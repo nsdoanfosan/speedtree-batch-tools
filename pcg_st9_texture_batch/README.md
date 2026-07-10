@@ -1,6 +1,6 @@
 # PCG ST9 → SK 전환 준비 보드
 
-언리얼 PCG에서 쓰는 ST9 나무(WPO + 마스크 머티리얼)를
+언리얼 PCG와 작업 레벨에 직접 배치된 ST9 나무(WPO + 마스크 머티리얼)를
 **SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)** 로 바꾸기 위한 상태 보드.
 
 실행:
@@ -35,9 +35,11 @@ PCG_ST9_Texture_Batch.bat
   - **원본 못 찾음**: 폴더에서 해당 메시의 원본 SPM을 못 찾음 → 파일 이름 확인
   - **기본 이름 머티리얼**(`Material 2` 등): 이름은 그대로 두고 나머지만 처리(부분 적용).
     SpeedTree에서 이름을 지은 뒤 다시 ①을 누르면 마저 처리된다.
+- 표에는 `SK_x.spm → Material 2`처럼 문제 SPM과 이름을 함께 표시한다. 여러 SPM이면
+  `SK_x.spm(3), SK_y.spm(3)`으로 위치를 요약하고, 상세 패널에서 전체 경로와 이름을 본다.
 - `⚠ 문제 표시된 항목도 적용` 체크박스를 켜면 중복 매칭·기본 이름도 강제 적용된다.
 
-## 아틀라스 항목이 잡히는 두 가지 경로
+## 아틀라스 항목과 ② 원본 잎 메시가 잡히는 경로
 
 1. **클러스터 SPM**: `Cluster\*.spm` → `M_{이름}_atlas_01` (elm 방식)
 2. **머티리얼 이름**: 클러스터 없이 SK SPM의 머티리얼이 아틀라스를 직접 쓰는 경우
@@ -46,6 +48,13 @@ PCG_ST9_Texture_Batch.bat
    `_green/_stem` 같은 Auto Split 그룹 접미사가 붙은 형태면 아틀라스로 감지한다.
    bark/decal/stem 계열은 ③(텍스처)만 추적하고 ②(잎 메시) 대상에서 뺀다.
 
+②는 Cluster 결과 TGA 자체를 메시화하지 않는다. 최종 SPM이
+`Cluster\leaf_x_01.tga`를 쓰면 같은 이름의 `Cluster\leaf_x_01.spm`을 열어,
+그 안의 잎 머티리얼이 참조하는 **원본 잎 알베도+알파 아틀라스**를 찾는다.
+클러스터 없이 원본 잎 아틀라스를 직접 쓰는 SPM도 같은 방식으로 찾는다.
+동일한 절대경로의 알베도+알파 쌍을 여러 Cluster SPM이 재사용하면 blend/메시는
+한 번만 만들고, 적용 대상 SPM 목록만 합친다.
+
 - 다른 폴더의 아틀라스를 쓰는 경우(densiflora→scotspine)는 **그래프가 있는
   폴더 소유**로 정리된다: 작업은 소유 폴더 행에 나오고, 사용하는 폴더에는
   "공유 — 그쪽 행에서 처리"로 표시된다.
@@ -53,18 +62,17 @@ PCG_ST9_Texture_Batch.bat
 
 ## [② 실행] — 잎 메시 blend 만들기 (헤드리스 Blender)
 
-- blend가 없는 원본 묶음마다 `jobs\atlas_blend_job.py` 를 `--factory-startup` 백그라운드
+- blend가 없는 고유 원본 잎 아틀라스 묶음마다 `jobs\atlas_blend_job.py` 를 `--factory-startup` 백그라운드
   Blender로 돌린다. 사용자 시작 애드온은 로드하지 않고 필요한
   `atlas_leaf_mesh_builder`만 스크립트에서 직접 활성화한다.
-- 알베도/알파 우선순위: **그 아틀라스의 렌더 결과물(`M_x_color/opacity.tga` — SPM이
-  실제로 쓰는 텍스처)** → SBS M_ 그래프의 알베도/오파시티 연결 → SPM 원본 참조 추측.
-  셋 다 없으면 건너뛰고 "③으로 텍스처를 먼저 만들면 그걸 사용"이라고 알려준다.
-  (확인창에 파일명 표시 — 틀리면 취소.)
+- 최종 SPM → 참조 Cluster SPM → 내부 잎 머티리얼의 원본 알베도/알파 순으로
+  실제 참조 체인을 읽는다. Cluster 결과 TGA는 ② 입력으로 쓰지 않는다.
 - pair 목록을 비워서 넘기므로 **감지된 모든 알파 아일랜드**가 잎 메시가 된다.
   Quality=SPEEDTREE_LOW, Plate=One Plate 고정. `atlas\M_이름.blend` 로 저장.
-- 기본은 blend 생성까지만. `만든 뒤 SK SPM에 잎 메시 반영` 체크박스를 켜면
-  Build/Update Target SPMs 까지 실행한다 (SK SPM 수정 → ④ 재생성 필요).
-  반영 직전 각 SK SPM은 `_spm_backups\`에 백업되고, 작업 실패 시 자동 복원된다.
+- 기본은 blend 생성까지만. `만든 뒤 대상 SPM에 잎 메시 반영` 체크박스를 켜면
+  Build/Update Target SPMs까지 실행한다. 직접 원본은 최종 SK SPM, Cluster 내부
+  원본은 해당 Cluster SPM이 대상이다 (최종 SK SPM 수정 시 ④ 재생성 필요).
+  반영 직전 각 대상 SPM은 `_spm_backups\`에 백업되고, 작업 실패 시 자동 복원된다.
   메시를 눈으로 먼저 보고 싶으면 끄고, blend 열어 확인한 뒤 애드온에서 직접 반영.
 
 ## [③ 실행] — 아틀라스 텍스처 5장 만들기 (sbsrender)
@@ -92,16 +100,19 @@ PCG_ST9_Texture_Batch.bat
 - 렌더는 5장을 한 세트로 다시 만든다. 기존 동명 TGA는 먼저
   `_pcgtex_backups\M_x_타임스탬프\`에 백업하며, 실패하면 기존 파일을 복원한다.
 
-설정(`pcg_texture_config.json`): `blender_exe`, `designer_dir`(sbsrender 위치),
+설정(`pcg_texture_config.json`): `unreal_levels`, `blender_exe`, `designer_dir`(sbsrender 위치),
 `cluster_sbsar`, `cluster_sbsar_normal_behavior`, `atlas_job_timeout`, `sbsrender_timeout`.
 
-## PCG 대상 목록
+## PCG + 작업 레벨 대상 목록
 
-- **Unreal에서 읽기**: 에디터가 켜져 있을 때. PCG_01 데이터에셋에서 실제 사용하는
-  메시 목록을 읽어 `pcg_targets.json` 갱신.
+- **Unreal에서 읽기**: 에디터가 켜져 있을 때. PCG_01 데이터에셋과
+  `pcg_texture_config.json`의 `unreal_levels`에 지정된 레벨을 읽어 `pcg_targets.json` 갱신.
+  현재 기본 작업 레벨은 `/Game/Level/Cliff_final_01`이다. 레벨은 현재 열려 있지 않아도
+  World asset을 읽기 전용으로 로드하므로 사용자의 현재 레벨을 전환하지 않는다.
 - **저장된 리포트에서 읽기**: 에디터가 꺼져 있을 때, 저장해 둔 PCG 덤프에서 읽음.
-- **PCG에서 쓰는 폴더만 보기**: 켜면 매칭되는 폴더만 표에 나온다.
-- 매칭 안 된 PCG 메시, 중복 매칭은 검사 직후 로그에 표시된다.
+- **PCG/레벨에서 쓰는 폴더만 보기**: 켜면 두 출처 중 하나 이상에 매칭되는 폴더만 나온다.
+- 표의 대상 메시 컬럼은 `P`(PCG)와 `L`(직접 배치 레벨)을 따로 표시한다.
+- 매칭 안 된 대상 메시와 중복 매칭은 검사 직후 로그에 표시된다.
 
 ## CLI (자동화/리포트가 필요할 때만)
 

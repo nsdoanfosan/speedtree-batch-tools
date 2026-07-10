@@ -1,4 +1,6 @@
 import gzip
+import importlib.machinery
+import importlib.util
 import shutil
 import sys
 import tempfile
@@ -13,6 +15,64 @@ sys.path.insert(0, str(TOOL_DIR))
 
 import sbs_auto
 from export_texture_plan import build_texture_plan_from_report, extract_material_image_refs
+from pcg_texture_audit import (
+    cluster_spms,
+    discover_leaf_mesh_sources,
+    target_mesh_source_map,
+)
+from refresh_pcg_targets import payload
+
+
+class TargetCollectionTests(unittest.TestCase):
+    def test_pcg_and_level_provenance_stay_separate(self):
+        targets = {
+            "meshes": [
+                {
+                    "static_mesh": "/Game/Meshes/Tree/st9/tree_pcg.tree_pcg",
+                    "sections": ["Tree"],
+                    "data_assets": ["/Game/PCG/DataBase/DA_Test"],
+                },
+                {
+                    "static_mesh": "/Game/Meshes/Tree/st9/tree_level.tree_level",
+                    "sections": [],
+                    "data_assets": [],
+                    "level_instances": [{
+                        "level": "/Game/Level/Cliff_final_01",
+                        "actor": "TreeActor",
+                        "instance_count": 3,
+                    }],
+                },
+                {
+                    "static_mesh": "/Game/Meshes/Tree/st9/tree_both.tree_both",
+                    "sections": ["Tree"],
+                    "data_assets": ["/Game/PCG/DataBase/DA_Test"],
+                    "level_instances": [{
+                        "level": "/Game/Level/Cliff_final_01",
+                        "actor": "BothActor",
+                        "instance_count": 2,
+                    }],
+                },
+            ],
+            "data_assets": [],
+        }
+        sources = target_mesh_source_map(targets)
+        self.assertTrue(sources["tree_pcg"]["pcg"])
+        self.assertFalse(sources["tree_pcg"]["levels"])
+        self.assertFalse(sources["tree_level"]["pcg"])
+        self.assertEqual(sources["tree_level"]["levels"], {"/Game/Level/Cliff_final_01"})
+        self.assertTrue(sources["tree_both"]["pcg"])
+        self.assertEqual(sources["tree_both"]["level_instances"][0]["instance_count"], 2)
+
+    def test_remote_payload_reads_explicit_level_without_switching_maps(self):
+        script = payload(
+            Path(r"C:\Temp\targets.json"),
+            "/Game/PCG/PCG_01",
+            ["/Game/Level/Cliff_final_01"],
+        )
+        self.assertIn("LEVEL_PATHS = ['/Game/Level/Cliff_final_01']", script)
+        self.assertIn("EditorAssetLibrary.load_asset(level_path)", script)
+        self.assertIn("GameplayStatics.get_all_actors_of_class(world, unreal.Actor)", script)
+        self.assertNotIn("load_level(", script)
 
 
 class SourceSelectionTests(unittest.TestCase):
@@ -126,6 +186,79 @@ class SourceSelectionTests(unittest.TestCase):
             candidates = sbs_auto.source_set_candidates(row)
             selected = sbs_auto.select_source_set(row, preferred=candidates[1]["label"])
             self.assertEqual(selected["label"], candidates[1]["label"])
+
+    def test_cluster_leaf_sources_are_deduplicated_across_spms(self):
+        def write_spm(path, materials):
+            blocks = []
+            for index, (name, refs) in enumerate(materials, 1):
+                tex = "".join(f"<TexFilename>{ref}</TexFilename>" for ref in refs)
+                blocks.append(
+                    f'<Material_v8 ID="{index}" Name="{name}">{tex}</Material_v8>')
+            xml = ("<?xml version=\"1.0\"?><SpeedTree><Materials>"
+                   + "".join(blocks) + "</Materials></SpeedTree>").encode()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "wb") as handle:
+                handle.write(xml)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cluster_dir = root / "Cluster"
+            texture_dir = root / "texture" / "Leaf"
+            common_albedo = self._image(texture_dir / "Common_4K_albedo.tif")
+            common_alpha = self._image(texture_dir / "Common_4K_alpha.tif")
+            dry_albedo = self._image(texture_dir / "Dry_4K_albedo.tif")
+            dry_alpha = self._image(texture_dir / "Dry_4K_alpha.tif")
+            rel_common = [
+                str(Path(common_albedo).relative_to(cluster_dir.parent)),
+                str(Path(common_alpha).relative_to(cluster_dir.parent)),
+            ]
+            rel_dry = [
+                str(Path(dry_albedo).relative_to(cluster_dir.parent)),
+                str(Path(dry_alpha).relative_to(cluster_dir.parent)),
+            ]
+            # Cluster SPM refs are relative to Cluster/, so prefix one parent.
+            rel_common = [str(Path("..") / value) for value in rel_common]
+            rel_dry = [str(Path("..") / value) for value in rel_dry]
+            cluster_a = cluster_dir / "leaf_test_01.spm"
+            cluster_b = cluster_dir / "leaf_test_side_01.spm"
+            write_spm(cluster_a, [("Material", rel_common), ("Material 2", rel_dry)])
+            write_spm(cluster_b, [("Material", rel_common)])
+            final_spm = root / "SK_tree_test_01.spm"
+            write_spm(final_spm, [("M_leaf_test", [
+                r"Cluster\leaf_test_01.tga", r"Cluster\leaf_test_01_Opacity.tga",
+                r"Cluster\leaf_test_side_01.tga", r"Cluster\leaf_test_side_01_Opacity.tga",
+            ])])
+            cfg = {"atlas_root": str(root / "atlas")}
+            sources, referenced = discover_leaf_mesh_sources(
+                root, cfg, [final_spm], cluster_spms(root))
+            self.assertEqual(len(referenced), 2)
+            self.assertEqual(len(sources), 2)
+            common = next(row for row in sources if row["source_family"].lower() == "common")
+            self.assertEqual(
+                {Path(target["spm"]).name for target in common["targets"]},
+                {cluster_a.name, cluster_b.name},
+            )
+
+
+class GuiLabelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = TOOL_DIR / "pcg_texture_gui.pyw"
+        loader = importlib.machinery.SourceFileLoader("pcg_texture_gui_test", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.gui = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.gui)
+
+    def test_generic_material_summary_names_exact_spm_and_material(self):
+        item = {"target_spm_statuses": [{
+            "mesh_name": "weed_blackgum_01",
+            "sk_spm": r"D:\Tree\SK_weed_blackgum_01.spm",
+            "materials_missing_m_prefix": ["Material 2"],
+        }]}
+        self.assertEqual(
+            self.gui.generic_material_summary(item),
+            "⚠ SK_weed_blackgum_01.spm → Material 2",
+        )
 
 
 class SafetyTests(unittest.TestCase):

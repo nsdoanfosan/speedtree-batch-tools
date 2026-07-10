@@ -6,6 +6,7 @@ only mutates files when --prepare-sk is passed.
 import argparse
 import csv
 import gzip
+import html
 import json
 import re
 import shutil
@@ -26,11 +27,32 @@ from pcg_texture_common import (
 )
 
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
+MATERIAL_BLOCK_RE = re.compile(
+    r"<Material_v8\b[^>]*>.*?</Material_v8>", re.IGNORECASE | re.DOTALL)
+TEX_FILENAME_RE = re.compile(
+    r"<TexFilename\b[^>]*>(.*?)</TexFilename>", re.IGNORECASE | re.DOTALL)
 ABS_IMAGE_RE = re.compile(
     r"[A-Za-z]:[\\/][^<>'\"\r\n]+?\.(?:png|tga|tif|tiff|jpg|jpeg|exr|bmp)",
     re.IGNORECASE,
 )
 TOKEN_SPLIT_RE = re.compile(r"[\s<>'\"=;,\(\)\[\]\{\}]+")
+LEAF_SOURCE_WORDS = ("leaf", "leaves", "foliage", "needle")
+ALBEDO_WORDS = ("albedo", "basecolor", "base_color", "diffuse", "colour", "_color", "-color")
+ALPHA_WORDS = ("alpha", "opacity", "transparency", "mask")
+NON_COLOR_WORDS = (
+    "normal", "rough", "gloss", "height", "displacement", "depth",
+    "ambientocclusion", "ambient_occlusion", "occlusion", "_ao", "-ao",
+    "subsurface", "translucency", "vertex", "metallic",
+)
+SOURCE_MAP_SUFFIX_RE = re.compile(
+    r"(?:[_-](?:base[_-]?color|basecolor|albedo|diffuse|colour|color|opacity|alpha|"
+    r"transparency|mask|normal|roughness|rough|gloss|height|displacement|depth|"
+    r"ambient[_-]?occlusion|ao|occlusion|translucency|subsurface))$",
+    re.IGNORECASE,
+)
+SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
+    r"(?:[_-](?:1k|2k|4k|8k|16k|\d+x\d+))$", re.IGNORECASE)
+_MATERIAL_IMAGE_REF_CACHE = {}
 
 
 def read_maybe_gzip_text(path):
@@ -96,6 +118,184 @@ def extract_image_refs(path):
         if Path(token).suffix.lower() in IMAGE_EXTS:
             refs.append(token.replace("/", "\\"))
     return unique(refs)
+
+
+def extract_material_image_refs(path):
+    """Return material names and only the image refs owned by each material."""
+    path = Path(path)
+    try:
+        stat = path.stat()
+        cache_key = (str(path).lower(), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        cache_key = (str(path).lower(), 0, 0)
+    cached = _MATERIAL_IMAGE_REF_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    text = read_maybe_gzip_text(path)
+    if not text:
+        return []
+    rows = []
+    for block_match in MATERIAL_BLOCK_RE.finditer(text):
+        block = block_match.group(0)
+        name_match = MATERIAL_RE.search(block)
+        name = html.unescape(name_match.group(2)) if name_match else ""
+        refs = []
+        for ref_match in TEX_FILENAME_RE.finditer(block):
+            value = html.unescape(ref_match.group(1).strip())
+            if value and Path(value).suffix.lower() in IMAGE_EXTS:
+                refs.append(value.replace("/", "\\"))
+        rows.append({"material_name": name, "refs": unique(refs)})
+    _MATERIAL_IMAGE_REF_CACHE[cache_key] = rows
+    return rows
+
+
+def resolve_spm_image_ref(spm, ref):
+    path = Path(str(ref).replace("/", "\\"))
+    if not path.is_absolute():
+        path = Path(spm).parent / path
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def source_family_name(path):
+    """Stable display/output name shared by all maps in one source atlas set."""
+    stem = Path(path).stem
+    stem = SOURCE_MAP_SUFFIX_RE.sub("", stem)
+    stem = SOURCE_RESOLUTION_SUFFIX_RE.sub("", stem)
+    stem = SOURCE_MAP_SUFFIX_RE.sub("", stem)
+    return stem.strip("_-") or Path(path).stem
+
+
+def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None):
+    """Find coherent leaf albedo/alpha pairs used by one SPM material.
+
+    One material normally owns one atlas pair. If a material happens to list
+    more maps, family-name matching keeps albedo and alpha in the same set.
+    """
+    results = []
+    excluded_albedo_stems = {str(stem).lower() for stem in (excluded_albedo_stems or [])}
+    for row in extract_material_image_refs(spm):
+        name = row["material_name"]
+        refs = row["refs"]
+        searchable = " ".join([name] + refs).lower()
+        if not any(word in searchable for word in LEAF_SOURCE_WORDS):
+            continue
+        albedo_refs = []
+        alpha_refs = []
+        for ref in refs:
+            low = Path(ref).name.lower()
+            if any(word in low for word in ALPHA_WORDS):
+                alpha_refs.append(ref)
+            elif any(word in low for word in ALBEDO_WORDS):
+                albedo_refs.append(ref)
+            elif not any(word in low for word in NON_COLOR_WORDS):
+                # SpeedTree cluster colors commonly have no "albedo" suffix.
+                albedo_refs.append(ref)
+        albedo_refs = [
+            ref for ref in albedo_refs
+            if Path(ref).stem.lower() not in excluded_albedo_stems
+        ]
+        if not albedo_refs or not alpha_refs:
+            continue
+        albedos = [resolve_spm_image_ref(spm, ref) for ref in albedo_refs]
+        alphas = [resolve_spm_image_ref(spm, ref) for ref in alpha_refs]
+        albedos = [path for path in albedos if path.exists()]
+        alphas = [path for path in alphas if path.exists()]
+        if not albedos or not alphas:
+            continue
+        alpha_by_family = {}
+        for path in alphas:
+            alpha_by_family.setdefault(source_family_name(path).lower(), []).append(path)
+        pairs = []
+        for albedo in albedos:
+            family = source_family_name(albedo)
+            matches = alpha_by_family.get(family.lower(), [])
+            if matches:
+                pairs.append((albedo, matches[0], family))
+        if not pairs and len(albedos) == 1 and len(alphas) == 1:
+            pairs.append((albedos[0], alphas[0], source_family_name(albedos[0])))
+        for albedo, alpha, family in pairs:
+            safe_family = re.sub(r"[^A-Za-z0-9_-]+", "_", family).strip("_-") or "leaf"
+            results.append({
+                "albedo": str(albedo),
+                "alpha": str(alpha),
+                "source_family": family,
+                "atlas_base": f"M_{safe_family}_atlas_01",
+                "source_kind": source_kind,
+                "target_spm": str(Path(spm)),
+                "material_names": [name] if name else [],
+            })
+    return results
+
+
+def merge_leaf_mesh_sources(sources, cfg, folder):
+    """Deduplicate by resolved source atlas pair and merge every target SPM."""
+    grouped = {}
+    for source in sources:
+        key = (
+            str(Path(source["albedo"]).resolve()).lower(),
+            str(Path(source["alpha"]).resolve()).lower(),
+        )
+        entry = grouped.get(key)
+        target = {
+            "spm": source["target_spm"],
+            "material_names": list(source.get("material_names") or []),
+            "source_kind": source.get("source_kind", "direct"),
+        }
+        if entry is None:
+            entry = dict(source)
+            entry["targets"] = [target]
+            entry["source_kinds"] = [source.get("source_kind", "direct")]
+            entry["atlas_blends"] = find_atlas_blends(
+                cfg["atlas_root"], folder, source["atlas_base"])
+            grouped[key] = entry
+            continue
+        if source.get("source_kind") not in entry["source_kinds"]:
+            entry["source_kinds"].append(source.get("source_kind"))
+        existing = next(
+            (row for row in entry["targets"]
+             if row["spm"].lower() == target["spm"].lower()), None)
+        if existing:
+            existing["material_names"] = unique(
+                existing["material_names"] + target["material_names"])
+        else:
+            entry["targets"].append(target)
+    return list(grouped.values())
+
+
+def referenced_cluster_spms(target_spms, clusters):
+    """Map final-tree cluster texture refs to the Cluster SPM that rendered them."""
+    refs_by_stem = {}
+    for spm in target_spms:
+        for material in extract_material_image_refs(spm):
+            for ref in material["refs"]:
+                refs_by_stem.setdefault(Path(ref).stem.lower(), set()).add(str(spm))
+    found = {}
+    for cluster in clusters:
+        users = refs_by_stem.get(cluster.stem.lower())
+        if users:
+            found[str(cluster).lower()] = sorted(users)
+    return found
+
+
+def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
+    """Discover direct leaf atlases plus leaf atlases inside referenced clusters."""
+    referenced = referenced_cluster_spms(target_spms, clusters)
+    referenced_stems = {Path(path).stem.lower() for path in referenced}
+    sources = []
+    for spm in target_spms:
+        for source in leaf_sources_from_spm(
+                spm, "direct", excluded_albedo_stems=referenced_stems):
+            sources.append(source)
+    for cluster in clusters:
+        if str(cluster).lower() not in referenced:
+            continue
+        for source in leaf_sources_from_spm(cluster, "cluster"):
+            source["referenced_by_spms"] = referenced[str(cluster).lower()]
+            sources.append(source)
+    return merge_leaf_mesh_sources(sources, cfg, folder), referenced
 
 
 def patch_m_prefix(spm, exclude=None):
@@ -533,6 +733,9 @@ def audit_folder(folder, cfg, include_refs=False):
     tex_dirs = texture_dir_candidates(folder, sbs_files) or [texture_dir]
     folder_graphs = folder_m_graph_names(sbs_files)
     clusters = cluster_spms(folder)
+    target_spms = preferred or loose or sources
+    leaf_mesh_sources, referenced_clusters = discover_leaf_mesh_sources(
+        folder, cfg, target_spms, clusters)
     cluster_items = []
     ignored_cluster_spms = []
     for cluster in clusters:
@@ -545,7 +748,12 @@ def audit_folder(folder, cfg, include_refs=False):
             atlas_base.lower(),
             atlas_base.lower().removeprefix("m_"),
         }
-        is_relevant = bool(atlas_blends) or any(export_maps.values()) or bool(material_keys & relevant_keys)
+        is_relevant = (
+            bool(atlas_blends)
+            or any(export_maps.values())
+            or bool(material_keys & relevant_keys)
+            or str(cluster).lower() in referenced_clusters
+        )
         if not is_relevant:
             ignored_cluster_spms.append(str(cluster))
             continue
@@ -565,6 +773,7 @@ def audit_folder(folder, cfg, include_refs=False):
                 "m_graph": graph[0] if graph else None,
                 "m_graph_sbs": graph[1] if graph else None,
                 "source_refs": extract_image_refs(cluster)[:20] if include_refs else [],
+                "referenced_by_spms": referenced_clusters.get(str(cluster).lower(), []),
             }
         )
     # 클러스터 SPM 없이 아틀라스를 직접 쓰는 머티리얼도 항목으로 추가
@@ -595,6 +804,7 @@ def audit_folder(folder, cfg, include_refs=False):
         "texture_dirs": [str(d) for d in tex_dirs],
         "m_graph_names": {low: list(pair) for low, pair in folder_graphs.items()},
         "cluster_items": cluster_items,
+        "leaf_mesh_sources": leaf_mesh_sources,
         "ignored_cluster_spms": ignored_cluster_spms,
         "source_refs": all_refs[:40],
         "normal_convention": infer_normal_convention(all_refs),
@@ -623,7 +833,8 @@ def derive_status_actions(item):
     if item["chosen_spm"] and not item["blend"]:
         actions.append("별도 리페어에서 SK Blend 생성 필요")
     local_entries = [c for c in item["cluster_items"] if not c.get("shared_from")]
-    if any(c.get("needs_leaf_mesh") and not c["atlas_blends"] for c in local_entries):
+    leaf_sources = item.get("leaf_mesh_sources") or []
+    if any(not source.get("atlas_blends") for source in leaf_sources):
         actions.append("Blender 아틀라스 파일 확인 필요")
     if any(c["missing_export_maps"] for c in local_entries):
         actions.append("Substance에서 출력 텍스처 저장 필요")
@@ -673,6 +884,52 @@ def target_mesh_map_from_pcg_targets(pcg_targets):
                 if mesh:
                     mesh_map.setdefault(mesh_asset_name(mesh).lower(), set()).add(mesh)
     return mesh_map
+
+
+def target_mesh_source_map(pcg_targets):
+    """Return per-mesh PCG and explicitly placed-level provenance."""
+    source_map = {}
+    if not pcg_targets:
+        return source_map
+
+    def entry(mesh):
+        name = mesh_asset_name(mesh).lower()
+        return source_map.setdefault(name, {
+            "paths": set(),
+            "pcg": False,
+            "data_assets": set(),
+            "levels": set(),
+            "level_instances": [],
+        })
+
+    for item in pcg_targets.get("meshes", []):
+        mesh = item.get("static_mesh")
+        if not mesh:
+            continue
+        source = entry(mesh)
+        source["paths"].add(mesh)
+        data_assets = item.get("data_assets") or []
+        if data_assets or item.get("sections") or item.get("source_graphs"):
+            source["pcg"] = True
+            source["data_assets"].update(data_assets)
+        for placement in item.get("level_instances") or []:
+            level = placement.get("level")
+            if level:
+                source["levels"].add(level)
+            source["level_instances"].append(dict(placement))
+
+    for da in pcg_targets.get("data_assets", []):
+        for entries in da.get("sections", {}).values():
+            for item in entries:
+                mesh = item.get("static_mesh")
+                if not mesh:
+                    continue
+                source = entry(mesh)
+                source["paths"].add(mesh)
+                source["pcg"] = True
+                if da.get("asset"):
+                    source["data_assets"].add(da["asset"])
+    return source_map
 
 
 def folder_matches_target_meshes(folder, target_mesh_names):
@@ -848,6 +1105,7 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
     items = [audit_folder(folder, cfg, include_refs=include_refs) for folder in folders]
     resolve_shared_atlas_entries(items, cfg)
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
+    target_source_map = target_mesh_source_map(pcg_targets)
     target_mesh_names = set(target_mesh_map)
     matched_target_names = set()
     target_folder_matches = {}
@@ -859,6 +1117,20 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
         for name in folder_matches:
             target_folder_matches.setdefault(name, []).append(item["name"])
         item["pcg_target_mesh_names"] = folder_matches
+        item["target_mesh_names"] = folder_matches
+        item["pcg_mesh_names"] = [
+            name for name in folder_matches
+            if target_source_map.get(name, {}).get("pcg")
+        ]
+        item["level_mesh_names"] = [
+            name for name in folder_matches
+            if target_source_map.get(name, {}).get("levels")
+        ]
+        item["level_placements"] = [
+            placement
+            for name in folder_matches
+            for placement in target_source_map.get(name, {}).get("level_instances", [])
+        ]
         item["pcg_target_meshes"] = [
             path
             for name in folder_matches
@@ -895,6 +1167,7 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             if name in duplicate_mesh_matches
         ]
         item["duplicate_pcg_target_mesh_names"] = duplicates
+        item["duplicate_target_mesh_names"] = duplicates
         if duplicates:
             item["status"] = "needs_duplicate_review"
             item["actions"] = unique([
@@ -909,6 +1182,19 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             status = entry.get("status", "unknown")
             target_status_counts[status] = target_status_counts.get(status, 0) + 1
     unmatched_names = sorted(target_mesh_names - matched_target_names)
+    pcg_mesh_names = {
+        name for name, source in target_source_map.items()
+        if source.get("pcg")
+    }
+    level_mesh_names = {
+        name for name, source in target_source_map.items()
+        if source.get("levels")
+    }
+    level_placements = [
+        placement
+        for source in target_source_map.values()
+        for placement in source.get("level_instances", [])
+    ]
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "config": cfg,
@@ -928,6 +1214,12 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             ],
             "duplicate_mesh_match_count": len(duplicate_mesh_matches) if pcg_targets else 0,
             "duplicate_mesh_matches": duplicate_mesh_matches,
+            "pcg_mesh_count": len(pcg_mesh_names),
+            "level_mesh_count": len(level_mesh_names),
+            "pcg_level_overlap_mesh_count": len(pcg_mesh_names & level_mesh_names),
+            "level_component_count": len(level_placements),
+            "level_instance_count": sum(int(item.get("instance_count", 1)) for item in level_placements),
+            "levels": pcg_targets.get("levels", []) if pcg_targets else [],
         },
         "summary": {
             "total": len(items),

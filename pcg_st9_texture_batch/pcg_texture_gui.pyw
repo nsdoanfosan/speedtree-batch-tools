@@ -53,6 +53,45 @@ def split_generic(names):
     return normal, generic
 
 
+def generic_material_issues(item):
+    """Return exact SPM/material locations for default SpeedTree names."""
+    issues = []
+    statuses = item.get("target_spm_statuses") or []
+    if statuses:
+        for status in statuses:
+            _normal, generic = split_generic(
+                status.get("materials_missing_m_prefix", []))
+            spm = status.get("sk_spm") or status.get("source_spm") or ""
+            for material in generic:
+                issues.append({
+                    "mesh_name": status.get("mesh_name", ""),
+                    "spm": spm,
+                    "material": material,
+                })
+        return issues
+    _normal, generic = split_generic(item.get("materials_missing_m_prefix", []))
+    spm = item.get("chosen_spm") or next(iter(item.get("sk_spms") or []), "")
+    for material in generic:
+        issues.append({"mesh_name": "", "spm": spm, "material": material})
+    return issues
+
+
+def generic_material_summary(item):
+    issues = generic_material_issues(item)
+    if not issues:
+        return ""
+    grouped = {}
+    for issue in issues:
+        label = Path(issue["spm"]).name if issue["spm"] else "SPM 미상"
+        grouped.setdefault(label, []).append(issue["material"])
+    if len(issues) == 1:
+        issue = issues[0]
+        return f"⚠ {Path(issue['spm']).name or 'SPM 미상'} → {issue['material']}"
+    locations = ", ".join(
+        f"{spm}({len(materials)})" for spm, materials in grouped.items())
+    return f"⚠ 기본명 {len(issues)}개 · {locations}"
+
+
 class Tooltip:
     """말풍선 도움말: 위젯에 마우스를 올리면 설명이 뜬다."""
 
@@ -123,21 +162,21 @@ class App:
 
         src = ttk.Frame(self.root, padding=(6, 0, 6, 3))
         src.pack(fill="x")
-        ttk.Label(src, text="PCG 대상 목록:").pack(side="left")
+        ttk.Label(src, text="PCG + 배치 레벨 대상:").pack(side="left")
         btn_live = ttk.Button(src, text="Unreal에서 읽기", command=self.refresh_pcg_targets)
         btn_live.pack(side="left", padx=(6, 0))
         Tooltip(btn_live, "언리얼 에디터가 켜져 있을 때 사용.\n"
-                          "PCG_01 데이터에셋에서 실제로 쓰는 메시 목록을 새로 읽어 옵니다.\n"
-                          "이 목록이 있어야 'PCG에서 안 쓰는 폴더'를 표에서 걸러낼 수 있습니다.")
+                          "PCG_01 데이터에셋과 설정된 작업 레벨에 직접 배치된 ST9 메시를 읽습니다.\n"
+                          "현재 설정 레벨: /Game/Level/Cliff_final_01")
         btn_saved = ttk.Button(src, text="저장된 리포트에서 읽기", command=self.import_saved_pcg_report)
         btn_saved.pack(side="left", padx=(6, 0))
         Tooltip(btn_saved, "언리얼 에디터가 꺼져 있을 때 사용.\n"
                            "이전에 저장해 둔 PCG 덤프 파일에서 메시 목록을 읽어 옵니다.")
         self.use_pcg_targets_var = tk.BooleanVar(value=TARGETS_PATH.exists())
-        chk_pcg = ttk.Checkbutton(src, text="PCG에서 쓰는 폴더만 보기",
+        chk_pcg = ttk.Checkbutton(src, text="PCG/레벨에서 쓰는 폴더만 보기",
                                   variable=self.use_pcg_targets_var, command=self.refresh)
         chk_pcg.pack(side="left", padx=10)
-        Tooltip(chk_pcg, "켜면: PCG 대상 목록과 매칭되는 나무 폴더만 표에 나옵니다.\n"
+        Tooltip(chk_pcg, "켜면: PCG 또는 작업 레벨 대상과 매칭되는 나무 폴더만 표에 나옵니다.\n"
                          "끄면: 루트 아래 모든 나무 폴더가 나옵니다.")
         self.targets_info_var = tk.StringVar(value="")
         ttk.Label(src, textvariable=self.targets_info_var, foreground="#666").pack(side="left", padx=8)
@@ -172,20 +211,23 @@ class App:
         self.btn_step2 = ttk.Button(actions2, text="② 실행 — 잎 메시 blend 만들기 (선택 항목)",
                                     command=self.start_step2)
         self.btn_step2.pack(side="left")
-        Tooltip(self.btn_step2, "체크된 행 중 잎 메시 blend가 없는 묶음마다 헤드리스 Blender로\n"
+        Tooltip(self.btn_step2, "체크된 행의 최종/Cluster SPM을 따라 원본 잎 아틀라스를 찾고\n"
                                 "아틀라스 리프 제너레이터를 돌립니다 (묶음당 수십초~수분):\n"
-                                "· 알베도+알파 자동 감지 → 모든 알파 아일랜드를 잎 메시로 생성\n"
+                                "· Cluster 결과 TGA가 아니라 그 Cluster SPM 내부 원본을 사용\n"
+                                "· 같은 원본 아틀라스를 여러 SPM이 쓰면 한 번만 생성\n"
+                                "· 알베도+알파의 모든 알파 아일랜드를 잎 메시로 생성\n"
                                 "· Quality=Low, Plate=One Plate 고정\n"
                                 "· atlas 폴더에 M_이름.blend 저장 (기존 파일은 안 건드림)\n"
                                 "알베도/알파 원본을 못 찾은 묶음은 이유를 표시하고 건너뜁니다.\n"
                                 "메시를 눈으로 확인/정리하려면 저장된 blend를 열면 됩니다.")
         self.spm_push_var = tk.BooleanVar(value=False)
-        chk_spm = ttk.Checkbutton(actions2, text="만든 뒤 SK SPM에 잎 메시 반영", variable=self.spm_push_var)
+        chk_spm = ttk.Checkbutton(actions2, text="만든 뒤 대상 SPM에 잎 메시 반영", variable=self.spm_push_var)
         chk_spm.pack(side="left", padx=8)
-        Tooltip(chk_spm, "켜면 ② 직후 그 잎 메시들을 SK SPM에 넣습니다(Build/Update Target SPMs).\n"
-                         "SK SPM 파일이 수정되므로, 메시를 먼저 눈으로 확인하고 싶으면 끄고\n"
+        Tooltip(chk_spm, "켜면 ② 직후 그 잎 메시들을 실제 사용 SPM에 넣습니다(Build/Update Target SPMs).\n"
+                         "직접 원본은 최종 SK SPM, Cluster 내부 원본은 해당 Cluster SPM이 대상입니다.\n"
+                         "SPM 파일이 수정되므로, 메시를 먼저 눈으로 확인하고 싶으면 끄고\n"
                          "blend를 열어 본 뒤 애드온에서 직접 반영하세요.\n"
-                         "반영 후에는 ④ SK Blend를 SK Batch에서 다시 만들어야 합니다.")
+                         "최종 SK SPM을 바꾼 경우에는 ④ SK Blend를 다시 만들어야 합니다.")
         self.btn_step3 = ttk.Button(actions2, text="③ 실행 — 텍스처 5장 만들기 (선택 항목)",
                                     command=self.start_step3)
         self.btn_step3.pack(side="left", padx=10)
@@ -208,8 +250,8 @@ class App:
         self.tree.heading("#0", text="나무 폴더 (클릭=선택 토글)")
         self.tree.column("#0", width=250, anchor="w")
         headers = {
-            "pcg": ("PCG 메시", 70),
-            "step1": ("① SK + M_ 이름", 160),
+            "pcg": ("대상 메시", 90),
+            "step1": ("① SK + M_ 이름", 300),
             "step2": ("② 잎 메시 (Blender)", 150),
             "step3": ("③ 텍스처 (Substance)", 180),
             "step4": ("④ SK Blend (SK Batch)", 160),
@@ -222,7 +264,7 @@ class App:
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.show_details())
         header_tip = ("컬럼 = 작업 순서입니다.\n"
-                      "PCG 메시: 이 폴더의 메시를 PCG가 몇 개 쓰는지\n"
+                      "대상 메시: P=PCG 사용, L=작업 레벨 직접 배치\n"
                       "①: SK SPM 존재 + 머티리얼 M_ 이름 (이 도구가 자동 처리)\n"
                       "②: 잎 지오메트리 blend — 헤드리스 Blender 자동 생성\n"
                       "③: 아틀라스 텍스처 5장 — sbsrender 자동 생성\n"
@@ -299,27 +341,45 @@ class App:
         review = sum(1 for i in items if i["status"] in ("needs_source_review", "needs_duplicate_review"))
         pcg = self.report.get("pcg_targets", {})
         if pcg.get("mesh_count"):
-            head = f"PCG에서 쓰는 나무 폴더 {n}개"
+            head = f"PCG/작업 레벨에서 쓰는 나무 폴더 {n}개"
             source_time = f" · {pcg['generated_at']}" if pcg.get("generated_at") else ""
+            level_reports = pcg.get("levels") or []
+            level_names = [Path(row.get("level", "")).name for row in level_reports if row.get("level")]
+            level_label = ", ".join(level_names) or "작업 레벨"
+            overlap = pcg.get("pcg_level_overlap_mesh_count", 0)
+            overlap_text = f" · 양쪽 중복 {overlap}개" if overlap else ""
             self.targets_info_var.set(
-                f"PCG 메시 {pcg['mesh_count']}개 중 {pcg['matched_mesh_count']}개 폴더 매칭됨{source_time}"
+                f"고유 대상 {pcg['mesh_count']}개 (PCG {pcg.get('pcg_mesh_count', 0)} · "
+                f"{level_label} 직접 배치 {pcg.get('level_mesh_count', 0)}{overlap_text}) 중 "
+                f"{pcg['matched_mesh_count']}개가 나무 폴더에 매칭됨{source_time}"
             )
             unmatched = pcg.get("unmatched_mesh_names", [])
             if unmatched:
-                self.log(f"⚠ PCG 메시 {len(unmatched)}개는 매칭되는 나무 폴더를 못 찾았습니다: "
+                self.log(f"⚠ 대상 메시 {len(unmatched)}개는 매칭되는 나무 폴더를 못 찾았습니다: "
                          + ", ".join(unmatched[:10])
                          + (" ..." if len(unmatched) > 10 else ""))
             dup = pcg.get("duplicate_mesh_matches", {})
             if dup:
-                self.log(f"⚠ PCG 메시 {len(dup)}개는 폴더가 2개 이상 매칭됩니다 (표에 '중복' 표시): "
+                self.log(f"⚠ 대상 메시 {len(dup)}개는 폴더가 2개 이상 매칭됩니다 (표에 '중복' 표시): "
                          + ", ".join(dup))
         else:
-            head = f"나무 폴더 {n}개 (PCG 필터 없음)"
+            head = f"나무 폴더 {n}개 (대상 필터 없음)"
             self.targets_info_var.set("")
         self.status_var.set(
             f"{head} — ✅ 다 됨 {done} · ① 필요 {need1} · ②③ 남음 {need23} · ⚠ 확인 필요 {review}"
         )
         self.log(f"검사 완료: {head}. ✅ {done} / ① {need1} / ②③ {need23} / ⚠ {review}")
+
+    @staticmethod
+    def _target_source_text(item):
+        pcg_count = len(item.get("pcg_mesh_names") or [])
+        level_count = len(item.get("level_mesh_names") or [])
+        parts = []
+        if pcg_count:
+            parts.append(f"P{pcg_count}")
+        if level_count:
+            parts.append(f"L{level_count}")
+        return " / ".join(parts) or "-"
 
     def populate(self):
         old_checked = {iid: e["checked"] for iid, e in self.items.items()}
@@ -335,7 +395,7 @@ class App:
                 "", "end", iid=iid,
                 text=f"{mark} {item['name']}",
                 values=(
-                    str(len(item.get("pcg_target_mesh_names", [])) or "-"),
+                    self._target_source_text(item),
                     self.step1_text(item),
                     self.step2_text(item),
                     self.step3_text(item),
@@ -346,7 +406,7 @@ class App:
 
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):
-        if item.get("duplicate_pcg_target_mesh_names"):
+        if item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names"):
             return "⚠ 중복 매칭 확인"
         statuses = item.get("target_spm_statuses") or []
         if statuses:
@@ -365,20 +425,22 @@ class App:
         if normal:
             return f"M_ {len(normal)}개 필요 → [① 실행]"
         if generic:
-            return f"⚠ 기본 이름 {len(generic)}개 — SpeedTree에서 이름"
+            return generic_material_summary(item)
         return "완료 ✓"
 
     def step2_text(self, item):
-        entries = [c for c in item.get("cluster_items", [])
-                   if c.get("needs_leaf_mesh", True) and not c.get("shared_from")]
-        shared = sum(1 for c in item.get("cluster_items", []) if c.get("shared_from"))
-        if not entries:
-            return f"공유 {shared}개 (다른 폴더)" if shared else "잎 작업 없음"
-        have = sum(1 for c in entries if c["atlas_blends"])
-        text = f"{have}/{len(entries)} 완료 ✓" if have == len(entries) else f"{have}/{len(entries)} — 만들기 필요"
-        if shared:
-            text += f" (+공유 {shared})"
-        return text
+        sources = item.get("leaf_mesh_sources") or []
+        if not sources:
+            return "원본 잎 아틀라스 없음"
+        have = sum(1 for source in sources if source.get("atlas_blends"))
+        targets = {
+            target.get("spm", "").lower()
+            for source in sources for target in source.get("targets", [])
+            if target.get("spm")
+        }
+        if have == len(sources):
+            return f"아틀라스 {len(sources)}개 완료 ✓"
+        return f"아틀라스 {len(sources)}개 · 대상 SPM {len(targets)}개 → 만들기"
 
     def step3_text(self, item):
         entries = [c for c in item.get("cluster_items", []) if not c.get("shared_from")]
@@ -528,12 +590,25 @@ class App:
     def _detail_text(self, item):
         L = []
         L.append(f"📁 {item['name']}   {item['folder']}")
-        names = item.get("pcg_target_mesh_names") or []
-        if names:
-            L.append(f"PCG에서 사용하는 메시 {len(names)}개: {', '.join(names)}")
-        else:
-            L.append("PCG 매칭 정보 없음 (전체 보기 모드이거나 PCG에서 안 쓰는 폴더)")
-        for dup in item.get("duplicate_pcg_target_mesh_names") or []:
+        target_names = item.get("target_mesh_names") or item.get("pcg_target_mesh_names") or []
+        pcg_names = item.get("pcg_mesh_names") or []
+        level_names = item.get("level_mesh_names") or []
+        placements = item.get("level_placements") or []
+        if pcg_names:
+            L.append(f"PCG에서 사용하는 메시 {len(pcg_names)}개: {', '.join(pcg_names)}")
+        if level_names:
+            level_paths = sorted({row.get("level", "") for row in placements if row.get("level")})
+            level_label = ", ".join(Path(path).name for path in level_paths) or "작업 레벨"
+            component_count = len(placements)
+            instance_count = sum(int(row.get("instance_count", 1)) for row in placements)
+            actor_count = len({row.get("actor_name") or row.get("actor") for row in placements})
+            L.append(
+                f"{level_label} 직접 배치 메시 {len(level_names)}개: {', '.join(level_names)} "
+                f"(액터 {actor_count} · 컴포넌트 {component_count} · 인스턴스 {instance_count})"
+            )
+        if not target_names:
+            L.append("대상 매칭 정보 없음 (전체 보기 모드이거나 PCG/작업 레벨에서 안 쓰는 폴더)")
+        for dup in item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names") or []:
             L.append(f"⚠ '{dup}' 은(는) 다른 폴더에도 매칭됩니다 — 어느 폴더가 진짜인지 먼저 정한 뒤 ①을 실행하세요.")
         L.append("")
 
@@ -577,45 +652,43 @@ class App:
                 if generic:
                     L.append(f"  · ⚠ 기본 이름 머티리얼 {len(generic)}개 (SpeedTree에서 이름 지은 뒤 ①): "
                              + ", ".join(generic))
+        generic_issues = generic_material_issues(item)
+        if generic_issues:
+            L.append("  · ⚠ 기본 이름 문제 위치 (이 SPM을 SpeedTree에서 열어 이름 수정):")
+            grouped = {}
+            for issue in generic_issues:
+                key = (issue["spm"], issue["mesh_name"])
+                grouped.setdefault(key, []).append(issue["material"])
+            for (spm, mesh), names in grouped.items():
+                mesh_note = f" / 대상 메시: {mesh}" if mesh else ""
+                L.append(f"      SPM: {spm or '미상'}{mesh_note}")
+                L.append(f"      머티리얼: {', '.join(names)}")
         L.append("  왜? SK SPM은 나나이트 전환용 복사본, M_ 이름은 send2ue 임포트 규칙입니다.")
         L.append("")
 
-        # ②③ 텍스처 계열 — texture plan 사용
+        # ② 원본 잎 아틀라스 / ③ 텍스처 계열
         clusters = item.get("cluster_items", [])
         rows = self._texplan_rows(item) if clusters else []
         L.append("── ② 잎 메시 만들기 ──   ([② 실행] 버튼이 자동 처리 · Blender 아틀라스 리프 제너레이터)")
-        if not clusters:
-            L.append("  · 이 폴더는 클러스터(잎) SPM이 없어 해당 없음.")
-        for row in rows:
-            name = row["cluster_name"]
-            base = row["atlas_base"]
-            if row.get("shared_from"):
-                L.append(f"  · {base}: 다른 폴더({row['shared_from']})에서 관리 — 그쪽 행에서 처리")
-                continue
-            if not row.get("needs_leaf_mesh", True):
-                L.append(f"  · {base}: 잎 메시 대상 아님 (bark/decal 계열 — ③ 텍스처만 추적)")
-                continue
-            direct = "  (클러스터 없이 SPM이 직접 사용)" if row.get("source") == "material" else ""
-            blends = row.get("atlas_blends") or []
-            if blends:
-                L.append(f"  · {name}: {Path(blends[0]).name} ✓ 있음{direct}")
-                continue
-            L.append(f"  · {name}: blend 없음{direct} → [② 실행]이 아래 값으로 자동 생성 (직접 할 땐 Generate Leaf Meshes)")
-            alb = row.get("source_albedo") or []
-            alp = row.get("source_alpha") or []
-            L.append(f"      Albedo 후보: {alb[0] if alb else '⚠ 못 찾음 — 직접 지정'}"
-                     + ("  (자동 추측 — 파일명 확인)" if alb else ""))
-            L.append(f"      Alpha  후보: {alp[0] if alp else '⚠ 못 찾음 — 직접 지정'}"
-                     + ("  (자동 추측 — 파일명 확인)" if alp else ""))
-            L.append(f"      Material Name: {base} / Quality: Low / Plate Mode: One Plate")
-            targets = row.get("pcg_target_meshes") or []
-            sk_names = [Path(s["sk_spm"]).name for s in statuses if s.get("sk_spm")]
-            if sk_names:
-                L.append(f"      SPM To Add: {', '.join(sk_names)}")
-            elif targets:
-                L.append("      SPM To Add: (①에서 SK를 먼저 만든 뒤 그 SK SPM을 넣으세요)")
-        if clusters:
-            L.append("  왜? 오파시티 마스크 대신 실제 잎 지오메트리를 쓰기 위해서입니다.")
+        leaf_sources = item.get("leaf_mesh_sources") or []
+        if not leaf_sources:
+            L.append("  · 최종/Cluster SPM에서 메시화할 원본 잎 아틀라스를 찾지 못했습니다.")
+        for source in leaf_sources:
+            kinds = source.get("source_kinds") or [source.get("source_kind", "direct")]
+            route = "Cluster SPM 내부 원본" if "cluster" in kinds else "최종 SPM 직접 원본"
+            blends = source.get("atlas_blends") or []
+            state = f"{Path(blends[0]).name} ✓ 있음" if blends else "blend 없음 → [② 실행]"
+            L.append(f"  · {source['source_family']}: {state}  ({route})")
+            L.append(f"      Albedo: {source['albedo']}")
+            L.append(f"      Alpha:  {source['alpha']}")
+            L.append(f"      생성 이름: {source['atlas_base']} / Quality: Low / Plate Mode: One Plate")
+            for target in source.get("targets", []):
+                materials = ", ".join(target.get("material_names") or []) or "머티리얼 미상"
+                L.append(f"      적용 대상: {target.get('spm', '')}  /  원본 머티리얼: {materials}")
+            if len(source.get("targets", [])) > 1:
+                L.append("      ↳ 같은 원본 아틀라스이므로 메시 생성은 한 번, 모든 대상 SPM에 함께 반영")
+        if leaf_sources:
+            L.append("  왜? Cluster 결과 TGA가 아니라, 그것을 만드는 원본 잎 아틀라스의 알파를 실제 지오메트리로 바꾸기 위해서입니다.")
         L.append("")
 
         L.append("── ③ 아틀라스 텍스처 5장 ──   ([③ 실행] 버튼이 자동 처리 · Substance Designer)")
@@ -689,7 +762,7 @@ class App:
             if not entry["checked"]:
                 continue
             item = entry["item"]
-            duplicates = set(item.get("duplicate_pcg_target_mesh_names", []))
+            duplicates = set(item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names", []))
             statuses = item.get("target_spm_statuses") or []
             jobs = []  # (mesh_name or None)
             if statuses:
@@ -887,50 +960,48 @@ class App:
 
     # ------------------------------------------------------------- ② 실행
     def _step2_jobs(self):
-        jobs, skipped = [], []
+        grouped, skipped = {}, []
         atlas_root = Path(self.cfg["atlas_root"])
-        for item, row in self._checked_texplan_rows():
-            base = row["atlas_base"]
-            if row.get("shared_from"):
-                continue  # 다른 폴더에서 관리
-            if not row.get("needs_leaf_mesh", True):
-                continue  # bark/decal 등 — 잎 메시 없음
-            if row.get("atlas_blends"):
-                continue  # 이미 blend 있음
-            # 우선순위: 이 아틀라스의 렌더 결과물(SPM이 실제로 쓰는 그 텍스처)
-            #          → SBS 그래프의 알베도/오파시티 연결 → 원본 참조 추측
-            maps = row.get("export_maps") or {}
-            albedo = alpha = None
-            if maps.get("color") and maps.get("opacity"):
-                albedo, alpha = Path(maps["color"]), Path(maps["opacity"])
-            else:
-                g_albedo, g_alpha = self._graph_albedo_alpha(row)
-                if g_albedo and g_alpha:
-                    albedo, alpha = g_albedo, g_alpha
-                else:
-                    try:
-                        source_inputs, _notes = sbs_auto.plan_inputs_from_row(
-                            row, preferred=self._source_override(row))
-                        albedo = source_inputs.get("Base_Color")
-                        alpha = source_inputs.get("Opacity")
-                    except Exception as exc:
-                        skipped.append((item, base, str(exc)))
-                        continue
-            if not albedo or not alpha:
-                missing = [n for n, v in (("알베도", albedo), ("알파", alpha)) if not v]
-                skipped.append((item, base,
-                                f"{'/'.join(missing)} 원본을 못 찾음 — [③ 실행]으로 텍스처를 먼저 만들면 그걸 사용합니다"))
+        for entry in self.items.values():
+            if not entry["checked"]:
                 continue
-            sk_spms = [s["sk_spm"] for s in item.get("target_spm_statuses", []) if s.get("sk_spm")]
-            if not sk_spms:
-                sk_spms = item.get("sk_spms", [])
-            jobs.append({
-                "item": item, "base": base,
-                "albedo": albedo, "alpha": alpha,
-                "blend_out": atlas_root / f"{base}.blend",
-                "sk_spms": sk_spms,
-            })
-        return jobs, skipped
+            item = entry["item"]
+            for source in item.get("leaf_mesh_sources") or []:
+                base = source.get("atlas_base", "")
+                if source.get("atlas_blends"):
+                    continue
+                albedo = Path(source.get("albedo", ""))
+                alpha = Path(source.get("alpha", ""))
+                if not albedo.exists() or not alpha.exists():
+                    missing = []
+                    if not albedo.exists():
+                        missing.append("알베도")
+                    if not alpha.exists():
+                        missing.append("알파")
+                    skipped.append((item, base, f"{'/'.join(missing)} 원본 파일 없음"))
+                    continue
+                key = (str(albedo.resolve()).lower(), str(alpha.resolve()).lower())
+                job = grouped.get(key)
+                if job is None:
+                    job = {
+                        "item": item, "items": [item], "base": base,
+                        "albedo": albedo, "alpha": alpha,
+                        "blend_out": atlas_root / f"{base}.blend",
+                        "target_spms": [], "target_details": [],
+                    }
+                    grouped[key] = job
+                elif item not in job["items"]:
+                    job["items"].append(item)
+                known_spms = {path.lower() for path in job["target_spms"]}
+                for target in source.get("targets", []):
+                    spm = target.get("spm")
+                    if spm and spm.lower() not in known_spms:
+                        job["target_spms"].append(spm)
+                        known_spms.add(spm.lower())
+                    detail = (spm, tuple(target.get("material_names") or []))
+                    if detail not in job["target_details"]:
+                        job["target_details"].append(detail)
+        return list(grouped.values()), skipped
 
     def start_step2(self):
         if not self.report:
@@ -946,18 +1017,20 @@ class App:
                                 + (f"\n(건너뜀 {len(skipped)}개 — 로그 참조)" if skipped else ""))
             self.status_var.set("대기")
             return
-        no_spm = [j for j in jobs if push_spm and not j["sk_spms"]]
+        no_spm = [j for j in jobs if push_spm and not j["target_spms"]]
         msg = ["② 잎 메시 blend 만들기 (헤드리스 Blender)\n"]
         msg.append(f"만들 blend {len(jobs)}개 (Quality=Low, One Plate, 모든 알파 아일랜드):")
         for j in jobs[:10]:
-            msg.append(f" · {j['base']}.blend  (알베도: {Path(j['albedo']).name})")
+            msg.append(
+                f" · {j['base']}.blend  (알베도: {Path(j['albedo']).name} / "
+                f"대상 SPM: {len(j['target_spms'])}개)")
         if len(jobs) > 10:
             msg.append(f" · ... 외 {len(jobs) - 10}개")
         msg.append(f"저장 위치: {self.cfg['atlas_root']}")
         if push_spm:
-            msg.append("\n만든 뒤 SK SPM에도 반영합니다 (SK SPM 파일 수정, 이후 ④ 재생성 필요).")
+            msg.append("\n만든 뒤 대상 SPM에도 반영합니다 (최종 SK 또는 Cluster SPM 파일 수정).")
             if no_spm:
-                msg.append(f"⚠ SK SPM이 아직 없는 {len(no_spm)}개는 blend만 만듭니다.")
+                msg.append(f"⚠ 대상 SPM이 없는 {len(no_spm)}개는 blend만 만듭니다.")
         if skipped:
             msg.append(f"\n건너뜀 {len(skipped)}개 (원본 못 찾음 — 로그 참조)")
         msg.append("\n묶음당 수십초~수분 걸립니다. 계속할까요?")
@@ -990,8 +1063,8 @@ class App:
                 "--quality", "SPEEDTREE_LOW",
                 "--plate-mode", "SINGLE",
             ]
-            if push_spm and job["sk_spms"]:
-                for spm in job["sk_spms"]:
+            if push_spm and job["target_spms"]:
+                for spm in job["target_spms"]:
                     cmd += ["--spm", str(spm)]
                 cmd.append("--build-spm")
             try:
@@ -1002,7 +1075,7 @@ class App:
                 if result.returncode != 0 or data.get("status") != "ok":
                     raise RuntimeError(data.get("error") or (result.stderr or result.stdout)[-400:])
                 done += 1
-                spm_note = " + SK SPM 반영됨(④ 재생성 필요)" if data.get("spm_built") else ""
+                spm_note = " + 대상 SPM 반영됨" if data.get("spm_built") else ""
                 self._ui(lambda b=base, d=data, s=spm_note: self.log(
                     f"[② 완료] {b}.blend — 잎 메시 {d.get('meshes', '?')}개{s}"))
                 if data.get("spm_backups"):
@@ -1154,9 +1227,9 @@ class App:
         self.log(f"{label} 완료: 성공 {done}개, 실패 {failed}개. 표를 다시 검사합니다.")
         self.refresh()
 
-    # ---------------------------------------------------------- PCG targets
+    # ---------------------------------------------------------- PCG + placed-level targets
     def refresh_pcg_targets(self):
-        self.status_var.set("Unreal에서 PCG 대상 읽는 중...")
+        self.status_var.set("Unreal에서 PCG + 작업 레벨 대상 읽는 중...")
 
         def worker():
             cmd = [
@@ -1185,11 +1258,11 @@ class App:
 
     def _pcg_targets_done(self, result):
         if result.returncode != 0:
-            messagebox.showerror("PCG 대상 읽기 실패", (result.stderr or result.stdout)[-2000:])
-            self.status_var.set("PCG 대상 읽기 실패")
+            messagebox.showerror("대상 읽기 실패", (result.stderr or result.stdout)[-2000:])
+            self.status_var.set("PCG + 작업 레벨 대상 읽기 실패")
             return
         self.use_pcg_targets_var.set(True)
-        self.log((result.stdout or "PCG 대상 목록 갱신됨").strip())
+        self.log((result.stdout or "PCG + 작업 레벨 대상 목록 갱신됨").strip())
         self.refresh()
 
     def open_selected_folder(self):

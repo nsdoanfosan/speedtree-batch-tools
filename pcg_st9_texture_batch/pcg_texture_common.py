@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "atlas_root": r"D:\OneDrive\Forestportfolio\02_nature\Tree\atlas",
     "unreal_project": r"C:\UnrealProjects\MyProject2",
     "pcg_database_content": r"C:\UnrealProjects\MyProject2\Content\PCG\DataBase",
+    "unreal_levels": ["/Game/Level/Cliff_final_01"],
     "source_texture_roots": [r"D:\OneDrive\Forestportfolio\Texture"],
     "required_export_maps": ["color", "normal", "extra", "height", "opacity"],
     "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
