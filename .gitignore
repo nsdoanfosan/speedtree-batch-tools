@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+.idea/
+.vscode/
+
+# Machine-specific configuration and remembered GUI state
+pcg_st9_texture_batch/pcg_texture_config.json
+pcg_st9_texture_batch/pcg_texture_state.json
+pcg_st9_texture_batch/pcg_targets.json
+sk_batch/sk_batch_config.json
+sk_batch/sk_batch_state.json
+
+# Generated logs, audits, queues, and work reports
+pcg_st9_texture_batch/reports/
+sk_batch/logs/
