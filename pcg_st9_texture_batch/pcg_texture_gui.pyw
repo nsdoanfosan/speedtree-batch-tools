@@ -9,13 +9,15 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
                        M_ 을 붙인다. 이 도구가 자동으로 해 준다.
   ② 잎 메시 (Blender) : 헤드리스 아틀라스 리프 제너레이터로 오파시티 없는 잎
                        지오메트리와 blend를 만들고, 선택 시 SK SPM에도 반영한다.
-  ③ 텍스처 (Substance) : SBS에 원본을 연결해 5장(color/normal/extra/height/opacity)
-                       익스포트하고, 필요하면 HBAO와 M_ 그래프도 만든다.
+  ③ 텍스처 (Substance) : SBS에 원본을 연결해 6장
+                       (color/normal/extra/height/opacity/subsurface)
+                       익스포트하고, 필요하면 HBAO와 T_ 그래프도 만든다.
   ④ SK Blend (SK Batch) : 별도 도구 SK_Batch.bat 담당. 여기서는 상태만 보여준다.
 
 ①~③은 실행 전 확인창을 띄우며, SPM/SBS/기존 출력은 수정 전에 백업한다.
 """
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -28,15 +30,58 @@ TOOL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_texture_common import (
-    TARGETS_PATH, load_config, load_pcg_targets, load_state, save_config, save_state,
+    TARGETS_PATH, load_config, load_pcg_targets, save_config,
 )
-from pcg_texture_audit import make_report, prepare_sk
+from pcg_texture_audit import (
+    make_report,
+    prepare_sk,
+    register_blend_source_images,
+    save_spm_analysis_cache,
+)
 from export_review_queue import GENERIC_MATERIAL_RE
-from export_texture_plan import build_texture_plan_from_report
+from export_texture_plan import bucket_refs, build_texture_plan_from_report
 import sbs_auto
+from migrate_current_sk_textures import (
+    build_job as build_texture_job,
+    complete_output_set,
+    expected_job_size,
+    job_needs_source_repair,
+    run_job as run_texture_job,
+)
+from spm_texture_normalize import (
+    cleanup_preserved_cluster_outputs,
+    jobs_from_texture_plan,
+    normalize_spms_transactionally,
+)
 
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+
+
+def blender_user_startup_path(blender_exe):
+    version = Path(blender_exe).parent.name.rsplit(" ", 1)[-1]
+    appdata = os.environ.get("APPDATA")
+    if not appdata or not version or not version[0].isdigit():
+        return None
+    startup = (Path(appdata) / "Blender Foundation" / "Blender" /
+               version / "config" / "startup.blend")
+    return startup if startup.is_file() else None
+
+
+def atlas_blender_command(blender_exe):
+    """Save a clean atlas file with PARK's startup UI/workspaces embedded."""
+    startup = blender_user_startup_path(blender_exe)
+    command = [blender_exe]
+    if startup:
+        # Factory preferences avoid loading every interactive add-on in a
+        # background process. Opening the user's startup file explicitly still
+        # carries its screens/workspaces into the blend that the job saves.
+        command += ["--factory-startup", "--background", str(startup)]
+    else:
+        command += ["--background"]
+    return command + [
+        "--python", str(TOOL_DIR / "jobs" / "atlas_blend_job.py"), "--",
+    ]
 
 # 자동 적용을 막는 문제들의 한국어 설명
 BLOCKER_TEXT = {
@@ -48,8 +93,9 @@ BLOCKER_TEXT = {
 
 def split_generic(names):
     """머티리얼 이름을 (정상 이름, 'Material 2' 같은 기본 이름)으로 나눈다."""
-    generic = [n for n in names if GENERIC_MATERIAL_RE.match(str(n).strip())]
-    normal = [n for n in names if n not in generic]
+    unprefixed = [n for n in names if not str(n).strip().startswith("M_")]
+    generic = [n for n in unprefixed if GENERIC_MATERIAL_RE.match(str(n).strip())]
+    normal = [n for n in unprefixed if n not in generic]
     return normal, generic
 
 
@@ -126,10 +172,10 @@ class App:
     def __init__(self, root):
         self.root = root
         self.cfg = load_config()
-        self.state = load_state()
         self.report = None
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
         self.texplan_cache = {}  # folder -> texture plan rows (선택 시 지연 계산)
+        self.select_all_armed = True
         self.worker = None
         root.title("PCG ST9 → SK 전환 준비 보드")
         root.geometry("1320x820")
@@ -155,7 +201,7 @@ class App:
         btn_refresh = ttk.Button(top, text="🔍 다시 검사 (자산 수정 없음)", command=self.refresh)
         btn_refresh.pack(side="left", padx=6)
         Tooltip(btn_refresh, "아무것도 수정하지 않습니다.\n"
-                             "폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 5장 / SK Blend "
+                             "폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 6장 / SK Blend "
                              "상태를 다시 읽어서 표를 갱신합니다.")
         ttk.Button(top, text="전체 선택", command=lambda: self._set_all(True)).pack(side="left")
         ttk.Button(top, text="전체 해제", command=lambda: self._set_all(False)).pack(side="left", padx=4)
@@ -221,36 +267,35 @@ class App:
                                 "알베도/알파 원본을 못 찾은 묶음은 이유를 표시하고 건너뜁니다.\n"
                                 "메시를 눈으로 확인/정리하려면 저장된 blend를 열면 됩니다.")
         self.spm_push_var = tk.BooleanVar(value=False)
-        chk_spm = ttk.Checkbutton(actions2, text="만든 뒤 대상 SPM에 잎 메시 반영", variable=self.spm_push_var)
+        chk_spm = ttk.Checkbutton(
+            actions2, text="최종 SK에 잎 메시 머티리얼 생성",
+            variable=self.spm_push_var)
         chk_spm.pack(side="left", padx=8)
-        Tooltip(chk_spm, "켜면 ② 직후 그 잎 메시들을 실제 사용 SPM에 넣습니다(Build/Update Target SPMs).\n"
-                         "직접 원본은 최종 SK SPM, Cluster 내부 원본은 해당 Cluster SPM이 대상입니다.\n"
+        Tooltip(chk_spm, "켜면 ② 직후 Material_v8과 FBX/XML Mesh 자산을 최종 SK SPM에 등록합니다.\n"
+                         "Cluster SPM은 원본 아틀라스 추적에만 쓰며 수정/개수 계산에서 제외합니다.\n"
+                         "Leaf Mesh Generator의 Material/Mesh 슬롯에는 자동 연결하지 않습니다.\n"
                          "SPM 파일이 수정되므로, 메시를 먼저 눈으로 확인하고 싶으면 끄고\n"
                          "blend를 열어 본 뒤 애드온에서 직접 반영하세요.\n"
                          "최종 SK SPM을 바꾼 경우에는 ④ SK Blend를 다시 만들어야 합니다.")
-        self.btn_step3 = ttk.Button(actions2, text="③ 실행 — 텍스처 5장 만들기 (선택 항목)",
+        self.btn_step3 = ttk.Button(actions2, text="③ 실행 — 텍스처 6장 만들기 (선택 항목)",
                                     command=self.start_step3)
         self.btn_step3.pack(side="left", padx=10)
         Tooltip(self.btn_step3, "체크된 행 중 텍스처가 누락된 묶음마다 sbsrender로\n"
-                                "color/normal/extra/height/opacity 5장을 4K로 만듭니다 (묶음당 ~1분):\n"
-                                "· SBS에 M_ 그래프가 있으면: 그 연결/설정 그대로 렌더 (elm에서 픽셀 일치 검증)\n"
+                                "color/normal/extra/height/opacity/subsurface 6장을 4K로 만듭니다 (묶음당 ~1분):\n"
+                                "· SpeedTree Generator가 실제로 쓰는 모든 M_ 머티리얼이 대상\n"
+                                "· 머티리얼 M_ 이름은 유지하고 출력 텍스처만 T_ 이름으로 저장\n"
+                                "· SBS의 T_ 그래프를 렌더하고, 기존 M_ 그래프는 T_로 안전하게 이름 변경\n"
                                 "· 없으면: 원본 텍스처를 자동 매핑해 렌더하고, 나중에 Designer에서\n"
-                                "  관리할 수 있게 M_ 그래프를 SBS에 새로 넣습니다 (수정 전 백업 저장)\n"
+                                "  관리할 수 있게 T_ 그래프를 SBS에 새로 넣습니다 (수정 전 백업 저장)\n"
                                 "AO 없으면 height에서 Designer HBAO 생성, SDF=0, 노멀 방식은 원본 출처로 자동 판정.\n"
-                                "기존 5개 출력은 렌더 전에 _pcgtex_backups\\ 에 백업합니다.")
-        self.btn_source = ttk.Button(actions2, text="원본 세트 지정 (선택 행)",
-                                     command=self.choose_source_set_for_selected)
-        self.btn_source.pack(side="left")
-        Tooltip(self.btn_source, "SPM에 서로 다른 원본 텍스처 세트가 여러 개 들어 있어 자동 판정이\n"
-                                 "애매할 때 사용합니다. 표에서 행을 선택한 뒤 각 아틀라스에 사용할\n"
-                                 "알베도/알파 세트를 고르면 다음 ②/③ 실행부터 그 선택을 재사용합니다.")
-
+                                "기존 T_ 6장은 렌더 전에 _pcgtex_backups\\ 에 백업하고,\n"
+                                "새 T_ 렌더가 성공하면 대응하는 기존 M_ 출력은 삭제합니다.")
         cols = ("pcg", "step1", "step2", "step3", "step4", "next")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
         self.tree.heading("#0", text="나무 폴더 (클릭=선택 토글)")
         self.tree.column("#0", width=250, anchor="w")
         headers = {
-            "pcg": ("대상 메시", 90),
+            "pcg": ("PCG/레벨 사용", 145),
             "step1": ("① SK + M_ 이름", 300),
             "step2": ("② 잎 메시 (Blender)", 150),
             "step3": ("③ 텍스처 (Substance)", 180),
@@ -264,10 +309,10 @@ class App:
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.show_details())
         header_tip = ("컬럼 = 작업 순서입니다.\n"
-                      "대상 메시: P=PCG 사용, L=작업 레벨 직접 배치\n"
+                      "PCG/레벨 사용: 각 위치에서 사용하는 메시 이름 개수\n"
                       "①: SK SPM 존재 + 머티리얼 M_ 이름 (이 도구가 자동 처리)\n"
                       "②: 잎 지오메트리 blend — 헤드리스 Blender 자동 생성\n"
-                      "③: 아틀라스 텍스처 5장 — sbsrender 자동 생성\n"
+                      "③: 사용 머티리얼별 T_ 텍스처 6장 — sbsrender 자동 생성\n"
                       "④: SK SPM의 리페어 blend — 별도 SK_Batch.bat 담당")
         Tooltip(self.tree, header_tip, wrap=460)
 
@@ -300,6 +345,7 @@ class App:
             self.root_var.set(path)
 
     def _set_all(self, checked):
+        self.select_all_armed = bool(checked)
         for iid, entry in self.items.items():
             entry["checked"] = checked
             mark = CHECK_ON if checked else CHECK_OFF
@@ -310,10 +356,19 @@ class App:
             return
         iid = self.tree.identify_row(event.y)
         if iid in self.items:
-            entry = self.items[iid]
-            entry["checked"] = not entry["checked"]
-            mark = CHECK_ON if entry["checked"] else CHECK_OFF
-            self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
+            if self.select_all_armed and all(
+                    entry["checked"] for entry in self.items.values()):
+                for other_iid, entry in self.items.items():
+                    entry["checked"] = other_iid == iid
+                    mark = CHECK_ON if entry["checked"] else CHECK_OFF
+                    self.tree.item(
+                        other_iid, text=f"{mark} {entry['item']['name']}")
+            else:
+                entry = self.items[iid]
+                entry["checked"] = not entry["checked"]
+                mark = CHECK_ON if entry["checked"] else CHECK_OFF
+                self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
+            self.select_all_armed = False
 
     # ------------------------------------------------------------------ scan
     def refresh(self):
@@ -324,6 +379,7 @@ class App:
         try:
             pcg_targets = load_pcg_targets() if self.use_pcg_targets_var.get() else None
             self.report = make_report(self.cfg, pcg_targets=pcg_targets)
+            save_spm_analysis_cache()
         except Exception as exc:
             messagebox.showerror("검사 실패", str(exc))
             self.status_var.set("검사 실패")
@@ -355,12 +411,12 @@ class App:
             )
             unmatched = pcg.get("unmatched_mesh_names", [])
             if unmatched:
-                self.log(f"⚠ 대상 메시 {len(unmatched)}개는 매칭되는 나무 폴더를 못 찾았습니다: "
+                self.log(f"⚠ 사용 메시 {len(unmatched)}개는 매칭되는 나무 폴더를 못 찾았습니다: "
                          + ", ".join(unmatched[:10])
                          + (" ..." if len(unmatched) > 10 else ""))
             dup = pcg.get("duplicate_mesh_matches", {})
             if dup:
-                self.log(f"⚠ 대상 메시 {len(dup)}개는 폴더가 2개 이상 매칭됩니다 (표에 '중복' 표시): "
+                self.log(f"⚠ 사용 메시 {len(dup)}개는 폴더가 2개 이상 매칭됩니다 (표에 '중복' 표시): "
                          + ", ".join(dup))
         else:
             head = f"나무 폴더 {n}개 (대상 필터 없음)"
@@ -376,9 +432,9 @@ class App:
         level_count = len(item.get("level_mesh_names") or [])
         parts = []
         if pcg_count:
-            parts.append(f"P{pcg_count}")
+            parts.append(f"PCG {pcg_count}")
         if level_count:
-            parts.append(f"L{level_count}")
+            parts.append(f"레벨 {level_count}")
         return " / ".join(parts) or "-"
 
     def populate(self):
@@ -413,6 +469,7 @@ class App:
             n_src = sum(1 for s in statuses if s["status"] == "needs_source_review")
             n_sk = sum(1 for s in statuses if s["status"] == "needs_sk")
             missing = [m for s in statuses for m in s.get("materials_missing_m_prefix", [])]
+            renames = [pair for s in statuses for pair in s.get("material_renames_needed", [])]
             if n_src:
                 return f"⚠ 원본 못 찾음 {n_src}개"
             if n_sk:
@@ -421,9 +478,13 @@ class App:
             if not item.get("sk_spms"):
                 return "SK 없음 → [① 실행]" if item.get("source_spms") else "⚠ SPM 없음"
             missing = item.get("materials_missing_m_prefix", [])
+            renames = item.get("material_renames_needed", [])
         normal, generic = split_generic(missing)
+        common = [pair for pair in renames if str(pair[0]).lower().startswith("m_")]
+        if common and not normal:
+            return f"공용 머티리얼 {len(common)}개 이름 통일 → [① 실행]"
         if normal:
-            return f"M_ {len(normal)}개 필요 → [① 실행]"
+            return f"머티리얼 이름 {len(renames)}개 정리 → [① 실행]"
         if generic:
             return generic_material_summary(item)
         return "완료 ✓"
@@ -439,24 +500,21 @@ class App:
             if target.get("spm")
         }
         if have == len(sources):
-            return f"아틀라스 {len(sources)}개 완료 ✓"
-        return f"아틀라스 {len(sources)}개 · 대상 SPM {len(targets)}개 → 만들기"
+            return f"잎 매쉬 {len(sources)}개 완료 ✓"
+        remaining = len(sources) - have
+        if have:
+            return f"잎 매쉬 {have}/{len(sources)}개 완료 · {remaining}개 만들기"
+        return f"잎 매쉬 {len(sources)}개 만들기 · 최종 SK {len(targets)}개"
 
     def step3_text(self, item):
         entries = [c for c in item.get("cluster_items", []) if not c.get("shared_from")]
         if not entries:
             return "-"
-        missing = sorted(set(m for c in entries for m in c["missing_export_maps"]))
-        if not missing:
-            return "5장 모두 있음 ✓"
-        for row in self._texplan_rows(item):
-            if row.get("shared_from") or not row.get("missing_export_maps") or row.get("m_graph"):
-                continue
-            try:
-                sbs_auto.select_source_set(row, preferred=self._source_override(row))
-            except Exception:
-                return "⚠ 원본 세트 지정 필요"
-        return "누락: " + ",".join(missing)
+        pending = sum(1 for row in entries if row.get("missing_export_maps"))
+        total_maps = len(entries) * len(sbs_auto.RENDER_MAPS)
+        if not pending:
+            return f"머티리얼 {len(entries)}개 · {total_maps}장 완료 ✓"
+        return f"머티리얼 {len(entries)}개 · 총 {total_maps}장 → 생성"
 
     def step4_text(self, item):
         statuses = [s for s in (item.get("target_spm_statuses") or []) if s.get("sk_spm")]
@@ -492,92 +550,33 @@ class App:
         return self.texplan_cache[folder]
 
     @staticmethod
-    def _source_state_key(row):
-        return f"{str(row.get('folder', '')).lower()}|{str(row.get('atlas_base', '')).lower()}"
+    def _detail_texture_rows(item):
+        """Build lightweight display rows without reopening SPM/SBS files.
 
-    def _source_override(self, row):
-        return (self.state.get("source_set_overrides") or {}).get(self._source_state_key(row))
-
-    def _source_set_dialog(self, atlas_base, candidates, current=None):
-        result = {"value": None}
-        win = tk.Toplevel(self.root)
-        win.title(f"원본 세트 지정 — {atlas_base}")
-        win.transient(self.root)
-        win.grab_set()
-        ttk.Label(
-            win, padding=8,
-            text="알베도·알파·노멀·height를 같은 세트에서 가져옵니다.\n"
-                 "파일 경로를 보고 이 아틀라스의 실제 원본 세트를 선택하세요.",
-        ).pack(fill="x")
-        box = tk.Listbox(win, width=120, height=min(12, max(4, len(candidates))))
-        box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        for index, candidate in enumerate(candidates):
-            paths = candidate.get("paths", {})
-            suffix = f"  [A:{Path(paths['albedo']).name} / α:{Path(paths['alpha']).name}]"
-            box.insert("end", candidate["label"] + suffix)
-            if current and candidate["label"].lower() == str(current).lower():
-                box.selection_set(index)
-                box.see(index)
-        if not box.curselection() and candidates:
-            box.selection_set(0)
-
-        def accept():
-            selection = box.curselection()
-            if selection:
-                result["value"] = candidates[selection[0]]["label"]
-                win.destroy()
-
-        def clear():
-            result["value"] = ""
-            win.destroy()
-
-        buttons = ttk.Frame(win, padding=(8, 0, 8, 8))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="이 세트 사용", command=accept).pack(side="left")
-        ttk.Button(buttons, text="저장된 선택 해제", command=clear).pack(side="left", padx=6)
-        ttk.Button(buttons, text="취소", command=win.destroy).pack(side="right")
-        box.bind("<Double-Button-1>", lambda _event: accept())
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        win.wait_window()
-        return result["value"]
-
-    def choose_source_set_for_selected(self):
-        item = self.selected_item()
-        if not item:
-            messagebox.showinfo("원본 세트 지정", "표에서 행을 먼저 선택하세요.")
-            return
-        rows = [row for row in self._texplan_rows(item) if not row.get("shared_from")]
-        overrides = self.state.setdefault("source_set_overrides", {})
-        changed = 0
-        ambiguous = 0
-        for row in rows:
-            try:
-                candidates = sbs_auto.source_set_candidates(row)
-            except Exception as exc:
-                self.log(f"[원본 세트 없음] {row.get('atlas_base')}: {exc}")
-                continue
-            key = self._source_state_key(row)
-            current = overrides.get(key)
-            if len(candidates) <= 1 and not current:
-                continue
-            ambiguous += 1
-            choice = self._source_set_dialog(row["atlas_base"], candidates, current=current)
-            if choice is None:
-                break
-            if choice:
-                overrides[key] = choice
-                self.log(f"[원본 세트 지정] {row['atlas_base']}: {choice}")
-            else:
-                overrides.pop(key, None)
-                self.log(f"[원본 세트 해제] {row['atlas_base']}: 자동 판정으로 복귀")
-            changed += 1
-        if changed:
-            save_state(self.state)
-            self.tree.set(item["folder"], "step3", self.step3_text(item))
-            self.show_details()
-            messagebox.showinfo("원본 세트 지정", f"{changed}개 선택을 저장했습니다.")
-        elif not ambiguous:
-            messagebox.showinfo("원본 세트 지정", "이 행에는 여러 원본 후보가 있는 항목이 없습니다.")
+        The full texture plan resolves provenance and is intentionally kept for
+        the execution buttons.  A row selection must only display information
+        already collected by the audit, otherwise every first click performs a
+        fresh material-reference scan and makes the Treeview feel unresponsive.
+        """
+        rows = []
+        for cluster in item.get("cluster_items") or []:
+            row = dict(cluster)
+            buckets = bucket_refs(cluster.get("source_refs") or [])
+            row.update({
+                "folder": item.get("folder", ""),
+                "sbs_files": item.get("sbs_files") or [],
+                "normal_convention": item.get("normal_convention", "unknown"),
+            })
+            for kind, refs in buckets.items():
+                row.setdefault(f"source_{kind}", refs)
+            # Color and opacity come from the exact SpeedTree material slots;
+            # keep those authoritative instead of guessing from file names.
+            if cluster.get("source_albedo"):
+                row["source_albedo"] = cluster["source_albedo"]
+            if cluster.get("source_alpha"):
+                row["source_alpha"] = cluster["source_alpha"]
+            rows.append(row)
+        return rows
 
     def show_details(self):
         item = self.selected_item()
@@ -625,7 +624,9 @@ class App:
                     L.append(f"  · {mesh}: SK 없음 → [① 실행]이 {src} 을(를) 복사해 SK_{src} 생성")
                 else:
                     miss = s.get("materials_missing_m_prefix", [])
-                    if miss:
+                    common = [pair for pair in s.get("material_renames_needed", [])
+                              if str(pair[0]).lower().startswith("m_")]
+                    if miss or common:
                         normal, generic = split_generic(miss)
                         parts = []
                         if normal:
@@ -633,6 +634,9 @@ class App:
                         if generic:
                             parts.append(f"⚠ 기본 이름 {len(generic)}개(SpeedTree에서 이름 지은 뒤 ①): "
                                          + ", ".join(generic))
+                        if common:
+                            parts.append("공용 이름 통일: "
+                                         + ", ".join(f"{old}→{new}" for old, new in common))
                         L.append(f"  · {mesh}: {Path(s['sk_spm']).name} ✓ / " + " / ".join(parts))
                     else:
                         L.append(f"  · {mesh}: {Path(s['sk_spm']).name} ✓  머티리얼 이름 완료 ✓")
@@ -652,6 +656,11 @@ class App:
                 if generic:
                     L.append(f"  · ⚠ 기본 이름 머티리얼 {len(generic)}개 (SpeedTree에서 이름 지은 뒤 ①): "
                              + ", ".join(generic))
+            common = [pair for pair in item.get("material_renames_needed", [])
+                      if str(pair[0]).lower().startswith("m_")]
+            if common:
+                L.append("  · 공용 머티리얼 이름 통일: "
+                         + ", ".join(f"{old} → {new}" for old, new in common))
         generic_issues = generic_material_issues(item)
         if generic_issues:
             L.append("  · ⚠ 기본 이름 문제 위치 (이 SPM을 SpeedTree에서 열어 이름 수정):")
@@ -660,7 +669,7 @@ class App:
                 key = (issue["spm"], issue["mesh_name"])
                 grouped.setdefault(key, []).append(issue["material"])
             for (spm, mesh), names in grouped.items():
-                mesh_note = f" / 대상 메시: {mesh}" if mesh else ""
+                mesh_note = f" / 사용 메시: {mesh}" if mesh else ""
                 L.append(f"      SPM: {spm or '미상'}{mesh_note}")
                 L.append(f"      머티리얼: {', '.join(names)}")
         L.append("  왜? SK SPM은 나나이트 전환용 복사본, M_ 이름은 send2ue 임포트 규칙입니다.")
@@ -668,7 +677,7 @@ class App:
 
         # ② 원본 잎 아틀라스 / ③ 텍스처 계열
         clusters = item.get("cluster_items", [])
-        rows = self._texplan_rows(item) if clusters else []
+        rows = self._detail_texture_rows(item) if clusters else []
         L.append("── ② 잎 메시 만들기 ──   ([② 실행] 버튼이 자동 처리 · Blender 아틀라스 리프 제너레이터)")
         leaf_sources = item.get("leaf_mesh_sources") or []
         if not leaf_sources:
@@ -682,16 +691,20 @@ class App:
             L.append(f"      Albedo: {source['albedo']}")
             L.append(f"      Alpha:  {source['alpha']}")
             L.append(f"      생성 이름: {source['atlas_base']} / Quality: Low / Plate Mode: One Plate")
+            for trace in source.get("trace_sources", []):
+                materials = ", ".join(trace.get("material_names") or []) or "머티리얼 미상"
+                L.append(f"      추적 근거(수정 안 함): {trace.get('spm', '')}  /  원본 머티리얼: {materials}")
             for target in source.get("targets", []):
-                materials = ", ".join(target.get("material_names") or []) or "머티리얼 미상"
-                L.append(f"      적용 대상: {target.get('spm', '')}  /  원본 머티리얼: {materials}")
+                materials = ", ".join(target.get("material_names") or [])
+                material_note = f"  /  직접 원본 머티리얼: {materials}" if materials else ""
+                L.append(f"      최종 SK 적용 대상: {target.get('spm', '')}{material_note}")
             if len(source.get("targets", [])) > 1:
-                L.append("      ↳ 같은 원본 아틀라스이므로 메시 생성은 한 번, 모든 대상 SPM에 함께 반영")
+                L.append("      ↳ 같은 원본 아틀라스이므로 메시 생성은 한 번, 모든 최종 SK에 함께 반영")
         if leaf_sources:
             L.append("  왜? Cluster 결과 TGA가 아니라, 그것을 만드는 원본 잎 아틀라스의 알파를 실제 지오메트리로 바꾸기 위해서입니다.")
         L.append("")
 
-        L.append("── ③ 아틀라스 텍스처 5장 ──   ([③ 실행] 버튼이 자동 처리 · Substance Designer)")
+        L.append("── ③ 사용 머티리얼별 텍스처 6장 ──   ([③ 실행] 버튼이 자동 처리 · Substance Designer)")
         if not clusters:
             L.append("  · 해당 없음.")
         seen_bases = set()
@@ -703,24 +716,26 @@ class App:
             if row.get("shared_from"):
                 L.append(f"  · {base}: 다른 폴더({row['shared_from']})에서 관리")
                 continue
-            override = self._source_override(row)
-            if override:
-                L.append(f"  · {base}: 원본 세트 지정됨 → {override}")
+            texture_base = row.get("texture_base") or base
             missing = row.get("missing_export_maps") or []
             if not missing:
-                L.append(f"  · {base}: color/normal/extra/height/opacity 모두 있음 ✓")
+                L.append(f"  · {base} → {texture_base}: 6장 모두 있음 ✓")
                 continue
-            L.append(f"  · {base}: 누락 → {', '.join(missing)} → [③ 실행]이 자동 렌더")
+            L.append(f"  · {base} → {texture_base}: 누락 → {', '.join(missing)} → [③ 실행]이 자동 렌더")
             if not row.get("m_graph"):
                 try:
-                    selected = sbs_auto.select_source_set(row, preferred=override)
-                    L.append(f"      원본 세트: {selected['label']}")
+                    selected = sbs_auto.select_source_set(row, require_alpha=False)
+                    L.append(f"      SpeedTree 원본 참조: {selected['label']}")
                     if row.get("material_spms"):
                         L.append("      연결 근거 SPM: "
                                  + ", ".join(Path(path).name for path in row["material_spms"]))
                 except Exception as exc:
-                    L.append(f"      ⚠ {exc} — [원본 세트 지정] 버튼에서 선택")
-            sbs = row.get("sbs_files") or []
+                    legacy = row.get("legacy_export_maps") or {}
+                    if all(legacy.get(name) for name in sbs_auto.RENDER_MAPS):
+                        L.append("      기존 M_ 출력은 SBS의 Unreal용 출력이므로 원본 입력에서 제외")
+                    L.append(f"      ⚠ {exc}")
+            sbs = ([row.get("m_graph_sbs")] if row.get("m_graph_sbs")
+                   else row.get("sbs_files") or [])
             L.append(f"      SBS: {Path(sbs[0]).name if sbs else '⚠ 없음 — [③ 실행]이 텍스처만 생성'}"
                      f"   저장 위치: {row.get('texture_dir', '')}")
             conv = row.get("normal_convention", "unknown")
@@ -775,7 +790,8 @@ class App:
                             "blockers": ["source_review"], "generic": [],
                         })
             else:
-                if not item.get("sk_spms") or item.get("materials_missing_m_prefix"):
+                if (not item.get("sk_spms") or item.get("materials_missing_m_prefix")
+                        or item.get("material_renames_needed")):
                     if item.get("source_spms") or item.get("sk_spms"):
                         jobs.append(None)
                     else:
@@ -845,9 +861,9 @@ class App:
             for r in doable
         )
         n_generic_kept = sum(len(r["exclude"]) for r in doable)
-        msg = ["① SK 만들기 + M_ 이름 붙이기\n", "지금 실행하면:"]
+        msg = ["① SK 만들기 + 머티리얼 이름 정리\n", "지금 실행하면:"]
         msg.append(f" · SK SPM 새로 만들기: {n_create}개 (원본 SPM을 SK_이름.spm 으로 복사)")
-        msg.append(f" · 머티리얼 이름에 M_ 붙이기: {n_rename}개")
+        msg.append(f" · 머티리얼 M_ / 공용 이름 정리: {n_rename}개")
         if n_generic_kept:
             msg.append(f" · 'Material 2' 같은 기본 이름 {n_generic_kept}개는 그대로 둡니다 "
                        "(SpeedTree에서 이름 지은 뒤 다시 ① 실행)")
@@ -896,7 +912,8 @@ class App:
                         self._ui(lambda t=target: self.log(f"[① SK 생성] {Path(t['created']).name}"))
                     patch = target.get("patch") or {}
                     for old, new in patch.get("renames", []):
-                        self._ui(lambda o=old, n=new, lb=label: self.log(f"[① M_ 이름] {lb}: {o} → {n}"))
+                        self._ui(lambda o=old, n=new, lb=label: self.log(
+                            f"[① 머티리얼 이름] {lb}: {o} → {n}"))
                     if patch.get("backup"):
                         self._ui(lambda p=patch: self.log(f"    백업: {p['backup']}"))
                 done += 1
@@ -911,7 +928,7 @@ class App:
 
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
-        for btn in (self.btn_prepare, self.btn_step2, self.btn_step3, self.btn_source):
+        for btn in (self.btn_prepare, self.btn_step2, self.btn_step3):
             btn.configure(state=state)
 
     def _prepare_finished(self, done, failed):
@@ -939,7 +956,7 @@ class App:
         return result
 
     def _graph_albedo_alpha(self, row):
-        """SBS에 M_ 그래프가 있으면 그 그래프의 알베도/오파시티 연결을 그대로 쓴다."""
+        """SBS의 T_ 그래프(또는 레거시 M_) 원본 연결을 그대로 쓴다."""
         if not row.get("m_graph") or not row.get("m_graph_sbs"):
             return None, None
         try:
@@ -1023,14 +1040,15 @@ class App:
         for j in jobs[:10]:
             msg.append(
                 f" · {j['base']}.blend  (알베도: {Path(j['albedo']).name} / "
-                f"대상 SPM: {len(j['target_spms'])}개)")
+                f"최종 SK: {len(j['target_spms'])}개)")
         if len(jobs) > 10:
             msg.append(f" · ... 외 {len(jobs) - 10}개")
         msg.append(f"저장 위치: {self.cfg['atlas_root']}")
         if push_spm:
-            msg.append("\n만든 뒤 대상 SPM에도 반영합니다 (최종 SK 또는 Cluster SPM 파일 수정).")
+            msg.append("\nMaterial_v8 + Mesh 자산을 최종 SK에 등록합니다.")
+            msg.append("Cluster SPM은 수정하지 않으며 Leaf Mesh Generator에는 자동 연결하지 않습니다.")
             if no_spm:
-                msg.append(f"⚠ 대상 SPM이 없는 {len(no_spm)}개는 blend만 만듭니다.")
+                msg.append(f"⚠ 최종 SK가 없는 {len(no_spm)}개는 blend만 만듭니다.")
         if skipped:
             msg.append(f"\n건너뜀 {len(skipped)}개 (원본 못 찾음 — 로그 참조)")
         msg.append("\n묶음당 수십초~수분 걸립니다. 계속할까요?")
@@ -1052,9 +1070,7 @@ class App:
             self._ui(lambda it=job["item"]: self.tree.set(it["folder"], "step2", "만드는 중..."))
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_path = REPORT_DIR / f"atlas_job_{base}_{stamp}.json"
-            cmd = [
-                self.cfg.get("blender_exe", ""), "--background", "--factory-startup",
-                "--python", str(TOOL_DIR / "jobs" / "atlas_blend_job.py"), "--",
+            cmd = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
                 "--albedo", str(job["albedo"]),
                 "--alpha", str(job["alpha"]),
                 "--material-name", base,
@@ -1069,13 +1085,18 @@ class App:
                 cmd.append("--build-spm")
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace",
                                         timeout=self.cfg.get("atlas_job_timeout", 1800),
                                         creationflags=0x08000000)
                 data = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
                 if result.returncode != 0 or data.get("status") != "ok":
                     raise RuntimeError(data.get("error") or (result.stderr or result.stdout)[-400:])
+                register_blend_source_images(
+                    job["blend_out"], (job["albedo"], job["alpha"]),
+                    authoritative=True)
+                save_spm_analysis_cache()
                 done += 1
-                spm_note = " + 대상 SPM 반영됨" if data.get("spm_built") else ""
+                spm_note = " + 최종 SK에 머티리얼·메시 자산 등록됨" if data.get("spm_built") else ""
                 self._ui(lambda b=base, d=data, s=spm_note: self.log(
                     f"[② 완료] {b}.blend — 잎 메시 {d.get('meshes', '?')}개{s}"))
                 if data.get("spm_backups"):
@@ -1093,36 +1114,26 @@ class App:
             base = row["atlas_base"]
             if row.get("shared_from"):
                 continue  # 다른 폴더에서 관리 — 그쪽 행에서 처리
-            if not row.get("missing_export_maps"):
-                continue  # 5장 모두 있음
-            sbs_files = item.get("sbs_files") or []
-            graph_name = row.get("m_graph")
-            graph_sbs = row.get("m_graph_sbs")
-            if not graph_name:
-                for sbs in sbs_files:
-                    name = sbs_auto.find_m_graph_name(sbs, base)
-                    if name:
-                        graph_name, graph_sbs = name, sbs
-                        break
-            normal_opengl = row.get("normal_convention") != "DirectX"
-            job = {
-                "item": item, "base": base, "row": row,
-                "out_dir": row.get("texture_dir") or str(Path(item["folder"]) / "texture"),
-                "normal_opengl": normal_opengl,
-            }
-            if graph_name:
-                job.update(mode="render", graph=graph_name, sbs=graph_sbs)
-            else:
-                try:
-                    inputs, notes = sbs_auto.plan_inputs_from_row(
-                        row, preferred=self._source_override(row))
-                except Exception as exc:
-                    skipped.append((item, base, str(exc)))
+            try:
+                job = build_texture_job(row)
+                job["item"] = item
+                job["size_log2"] = expected_job_size(job)
+                expected_pixels = sbs_auto.size_log2_pixels(job["size_log2"])
+                graph_needs_update = False
+                if job.get("mode") == "render":
+                    graph_needs_update = sbs_auto.managed_graph_resolution_state(
+                        job["sbs"], job["graph"])["needs_update"]
+                source_needs_repair = job_needs_source_repair(job)
+                complete = complete_output_set(row, expected_pixels=expected_pixels)
+                if job.get("mode") == "direct" and not complete:
+                    required = set(job.get("direct_maps", [])) | {"opacity"}
+                    complete = complete_output_set(
+                        row, expected_pixels=expected_pixels, roles=required)
+                if complete and not graph_needs_update and not source_needs_repair:
                     continue
-                job.update(mode="insert" if sbs_files else "render_only",
-                           graph=base, sbs=sbs_files[0] if sbs_files else None,
-                           inputs=inputs, notes=notes)
-            jobs.append(job)
+                jobs.append(job)
+            except Exception as exc:
+                skipped.append((item, base, str(exc)))
         return jobs, skipped
 
     def start_step3(self):
@@ -1133,24 +1144,41 @@ class App:
         jobs, skipped = self._step3_jobs()
         for item, base, reason in skipped:
             self.log(f"[③ 건너뜀] {item['name']} / {base}: {reason}")
+        checked_folders = sorted({
+            entry["item"]["folder"] for entry in self.items.values()
+            if entry["checked"] and entry["item"].get("sk_spms")
+        })
         if not jobs:
-            messagebox.showinfo("③ 실행", "체크된 항목 중 텍스처를 만들 것이 없습니다."
-                                + (f"\n(건너뜀 {len(skipped)}개 — 로그 참조)" if skipped else ""))
-            self.status_var.set("대기")
+            if skipped or not checked_folders:
+                messagebox.showinfo("③ 실행", "체크된 항목 중 텍스처를 만들 것이 없습니다."
+                                    + (f"\n(건너뜀 {len(skipped)}개 — 로그 참조)" if skipped else ""))
+                self.status_var.set("대기")
+                return
+            if not messagebox.askyesno(
+                    "③ 실행", "6장 출력은 이미 있습니다.\n"
+                    "체크된 SK SPM의 머티리얼 슬롯을 T_ 출력 기준으로 정리할까요?"):
+                self.status_var.set("대기")
+                return
+            self._set_busy(True)
+            self.worker = threading.Thread(
+                target=self._run_step3, args=([], checked_folders), daemon=True)
+            self.worker.start()
             return
         n_render = sum(1 for j in jobs if j["mode"] == "render")
         n_insert = sum(1 for j in jobs if j["mode"] == "insert")
         n_nosbs = sum(1 for j in jobs if j["mode"] == "render_only")
-        msg = ["③ 아틀라스 텍스처 5장 만들기 (sbsrender, 4K)\n"]
-        msg.append(f"렌더할 묶음 {len(jobs)}개:")
-        msg.append(f" · SBS의 기존 M_ 그래프 설정 그대로: {n_render}개")
+        msg = ["③ 사용 머티리얼 텍스처 만들기 (sbsrender, 원본 비율·최대 축 4K)\n"]
+        msg.append(f"렌더할 머티리얼 {len(jobs)}개 · 출력 {len(jobs) * len(sbs_auto.RENDER_MAPS)}장:")
+        msg.append(f" · SBS의 T_ 그래프 설정 사용 (기존 M_은 T_로 이름 변경): {n_render}개")
         if n_insert:
-            msg.append(f" · SBS에 M_ 그래프 새로 넣고 렌더: {n_insert}개 (수정 전 SBS 백업 저장)")
+            msg.append(f" · SBS에 T_ 그래프 새로 넣고 렌더: {n_insert}개 (수정 전 SBS 백업 저장)")
         if n_nosbs:
             msg.append(f" · SBS 파일이 없어 텍스처만 생성: {n_nosbs}개")
         for j in jobs[:10]:
-            mode_txt = {"render": "기존 그래프", "insert": "그래프 삽입", "render_only": "SBS 없음"}[j["mode"]]
-            msg.append(f" · {j['base']} ({mode_txt})")
+            mode_txt = {"render": "기존 그래프", "insert": "그래프 삽입",
+                        "render_only": "SBS 없음"}[j["mode"]]
+            msg.append(
+                f" · {j['base']} → {j['texture_base']} × {len(sbs_auto.RENDER_MAPS)} ({mode_txt})")
         if len(jobs) > 10:
             msg.append(f" · ... 외 {len(jobs) - 10}개")
         if skipped:
@@ -1160,34 +1188,79 @@ class App:
             self.status_var.set("대기")
             return
         self._set_busy(True)
-        self.worker = threading.Thread(target=self._run_step3, args=(jobs,), daemon=True)
+        affected_folders = sorted({job["item"]["folder"] for job in jobs})
+        self.worker = threading.Thread(
+            target=self._run_step3, args=(jobs, affected_folders), daemon=True)
         self.worker.start()
 
-    def _run_step3(self, jobs):
+    def _run_step3(self, jobs, affected_folders):
         done = failed = 0
         total = len(jobs)
         timeout = self.cfg.get("sbsrender_timeout", 1800)
         for index, job in enumerate(jobs, 1):
             base = job["base"]
-            self._ui(lambda i=index, b=base: self.status_var.set(f"③ {i}/{total}: {b} 렌더 중..."))
+            texture_base = job["texture_base"]
+            self._ui(lambda i=index, b=base, t=texture_base: self.status_var.set(
+                f"③ {i}/{total}: {b} → {t} 렌더 중..."))
             self._ui(lambda it=job["item"]: self.tree.set(it["folder"], "step3", "렌더 중..."))
             try:
+                result = run_texture_job(job, self.cfg, timeout)
+                done += 1
+                self._ui(lambda b=base, r=result: self.log(
+                    f"[③ 완료] {b} → {r['texture_base']} — "
+                    f"{len(r['files'])}장 / {Path(r['files'][0]).parent}"))
+                continue
+                if job.get("rename_graph_to"):
+                    rename = sbs_auto.rename_managed_graph(
+                        job["sbs"], job["graph"], job["rename_graph_to"])
+                    job["graph"] = job["rename_graph_to"]
+                    self._ui(lambda b=base, r=rename: self.log(
+                        f"[③ 그래프 이름] {r['old']} → {r['new']} "
+                        f"(백업: {Path(r['backup']).name})"))
                 if job["mode"] == "render":
                     info = sbs_auto.parse_m_graph(job["sbs"], job["graph"])
                     inputs, params = info["inputs"], info["params"]
                     if not inputs.get("Base_Color"):
                         raise RuntimeError(f"{job['graph']}: 그래프의 원본 연결이 깨져 있음 (Designer에서 확인)")
+                    # A real Translucency/Subsurface source wins over a stale
+                    # neutral-black graph resource.  Amount is always identity 1.
+                    try:
+                        planned_inputs, _notes = sbs_auto.plan_inputs_from_row(
+                            job["row"], require_alpha=False)
+                    except Exception:
+                        planned_inputs = {}
+                    desired_subsurface = planned_inputs.get("Subsurface")
+                    current_subsurface = inputs.get("Subsurface")
+                    if desired_subsurface and (
+                            not current_subsurface
+                            or "neutral_black" in Path(current_subsurface).name.lower()):
+                        patch = sbs_auto.patch_m_graph_input_resource(
+                            job["sbs"], job["graph"], "Subsurface", desired_subsurface)
+                        inputs["Subsurface"] = desired_subsurface
+                        self._ui(lambda b=base, r=patch: self.log(
+                            f"[③ Subsurface 연결] {b}: Translucency 원본 연결 "
+                            f"(백업: {Path(r['backup']).name})"))
+                    white = sbs_auto.neutral_image("white")
+                    current_amount = inputs.get("Subsurface_Amount")
+                    if current_amount and Path(current_amount).resolve() != white.resolve():
+                        patch = sbs_auto.patch_m_graph_input_resource(
+                            job["sbs"], job["graph"], "Subsurface_Amount", white)
+                        self._ui(lambda b=base, r=patch: self.log(
+                            f"[③ Subsurface Amount] {b}: 1로 고정 "
+                            f"(백업: {Path(r['backup']).name})"))
+                    inputs["Subsurface_Amount"] = white
                 else:
                     inputs = job["inputs"]
                     params = sbs_auto.default_params(job["normal_opengl"])
                     for note in job.get("notes", []):
                         self._ui(lambda b=base, n=note: self.log(f"[③ 참고] {b}: {n}"))
+                had_graph_ao = bool(inputs.get("Ambient_Occlusion"))
                 inputs, hbao_path = sbs_auto.ensure_hbao_input(
-                    base, inputs, job["out_dir"], cfg=self.cfg, timeout=timeout)
+                    texture_base, inputs, job["out_dir"], cfg=self.cfg, timeout=timeout)
                 if hbao_path:
                     self._ui(lambda b=base, p=hbao_path: self.log(
                         f"[③ HBAO] {b}: height에서 생성 → {p}"))
-                    if job["mode"] == "render":
+                    if job["mode"] == "render" and had_graph_ao:
                         patch = sbs_auto.patch_m_graph_input_resource(
                             job["sbs"], job["graph"], "Ambient_Occlusion", hbao_path)
                         self._ui(lambda b=base, r=patch: self.log(
@@ -1196,16 +1269,16 @@ class App:
                 if job["mode"] != "render":
                     if job["mode"] == "insert":
                         insert_result = sbs_auto.insert_m_graph(
-                            job["sbs"], base, inputs,
+                            job["sbs"], texture_base, inputs,
                             normal_opengl=job["normal_opengl"], cfg=self.cfg)
-                        self._ui(lambda b=base, r=insert_result, s=job["sbs"]: self.log(
+                        self._ui(lambda b=texture_base, r=insert_result, s=job["sbs"]: self.log(
                             f"[③ 그래프 삽입] {b} → {Path(s).name} "
                             f"(백업: {Path(r['backup']).name})"))
                     else:
                         self._ui(lambda b=base: self.log(
                             f"[③ 참고] {b}: SBS 파일이 없어 그래프 삽입은 생략, 텍스처만 생성"))
                 render_info = sbs_auto.render_maps(
-                    job["graph"], inputs, params, job["out_dir"],
+                    texture_base, inputs, params, job["out_dir"],
                     cfg=self.cfg, timeout=timeout, return_info=True)
                 files = render_info["files"]
                 if render_info.get("backup_dir"):
@@ -1214,12 +1287,40 @@ class App:
                 if render_info.get("normal_green_corrected"):
                     self._ui(lambda b=base: self.log(
                         f"[③ 노멀] {b}: DirectX 원본 보존을 위해 출력 G 채널 보정"))
+                deleted_legacy = sbs_auto.delete_legacy_m_outputs(
+                    base, job["out_dir"],
+                    legacy_maps=job["row"].get("legacy_export_maps"))
+                if deleted_legacy:
+                    self._ui(lambda b=base, paths=deleted_legacy: self.log(
+                        f"[③ 기존 M_ 출력 삭제] {b}: {len(paths)}개"))
                 done += 1
-                self._ui(lambda b=base, f=files: self.log(
-                    f"[③ 완료] {b} — {len(f)}장 저장: {Path(f[0]).parent}"))
+                self._ui(lambda b=base, t=texture_base, f=files: self.log(
+                    f"[③ 완료] {b} → {t} — {len(f)}장 저장: {Path(f[0]).parent}"))
             except Exception as exc:
                 failed += 1
                 self._ui(lambda b=base, e=exc: self.log(f"[③ 실패] {b}: {e}"))
+        if failed == 0 and affected_folders:
+            try:
+                self._ui(lambda: self.status_var.set("③ SK SPM 머티리얼 슬롯 정리 중..."))
+                report = make_report(self.cfg, targets=affected_folders)
+                save_spm_analysis_cache()
+                plan = build_texture_plan_from_report(report, "<step3-normalize>")
+                spm_jobs = jobs_from_texture_plan(plan)
+                normalized = normalize_spms_transactionally(
+                    spm_jobs,
+                    backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
+                )
+                cleanup = cleanup_preserved_cluster_outputs(plan)
+                self._ui(lambda r=normalized: self.log(
+                    f"[③ SK SPM 정리] {len(r['spms'])}개 SPM / "
+                    f"{r['materials']}개 머티리얼 — 백업: {r['backup_dir']}"))
+                if cleanup["cleaned"]:
+                    self._ui(lambda r=cleanup: self.log(
+                        f"[③ Cluster 원본 보존] {len(r['cleaned'])}개 머티리얼 복원"))
+            except Exception as exc:
+                failed += 1
+                self._ui(lambda e=exc: self.log(
+                    f"[③ SK SPM 정리 실패] 출력 파일은 보존됨, SPM은 변경하지 않음: {e}"))
         self._ui(lambda: self._batch_finished("③", done, failed))
 
     def _batch_finished(self, label, done, failed):

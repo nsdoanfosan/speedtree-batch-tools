@@ -2,22 +2,24 @@
 
 Bone rule (checklist item 1, size-aware):
   SpeedTree's Relative bone style already scales bone count with spline length,
-  but a single Relative value applied to every plant starves tiny weeds (rounds
-  to 0 bones) and explodes big trees. So instead of one magic number we
-  CALIBRATE per generator against ground truth:
+  but an uncapped "bones per branch" target explodes on trees with thousands of
+  twigs. We calibrate one shared Relative value against a capped total budget:
 
   1. probe   — temporarily set every target generator to Absolute/1 and export
-               the hierarchy XML once. Absolute/1 = exactly one bone per
-               branch, so the per-generator bone count IS the branch count.
-  2. target  — desired bones per generator = branches x target_bones_per_branch
-               (acceptance window: branches x [min_per_branch, max_per_branch]).
-  3. solve   — set Relative style and scale the value proportionally
-               (bones scale ~linearly with the value) until the exported bone
-               count lands inside the window. Generators already inside the
-               window keep their current value untouched.
+               XML once. Absolute/1 gives exactly one bone per branch, exposing
+               both the branch count and approximate branch lengths.
+  2. priority — when the uncapped target exceeds max_total_bones, disable every
+               Base-sourced target before reducing the Tree skeleton density.
+  3. target  — min(remaining Tree branches x target_bones_per_branch,
+               max_total_bones).
+  4. solve   — estimate one Relative value for the remaining targets from the
+               probe lengths, then verify once in SpeedTree. Only outliers need
+               proportional correction rounds.
 
-  Generators saved as Absolute with Bones=0 are treated as an intentional
-  "no bones here" and skipped.
+  Generator/Node GUID ancestry decides which Branch generators belong to the
+  live Tree skeleton. Absolute/0 on that root chain is activated automatically;
+  Base-reference internals remain excluded except for the first Branch stage of
+  an explicitly classified branch reference.
 
 Materials (checklist item 2): every Assets/Material_v8 Name gets the M_ prefix
 (attribute-only rename, verified safe — FBX picks up the new name, texture
@@ -31,7 +33,10 @@ Standalone:  python spm_audit.py <file.spm> [--dry-run] [--report out.json]
 """
 import argparse
 import gzip
+import hashlib
 import json
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -43,14 +48,438 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sk_common import load_config
+from sk_common import file_content_fingerprint, load_config
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
 FIRST_NAME_RE = re.compile(r"<Name>([^<]*)</Name>")
+FIRST_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>")
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
 
 BACKUP_SUBDIR = "_spm_backups"
+PROBE_CACHE_VERSION = 1
+PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
+BONE_VALUE_RE = re.compile(
+    r"(<Name>Physics:(?:Bone style|Bones)</Name>\s*<Value>)[^<]*(</Value>)",
+    re.DOTALL,
+)
+
+
+class ManualCalibrationRequired(RuntimeError):
+    """A known outlier that should stop quickly without changing the SPM."""
+
+    def __init__(
+        self,
+        reason,
+        *,
+        rounds,
+        total_bones,
+        calibration,
+        warnings=None,
+        skipped=None,
+    ):
+        super().__init__(reason)
+        self.rounds = rounds
+        self.total_bones = total_bones
+        self.calibration = calibration
+        self.warnings = list(warnings or [])
+        self.skipped = list(skipped or [])
+
+
+class SpeedTreeExportTimeout(RuntimeError):
+    """One SpeedTree export exceeded the automatic-calibration time budget."""
+
+    def __init__(self, stage, timeout_seconds):
+        self.stage = stage
+        self.timeout_seconds = float(timeout_seconds)
+        super().__init__(
+            f"SpeedTree {stage} export exceeded {self.timeout_seconds:g}s; "
+            "skipped automatic calibration for manual bone setup"
+        )
+
+
+SYNC_MANIFEST_NAME = "spm_generator_sync.json"
+ASSET_BONE_PROFILES = {
+    "tree": {"root_parent_types": ("Tree",), "base_depth": 1},
+    "bush": {"root_parent_types": ("Tree", "Zone"), "base_depth": 2},
+    "weed": {"root_parent_types": ("Tree", "Zone"), "base_depth": 2},
+    "other": {"root_parent_types": ("Tree",), "base_depth": 1},
+}
+
+
+def _direct_properties(element):
+    values = {}
+    properties = element.find("Properties")
+    for prop in list(properties) if properties is not None else ():
+        name = prop.findtext("Name")
+        if name:
+            values[name] = prop.findtext("Value")
+    return values
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _icon_category(generator):
+    """Read the explicit role colour written by SPM Generator Sync.
+
+    Brightness varies by Base, so category is inferred from hue rather than an
+    exact RGBA tuple. This is metadata, not a generator-name heuristic.
+    """
+    extra = generator.find("Extra")
+    if extra is None or (extra.findtext("m_bSetBackgroundIconColor") or "").lower() != "true":
+        return None
+    rgb = tuple(
+        _number(extra.findtext(f"m_vecBackgroundIconColor_{axis}"))
+        for axis in "rgb"
+    )
+    if any(value is None for value in rgb):
+        return None
+    red, green, blue = rgb
+    if red > max(green, blue) * 1.5:
+        return "end"
+    if blue > max(red, green) * 1.5:
+        return "branch"
+    if green > max(red, blue) * 1.5:
+        return "leaf"
+    return None
+
+
+def load_sync_base_categories(spm_path):
+    """Resolve explicit Base roles for a master or follower SPM."""
+    if not spm_path:
+        return {}, None
+    spm = Path(spm_path)
+    manifest = spm.parent / SYNC_MANIFEST_NAME
+    if not manifest.exists():
+        return {}, None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, str(manifest)
+    filename = spm.name.casefold()
+    for group in data.get("groups", []):
+        source_categories = group.get("base_categories") or {}
+        if str(group.get("master", "")).casefold() == filename:
+            return {
+                str(name): category
+                for name, category in source_categories.items()
+                if category
+            }, str(manifest)
+        for follower in group.get("followers", []):
+            if str(follower.get("file", "")).casefold() != filename:
+                continue
+            resolved = {}
+            for source_name, target_name in (follower.get("base_map") or {}).items():
+                category = source_categories.get(source_name)
+                if target_name and category:
+                    resolved[str(target_name)] = category
+            return resolved, str(manifest)
+    return {}, str(manifest)
+
+
+def _descendants(seeds, edges):
+    result = set(seeds)
+    pending = list(seeds)
+    while pending:
+        parent = pending.pop()
+        for child in edges.get(parent, ()):
+            if child not in result:
+                result.add(child)
+                pending.append(child)
+    return result
+
+
+def _descendants_to_depth(seeds, edges, max_depth):
+    """Return seed stage 1 through max_depth, measured in Branch stages."""
+    result = set()
+    pending = [(seed, 1) for seed in seeds]
+    while pending:
+        guid, depth = pending.pop()
+        if guid in result or depth > max_depth:
+            continue
+        result.add(guid)
+        pending.extend((child, depth + 1) for child in edges.get(guid, ()))
+    return result
+
+
+def classify_asset_kind(spm_path):
+    """Classify the authored SK role from its established filename prefix."""
+    stem = Path(spm_path).stem.casefold() if spm_path else ""
+    if stem.startswith("sk_"):
+        stem = stem[3:]
+    for kind in ("tree", "bush", "weed"):
+        if stem == kind or stem.startswith(kind + "_"):
+            return kind
+    return "other"
+
+
+def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
+    """Select automatic bone generators from Generator/Node GUID ancestry.
+
+    Tree-started Branch chains are targets even when authored as Absolute/0.
+    Base-reference descendants are excluded. The only Base exception is its
+    first Branch stage when the Base is explicitly a branch role, or a
+    non-Classic/Any leaf role. Any Tree/Base GUID overlap is an error.
+    """
+    root = ET.fromstring(text)
+    generators = []
+    generator_by_guid = {}
+    branch_index_by_guid = {}
+    branch_index = -1
+    duplicate_generator_guids = set()
+    for generator in root.findall(".//Generator"):
+        guid = generator.findtext("GUID")
+        info = {
+            "guid": guid,
+            "name": generator.findtext("Name") or "?",
+            "type": generator.attrib.get("Type", "?"),
+            "hidden": (generator.findtext("Hidden") or "").strip().lower()
+            in {"1", "true", "yes"},
+            "properties": _direct_properties(generator),
+            "icon_category": _icon_category(generator),
+        }
+        generators.append(info)
+        if guid:
+            if guid in generator_by_guid:
+                duplicate_generator_guids.add(guid)
+            generator_by_guid[guid] = info
+        if info["type"] == "Branch":
+            branch_index += 1
+            if guid:
+                branch_index_by_guid[guid] = branch_index
+
+    nodes = []
+    node_by_guid = {}
+    duplicate_node_guids = set()
+    for node in root.findall(".//Node"):
+        guid = node.findtext("GUID")
+        record = {
+            "guid": guid,
+            "type": node.attrib.get("Type", "?"),
+            "generator_guid": node.findtext("GeneratorGUID"),
+            "parent_guid": node.findtext("ParentGUID"),
+        }
+        nodes.append(record)
+        if guid:
+            if guid in node_by_guid:
+                duplicate_node_guids.add(guid)
+            node_by_guid[guid] = record
+
+    explicit_categories, manifest_path = load_sync_base_categories(spm_path)
+    asset_kind = classify_asset_kind(spm_path)
+    profile = ASSET_BONE_PROFILES[asset_kind]
+    if base_categories:
+        explicit_categories.update(base_categories)
+    explicit_categories_folded = {
+        str(name).casefold(): category for name, category in explicit_categories.items()
+    }
+
+    edges = {}
+    tree_seeds = set()
+    base_entries = {}
+    unresolved_parent_nodes = 0
+    for node in nodes:
+        child_guid = node["generator_guid"]
+        if node["type"] != "Branch" or child_guid not in branch_index_by_guid:
+            continue
+        parent = node_by_guid.get(node["parent_guid"])
+        if parent is None:
+            unresolved_parent_nodes += 1
+            continue
+        parent_generator = generator_by_guid.get(parent["generator_guid"], {})
+        if parent["type"] in profile["root_parent_types"]:
+            tree_seeds.add(child_guid)
+        elif parent["type"] == "Branch" and parent["generator_guid"] in branch_index_by_guid:
+            edges.setdefault(parent["generator_guid"], set()).add(child_guid)
+        elif parent["type"] == "Base":
+            base_guid = parent["generator_guid"]
+            base_info = generator_by_guid.get(base_guid, {})
+            base_name = base_info.get("name", "?")
+            category = explicit_categories.get(base_name)
+            category_source = "manifest" if category else None
+            if not category:
+                category = explicit_categories_folded.get(base_name.casefold())
+                category_source = "manifest" if category else None
+            if not category:
+                category = base_info.get("icon_category")
+                category_source = "icon" if category else None
+            props = base_info.get("properties", {})
+            entry = base_entries.setdefault(
+                (base_guid, child_guid),
+                {
+                    "base_guid": base_guid,
+                    "base_name": base_name,
+                    "branch_guid": child_guid,
+                    "branch_name": generator_by_guid[child_guid]["name"],
+                    "category": category,
+                    "category_source": category_source,
+                    "generation_mode": _number(props.get("Generation:Mode")),
+                    "generation_style": _number(props.get("Generation:Style")),
+                    "node_count": 0,
+                },
+            )
+            entry["node_count"] += 1
+
+    tree_chain = _descendants(tree_seeds, edges)
+    base_seeds = {entry["branch_guid"] for entry in base_entries.values()}
+    base_chain = _descendants(base_seeds, edges)
+    ambiguous = tree_chain & base_chain
+
+    included_base_entries = set()
+    included_base_chain = set()
+    unknown_bases = []
+    leaf_classic_excluded = []
+    base_entry_report = []
+    for entry in base_entries.values():
+        category = entry["category"]
+        include = False
+        reason = ""
+        if category == "branch":
+            include = True
+            reason = "branch Base first stage"
+        elif category == "leaf":
+            classic_any = (
+                entry["generation_mode"] == 0.0
+                and entry["generation_style"] == 0.0
+            )
+            if classic_any:
+                reason = "Classic+Any leaf Base"
+                leaf_classic_excluded.append(entry["base_guid"])
+            else:
+                include = True
+                reason = "non-Classic/Any leaf Base first stage"
+        elif category == "end":
+            reason = "end Base"
+        else:
+            reason = "Base role is unknown"
+            unknown_bases.append(
+                {"guid": entry["base_guid"], "name": entry["base_name"]}
+            )
+        if include:
+            included_base_entries.add(entry["branch_guid"])
+            included_base_chain.update(
+                _descendants_to_depth(
+                    {entry["branch_guid"]}, edges, profile["base_depth"]
+                )
+            )
+        base_entry_report.append({**entry, "included": include, "reason": reason})
+
+    target_guids = tree_chain | included_base_chain
+    base_excluded = base_chain - included_base_chain
+    errors = []
+    if duplicate_generator_guids:
+        errors.append(
+            "duplicate Generator GUIDs prevent deterministic bone selection: "
+            + ", ".join(sorted(duplicate_generator_guids))
+        )
+    if duplicate_node_guids:
+        errors.append(
+            "duplicate Node GUIDs prevent deterministic bone selection: "
+            + ", ".join(sorted(duplicate_node_guids))
+        )
+    if ambiguous:
+        errors.append(
+            "the same Branch Generator GUID is reachable from both Tree and Base: "
+            + ", ".join(
+                f"{generator_by_guid.get(guid, {}).get('name', '?')}({guid})"
+                for guid in sorted(ambiguous)
+            )
+        )
+
+    missing_properties = []
+    hidden_targets = []
+    target_indices = []
+    target_report = []
+    activated_zero = []
+    for guid in sorted(target_guids, key=lambda item: branch_index_by_guid[item]):
+        info = generator_by_guid[guid]
+        index = branch_index_by_guid[guid]
+        style = _number(info["properties"].get("Physics:Bone style"))
+        bones = _number(info["properties"].get("Physics:Bones"))
+        if guid in tree_chain:
+            source = "tree"
+        elif guid in included_base_entries:
+            source = "base_entry"
+        else:
+            source = "base_internal"
+        if info["hidden"]:
+            hidden_targets.append({"guid": guid, "name": info["name"]})
+            continue
+        if style is None or bones is None:
+            missing_properties.append({"guid": guid, "name": info["name"]})
+            continue
+        target_indices.append(index)
+        target_report.append(
+            {"index": index, "guid": guid, "name": info["name"], "source": source}
+        )
+        if style == 0.0 and bones == 0.0:
+            activated_zero.append({"guid": guid, "name": info["name"]})
+    if missing_properties:
+        errors.append(
+            "automatic Branch targets have no bone properties: "
+            + ", ".join(
+                f"{item['name']}({item['guid']})" for item in missing_properties
+            )
+        )
+    if not target_indices and any(info["type"] == "Branch" for info in generators):
+        detail = ""
+        if unknown_bases:
+            detail = "; unclassified Base references were excluded: " + ", ".join(
+                f"{item['name']}({item['guid']})" for item in unknown_bases
+            )
+        errors.append("no automatic Branch bone targets were found" + detail)
+
+    expected_target_nodes = sum(
+        1
+        for node in nodes
+        if node["type"] == "Branch" and node["generator_guid"] in target_guids
+    )
+    ambiguous_report = [
+        {"guid": guid, "name": generator_by_guid.get(guid, {}).get("name", "?")}
+        for guid in sorted(ambiguous)
+    ]
+    return {
+        "mode": "guid_graph",
+        "asset_kind": asset_kind,
+        "root_parent_types": list(profile["root_parent_types"]),
+        "base_branch_depth_limit": profile["base_depth"],
+        "target_indices": target_indices,
+        "target_generators": target_report,
+        "root_target_generator_count": len(target_indices),
+        "tree_target_generator_count": sum(item["source"] == "tree" for item in target_report),
+        "base_entry_target_generator_count": sum(
+            item["source"] == "base_entry" for item in target_report
+        ),
+        "base_internal_target_generator_count": sum(
+            item["source"] == "base_internal" for item in target_report
+        ),
+        "base_excluded_generator_count": len(base_excluded),
+        "base_excluded_guids": sorted(base_excluded),
+        "base_generator_indices": sorted(
+            branch_index_by_guid[guid]
+            for guid in base_chain
+            if guid in branch_index_by_guid
+        ),
+        "base_generator_count": len(base_chain),
+        "ambiguous_shared_guids": ambiguous_report,
+        "expected_target_branch_nodes": expected_target_nodes,
+        "activated_zero_bone_generators": activated_zero,
+        "activated_zero_bone_generator_count": len(activated_zero),
+        "base_entries": base_entry_report,
+        "unknown_base_generators": unknown_bases,
+        "leaf_classic_any_excluded_count": len(set(leaf_classic_excluded)),
+        "hidden_targets": hidden_targets,
+        "missing_bone_property_targets": missing_properties,
+        "unresolved_branch_parent_nodes": unresolved_parent_nodes,
+        "sync_manifest": manifest_path,
+        "errors": errors,
+        "ready": not errors,
+    }
 
 
 def read_spm(path):
@@ -60,6 +489,89 @@ def read_spm(path):
 def write_spm(path, text):
     with gzip.open(path, "wb") as handle:
         handle.write(text.encode("utf-8"))
+
+
+def probe_cache_path(spm_path):
+    spm = Path(spm_path)
+    return spm.parent / BACKUP_SUBDIR / f"{spm.stem}{PROBE_CACHE_SUFFIX}"
+
+
+def _probe_dependency_identity(path, hash_content=False):
+    candidate = Path(path) if path else None
+    if not candidate or not candidate.exists():
+        return {"path": str(candidate or ""), "missing": True}
+    try:
+        stat = candidate.stat()
+        identity = {
+            "path": str(candidate.resolve()),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if hash_content:
+            identity["fingerprint"] = file_content_fingerprint(candidate)
+        return identity
+    except OSError as exc:
+        return {"path": str(candidate), "error": str(exc)}
+
+
+def probe_cache_key(source_text, target_indices, cfg):
+    # Bone values are the output of calibration, not probe inputs. Material
+    # name prefixing also cannot alter branch count/length, so both are masked.
+    normalized = BONE_VALUE_RE.sub(r"\1<CACHED_BONE_VALUE>\2", source_text)
+    normalized = MATERIAL_RE.sub(r"\1<CACHED_MATERIAL_NAME>\3", normalized)
+    payload = {
+        "version": PROBE_CACHE_VERSION,
+        "source": hashlib.blake2b(normalized.encode("utf-8"), digest_size=16).hexdigest(),
+        "target_indices": list(target_indices),
+        "xml_ini": _probe_dependency_identity(cfg.get("xml_ini"), hash_content=True),
+        "speedtree_exe": _probe_dependency_identity(cfg.get("speedtree_exe")),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def load_probe_cache(spm_path, key):
+    path = probe_cache_path(spm_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        counts = data.get("probe_counts")
+        lengths = data.get("probe_lengths")
+        if (
+            data.get("version") != PROBE_CACHE_VERSION
+            or data.get("key") != key
+            or not isinstance(counts, dict)
+            or not isinstance(lengths, list)
+            or sum(int(value) for value in counts.values()) <= 0
+        ):
+            return None
+        return {
+            "probe_counts": {str(name): int(value) for name, value in counts.items()},
+            "probe_lengths": [float(value) for value in lengths],
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def save_probe_cache(spm_path, key, probe_counts, probe_lengths):
+    path = probe_cache_path(spm_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "version": PROBE_CACHE_VERSION,
+        "key": key,
+        "probe_counts": probe_counts,
+        "probe_lengths": probe_lengths,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return path
 
 
 def prop_value(block, prop_name):
@@ -86,8 +598,8 @@ def format_value(value):
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
-def audit_spm(path):
-    text = read_spm(path)
+def audit_spm(path, text=None, analyze_bone_graph=False):
+    text = read_spm(path) if text is None else text
     generators = []
     for m in GEN_RE.finditer(text):
         block = m.group(0)
@@ -95,6 +607,8 @@ def audit_spm(path):
         gtype = tm.group(1) if tm else "?"
         nm = FIRST_NAME_RE.search(block)
         gname = nm.group(1) if nm else "?"
+        gm = FIRST_GUID_RE.search(block)
+        guid = gm.group(1) if gm else None
         if gtype != "Branch":
             continue
         style = prop_value(block, "Physics:Bone style")
@@ -104,6 +618,7 @@ def audit_spm(path):
         generators.append(
             {
                 "name": gname,
+                "guid": guid,
                 "type": gtype,
                 "style": float(style) if style is not None else None,
                 "bones": float(bones) if bones is not None else None,
@@ -114,7 +629,10 @@ def audit_spm(path):
         {"name": m.group(2), "needs_prefix": not m.group(2).startswith("M_")}
         for m in MATERIAL_RE.finditer(text)
     ]
-    return {"path": str(path), "generators": generators, "materials": materials}
+    result = {"path": str(path), "generators": generators, "materials": materials}
+    if analyze_bone_graph:
+        result["bone_graph"] = analyze_branch_bone_graph(text, spm_path=path)
+    return result
 
 
 def sk_readiness(audit):
@@ -147,6 +665,28 @@ def sk_readiness(audit):
         }
         for gen in disabled
     ]
+    graph = audit.get("bone_graph")
+    if graph is not None:
+        if graph.get("errors"):
+            error = "SPM bone GUID graph is not SK-ready: " + "; ".join(graph["errors"])
+            return {
+                "ready": False,
+                "mode": "bone_graph_error",
+                "visible_branch_generators": len(visible),
+                "enabled_branch_generators": len(enabled),
+                "disabled_generators": details,
+                "bone_graph": graph,
+                "error": error,
+            }
+        if graph.get("target_indices"):
+            return {
+                "ready": True,
+                "mode": "speedtree_bones",
+                "visible_branch_generators": len(visible),
+                "enabled_branch_generators": len(enabled),
+                "disabled_generators": details,
+                "bone_graph": graph,
+            }
     if visible and not enabled:
         settings = ", ".join(
             f"{item['generator']}(style={item['style']:g}, bones={item['bones']:g})"
@@ -214,6 +754,14 @@ def apply_branch_values(text, indices, style, bones):
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
+
+
+def apply_prioritized_branch_values(
+    text, relative_indices, relative_value, disabled_base_indices=()
+):
+    """Disable capped Base targets, then set Relative density on what remains."""
+    patched = apply_branch_values(text, disabled_base_indices, 0.0, 0.0)
+    return apply_branch_values(patched, relative_indices, 1.0, relative_value)
 
 
 def apply_material_renames(text, renames):
@@ -380,16 +928,21 @@ def export_verify_xml(spm_path, cfg, out_path):
         "-export",
         str(out_path),
     ]
-    result = subprocess.run(
-        cmd,
-        cwd=str(Path(spm_path).parent),
-        capture_output=True,
-        text=True,
-        timeout=cfg.get("spm_verify_timeout", 900),
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
-    )
+    timeout = float(cfg.get("spm_verify_timeout", 120))
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(Path(spm_path).parent),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SpeedTreeExportTimeout("XML", timeout) from exc
     if result.returncode != 0 or not Path(out_path).exists():
-        raise RuntimeError(f"SpeedTree XML verify export failed ({result.returncode}): {result.stderr[-500:]}")
+        detail = (result.stderr or result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"SpeedTree XML verify export failed ({result.returncode}): {detail}")
     return out_path
 
 
@@ -402,17 +955,22 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
         "-export",
         str(out_path),
     ]
-    result = subprocess.run(
-        cmd,
-        cwd=str(Path(spm_path).parent),
-        capture_output=True,
-        text=True,
-        timeout=cfg.get("spm_verify_timeout", 900),
-        creationflags=0x08000000,
-    )
+    timeout = float(cfg.get("spm_verify_timeout", 120))
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(Path(spm_path).parent),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=0x08000000,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SpeedTreeExportTimeout("FBX", timeout) from exc
     path = Path(out_path)
     if result.returncode != 0 or not path.exists():
-        raise RuntimeError(f"SpeedTree FBX verify export failed ({result.returncode}): {result.stderr[-500:]}")
+        detail = (result.stderr or result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"SpeedTree FBX verify export failed ({result.returncode}): {detail}")
     # SpeedTree writes binary FBX. A real mesh contains the FBX property name
     # "Vertices" in clear text; armature-only/container-only exports do not.
     return b"Vertices" in path.read_bytes()
@@ -427,9 +985,88 @@ def bone_counts_from_xml(xml_path):
     return counts
 
 
-def calibrate_bones(spm_path, cfg, log=print):
-    """Solve ONE Relative value (shared by every target Branch generator) so the
-    tree's TOTAL bone count lands near a size-aware budget.
+def bone_lengths_from_xml(xml_path):
+    """Chord lengths from an Absolute/1 probe, one exported bone per branch."""
+    root = ET.parse(xml_path).getroot()
+    lengths = []
+    for bone in root.findall(".//Bone"):
+        try:
+            start = tuple(float(bone.get(f"Start{axis}")) for axis in "XYZ")
+            end = tuple(float(bone.get(f"End{axis}")) for axis in "XYZ")
+        except (TypeError, ValueError):
+            continue
+        length = math.dist(start, end)
+        if math.isfinite(length) and length > 0:
+            lengths.append(length)
+    return lengths
+
+
+def estimate_relative_value_from_probe(
+    lengths,
+    target_total,
+    value_floor,
+    value_cap,
+    exported_units_per_speedtree_unit=30.48,
+):
+    """Estimate the Relative value directly from an Absolute/1 XML probe.
+
+    SpeedTree is unitless, but its library convention is roughly one foot per
+    model unit. Our XML preset exports centimeters, hence 30.48. The exact
+    internal rounding varies slightly with curved spines; the normal Relative
+    export still verifies the result and the existing proportional correction
+    handles an outlier.
+    """
+    usable = [
+        float(length)
+        for length in lengths
+        if math.isfinite(length) and length > 0
+    ]
+    if not usable or exported_units_per_speedtree_unit <= 0:
+        return None
+
+    floor_value = max(0.0, float(value_floor))
+    cap_value = max(floor_value, float(value_cap))
+    target = max(0.0, float(target_total))
+
+    def predicted_total(relative_value):
+        # C++-style nearest-integer estimate; unlike Python round(), .5 is not
+        # banker's rounding. A final SpeedTree export remains authoritative.
+        return sum(
+            max(
+                0,
+                math.floor(length * relative_value / exported_units_per_speedtree_unit + 0.5),
+            )
+            for length in usable
+        )
+
+    if predicted_total(floor_value) >= target:
+        return floor_value
+    if predicted_total(cap_value) <= target:
+        return cap_value
+
+    continuous = max(
+        floor_value,
+        min(cap_value, target * exported_units_per_speedtree_unit / sum(usable)),
+    )
+    low = floor_value
+    high = cap_value
+    for _ in range(64):
+        mid = (low + high) * 0.5
+        if predicted_total(mid) < target:
+            low = mid
+        else:
+            high = mid
+    return min(
+        (continuous, low, high),
+        key=lambda value: (
+            abs(predicted_total(value) - target),
+            abs(value - continuous),
+        ),
+    )
+
+
+def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=None):
+    """Keep Tree density first, then solve the remaining capped bone budget.
 
     Why total-budget instead of per-branch average:
       A big tree has thousands of tiny twigs. "N bones per branch" forces bones
@@ -437,8 +1074,9 @@ def calibrate_bones(spm_path, cfg, log=print):
       80k+ bones). But SpeedTree's Relative style already gives short splines
       FEWER bones (0 when the value is low enough), so we instead pick a single
       value that hits a total budget = min(branches x per_branch, max_total).
-      Small plants stay near per_branch; big trees hit the cap, which naturally
-      leaves twigs at 0-1 bone and keeps bones on the big/long branches.
+      Small plants stay near per_branch. When a large asset hits the cap, every
+      Base-sourced target is disabled first. Only when the remaining Tree target
+      still exceeds the cap do we reduce its shared Relative density.
     This also dodges duplicate generator names (elm_03) and honours Size scalar
     automatically, because Relative bones track real spline length.
 
@@ -453,68 +1091,304 @@ def calibrate_bones(spm_path, cfg, log=print):
     seed = float(cfg.get("seed_relative_value", 0.5))
     max_rounds = int(cfg.get("max_calibration_rounds", 4))
 
-    audit = audit_spm(spm_path)
-    branch_gens = audit["generators"]  # Branch-type only, document order
-    target_indices = []
-    zero_bone_indices = []
+    original_text = source_text if source_text is not None else read_spm(spm_path)
+    audit = source_audit if source_audit is not None else audit_spm(
+        spm_path, text=original_text, analyze_bone_graph=True
+    )
+    graph = audit.get("bone_graph") or analyze_branch_bone_graph(
+        original_text, spm_path=spm_path
+    )
+    target_indices = list(graph.get("target_indices") or [])
+    tree_target_indices = [
+        item["index"]
+        for item in graph.get("target_generators", [])
+        if item.get("source") == "tree"
+    ]
+    base_target_indices = list(graph.get("base_generator_indices") or [])
+    if not base_target_indices:
+        base_target_indices = [
+            item["index"]
+            for item in graph.get("target_generators", [])
+            if item.get("source") in {"base_entry", "base_internal"}
+        ]
     skipped = []
-    for i, gen in enumerate(branch_gens):
-        if gen.get("hidden", False):
-            skipped.append({"generator": gen["name"], "reason": "hidden generator"})
-            continue
-        if gen["style"] is None or gen["bones"] is None:
-            skipped.append({"generator": gen["name"], "reason": "no bone properties"})
-            continue
-        if gen["style"] == 0.0 and gen["bones"] == 0.0:
-            if not gen.get("hidden", False):
-                zero_bone_indices.append(i)
-            skipped.append({"generator": gen["name"], "reason": "Absolute+0 = no-bones"})
-            continue
-        target_indices.append(i)
-
+    for item in graph.get("hidden_targets", []):
+        skipped.append({"generator": item["name"], "reason": "hidden root target"})
+    for item in graph.get("base_entries", []):
+        if not item.get("included"):
+            skipped.append(
+                {
+                    "generator": item["branch_name"],
+                    "reason": f"Base excluded: {item['reason']}",
+                }
+            )
     rounds = []
     warnings = []
-    activated_zero_bone_generators = False
-    if not target_indices and zero_bone_indices:
-        raise RuntimeError(sk_readiness(audit)["error"])
+    if graph.get("errors"):
+        raise RuntimeError("; ".join(graph["errors"]))
     if not target_indices:
-        warnings.append("no bone-capable Branch generators; Blender will use a rigid one-bone fallback")
-        return {}, rounds, None, {"mode": "no_branch_generators"}, warnings, skipped, False
+        warnings.append("no automatic Branch bone targets; Blender will use a rigid one-bone fallback")
+        meta = {key: value for key, value in graph.items() if key != "target_indices"}
+        meta["mode"] = "no_branch_generators"
+        return {}, rounds, None, meta, warnings, skipped, False
+    if graph.get("unknown_base_generators"):
+        names = ", ".join(
+            item["name"] for item in graph["unknown_base_generators"]
+        )
+        warnings.append(
+            f"unclassified Base references were excluded from automatic bones: {names}"
+        )
 
-    original_text = read_spm(spm_path)
-    has_base_links = target_generators_have_base_links(original_text, target_indices)
+    activated_zero_bone_generators = graph.get("activated_zero_bone_generators", [])
+    has_base_links = bool(graph.get("base_entry_target_generator_count"))
+    log(
+        "  [bone graph] "
+        f"targets={graph['root_target_generator_count']} "
+        f"(Tree={graph['tree_target_generator_count']}, "
+        f"Base-entry={graph['base_entry_target_generator_count']}, "
+        f"Base-internal={graph['base_internal_target_generator_count']}), "
+        f"Base-excluded={graph['base_excluded_generator_count']}, "
+        f"ambiguous={len(graph['ambiguous_shared_guids'])}"
+    )
+    cache_key = probe_cache_key(original_text, target_indices, cfg)
+    cached_probe = (
+        load_probe_cache(spm_path, cache_key)
+        if cfg.get("probe_cache_enabled", True)
+        else None
+    )
+    probe_cache_hit = cached_probe is not None
     with tempfile.TemporaryDirectory(prefix="skbatch_cal_") as tmp:
         xml_out = Path(tmp) / f"{Path(spm_path).stem}_cal.xml"
 
-        # -- probe: Absolute/1 == exactly 1 bone per branch -> total branch count
-        write_spm(spm_path, apply_branch_values(original_text, target_indices, 0.0, 1.0))
-        probe_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
+        # -- probe: Absolute/1 == exactly 1 bone per branch -> total branch count.
+        # The probe depends on topology, selected generators, SpeedTree, and the
+        # XML preset—not on the Relative value produced by a previous run.
+        if cached_probe:
+            probe_counts = cached_probe["probe_counts"]
+            probe_lengths = cached_probe["probe_lengths"]
+            log(f"  [probe cache] reused {sum(probe_counts.values())} branch lengths")
+        else:
+            write_spm(spm_path, apply_branch_values(original_text, target_indices, 0.0, 1.0))
+            log("  [SpeedTree] XML 가지 프로브 시작")
+            export_verify_xml(spm_path, cfg, xml_out)
+            probe_counts = bone_counts_from_xml(xml_out)
+            probe_lengths = bone_lengths_from_xml(xml_out)
+            if cfg.get("probe_cache_enabled", True) and probe_counts:
+                try:
+                    save_probe_cache(spm_path, cache_key, probe_counts, probe_lengths)
+                except OSError as exc:
+                    log(f"  [probe cache warning] could not save cache: {exc}")
         total_branches = sum(probe_counts.values())
-        rounds.append({"phase": "probe(absolute/1)", "total_branches": total_branches})
+        graph_meta = {
+            "asset_kind": graph["asset_kind"],
+            "base_branch_depth_limit": graph["base_branch_depth_limit"],
+            "root_target_generator_count": graph["root_target_generator_count"],
+            "tree_target_generator_count": graph["tree_target_generator_count"],
+            "base_entry_target_generator_count": graph[
+                "base_entry_target_generator_count"
+            ],
+            "base_internal_target_generator_count": graph[
+                "base_internal_target_generator_count"
+            ],
+            "base_excluded_generator_count": graph["base_excluded_generator_count"],
+            "base_generator_count": graph.get(
+                "base_generator_count", len(base_target_indices)
+            ),
+            "ambiguous_shared_guids": graph["ambiguous_shared_guids"],
+            "expected_target_branch_nodes": graph["expected_target_branch_nodes"],
+            "actual_probe_branch_count": total_branches,
+            "activated_zero_bone_generator_count": graph[
+                "activated_zero_bone_generator_count"
+            ],
+            "activated_zero_bone_generators": activated_zero_bone_generators,
+            "base_entries": graph["base_entries"],
+            "unknown_base_generators": graph["unknown_base_generators"],
+            "sync_manifest": graph.get("sync_manifest"),
+        }
+        probe_round = {
+            "phase": "probe(cache)" if probe_cache_hit else "probe(absolute/1)",
+            "cache_hit": probe_cache_hit,
+            "total_branches": total_branches,
+            "total_branch_chord_cm": round(sum(probe_lengths), 4),
+            "estimated_relative_value": None,
+        }
+        rounds.append(probe_round)
         log(f"  [probe] total branches = {total_branches}")
-        if total_branches == 0:
+        uncapped_target_total = total_branches * per_branch
+        capped = uncapped_target_total > max_total
+        initial_target_total = min(uncapped_target_total, max_total)
+
+        if total_branches == 0 or (
+            total_branches <= 3 and graph["expected_target_branch_nodes"] > 3
+        ):
+            reason = (
+                f"GUID graph expected {graph['expected_target_branch_nodes']} root/base-entry "
+                f"Branch nodes, but the SpeedTree Absolute/1 probe exported only "
+                f"{total_branches}; refusing to accept a false low-bone success"
+            )
             write_spm(spm_path, original_text)
-            warnings.append("probe produced no branches (all hidden/empty?)")
-            return {}, rounds, 0, None, warnings, skipped, False
+            raise ManualCalibrationRequired(
+                reason,
+                rounds=list(rounds),
+                total_bones=total_branches,
+                calibration={
+                    **graph_meta,
+                    "mode": "manual_required_probe_underflow",
+                    "total_branches": total_branches,
+                    "target_total": round(initial_target_total),
+                    "capped": capped,
+                    "probe_cache_hit": probe_cache_hit,
+                    "manual_required": True,
+                },
+                warnings=[reason],
+                skipped=list(skipped),
+            )
 
-        target_total = min(total_branches * per_branch, max_total)
-        capped = total_branches * per_branch > max_total
-        lo, hi = target_total * lo_frac, target_total * hi_frac
+        calibration_indices = target_indices
+        calibration_lengths = probe_lengths
+        calibration_branches = total_branches
+        disabled_base_indices = []
+        base_priority_applied = capped and bool(base_target_indices)
+        if base_priority_applied:
+            disabled_base_indices = list(base_target_indices)
+            calibration_indices = list(tree_target_indices)
+            priority_probe_text = apply_branch_values(
+                original_text, disabled_base_indices, 0.0, 0.0
+            )
+            priority_probe_text = apply_branch_values(
+                priority_probe_text,
+                calibration_indices,
+                0.0,
+                1.0,
+            )
+            write_spm(spm_path, priority_probe_text)
+            log("  [SpeedTree] XML Base OFF / Tree 전용 프로브 시작")
+            export_verify_xml(spm_path, cfg, xml_out)
+            priority_probe_counts = bone_counts_from_xml(xml_out)
+            calibration_lengths = bone_lengths_from_xml(xml_out)
+            calibration_branches = sum(priority_probe_counts.values())
+            rounds.append(
+                {
+                    "phase": "probe(tree-only-after-base-disable)",
+                    "total_branches": calibration_branches,
+                    "disabled_base_generator_count": len(disabled_base_indices),
+                    "total_branch_chord_cm": round(sum(calibration_lengths), 4),
+                }
+            )
+            log(
+                "  [bone priority] cap exceeded; "
+                f"disabled {len(disabled_base_indices)} Base generators, "
+                f"Tree branches={calibration_branches}"
+            )
+            if calibration_indices and calibration_branches == 0:
+                reason = (
+                    "Base targets were disabled first, but the Tree-only "
+                    "Absolute/1 probe exported no bones"
+                )
+                write_spm(spm_path, original_text)
+                raise ManualCalibrationRequired(
+                    reason,
+                    rounds=list(rounds),
+                    total_bones=0,
+                    calibration={
+                        **graph_meta,
+                        "mode": "manual_required_tree_probe_underflow",
+                        "total_branches": total_branches,
+                        "calibration_branch_count": 0,
+                        "target_total": 0,
+                        "capped": True,
+                        "base_priority_applied": True,
+                        "disabled_base_generator_count": len(disabled_base_indices),
+                        "probe_cache_hit": probe_cache_hit,
+                        "manual_required": True,
+                    },
+                    warnings=[reason],
+                    skipped=list(skipped),
+                )
 
-        # -- solve a single Relative value to hit target_total. Relative bones
-        # grow super-linearly with the value, so damp the proportional step.
-        r = seed
+        target_total = min(calibration_branches * per_branch, max_total)
+        density_reduced_for_cap = calibration_branches * per_branch > max_total
+        lo = target_total * lo_frac
+        hi = min(target_total * hi_frac, max_total) if capped else target_total * hi_frac
+
+        estimated_r = estimate_relative_value_from_probe(
+            calibration_lengths,
+            target_total,
+            value_floor,
+            value_cap,
+        )
+        probe_round["estimated_relative_value"] = (
+            round(estimated_r, 4) if estimated_r is not None else None
+        )
+        if estimated_r is not None:
+            log(
+                f"  [estimate] Relative r={estimated_r:.3f} "
+                f"from {len(calibration_lengths)} branch lengths"
+            )
+
+        def stop_for_manual(reason, relative_value, measured_total, mode):
+            # Put the logical source back immediately. process_spm restores the
+            # byte-identical timestamped backup as well when backups are on.
+            write_spm(spm_path, original_text)
+            raise ManualCalibrationRequired(
+                reason,
+                rounds=list(rounds),
+                total_bones=measured_total,
+                calibration={
+                    **graph_meta,
+                    "mode": mode,
+                    "total_branches": total_branches,
+                    "calibration_branch_count": calibration_branches,
+                    "target_total": round(target_total),
+                    "relative_value": round(relative_value, 4),
+                    "capped": capped,
+                    "base_priority_applied": base_priority_applied,
+                    "disabled_base_generator_count": len(disabled_base_indices),
+                    "density_reduced_for_cap": density_reduced_for_cap,
+                    "probe_cache_hit": probe_cache_hit,
+                    "manual_required": True,
+                },
+                warnings=[reason],
+                skipped=list(skipped),
+            )
+
+        # -- solve one Relative value for the remaining targets. Under a cap,
+        # Base targets stay Absolute/0 and only the Tree side can be density-scaled.
+        # grow super-linearly with the value. The Absolute/1 probe gives a
+        # length-based first estimate; proportional correction remains for
+        # unusual models whose curved spines differ from their probe chords.
+        r = estimated_r if estimated_r is not None else seed
         final_counts = {}
         total = 0
         for round_index in range(max_rounds):
             r = max(value_floor, min(value_cap, r))
-            write_spm(spm_path, apply_branch_values(original_text, target_indices, 1.0, r))
+            write_spm(
+                spm_path,
+                apply_prioritized_branch_values(
+                    original_text,
+                    calibration_indices,
+                    r,
+                    disabled_base_indices,
+                ),
+            )
+            log(f"  [SpeedTree] XML Relative 검증 시작 (round {round_index + 1})")
             final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
             total = sum(final_counts.values())
             rounds.append({"phase": f"relative round {round_index + 1}", "value": round(r, 4), "total_bones": total})
             log(f"  [calibrate] r={r:.3f} -> {total} bones (target {target_total:.0f}, window {lo:.0f}-{hi:.0f})")
             if lo <= total <= hi:
                 break
+            if cfg.get("fast_skip_problem_spm", True):
+                stop_for_manual(
+                    (
+                        f"first Relative verification produced {total} bones, outside "
+                        f"the accepted window {lo:.0f}-{hi:.0f}; skipped further "
+                        "SpeedTree correction rounds"
+                    ),
+                    r,
+                    total,
+                    "manual_required_relative_outlier",
+                )
             if total == 0:
                 r *= 3
                 continue
@@ -525,21 +1399,37 @@ def calibrate_bones(spm_path, cfg, log=print):
 
         final_r = max(value_floor, min(value_cap, r))
 
-        calibration_mode = "base_ref_relative" if has_base_links else "root_only_relative"
+        if base_priority_applied:
+            calibration_mode = "base_disabled_tree_relative"
+        else:
+            calibration_mode = "base_ref_relative" if has_base_links else "root_only_relative"
         absolute_fallback = None
         material_reference_fallbacks = []
         if not has_base_links:
             fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
+            log("  [SpeedTree] FBX geometry 검증 시작")
             if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+                if cfg.get("fast_skip_problem_spm", True):
+                    stop_for_manual(
+                        (
+                            "first FBX geometry verification produced an armature-only "
+                            "file; skipped automatic Absolute/material fallback exports"
+                        ),
+                        final_r,
+                        total,
+                        "manual_required_geometry",
+                    )
                 # Certain root/frond assets export an armature but silently drop
                 # every mesh after Relative bone calibration. Absolute/1 is the
                 # known-good SpeedTree representation for those assets.
                 fallback_text = apply_branch_values(original_text, target_indices, 0.0, 1.0)
                 write_spm(spm_path, fallback_text)
+                log("  [SpeedTree] XML Absolute/1 fallback 검증 시작")
                 final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
                 total = sum(final_counts.values())
                 if fbx_out.exists():
                     fbx_out.unlink()
+                log("  [SpeedTree] FBX Absolute/1 fallback 검증 시작")
                 if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
                     fallback_text, material_reference_fallbacks = repair_external_frond_material_references(
                         fallback_text
@@ -548,6 +1438,7 @@ def calibrate_bones(spm_path, cfg, log=print):
                         write_spm(spm_path, fallback_text)
                         if fbx_out.exists():
                             fbx_out.unlink()
+                        log("  [SpeedTree] FBX material fallback 검증 시작")
                     if not material_reference_fallbacks or not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
                         raise RuntimeError("SpeedTree FBX contains no mesh geometry after bone/material fallbacks")
                 absolute_fallback = 1
@@ -582,12 +1473,17 @@ def calibrate_bones(spm_path, cfg, log=print):
                 f"(relative value at floor/cap {final_r:.3f})"
             )
     meta = {
+        **graph_meta,
         "mode": calibration_mode,
         "total_branches": total_branches,
+        "calibration_branch_count": calibration_branches,
         "target_total": round(target_total),
         "relative_value": round(final_r, 4),
         "capped": capped,
-        "activated_zero_bone_generators": activated_zero_bone_generators,
+        "base_priority_applied": base_priority_applied,
+        "disabled_base_generator_count": len(disabled_base_indices),
+        "density_reduced_for_cap": density_reduced_for_cap,
+        "probe_cache_hit": probe_cache_hit,
     }
     if absolute_fallback is not None:
         meta["absolute_bones_per_branch"] = absolute_fallback
@@ -599,6 +1495,9 @@ def calibrate_bones(spm_path, cfg, log=print):
 def process_spm(spm_path, cfg, log=print, dry_run=False):
     """Material prefix + bone calibration with backup/restore. Returns report."""
     spm_path = Path(spm_path)
+    source_bytes = spm_path.read_bytes()
+    source_stat = spm_path.stat()
+    source_text = gzip.decompress(source_bytes).decode("utf-8")
     report = {
         "spm": str(spm_path),
         "status": "unchanged",
@@ -611,7 +1510,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         "warnings": [],
     }
 
-    audit = audit_spm(spm_path)
+    audit = audit_spm(spm_path, text=source_text, analyze_bone_graph=True)
     readiness = sk_readiness(audit)
     report["sk_readiness"] = readiness
     renames, mat_skipped = plan_material_renames(audit)
@@ -623,9 +1522,10 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["calibration"] = {
             "mode": readiness["mode"],
             "disabled_generators": readiness["disabled_generators"],
+            "bone_graph": readiness.get("bone_graph"),
         }
         report["warnings"].append(
-            "Skipped without modifying the SPM because its visible Branch generators have bones disabled."
+            "Skipped without modifying the SPM because its GUID bone graph is not SK-ready."
         )
         return report
 
@@ -633,6 +1533,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["status"] = "dry-run"
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
+        report["bone_graph"] = audit.get("bone_graph")
         return report
 
     backup = None
@@ -641,6 +1542,20 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["backup"] = backup
 
     try:
+        generators, rounds, total, meta, warnings, skipped, changed = calibrate_bones(
+            spm_path,
+            cfg,
+            log=log,
+            source_text=source_text,
+            source_audit=audit,
+        )
+        report["generators"] = generators
+        report["rounds"] = rounds
+        report["total_bones"] = total
+        report["calibration"] = meta
+        report["warnings"].extend(warnings)
+        report["skipped"].extend(skipped)
+
         if cfg.get("rename_materials", True) and renames:
             text = read_spm(spm_path)
             text, applied = apply_material_renames(text, renames)
@@ -648,14 +1563,51 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
                 write_spm(spm_path, text)
                 report["material_renames"] = applied
 
-        generators, rounds, total, meta, warnings, skipped, changed = calibrate_bones(spm_path, cfg, log=log)
-        report["generators"] = generators
-        report["rounds"] = rounds
-        report["total_bones"] = total
-        report["calibration"] = meta
-        report["warnings"].extend(warnings)
-        report["skipped"].extend(skipped)
+        # Calibration temporarily writes Absolute/1 and Relative variants. If
+        # the final logical XML is identical to the source, restore the exact
+        # gzip bytes and timestamps so a no-op ① run does not invalidate a
+        # perfectly good .blend merely by touching the SPM.
+        if read_spm(spm_path) == source_text:
+            spm_path.write_bytes(source_bytes)
+            os.utime(
+                spm_path,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+            changed = False
+            report["source_restored_unchanged"] = True
+
         report["status"] = "calibrated" if (changed or report["material_renames"]) else "already-ok"
+    except ManualCalibrationRequired as exc:
+        if backup:
+            shutil.copy2(backup, spm_path)
+        report["status"] = "manual-required"
+        report["error"] = str(exc)
+        report["rounds"] = exc.rounds
+        report["total_bones"] = exc.total_bones
+        report["calibration"] = exc.calibration
+        report["warnings"].extend(exc.warnings)
+        report["warnings"].append("automatic calibration stopped; original SPM restored")
+        report["skipped"].extend(exc.skipped)
+    except SpeedTreeExportTimeout as exc:
+        if backup:
+            shutil.copy2(backup, spm_path)
+        else:
+            spm_path.write_bytes(source_bytes)
+            os.utime(
+                spm_path,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+        report["status"] = "manual-required"
+        report["error"] = str(exc)
+        report["calibration"] = {
+            "mode": "manual_required_export_timeout",
+            "stage": exc.stage,
+            "timeout_seconds": exc.timeout_seconds,
+            "manual_required": True,
+        }
+        report["warnings"].append(
+            "SpeedTree export was too slow; automatic calibration stopped and original SPM restored"
+        )
     except Exception:
         if backup:
             shutil.copy2(backup, spm_path)

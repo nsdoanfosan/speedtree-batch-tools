@@ -16,7 +16,7 @@ DEFAULT_CONFIG = {
     "pcg_database_content": r"C:\UnrealProjects\MyProject2\Content\PCG\DataBase",
     "unreal_levels": ["/Game/Level/Cliff_final_01"],
     "source_texture_roots": [r"D:\OneDrive\Forestportfolio\Texture"],
-    "required_export_maps": ["color", "normal", "extra", "height", "opacity"],
+    "required_export_maps": ["color", "normal", "extra", "height", "opacity", "subsurface"],
     "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
     "designer_dir": r"C:\Program Files\Adobe\Adobe Substance 3D Designer",
     "cluster_sbsar": r"D:\OneDrive\Forestportfolio\substanceDesigner\Cluster_System_01.sbsar",

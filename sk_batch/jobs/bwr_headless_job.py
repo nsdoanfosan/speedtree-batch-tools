@@ -95,6 +95,17 @@ def main():
                 ),
             }
         )
+        pipeline_path = Path(report["pipeline_report"])
+        if pipeline_path.is_file():
+            pipeline_data = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            texture_normalization = pipeline_data.get("texture_normalization") or {}
+            report["texture_normalization"] = texture_normalization
+            for missing in texture_normalization.get("missing", []):
+                roles = ", ".join(missing.get("missing_roles", [])) or "대응 세트"
+                report.setdefault("warnings", []).append(
+                    f"{missing.get('material', '?')}: "
+                    f"{missing.get('expected_texture_base', 'T_?')} ({roles}) 누락"
+                )
         for key in ("megaplant_json", "dynamic_wind_json", "pipeline_report"):
             if not os.path.exists(report[key]):
                 report.setdefault("warnings", []).append(f"expected output missing: {report[key]}")

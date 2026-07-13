@@ -12,7 +12,7 @@ if __package__ in (None, ""):
 from export_prepare_plan import build_plan_from_report
 from export_texture_plan import build_texture_plan_from_report
 
-GENERIC_MATERIAL_RE = re.compile(r"^material(?:\s+copy)?(?:\s*\d+)?$", re.IGNORECASE)
+GENERIC_MATERIAL_RE = re.compile(r"^(?:m_)?material(?:\s+copy)?(?:\s*\d+)?$", re.IGNORECASE)
 
 
 def add_row(rows, severity, issue_type, folder="", target="", cluster="", detail="", action="", evidence=""):

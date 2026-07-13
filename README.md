@@ -6,6 +6,7 @@ SpeedTree 식생 변환 작업을 위한 독립형 Windows 배치 도구 모음�
 
 - `pcg_st9_texture_batch/PCG_ST9_Texture_Batch.bat`: PCG에서 사용하는 ST9 나무를 SK·나나이트·버추얼 텍스처 작업으로 연결하는 준비 보드
 - `sk_batch/SK_Batch.bat`: SPM 수정, Blender 리페어, Unreal 전송을 단계별로 실행하는 SK 식생 배치 도구
+- `spm_generator_sync/SPM_Generator_Sync.bat`: 같은 수종의 SPM을 마스터·자식·독립 계보로 관리하고 Base 제작 구조와 아이콘 색을 동기화하는 도구. 이후 SK Batch의 `0. Generator Sync`가 같은 엔진을 호출할 수 있는 패키지 진입점을 포함합니다.
 
 각 도구의 상세 사용법은 해당 폴더의 `README.md`를 참고합니다.
 
@@ -36,5 +37,6 @@ GitHub/
 
 ```powershell
 python -m unittest discover -s .\pcg_st9_texture_batch\tests -v
-python -m compileall -q .\pcg_st9_texture_batch .\sk_batch
+python -m unittest discover -s .\spm_generator_sync\tests -v
+python -m compileall -q .\pcg_st9_texture_batch .\sk_batch .\spm_generator_sync
 ```

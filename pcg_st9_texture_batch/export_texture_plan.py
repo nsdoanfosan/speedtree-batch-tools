@@ -3,6 +3,7 @@ import argparse
 import csv
 import gzip
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pcg_texture_audit import infer_normal_convention, unique
+from pcg_texture_audit import GENERATED_EXPORT_RE, canonical_material_name, infer_normal_convention, unique
 
 
 MAP_KEYWORDS = {
@@ -20,6 +21,7 @@ MAP_KEYWORDS = {
     "height": ("height", "displacement", "depth"),
     "ao": ("ambientocclusion", "ambient_occlusion", "_ao", "-ao", "occlusion"),
     "roughness": ("roughness", "rough", "gloss"),
+    "subsurface": ("subsurface", "translucency", "translucent"),
 }
 
 MAX_SCAN_BYTES = 8 * 1024 * 1024
@@ -58,6 +60,7 @@ def fast_extract_image_refs(path):
         looks_like_named_map = any(keyword in low for keyword in (
             "albedo", "basecolor", "base_color", "opacity", "alpha",
             "normal", "height", "depth", "ambientocclusion", "_ao",
+            "subsurface", "translucency", "translucent",
         ))
         if not looks_like_path and not looks_like_named_map:
             continue
@@ -150,6 +153,8 @@ def collect_item_fallback_refs(item, ref_cache):
 
 
 def collect_cluster_refs(item, cluster, item_fallback_refs, ref_cache, material_ref_map=None):
+    if cluster.get("leaf_source_provenance") and cluster.get("source_refs"):
+        return unique(cluster["source_refs"]), [], "leaf_atlas_source"
     if cluster.get("source") == "material" and material_ref_map:
         material_refs = []
         for name in cluster.get("material_names") or []:
@@ -163,6 +168,104 @@ def collect_cluster_refs(item, cluster, item_fallback_refs, ref_cache, material_
         return unique(cluster_refs), item_fallback_refs, "cluster_spm"
     # cluster_spm이 없는 항목(머티리얼 기반 아틀라스)은 폴더 폴백 참조를 쓴다.
     return [], item_fallback_refs, "folder_fallback"
+
+
+def recover_graph_provenance_refs(item, cluster, refs, cfg):
+    """Recover a generated material's source set from a sibling SBS graph family."""
+    if not refs or not all(GENERATED_EXPORT_RE.match(Path(ref).name) for ref in refs):
+        return None
+    import sbs_auto
+
+    target = str(cluster.get("texture_base") or cluster.get("atlas_base") or "")
+    target_sbs = cluster.get("m_graph_sbs")
+    target_graph = cluster.get("m_graph")
+    if not target_sbs or not target_graph:
+        return None
+    current = (sbs_auto.find_m_graph_name(target_sbs, target)
+               or sbs_auto.find_m_graph_name(target_sbs, target_graph))
+    if not current:
+        return None
+    try:
+        seed_inputs = sbs_auto.parse_m_graph(target_sbs, current)["inputs"]
+        seed = seed_inputs.get("Base_Color")
+        family = sbs_auto.source_family_key(seed) if seed else ""
+    except Exception:
+        return None
+    if not family:
+        return None
+    real_roles = sum(
+        1 for slot in ("Base_Color", "Opacity", "Normal", "Height", "Roughness",
+                       "Ambient_Occlusion", "Subsurface")
+        if seed_inputs.get(slot)
+        and "neutral_" not in Path(seed_inputs[slot]).name.lower()
+        and not GENERATED_EXPORT_RE.match(Path(seed_inputs[slot]).name)
+    )
+    # A complete graph already carries authoritative original inputs.  Sibling
+    # provenance is only needed for generated graphs whose missing roles were
+    # filled with neutral black/normal images.
+    if real_roles >= 4:
+        return None
+
+    leaf_matches = []
+    for source in item.get("leaf_mesh_sources") or []:
+        source_family = str(source.get("source_family") or "").lower()
+        source_refs = [str(ref) for ref in (source.get("source_refs") or []) if ref]
+        if source_family == family and source_refs \
+                and not all(GENERATED_EXPORT_RE.match(Path(ref).name) for ref in source_refs):
+            leaf_matches.append(source)
+    if len(leaf_matches) == 1:
+        source = leaf_matches[0]
+        return {
+            "graph": f"leaf_source:{source.get('source_family')}",
+            "sbs": None,
+            "refs": [str(ref) for ref in source.get("source_refs") or [] if ref],
+            "score": (2, 0, len(source.get("source_refs") or [])),
+        }
+
+    source_roots = [Path(path).resolve() for path in cfg.get("source_texture_roots", [])]
+    candidates = []
+    for sbs in item.get("sbs_files") or []:
+        for graph in sbs_auto.list_m_graphs(sbs):
+            if str(Path(sbs)).lower() == str(Path(target_sbs)).lower() \
+                    and graph.lower() == current.lower():
+                continue
+            try:
+                inputs = sbs_auto.parse_m_graph(sbs, graph)["inputs"]
+            except Exception:
+                continue
+            base_color = inputs.get("Base_Color")
+            if not base_color or sbs_auto.source_family_key(base_color) != family:
+                continue
+            ordered = []
+            for slot in ("Base_Color", "Opacity", "Normal", "Height", "Depth",
+                         "Roughness", "Ambient_Occlusion", "Subsurface"):
+                path = inputs.get(slot)
+                if path and "neutral_" not in Path(path).name.lower() \
+                        and str(path).lower() not in {value.lower() for value in ordered}:
+                    ordered.append(str(path))
+            if not ordered:
+                continue
+            external = 0
+            try:
+                resolved = Path(base_color).resolve()
+                external = int(any(resolved.is_relative_to(root) for root in source_roots))
+            except (OSError, ValueError):
+                pass
+            target_tokens = set(re.findall(r"[a-z]+|\d+", target.lower())) - {
+                "m", "t", "atlas", "cluster"
+            }
+            graph_tokens = set(re.findall(r"[a-z]+|\d+", graph.lower())) - {
+                "m", "t", "atlas", "cluster"
+            }
+            score = (external, len(target_tokens & graph_tokens), len(ordered))
+            candidates.append({"graph": graph, "sbs": str(sbs), "refs": ordered,
+                               "score": score})
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row["score"], row["graph"].lower()), reverse=True)
+    if len(candidates) > 1 and candidates[0]["score"] == candidates[1]["score"]:
+        return None
+    return candidates[0]
 
 
 def atlas_quality_for_folder(folder_name):
@@ -194,8 +297,10 @@ def sbs_status(item, buckets):
 def build_texture_plan_from_report(report, source_report="<memory>"):
     rows = []
     folder_notes = []
+    preserved_materials = []
     ref_cache = {}
     for item in report.get("items", []):
+        preserved_materials.extend(item.get("preserved_cluster_materials") or [])
         clusters = item.get("cluster_items", [])
         if not clusters:
             folder_notes.append({
@@ -216,9 +321,30 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
             for spm in material_spms:
                 requested_by_spm.setdefault(spm, []).extend(cluster.get("material_names") or [])
         material_ref_map = {}
+        canonical_material_names = set()
         for spm, names in requested_by_spm.items():
             for name, refs in extract_material_image_refs(spm, names).items():
                 material_ref_map[name] = unique(material_ref_map.get(name, []) + refs)
+        # The audit resolves pixel-identical local PNG copies back to their
+        # referenced external originals. Use that canonical set for Substance
+        # too, so ② and ③ never disagree about the source atlas.
+        for source in item.get("leaf_mesh_sources") or []:
+            refs = source.get("source_refs") or [source.get("albedo"), source.get("alpha")]
+            refs = [str(ref) for ref in refs if ref]
+            if refs and all(GENERATED_EXPORT_RE.match(Path(ref).name) for ref in refs):
+                continue
+            names = []
+            for target in source.get("targets", []):
+                names.extend(target.get("material_names") or [])
+            for trace in source.get("trace_sources", []):
+                names.extend(trace.get("material_names") or [])
+            for name in unique(names):
+                key = str(name).lower()
+                material_ref_map[key] = refs
+                canonical_material_names.add(key)
+                canonical_key = canonical_material_name(name).lower()
+                material_ref_map[canonical_key] = refs
+                canonical_material_names.add(canonical_key)
         for cluster in clusters:
             cluster_refs, _fallback_refs, source_scope = collect_cluster_refs(
                 item, cluster, [], ref_cache, material_ref_map=material_ref_map)
@@ -230,7 +356,25 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 fallback_refs = item_fallback_refs
                 source_scope = "folder_fallback"
             refs = cluster_refs or fallback_refs
+            graph_provenance = recover_graph_provenance_refs(
+                item, cluster, refs, report.get("config", {}))
+            if graph_provenance:
+                refs = graph_provenance["refs"]
+                source_scope = f"sbs_graph:{graph_provenance['graph']}"
             buckets = bucket_refs(refs)
+            # Use the exact Material_v8 Color/Opacity slots recorded by the
+            # audit; never infer a missing "color" suffix from the filename.
+            cluster_names = {
+                str(name).lower() for name in cluster.get("material_names") or []
+            }
+            has_canonical_provenance = bool(
+                cluster_names & canonical_material_names) \
+                or bool(cluster.get("leaf_source_provenance")) \
+                or bool(graph_provenance)
+            if cluster.get("source_albedo") and not has_canonical_provenance:
+                buckets["albedo"] = unique(cluster["source_albedo"])
+            if cluster.get("source_alpha") and not has_canonical_provenance:
+                buckets["alpha"] = unique(cluster["source_alpha"])
             normal_convention = infer_normal_convention(refs) if refs else item.get("normal_convention", "unknown")
             missing_maps = cluster.get("missing_export_maps", [])
             duplicate_targets = item.get("duplicate_pcg_target_mesh_names", [])
@@ -249,7 +393,9 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "shared_from": cluster.get("shared_from"),
                 "m_graph": cluster.get("m_graph"),
                 "m_graph_sbs": cluster.get("m_graph_sbs"),
+                "legacy_m_graph": cluster.get("legacy_m_graph", False),
                 "atlas_base": cluster.get("atlas_base", ""),
+                "texture_base": cluster.get("texture_base", cluster.get("atlas_base", "")),
                 "atlas_blends": cluster.get("atlas_blends", []),
                 "atlas_blend_status": "ok" if cluster.get("atlas_blends") else "missing",
                 "atlas_generator_quality": atlas_quality_for_folder(item.get("name", "")),
@@ -259,6 +405,7 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "sbs_status": sbs_status(item, buckets),
                 "texture_dir": cluster.get("texture_dir") or item.get("texture_dir", ""),
                 "export_maps": cluster.get("export_maps", {}),
+                "legacy_export_maps": cluster.get("legacy_export_maps", {}),
                 "missing_export_maps": missing_maps,
                 "export_status": "ok" if not missing_maps else "missing " + ",".join(missing_maps),
                 "normal_convention": normal_convention,
@@ -266,6 +413,7 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "ao_policy": item.get("ao_policy", ""),
                 "sdf_policy": item.get("sdf_policy", ""),
                 "source_scope": source_scope,
+                "canonical_source_provenance": has_canonical_provenance,
                 "source_refs": refs,
                 "source_albedo": buckets.get("albedo", []),
                 "source_alpha": buckets.get("alpha", []),
@@ -273,6 +421,7 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "source_height": buckets.get("height", []),
                 "source_ao": buckets.get("ao", []),
                 "source_roughness": buckets.get("roughness", []),
+                "source_subsurface": buckets.get("subsurface", []),
                 "unknown_source_refs": buckets.get("unknown", []),
                 "actions": item.get("actions", []),
             })
@@ -289,6 +438,7 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
         "pcg_targets": report.get("pcg_targets", {}),
         "summary": counts,
         "items": rows,
+        "preserved_cluster_materials": preserved_materials,
         "folder_notes": folder_notes,
     }
 
@@ -314,6 +464,8 @@ def write_csv(plan, csv_path):
         "duplicate_pcg_target_meshes",
         "cluster_name",
         "atlas_base",
+        "texture_base",
+        "legacy_export_maps",
         "atlas_blend_status",
         "atlas_blends",
         "atlas_generator_quality",
@@ -331,6 +483,7 @@ def write_csv(plan, csv_path):
         "source_normal",
         "source_height",
         "source_ao",
+        "source_subsurface",
         "texture_dir",
         "cluster_spm",
         "folder",
@@ -345,6 +498,10 @@ def write_csv(plan, csv_path):
             "duplicate_pcg_target_meshes": join_list(item.get("duplicate_pcg_target_meshes", []), 20),
             "cluster_name": item.get("cluster_name", ""),
             "atlas_base": item.get("atlas_base", ""),
+            "texture_base": item.get("texture_base", ""),
+            "legacy_export_maps": join_list(
+                [f"{name}={path}" for name, path in
+                 (item.get("legacy_export_maps") or {}).items() if path], 5),
             "atlas_blend_status": item.get("atlas_blend_status", ""),
             "atlas_blends": join_list(item.get("atlas_blends", []), 4),
             "atlas_generator_quality": item.get("atlas_generator_quality", ""),
@@ -362,6 +519,7 @@ def write_csv(plan, csv_path):
             "source_normal": join_list(item.get("source_normal", []), 6),
             "source_height": join_list(item.get("source_height", []), 6),
             "source_ao": join_list(item.get("source_ao", []), 6),
+            "source_subsurface": join_list(item.get("source_subsurface", []), 6),
             "texture_dir": item.get("texture_dir", ""),
             "cluster_spm": item.get("cluster_spm", ""),
             "folder": item.get("folder", ""),
