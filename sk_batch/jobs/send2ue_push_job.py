@@ -14,6 +14,7 @@ Steps:
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,6 +36,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", required=True)
     parser.add_argument("--ue-timeout", type=float, default=180.0)
+    parser.add_argument("--rpc-timeout-min", type=float, default=180.0)
+    parser.add_argument("--rpc-timeout-max", type=float, default=900.0)
+    parser.add_argument("--max-push-polygons", type=int, default=2_000_000)
+    parser.add_argument("--max-push-bones", type=int, default=1_500)
     parser.add_argument("--skip-wind", action="store_true")
     return parser.parse_args(argv)
 
@@ -92,13 +97,6 @@ def unreal_editor_running():
     """Best-effort distinction between an RPC error and an editor crash/exit."""
     if os.name != "nt":
         return None
-
-
-def enable_required_addon(addon_utils, module):
-    """Enable only the add-ons that the isolated Push pipeline requires."""
-    _loaded, enabled = addon_utils.check(module)
-    if not enabled:
-        bpy.ops.preferences.addon_enable(module=module)
     try:
         result = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
@@ -110,6 +108,57 @@ def enable_required_addon(addon_utils, module):
         return result.returncode == 0 and "UnrealEditor.exe" in result.stdout
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def enable_required_addon(addon_utils, module):
+    """Enable only the add-ons that the isolated Push pipeline requires."""
+    _loaded, enabled = addon_utils.check(module)
+    if not enabled:
+        bpy.ops.preferences.addon_enable(module=module)
+
+
+def wait_for_json(path, timeout, label):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not path.exists():
+        time.sleep(1.0)
+    if not path.exists():
+        raise RuntimeError(f"{label}: no result file (timed out after {timeout:g}s)")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def export_complexity():
+    """Return cheap counts for the exact mesh unit that Send2UE will export."""
+    export_collection = bpy.data.collections.get("Export")
+    objects = list(export_collection.all_objects) if export_collection else []
+    meshes = [obj for obj in objects if obj.type == "MESH" and obj.data]
+    armatures = set()
+    for mesh in meshes:
+        armature = mesh.find_armature()
+        if armature and armature.data:
+            armatures.add(armature)
+    return {
+        "mesh_count": len(meshes),
+        "polygon_count": sum(len(mesh.data.polygons) for mesh in meshes),
+        "bone_count": sum(len(armature.data.bones) for armature in armatures),
+        "meshes": [
+            {"name": mesh.name, "polygons": len(mesh.data.polygons)}
+            for mesh in meshes
+        ],
+    }
+
+
+def adaptive_rpc_timeout(complexity, polygon_limit, bone_limit, minimum, maximum):
+    """Scale the RPC wait continuously from the export's relative complexity."""
+    minimum = max(60, float(minimum))
+    maximum = max(minimum, float(maximum))
+    ratios = []
+    if polygon_limit > 0:
+        ratios.append(complexity["polygon_count"] / polygon_limit)
+    if bone_limit > 0:
+        ratios.append(complexity["bone_count"] / bone_limit)
+    load_ratio = min(1.0, max(ratios, default=0.0))
+    seconds = math.ceil(minimum + (maximum - minimum) * load_ratio)
+    return seconds, load_ratio
 
 
 def main():
@@ -145,11 +194,67 @@ def main():
                 + " | ".join(details)
             )
 
+        complexity = export_complexity()
+        report["complexity"] = complexity
+        exceeded = []
+        if (
+            args.max_push_polygons > 0
+            and complexity["polygon_count"] > args.max_push_polygons
+        ):
+            exceeded.append(
+                f"폴리곤 {complexity['polygon_count']:,} > {args.max_push_polygons:,}"
+            )
+        if args.max_push_bones > 0 and complexity["bone_count"] > args.max_push_bones:
+            exceeded.append(f"본 {complexity['bone_count']:,} > {args.max_push_bones:,}")
+        if exceeded:
+            report["status"] = "manual_required"
+            report["manual_required"] = True
+            raise RuntimeError(
+                "Unreal Push 수동 처리 필요: "
+                + ", ".join(exceeded)
+                + ". Unreal RPC를 막지 않고 이 항목을 건너뜁니다."
+            )
+
         from send2ue.core import utilities
-        from send2ue.dependencies.unreal import run_commands
+        from send2ue.dependencies.unreal import run_commands, set_rpc_env
 
         if not utilities.is_unreal_connected():
             raise RuntimeError("Unreal editor is not running / RPC not reachable. Open the project first.")
+
+        # Successful calls return immediately; this only controls how long an
+        # unattended run tolerates a legitimately slow synchronous import.
+        # The same polygon/bone limits used by the manual guard provide one
+        # continuous load ratio, so light assets get the minimum and assets
+        # near the automatic-processing ceiling get the maximum.
+        rpc_timeout, rpc_load_ratio = adaptive_rpc_timeout(
+            complexity,
+            args.max_push_polygons,
+            args.max_push_bones,
+            args.rpc_timeout_min,
+            args.rpc_timeout_max,
+        )
+        set_rpc_env("RPC_TIME_OUT", rpc_timeout)
+        report["rpc_timeout_seconds"] = rpc_timeout
+        report["rpc_timeout"] = {
+            "seconds": rpc_timeout,
+            "minimum": max(60, float(args.rpc_timeout_min)),
+            "maximum": max(
+                max(60, float(args.rpc_timeout_min)),
+                float(args.rpc_timeout_max),
+            ),
+            "load_ratio": round(rpc_load_ratio, 6),
+            "polygon_ratio": round(
+                complexity["polygon_count"] / args.max_push_polygons, 6
+            ) if args.max_push_polygons > 0 else None,
+            "bone_ratio": round(
+                complexity["bone_count"] / args.max_push_bones, 6
+            ) if args.max_push_bones > 0 else None,
+        }
+        print(
+            f"[SK Batch] RPC timeout: {rpc_timeout}s "
+            f"(load {rpc_load_ratio:.1%}, range "
+            f"{args.rpc_timeout_min:g}-{args.rpc_timeout_max:g}s)"
+        )
 
         scene_props = bpy.context.scene.send2ue
         if hasattr(scene_props, "skip_animation_export"):
@@ -160,14 +265,49 @@ def main():
         report["unit_name"] = unit_name
         report["unreal_folder"] = folder
 
+        blend_dir = Path(blend_path).parent
+        mesh_path = folder.rstrip("/") + "/" + unit_name
+
+        # The post-import material/wind pipeline saves the skeletal mesh without
+        # an interactive checkout prompt. Check out existing generated assets
+        # up front so a Perforce read-only package cannot fail after import.
+        checkout_result_path = (
+            blend_dir / "reports" / f"__skbatch_ue_checkout_{unit_name}.json"
+        )
+        checkout_result_path.parent.mkdir(parents=True, exist_ok=True)
+        if checkout_result_path.exists():
+            checkout_result_path.unlink()
+        checkout_lines = [
+            "import unreal, json, traceback",
+            "res = {'ok': False}",
+            "try:",
+            "    subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)",
+            f"    candidates = {[mesh_path, mesh_path + '_Skeleton', mesh_path + '_PhysicsAsset']!r}",
+            "    existing = [path for path in candidates if unreal.EditorAssetLibrary.does_asset_exist(path)]",
+            "    failed = [path for path in existing if not subsystem.checkout_asset(path)]",
+            "    if failed:",
+            "        raise RuntimeError('source-control checkout failed: ' + ', '.join(failed))",
+            "    res = {'ok': True, 'existing': existing, 'checked_out': existing}",
+            "except Exception as e:",
+            "    res = {'ok': False, 'error': str(e), 'trace': traceback.format_exc()}",
+            f"open({str(checkout_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
+        ]
+        run_commands(checkout_lines)
+        checkout_result = wait_for_json(
+            checkout_result_path, args.ue_timeout, "Unreal source-control checkout"
+        )
+        report["checkout"] = checkout_result
+        if not checkout_result.get("ok"):
+            raise RuntimeError(
+                f"Unreal source-control checkout failed: {checkout_result.get('error')}"
+            )
+
         unreal_log_path, unreal_log_offset = unreal_log_checkpoint()
         result = bpy.ops.wm.send2ue("EXEC_DEFAULT")
         if "FINISHED" not in result:
             raise RuntimeError(f"send2ue returned {result}")
         report["send2ue"] = "FINISHED"
 
-        blend_dir = Path(blend_path).parent
-        mesh_path = folder.rstrip("/") + "/" + unit_name
         material_result_path = (
             blend_dir / "reports" / f"__skbatch_ue_material_{unit_name}.json"
         )
@@ -202,12 +342,9 @@ def main():
             f"open({str(material_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
         ]
         run_commands(material_lines)
-        deadline = time.time() + args.ue_timeout
-        while time.time() < deadline and not material_result_path.exists():
-            time.sleep(1.0)
-        if not material_result_path.exists():
-            raise RuntimeError("Unreal material validation: no result file (timed out)")
-        material_result = json.loads(material_result_path.read_text(encoding="utf-8"))
+        material_result = wait_for_json(
+            material_result_path, args.ue_timeout, "Unreal material validation"
+        )
         report["materials"] = material_result
         if not material_result.get("ok"):
             raise RuntimeError(
@@ -260,16 +397,12 @@ def main():
                 f"open({str(ue_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
             ]
             run_commands(lines)
-            deadline = time.time() + args.ue_timeout
-            while time.time() < deadline and not ue_result_path.exists():
-                time.sleep(1.0)
-            if ue_result_path.exists():
-                ue_result = json.loads(ue_result_path.read_text(encoding="utf-8"))
-                report["wind"] = ue_result
-                if not ue_result.get("ok"):
-                    raise RuntimeError(f"Unreal wind import failed: {ue_result.get('error')}")
-            else:
-                raise RuntimeError("Unreal wind import: no result file (timed out)")
+            ue_result = wait_for_json(
+                ue_result_path, args.ue_timeout, "Unreal wind import"
+            )
+            report["wind"] = ue_result
+            if not ue_result.get("ok"):
+                raise RuntimeError(f"Unreal wind import failed: {ue_result.get('error')}")
         report["status"] = "ok"
     except Exception as exc:
         editor_running = unreal_editor_running()

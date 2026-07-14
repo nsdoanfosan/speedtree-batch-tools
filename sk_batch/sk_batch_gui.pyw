@@ -731,11 +731,14 @@ class App:
                     self._job_push(iid, spm)
             except Exception as exc:
                 reason = compact_error_message(exc)
-                self.log(f"[실패] {spm.name}: {reason}")
-                self.ui_queue.put(("cell", (iid, column, f"실패: {reason}")))
+                manual_required = phase == "push" and "수동 처리 필요" in reason
+                status_text = reason if manual_required else f"실패: {reason}"
+                tag = "수동" if manual_required else "실패"
+                self.log(f"[{tag}] {spm.name}: {reason}")
+                self.ui_queue.put(("cell", (iid, column, status_text)))
                 with self.state_lock:
                     state_entry = self.state.setdefault(iid, {})
-                    state_entry[column] = f"실패: {reason}"
+                    state_entry[column] = status_text
                     state_entry[f"{column}_error"] = {
                         "time": datetime.now().isoformat(timespec="seconds"),
                         "message": reason,
@@ -1175,6 +1178,10 @@ class App:
             self.cfg["blender_exe"], "--factory-startup", "-b", str(blend),
             "--python", str(TOOL_DIR / "jobs" / "send2ue_push_job.py"), "--",
             "--report", str(job_report),
+            "--max-push-polygons", str(self.cfg.get("push_max_polygons", 2_000_000)),
+            "--max-push-bones", str(self.cfg.get("push_max_bones", 1_500)),
+            "--rpc-timeout-min", str(self.cfg.get("push_rpc_timeout_min", 180)),
+            "--rpc-timeout-max", str(self.cfg.get("push_rpc_timeout_max", 900)),
         ]
         code, log_file = self._run_limited(cmd, f"{spm.stem}_push_{stamp}.log",
                                            self.cfg.get("push_job_timeout", 1800))

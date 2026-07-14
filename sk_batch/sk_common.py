@@ -70,6 +70,14 @@ DEFAULT_CONFIG = {
     "spm_verify_timeout": 120,
     "blender_job_timeout": 3600,
     "push_job_timeout": 1800,
+    # Avoid wedging Unreal's synchronous RPC queue with assets that are faster
+    # to handle manually than to import through the unattended handoff.
+    "push_max_polygons": 2_000_000,
+    "push_max_bones": 1_500,
+    # Successful RPC calls return immediately. These bounds only control how
+    # long an unattended Push tolerates a slow import before declaring failure.
+    "push_rpc_timeout_min": 180,
+    "push_rpc_timeout_max": 900,
     "process_poll_interval": 0.2,
 }
 
