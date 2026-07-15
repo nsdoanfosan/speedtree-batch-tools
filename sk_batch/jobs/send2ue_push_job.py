@@ -182,8 +182,10 @@ def unreal_editor_running():
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        return result.returncode == 0 and "UnrealEditor.exe" in result.stdout
-    except (OSError, subprocess.SubprocessError):
+        # result.stdout has been observed as None under background Blender
+        # even with capture_output=True; a crash here would skip the report.
+        return result.returncode == 0 and "UnrealEditor.exe" in (result.stdout or "")
+    except Exception:
         return None
 
 
@@ -292,26 +294,29 @@ def main():
                 + " | ".join(details)
             )
 
+        # The polygon/bone values are scaling references for the adaptive RPC
+        # timeout, not hard limits: over-reference exports proceed at the
+        # maximum timeout instead of being skipped as manual_required.
         report["stage"] = "complexity_guard"
         complexity = export_complexity()
         report["complexity"] = complexity
-        exceeded = []
+        over_reference = []
         if (
             args.max_push_polygons > 0
             and complexity["polygon_count"] > args.max_push_polygons
         ):
-            exceeded.append(
+            over_reference.append(
                 f"폴리곤 {complexity['polygon_count']:,} > {args.max_push_polygons:,}"
             )
         if args.max_push_bones > 0 and complexity["bone_count"] > args.max_push_bones:
-            exceeded.append(f"본 {complexity['bone_count']:,} > {args.max_push_bones:,}")
-        if exceeded:
-            report["status"] = "manual_required"
-            report["manual_required"] = True
-            raise RuntimeError(
-                "Unreal Push 수동 처리 필요: "
-                + ", ".join(exceeded)
-                + ". Unreal RPC를 막지 않고 이 항목을 건너뜁니다."
+            over_reference.append(
+                f"본 {complexity['bone_count']:,} > {args.max_push_bones:,}"
+            )
+        if over_reference:
+            report["complexity_over_reference"] = over_reference
+            print(
+                "[SK Batch] 복잡도 기준 초과 (최대 RPC 타임아웃으로 계속 진행): "
+                + ", ".join(over_reference)
             )
 
         from send2ue.constants import PathModes
@@ -534,50 +539,59 @@ def main():
             report["status"] = "ok"
             report["failure_kind"] = None
     except Exception as exc:
-        editor_running = unreal_editor_running()
-        report["unreal_editor_running_after_failure"] = editor_running
+        # Record the error before any classification helper runs: a crash in
+        # this handler must never leave the report unwritten ("job report was
+        # not created" hides the real failure from the GUI).
         error_text = str(exc)
-        lowered = error_text.lower()
-        if report.get("status") == "manual_required":
-            failure_kind = "manual_required"
-        elif (
-            report.get("stage") != "unreal_preflight"
-            and report.get("unreal_rpc_started")
-            and editor_running is False
-        ):
-            failure_kind = "unreal_crash"
-        elif any(
-            token in lowered
-            for token in (
-                'the call "import_asset" timed out',
-                "rpc timeout",
-                "rpc_time_out",
-                "no result file (timed out",
-            )
-        ):
-            failure_kind = "rpc_timeout"
-        elif any(
-            token in lowered
-            for token in (
-                "could not find an open unreal editor instance",
-                "rpc not reachable",
-                "unreal editor is not running",
-                "connectionreseterror",
-                "winerror 10054",
-            )
-        ):
-            failure_kind = "unreal_unavailable"
-        else:
-            failure_kind = "data_error"
-        report["failure_kind"] = failure_kind
-        if failure_kind == "unreal_crash":
-            report["error"] = f"Unreal Editor crashed or exited during push: {exc}"
-        else:
-            report["error"] = error_text
+        report["error"] = error_text
         report["traceback"] = traceback.format_exc()
+        try:
+            classify_failure(report, error_text)
+        except Exception:
+            report.setdefault("failure_kind", "data_error")
     write_report(args.report, report)
     if report["status"] not in {"ok", "exported_pending_unreal"}:
         sys.exit(1)
+
+
+def classify_failure(report, error_text):
+    editor_running = unreal_editor_running()
+    report["unreal_editor_running_after_failure"] = editor_running
+    lowered = error_text.lower()
+    if report.get("status") == "manual_required":
+        failure_kind = "manual_required"
+    elif (
+        report.get("stage") != "unreal_preflight"
+        and report.get("unreal_rpc_started")
+        and editor_running is False
+    ):
+        failure_kind = "unreal_crash"
+    elif any(
+        token in lowered
+        for token in (
+            'the call "import_asset" timed out',
+            "rpc timeout",
+            "rpc_time_out",
+            "no result file (timed out",
+        )
+    ):
+        failure_kind = "rpc_timeout"
+    elif any(
+        token in lowered
+        for token in (
+            "could not find an open unreal editor instance",
+            "rpc not reachable",
+            "unreal editor is not running",
+            "connectionreseterror",
+            "winerror 10054",
+        )
+    ):
+        failure_kind = "unreal_unavailable"
+    else:
+        failure_kind = "data_error"
+    report["failure_kind"] = failure_kind
+    if failure_kind == "unreal_crash":
+        report["error"] = f"Unreal Editor crashed or exited during push: {error_text}"
 
 
 main()
