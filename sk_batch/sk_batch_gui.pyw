@@ -15,6 +15,7 @@
 실행된다 (자식 SpeedTree CLI에 상속. 헤드리스 Blender는 GPU를 쓰지 않음).
 """
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -27,14 +28,22 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 TOOL_DIR = Path(__file__).resolve().parent
+REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
+
+from batch_ui_common import CheckedRowController, copy_selected_row_paths
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
     LOG_DIR,
+    PUSH_ABORT_KINDS,
+    PUSH_MANIFEST_SCHEMA_VERSION,
+    atomic_write_json,
     blend_path_for,
     calibration_cache_matches,
     calibration_settings_signature,
+    classify_push_failure,
     compact_error_message,
     file_content_snapshot,
     is_manual_bones_locked,
@@ -42,6 +51,7 @@ from sk_common import (
     load_config,
     load_job_report,
     load_state,
+    manifest_item_files_match,
     manual_bones_marker_path,
     save_config,
     save_state,
@@ -49,6 +59,7 @@ from sk_common import (
     set_manual_bones_marker,
     summarize_job_failure,
     terminate_process_tree,
+    push_source_fingerprint,
     wind_preset_for,
 )
 
@@ -62,6 +73,19 @@ WIND_OPTIONS = (
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+
+
+class BatchItemError(RuntimeError):
+    """One item failed, with a machine-readable queue-impact classification."""
+
+    def __init__(
+        self, reason, kind="data_error", report=None, log_file=None, report_file=None
+    ):
+        super().__init__(reason)
+        self.kind = kind
+        self.report = report or {}
+        self.log_file = log_file
+        self.report_file = report_file
 
 
 class Tooltip:
@@ -100,6 +124,7 @@ class App:
         self.cfg = load_config()
         self.state = load_state()
         self.items = {}  # iid -> {"spm": Path, "checked": bool, "wind_override": str}
+        self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.ui_queue = queue.Queue()
         self.worker = None
         self.cell_editor = None
@@ -130,9 +155,50 @@ class App:
         self.btn_select_all.pack(side="left")
         self.btn_clear_all = ttk.Button(top, text="전체 해제", command=lambda: self._set_all(False))
         self.btn_clear_all.pack(side="left", padx=4)
+        ttk.Button(
+            top, text="선택 SPM 경로 복사", command=self.copy_selected_paths
+        ).pack(side="left", padx=(4, 0))
 
         opts = ttk.LabelFrame(self.root, text="옵션 (각 항목에 마우스를 올리면 설명이 뜹니다)", padding=6)
         opts.pack(fill="x", padx=6)
+
+        transport_opts = ttk.LabelFrame(
+            self.root,
+            text="Unreal Push transport",
+            padding=6,
+        )
+        transport_opts.pack(fill="x", padx=6, pady=(4, 0))
+        ttk.Label(transport_opts, text="③ Unreal Push:").pack(side="left")
+        self.transport_var = tk.StringVar(
+            value=self.cfg.get("push_transport", "rpc")
+        )
+        transport_combo = ttk.Combobox(
+            transport_opts,
+            textvariable=self.transport_var,
+            values=("rpc", "headless"),
+            width=12,
+            state="readonly",
+        )
+        transport_combo.pack(side="left", padx=6)
+        Tooltip(
+            transport_combo,
+            "rpc = 기존 열린 Unreal Editor 경로\n"
+            "headless = Blender 전체 export 후 UnrealEditor-Cmd 1회 배치 import",
+        )
+        self.night_headless_var = tk.BooleanVar(
+            value=bool(self.cfg.get("night_headless", True))
+        )
+        night_check = ttk.Checkbutton(
+            transport_opts,
+            text="전체 자동(야간)은 headless",
+            variable=self.night_headless_var,
+        )
+        night_check.pack(side="left", padx=(12, 0))
+        Tooltip(
+            night_check,
+            "켜면 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
+            "단독 ③ Push는 왼쪽 transport 선택을 따릅니다.",
+        )
 
         lbl = ttk.Label(opts, text="가지당 목표 본 수:")
         lbl.pack(side="left")
@@ -264,7 +330,7 @@ class App:
 
         cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status", "folder")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
-        self.tree.heading("#0", text="파일 (클릭=선택 토글)")
+        self.tree.heading("#0", text="파일 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
         self.tree.column("#0", width=310, anchor="w")
         headers = {
             "bone_mode": ("본 모드 (▼ 클릭)", 135),
@@ -279,6 +345,7 @@ class App:
             self.tree.column(key, width=width, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6)
         self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<Control-c>", self.copy_selected_paths, add="+")
 
         logf = ttk.LabelFrame(self.root, text="로그", padding=4)
         logf.pack(fill="both", padx=6, pady=4)
@@ -390,6 +457,7 @@ class App:
                     str(spm.parent),
                 ),
             )
+        self.checked_rows.sync_after_reload()
         save_state(self.state)
         cache_count = sum(
             1
@@ -411,6 +479,9 @@ class App:
         mark = CHECK_ON if item["checked"] else CHECK_OFF
         lock = "🔒 " if item.get("manual_bones_locked", False) else ""
         return f"{mark} {lock}{item['spm'].name}"
+
+    def _redraw_checked_row(self, iid, _item):
+        self.tree.item(iid, text=self._item_label(iid))
 
     def _bone_mode_label(self, iid):
         if self.items[iid].get("manual_bones_locked", False):
@@ -471,9 +542,13 @@ class App:
         if iid not in self.items:
             return
         if region == "tree":
-            item = self.items[iid]
-            item["checked"] = not item["checked"]
-            self.tree.item(iid, text=self._item_label(iid))
+            # Returning "break" suppresses Treeview's native selection, so
+            # select explicitly.  Ctrl+C must copy the row the user just hit,
+            # not every checked execution target or a stale prior selection.
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.focus_set()
+            self.checked_rows.click(iid)
             return "break"
         if region != "cell":
             return
@@ -506,9 +581,20 @@ class App:
     def _set_all(self, checked):
         if self.worker and self.worker.is_alive():
             return
-        for iid, item in self.items.items():
-            item["checked"] = checked
-            self.tree.item(iid, text=self._item_label(iid))
+        self.checked_rows.set_all(checked)
+
+    def copy_selected_paths(self, _event=None):
+        count = copy_selected_row_paths(
+            self.root,
+            self.tree,
+            self.items,
+            lambda item: item.get("spm"),
+        )
+        if count:
+            self.progress_var.set(f"SPM 경로 복사 완료 · {count}개")
+        else:
+            self.progress_var.set("복사할 SPM 행을 먼저 클릭하세요")
+        return "break"
 
     def _set_bone_mode(self, iid, mode):
         if iid not in self.items or mode not in {"auto", "manual"}:
@@ -556,6 +642,9 @@ class App:
             cfg["target_bones_per_branch"] = float(self.target_var.get())
             cfg["max_total_bones"] = int(self.maxtotal_var.get())
             cfg["spm_parallel_jobs"] = max(1, int(self.parallel_var.get()))
+            transport = self.transport_var.get()
+            cfg["push_transport"] = transport if transport in {"rpc", "headless"} else "rpc"
+            cfg["night_headless"] = bool(self.night_headless_var.get())
         except (AttributeError, tk.TclError):
             pass
         return cfg
@@ -609,6 +698,7 @@ class App:
         self.cfg = self._collect_cfg()
         self.spm_calibration_signature = calibration_settings_signature(self.cfg)
         save_config(self.cfg)
+        self.active_push_transport = self.cfg.get("push_transport", "rpc")
         # snapshot tk vars on the main thread; the worker must not touch them
         self.force_rerun = bool(self.force_var.get())
         self.stop_flag.clear()
@@ -633,6 +723,11 @@ class App:
         self.cfg = self._collect_cfg()
         self.spm_calibration_signature = calibration_settings_signature(self.cfg)
         save_config(self.cfg)
+        self.active_push_transport = (
+            "headless"
+            if self.cfg.get("night_headless", True)
+            else self.cfg.get("push_transport", "rpc")
+        )
         self.force_rerun = bool(self.force_var.get())
         self.stop_flag.clear()
         self.batch_progress.configure(value=0)
@@ -684,13 +779,47 @@ class App:
         # racing a direct parent-only kill that would orphan SpeedTree children.
         self.log("중지 요청됨 — 실행 중인 작업과 SpeedTree 자식을 종료합니다.")
 
+    def _record_phase_status(
+        self, iid, column, status_text, kind, reason, details=None, persist=True
+    ):
+        """Write the same structured item outcome to GUI and persistent state."""
+        self.ui_queue.put(("cell", (iid, column, status_text)))
+        with self.state_lock:
+            state_entry = self.state.setdefault(iid, {})
+            state_entry[column] = status_text
+            state_entry[f"{column}_kind"] = kind
+            error_entry = {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "kind": kind,
+                "message": reason,
+            }
+            if details:
+                error_entry.update(details)
+            state_entry[f"{column}_error"] = error_entry
+            if persist:
+                save_state(self.state)
+
+    @staticmethod
+    def _failure_status_text(reason, kind):
+        if kind == "manual_required":
+            return reason
+        if kind in PUSH_ABORT_KINDS:
+            return f"중단: {reason}"
+        return f"실패: {reason}"
+
     def _run_batch(self, phase, targets, emit_done=True):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self._phase_abort_reason = None
         if phase == "spm":
             targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
-            targets = self._push_preflight(targets)
+            targets, preflight_abort = self._push_preflight(targets)
+            if preflight_abort:
+                self._phase_abort_reason = preflight_abort
+                if emit_done:
+                    self.ui_queue.put(("progress", f"Unreal Push 중단 — {preflight_abort}"))
+                    self.ui_queue.put(("done", None))
+                return False
             if not targets:
                 self.log("push 가능한 항목이 없습니다. (준비 검사 결과를 표에서 확인)")
                 if emit_done:
@@ -700,6 +829,11 @@ class App:
         titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Repair", "push": "Unreal Push"}
         column_by_phase = {"check": "spm_status", "spm": "spm_status",
                            "blender": "blend_status", "push": "push_status"}
+        if (
+            phase == "push"
+            and getattr(self, "active_push_transport", "rpc") == "headless"
+        ):
+            return self._run_headless_push_batch(targets, emit_done=emit_done)
         title = titles[phase]
         column = column_by_phase[phase]
         total = len(targets)
@@ -707,6 +841,7 @@ class App:
         self._batch_done = 0
         self._batch_active = 0
         phase_abort = threading.Event()
+        attempted = set()
 
         def run_one(item):
             if self.stop_flag.is_set():
@@ -714,6 +849,7 @@ class App:
             spm = item["spm"]
             iid = str(spm)
             with self.state_lock:
+                attempted.add(iid)
                 self._batch_active += 1
                 active = self._batch_active
                 done = self._batch_done
@@ -731,24 +867,32 @@ class App:
                     self._job_push(iid, spm)
             except Exception as exc:
                 reason = compact_error_message(exc)
-                manual_required = phase == "push" and "수동 처리 필요" in reason
-                status_text = reason if manual_required else f"실패: {reason}"
-                tag = "수동" if manual_required else "실패"
+                kind = getattr(exc, "kind", "data_error")
+                if phase == "push" and kind == "data_error" and "시간 초과" in reason:
+                    kind = "push_timeout"
+                    reason = "Push 작업 시간 초과 — Unreal/RPC 상태 확인 필요"
+                status_text = self._failure_status_text(reason, kind)
+                tag = {
+                    "manual_required": "수동",
+                    "unreal_crash": "Unreal 중단",
+                    "unreal_unavailable": "Unreal 중단",
+                    "rpc_timeout": "RPC 중단",
+                    "push_timeout": "Push 중단",
+                }.get(kind, "실패")
                 self.log(f"[{tag}] {spm.name}: {reason}")
-                self.ui_queue.put(("cell", (iid, column, status_text)))
-                with self.state_lock:
-                    state_entry = self.state.setdefault(iid, {})
-                    state_entry[column] = status_text
-                    state_entry[f"{column}_error"] = {
-                        "time": datetime.now().isoformat(timespec="seconds"),
-                        "message": reason,
-                    }
-                    save_state(self.state)
-                if phase == "push" and reason.startswith("Unreal 연결 실패"):
+                details = {}
+                if getattr(exc, "log_file", None):
+                    details["log"] = str(exc.log_file)
+                if getattr(exc, "report_file", None):
+                    details["report"] = str(exc.report_file)
+                self._record_phase_status(
+                    iid, column, status_text, kind, reason, details=details
+                )
+                if phase == "push" and kind in PUSH_ABORT_KINDS:
                     self._phase_abort_reason = reason
                     phase_abort.set()
                     self.log(
-                        "[Push 단계 중단] Unreal RPC 연결이 끊겨 남은 항목을 실행하지 않습니다."
+                        "[Push 단계 중단] Unreal/RPC 상태가 안전하지 않아 남은 항목을 실행하지 않습니다."
                     )
             finally:
                 with self.state_lock:
@@ -780,10 +924,31 @@ class App:
                     break
                 run_one(item)
 
+        if phase_abort.is_set():
+            deferred_reason = f"Unreal/RPC 중단으로 미실행 — {self._phase_abort_reason}"
+            for item in targets:
+                iid = str(item["spm"])
+                if iid in attempted:
+                    continue
+                self._record_phase_status(
+                    iid,
+                    column,
+                    deferred_reason,
+                    "not_run_unreal",
+                    deferred_reason,
+                    persist=False,
+                )
+                self.log(f"[미실행] {item['spm'].name}: {deferred_reason}")
+
         with self.state_lock:
             save_state(self.state)
         if emit_done:
-            self.ui_queue.put(("progress", "대기"))
+            progress = (
+                f"{title} 중단 — {self._phase_abort_reason}"
+                if phase_abort.is_set()
+                else "대기"
+            )
+            self.ui_queue.put(("progress", progress))
             self.ui_queue.put(("done", None))
         self.log(f"{title} 배치 종료.")
         return not phase_abort.is_set()
@@ -804,10 +969,16 @@ class App:
             return ""
 
     def _run_limited(
-        self, cmd, log_name, timeout, affinity=True, progress_callback=None
+        self, cmd, log_name, timeout, affinity=True, progress_callback=None, env=None
     ):
         log_file = LOG_DIR / log_name
-        proc = launch_limited(cmd, self.cfg, log_file=str(log_file), affinity=affinity)
+        proc = launch_limited(
+            cmd,
+            self.cfg,
+            log_file=str(log_file),
+            affinity=affinity,
+            env=env,
+        )
         with self.procs_lock:
             self.active_procs.add(proc)
         try:
@@ -822,9 +993,11 @@ class App:
                 if time.time() > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
-                    raise RuntimeError(
+                    timeout_error = RuntimeError(
                         f"시간 초과({timeout}s){detail} — 로그: {log_file}"
                     )
+                    timeout_error.log_file = log_file
+                    raise timeout_error
                 now = time.monotonic()
                 if progress_callback is not None and now >= next_progress:
                     progress_callback(
@@ -1142,13 +1315,44 @@ class App:
         self.log(f"repair 완료: {blend.name}")
 
     def _push_preflight(self, targets):
-        """push 시작 전에 전 항목 준비 검사. 준비된 항목만 반환."""
+        """Return (ready items, fatal Unreal reason) after recording all skips."""
         self.log("push 준비 검사 중...")
-        if not self._unreal_running():
-            self.log("[중단] 언리얼 에디터가 실행 중이 아닙니다. MyProject2를 먼저 열어주세요.")
+        transport = getattr(
+            self,
+            "active_push_transport",
+            self.cfg.get("push_transport", "rpc"),
+        )
+        if transport == "rpc" and not self._unreal_running():
+            reason = "Unreal Editor 종료 — MyProject2가 실행 중이 아님"
+            self.log(f"[중단] {reason}")
             for item in targets:
-                self.ui_queue.put(("cell", (str(item["spm"]), "push_status", "언리얼 에디터 꺼짐")))
-            return []
+                iid = str(item["spm"])
+                self._record_phase_status(
+                    iid,
+                    "push_status",
+                    f"중단: {reason}",
+                    "unreal_unavailable",
+                    reason,
+                    persist=False,
+                )
+            with self.state_lock:
+                save_state(self.state)
+            return [], reason
+        if transport == "headless" and self._unreal_running():
+            reason = "headless Push는 자산 잠금 충돌 방지를 위해 Unreal Editor를 닫아야 함"
+            self.log(f"[중단] {reason}")
+            for item in targets:
+                self._record_phase_status(
+                    str(item["spm"]),
+                    "push_status",
+                    f"중단: {reason}",
+                    "unreal_unavailable",
+                    reason,
+                    persist=False,
+                )
+            with self.state_lock:
+                save_state(self.state)
+            return [], reason
         ready = []
         for item in targets:
             spm = item["spm"]
@@ -1156,9 +1360,20 @@ class App:
             if ok:
                 ready.append(item)
             else:
-                self.ui_queue.put(("cell", (str(spm), "push_status", why)))
+                status_text = f"건너뜀: {why}"
+                self._record_phase_status(
+                    str(spm),
+                    "push_status",
+                    status_text,
+                    "preflight_skip",
+                    why,
+                    persist=False,
+                )
+                self.log(f"[준비 안 됨] {spm.name}: {why}")
+        with self.state_lock:
+            save_state(self.state)
         self.log(f"준비 검사: {len(ready)}/{len(targets)}개 push 가능.")
-        return ready
+        return ready, None
 
     @staticmethod
     def _unreal_running():
@@ -1168,16 +1383,495 @@ class App:
         )
         return "UnrealEditor.exe" in (result.stdout or "")
 
+    def _set_push_state(self, iid, kind, status_text, details=None, message=None):
+        self.ui_queue.put(("cell", (iid, "push_status", status_text)))
+        with self.state_lock:
+            entry = self.state.setdefault(iid, {})
+            error_message = message or status_text
+            existing_error = entry.get("push_status_error") or {}
+            unchanged = (
+                entry.get("push_status") == status_text
+                and entry.get("push_status_kind") == kind
+                and (not details or entry.get("push_paths") == details)
+                and (
+                    kind in {"exported_pending_unreal", "importing", "imported_ok"}
+                    or (
+                        existing_error.get("kind") == kind
+                        and existing_error.get("message") == error_message
+                    )
+                )
+            )
+            if unchanged:
+                return
+            entry["push_status"] = status_text
+            entry["push_status_kind"] = kind
+            if kind in {"exported_pending_unreal", "importing", "imported_ok"}:
+                entry.pop("push_status_error", None)
+            else:
+                error = {
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "kind": kind,
+                    "message": error_message,
+                }
+                if details:
+                    error.update(details)
+                entry["push_status_error"] = error
+            if details:
+                entry["push_paths"] = details
+            save_state(self.state)
+
+    def _push_dependency_paths(self):
+        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        return [
+            TOOL_DIR / "jobs" / "send2ue_push_job.py",
+            TOOL_DIR / "unreal_ingest.py",
+            send2ue_dir / "core" / "export.py",
+            send2ue_dir / "core" / "ingest.py",
+            send2ue_dir / "dependencies" / "unreal.py",
+            send2ue_dir / "resources" / "extensions" / "send2ue_material_pipeline.py",
+            send2ue_dir / "resources" / "pipeline" / "ue_material_setup.py",
+            Path(
+                r"C:\Users\PARK\Documents\GitHub\ue-unique-export-names-addon"
+                r"\ue_unique_export_names_addon\unreal_material_json.py"
+            ),
+        ]
+
+    def _source_push_fingerprint(self, blend):
+        return push_source_fingerprint(blend, self._push_dependency_paths())
+
+    def _cached_manifest_item(self, iid, source_fingerprint):
+        if self.force_rerun:
+            return None
+        cache = self.state.get(iid, {}).get("push_export_cache") or {}
+        if cache.get("source_fingerprint") != source_fingerprint:
+            return None
+        manifest_path = Path(cache.get("manifest", ""))
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            item = (manifest.get("items") or [])[0]
+        except (OSError, ValueError, IndexError, TypeError):
+            return None
+        if str(item.get("queue_id")) != iid or not manifest_item_files_match(item):
+            return None
+        return item
+
+    def _export_manifest_item(self, iid, spm, batch_stamp):
+        blend = blend_path_for(spm)
+        source_fingerprint = self._source_push_fingerprint(blend)
+        cached = self._cached_manifest_item(iid, source_fingerprint)
+        import_report = LOG_DIR / f"{spm.stem}_unreal_{batch_stamp}.json"
+        if cached is not None:
+            cached = dict(cached)
+            cached["report_path"] = str(import_report.resolve())
+            details = {
+                "manifest": self.state[iid]["push_export_cache"]["manifest"],
+                "export_report": cached.get("export_report_path", ""),
+                "import_report": str(import_report),
+                "cache": "hit",
+            }
+            self._set_push_state(
+                iid,
+                "exported_pending_unreal",
+                "export 완료 · Unreal 대기 (cache)",
+                details=details,
+            )
+            self.log(f"[export cache] {spm.name}: {cached['fingerprint']}")
+            return cached
+
+        cache_root = LOG_DIR / "send2ue_export_cache" / source_fingerprint / spm.stem
+        manifest_path = LOG_DIR / f"{spm.stem}_manifest_{source_fingerprint}.json"
+        export_report = LOG_DIR / f"{spm.stem}_export_{source_fingerprint}.json"
+        export_log_name = f"{spm.stem}_export_{batch_stamp}.log"
+        checkpoint_path = LOG_DIR / f"{spm.stem}_rpc_checkpoint_{batch_stamp}.json"
+        batch_report = LOG_DIR / f"{spm.stem}_rpc_batch_{batch_stamp}.json"
+        send2ue_unreal_py = (
+            Path(self.cfg["send2ue_dir"]) / "dependencies" / "unreal.py"
+        )
+        cmd = [
+            self.cfg["blender_exe"],
+            "--factory-startup",
+            "-b",
+            str(blend),
+            "--python",
+            str(TOOL_DIR / "jobs" / "send2ue_push_job.py"),
+            "--",
+            "--transport",
+            "headless_export",
+            "--report",
+            str(export_report),
+            "--manifest",
+            str(manifest_path),
+            "--checkpoint",
+            str(checkpoint_path),
+            "--batch-report",
+            str(batch_report),
+            "--item-import-report",
+            str(import_report),
+            "--export-root",
+            str(cache_root),
+            "--queue-id",
+            iid,
+            "--source-fingerprint",
+            source_fingerprint,
+            "--unreal-ingest",
+            str(TOOL_DIR / "unreal_ingest.py"),
+            "--send2ue-unreal-py",
+            str(send2ue_unreal_py),
+            "--max-push-polygons",
+            str(self.cfg.get("push_max_polygons", 2_000_000)),
+            "--max-push-bones",
+            str(self.cfg.get("push_max_bones", 1_500)),
+        ]
+        code, log_file = self._run_limited(
+            cmd,
+            export_log_name,
+            self.cfg.get("push_job_timeout", 1800),
+        )
+        result = load_job_report(export_report)
+        if code != 0 or result.get("status") != "exported_pending_unreal":
+            reason = summarize_job_failure(result, log_file)
+            raise BatchItemError(
+                reason,
+                kind=classify_push_failure(result, log_file),
+                report=result,
+                log_file=log_file,
+                report_file=export_report,
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            item = (manifest.get("items") or [])[0]
+        except (OSError, ValueError, IndexError, TypeError) as exc:
+            raise BatchItemError(
+                f"manifest read failed: {exc}",
+                kind="data_error",
+                log_file=log_file,
+                report_file=export_report,
+            ) from exc
+        if not manifest_item_files_match(item):
+            raise BatchItemError(
+                "manifest exported-file fingerprint verification failed",
+                kind="data_error",
+                log_file=log_file,
+                report_file=export_report,
+            )
+
+        post_export_source_fingerprint = self._source_push_fingerprint(blend)
+        self.state.setdefault(iid, {})["push_export_cache"] = {
+            "source_fingerprint": post_export_source_fingerprint,
+            "manifest": str(manifest_path),
+            "fingerprint": item["fingerprint"],
+        }
+        details = {
+            "manifest": str(manifest_path),
+            "export_report": str(export_report),
+            "export_log": str(log_file),
+            "import_report": str(import_report),
+            "cache": "miss",
+        }
+        self._set_push_state(
+            iid,
+            "exported_pending_unreal",
+            "export 완료 · Unreal 대기",
+            details=details,
+        )
+        return item
+
+    def _sync_headless_checkpoint(self, checkpoint_path, item_by_id, log_file=None):
+        try:
+            checkpoint = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        labels = {
+            "importing": "Unreal import 중...",
+            "imported_ok": "완료 (headless)",
+            "data_error": "실패: data error",
+            "manual_required": "수동 처리 필요",
+            "unreal_crash": "Unreal commandlet crash",
+            "not_run": "미실행",
+        }
+        for queue_id, result in (checkpoint.get("items") or {}).items():
+            if queue_id not in item_by_id:
+                continue
+            status = result.get("status", "not_run")
+            message = result.get("message") or labels.get(status, status)
+            text = labels.get(status, status)
+            if status in {"data_error", "manual_required", "unreal_crash", "not_run"}:
+                text = f"{text}: {compact_error_message(message, 80)}"
+            item = item_by_id[queue_id]
+            details = {
+                "manifest": str(item.get("batch_manifest", "")),
+                "checkpoint": str(checkpoint_path),
+                "report": str(item.get("report_path", "")),
+                "batch_report": str(item.get("batch_report", "")),
+            }
+            if log_file:
+                details["log"] = str(log_file)
+            if status == "imported_ok":
+                self.state.setdefault(queue_id, {})["push_import_fingerprint"] = item[
+                    "fingerprint"
+                ]
+            self._set_push_state(
+                queue_id,
+                status,
+                text,
+                details=details,
+                message=message,
+            )
+        return checkpoint
+
+    @staticmethod
+    def _record_headless_process_exit(checkpoint_path, max_item_crash_retries):
+        checkpoint_path = Path(checkpoint_path)
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        current_id = checkpoint.get("current_item")
+        state = (checkpoint.get("items") or {}).get(current_id)
+        if not current_id or not state or state.get("status") != "importing":
+            return checkpoint
+        crash_count = int(state.get("crash_count", 0)) + 1
+        status = (
+            "manual_required"
+            if crash_count > int(max_item_crash_retries)
+            else "unreal_crash"
+        )
+        message = (
+            f"Unreal commandlet crash retry limit exceeded ({max_item_crash_retries})"
+            if status == "manual_required"
+            else "UnrealEditor-Cmd exited while this item was importing"
+        )
+        state.update(
+            {
+                "status": status,
+                "crash_count": crash_count,
+                "message": message,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        checkpoint["current_item"] = None
+        checkpoint["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        atomic_write_json(checkpoint_path, checkpoint)
+        return checkpoint
+
+    def _run_headless_push_batch(self, targets, emit_done=True):
+        batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        total = len(targets)
+        self.ui_queue.put(("batch_progress", (0, total)))
+        exported = []
+        for index, item in enumerate(targets, 1):
+            if self.stop_flag.is_set():
+                break
+            spm = item["spm"]
+            iid = str(spm)
+            self.ui_queue.put(("cell", (iid, "push_status", "Send2UE export 중...")))
+            try:
+                exported.append(self._export_manifest_item(iid, spm, batch_stamp))
+            except Exception as exc:
+                reason = compact_error_message(exc)
+                kind = getattr(exc, "kind", "data_error")
+                details = {}
+                if getattr(exc, "log_file", None):
+                    details["log"] = str(exc.log_file)
+                if getattr(exc, "report_file", None):
+                    details["report"] = str(exc.report_file)
+                self._set_push_state(
+                    iid,
+                    kind,
+                    self._failure_status_text(reason, kind),
+                    details=details,
+                    message=reason,
+                )
+                self.log(f"[headless export {kind}] {spm.name}: {reason}")
+            self.ui_queue.put(("batch_progress", (index, total)))
+
+        if self.stop_flag.is_set():
+            for item in targets:
+                iid = str(item["spm"])
+                if self.state.get(iid, {}).get("push_status_kind") not in {
+                    "exported_pending_unreal", "imported_ok", "data_error", "manual_required"
+                }:
+                    self._set_push_state(iid, "not_run", "미실행: 사용자 중지")
+            if emit_done:
+                self.ui_queue.put(("progress", "중지됨"))
+                self.ui_queue.put(("done", None))
+            return False
+
+        pending = []
+        for item in exported:
+            iid = str(item["queue_id"])
+            entry = self.state.setdefault(iid, {})
+            if (
+                not self.force_rerun
+                and entry.get("push_import_fingerprint") == item["fingerprint"]
+            ):
+                self._set_push_state(iid, "imported_ok", "완료 (import cache)")
+                continue
+            pending.append(item)
+
+        if not pending:
+            if emit_done:
+                self.ui_queue.put(("progress", "Unreal Push 완료 (cache)"))
+                self.ui_queue.put(("done", None))
+            return True
+
+        manifest_path = LOG_DIR / f"headless_queue_{batch_stamp}.json"
+        checkpoint_path = LOG_DIR / f"headless_queue_{batch_stamp}_checkpoint.json"
+        report_path = LOG_DIR / f"headless_queue_{batch_stamp}_report.json"
+        for item in pending:
+            item["batch_manifest"] = str(manifest_path)
+            item["batch_report"] = str(report_path)
+        manifest = {
+            "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint_path": str(checkpoint_path),
+            "report_path": str(report_path),
+            "max_item_crash_retries": int(
+                self.cfg.get("headless_item_crash_retries", 2)
+            ),
+            "items": pending,
+        }
+        atomic_write_json(manifest_path, manifest)
+        item_by_id = {str(item["queue_id"]): item for item in pending}
+
+        commandlet = self.cfg["unreal_editor_cmd"]
+        project = self.cfg["unreal_project"]
+        runner = TOOL_DIR / "unreal_ingest.py"
+        cmd = [
+            commandlet,
+            project,
+            "-run=pythonscript",
+            f"-script={runner}",
+            "-unattended",
+            "-NoSplash",
+            "-NoSound",
+            "-UTF8Output",
+        ]
+        env = os.environ.copy()
+        env.update(
+            {
+                "SK_BATCH_MANIFEST_PATH": str(manifest_path.resolve()),
+                "SK_BATCH_CHECKPOINT_PATH": str(checkpoint_path.resolve()),
+                "SK_BATCH_REPORT_PATH": str(report_path.resolve()),
+            }
+        )
+        max_restarts = max(0, int(self.cfg.get("headless_batch_max_restarts", 10)))
+        complete = False
+        last_log = None
+        for launch_index in range(max_restarts + 1):
+            if self.stop_flag.is_set():
+                break
+            self.log(
+                f"UnrealEditor-Cmd headless 시작 ({launch_index + 1}/{max_restarts + 1})"
+            )
+            attempt_log = LOG_DIR / (
+                f"headless_unreal_{batch_stamp}_{launch_index + 1}.log"
+            )
+            last_log = attempt_log
+            try:
+                code, last_log = self._run_limited(
+                    cmd,
+                    attempt_log.name,
+                    self.cfg.get("headless_job_timeout", 14_400),
+                    affinity=False,
+                    progress_callback=lambda _elapsed, _line: self._sync_headless_checkpoint(
+                        checkpoint_path,
+                        item_by_id,
+                        attempt_log,
+                    ),
+                    env=env,
+                )
+            except Exception as exc:
+                code = -1
+                self.log(f"[headless watchdog] {exc}")
+            checkpoint = self._sync_headless_checkpoint(
+                checkpoint_path,
+                item_by_id,
+                last_log,
+            )
+            complete = bool(checkpoint.get("complete")) and report_path.is_file()
+            if complete:
+                break
+            checkpoint = self._record_headless_process_exit(
+                checkpoint_path,
+                manifest["max_item_crash_retries"],
+            )
+            self._sync_headless_checkpoint(
+                checkpoint_path,
+                item_by_id,
+                last_log,
+            )
+            self.log(
+                f"[headless watchdog] commandlet 종료 code={code}; checkpoint 재개"
+            )
+
+        if not complete:
+            checkpoint = self._sync_headless_checkpoint(
+                checkpoint_path,
+                item_by_id,
+                last_log,
+            )
+            terminal = {
+                "imported_ok",
+                "data_error",
+                "manual_required",
+                "unreal_crash",
+            }
+            for iid in item_by_id:
+                status = (checkpoint.get("items") or {}).get(iid, {}).get("status")
+                if status not in terminal:
+                    self._set_push_state(
+                        iid,
+                        "not_run",
+                        "미실행: headless watchdog 재시작 상한 초과",
+                        details={
+                            "manifest": str(manifest_path),
+                            "checkpoint": str(checkpoint_path),
+                            "log": str(last_log or ""),
+                        },
+                    )
+            self._phase_abort_reason = "headless watchdog 재시작 상한 초과"
+
+        with self.state_lock:
+            save_state(self.state)
+        if emit_done:
+            self.ui_queue.put(
+                ("progress", "Unreal Push 완료" if complete else self._phase_abort_reason)
+            )
+            self.ui_queue.put(("done", None))
+        return complete
+
     def _job_push(self, iid, spm):
         blend = blend_path_for(spm)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log(f"Unreal push 시작: {blend.name}")
         self.ui_queue.put(("cell", (iid, "push_status", "push 중...")))
         job_report = LOG_DIR / f"{spm.stem}_push_{stamp}.json"
+        manifest_path = LOG_DIR / f"{spm.stem}_rpc_manifest_{stamp}.json"
+        checkpoint_path = LOG_DIR / f"{spm.stem}_rpc_checkpoint_{stamp}.json"
+        batch_report = LOG_DIR / f"{spm.stem}_rpc_batch_{stamp}.json"
+        import_report = LOG_DIR / f"{spm.stem}_rpc_unreal_{stamp}.json"
+        export_root = LOG_DIR / "send2ue_rpc_export" / stamp / spm.stem
+        source_fingerprint = self._source_push_fingerprint(blend)
+        send2ue_unreal_py = (
+            Path(self.cfg["send2ue_dir"]) / "dependencies" / "unreal.py"
+        )
         cmd = [
             self.cfg["blender_exe"], "--factory-startup", "-b", str(blend),
             "--python", str(TOOL_DIR / "jobs" / "send2ue_push_job.py"), "--",
             "--report", str(job_report),
+            "--transport", "rpc",
+            "--manifest", str(manifest_path),
+            "--checkpoint", str(checkpoint_path),
+            "--batch-report", str(batch_report),
+            "--item-import-report", str(import_report),
+            "--export-root", str(export_root),
+            "--queue-id", iid,
+            "--source-fingerprint", source_fingerprint,
+            "--unreal-ingest", str(TOOL_DIR / "unreal_ingest.py"),
+            "--send2ue-unreal-py", str(send2ue_unreal_py),
             "--max-push-polygons", str(self.cfg.get("push_max_polygons", 2_000_000)),
             "--max-push-bones", str(self.cfg.get("push_max_bones", 1_500)),
             "--rpc-timeout-min", str(self.cfg.get("push_rpc_timeout_min", 180)),
@@ -1188,13 +1882,30 @@ class App:
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             reason = summarize_job_failure(result, log_file)
+            kind = classify_push_failure(result, log_file)
             self.log(f"  [Unreal 실패 원인] {reason} — 상세 로그: {log_file}")
-            raise RuntimeError(reason)
+            raise BatchItemError(
+                reason,
+                kind=kind,
+                report=result,
+                log_file=log_file,
+                report_file=job_report,
+            )
         wind_info = result.get("wind")
         wind_ok = "wind ✓" if isinstance(wind_info, dict) and wind_info.get("ok") else "wind -"
         self.ui_queue.put(("cell", (iid, "push_status", f"완료 ({wind_ok})")))
         entry = self.state.setdefault(iid, {})
         entry["push_status"] = f"완료 {datetime.now():%m-%d %H:%M}"
+        entry["push_status_kind"] = "imported_ok"
+        entry["push_import_fingerprint"] = result.get("manifest_fingerprint")
+        entry["push_paths"] = {
+            "manifest": str(manifest_path),
+            "checkpoint": str(checkpoint_path),
+            "report": str(job_report),
+            "import_report": str(import_report),
+            "log": str(log_file),
+        }
+        entry.pop("push_status_error", None)
         save_state(self.state)
         self.log(f"push 완료: {result.get('unreal_folder', '?')}{result.get('unit_name', '')}")
 

@@ -265,6 +265,81 @@ class GeneratorSyncTests(unittest.TestCase):
                 sum(item.asset_reference_updates for item in repair.base_results), 1
             )
 
+    def test_missing_material_and_cutout_meshes_are_copied_with_new_local_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            master_assets = (
+                '<Assets><Material_v8 ID="12" Name="M_MasterLeaf">'
+                '<CutoutMeshID>18</CutoutMeshID><BackMaterialID>-1</BackMaterialID>'
+                '<SupplementalCutoutMeshIDs Count="1"><CutoutMesh ID="19" />'
+                '</SupplementalCutoutMeshIDs></Material_v8>'
+                '<Mesh ID="18" Name="MasterLeaf Cutout" />'
+                '<Mesh ID="19" Name="MasterLeaf Cutout 2" /></Assets>'
+            )
+            master_text = make_master().replace("MasterLeaf2", "12")
+            master_text = master_text.replace("<Generators>", master_assets + "<Generators>", 1)
+            target_text = with_assets(
+                make_target(),
+                [
+                    ("Material_v8", "12", "M_cluster_target"),
+                    ("Mesh", "18", "Existing target cutout"),
+                ],
+            )
+            write_spm(master, master_text)
+            write_spm(target, target_text)
+            mapping = {
+                "Leaf 2": "Leaf", "BranchBig": "Branch",
+                "BranchSmall": None, "End 2": "End",
+            }
+
+            plan = sync.build_sync_plan(master, target, mapping)
+            patched = sync.SPMDocument(
+                target, plan.patched_text, plan.compressed, full=True
+            )
+            material_id = patched.asset_id("Material_v8", "M_MasterLeaf")
+            cutout_id = patched.asset_id("Mesh", "MasterLeaf Cutout")
+            supplemental_id = patched.asset_id("Mesh", "MasterLeaf Cutout 2")
+            self.assertIsNotNone(material_id)
+            self.assertIsNotNone(cutout_id)
+            self.assertIsNotNone(supplemental_id)
+            self.assertNotEqual(material_id, "12")
+            self.assertNotEqual(cutout_id, "18")
+
+            added_leaf = next(
+                detail for result in plan.base_results
+                for detail in result.added_node_details
+                if detail["name"] == "Leaf 2"
+            )
+            added_generator = patched.by_guid[added_leaf["guid"]]
+            self.assertEqual(
+                property_value(added_generator, "Leaves:Type:0:Material"), material_id
+            )
+            material = patched.asset_elements_by_id["Material_v8"][material_id]
+            self.assertEqual(material.findtext("CutoutMeshID"), cutout_id)
+            self.assertEqual(
+                material.find("./SupplementalCutoutMeshIDs/CutoutMesh").attrib["ID"],
+                supplemental_id,
+            )
+            copied = [
+                (asset["kind"], asset["name"])
+                for result in plan.base_results for asset in result.copied_assets
+            ]
+            self.assertEqual(
+                copied,
+                [
+                    ("Material_v8", "M_MasterLeaf"),
+                    ("Mesh", "MasterLeaf Cutout"),
+                    ("Mesh", "MasterLeaf Cutout 2"),
+                ],
+            )
+
+            write_spm(target, plan.patched_text)
+            repeat = sync.build_sync_plan(master, target, mapping)
+            self.assertFalse(repeat.changed)
+            self.assertFalse(any(result.copied_assets for result in repeat.base_results))
+
     def test_scale_risk_uses_tree_radius_and_blocks_dangerous_apply(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

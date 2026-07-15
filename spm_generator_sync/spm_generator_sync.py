@@ -21,7 +21,6 @@ import base64
 import copy
 import gzip
 import hashlib
-import html
 import json
 import os
 import re
@@ -75,7 +74,7 @@ SELF_CLOSING_SECTION_RE = {
     tag: re.compile(rf"<{tag}\b[^>]*/>") for tag in ("Generators", "Links")
 }
 ASSETS_SECTION_RE = re.compile(r"<Assets(?:\s[^>]*)?>.*?</Assets>", re.DOTALL)
-ASSET_TAG_RE = re.compile(r"<(Material_v8|Mesh)\b([^>]*)>", re.DOTALL)
+ASSETS_SELF_CLOSING_RE = re.compile(r"<Assets\b[^>]*/>")
 
 
 class SyncError(RuntimeError):
@@ -171,6 +170,29 @@ def insert_links_section(text: str, replacement: str) -> str:
         if index < 0:
             raise SyncError("SPM에서 Links 섹션을 삽입할 위치를 찾지 못했습니다")
     return text[:index] + replacement + "\n" + text[index:]
+
+
+def append_assets_section(text: str, assets: list[ET.Element]) -> str:
+    """Append cloned asset definitions without reserializing existing assets."""
+    if not assets:
+        return text
+    serialized = "".join(
+        "\n\t\t" + ET.tostring(asset, encoding="unicode", short_empty_elements=True)
+        for asset in assets
+    )
+    section = ASSETS_SECTION_RE.search(text)
+    if section is not None:
+        close_at = section.end() - len("</Assets>")
+        return text[:close_at] + serialized + "\n\t" + text[close_at:]
+    self_closing = ASSETS_SELF_CLOSING_RE.search(text)
+    if self_closing is not None:
+        replacement = "<Assets>" + serialized + "\n\t</Assets>"
+        return text[:self_closing.start()] + replacement + text[self_closing.end():]
+    generators = _section_match(text, "Generators")
+    if generators is None:
+        raise SyncError("SPM에서 Assets 섹션을 삽입할 위치를 찾지 못했습니다")
+    replacement = "<Assets>" + serialized + "\n\t</Assets>\n\t"
+    return text[:generators.start()] + replacement + text[generators.start():]
 
 
 def validate_xml_text(text: str) -> None:
@@ -269,6 +291,7 @@ class BaseSyncResult:
     target_only_nodes: int = 0
     color_updates: int = 0
     asset_reference_updates: int = 0
+    copied_assets: list[dict[str, str]] = field(default_factory=list)
     created_base: bool = False
     added_node_details: list[dict[str, str]] = field(default_factory=list)
     target_only_details: list[dict[str, str]] = field(default_factory=list)
@@ -336,7 +359,12 @@ class SyncPlan:
                 f"{relation} [{item.category}] · "
                 f"공통 {item.matched_nodes}, 속성 {item.property_updates}, "
                 f"추가 예정 {item.added_nodes}, 자식 전용 {item.target_only_nodes}, "
-                f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}"
+                f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}, "
+                f"에셋 복사 {len(item.copied_assets)}"
+            )
+            lines.extend(
+                f"  + 에셋 복사: {asset['kind']} · {asset['name']} (ID {asset['id']})"
+                for asset in item.copied_assets
             )
             lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
             for detail in item.added_node_details:
@@ -388,6 +416,10 @@ class SPMDocument:
         self.asset_ids_by_name: dict[str, dict[str, str]] = {
             "Material_v8": {}, "Mesh": {},
         }
+        self.asset_elements_by_id: dict[str, dict[str, ET.Element]] = {
+            "Material_v8": {}, "Mesh": {},
+        }
+        self.pending_asset_elements: list[ET.Element] = []
         if full:
             self._index_assets(text)
         try:
@@ -403,22 +435,96 @@ class SPMDocument:
         section = ASSETS_SECTION_RE.search(text)
         if section is None:
             return
-        for match in ASSET_TAG_RE.finditer(text, section.start(), section.end()):
-            kind, attributes = match.groups()
-            id_match = re.search(r'\bID="([^"]+)"', attributes)
-            name_match = re.search(r'\bName="([^"]*)"', attributes)
-            if id_match is None or name_match is None:
+        try:
+            assets = ET.fromstring(section.group(0))
+        except ET.ParseError as exc:
+            raise SyncError(f"Assets XML 파싱 실패: {self.path.name}: {exc}") from exc
+        for asset in list(assets):
+            kind = asset.tag
+            if kind not in self.asset_names_by_id:
                 continue
-            asset_id = html.unescape(id_match.group(1))
-            asset_name = html.unescape(name_match.group(1))
+            asset_id = str(asset.attrib.get("ID", ""))
+            asset_name = str(asset.attrib.get("Name", ""))
+            if not asset_id or not asset_name:
+                continue
             self.asset_names_by_id[kind][asset_id] = asset_name
             self.asset_ids_by_name[kind][asset_name.casefold()] = asset_id
+            self.asset_elements_by_id[kind][asset_id] = asset
 
     def asset_name(self, kind: str, asset_id: str) -> str | None:
         return self.asset_names_by_id.get(kind, {}).get(str(asset_id))
 
     def asset_id(self, kind: str, asset_name: str) -> str | None:
         return self.asset_ids_by_name.get(kind, {}).get(str(asset_name).casefold())
+
+    def _next_asset_id(self, kind: str) -> str:
+        used = set(self.asset_names_by_id.get(kind, {}))
+        numeric = [int(value) for value in used if value.isdigit()]
+        candidate = max(numeric, default=-1) + 1
+        while str(candidate) in used:
+            candidate += 1
+        return str(candidate)
+
+    def copy_asset_from(
+        self,
+        source_document: "SPMDocument",
+        kind: str,
+        source_asset_id: str,
+        copied_assets: list[dict[str, str]],
+        warnings: list[str],
+    ) -> str | None:
+        """Copy one missing asset and recursively remap its dependencies."""
+        source_asset_id = str(source_asset_id)
+        source_name = source_document.asset_name(kind, source_asset_id)
+        if source_name is None:
+            warnings.append(f"마스터 에셋 정의 없음: {kind} ID {source_asset_id}")
+            return None
+        existing_id = self.asset_id(kind, source_name)
+        if existing_id is not None:
+            return existing_id
+        source_asset = source_document.asset_elements_by_id.get(kind, {}).get(source_asset_id)
+        if source_asset is None:
+            warnings.append(f"마스터 에셋 XML 없음: {kind} · {source_name}")
+            return None
+
+        clone = copy.deepcopy(source_asset)
+        clone.tail = None
+        target_asset_id = self._next_asset_id(kind)
+        clone.set("ID", target_asset_id)
+
+        # Register before recursion so cyclic BackMaterialID references cannot
+        # clone the same asset repeatedly.
+        self.asset_names_by_id[kind][target_asset_id] = source_name
+        self.asset_ids_by_name[kind][source_name.casefold()] = target_asset_id
+        self.asset_elements_by_id[kind][target_asset_id] = clone
+        self.pending_asset_elements.append(clone)
+        copied_assets.append({"kind": kind, "name": source_name, "id": target_asset_id})
+
+        if kind == "Material_v8":
+            cutout = clone.find("CutoutMeshID")
+            if cutout is not None and cutout.text not in (None, "", "-1"):
+                remapped = self.copy_asset_from(
+                    source_document, "Mesh", cutout.text, copied_assets, warnings
+                )
+                if remapped is not None:
+                    cutout.text = remapped
+            for item in clone.findall("./SupplementalCutoutMeshIDs/CutoutMesh"):
+                source_mesh_id = item.attrib.get("ID")
+                if source_mesh_id in (None, "", "-1"):
+                    continue
+                remapped = self.copy_asset_from(
+                    source_document, "Mesh", source_mesh_id, copied_assets, warnings
+                )
+                if remapped is not None:
+                    item.set("ID", remapped)
+            back = clone.find("BackMaterialID")
+            if back is not None and back.text not in (None, "", "-1"):
+                remapped = self.copy_asset_from(
+                    source_document, "Material_v8", back.text, copied_assets, warnings
+                )
+                if remapped is not None:
+                    back.text = remapped
+        return target_asset_id
 
     @classmethod
     def from_path(cls, path: Path, full: bool = True) -> "SPMDocument":
@@ -578,6 +684,7 @@ class SPMDocument:
         text = insert_links_section(text, links) if self.links_missing else replace_section(
             text, "Links", links
         )
+        text = append_assets_section(text, self.pending_asset_elements)
         return text
 
 
@@ -794,7 +901,7 @@ def remap_generator_asset_references(
     source_generator: ET.Element,
     target_generator: ET.Element,
     force: bool = False,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[dict[str, str]], list[str]]:
     """Translate source-local asset IDs into target-local IDs by asset name.
 
     Existing target asset choices remain untouched unless their current local
@@ -805,9 +912,10 @@ def remap_generator_asset_references(
     source_properties = source_generator.find("Properties")
     target_properties = target_generator.find("Properties")
     if source_properties is None or target_properties is None:
-        return 0, []
+        return 0, [], []
     target_by_name = {_property_name(item): item for item in list(target_properties)}
     updates = 0
+    copied_assets: list[dict[str, str]] = []
     warnings: list[str] = []
     for source_prop in list(source_properties):
         property_name = _property_name(source_prop)
@@ -820,13 +928,6 @@ def remap_generator_asset_references(
         source_asset_name = source_document.asset_name(kind, _property_value(source_prop))
         if source_asset_name is None:
             continue
-        target_asset_id = target_document.asset_id(kind, source_asset_name)
-        if target_asset_id is None:
-            if force:
-                warnings.append(
-                    f"대상 SPM에 같은 에셋 없음: {property_name} · {source_asset_name}"
-                )
-            continue
         current_id = _property_value(target_prop)
         current_asset_name = target_document.asset_name(kind, current_id)
         source_role = _asset_role(source_asset_name)
@@ -836,10 +937,21 @@ def remap_generator_asset_references(
             and source_role != current_role
         )
         should_update = force or current_asset_name is None or role_conflict
+        target_asset_id = target_document.asset_id(kind, source_asset_name)
+        if should_update and target_asset_id is None:
+            target_asset_id = target_document.copy_asset_from(
+                source_document,
+                kind,
+                _property_value(source_prop),
+                copied_assets,
+                warnings,
+            )
+        if target_asset_id is None:
+            continue
         if should_update and current_id != target_asset_id:
             _set_child_text(target_prop, "Value", target_asset_id)
             updates += 1
-    return updates, warnings
+    return updates, copied_assets, warnings
 
 
 def clone_subtree(
@@ -864,10 +976,11 @@ def clone_subtree(
     new_guid = _new_guid()
     _set_child_text(clone, "GUID", new_guid)
     _set_child_text(clone, "Level", str(target_parent_level + 1))
-    asset_updates, asset_warnings = remap_generator_asset_references(
+    asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
         source_document, target_document, source, clone, force=True
     )
     result.asset_reference_updates += asset_updates
+    result.copied_assets.extend(copied_assets)
     for warning in asset_warnings:
         if warning not in result.warnings:
             result.warnings.append(warning)
@@ -999,10 +1112,11 @@ def sync_subtree(
         count, names = sync_generator_properties(source, target)
         result.property_updates += count
         result.changed_properties.extend(names)
-        asset_updates, asset_warnings = remap_generator_asset_references(
+        asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
             source_document, target_document, source, target, force=False
         )
         result.asset_reference_updates += asset_updates
+        result.copied_assets.extend(copied_assets)
         for warning in asset_warnings:
             if warning not in result.warnings:
                 result.warnings.append(warning)

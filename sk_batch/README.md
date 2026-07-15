@@ -3,6 +3,10 @@
 WPO/마스크 방식 식생을 스켈레탈 메시(SK_*.spm)로 교체하는 반복 작업을
 단계별 버튼으로 자동화하는 도구. `SK_Batch.bat` 더블클릭으로 실행.
 
+트리의 G(trunk/branch 감쇠)와 R(leaf 근접도)이 SpeedTree부터 Unreal까지 갖는
+정확한 의미와 보존 규칙은 [Tree Vertex Color 계약](docs/tree_vertex_color_contract.md)을
+기준으로 한다.
+
 ## 사용 순서 (빠른 것 → 느린 것)
 
 **🔍 검사 (수정 없음)** — 표에 상태만 채운다:

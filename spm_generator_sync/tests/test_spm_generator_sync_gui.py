@@ -22,6 +22,14 @@ LOADER.exec_module(GUI)
 
 
 class GeneratorSyncGuiCacheTests(unittest.TestCase):
+    def test_gui_uses_full_sibling_engine_module(self):
+        self.assertEqual(
+            Path(GUI.engine.__file__).resolve(),
+            (TOOL_DIR / "spm_generator_sync.py").resolve(),
+        )
+        for name in ("SPMDocument", "base_role_color", "set_master", "save_manifest"):
+            self.assertTrue(hasattr(GUI.engine, name), name)
+
     def test_selected_spm_full_path_is_copied_for_everything(self):
         root = tk.Tk()
         root.withdraw()

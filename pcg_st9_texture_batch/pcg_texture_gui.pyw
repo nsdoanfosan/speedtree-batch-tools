@@ -27,7 +27,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 TOOL_DIR = Path(__file__).resolve().parent
+REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
+
+from batch_ui_common import CheckedRowController, copy_selected_row_paths
 
 from pcg_texture_common import (
     TARGETS_PATH, load_config, load_pcg_targets, save_config,
@@ -56,6 +60,21 @@ from spm_texture_normalize import (
 
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+
+
+def spm_paths_for_item(item):
+    """Return the concrete SPM paths represented by a PCG folder row."""
+
+    paths = []
+    for status in item.get("target_spm_statuses") or []:
+        path = status.get("sk_spm") or status.get("source_spm")
+        if path:
+            paths.append(path)
+    if not paths:
+        paths.extend(item.get("sk_spms") or [])
+    if not paths and item.get("chosen_spm"):
+        paths.append(item["chosen_spm"])
+    return paths
 
 
 def blender_user_startup_path(blender_exe):
@@ -174,8 +193,8 @@ class App:
         self.cfg = load_config()
         self.report = None
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
+        self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.texplan_cache = {}  # folder -> texture plan rows (선택 시 지연 계산)
-        self.select_all_armed = True
         self.worker = None
         root.title("PCG ST9 → SK 전환 준비 보드")
         root.geometry("1320x820")
@@ -249,6 +268,11 @@ class App:
         btn_open = ttk.Button(actions, text="선택 폴더 열기", command=self.open_selected_folder)
         btn_open.pack(side="left", padx=10)
         Tooltip(btn_open, "표에서 클릭한 행의 나무 폴더를 탐색기로 엽니다.")
+        btn_copy = ttk.Button(
+            actions, text="선택 SPM 경로 복사", command=self.copy_selected_paths
+        )
+        btn_copy.pack(side="left")
+        Tooltip(btn_copy, "선택한 행의 SPM 전체 경로를 복사합니다. Everything에 바로 붙여넣을 수 있습니다.")
         self.status_var = tk.StringVar(value="대기")
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
@@ -292,7 +316,7 @@ class App:
                                 "새 T_ 렌더가 성공하면 대응하는 기존 M_ 출력은 삭제합니다.")
         cols = ("pcg", "step1", "step2", "step3", "step4", "next")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
-        self.tree.heading("#0", text="나무 폴더 (클릭=선택 토글)")
+        self.tree.heading("#0", text="나무 폴더 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
         self.tree.column("#0", width=250, anchor="w")
         headers = {
             "pcg": ("PCG/레벨 사용", 145),
@@ -307,6 +331,7 @@ class App:
             self.tree.column(key, width=width, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=(0, 2))
         self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<Control-c>", self.copy_selected_paths, add="+")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.show_details())
         header_tip = ("컬럼 = 작업 순서입니다.\n"
                       "PCG/레벨 사용: 각 위치에서 사용하는 메시 이름 개수\n"
@@ -345,30 +370,30 @@ class App:
             self.root_var.set(path)
 
     def _set_all(self, checked):
-        self.select_all_armed = bool(checked)
-        for iid, entry in self.items.items():
-            entry["checked"] = checked
-            mark = CHECK_ON if checked else CHECK_OFF
-            self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
+        self.checked_rows.set_all(checked)
+
+    def _redraw_checked_row(self, iid, entry):
+        mark = CHECK_ON if entry["checked"] else CHECK_OFF
+        self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
 
     def _on_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "tree":
             return
         iid = self.tree.identify_row(event.y)
-        if iid in self.items:
-            if self.select_all_armed and all(
-                    entry["checked"] for entry in self.items.values()):
-                for other_iid, entry in self.items.items():
-                    entry["checked"] = other_iid == iid
-                    mark = CHECK_ON if entry["checked"] else CHECK_OFF
-                    self.tree.item(
-                        other_iid, text=f"{mark} {entry['item']['name']}")
-            else:
-                entry = self.items[iid]
-                entry["checked"] = not entry["checked"]
-                mark = CHECK_ON if entry["checked"] else CHECK_OFF
-                self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
-            self.select_all_armed = False
+        self.checked_rows.click(iid)
+
+    def copy_selected_paths(self, _event=None):
+        count = copy_selected_row_paths(
+            self.root,
+            self.tree,
+            self.items,
+            lambda entry: spm_paths_for_item(entry["item"]),
+        )
+        if count:
+            self.status_var.set(f"SPM 경로 복사 완료 · {count}개")
+        else:
+            self.status_var.set("복사할 SPM이 있는 행을 먼저 클릭하세요")
+        return "break"
 
     # ------------------------------------------------------------------ scan
     def refresh(self):
@@ -459,6 +484,7 @@ class App:
                     item["actions"][0] if item["actions"] else "없음 — 준비 끝 ✓",
                 ),
             )
+        self.checked_rows.sync_after_reload()
 
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):

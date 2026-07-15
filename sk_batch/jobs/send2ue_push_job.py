@@ -13,9 +13,11 @@ Steps:
      The Unreal side writes a result JSON we read back for ground truth.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,12 +43,87 @@ def parse_args():
     parser.add_argument("--max-push-polygons", type=int, default=2_000_000)
     parser.add_argument("--max-push-bones", type=int, default=1_500)
     parser.add_argument("--skip-wind", action="store_true")
+    parser.add_argument("--transport", choices=("rpc", "headless_export"), default="rpc")
+    parser.add_argument("--manifest")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--batch-report")
+    parser.add_argument("--export-root")
+    parser.add_argument("--queue-id")
+    parser.add_argument("--source-fingerprint", default="")
+    parser.add_argument("--item-import-report")
+    parser.add_argument("--unreal-ingest")
+    parser.add_argument("--send2ue-unreal-py")
     return parser.parse_args(argv)
 
 
 def write_report(path, data):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+
+
+def file_fingerprint(path):
+    candidate = Path(path)
+    hasher = hashlib.blake2b(digest_size=16)
+    with candidate.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    stat = candidate.stat()
+    return {
+        "path": str(candidate.resolve()),
+        "size": stat.st_size,
+        "fingerprint": hasher.hexdigest(),
+    }
+
+
+def manifest_asset_files(manifest_assets):
+    paths = []
+    for manifest_asset in manifest_assets:
+        asset_data = manifest_asset.get("asset_data") or {}
+        for value in (
+            asset_data.get("file_path"),
+            asset_data.get("fcurve_file_path"),
+            *(asset_data.get("lods") or {}).values(),
+        ):
+            if value and value not in paths:
+                paths.append(value)
+    missing = [str(path) for path in paths if not Path(path).is_file()]
+    if missing:
+        raise RuntimeError("Send2UE exported file missing: " + ", ".join(missing))
+    return [file_fingerprint(path) for path in paths]
+
+
+def command_json_files(manifest_assets):
+    """Return absolute JSON dependencies embedded in extension command payloads."""
+    pattern = re.compile(r'''(?i)(?:r)?["']([a-z]:[\\/][^"']+\.json)["']''')
+    paths = []
+    for manifest_asset in manifest_assets:
+        command_groups = (
+            list(manifest_asset.get("pre_import_commands") or [])
+            + list(manifest_asset.get("post_import_commands") or [])
+        )
+        for commands in command_groups:
+            for line in commands:
+                for match in pattern.findall(str(line)):
+                    path = Path(match)
+                    if path.is_file() and path not in paths:
+                        paths.append(path)
+    return paths
+
+
+def stable_fingerprint(data):
+    encoded = json.dumps(
+        data,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
 def unreal_log_checkpoint():
@@ -163,19 +240,40 @@ def adaptive_rpc_timeout(complexity, polygon_limit, bone_limit, minimum, maximum
 
 def main():
     args = parse_args()
+    report_path = Path(args.report).resolve()
+    if not args.manifest:
+        args.manifest = str(report_path.with_name(f"{report_path.stem}_manifest.json"))
+    if not args.export_root:
+        args.export_root = str(report_path.with_name(f"{report_path.stem}_export"))
+    if not args.unreal_ingest:
+        args.unreal_ingest = str(Path(__file__).resolve().parents[1] / "unreal_ingest.py")
     blend_path = bpy.data.filepath
-    report = {"blend": blend_path, "status": "failed"}
+    report = {
+        "blend": blend_path,
+        "status": "failed",
+        "stage": "startup",
+        "unreal_rpc_started": False,
+    }
     try:
         import addon_utils
 
         # --factory-startup keeps unrelated UI/GPU add-ons out of background
         # Blender, so required handoff registrations must be explicit.
+        report["stage"] = "addon_setup"
         enable_required_addon(addon_utils, "speedtree_bone_weight_repair")
         enable_required_addon(addon_utils, "ue_unique_export_names_addon")
         enable_required_addon(addon_utils, "send2ue")
 
-        from speedtree_bone_weight_repair.core import normalize_speedtree_material_textures
+        from speedtree_bone_weight_repair.core import (
+            consolidate_speedtree_group_materials,
+            normalize_speedtree_material_textures,
+        )
 
+        report["stage"] = "texture_validation"
+        material_consolidation = consolidate_speedtree_group_materials(
+            bpy.context.scene.objects
+        )
+        report["material_consolidation"] = material_consolidation
         texture_normalization = normalize_speedtree_material_textures(bpy.context.scene.objects)
         report["texture_normalization"] = texture_normalization
         if texture_normalization.get("material_count"):
@@ -194,6 +292,7 @@ def main():
                 + " | ".join(details)
             )
 
+        report["stage"] = "complexity_guard"
         complexity = export_complexity()
         report["complexity"] = complexity
         exceeded = []
@@ -215,46 +314,53 @@ def main():
                 + ". Unreal RPC를 막지 않고 이 항목을 건너뜁니다."
             )
 
-        from send2ue.core import utilities
+        from send2ue.constants import PathModes
+        from send2ue.core import ingest, utilities
+        from send2ue.dependencies import unreal as send2ue_unreal_dependency
         from send2ue.dependencies.unreal import run_commands, set_rpc_env
 
-        if not utilities.is_unreal_connected():
-            raise RuntimeError("Unreal editor is not running / RPC not reachable. Open the project first.")
+        if not args.send2ue_unreal_py:
+            args.send2ue_unreal_py = str(Path(send2ue_unreal_dependency.__file__).resolve())
 
-        # Successful calls return immediately; this only controls how long an
-        # unattended run tolerates a legitimately slow synchronous import.
-        # The same polygon/bone limits used by the manual guard provide one
-        # continuous load ratio, so light assets get the minimum and assets
-        # near the automatic-processing ceiling get the maximum.
-        rpc_timeout, rpc_load_ratio = adaptive_rpc_timeout(
-            complexity,
-            args.max_push_polygons,
-            args.max_push_bones,
-            args.rpc_timeout_min,
-            args.rpc_timeout_max,
-        )
-        set_rpc_env("RPC_TIME_OUT", rpc_timeout)
-        report["rpc_timeout_seconds"] = rpc_timeout
-        report["rpc_timeout"] = {
-            "seconds": rpc_timeout,
-            "minimum": max(60, float(args.rpc_timeout_min)),
-            "maximum": max(
-                max(60, float(args.rpc_timeout_min)),
-                float(args.rpc_timeout_max),
-            ),
-            "load_ratio": round(rpc_load_ratio, 6),
-            "polygon_ratio": round(
-                complexity["polygon_count"] / args.max_push_polygons, 6
-            ) if args.max_push_polygons > 0 else None,
-            "bone_ratio": round(
-                complexity["bone_count"] / args.max_push_bones, 6
-            ) if args.max_push_bones > 0 else None,
-        }
-        print(
-            f"[SK Batch] RPC timeout: {rpc_timeout}s "
-            f"(load {rpc_load_ratio:.1%}, range "
-            f"{args.rpc_timeout_min:g}-{args.rpc_timeout_max:g}s)"
-        )
+        if args.transport == "rpc":
+            report["stage"] = "unreal_preflight"
+            if not utilities.is_unreal_connected():
+                raise RuntimeError(
+                    "Unreal editor is not running / RPC not reachable. Open the project first."
+                )
+            report["unreal_rpc_started"] = True
+
+            rpc_timeout, rpc_load_ratio = adaptive_rpc_timeout(
+                complexity,
+                args.max_push_polygons,
+                args.max_push_bones,
+                args.rpc_timeout_min,
+                args.rpc_timeout_max,
+            )
+            set_rpc_env("RPC_TIME_OUT", rpc_timeout)
+            report["rpc_timeout_seconds"] = rpc_timeout
+            report["rpc_timeout"] = {
+                "seconds": rpc_timeout,
+                "minimum": max(60, float(args.rpc_timeout_min)),
+                "maximum": max(
+                    max(60, float(args.rpc_timeout_min)),
+                    float(args.rpc_timeout_max),
+                ),
+                "load_ratio": round(rpc_load_ratio, 6),
+                "polygon_ratio": round(
+                    complexity["polygon_count"] / args.max_push_polygons, 6
+                ) if args.max_push_polygons > 0 else None,
+                "bone_ratio": round(
+                    complexity["bone_count"] / args.max_push_bones, 6
+                ) if args.max_push_bones > 0 else None,
+            }
+            print(
+                f"[SK Batch] RPC timeout: {rpc_timeout}s "
+                f"(load {rpc_load_ratio:.1%}, range "
+                f"{args.rpc_timeout_min:g}-{args.rpc_timeout_max:g}s)"
+            )
+        else:
+            rpc_timeout = 0
 
         scene_props = bpy.context.scene.send2ue
         if hasattr(scene_props, "skip_animation_export"):
@@ -264,156 +370,213 @@ def main():
         folder = scene_props.unreal_mesh_folder_path
         report["unit_name"] = unit_name
         report["unreal_folder"] = folder
+        report["transport"] = args.transport
+
+        export_root = Path(args.export_root).resolve()
+        export_root.mkdir(parents=True, exist_ok=True)
+        scene_props.path_mode = PathModes.SEND_TO_DISK.value
+        scene_props.disk_mesh_folder_path = str(export_root)
+        scene_props.disk_animation_folder_path = str(export_root / "animations")
+        scene_props.disk_groom_folder_path = str(export_root / "groom")
 
         blend_dir = Path(blend_path).parent
         mesh_path = folder.rstrip("/") + "/" + unit_name
-
-        # The post-import material/wind pipeline saves the skeletal mesh without
-        # an interactive checkout prompt. Check out existing generated assets
-        # up front so a Perforce read-only package cannot fail after import.
-        checkout_result_path = (
-            blend_dir / "reports" / f"__skbatch_ue_checkout_{unit_name}.json"
+        wind_json = (
+            blend_dir
+            / "JSON"
+            / f"{unit_name}_dynamic_wind_import_from_megaplant_groups.json"
         )
-        checkout_result_path.parent.mkdir(parents=True, exist_ok=True)
-        if checkout_result_path.exists():
-            checkout_result_path.unlink()
-        checkout_lines = [
-            "import unreal, json, traceback",
-            "res = {'ok': False}",
-            "try:",
-            "    subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)",
-            f"    candidates = {[mesh_path, mesh_path + '_Skeleton', mesh_path + '_PhysicsAsset']!r}",
-            "    existing = [path for path in candidates if unreal.EditorAssetLibrary.does_asset_exist(path)]",
-            "    failed = [path for path in existing if not subsystem.checkout_asset(path)]",
-            "    if failed:",
-            "        raise RuntimeError('source-control checkout failed: ' + ', '.join(failed))",
-            "    res = {'ok': True, 'existing': existing, 'checked_out': existing}",
-            "except Exception as e:",
-            "    res = {'ok': False, 'error': str(e), 'trace': traceback.format_exc()}",
-            f"open({str(checkout_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
-        ]
-        run_commands(checkout_lines)
-        checkout_result = wait_for_json(
-            checkout_result_path, args.ue_timeout, "Unreal source-control checkout"
-        )
-        report["checkout"] = checkout_result
-        if not checkout_result.get("ok"):
-            raise RuntimeError(
-                f"Unreal source-control checkout failed: {checkout_result.get('error')}"
-            )
 
-        unreal_log_path, unreal_log_offset = unreal_log_checkpoint()
+        report["stage"] = "send2ue_export"
         result = bpy.ops.wm.send2ue("EXEC_DEFAULT")
         if "FINISHED" not in result:
             raise RuntimeError(f"send2ue returned {result}")
         report["send2ue"] = "FINISHED"
 
-        material_result_path = (
-            blend_dir / "reports" / f"__skbatch_ue_material_{unit_name}.json"
-        )
-        material_result_path.parent.mkdir(parents=True, exist_ok=True)
-        if material_result_path.exists():
-            material_result_path.unlink()
-        material_lines = [
-            "import unreal, json, traceback",
-            "res = {'ok': False}",
-            "try:",
-            f"    mesh_path = {mesh_path!r}",
-            "    mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)",
-            "    if not mesh:",
-            "        raise RuntimeError('mesh not found: ' + mesh_path)",
-            "    slots = list(mesh.get_editor_property('materials') or [])",
-            "    details = []",
-            "    missing = []",
-            "    for index, slot in enumerate(slots):",
-            "        slot_name = str(slot.get_editor_property('material_slot_name'))",
-            "        material = slot.get_editor_property('material_interface')",
-            "        material_path = material.get_path_name() if material else ''",
-            "        details.append({'index': index, 'slot': slot_name, 'material': material_path})",
-            "        if not material:",
-            "            missing.append('%s[%d]' % (slot_name, index))",
-            "    if not slots:",
-            "        raise RuntimeError('skeletal mesh has no material slots')",
-            "    if missing:",
-            "        raise RuntimeError('unassigned material slots: ' + ', '.join(missing))",
-            "    res = {'ok': True, 'mesh': mesh_path, 'slots': details}",
-            "except Exception as e:",
-            "    res = {'ok': False, 'error': str(e), 'trace': traceback.format_exc()}",
-            f"open({str(material_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
-        ]
-        run_commands(material_lines)
-        material_result = wait_for_json(
-            material_result_path, args.ue_timeout, "Unreal material validation"
-        )
-        report["materials"] = material_result
-        if not material_result.get("ok"):
-            raise RuntimeError(
-                f"Unreal material validation failed: {material_result.get('error')}"
-            )
-        material_names = [
-            item.get("material", "")
-            for item in texture_normalization.get("materials", [])
-        ]
-        compile_failures = target_material_compile_failures(
-            unreal_log_path, unreal_log_offset, material_names
-        )
-        report["material_compile_failures"] = compile_failures
-        if compile_failures:
-            raise RuntimeError(
-                "Unreal material compile failed after import: "
-                + compile_failures[0].splitlines()[0]
-            )
+        report["stage"] = "manifest"
+        manifest_assets = ingest.build_manifest_items(scene_props)
+        if not manifest_assets:
+            raise RuntimeError("Send2UE produced no manifest assets")
 
-        wind_json = blend_dir / "JSON" / f"{unit_name}_dynamic_wind_import_from_megaplant_groups.json"
-        if args.skip_wind:
-            report["wind"] = "skipped (flag)"
-        elif not wind_json.exists():
-            report["wind"] = f"skipped (no JSON at {wind_json})"
-        else:
-            ue_result_path = blend_dir / "reports" / f"__skbatch_ue_wind_{unit_name}.json"
-            ue_result_path.parent.mkdir(parents=True, exist_ok=True)
-            if ue_result_path.exists():
-                ue_result_path.unlink()
-            # run_commands wraps these lines in a try/except on the Unreal side;
-            # we write our own result file for ground truth either way.
-            lines = [
-                "import unreal, json, traceback",
-                "res = {'ok': False}",
-                "try:",
-                f"    mesh_path = {mesh_path!r}",
-                "    mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)",
-                "    if not mesh:",
-                f"        data = unreal.EditorAssetLibrary.list_assets({folder!r}, recursive=False)",
-                "        raise RuntimeError('mesh not found: %s (folder has: %s)' % (mesh_path, list(data)[:20]))",
-                "    if not hasattr(unreal, 'CodexDynamicWindImportLibrary'):",
-                "        raise RuntimeError('CodexDynamicWindImportLibrary missing (Codex plugin not loaded)')",
-                "    r = unreal.CodexDynamicWindImportLibrary.import_dynamic_wind_json_to_skeletal_mesh(",
-                f"        mesh, {str(wind_json)!r})",
-                "    unreal.EditorAssetLibrary.save_asset(mesh_path)",
-                f"    unreal.EditorAssetLibrary.save_directory({folder!r}, only_if_is_dirty=True)",
-                "    res = {'ok': True, 'mesh': mesh_path, 'import_result': str(r)}",
-                "except Exception as e:",
-                "    res = {'ok': False, 'error': str(e), 'trace': traceback.format_exc()}",
-                f"open({str(ue_result_path)!r}, 'w', encoding='utf-8').write(json.dumps(res))",
+        exported_files = manifest_asset_files(manifest_assets)
+        json_dir = blend_dir / "JSON"
+        handoff_paths = []
+        if json_dir.is_dir():
+            handoff_paths = [
+                path
+                for path in sorted(json_dir.glob("*.json"))
+                if unit_name.casefold() in path.stem.casefold()
             ]
-            run_commands(lines)
-            ue_result = wait_for_json(
-                ue_result_path, args.ue_timeout, "Unreal wind import"
+        for path in command_json_files(manifest_assets):
+            if path not in handoff_paths:
+                handoff_paths.append(path)
+        handoff_files = [file_fingerprint(path) for path in handoff_paths]
+        wind_file = (
+            None
+            if args.skip_wind or not wind_json.is_file()
+            else file_fingerprint(wind_json)
+        )
+        code_files = [
+            file_fingerprint(args.unreal_ingest),
+            file_fingerprint(args.send2ue_unreal_py),
+        ]
+        material_pipeline = (
+            Path(args.send2ue_unreal_py).resolve().parents[1]
+            / "resources"
+            / "pipeline"
+            / "ue_material_setup.py"
+        )
+        if material_pipeline.is_file():
+            code_files.append(file_fingerprint(material_pipeline))
+
+        contract = {
+            "schema_version": 1,
+            "source_fingerprint": args.source_fingerprint,
+            "blend": str(Path(blend_path).resolve()),
+            "unit_name": unit_name,
+            "unreal_folder": folder,
+            "mesh_path": mesh_path,
+            "assets": manifest_assets,
+            "exported_files": exported_files,
+            "handoff_files": handoff_files,
+            "wind_file": wind_file,
+            "code_files": code_files,
+        }
+        fingerprint = stable_fingerprint(contract)
+        queue_id = args.queue_id or str(Path(blend_path).resolve())
+        item_import_report = args.item_import_report or str(
+            Path(args.report).with_name(
+                f"{Path(args.report).stem}_unreal.json"
             )
-            report["wind"] = ue_result
-            if not ue_result.get("ok"):
-                raise RuntimeError(f"Unreal wind import failed: {ue_result.get('error')}")
-        report["status"] = "ok"
+        )
+        item = {
+            **contract,
+            "queue_id": queue_id,
+            "fingerprint": fingerprint,
+            "send2ue_unreal_py": str(Path(args.send2ue_unreal_py).resolve()),
+            "wind_json": None if args.skip_wind else str(wind_json),
+            "checkout_asset_paths": [
+                mesh_path,
+                mesh_path + "_Skeleton",
+                mesh_path + "_PhysicsAsset",
+            ],
+            "report_path": str(Path(item_import_report).resolve()),
+            "export_report_path": str(Path(args.report).resolve()),
+        }
+        manifest_path = Path(args.manifest).resolve()
+        checkpoint_path = Path(
+            args.checkpoint
+            or manifest_path.with_name(f"{manifest_path.stem}_checkpoint.json")
+        ).resolve()
+        batch_report_path = Path(
+            args.batch_report
+            or manifest_path.with_name(f"{manifest_path.stem}_report.json")
+        ).resolve()
+        manifest = {
+            "schema_version": 1,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "checkpoint_path": str(checkpoint_path),
+            "report_path": str(batch_report_path),
+            "max_item_crash_retries": 2,
+            "items": [item],
+        }
+        write_report(manifest_path, manifest)
+        report["manifest"] = str(manifest_path)
+        report["manifest_fingerprint"] = fingerprint
+        report["exported_files"] = exported_files
+        report["handoff_files"] = handoff_files
+        report["checkpoint"] = str(checkpoint_path)
+        report["batch_report"] = str(batch_report_path)
+        report["item_import_report"] = str(Path(item_import_report).resolve())
+
+        if args.transport == "headless_export":
+            report["stage"] = "exported_pending_unreal"
+            report["status"] = "exported_pending_unreal"
+            report["failure_kind"] = None
+        else:
+            if batch_report_path.exists():
+                batch_report_path.unlink()
+            runner_path = str(Path(args.unreal_ingest).resolve())
+            rpc_lines = [
+                "import importlib.util, sys",
+                f"_runner_path = {runner_path!r}",
+                "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
+                "if _spec is None or _spec.loader is None:",
+                "\traise RuntimeError('Could not load SK Batch Unreal ingest: ' + _runner_path)",
+                "_runner = importlib.util.module_from_spec(_spec)",
+                "sys.modules[_spec.name] = _runner",
+                "_spec.loader.exec_module(_runner)",
+                (
+                    f"_runner.run_manifest({str(manifest_path)!r}, "
+                    f"checkpoint_path={str(checkpoint_path)!r}, "
+                    f"report_path={str(batch_report_path)!r})"
+                ),
+            ]
+            report["stage"] = "rpc_ingest"
+            run_commands(rpc_lines)
+            batch_result = wait_for_json(
+                batch_report_path,
+                max(args.ue_timeout, rpc_timeout + 60),
+                "SK Batch RPC manifest ingest",
+            )
+            item_result = (batch_result.get("items") or {}).get(queue_id, {})
+            report["unreal_result"] = item_result
+            report["wind"] = item_result.get("wind")
+            report["materials"] = item_result.get("materials")
+            report["checkout"] = item_result.get("checkout")
+            if item_result.get("status") != "imported_ok":
+                report["status"] = item_result.get("status", "failed")
+                report["failure_kind"] = item_result.get("status", "data_error")
+                raise RuntimeError(
+                    item_result.get("message") or "Unreal manifest ingest failed"
+                )
+            report["stage"] = "completed"
+            report["status"] = "ok"
+            report["failure_kind"] = None
     except Exception as exc:
         editor_running = unreal_editor_running()
         report["unreal_editor_running_after_failure"] = editor_running
-        if editor_running is False:
+        error_text = str(exc)
+        lowered = error_text.lower()
+        if report.get("status") == "manual_required":
+            failure_kind = "manual_required"
+        elif (
+            report.get("stage") != "unreal_preflight"
+            and report.get("unreal_rpc_started")
+            and editor_running is False
+        ):
+            failure_kind = "unreal_crash"
+        elif any(
+            token in lowered
+            for token in (
+                'the call "import_asset" timed out',
+                "rpc timeout",
+                "rpc_time_out",
+                "no result file (timed out",
+            )
+        ):
+            failure_kind = "rpc_timeout"
+        elif any(
+            token in lowered
+            for token in (
+                "could not find an open unreal editor instance",
+                "rpc not reachable",
+                "unreal editor is not running",
+                "connectionreseterror",
+                "winerror 10054",
+            )
+        ):
+            failure_kind = "unreal_unavailable"
+        else:
+            failure_kind = "data_error"
+        report["failure_kind"] = failure_kind
+        if failure_kind == "unreal_crash":
             report["error"] = f"Unreal Editor crashed or exited during push: {exc}"
         else:
-            report["error"] = str(exc)
+            report["error"] = error_text
         report["traceback"] = traceback.format_exc()
     write_report(args.report, report)
-    if report["status"] != "ok":
+    if report["status"] not in {"ok", "exported_pending_unreal"}:
         sys.exit(1)
 
 

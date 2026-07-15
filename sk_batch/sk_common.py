@@ -35,6 +35,10 @@ PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 LOG_DIR = TOOL_DIR / "logs"
+PUSH_MANIFEST_SCHEMA_VERSION = 1
+DEFAULT_SEND2UE_DIR = Path(
+    r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
+)
 
 DEFAULT_CONFIG = {
     "root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",
@@ -59,6 +63,9 @@ DEFAULT_CONFIG = {
     # and mark it for manual handling instead of paying for more ~16s launches.
     "fast_skip_problem_spm": True,
     "rename_materials": True,    # checklist item 2: M_ prefix
+    # Direct leaf-parent Branches receive R=0 at the root and R=1 at the tip.
+    # This is tree-only and preserves the established G channel contract.
+    "tree_leaf_parent_red_gradient": True,
     "backup_spm": True,
     # SpeedTree startup is expensive, so independent SPMs run concurrently.
     # A single slow export is bounded separately by spm_verify_timeout.
@@ -78,6 +85,16 @@ DEFAULT_CONFIG = {
     # long an unattended Push tolerates a slow import before declaring failure.
     "push_rpc_timeout_min": 180,
     "push_rpc_timeout_max": 900,
+    # Preserve the established standalone Push behavior. The one-click/full
+    # unattended pipeline uses headless by default via night_headless.
+    "push_transport": "rpc",
+    "night_headless": True,
+    "unreal_editor_cmd": r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+    "unreal_project": r"C:\UnrealProjects\MyProject2\MyProject2.uproject",
+    "send2ue_dir": str(DEFAULT_SEND2UE_DIR),
+    "headless_item_crash_retries": 2,
+    "headless_batch_max_restarts": 10,
+    "headless_job_timeout": 14_400,
     "process_poll_interval": 0.2,
 }
 
@@ -87,7 +104,7 @@ PRIORITY_FLAGS = {
     "normal": 0x00000020,      # NORMAL_PRIORITY_CLASS
 }
 CREATE_NO_WINDOW = 0x08000000
-CALIBRATION_CACHE_VERSION = 1
+CALIBRATION_CACHE_VERSION = 2
 _JSON_WRITE_LOCK = threading.RLock()
 
 
@@ -104,6 +121,11 @@ def _atomic_write_json(path, data):
         finally:
             if temp.exists():
                 temp.unlink()
+
+
+def atomic_write_json(path, data):
+    """Public atomic JSON writer for queue manifests and checkpoints."""
+    _atomic_write_json(path, data)
 
 
 def load_config():
@@ -163,6 +185,57 @@ def file_content_snapshot(path):
     raise RuntimeError(f"File changed while hashing: {candidate}")
 
 
+def push_source_fingerprint(blend_path, dependency_paths=()):
+    """Fingerprint the Blender export input and code that defines its contract."""
+    dependencies = []
+    for path in dependency_paths:
+        candidate = Path(path)
+        if candidate.is_file():
+            dependencies.append(
+                {
+                    "path": str(candidate.resolve()),
+                    "fingerprint": file_content_fingerprint(candidate),
+                }
+            )
+        else:
+            dependencies.append({"path": str(candidate), "missing": True})
+    payload = {
+        "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
+        "blend": {
+            "path": str(Path(blend_path).resolve()),
+            "fingerprint": file_content_fingerprint(blend_path),
+        },
+        "dependencies": dependencies,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def manifest_item_files_match(item):
+    """Validate all cached source/export fingerprints referenced by one item."""
+    if not isinstance(item, dict) or not item.get("fingerprint"):
+        return False
+    groups = (
+        item.get("exported_files") or [],
+        item.get("handoff_files") or [],
+        [item["wind_file"]] if item.get("wind_file") else [],
+        item.get("code_files") or [],
+    )
+    for group in groups:
+        for identity in group:
+            try:
+                path = Path(identity["path"])
+                if not path.is_file():
+                    return False
+                if path.stat().st_size != identity.get("size"):
+                    return False
+                if file_content_fingerprint(path) != identity.get("fingerprint"):
+                    return False
+            except (KeyError, OSError, TypeError):
+                return False
+    return True
+
+
 def _dependency_identity(path, hash_content=False):
     candidate = Path(path) if path else None
     if not candidate or not candidate.exists():
@@ -196,6 +269,7 @@ def calibration_settings_signature(cfg):
         "fast_skip_problem_spm",
         "spm_verify_timeout",
         "rename_materials",
+        "tree_leaf_parent_red_gradient",
     )
     payload = {
         "version": CALIBRATION_CACHE_VERSION,
@@ -256,26 +330,93 @@ def _read_log_tail(path, max_bytes=65536):
         return ""
 
 
+PUSH_ABORT_KINDS = frozenset(
+    {"unreal_crash", "unreal_unavailable", "rpc_timeout", "push_timeout"}
+)
+
+
+def classify_push_failure(report=None, log_path=None):
+    """Classify whether a Push failure is item-local or poisons the UE queue."""
+    report = report if isinstance(report, dict) else {}
+    explicit = report.get("failure_kind")
+    if explicit:
+        return str(explicit)
+    if report.get("status") == "manual_required" or report.get("manual_required"):
+        return "manual_required"
+
+    text = "\n".join(
+        str(value)
+        for value in (
+            report.get("error"),
+            report.get("reason"),
+            report.get("message"),
+            report.get("traceback"),
+            report.get("trace"),
+            report.get("_report_error"),
+            _read_log_tail(log_path) if log_path else "",
+        )
+        if value
+    )
+    lowered = text.lower()
+    if "unreal editor crashed or exited during push" in lowered:
+        return "unreal_crash"
+    if any(
+        token in lowered
+        for token in (
+            'the call "import_asset" timed out',
+            "rpc timeout",
+            "rpc_time_out",
+            "no result file (timed out",
+        )
+    ):
+        return "rpc_timeout"
+    if any(
+        token in lowered
+        for token in (
+            "could not find an open unreal editor instance",
+            "rpc not reachable",
+            "unreal editor is not running",
+            "connectionreseterror",
+            "winerror 10054",
+        )
+    ):
+        if report.get("unreal_editor_running_after_failure") is False:
+            return "unreal_crash"
+        return "unreal_unavailable"
+    return "data_error"
+
+
 def summarize_job_failure(report=None, log_path=None, max_chars=100):
     """Extract a short actionable cause from Blender/Unreal reports and logs."""
     report = report if isinstance(report, dict) else {}
-    sources = []
+    report_sources = []
     for key in ("error", "reason", "message", "traceback", "trace", "_report_error"):
         value = report.get(key)
         if value:
-            sources.append(str(value))
+            report_sources.append(str(value))
     wind = report.get("wind")
     if isinstance(wind, dict):
         for key in ("error", "trace"):
             if wind.get(key):
-                sources.append(str(wind[key]))
-    if log_path:
-        sources.append(_read_log_tail(log_path))
-    text = "\n".join(sources)
+                report_sources.append(str(wind[key]))
+    report_text = "\n".join(report_sources)
+    log_text = _read_log_tail(log_path) if log_path else ""
+    text = "\n".join(value for value in (report_text, log_text) if value)
     lowered = text.lower()
 
     if "unreal editor crashed or exited during push" in lowered:
         return "Unreal Editor 크래시 — Push 중 에디터 종료"
+
+    failure_kind = classify_push_failure(report, log_path)
+    if failure_kind == "manual_required":
+        primary = report.get("error") or report.get("reason") or report.get("message")
+        return compact_error_message(primary or "Unreal Push 수동 처리 필요", max_chars)
+    if failure_kind == "rpc_timeout":
+        return "Unreal RPC 시간 초과 — 큐 응답 정지"
+    if failure_kind == "unreal_crash":
+        return "Unreal Editor 크래시 — Push 중 에디터 종료"
+    if failure_kind == "unreal_unavailable":
+        return "Unreal 연결 실패 — 에디터/RPC 응답 없음"
 
     if any(
         token in lowered
@@ -318,8 +459,12 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
         match = re.search(r"export_from_speedtree returned\s*([^\r\n]+)", text, re.IGNORECASE)
         return compact_error_message(f"Blender repair 실행 실패: {(match.group(1) if match else '').strip()}", max_chars)
 
+    # A structured report is authoritative. Blender shutdown can append noisy
+    # unregister_class exceptions after the real item error; those must never
+    # replace the cause shown in GUI/state.
+    exception_text = report_text or log_text
     exception_lines = []
-    for line in text.splitlines():
+    for line in exception_text.splitlines():
         stripped = line.strip()
         if re.match(r"^[A-Za-z_][\w.]*?(?:Error|Exception):\s*.+", stripped):
             exception_lines.append(stripped)
@@ -436,7 +581,7 @@ def set_process_affinity(pid, cores):
         kernel32.CloseHandle(handle)
 
 
-def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True):
+def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     """Start a background child at reduced priority + optional CPU affinity.
 
     Priority class and affinity are inherited by grandchildren (Blender ->
@@ -455,6 +600,7 @@ def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True):
         stdout=handle if handle else subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
         cwd=cwd,
+        env=env,
         creationflags=flags,
     )
     proc.sk_log_handle = handle  # caller closes after wait (see GUI _run_limited)

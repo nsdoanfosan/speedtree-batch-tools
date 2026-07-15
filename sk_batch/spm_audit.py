@@ -591,6 +591,367 @@ def set_prop_value(block, prop_name, new_value):
     return pat.sub(lambda m: m.group(1) + format_value(new_value) + m.group(2), block, count=1)
 
 
+def _is_leaf_generator_type(generator_type):
+    """Return whether a SpeedTree generator creates leaf geometry.
+
+    SpeedTree versions and authoring modes use labels such as ``Leaf Mesh``
+    and ``Batched Leaf``. Matching the generator *type* keeps this independent
+    of artist-controlled generator names.
+    """
+    return "leaf" in str(generator_type or "").strip().casefold()
+
+
+def _direct_vertex_color_properties(generator):
+    properties = generator.find("Properties")
+    if properties is None:
+        return {}
+    return {
+        prop.findtext("Name"): prop
+        for prop in list(properties)
+        if prop.findtext("Name")
+    }
+
+
+def _vertex_color_channel_signature(text, channel):
+    """Semantic snapshot used to prove another channel was not changed."""
+    root = ET.fromstring(text)
+    prefix = f"Vertex Color:{channel}:"
+    signature = []
+    for generator in root.findall(".//Generator"):
+        properties = _direct_vertex_color_properties(generator)
+        payload = [
+            ET.tostring(properties[name], encoding="unicode")
+            for name in sorted(properties)
+            if name.startswith(prefix)
+        ]
+        if payload:
+            signature.append(
+                (
+                    generator.findtext("GUID") or "",
+                    generator.findtext("Name") or "",
+                    tuple(payload),
+                )
+            )
+    encoded = json.dumps(signature, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _set_simple_xml_text(block, tag, text):
+    pattern = re.compile(
+        r"(<" + re.escape(tag) + r">)[^<]*(</" + re.escape(tag) + r">)",
+        re.DOTALL,
+    )
+    return pattern.sub(
+        lambda match: match.group(1) + str(text) + match.group(2),
+        block,
+        count=1,
+    )
+
+
+def _set_simple_xml_value(block, tag, value):
+    return _set_simple_xml_text(block, tag, format_value(value))
+
+
+def _linearize_spline_profile(block, prop_name):
+    """Set one SplineProperty profile to Y=X without reserializing the SPM."""
+    property_pattern = re.compile(
+        r"<SplineProperty>\s*<Name>"
+        + re.escape(prop_name)
+        + r"</Name>.*?</SplineProperty>",
+        re.DOTALL,
+    )
+    property_match = property_pattern.search(block)
+    if not property_match:
+        return block, f"missing SplineProperty: {prop_name}"
+
+    property_block = property_match.group(0)
+    profile_pattern = re.compile(
+        r"(<ProfileSpline\b[^>]*>)(.*?)(</ProfileSpline>)", re.DOTALL
+    )
+    profile_matches = list(profile_pattern.finditer(property_block))
+    if not profile_matches:
+        return block, f"missing ProfileSpline: {prop_name}"
+    if len(profile_matches) != 1:
+        return block, f"expected exactly one ProfileSpline: {prop_name}"
+    profile_match = profile_matches[0]
+
+    control_point_pattern = re.compile(
+        r"<ControlPoint>.*?</ControlPoint>", re.DOTALL
+    )
+    control_points = list(control_point_pattern.finditer(profile_match.group(2)))
+    if len(control_points) < 2:
+        return block, f"ProfileSpline needs at least two points: {prop_name}"
+
+    required_tags = ("X", "Y", "TangentX", "TangentY")
+
+    def parse_control_point(point_text, point_index):
+        values = {}
+        for tag in required_tags:
+            matches = re.findall(
+                r"<" + re.escape(tag) + r">([^<]*)</" + re.escape(tag) + r">",
+                point_text,
+            )
+            if len(matches) != 1:
+                return None, (
+                    f"ProfileSpline point {point_index} needs exactly one {tag}: "
+                    f"{prop_name}"
+                )
+            try:
+                value = float(matches[0])
+            except (TypeError, ValueError):
+                return None, (
+                    f"ProfileSpline point {point_index} has an invalid {tag}: "
+                    f"{prop_name}"
+                )
+            if not math.isfinite(value):
+                return None, (
+                    f"ProfileSpline point {point_index} has a non-finite {tag}: "
+                    f"{prop_name}"
+                )
+            values[tag] = value
+        return values, None
+
+    parsed_points = []
+    for point_index, point in enumerate(control_points):
+        values, point_error = parse_control_point(point.group(0), point_index)
+        if point_error:
+            return block, point_error
+        parsed_points.append(values)
+
+    x_values = [values["X"] for values in parsed_points]
+    if any(value < 0.0 or value > 1.0 for value in x_values):
+        return block, f"ProfileSpline X coordinates must stay in [0, 1]: {prop_name}"
+    if any(
+        current < previous
+        for previous, current in zip(x_values, x_values[1:])
+    ):
+        return block, f"ProfileSpline X coordinates are out of order: {prop_name}"
+    if not math.isclose(x_values[0], 0.0, abs_tol=1e-6) or not math.isclose(
+        x_values[-1], 1.0, abs_tol=1e-6
+    ):
+        return block, f"ProfileSpline endpoints are not 0 and 1: {prop_name}"
+
+    def patch_control_point(match):
+        point = match.group(0)
+        x_match = re.search(r"<X>([^<]*)</X>", point)
+        point = _set_simple_xml_text(point, "Y", x_match.group(1))
+        point = _set_simple_xml_value(point, "TangentX", 0.0)
+        point = _set_simple_xml_value(point, "TangentY", 0.0)
+        return point
+
+    profile_inner = control_point_pattern.sub(
+        patch_control_point, profile_match.group(2)
+    )
+    patched_control_points = list(control_point_pattern.finditer(profile_inner))
+    if len(patched_control_points) != len(parsed_points):
+        return block, f"ProfileSpline control-point count changed: {prop_name}"
+    for point_index, (original, patched_point) in enumerate(
+        zip(parsed_points, patched_control_points)
+    ):
+        patched_values, point_error = parse_control_point(
+            patched_point.group(0), point_index
+        )
+        if point_error:
+            return block, point_error
+        if not math.isclose(
+            patched_values["X"], original["X"], abs_tol=1e-12
+        ):
+            return block, f"ProfileSpline point {point_index} changed X: {prop_name}"
+        if not math.isclose(
+            patched_values["Y"], patched_values["X"], abs_tol=1e-6
+        ):
+            return block, (
+                f"ProfileSpline point {point_index} failed Y=X postcondition: "
+                f"{prop_name}"
+            )
+        if not math.isclose(
+            patched_values["TangentX"], 0.0, abs_tol=1e-6
+        ) or not math.isclose(patched_values["TangentY"], 0.0, abs_tol=1e-6):
+            return block, (
+                f"ProfileSpline point {point_index} failed zero-tangent postcondition: "
+                f"{prop_name}"
+            )
+    patched_property = (
+        property_block[: profile_match.start(2)]
+        + profile_inner
+        + property_block[profile_match.end(2) :]
+    )
+    patched_block = (
+        block[: property_match.start()]
+        + patched_property
+        + block[property_match.end() :]
+    )
+    return patched_block, None
+
+
+def _vertex_color_channel_summary(generator, channel):
+    properties = _direct_vertex_color_properties(generator)
+    style = properties.get(f"Vertex Color:{channel}:Style")
+    value = properties.get(f"Vertex Color:{channel}:Value")
+    profile = []
+    if value is not None:
+        for point in value.findall("./ProfileSpline/ControlPoint"):
+            profile.append(
+                {
+                    "x": _number(point.findtext("X")),
+                    "y": _number(point.findtext("Y")),
+                    "tangent_x": _number(point.findtext("TangentX")),
+                    "tangent_y": _number(point.findtext("TangentY")),
+                }
+            )
+    return {
+        "style": _number(style.findtext("Value")) if style is not None else None,
+        "value": _number(value.findtext("Value")) if value is not None else None,
+        "profile": profile,
+    }
+
+
+def apply_leaf_parent_red_gradient(text):
+    """Author R on direct leaf-parent Branch generators, preserving G/B/A."""
+    root = ET.fromstring(text)
+    generators = root.findall(".//Generator")
+    generator_by_guid = {
+        generator.findtext("GUID"): generator
+        for generator in generators
+        if generator.findtext("GUID")
+    }
+    nodes = root.findall(".//Node")
+    node_by_guid = {
+        node.findtext("GUID"): node
+        for node in nodes
+        if node.findtext("GUID")
+    }
+    target_info = {}
+    warnings = []
+    for leaf_node in nodes:
+        if not _is_leaf_generator_type(leaf_node.attrib.get("Type")):
+            continue
+        leaf_node_guid = leaf_node.findtext("GUID") or ""
+        parent_guid = leaf_node.findtext("ParentGUID") or ""
+        parent_node = node_by_guid.get(parent_guid)
+        if parent_node is None:
+            warnings.append(
+                f"leaf node {leaf_node_guid or '?'} has no resolvable ParentGUID"
+            )
+            continue
+        if parent_node.attrib.get("Type") != "Branch":
+            continue
+        branch_generator_guid = parent_node.findtext("GeneratorGUID") or ""
+        branch_generator = generator_by_guid.get(branch_generator_guid)
+        if branch_generator is None or branch_generator.attrib.get("Type") != "Branch":
+            warnings.append(
+                f"leaf node {leaf_node_guid or '?'} has a Branch parent whose "
+                f"GeneratorGUID is not a Branch generator: {branch_generator_guid or '?'}"
+            )
+            continue
+        leaf_generator_guid = leaf_node.findtext("GeneratorGUID") or ""
+        leaf_generator = generator_by_guid.get(leaf_generator_guid)
+        info = target_info.setdefault(
+            branch_generator_guid,
+            {
+                "guid": branch_generator_guid,
+                "name": branch_generator.findtext("Name") or "?",
+                "leaf_nodes": [],
+                "before": _vertex_color_channel_summary(branch_generator, "Red"),
+            },
+        )
+        info["leaf_nodes"].append(
+            {
+                "node_guid": leaf_node_guid,
+                "generator_guid": leaf_generator_guid,
+                "generator_name": leaf_generator.findtext("Name")
+                if leaf_generator is not None
+                else "?",
+                "generator_type": leaf_generator.attrib.get("Type", "?")
+                if leaf_generator is not None
+                else leaf_node.attrib.get("Type", "?"),
+            }
+        )
+
+    green_before = _vertex_color_channel_signature(text, "Green")
+    errors = []
+    changed_generators = []
+    out = []
+    position = 0
+    for match in GEN_RE.finditer(text):
+        block = match.group(0)
+        guid_match = FIRST_GUID_RE.search(block)
+        guid = guid_match.group(1) if guid_match else None
+        if guid in target_info:
+            style_name = "Vertex Color:Red:Style"
+            value_name = "Vertex Color:Red:Value"
+            if prop_value(block, style_name) is None:
+                errors.append(
+                    f"{target_info[guid]['name']}({guid}) has no {style_name}"
+                )
+            elif prop_value(block, value_name) is None:
+                errors.append(
+                    f"{target_info[guid]['name']}({guid}) has no {value_name}"
+                )
+            else:
+                patched = set_prop_value(block, style_name, 0.0)
+                patched = set_prop_value(patched, value_name, 1.0)
+                patched, profile_error = _linearize_spline_profile(
+                    patched, value_name
+                )
+                if profile_error:
+                    errors.append(
+                        f"{target_info[guid]['name']}({guid}): {profile_error}"
+                    )
+                elif patched != block:
+                    block = patched
+                    changed_generators.append(guid)
+        out.append(text[position : match.start()])
+        out.append(block)
+        position = match.end()
+    out.append(text[position:])
+    patched_text = "".join(out)
+
+    # Atomic patch: an unsupported target must not leave a half-authored tree.
+    if errors:
+        patched_text = text
+        changed_generators = []
+
+    patched_root = ET.fromstring(patched_text)
+    patched_by_guid = {
+        generator.findtext("GUID"): generator
+        for generator in patched_root.findall(".//Generator")
+        if generator.findtext("GUID")
+    }
+    targets = []
+    for guid, info in target_info.items():
+        after_generator = patched_by_guid.get(guid)
+        targets.append(
+            {
+                **info,
+                "after": _vertex_color_channel_summary(after_generator, "Red")
+                if after_generator is not None
+                else {},
+                "changed": guid in changed_generators,
+            }
+        )
+
+    green_after = _vertex_color_channel_signature(patched_text, "Green")
+    report = {
+        "channel": "VertexColor.R",
+        "selection": (
+            "GeneratorGUID of the immediate Branch parent Node for each "
+            "leaf-type Node, deduplicated by Branch generator GUID"
+        ),
+        "authoring": "Set (Style 0), Value 1, Profile Y=X (root 0 -> tip 1)",
+        "target_count": len(targets),
+        "leaf_node_count": sum(len(item["leaf_nodes"]) for item in targets),
+        "changed_generator_count": len(changed_generators),
+        "targets": targets,
+        "errors": errors,
+        "warnings": warnings,
+        "green_signature_before": green_before,
+        "green_signature_after": green_after,
+        "green_unchanged": green_before == green_after,
+    }
+    return patched_text, report
+
+
 def format_value(value):
     value = float(value)
     if value == int(value):
@@ -1515,6 +1876,10 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
     report["sk_readiness"] = readiness
     renames, mat_skipped = plan_material_renames(audit)
     report["skipped"].extend(mat_skipped)
+    apply_tree_red = bool(
+        cfg.get("tree_leaf_parent_red_gradient", True)
+        and classify_asset_kind(spm_path) == "tree"
+    )
 
     if not readiness["ready"]:
         report["status"] = "not-sk-ready"
@@ -1534,6 +1899,9 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
         report["bone_graph"] = audit.get("bone_graph")
+        if apply_tree_red:
+            _planned_text, vertex_report = apply_leaf_parent_red_gradient(source_text)
+            report["vertex_colors"] = vertex_report
         return report
 
     backup = None
@@ -1563,6 +1931,21 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
                 write_spm(spm_path, text)
                 report["material_renames"] = applied
 
+        vertex_changed = False
+        if apply_tree_red:
+            text = read_spm(spm_path)
+            text, vertex_report = apply_leaf_parent_red_gradient(text)
+            report["vertex_colors"] = vertex_report
+            if vertex_report["errors"]:
+                raise RuntimeError(
+                    "SpeedTree leaf-parent VertexColor.R contract failed: "
+                    + "; ".join(vertex_report["errors"])
+                )
+            if vertex_report["changed_generator_count"]:
+                write_spm(spm_path, text)
+                vertex_changed = True
+                changed = True
+
         # Calibration temporarily writes Absolute/1 and Relative variants. If
         # the final logical XML is identical to the source, restore the exact
         # gzip bytes and timestamps so a no-op ① run does not invalidate a
@@ -1576,7 +1959,11 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
             changed = False
             report["source_restored_unchanged"] = True
 
-        report["status"] = "calibrated" if (changed or report["material_renames"]) else "already-ok"
+        report["status"] = (
+            "calibrated"
+            if (changed or report["material_renames"] or vertex_changed)
+            else "already-ok"
+        )
     except ManualCalibrationRequired as exc:
         if backup:
             shutil.copy2(backup, spm_path)

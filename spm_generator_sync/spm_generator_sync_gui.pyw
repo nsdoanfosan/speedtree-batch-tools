@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import queue
@@ -16,9 +17,37 @@ from tkinter import filedialog, messagebox, ttk
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+# Keep the tool folder first: the GUI engine is the sibling
+# spm_generator_sync.py, not the repository package's limited public API.
 sys.path.insert(0, str(TOOL_DIR))
 
-import spm_generator_sync as engine
+from batch_ui_common import clipboard_text, copy_selected_row_paths
+
+
+def _load_sibling_engine():
+    """Load the full GUI engine without colliding with the public package."""
+
+    module_name = "_speedtree_spm_generator_sync_gui_engine"
+    engine_path = TOOL_DIR / "spm_generator_sync.py"
+    loaded = sys.modules.get(module_name)
+    loaded_path = getattr(loaded, "__file__", None)
+    if loaded_path and Path(loaded_path).resolve() == engine_path.resolve():
+        return loaded
+    spec = importlib.util.spec_from_file_location(module_name, engine_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"SPM Generator Sync engine을 불러올 수 없습니다: {engine_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+engine = _load_sibling_engine()
 
 
 CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
@@ -114,24 +143,21 @@ def rgba_to_hex(category: str, base_name: str = "") -> str:
     )
 
 
+def paths_for_row(row):
+    """Adapt a Generator Sync SPM/folder row to the shared path API."""
+
+    folder = Path(row.get("folder", ""))
+    if row.get("kind") == "spm" and row.get("file"):
+        return (folder / row["file"],)
+    if row.get("kind") == "folder" and row.get("folder"):
+        return (folder,)
+    return ()
+
+
 def clipboard_text_for_rows(rows) -> str:
-    """Return raw absolute paths suitable for pasting into Everything."""
-    paths: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        folder = Path(row.get("folder", ""))
-        if row.get("kind") == "spm" and row.get("file"):
-            path = folder / row["file"]
-        elif row.get("kind") == "folder":
-            path = folder
-        else:
-            continue
-        value = str(path.resolve())
-        key = value.casefold()
-        if key not in seen:
-            seen.add(key)
-            paths.append(value)
-    return "\n".join(paths)
+    """Compatibility wrapper for existing callers and tests."""
+
+    return clipboard_text(path for row in rows for path in paths_for_row(row))
 
 
 class Tooltip:
@@ -822,18 +848,15 @@ class App:
                 if iid in self.item_meta and self.item_meta[iid].get("kind") == "spm"]
 
     def copy_selected_paths(self, _event=None):
-        rows = [
-            self.item_meta[iid] for iid in self.tree.selection()
-            if iid in self.item_meta
-        ]
-        text = clipboard_text_for_rows(rows)
-        if not text:
+        count = copy_selected_row_paths(
+            self.root,
+            self.tree,
+            self.item_meta,
+            paths_for_row,
+        )
+        if not count:
             self.status_var.set("복사할 SPM 또는 폴더 행을 선택하세요")
             return "break"
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update_idletasks()
-        count = len(text.splitlines())
         self.status_var.set(f"전체 경로 복사 완료 · {count}개")
         return "break"
 

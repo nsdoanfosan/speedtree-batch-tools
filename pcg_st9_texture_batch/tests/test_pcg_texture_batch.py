@@ -1117,7 +1117,10 @@ class GuiLabelTests(unittest.TestCase):
             name: {"item": {"name": name}, "checked": True}
             for name in ("a", "b", "c")
         }
-        app.select_all_armed = True
+        app.checked_rows = self.gui.CheckedRowController(
+            app.items, app._redraw_checked_row
+        )
+        app.checked_rows.sync_after_reload()
         event = type("Event", (), {"x": 0, "y": "b"})()
 
         app._on_click(event)
@@ -1125,7 +1128,7 @@ class GuiLabelTests(unittest.TestCase):
             {name: row["checked"] for name, row in app.items.items()},
             {"a": False, "b": True, "c": False},
         )
-        self.assertFalse(app.select_all_armed)
+        self.assertFalse(app.checked_rows.armed)
 
         event.y = "c"
         app._on_click(event)
@@ -1133,12 +1136,28 @@ class GuiLabelTests(unittest.TestCase):
         self.assertTrue(app.items["c"]["checked"])
 
         app._set_all(True)
-        self.assertTrue(app.select_all_armed)
+        self.assertTrue(app.checked_rows.armed)
         event.y = "a"
         app._on_click(event)
         self.assertEqual(
             {name: row["checked"] for name, row in app.items.items()},
             {"a": True, "b": False, "c": False},
+        )
+
+    def test_folder_row_exposes_concrete_spm_paths_for_copy(self):
+        item = {
+            "target_spm_statuses": [
+                {"sk_spm": r"D:\Trees\oak\SK_oak_01.spm"},
+                {
+                    "sk_spm": "",
+                    "source_spm": r"D:\Trees\oak\oak_02.spm",
+                },
+            ],
+            "sk_spms": [r"D:\Trees\oak\ignored_when_status_exists.spm"],
+        }
+        self.assertEqual(
+            self.gui.spm_paths_for_item(item),
+            [r"D:\Trees\oak\SK_oak_01.spm", r"D:\Trees\oak\oak_02.spm"],
         )
 
 
