@@ -239,6 +239,60 @@ class SourceSelectionTests(unittest.TestCase):
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY = old_dirty
 
+    def test_hidden_generators_do_not_count_as_active_materials(self):
+        def generator(name, guid, hidden, material_id):
+            return (
+                f"<Generator Type=\"Leaf Mesh\"><Name>{name}</Name>"
+                f"<GUID>{guid}</GUID><Hidden>{hidden}</Hidden><Properties>"
+                f"<Property><Name>Leaves:Type:0:Material</Name>"
+                f"<Value>{material_id}</Value></Property>"
+                "</Properties></Generator>"
+            )
+
+        def link(source, target):
+            return (
+                f"<Link><SourceGUID>{source}</SourceGUID>"
+                f"<TargetGUID>{target}</TargetGUID><Hidden>false</Hidden></Link>"
+            )
+
+        xml = (
+            '<?xml version="1.0"?><SpeedTree><Materials>'
+            '<Material_v8 ID="1" Name="M_shown"></Material_v8>'
+            '<Material_v8 ID="2" Name="M_eye_off"></Material_v8>'
+            '<Material_v8 ID="3" Name="M_under_hidden_parent"></Material_v8>'
+            "</Materials><Generators>"
+            + generator("Tree", "g-tree", "false", "0")
+            + generator("Leaf 1", "g-shown", "false", "1")
+            + generator("Leaf 2", "g-hidden", "true", "2")
+            + generator("Branch", "g-hidden-parent", "true", "0")
+            + generator("Leaf 3", "g-shown-child", "false", "3")
+            + "</Generators><Links>"
+            + link("g-tree", "g-shown")
+            + link("g-tree", "g-hidden")
+            + link("g-tree", "g-hidden-parent")
+            + link("g-hidden-parent", "g-shown-child")
+            + "</Links></SpeedTree>"
+        ).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            spm = Path(temp) / "SK_hidden_test.spm"
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+            old_memory = pcg_texture_audit._SPM_ANALYSIS_CACHE
+            old_persistent = pcg_texture_audit._PERSISTENT_SPM_ANALYSIS
+            old_dirty = pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY
+            pcg_texture_audit._SPM_ANALYSIS_CACHE = {}
+            pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = {}
+            pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
+            try:
+                self.assertEqual(
+                    pcg_texture_audit.active_material_ids(spm), {"0", "1"})
+                self.assertEqual(
+                    pcg_texture_audit.active_material_names(spm), ["M_shown"])
+            finally:
+                pcg_texture_audit._SPM_ANALYSIS_CACHE = old_memory
+                pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
+                pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY = old_dirty
+
     def _image(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (2, 2), (128, 128, 128)).save(path)

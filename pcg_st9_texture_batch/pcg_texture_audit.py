@@ -49,6 +49,11 @@ ACTIVE_MATERIAL_VALUE_RE = re.compile(
     r"<Value\b[^>]*>(.*?)</Value>",
     re.IGNORECASE | re.DOTALL,
 )
+GENERATOR_LINK_RE = re.compile(r"<Link>.*?</Link>", re.IGNORECASE | re.DOTALL)
+ELEMENT_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>", re.IGNORECASE)
+ELEMENT_HIDDEN_RE = re.compile(r"<Hidden>([^<]*)</Hidden>", re.IGNORECASE)
+LINK_SOURCE_GUID_RE = re.compile(r"<SourceGUID>([^<]*)</SourceGUID>", re.IGNORECASE)
+LINK_TARGET_GUID_RE = re.compile(r"<TargetGUID>([^<]*)</TargetGUID>", re.IGNORECASE)
 BLEND_IMAGE_EXTENSION_RE = re.compile(
     rb"\.(?:png|tga|tif|tiff|jpg|jpeg|exr|bmp)", re.IGNORECASE)
 BLEND_IMAGE_NAME_BYTES = frozenset(
@@ -77,7 +82,8 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
-SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v1.json"
+# v3 stores both all referenced IDs (provenance) and visible/export IDs.
+SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v3.json"
 SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
 BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v1.json"
 _PERSISTENT_SBS_GRAPHS = None
@@ -214,6 +220,70 @@ def _cached_sbs_graph_names(sbs_path):
     return names
 
 
+def _referenced_material_ids_from_text(text):
+    """All material IDs referenced by any SpeedTree Generator property."""
+    return {
+        html.unescape(match.group(2).strip())
+        for match in ACTIVE_MATERIAL_VALUE_RE.finditer(text)
+    }
+
+
+def _visible_material_ids_from_text(text):
+    """Material IDs referenced by generators that would actually export.
+
+    SpeedTree keeps ``...:Material`` references on generators whose eye is
+    toggled off (``<Hidden>true</Hidden>``); that geometry never exports, so
+    counting it made disabled experiments look like active materials. A
+    generator is effectively hidden when it or any node-graph ancestor
+    (``<Link>`` Source->Target) is hidden. References that appear outside any
+    Generator block keep the previous always-active behavior.
+    """
+    all_ids = _referenced_material_ids_from_text(text)
+    generators = []
+    hidden_by_guid = {}
+    generator_ids = set()
+    for block_match in GENERATOR_BLOCK_RE.finditer(text):
+        block = block_match.group(0)
+        ids = {
+            html.unescape(match.group(2).strip())
+            for match in ACTIVE_MATERIAL_VALUE_RE.finditer(block)
+        }
+        generator_ids |= ids
+        guid_match = ELEMENT_GUID_RE.search(block)
+        hidden_match = ELEMENT_HIDDEN_RE.search(block)
+        guid = guid_match.group(1).strip() if guid_match else ""
+        if guid:
+            hidden_by_guid[guid] = bool(
+                hidden_match and hidden_match.group(1).strip().lower() == "true"
+            )
+        generators.append((guid, ids))
+    if not generators:
+        return all_ids
+
+    parent = {}
+    for link_match in GENERATOR_LINK_RE.finditer(text):
+        block = link_match.group(0)
+        source = LINK_SOURCE_GUID_RE.search(block)
+        target = LINK_TARGET_GUID_RE.search(block)
+        if source and target:
+            parent[target.group(1).strip()] = source.group(1).strip()
+
+    def effectively_hidden(guid):
+        seen = set()
+        while guid and guid not in seen:
+            seen.add(guid)
+            if hidden_by_guid.get(guid):
+                return True
+            guid = parent.get(guid, "")
+        return False
+
+    active = all_ids - generator_ids
+    for guid, ids in generators:
+        if not guid or not effectively_hidden(guid):
+            active |= ids
+    return active
+
+
 def _spm_analysis(path):
     """Decompress and parse one SPM once for all read-only audit queries."""
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
@@ -230,7 +300,8 @@ def _spm_analysis(path):
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
-            "active_material_ids": set(disk_entry.get("active_material_ids", [])),
+            "active_material_ids": set(disk_entry.get("referenced_material_ids", [])),
+            "visible_material_ids": set(disk_entry.get("visible_material_ids", [])),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
         return analysis
@@ -253,16 +324,18 @@ def _spm_analysis(path):
             "refs": unique(refs),
         })
 
-    active = {
-        html.unescape(match.group(2).strip())
-        for match in ACTIVE_MATERIAL_VALUE_RE.finditer(text)
-    }
+    referenced = _referenced_material_ids_from_text(text)
+    visible = _visible_material_ids_from_text(text)
 
     analysis = {
         "material_rows": rows,
         "material_names": unique(
             row["material_name"] for row in rows if row["material_name"]),
-        "active_material_ids": active,
+        # Keep active_material_ids as the legacy all-reference set. Cluster
+        # provenance needs hidden source generators too; final jobs use the
+        # separate visible_material_ids set below.
+        "active_material_ids": referenced,
+        "visible_material_ids": visible,
     }
     # A modified file receives a new stat key. Drop only stale entries for
     # this exact path so long-running GUI refreshes do not grow indefinitely.
@@ -277,7 +350,8 @@ def _spm_analysis(path):
             "mtime_ns": mtime_ns,
             "material_rows": rows,
             "material_names": analysis["material_names"],
-            "active_material_ids": sorted(active),
+            "referenced_material_ids": sorted(referenced),
+            "visible_material_ids": sorted(visible),
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     return analysis
@@ -294,7 +368,7 @@ def canonical_material_name(name):
 
 
 def material_rename_plan(spm, exclude=None):
-    names = active_material_names(spm)
+    names = visible_material_names(spm)
     exclude = {str(name) for name in (exclude or [])}
     renames = []
     for name in names:
@@ -353,12 +427,12 @@ def extract_material_image_refs(path):
 
 
 def active_material_ids(path):
-    """Material IDs actually referenced by a SpeedTree Generator property."""
+    """All IDs referenced by a Generator, including hidden provenance nodes."""
     return _spm_analysis(path)["active_material_ids"]
 
 
 def active_material_names(path):
-    """Material names currently referenced by a SpeedTree Generator."""
+    """All material names referenced by a Generator, including hidden nodes."""
     active_ids = active_material_ids(path)
     rows = extract_material_image_refs(path)
     if not active_ids:
@@ -366,6 +440,23 @@ def active_material_names(path):
     return unique(
         row["material_name"] for row in rows
         if row["material_name"] and row.get("material_id") in active_ids
+    )
+
+
+def visible_material_ids(path):
+    """IDs used by visible generators whose ancestor chain is also visible."""
+    return _spm_analysis(path)["visible_material_ids"]
+
+
+def visible_material_names(path):
+    """Material names that contribute geometry to the exported SpeedTree."""
+    visible_ids = visible_material_ids(path)
+    rows = extract_material_image_refs(path)
+    if not active_material_ids(path):
+        return unique(row["material_name"] for row in rows if row["material_name"])
+    return unique(
+        row["material_name"] for row in rows
+        if row["material_name"] and row.get("material_id") in visible_ids
     )
 
 
@@ -836,7 +927,7 @@ def target_spm_status(folder, mesh_name):
     source = find_source_spm_for_mesh(folder, mesh_name)
     sk = find_sk_spm_for_mesh(folder, mesh_name)
     target = sk or source
-    materials = active_material_names(target) if target else []
+    materials = visible_material_names(target) if target else []
     missing_m = [
         m for m in materials
         if m and not m.startswith("M_")
@@ -1309,6 +1400,24 @@ def folder_m_graph_names(sbs_files):
     return graphs
 
 
+def auto_split_atlas_base(name, blend_stems, graphs):
+    """Atlas base material for an Auto Split-suffixed name, else None.
+
+    Unlike leaf-source provenance this works from the name alone, so a
+    normalized SK (whose slots now point at managed T_ outputs instead of
+    the original leaf sources) still groups M_x_atlas_01_green under
+    M_x_atlas_01 instead of spawning a texture set for the suffixed name.
+    """
+    low = str(name).lower()
+    for stem_low, blend in blend_stems.items():
+        if low.startswith(stem_low + "_") and low[len(stem_low) + 1:] in AUTO_SPLIT_SUFFIXES:
+            return blend.stem
+    for graph_low, (graph, _sbs) in graphs.items():
+        if low.startswith(graph_low + "_") and low[len(graph_low) + 1:] in AUTO_SPLIT_SUFFIXES:
+            return "M_" + graph[2:] if graph.lower().startswith("t_") else graph
+    return None
+
+
 def material_atlas_base(name, blend_stems, graphs):
     """머티리얼 이름 → 아틀라스 베이스 이름 (아니면 None)."""
     low = str(name).lower()
@@ -1360,18 +1469,29 @@ def _refs_are_only_managed_outputs(refs):
 
 
 def _source_material_ref_map(folder, sk_spm):
-    """Original material refs for one SK copy, keyed by canonical name."""
+    """Original material refs for one SK copy, keyed by canonical name.
+
+    An SK may have been copied from an ``SM_`` authoring variant while an
+    older unsuffixed source with the same tail also exists. Prefer that SM_
+    peer, then the exact non-SK peer, and finally fill missing material names
+    from the remaining sources. This recovers original connections after an
+    earlier pass replaced the SK slots with managed T_ outputs.
+    """
     folder = Path(folder)
     expected = folder / sk_spm.name[3:] if sk_spm.name.lower().startswith("sk_") else None
-    candidates = [expected] if expected and expected.is_file() else source_spms(folder)
+    tail = sk_spm.stem[3:] if sk_spm.name.lower().startswith("sk_") else sk_spm.stem
+    sm_expected = folder / f"SM_{tail}.spm"
+    candidates = unique(
+        [path for path in (sm_expected, expected) if path and path.is_file()]
+        + source_spms(folder)
+    )
     result = {}
     for source in candidates:
-        active_ids = active_material_ids(source)
         for row in extract_material_image_refs(source):
-            if active_ids and row.get("material_id") not in active_ids:
-                continue
             key = canonical_material_name(row.get("material_name")).lower()
-            result[key] = unique(result.get(key, []) + (row.get("refs") or []))
+            refs = row.get("refs") or []
+            if key and refs and key not in result:
+                result[key] = list(refs)
     return result
 
 
@@ -1542,7 +1662,8 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
         if is_cluster_render_material(folder, spm, refs):
             continue
         base = (leaf_source["atlas_base"] if leaf_source
-                else canonical_material_name(name))
+                else auto_split_atlas_base(name, blend_stems, graphs)
+                or canonical_material_name(name))
         key = base.lower()
         texture_base = texture_base_for_material(base)
         graph = graphs.get(texture_base.lower()) or graphs.get(key)
@@ -1626,7 +1747,7 @@ def audit_folder(folder, cfg, include_refs=False):
     sources = source_spms(folder)
     chosen = preferred[0] if preferred else (loose[0] if loose else (sources[0] if sources else None))
     blend = blend_for_spm(chosen) if chosen else None
-    materials = active_material_names(chosen) if chosen else []
+    materials = visible_material_names(chosen) if chosen else []
     missing_m = [
         m for m in materials
         if m and not m.startswith("M_")

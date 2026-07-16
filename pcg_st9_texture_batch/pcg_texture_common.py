@@ -25,8 +25,12 @@ DEFAULT_CONFIG = {
     "sbsrender_timeout": 1800,
 }
 
+# " - 복사본"/" - Copy" are Windows Explorer duplicates: manual scratch copies,
+# not pipeline sources. Counting them can split otherwise-unique cluster
+# definitions and silently disable preserve-source handling for a folder.
 BACKUP_RE = re.compile(
-    r"(codex_backup|skbatch_backup|pcgtex_backup|\.sbk$|^~|\.blend1$)",
+    r"(codex_backup|skbatch_backup|pcgtex_backup|\.sbk$|^~|\.blend1$"
+    r"|\s-\s(?:복사본|copy)(?:\s\(\d+\))?\.)",
     re.IGNORECASE,
 )
 IMAGE_EXTS = {".png", ".tga", ".tif", ".tiff", ".jpg", ".jpeg", ".exr", ".bmp"}
