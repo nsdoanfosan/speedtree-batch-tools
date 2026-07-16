@@ -606,14 +606,31 @@ def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_o
     return results
 
 
-def _is_under(path, roots):
+def _resolve_for_membership(path):
+    """Path.resolve() with a per-report cache; each resolve is 1+ syscalls on
+    Windows and _is_under re-resolves the same few roots thousands of times."""
+    path_key = str(path).lower()
+    report_cache = _REPORT_SCAN_CACHE.get()
+    cache = None
+    if report_cache is not None:
+        cache = report_cache.setdefault("resolved_paths", {})
+        cached = cache.get(path_key)
+        if cached is not None:
+            return cached
     try:
         resolved = Path(path).resolve()
     except (OSError, ValueError):
         resolved = Path(path).absolute()
+    if cache is not None:
+        cache[path_key] = resolved
+    return resolved
+
+
+def _is_under(path, roots):
+    resolved = _resolve_for_membership(path)
     for root in roots:
         try:
-            resolved.relative_to(Path(root).resolve())
+            resolved.relative_to(_resolve_for_membership(root))
             return True
         except (OSError, ValueError):
             continue

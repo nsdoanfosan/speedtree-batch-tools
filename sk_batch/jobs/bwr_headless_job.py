@@ -59,7 +59,8 @@ def main():
         require_spm_sk_ready(os.path.abspath(args.spm))
 
         blend_path = os.path.abspath(args.blend)
-        if os.path.exists(blend_path):
+        blend_exists = os.path.exists(blend_path)
+        if blend_exists:
             bpy.ops.wm.open_mainfile(filepath=blend_path)
         else:
             bpy.ops.wm.read_homefile(use_empty=True)
@@ -77,9 +78,13 @@ def main():
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
 
-        # Save FIRST so default_paths anchors out_dir/JSON next to the SPM.
-        Path(blend_path).parent.mkdir(parents=True, exist_ok=True)
-        bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+        # default_paths anchors out_dir/JSON to bpy.data.filepath. open_mainfile
+        # already set it for existing blends, so only a fresh file needs the
+        # anchor save — re-saving a multi-GB blend right before the export
+        # rebuilds it was pure disk churn (2x full writes per repair).
+        if not blend_exists:
+            Path(blend_path).parent.mkdir(parents=True, exist_ok=True)
+            bpy.ops.wm.save_as_mainfile(filepath=blend_path)
 
         result = bpy.ops.speedtree_bwr.export_from_speedtree()
         if "FINISHED" not in result:
