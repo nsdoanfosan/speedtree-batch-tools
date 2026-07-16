@@ -278,7 +278,13 @@ def main():
         report["material_consolidation"] = material_consolidation
         texture_normalization = normalize_speedtree_material_textures(bpy.context.scene.objects)
         report["texture_normalization"] = texture_normalization
-        if texture_normalization.get("material_count"):
+        # Save only when this pass actually mutated the file: verified large
+        # blends should not be rewritten on every push just because their
+        # materials were examined.
+        consolidation_changed = material_consolidation.get("status") == "applied"
+        normalization_changed = bool(texture_normalization.get("changed_count"))
+        report["blend_resaved"] = bool(consolidation_changed or normalization_changed)
+        if report["blend_resaved"]:
             bpy.ops.wm.save_as_mainfile(filepath=blend_path)
         missing_textures = texture_normalization.get("missing", [])
         if missing_textures:

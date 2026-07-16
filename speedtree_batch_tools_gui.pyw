@@ -8,6 +8,7 @@ truth.
 
 from __future__ import annotations
 
+import ctypes
 import importlib.machinery
 import importlib.util
 import os
@@ -23,6 +24,38 @@ from tkinter import messagebox, ttk
 
 REPO_DIR = Path(__file__).resolve().parent
 ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
+ICON_PNG = REPO_DIR / "assets" / "speedtree_batch_tools_icon_512.png"
+ICON_ICO = REPO_DIR / "assets" / "speedtree_batch_tools.ico"
+APP_USER_MODEL_ID = "PARK.SpeedTree.BatchTools"
+
+
+def apply_app_user_model_id() -> None:
+    """Give Windows a stable identity for taskbar grouping and pinning."""
+
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            APP_USER_MODEL_ID
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+def apply_app_icon(root: tk.Tk) -> None:
+    """Apply the project icon while keeping launch resilient to missing assets."""
+
+    if ICON_PNG.is_file():
+        try:
+            root._speedtree_app_icon = tk.PhotoImage(file=str(ICON_PNG))
+            root.iconphoto(True, root._speedtree_app_icon)
+        except tk.TclError:
+            pass
+    if os.name == "nt" and ICON_ICO.is_file():
+        try:
+            root.iconbitmap(default=str(ICON_ICO))
+        except tk.TclError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -312,7 +345,9 @@ class IntegratedApp:
 
 
 def main():
+    apply_app_user_model_id()
     root = tk.Tk()
+    apply_app_icon(root)
     try:
         ttk.Style(root).theme_use("vista")
     except tk.TclError:

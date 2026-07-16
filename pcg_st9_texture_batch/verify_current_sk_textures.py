@@ -16,6 +16,7 @@ from pcg_texture_audit import (
     is_backup_path,
     preserved_cluster_materials,
     read_maybe_gzip_text,
+    visible_material_ids,
 )
 from pcg_texture_common import REPORT_DIR, load_config
 from spm_texture_normalize import inspect_material_slots
@@ -59,8 +60,14 @@ def verify(cfg=None):
 
     for spm in spms:
         rows = inspect_material_slots(read_maybe_gzip_text(spm))
-        active = {str(value).lower() for value in active_material_ids(spm)} - {"0"}
-        if not active:
+        referenced = {
+            str(value).lower() for value in active_material_ids(spm)
+        } - {"0"}
+        if referenced:
+            active = {
+                str(value).lower() for value in visible_material_ids(spm)
+            } - {"0"}
+        else:
             active = set(rows)
             no_material_property.append(str(spm))
         for material_id in active:

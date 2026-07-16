@@ -4,9 +4,10 @@ Run:
   blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
       --wind TREE|BUSH|GRASS|NONE --report result.json
 
-Relies on user prefs (NO --factory-startup) so the junction-installed
-speedtree_bone_weight_repair add-on registers itself. Re-running on an existing
-.blend is a clean idempotent update (the operator wipes its previous build).
+Runs with --factory-startup and enables only the junction-installed
+speedtree_bone_weight_repair add-on for this process.  This avoids loading every
+interactive user add-on in a background batch. Re-running on an existing .blend
+is a clean idempotent update (the operator wipes its previous build).
 """
 import argparse
 import json
@@ -39,9 +40,16 @@ def main():
     try:
         import addon_utils
 
-        loaded, enabled = addon_utils.check("speedtree_bone_weight_repair")
-        if not enabled:
-            bpy.ops.preferences.addon_enable(module="speedtree_bone_weight_repair")
+        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
+        if not loaded:
+            addon_utils.enable(
+                "speedtree_bone_weight_repair",
+                default_set=False,
+                persistent=False,
+            )
+        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
+        if not loaded:
+            raise RuntimeError("speedtree_bone_weight_repair add-on enable failed")
 
         # Reject authored-but-disabled Branch skeletons before creating an
         # empty .blend. BranchMesh-only assets remain valid and use the rigid

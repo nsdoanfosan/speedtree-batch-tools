@@ -36,6 +36,7 @@ CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 LOG_DIR = TOOL_DIR / "logs"
 PUSH_MANIFEST_SCHEMA_VERSION = 1
+PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
 DEFAULT_SEND2UE_DIR = Path(
     r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
 )
@@ -71,6 +72,7 @@ DEFAULT_CONFIG = {
     # A single slow export is bounded separately by spm_verify_timeout.
     "spm_parallel_jobs": 4,
     "check_parallel_jobs": 8,
+    "blender_parallel_jobs": 2,
     # resource limits (checklist "background + cpu limit")
     "priority": "belownormal",   # idle | belownormal | normal
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
@@ -185,30 +187,120 @@ def file_content_snapshot(path):
     raise RuntimeError(f"File changed while hashing: {candidate}")
 
 
-def push_source_fingerprint(blend_path, dependency_paths=()):
-    """Fingerprint the Blender export input and code that defines its contract."""
-    dependencies = []
-    for path in dependency_paths:
-        candidate = Path(path)
-        if candidate.is_file():
+def _push_source_stat_identity(path, required=False):
+    candidate = Path(path)
+    if not candidate.is_file():
+        if required:
+            raise FileNotFoundError(f"Push source file missing: {candidate}")
+        return {"path": str(candidate), "missing": True}
+    stat = candidate.stat()
+    return {
+        "path": str(candidate.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def push_source_snapshot(blend_path, dependency_paths=()):
+    """Cheap source identity used to decide whether a full content hash is needed."""
+    return {
+        "blend": _push_source_stat_identity(blend_path, required=True),
+        "dependencies": [
+            _push_source_stat_identity(path) for path in dependency_paths
+        ],
+    }
+
+
+def _push_source_fingerprint_record(blend_path, dependency_paths=()):
+    """Hash one stable cross-file snapshot and return its persistent cache record."""
+    dependency_paths = tuple(dependency_paths)
+    for _attempt in range(2):
+        blend_candidate = Path(blend_path)
+        blend_content = file_content_snapshot(blend_candidate)
+        blend_path_resolved = str(blend_candidate.resolve())
+        blend_identity = {
+            "path": blend_path_resolved,
+            "fingerprint": blend_content["fingerprint"],
+        }
+        snapshot = {
+            "blend": {
+                "path": blend_path_resolved,
+                "size": blend_content["size"],
+                "mtime_ns": blend_content["mtime_ns"],
+            },
+            "dependencies": [],
+        }
+        dependencies = []
+        for path in dependency_paths:
+            candidate = Path(path)
+            if not candidate.is_file():
+                missing = {"path": str(candidate), "missing": True}
+                dependencies.append(missing)
+                snapshot["dependencies"].append(dict(missing))
+                continue
+            content = file_content_snapshot(candidate)
+            resolved = str(candidate.resolve())
             dependencies.append(
+                {"path": resolved, "fingerprint": content["fingerprint"]}
+            )
+            snapshot["dependencies"].append(
                 {
-                    "path": str(candidate.resolve()),
-                    "fingerprint": file_content_fingerprint(candidate),
+                    "path": resolved,
+                    "size": content["size"],
+                    "mtime_ns": content["mtime_ns"],
                 }
             )
-        else:
-            dependencies.append({"path": str(candidate), "missing": True})
-    payload = {
-        "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
-        "blend": {
-            "path": str(Path(blend_path).resolve()),
-            "fingerprint": file_content_fingerprint(blend_path),
-        },
-        "dependencies": dependencies,
-    }
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+        # A source changing after its own hash but before the set completed must
+        # not be cached as one coherent export input.
+        if snapshot != push_source_snapshot(blend_path, dependency_paths):
+            continue
+        payload = {
+            "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
+            "blend": blend_identity,
+            "dependencies": dependencies,
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return {
+            "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint": hashlib.blake2b(encoded, digest_size=16).hexdigest(),
+            "snapshot": snapshot,
+        }
+    raise RuntimeError("Push source set changed while hashing")
+
+
+def push_source_fingerprint(blend_path, dependency_paths=()):
+    """Fingerprint the Blender export input and code that defines its contract."""
+    return _push_source_fingerprint_record(
+        blend_path,
+        dependency_paths,
+    )["fingerprint"]
+
+
+def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
+    """Reuse a stored content fingerprint when every source stat is unchanged."""
+    dependency_paths = tuple(dependency_paths)
+    snapshot = push_source_snapshot(blend_path, dependency_paths)
+    cache = cache if isinstance(cache, dict) else {}
+    fingerprint = cache.get("fingerprint")
+    cache_valid = (
+        cache.get("version") == PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
+        and cache.get("snapshot") == snapshot
+        and isinstance(fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{32}", fingerprint) is not None
+    )
+    if cache_valid:
+        return fingerprint, {
+            "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint": fingerprint,
+            "snapshot": snapshot,
+        }, True
+    record = _push_source_fingerprint_record(blend_path, dependency_paths)
+    return record["fingerprint"], record, False
 
 
 def manifest_item_files_match(item):

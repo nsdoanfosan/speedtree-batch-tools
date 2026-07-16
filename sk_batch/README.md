@@ -11,7 +11,9 @@ WPO/마스크 방식 식생을 스켈레탈 메시(SK_*.spm)로 교체하는 반
 
 **🔍 검사 (수정 없음)** — 표에 상태만 채운다:
 SPM 본 세팅 상태(미보정/Relative/무본/M_필요), blend 최신 여부,
-push에 필요한 핸드오프 산출물(wind JSON) 준비 여부.
+push에 필요한 핸드오프 산출물(wind JSON) 준비 여부. SK Batch를 열 때도 저장된
+과거 문구가 아니라 실제 SPM/blend 시간을 비교해 `생성 필요` 또는
+`교체 필요 — ② Blender Repair 다시 실행`을 바로 표시한다.
 오래 걸리는 단계를 돌리기 전에 항상 먼저 눌러보는 용도.
 
 **① SPM 본 세팅 (파일별 편차 있음, 기본 4개 동시 실행)** — SPM만 수정:
@@ -90,16 +92,20 @@ push에 필요한 핸드오프 산출물(wind JSON) 준비 여부.
   `_spm_backups/<SPM명>.skbatch_manual_bones.json`에 저장된다. 같은 드롭다운에서
   `자동 계산`을 선택하면 해제된다.
 
-**② Blender Repair (느림, 파일당 수분~수십분)** — 헤드리스 Blender로
+**② Blender Repair (느림, 기본 2개 동시 실행)** — 헤드리스 Blender로
 BWR `SpeedTree → Import → Repair` 실행, wind 프리셋은 파일명 기반 자동
 (tree/bush/weed·grass, deadleaves·deadbranches=무바람), SPM 옆에 같은 이름
 `.blend` + wind JSON 저장. **이미 SPM보다 최신인 blend는 건너뛴다**
-("완료된 항목도 다시 실행"으로 강제 가능). 재실행 = 갱신.
+("완료된 항목도 다시 실행"으로 강제 가능). 재실행 = 갱신. 배치 Blender는
+`--factory-startup`으로 시작하고 BWR만 명시적으로 켜므로 사용자용 애드온의 시작
+오류와 등록 비용을 가져오지 않는다.
 
 **③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
 blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비 안 된 항목은
 이유를 표에 남기고 건너뛰고, 준비된 것만 헤드리스 send2ue로 push한다
 (임포트 시 머티리얼 파이프라인이 wind JSON 연결까지 자동 수행 + 디스크 저장).
+headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
+안전하게 순차 실행한다.
 
 ②/③ 실패 시 표와 저장 상태에는 `Unreal 연결 실패`, `메시를 찾지 못함`,
 `add-on 로드 실패`, `FBX 메시 지오메트리 없음`, `시간 초과`처럼 짧은 원인을

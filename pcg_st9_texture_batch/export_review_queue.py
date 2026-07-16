@@ -77,21 +77,6 @@ def build_review_queue_from_report(report, source_report="<memory>"):
                     action="Locate the source SPM or confirm this target should be ignored/substituted.",
                     evidence=item.get("folder", ""),
                 )
-            elif status.get("status") in {"needs_blend", "needs_blend_update"}:
-                detail = "SK SPM exists but matching blend was not found."
-                if status.get("status") == "needs_blend_update":
-                    detail = "SK SPM is newer than the matching blend."
-                add_row(
-                    rows,
-                    "P2",
-                    "blend_missing",
-                    folder=item.get("name", ""),
-                    target=status.get("mesh_name", ""),
-                    detail=detail,
-                    action="Record this as a separate SK/BWR pipeline dependency before atlas handoff.",
-                    evidence=status.get("sk_spm", ""),
-                )
-
     prepare_plan = build_plan_from_report(report, source_report)
     for item in prepare_plan.get("items", []):
         duplicate_targets = set(item.get("duplicate_pcg_target_mesh_names", []))

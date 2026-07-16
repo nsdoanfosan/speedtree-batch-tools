@@ -4,6 +4,7 @@ This is intentionally conservative. It reads filesystem/SPM/SBS evidence and
 only mutates files when --prepare-sk is passed.
 """
 import argparse
+import contextvars
 import csv
 import functools
 import gzip
@@ -93,6 +94,7 @@ _PERSISTENT_BLEND_IMAGES_DIRTY = False
 _DIRECTORY_FILE_INDEX_CACHE = {}
 _BLEND_IMAGE_NAMES_CACHE = {}
 _IMAGE_EQUAL_CACHE = {}
+_REPORT_SCAN_CACHE = contextvars.ContextVar("pcg_report_scan_cache", default=None)
 COMMON_BARK_END_RE = re.compile(
     r"^m_bark_common_(?!end_).+_end_0*(\d+)$", re.IGNORECASE)
 GENERIC_MATERIAL_NAME_RE = re.compile(
@@ -122,13 +124,38 @@ def unique(seq):
     return out
 
 
+def _report_scan_cached(func):
+    """Give one report a stable, thread-safe snapshot of repeated filesystem reads."""
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        token = _REPORT_SCAN_CACHE.set({
+            "file_cache_keys": {},
+            "root_spms": {},
+            "path_exists": {},
+        })
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _REPORT_SCAN_CACHE.reset(token)
+    return wrapped
+
+
 def _file_cache_key(path):
     path = Path(path)
+    path_key = str(path).lower()
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is not None:
+        cached = report_cache["file_cache_keys"].get(path_key)
+        if cached is not None:
+            return cached
     try:
         stat = path.stat()
-        return str(path).lower(), stat.st_size, stat.st_mtime_ns
+        result = path_key, stat.st_size, stat.st_mtime_ns
     except OSError:
-        return str(path).lower(), 0, 0
+        result = path_key, 0, 0
+    if report_cache is not None:
+        report_cache["file_cache_keys"][path_key] = result
+    return result
 
 
 def _persistent_spm_analysis():
@@ -381,10 +408,20 @@ def material_rename_plan(spm, exclude=None):
 
 
 def root_spms(folder):
-    return sorted(
+    folder = Path(folder)
+    folder_key = str(folder).lower()
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is not None:
+        cached = report_cache["root_spms"].get(folder_key)
+        if cached is not None:
+            return list(cached)
+    paths = sorted(
         p for p in Path(folder).glob("*.spm")
         if p.is_file() and not is_backup_path(p)
     )
+    if report_cache is not None:
+        report_cache["root_spms"][folder_key] = tuple(paths)
+    return paths
 
 
 def preferred_sk_spms(folder):
@@ -397,11 +434,6 @@ def loose_sk_spms(folder):
 
 def source_spms(folder):
     return [p for p in root_spms(folder) if not p.name.lower().startswith("sk")]
-
-
-def blend_for_spm(spm):
-    blend = Path(spm).with_suffix(".blend")
-    return blend if blend.exists() else None
 
 
 def extract_material_names(spm):
@@ -461,25 +493,35 @@ def visible_material_names(path):
 
 
 @functools.lru_cache(maxsize=32768)
-def _resolve_spm_image_ref_cached(spm_text, ref_text):
-    path = Path(ref_text.replace("/", "\\"))
-    if not path.is_absolute():
-        path = Path(spm_text).parent / path
-    try:
-        return path.resolve()
-    except (OSError, ValueError):
-        return path.absolute()
+def _resolve_spm_image_ref_cached(base_text, ref_text):
+    path_text = ref_text.replace("/", "\\")
+    if not Path(path_text).is_absolute():
+        path_text = os.path.join(base_text, path_text)
+    # SPM texture references only need a stable absolute lexical path.  Using
+    # Path.resolve() here needlessly probes every path (including missing
+    # references) and dominates a full PCG audit on OneDrive-backed folders.
+    return Path(os.path.abspath(os.path.normpath(path_text)))
 
 
 def resolve_spm_image_ref(spm, ref):
-    return _resolve_spm_image_ref_cached(str(spm), str(ref))
+    ref_text = str(ref).replace("/", "\\")
+    ref_path = Path(ref_text)
+    base_text = "" if ref_path.is_absolute() else str(Path(spm).parent)
+    return _resolve_spm_image_ref_cached(base_text, ref_text)
 
 
 def path_exists(path):
+    path_key = str(Path(path)).lower()
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is not None and path_key in report_cache["path_exists"]:
+        return report_cache["path_exists"][path_key]
     try:
-        return Path(path).exists()
+        result = Path(path).exists()
     except (OSError, ValueError):
-        return False
+        result = False
+    if report_cache is not None:
+        report_cache["path_exists"][path_key] = result
+    return result
 
 
 def source_family_name(path):
@@ -933,7 +975,6 @@ def target_spm_status(folder, mesh_name):
         if m and not m.startswith("M_")
     ]
     renames_needed = material_rename_plan(target) if target else []
-    blend = blend_for_spm(sk) if sk else None
     status = "ready"
     actions = []
     if not source and not sk:
@@ -945,18 +986,10 @@ def target_spm_status(folder, mesh_name):
     elif renames_needed or missing_m:
         status = "needs_m_prefix"
         actions.append("머티리얼 이름 M_/공용 이름 정리 필요")
-    elif not blend:
-        status = "needs_blend"
-        actions.append("별도 리페어에서 SK Blend 생성 필요")
-    elif blend.stat().st_mtime < sk.stat().st_mtime:
-        status = "needs_blend_update"
-        actions.append("별도 리페어에서 오래된 SK Blend 갱신 필요")
     return {
         "mesh_name": mesh_name,
         "source_spm": str(source) if source else None,
         "sk_spm": str(sk) if sk else None,
-        "blend": str(blend) if blend else None,
-        "blend_stale": bool(blend and sk and blend.stat().st_mtime < sk.stat().st_mtime),
         "materials_missing_m_prefix": missing_m,
         "material_renames_needed": renames_needed,
         "status": status,
@@ -1415,6 +1448,27 @@ def auto_split_atlas_base(name, blend_stems, graphs):
     for graph_low, (graph, _sbs) in graphs.items():
         if low.startswith(graph_low + "_") and low[len(graph_low) + 1:] in AUTO_SPLIT_SUFFIXES:
             return "M_" + graph[2:] if graph.lower().startswith("t_") else graph
+    match = ATLAS_NAME_RE.match(str(name))
+    if match:
+        suffix = str(name)[len(match.group(1)):].lstrip("_").lower()
+        if suffix in AUTO_SPLIT_SUFFIXES:
+            return match.group(1)
+    return None
+
+
+def derived_material_base(name):
+    """Return a possible base for a SpeedTree Auto Split classification.
+
+    This is deliberately only a *candidate*. ``material_texture_items`` uses
+    it for a suffix-free output only when two visible aliases share the exact
+    same connected source set. A lone ``*_dead``/``*_green`` material keeps
+    its authored name unless atlas/leaf provenance proves the base.
+    """
+    canonical = canonical_material_name(name)
+    for suffix in sorted(AUTO_SPLIT_SUFFIXES, key=len, reverse=True):
+        marker = "_" + suffix
+        if canonical.lower().endswith(marker):
+            return canonical[:-len(marker)]
     return None
 
 
@@ -1572,9 +1626,10 @@ def preserved_cluster_materials(folder, definitions=None):
         exact_definitions = (
             cluster_render_definitions_from_spm(folder, exact_source)
             if exact_source.is_file() else {})
-        sk_active = active_material_ids(sk_spm)
+        referenced_ids = active_material_ids(sk_spm)
+        visible_ids = visible_material_ids(sk_spm)
         for row in extract_material_image_refs(sk_spm):
-            if sk_active and row.get("material_id") not in sk_active:
+            if referenced_ids and row.get("material_id") not in visible_ids:
                 continue
             canonical = canonical_material_name(row.get("material_name")).lower()
             definition = exact_definitions.get(canonical) or definitions.get(canonical)
@@ -1619,6 +1674,53 @@ def _leaf_source_for_active_material(spm, refs, leaf_mesh_sources):
     return None
 
 
+def _leaf_source_for_atlas_base(atlas_base, leaf_mesh_sources):
+    """Resolve one suffix-free atlas name to an unambiguous leaf source."""
+    wanted = canonical_material_name(atlas_base).lower()
+    matches = [
+        source for source in (leaf_mesh_sources or [])
+        if canonical_material_name(source.get("atlas_base", "")).lower() == wanted
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _material_ref_signature(spm, refs, material_name=""):
+    """Stable identity for the files connected to one SpeedTree material."""
+    resolved = unique(
+        str(resolve_spm_image_ref(spm, ref)).lower()
+        for ref in (refs or []) if ref
+    )
+    if resolved:
+        return tuple(sorted(resolved))
+    # Empty materials must never collapse merely because their names have the
+    # same Auto Split suffix.
+    return ("@material", str(Path(spm)).lower(), str(material_name).lower())
+
+
+def _managed_connection_matches(refs, texture_base, required_maps):
+    stems = {Path(ref).stem.lower() for ref in (refs or []) if ref}
+    expected = {
+        f"{texture_base}_{map_name}".lower() for map_name in required_maps
+    }
+    return expected.issubset(stems)
+
+
+def _graph_for_materials(graphs, base, material_names):
+    """Prefer the target graph, then a graph owned by one merged alias."""
+    keys = [texture_base_for_material(base).lower(), str(base).lower()]
+    for name in material_names:
+        canonical = canonical_material_name(name)
+        keys.extend((
+            texture_base_for_material(canonical).lower(),
+            canonical.lower(),
+            str(name).lower(),
+        ))
+    for key in unique(keys):
+        if key in graphs:
+            return graphs[key]
+    return None
+
+
 def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=None,
                            leaf_mesh_sources=None):
     """One managed texture-set job for every material used by a Generator."""
@@ -1626,18 +1728,36 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
     preserved_definitions = preserved_definitions if preserved_definitions is not None \
         else cluster_render_source_definitions(folder)
     preserved_names = set(preserved_definitions)
-    name_spm_pairs = []
+    blend_stems = atlas_blend_stems(cfg)
+    records = []
     for spm in spms:
-        active_ids = active_material_ids(spm)
+        referenced_ids = active_material_ids(spm)
+        visible_ids = visible_material_ids(spm)
         original_refs = _source_material_ref_map(folder, spm) if spm.name.lower().startswith("sk_") else {}
         for row in extract_material_image_refs(spm):
-            if active_ids and row.get("material_id") not in active_ids:
+            # No Generator material properties means a mesh/material asset and
+            # retains the legacy include-all fallback. Otherwise only visible
+            # generators contribute export jobs; hidden nodes remain available
+            # to the separate provenance tracing functions above.
+            if referenced_ids and row.get("material_id") not in visible_ids:
                 continue
-            refs = row["refs"]
-            current_is_managed = _refs_are_only_managed_outputs(refs)
+            name = row.get("material_name")
+            if not name:
+                continue
+            current_refs = list(row.get("refs") or [])
+            refs = list(current_refs)
+            current_is_managed = _refs_are_only_managed_outputs(current_refs)
             leaf_source = _leaf_source_for_active_material(
-                spm, refs, leaf_mesh_sources or [])
-            canonical = canonical_material_name(row["material_name"]).lower()
+                spm, current_refs, leaf_mesh_sources or [])
+            canonical_name = canonical_material_name(name)
+            canonical = canonical_name.lower()
+            auto_base = auto_split_atlas_base(name, blend_stems, graphs)
+            # A normalized SK can point at T_*_green while its source SPM has
+            # only the suffix-free leaf atlas. Recover that authoritative leaf
+            # source by atlas name so the job has every connected input map.
+            if not leaf_source and auto_base:
+                leaf_source = _leaf_source_for_atlas_base(
+                    auto_base, leaf_mesh_sources or [])
             # SK files often point only at old M_/T_ Unreal outputs.  Those
             # are not source inputs; recover the same material's references
             # from the original SPM copy instead.
@@ -1647,73 +1767,129 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                 refs = [str(ref) for ref in refs if ref]
             elif current_is_managed and original_refs.get(canonical):
                 refs = original_refs[canonical]
-            name_spm_pairs.append((
-                row["material_name"], spm, refs, current_is_managed, leaf_source))
-    blend_stems = atlas_blend_stems(cfg)
+                # Recovered source refs may identify the same atlas that the
+                # current managed T_* slots could not identify by themselves.
+                # Resolve it now so managed and not-yet-managed SK variants
+                # share one provenance/signature.
+                leaf_source = _leaf_source_for_active_material(
+                    spm, refs, leaf_mesh_sources or [])
+                if leaf_source:
+                    refs = list(leaf_source.get("source_refs") or [
+                        leaf_source.get("albedo"), leaf_source.get("alpha")])
+                    refs = [str(ref) for ref in refs if ref]
+            if canonical in preserved_names:
+                continue
+            # A cluster-folder image is already a derived SpeedTree cluster
+            # render, not an input set to process through Substance again.
+            if is_cluster_render_material(folder, spm, refs):
+                continue
+            exact_graph = _graph_for_materials(graphs, canonical_name, [name])
+            is_managed_generic = bool(
+                GENERIC_MATERIAL_NAME_RE.match(name) and exact_graph)
+            # An explicit T_<generic> graph is the authoritative contract for
+            # a visible generic material.  Atlas provenance still supplies
+            # its source inputs, but must not split the same material into a
+            # second, newly named output set.
+            strong_base = (
+                canonical_name if is_managed_generic
+                else leaf_source.get("atlas_base") if leaf_source else auto_base)
+            candidate_base = (
+                strong_base or derived_material_base(name) or canonical_name)
+            # Generic SpeedTree names are normally disposable placeholders,
+            # but an explicit managed graph makes the visible material part
+            # of our normalization contract even before its slots have been
+            # rewritten to T_* outputs.  Hidden generators were filtered
+            # above, so this keeps only actually contributing materials.
+            if GENERIC_MATERIAL_NAME_RE.match(name) and not exact_graph:
+                continue
+            source_albedo, source_alpha = material_color_alpha_refs(refs)
+            records.append({
+                "name": name,
+                "canonical": canonical_name,
+                "spm": spm,
+                "current_refs": current_refs,
+                "source_refs": list(refs),
+                "source_signature": _material_ref_signature(spm, refs, name),
+                "source_albedo": source_albedo,
+                "source_alpha": source_alpha,
+                "current_is_managed": current_is_managed,
+                "leaf_source": leaf_source,
+                "strong_base": strong_base,
+                "candidate_base": candidate_base,
+                "referenced_legacy": legacy_export_maps_from_refs(
+                    spm, current_refs, name, cfg["required_export_maps"]),
+            })
+
+    # First group by the possible suffix-free base, then by the exact connected
+    # source signature. Same-named variants with different sources stay apart.
+    candidate_groups = {}
+    for record in records:
+        candidate_groups.setdefault(record["candidate_base"].lower(), {
+            "base": record["candidate_base"], "records": [],
+        })["records"].append(record)
+
+    grouped = []
+    for candidate in candidate_groups.values():
+        signature_groups = {}
+        for record in candidate["records"]:
+            signature_groups.setdefault(record["source_signature"], []).append(record)
+        collision = len(signature_groups) > 1
+        for signature, aliases in signature_groups.items():
+            if not collision and (
+                    any(row.get("strong_base") for row in aliases)
+                    or len(aliases) > 1):
+                base = candidate["base"]
+            elif collision and any(
+                    row["canonical"].lower() == candidate["base"].lower()
+                    for row in aliases):
+                base = candidate["base"]
+            else:
+                base = aliases[0]["canonical"]
+            grouped.append((base, signature, aliases))
+
     items = []
-    by_base = {}
-    for name, spm, refs, current_is_managed, leaf_source in name_spm_pairs:
-        if not name:
-            continue
-        if canonical_material_name(name).lower() in preserved_names:
-            continue
-        # A cluster-folder image is already a derived SpeedTree cluster render.
-        # It is not an atlas/source texture to feed through SBS a second time.
-        if is_cluster_render_material(folder, spm, refs):
-            continue
-        base = (leaf_source["atlas_base"] if leaf_source
-                else auto_split_atlas_base(name, blend_stems, graphs)
-                or canonical_material_name(name))
-        key = base.lower()
+    for base, signature, aliases in grouped:
+        names = unique(row["name"] for row in aliases)
         texture_base = texture_base_for_material(base)
-        graph = graphs.get(texture_base.lower()) or graphs.get(key)
-        # A default SpeedTree name is normally too ambiguous to create a new
-        # texture set from.  It is still a real normalization target when the
-        # active SK slot already points only at a managed T_ output set and a
-        # matching SBS graph exists.  This keeps existing Material 2 / Copy
-        # slots covered without inventing name-based exceptions.
-        if GENERIC_MATERIAL_NAME_RE.match(name) and not (current_is_managed and graph):
-            continue
-        source_albedo, source_alpha = material_color_alpha_refs(refs)
-        referenced_legacy = legacy_export_maps_from_refs(
-            spm, refs, name, cfg["required_export_maps"])
-        if key in by_base:
-            if name not in by_base[key]["material_names"]:
-                by_base[key]["material_names"].append(name)
-            spm_text = str(spm)
-            if spm_text not in by_base[key]["material_spms"]:
-                by_base[key]["material_spms"].append(spm_text)
-            by_base[key]["source_refs"] = unique(
-                by_base[key]["source_refs"] + refs)
-            by_base[key]["source_albedo"] = unique(
-                by_base[key]["source_albedo"] + source_albedo)
-            by_base[key]["source_alpha"] = unique(
-                by_base[key]["source_alpha"] + source_alpha)
-            for map_name, path in referenced_legacy.items():
-                if path and not by_base[key]["legacy_export_maps"].get(map_name):
-                    by_base[key]["legacy_export_maps"][map_name] = path
-            continue
+        graph = _graph_for_materials(graphs, base, names)
         maps_dir, export_maps = find_export_maps_multi(
             tex_dirs, texture_base, cfg["required_export_maps"])
         _legacy_dir, legacy_export_maps = find_export_maps_multi(
             tex_dirs, base, cfg["required_export_maps"])
-        for map_name, path in referenced_legacy.items():
-            if path and not legacy_export_maps.get(map_name):
-                legacy_export_maps[map_name] = path
+        for record in aliases:
+            for map_name, path in record["referenced_legacy"].items():
+                if path and not legacy_export_maps.get(map_name):
+                    legacy_export_maps[map_name] = path
+        source_refs = unique(
+            ref for row in aliases for ref in row["source_refs"])
+        source_albedo = unique(
+            ref for row in aliases for ref in row["source_albedo"])
+        source_alpha = unique(
+            ref for row in aliases for ref in row["source_alpha"])
+        leaf_sources = unique(
+            row["leaf_source"] for row in aliases if row.get("leaf_source"))
+        connection_materials = unique(
+            row["name"] for row in aliases
+            if not _managed_connection_matches(
+                row["current_refs"], texture_base, cfg["required_export_maps"])
+        )
         entry = {
             "cluster_spm": None,
             "name": base,
             "source": "material",
-            "material_names": [name],
-            "material_spms": [str(spm)],
+            "material_names": names,
+            "material_aliases": names,
+            "material_spms": unique(str(row["spm"]) for row in aliases),
             "atlas_base": base,
             "texture_base": texture_base,
-            "is_atlas": bool(leaf_source)
-                        or bool(material_atlas_base(name, blend_stems, graphs))
-                        or any("cluster\\" in str(ref).lower() for ref in refs),
+            "is_atlas": any(row.get("leaf_source") for row in aliases)
+                        or any(material_atlas_base(row["name"], blend_stems, graphs)
+                               for row in aliases)
+                        or any("cluster\\" in str(ref).lower() for ref in source_refs),
             "needs_leaf_mesh": False,
-            "atlas_blends": list(leaf_source.get("atlas_blends") or [])
-                             if leaf_source else [],
+            "atlas_blends": unique(
+                path for source in leaf_sources
+                for path in source.get("atlas_blends") or []),
             "export_maps": export_maps,
             "missing_export_maps": [k for k, v in export_maps.items() if not v],
             "legacy_export_maps": legacy_export_maps,
@@ -1721,12 +1897,14 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
             "m_graph": graph[0] if graph else None,
             "m_graph_sbs": graph[1] if graph else None,
             "legacy_m_graph": bool(graph and graph[0].lower().startswith("m_")),
-            "source_refs": list(refs),
+            "source_refs": source_refs,
             "source_albedo": source_albedo,
             "source_alpha": source_alpha,
-            "leaf_source_provenance": bool(leaf_source),
+            "source_signature": list(signature),
+            "leaf_source_provenance": bool(leaf_sources),
+            "connection_update_needed": bool(connection_materials),
+            "connection_materials": connection_materials,
         }
-        by_base[key] = entry
         items.append(entry)
     return items
 
@@ -1746,7 +1924,6 @@ def audit_folder(folder, cfg, include_refs=False):
     loose = loose_sk_spms(folder)
     sources = source_spms(folder)
     chosen = preferred[0] if preferred else (loose[0] if loose else (sources[0] if sources else None))
-    blend = blend_for_spm(chosen) if chosen else None
     materials = visible_material_names(chosen) if chosen else []
     missing_m = [
         m for m in materials
@@ -1788,7 +1965,6 @@ def audit_folder(folder, cfg, include_refs=False):
         "sk_spms": [str(p) for p in preferred],
         "loose_sk_spms": [str(p) for p in loose if p not in preferred],
         "chosen_spm": str(chosen) if chosen else None,
-        "blend": str(blend) if blend else None,
         "materials": materials,
         "materials_missing_m_prefix": missing_m,
         "material_renames_needed": renames_needed,
@@ -1825,14 +2001,14 @@ def derive_status_actions(item):
         if status != "needs_sk":
             status = "needs_m_prefix"
         actions.append("머티리얼 이름 M_/공용 이름 정리 필요")
-    if item["chosen_spm"] and not item["blend"]:
-        actions.append("별도 리페어에서 SK Blend 생성 필요")
     local_entries = [c for c in item["cluster_items"] if not c.get("shared_from")]
     leaf_sources = item.get("leaf_mesh_sources") or []
     if any(not source.get("atlas_blends") for source in leaf_sources):
         actions.append("Blender 아틀라스 파일 확인 필요")
     if any(c["missing_export_maps"] for c in local_entries):
         actions.append("Substance에서 출력 텍스처 저장 필요")
+    if any(c.get("connection_update_needed") for c in item["cluster_items"]):
+        actions.append("SpeedTree 연결 텍스처 정리 필요")
     if local_entries and not item["sbs_files"]:
         actions.append("Substance SBS 파일 확인 필요")
     if actions and status == "ready":
@@ -1927,6 +2103,78 @@ def target_mesh_source_map(pcg_targets):
     return source_map
 
 
+def focus_pcg_targets(pcg_targets, focus_data_assets=None, positive_weight_only=True):
+    """Keep focused PCG DataAssets plus explicitly placed level meshes.
+
+    The Unreal refresh report intentionally contains the full PCG graph
+    dependency set.  The production board can therefore narrow PCG provenance
+    to the DataAssets currently used for the shot without losing directly
+    placed ST9 components from the configured level.
+    """
+    if not pcg_targets or not focus_data_assets:
+        return pcg_targets
+
+    focus = {str(path).lower() for path in focus_data_assets if path}
+    selected_data_assets = []
+    pcg_meshes = {}
+
+    def entry_is_active(entry):
+        if not entry.get("static_mesh"):
+            return False
+        if not positive_weight_only:
+            return True
+        weight = entry.get("weight")
+        if weight is None:
+            return True
+        try:
+            return float(weight) > 0.0
+        except (TypeError, ValueError):
+            return True
+
+    for data_asset in pcg_targets.get("data_assets", []):
+        asset_path = str(data_asset.get("asset") or "")
+        if asset_path.lower() not in focus:
+            continue
+        filtered_sections = {}
+        for section, entries in (data_asset.get("sections") or {}).items():
+            active_entries = [dict(entry) for entry in entries if entry_is_active(entry)]
+            if not active_entries:
+                continue
+            filtered_sections[section] = active_entries
+            for entry in active_entries:
+                mesh_path = entry["static_mesh"]
+                info = pcg_meshes.setdefault(mesh_path, {
+                    "data_assets": set(),
+                    "sections": set(),
+                })
+                info["data_assets"].add(asset_path)
+                info["sections"].add(section)
+        selected = dict(data_asset)
+        selected["sections"] = filtered_sections
+        selected_data_assets.append(selected)
+
+    selected_meshes = []
+    for item in pcg_targets.get("meshes", []):
+        mesh_path = item.get("static_mesh")
+        placements = [dict(row) for row in (item.get("level_instances") or [])]
+        pcg_info = pcg_meshes.get(mesh_path)
+        if not pcg_info and not placements:
+            continue
+        selected = dict(item)
+        selected["data_assets"] = sorted(pcg_info["data_assets"]) if pcg_info else []
+        selected["sections"] = sorted(pcg_info["sections"]) if pcg_info else []
+        selected["source_graphs"] = []
+        selected["level_instances"] = placements
+        selected_meshes.append(selected)
+
+    focused = dict(pcg_targets)
+    focused["data_assets"] = selected_data_assets
+    focused["meshes"] = selected_meshes
+    focused["focus_data_assets"] = [str(path) for path in focus_data_assets if path]
+    focused["positive_weight_only"] = bool(positive_weight_only)
+    return focused
+
+
 def folder_matches_target_meshes(folder, target_mesh_names):
     return bool(folder_target_mesh_names(folder, target_mesh_names))
 
@@ -2003,7 +2251,6 @@ def write_csv(report, csv_path):
                 "status": item["status"],
                 "folder": item["folder"],
                 "chosen_spm": item["chosen_spm"] or "",
-                "blend": item["blend"] or "",
                 "sbs": "; ".join(item["sbs_files"]),
                 "clusters": cluster_count,
                 "missing_m_prefix": "; ".join(item["materials_missing_m_prefix"]),
@@ -2019,7 +2266,7 @@ def write_csv(report, csv_path):
             }
         )
     fields = list(rows[0].keys()) if rows else [
-        "name", "status", "folder", "chosen_spm", "blend", "sbs", "clusters",
+        "name", "status", "folder", "chosen_spm", "sbs", "clusters",
         "missing_m_prefix", "missing_export_maps", "normal_convention",
         "pcg_target_meshes", "duplicate_pcg_target_meshes",
         "target_spm_statuses", "actions",
@@ -2054,9 +2301,10 @@ def attach_global_m_graphs(items, cfg):
     changed = set()
     for item in items:
         for entry in item.get("cluster_items") or []:
-            graph = (
-                graphs.get(str(entry.get("texture_base", "")).lower())
-                or graphs.get(str(entry.get("atlas_base", "")).lower())
+            graph = _graph_for_materials(
+                graphs,
+                entry.get("atlas_base", ""),
+                entry.get("material_names") or [],
             )
             if not graph:
                 continue
@@ -2081,13 +2329,23 @@ def attach_global_m_graphs(items, cfg):
 
 
 def resolve_shared_atlas_entries(items, cfg):
-    """Choose one owner for each exact material name and suppress duplicate jobs."""
+    """Choose one owner for each exact output/source pair.
+
+    Identical output names backed by different connected source sets are not
+    shared; that would silently render one material's maps for another.
+    """
     def priority(entry):
         if entry.get("m_graph"):
             return 3
         if any((entry.get("export_maps") or {}).values()):
             return 2
         return 1
+
+    def sharing_key(item_name, entry):
+        signature = tuple(entry.get("source_signature") or [])
+        if not signature:
+            signature = ("@folder", item_name.lower())
+        return entry["atlas_base"].lower(), signature
 
     owners = {}
     items_by_name = {item["name"]: item for item in items}
@@ -2097,12 +2355,12 @@ def resolve_shared_atlas_entries(items, cfg):
     ]
     for _rank, item_name, entry in sorted(
             candidates, key=lambda row: (-row[0], row[1].lower())):
-        owners.setdefault(entry["atlas_base"].lower(), (item_name, entry))
+        owners.setdefault(sharing_key(item_name, entry), (item_name, entry))
 
     changed = set()
     for item in items:
         for entry in item.get("cluster_items") or []:
-            owner_name, owner_entry = owners[entry["atlas_base"].lower()]
+            owner_name, owner_entry = owners[sharing_key(item["name"], entry)]
             if owner_name == item["name"] and owner_entry is entry:
                 continue
             entry["shared_from"] = owner_name
@@ -2118,7 +2376,13 @@ def resolve_shared_atlas_entries(items, cfg):
     return sorted(changed)
 
 
+@_report_scan_cached
 def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
+    pcg_targets = focus_pcg_targets(
+        pcg_targets,
+        cfg.get("pcg_focus_data_assets"),
+        cfg.get("pcg_positive_weight_only", True),
+    )
     ensure_blend_source_index(cfg)
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
     items = [audit_folder(folder, cfg, include_refs=include_refs) for folder in folders]
@@ -2142,6 +2406,11 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             name for name in folder_matches
             if target_source_map.get(name, {}).get("pcg")
         ]
+        item["pcg_data_assets"] = sorted({
+            asset
+            for name in folder_matches
+            for asset in target_source_map.get(name, {}).get("data_assets", [])
+        })
         item["level_mesh_names"] = [
             name for name in folder_matches
             if target_source_map.get(name, {}).get("levels")
@@ -2172,8 +2441,6 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             item["status"] = "needs_sk"
         elif "needs_m_prefix" in target_statuses:
             item["status"] = "needs_m_prefix"
-        elif ({"needs_blend", "needs_blend_update"} & target_statuses) and item["status"] == "ready":
-            item["status"] = "needs_texture_work"
         item["actions"] = unique(target_actions + item["actions"])
     duplicate_mesh_matches = {
         name: sorted(folders)
@@ -2240,6 +2507,8 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             "level_component_count": len(level_placements),
             "level_instance_count": sum(int(item.get("instance_count", 1)) for item in level_placements),
             "levels": pcg_targets.get("levels", []) if pcg_targets else [],
+            "focus_data_assets": pcg_targets.get("focus_data_assets", []) if pcg_targets else [],
+            "positive_weight_only": pcg_targets.get("positive_weight_only") if pcg_targets else None,
         },
         "summary": {
             "total": len(items),

@@ -6,6 +6,7 @@ from .spm_generator_sync import (
     apply_group_transaction,
     build_sync_plan,
     load_manifest,
+    promote_master,
     scan_tree_folders,
     suggest_base_map,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "apply_group_transaction",
     "build_sync_plan",
     "load_manifest",
+    "promote_master",
     "scan_tree_folders",
     "suggest_base_map",
 ]

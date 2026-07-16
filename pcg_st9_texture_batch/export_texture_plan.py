@@ -388,6 +388,8 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "cluster_spm": cluster.get("cluster_spm", ""),
                 "source": cluster.get("source", "cluster"),
                 "material_names": cluster.get("material_names", []),
+                "material_aliases": cluster.get(
+                    "material_aliases", cluster.get("material_names", [])),
                 "material_spms": cluster.get("material_spms", []),
                 "needs_leaf_mesh": cluster.get("needs_leaf_mesh", True),
                 "shared_from": cluster.get("shared_from"),
@@ -408,6 +410,10 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "legacy_export_maps": cluster.get("legacy_export_maps", {}),
                 "missing_export_maps": missing_maps,
                 "export_status": "ok" if not missing_maps else "missing " + ",".join(missing_maps),
+                "connection_update_needed": bool(
+                    cluster.get("connection_update_needed")),
+                "connection_materials": cluster.get("connection_materials", []),
+                "source_signature": cluster.get("source_signature", []),
                 "normal_convention": normal_convention,
                 "normal_opengl": True if normal_convention == "OpenGL" else (False if normal_convention == "DirectX" else None),
                 "ao_policy": item.get("ao_policy", ""),

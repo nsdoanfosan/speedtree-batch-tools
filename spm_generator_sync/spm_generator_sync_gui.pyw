@@ -1059,17 +1059,15 @@ class App:
         if item.get("role") == "master":
             return
         try:
-            manifest = engine.load_manifest(folder)
-            engine.set_master(manifest, item["file"])
-            group = engine.find_group(manifest, item["file"])
-            document = engine.SPMDocument.from_path(folder / item["file"], full=False)
-            group["base_categories"] = engine.source_base_categories(document)
-            engine.save_manifest(folder, manifest)
+            result = engine.promote_master(folder, item["file"])
         except Exception as exc:
             messagebox.showerror("마스터 지정 실패", str(exc), parent=self.root)
             return
         self.refresh(reveal=(folder, item["file"]))
-        self.status_var.set(f"마스터 지정 완료 · {item['file']}")
+        self.status_var.set(
+            f"마스터 지정 완료 · {item['file']} · "
+            f"Base 색상 {result['color_updates']}개 적용"
+        )
 
     def choose_master(self, folder: Path, manifest: dict):
         masters = [item.get("master") for item in manifest.get("groups", []) if item.get("master")]
@@ -1107,12 +1105,10 @@ class App:
                 parent=self.root,
             )
             return
+        if promote_master:
+            engine.promote_master(folder, master)
         source_doc = engine.SPMDocument.from_path(folder / master, full=False)
         manifest = engine.load_manifest(folder)
-        if promote_master:
-            engine.set_master(manifest, master)
-            promoted_group = engine.find_group(manifest, master)
-            promoted_group["base_categories"] = engine.source_base_categories(source_doc)
         group = engine.find_group(manifest, master)
         categories = group.get("base_categories") or engine.source_base_categories(source_doc)
         group["base_categories"] = categories

@@ -22,6 +22,7 @@ from pcg_texture_audit import (
     canonical_material_name,
     read_maybe_gzip_text,
     texture_base_for_material,
+    visible_material_ids,
 )
 
 
@@ -225,8 +226,14 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
     text = read_maybe_gzip_text(spm)
     if not text:
         raise RuntimeError(f"cannot read SPM: {spm}")
-    active_ids = {str(value).lower() for value in active_material_ids(spm)}
-    if not active_ids:
+    referenced_ids = {
+        str(value).lower() for value in active_material_ids(spm)
+    }
+    if referenced_ids:
+        active_ids = {
+            str(value).lower() for value in visible_material_ids(spm)
+        }
+    else:
         active_ids = {
             _material_id(match.group(0)).lower()
             for match in MATERIAL_BLOCK_RE.finditer(text)

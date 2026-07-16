@@ -246,17 +246,23 @@ def _material_compile_and_slot_validation(mesh_path):
 
 
 def _save_item_assets(item, imported_assets):
-    saved = []
+    asset_paths = []
+    seen_paths = set()
     for value in imported_assets:
         asset_path = value.get("asset_path") if isinstance(value, dict) else None
+        if asset_path and asset_path not in seen_paths:
+            seen_paths.add(asset_path)
+            asset_paths.append(asset_path)
+    mesh_path = item.get("mesh_path")
+    if mesh_path and mesh_path not in seen_paths:
+        seen_paths.add(mesh_path)
+        asset_paths.append(mesh_path)
+
+    saved = []
+    for asset_path in asset_paths:
         if asset_path and unreal.EditorAssetLibrary.does_asset_exist(asset_path):
             unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
             saved.append(asset_path)
-    mesh_path = item.get("mesh_path")
-    if mesh_path and unreal.EditorAssetLibrary.does_asset_exist(mesh_path):
-        unreal.EditorAssetLibrary.save_asset(mesh_path, only_if_is_dirty=False)
-        if mesh_path not in saved:
-            saved.append(mesh_path)
     folder = item.get("unreal_folder")
     if folder:
         unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True)
@@ -278,7 +284,6 @@ def ingest_item(item):
     wind = _apply_dynamic_wind(item)
     saved = _save_item_assets(item, imported_assets)
     materials = _material_compile_and_slot_validation(item["mesh_path"])
-    saved = _save_item_assets(item, imported_assets)
     return {
         "status": "imported_ok",
         "checkout": checkout,

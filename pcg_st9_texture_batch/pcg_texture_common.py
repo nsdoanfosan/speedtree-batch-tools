@@ -13,8 +13,20 @@ DEFAULT_CONFIG = {
     "tree_root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",
     "atlas_root": r"D:\OneDrive\Forestportfolio\02_nature\Tree\atlas",
     "unreal_project": r"C:\UnrealProjects\MyProject2",
+    "unreal_editor_cmd": (
+        r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64"
+        r"\UnrealEditor-Cmd.exe"),
+    "unreal_texture_sync_enabled": True,
+    "unreal_texture_destination": "/Game/Textures",
+    "unreal_texture_commandlet_fallback": True,
+    "unreal_texture_sync_timeout": 1800,
     "pcg_database_content": r"C:\UnrealProjects\MyProject2\Content\PCG\DataBase",
     "unreal_levels": ["/Game/Level/Cliff_final_01"],
+    "pcg_focus_data_assets": [
+        "/Game/PCG/DataBase/landscape/DA_Base_05",
+        "/Game/PCG/DataBase/landscape/DA_Base_06",
+    ],
+    "pcg_positive_weight_only": True,
     "source_texture_roots": [r"D:\OneDrive\Forestportfolio\Texture"],
     "required_export_maps": ["color", "normal", "extra", "height", "opacity", "subsurface"],
     "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",

@@ -27,7 +27,10 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             Path(GUI.engine.__file__).resolve(),
             (TOOL_DIR / "spm_generator_sync.py").resolve(),
         )
-        for name in ("SPMDocument", "base_role_color", "set_master", "save_manifest"):
+        for name in (
+            "SPMDocument", "base_role_color", "set_master", "promote_master",
+            "save_manifest",
+        ):
             self.assertTrue(hasattr(GUI.engine, name), name)
 
     def test_selected_spm_full_path_is_copied_for_everything(self):
@@ -49,6 +52,9 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             app.tree.selection_set(iid)
 
             result = app.copy_selected_paths()
+            # Commit the clipboard selection claim before reading it back;
+            # without this the read is timing-dependent under a full test run.
+            root.update()
             expected = str(
                 Path(r"D:\Trees\black_locust\tree_04.spm").resolve()
             )
@@ -57,6 +63,28 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertIn("1", app.status_var.get())
         finally:
             root.destroy()
+
+    def test_master_button_runs_immediate_master_promotion_transaction(self):
+        folder = Path(r"D:\Trees\oak")
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.selected_items = lambda: [{
+            "folder": folder,
+            "file": "SK_tree_oak_01.spm",
+            "role": "candidate",
+        }]
+        app.refresh = mock.Mock()
+        app.status_var = mock.Mock()
+
+        result = {"color_updates": 7}
+        with mock.patch.object(GUI.engine, "promote_master", return_value=result) as promote:
+            app.set_selected_master()
+
+        promote.assert_called_once_with(folder, "SK_tree_oak_01.spm")
+        app.refresh.assert_called_once_with(
+            reveal=(folder, "SK_tree_oak_01.spm")
+        )
+        self.assertIn("7", app.status_var.set.call_args.args[0])
 
     def test_clipboard_rows_are_deduplicated_and_folder_rows_are_supported(self):
         rows = [

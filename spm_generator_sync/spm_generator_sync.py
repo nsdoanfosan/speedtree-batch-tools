@@ -1804,6 +1804,76 @@ def set_master(manifest: dict, filename: str) -> dict:
     return manifest
 
 
+def promote_master(
+    folder: Path,
+    filename: str,
+    verify_callback=None,
+) -> dict:
+    """Promote one SPM and standardize its master-side Base data immediately."""
+
+    folder = Path(folder)
+    master_path = folder / filename
+    if not master_path.is_file():
+        raise SyncError(f"마스터 SPM이 없습니다: {master_path}")
+
+    manifest = load_manifest(folder)
+    set_master(manifest, filename)
+    group = find_group(manifest, filename)
+    source = SPMDocument.from_path(master_path, full=False)
+    categories = source_base_categories(source)
+    group["base_categories"] = categories
+
+    _document, rendered, color_updates, reference_renames, warnings = (
+        standardize_master_document(master_path, categories)
+    )
+    original_text, compressed = read_spm_text(master_path)
+    changed = rendered != original_text
+
+    validate_xml_text(rendered)
+    check = SPMDocument(master_path, rendered, compressed, full=True)
+    check.validate()
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = folder / BACKUP_SUBDIR / f"master_promotion_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    master_backup = backup_dir / f"01_{filename}"
+    shutil.copy2(master_path, master_backup)
+
+    manifest_path = folder / MANIFEST_NAME
+    manifest_existed = manifest_path.is_file()
+    manifest_backup = backup_dir / f"00_{MANIFEST_NAME}"
+    if manifest_existed:
+        shutil.copy2(manifest_path, manifest_backup)
+
+    try:
+        if changed:
+            write_spm_text(master_path, rendered, compressed)
+            written, written_compressed = read_spm_text(master_path)
+            if written != rendered or written_compressed != compressed:
+                raise SyncError(f"저장 후 바이트 검증 실패: {filename}")
+            SPMDocument(master_path, written, compressed, full=True).validate()
+            if verify_callback is not None:
+                verify_callback(master_path)
+        save_manifest(folder, manifest)
+    except Exception:
+        shutil.copy2(master_backup, master_path)
+        if manifest_existed and manifest_backup.is_file():
+            shutil.copy2(manifest_backup, manifest_path)
+        elif not manifest_existed:
+            manifest_path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "manifest": manifest,
+        "master": str(master_path),
+        "changed": changed,
+        "color_updates": color_updates,
+        "reference_renames": reference_renames,
+        "warnings": warnings,
+        "backup_dir": str(backup_dir),
+    }
+
+
 def set_independent(manifest: dict, filenames: list[str]) -> dict:
     for filename in filenames:
         _remove_relation(manifest, filename)

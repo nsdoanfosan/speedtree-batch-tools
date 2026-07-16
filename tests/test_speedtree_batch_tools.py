@@ -53,6 +53,14 @@ class IntegratedLauncherTests(unittest.TestCase):
         self.assertIn("speedtree_batch_tools_gui.pyw", text)
         self.assertNotIn("call \"SK_Batch.bat\"", text)
 
+    def test_integrated_app_icon_assets_exist(self):
+        self.assertTrue(self.launcher.ICON_PNG.is_file())
+        self.assertTrue(self.launcher.ICON_ICO.is_file())
+        self.assertEqual(
+            self.launcher.APP_USER_MODEL_ID,
+            "PARK.SpeedTree.BatchTools",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

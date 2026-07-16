@@ -437,6 +437,48 @@ class GeneratorSyncTests(unittest.TestCase):
         self.assertEqual(relations["tree_04.spm"]["role"], "master")
         self.assertNotIn("tree_04.spm", manifest["independent"])
 
+    def test_master_promotion_applies_base_mapping_colors_without_followers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            write_spm(master, make_master())
+
+            result = sync.promote_master(folder, master.name)
+
+            manifest = sync.load_manifest(folder)
+            group = sync.find_group(manifest, master.name)
+            self.assertFalse(group["followers"])
+            self.assertEqual(group["base_categories"]["Leaf"], "leaf")
+            self.assertEqual(group["base_categories"]["Branch"], "branch")
+            self.assertGreater(result["color_updates"], 0)
+            self.assertTrue(result["changed"])
+            self.assertTrue(Path(result["backup_dir"]).is_dir())
+
+            document = sync.SPMDocument.from_path(master, full=True)
+            for base in document.base_nodes():
+                category = group["base_categories"][document.generator_name(base)]
+                self.assertIn(category, sync.CATEGORY_COLORS)
+                self.assertEqual(
+                    base.findtext("Extra/m_bSetBackgroundIconColor"),
+                    "true",
+                )
+
+    def test_master_promotion_rolls_back_spm_and_manifest_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            write_spm(master, make_master())
+            original = master.read_bytes()
+
+            def fail(_path):
+                raise RuntimeError("verification failed")
+
+            with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                sync.promote_master(folder, master.name, verify_callback=fail)
+
+            self.assertEqual(master.read_bytes(), original)
+            self.assertFalse((folder / sync.MANIFEST_NAME).exists())
+
     def test_base_mapping_suggestion_supports_one_to_many_branch(self):
         with tempfile.TemporaryDirectory() as temp:
             master = Path(temp) / "master.spm"

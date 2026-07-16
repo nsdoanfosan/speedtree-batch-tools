@@ -1,10 +1,12 @@
 import gzip
 import importlib.machinery
 import importlib.util
+import os
 import shutil
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +18,7 @@ sys.path.insert(0, str(TOOL_DIR))
 
 import sbs_auto
 import pcg_texture_audit
+import migrate_current_sk_textures
 from export_texture_plan import build_texture_plan_from_report, extract_material_image_refs
 from pcg_texture_audit import (
     assign_leaf_atlas_bases,
@@ -24,6 +27,7 @@ from pcg_texture_audit import (
     canonical_material_name,
     cluster_spms,
     discover_leaf_mesh_sources,
+    focus_pcg_targets,
     is_cluster_render_material,
     material_color_alpha_refs,
     material_texture_items,
@@ -81,6 +85,50 @@ class TargetCollectionTests(unittest.TestCase):
         self.assertTrue(sources["tree_both"]["pcg"])
         self.assertEqual(sources["tree_both"]["level_instances"][0]["instance_count"], 2)
 
+    def test_focus_keeps_active_db05_db06_and_direct_level_placements(self):
+        db05 = "/Game/PCG/DataBase/landscape/DA_Base_05"
+        db01 = "/Game/PCG/DataBase/landscape/DA_Base_01"
+        targets = {
+            "meshes": [
+                {"static_mesh": "/Game/st9/pcg_active.pcg_active", "data_assets": [db05]},
+                {"static_mesh": "/Game/st9/pcg_zero.pcg_zero", "data_assets": [db05]},
+                {"static_mesh": "/Game/st9/old_pcg.old_pcg", "data_assets": [db01]},
+                {
+                    "static_mesh": "/Game/st9/level_only.level_only",
+                    "data_assets": [db01],
+                    "level_instances": [{"level": "/Game/Level/Cliff_final_01"}],
+                },
+                {
+                    "static_mesh": "/Game/st9/both.both",
+                    "data_assets": [db05],
+                    "level_instances": [{"level": "/Game/Level/Cliff_final_01"}],
+                },
+            ],
+            "data_assets": [
+                {"asset": db05, "sections": {"Tree": [
+                    {"static_mesh": "/Game/st9/pcg_active.pcg_active", "weight": 1},
+                    {"static_mesh": "/Game/st9/pcg_zero.pcg_zero", "weight": 0},
+                    {"static_mesh": "/Game/st9/both.both", "weight": 2},
+                ]}},
+                {"asset": db01, "sections": {"Tree": [
+                    {"static_mesh": "/Game/st9/old_pcg.old_pcg", "weight": 1},
+                ]}},
+            ],
+        }
+
+        focused = focus_pcg_targets(targets, [db05], positive_weight_only=True)
+        sources = target_mesh_source_map(focused)
+
+        self.assertEqual(set(sources), {"pcg_active", "level_only", "both"})
+        self.assertTrue(sources["pcg_active"]["pcg"])
+        self.assertFalse(sources["level_only"]["pcg"])
+        self.assertTrue(sources["level_only"]["levels"])
+        self.assertTrue(sources["both"]["pcg"])
+        self.assertTrue(sources["both"]["levels"])
+        self.assertEqual(focused["focus_data_assets"], [db05])
+        self.assertEqual(len(focused["data_assets"][0]["sections"]["Tree"]), 2)
+        self.assertEqual(len(targets["data_assets"][0]["sections"]["Tree"]), 3)
+
     def test_remote_payload_reads_explicit_level_without_switching_maps(self):
         script = payload(
             Path(r"C:\Temp\targets.json"),
@@ -105,10 +153,102 @@ class SourceSelectionTests(unittest.TestCase):
             for name in ("test.spm", "SK_test.spm"):
                 with gzip.open(root / name, "wb") as handle:
                     handle.write(xml)
+            repair_blend = root / "SK_test.blend"
+            repair_blend.write_bytes(b"BLENDER")
+            os.utime(repair_blend, (1, 1))
+            os.utime(root / "SK_test.spm", (2, 2))
             status = pcg_texture_audit.target_spm_status(root, "test")
             self.assertEqual(status["materials_missing_m_prefix"], [])
             self.assertEqual(status["material_renames_needed"], [])
-            self.assertEqual(status["status"], "needs_blend")
+            self.assertEqual(status["status"], "ready")
+            self.assertEqual(status["actions"], [])
+            self.assertNotIn("blend", status)
+            self.assertNotIn("blend_stale", status)
+
+    def test_repair_blend_is_not_part_of_folder_status(self):
+        item = {
+            "sk_spms": [r"D:\Trees\oak\SK_oak.spm"],
+            "chosen_spm": r"D:\Trees\oak\SK_oak.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [],
+            "leaf_mesh_sources": [],
+            "sbs_files": [],
+        }
+        pcg_texture_audit.derive_status_actions(item)
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
+    def test_relative_image_resolve_cache_is_shared_by_spms_in_one_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = root / "textures" / "leaf.tga"
+            image.parent.mkdir()
+            image.write_bytes(b"image")
+            cached = pcg_texture_audit._resolve_spm_image_ref_cached
+            cached.cache_clear()
+            try:
+                first = pcg_texture_audit.resolve_spm_image_ref(
+                    root / "tree.spm", r"textures\leaf.tga")
+                after_first = cached.cache_info()
+                second = pcg_texture_audit.resolve_spm_image_ref(
+                    root / "SK_tree.spm", r"textures\leaf.tga")
+                after_second = cached.cache_info()
+                self.assertEqual(first, image.resolve())
+                self.assertEqual(second, first)
+                self.assertEqual(after_second.misses, after_first.misses)
+                self.assertEqual(after_second.hits, after_first.hits + 1)
+            finally:
+                cached.cache_clear()
+
+    def test_spm_image_resolve_is_lexical(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cached = pcg_texture_audit._resolve_spm_image_ref_cached
+            cached.cache_clear()
+            try:
+                with mock.patch.object(
+                        Path, "resolve",
+                        side_effect=AssertionError("filesystem resolve is not expected")):
+                    result = pcg_texture_audit.resolve_spm_image_ref(
+                        root / "models" / "tree.spm",
+                        r"..\textures\.\missing.tga",
+                    )
+                expected = Path(os.path.abspath(os.path.normpath(
+                    root / "models" / r"..\textures\.\missing.tga")))
+                self.assertEqual(result, expected)
+            finally:
+                cached.cache_clear()
+
+    def test_report_scan_cache_is_fresh_between_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first_spm = root / "first.spm"
+            first_spm.write_bytes(b"one")
+
+            @pcg_texture_audit._report_scan_cached
+            def snapshot():
+                first_key = pcg_texture_audit._file_cache_key(first_spm)
+                second_key = pcg_texture_audit._file_cache_key(first_spm)
+                first_paths = pcg_texture_audit.root_spms(root)
+                second_paths = pcg_texture_audit.root_spms(root)
+                cache = pcg_texture_audit._REPORT_SCAN_CACHE.get()
+                return first_key, second_key, first_paths, second_paths, {
+                    name: len(values) for name, values in cache.items()
+                }
+
+            first = snapshot()
+            self.assertEqual(first[0], first[1])
+            self.assertEqual(first[2], first[3])
+            self.assertEqual(first[4]["file_cache_keys"], 1)
+            self.assertEqual(first[4]["root_spms"], 1)
+
+            first_spm.write_bytes(b"longer")
+            second_spm = root / "second.spm"
+            second_spm.write_bytes(b"two")
+            second = snapshot()
+            self.assertNotEqual(first[0][1], second[0][1])
+            self.assertEqual(second[2], [first_spm, second_spm])
 
     def test_leaf_blend_is_found_by_embedded_source_image(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -285,9 +425,15 @@ class SourceSelectionTests(unittest.TestCase):
             pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
             try:
                 self.assertEqual(
-                    pcg_texture_audit.active_material_ids(spm), {"0", "1"})
+                    pcg_texture_audit.active_material_ids(spm),
+                    {"0", "1", "2", "3"})
                 self.assertEqual(
-                    pcg_texture_audit.active_material_names(spm), ["M_shown"])
+                    pcg_texture_audit.active_material_names(spm),
+                    ["M_shown", "M_eye_off", "M_under_hidden_parent"])
+                self.assertEqual(
+                    pcg_texture_audit.visible_material_ids(spm), {"0", "1"})
+                self.assertEqual(
+                    pcg_texture_audit.visible_material_names(spm), ["M_shown"])
             finally:
                 pcg_texture_audit._SPM_ANALYSIS_CACHE = old_memory
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
@@ -588,6 +734,232 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(row["source_roughness"], [source_roughness])
             self.assertEqual(row["source_subsurface"], [source_subsurface])
 
+    def test_visible_auto_split_aliases_share_one_source_texture_set(self):
+        def material(material_id, name, refs):
+            filenames = "".join(
+                f"<TexFilename>{ref}</TexFilename>" for ref in refs)
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f"{filenames}</Material_v8>"
+            )
+
+        def generator(guid, hidden, material_id):
+            return (
+                f'<Generator Type="Leaf Mesh"><GUID>{guid}</GUID>'
+                f'<Hidden>{str(hidden).lower()}</Hidden><Properties><Property>'
+                f'<Name>Leaves:Material</Name><Value>{material_id}</Value>'
+                f'</Property></Properties></Generator>'
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            atlas = root / "atlas"
+            texture.mkdir()
+            atlas.mkdir()
+            (atlas / "M_cluster_fern_Atlas_01.blend").write_bytes(b"BLENDER")
+            source_refs = [
+                self._image(root / "source" / f"fern_{role}.png")
+                for role in ("albedo", "opacity", "normal", "roughness", "height", "translucency")
+            ]
+            source_xml = (
+                "<SpeedTree><Materials>"
+                + material("1", "M_cluster_fern_Atlas_01_green", source_refs)
+                + material("2", "M_cluster_fern_Atlas_01_stem", source_refs)
+                + material("3", "M_cluster_fern_Atlas_01_yellow", source_refs)
+                + "</Materials></SpeedTree>"
+            ).encode()
+            managed = lambda suffix: [
+                f"texture/T_cluster_fern_Atlas_01_{suffix}_{role}.tga"
+                for role in sbs_auto.RENDER_MAPS
+            ]
+            sk_xml = (
+                "<SpeedTree><Materials>"
+                + material("1", "M_cluster_fern_Atlas_01_green", managed("green"))
+                + material("2", "M_cluster_fern_Atlas_01_stem", managed("stem"))
+                + material("3", "M_cluster_fern_Atlas_01_yellow", managed("yellow"))
+                + "</Materials><Generators>"
+                + generator("visible-green", False, "1")
+                + generator("visible-stem", False, "2")
+                + generator("hidden-yellow", True, "3")
+                + "</Generators></SpeedTree>"
+            ).encode()
+            for path, payload in (
+                    (root / "SM_weed_fern.spm", source_xml),
+                    (root / "SK_weed_fern.spm", sk_xml)):
+                with gzip.open(path, "wb") as handle:
+                    handle.write(payload)
+
+            items = material_texture_items(
+                root,
+                {"atlas_root": str(atlas),
+                 "required_export_maps": list(sbs_auto.RENDER_MAPS)},
+                [texture], {},
+            )
+
+            self.assertEqual(len(items), 1)
+            row = items[0]
+            self.assertEqual(row["atlas_base"], "M_cluster_fern_Atlas_01")
+            self.assertEqual(row["texture_base"], "T_cluster_fern_Atlas_01")
+            self.assertEqual(
+                set(row["material_names"]),
+                {"M_cluster_fern_Atlas_01_green",
+                 "M_cluster_fern_Atlas_01_stem"},
+            )
+            self.assertNotIn("M_cluster_fern_Atlas_01_yellow",
+                             row["material_names"])
+            self.assertEqual(set(row["source_refs"]), set(source_refs))
+            self.assertTrue(row["connection_update_needed"])
+            self.assertEqual(set(row["connection_materials"]),
+                             set(row["material_names"]))
+
+    def test_auto_split_names_with_different_sources_do_not_merge(self):
+        def material(material_id, name, prefix):
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f'<TexFilename>{prefix}_albedo.png</TexFilename>'
+                f'<TexFilename>{prefix}_opacity.png</TexFilename>'
+                f'</Material_v8>'
+            )
+
+        xml = (
+            "<SpeedTree><Materials>"
+            + material("1", "M_leaf_test_atlas_01_green", "source/green")
+            + material("2", "M_leaf_test_atlas_01_yellow", "source/yellow")
+            + "</Materials><Generators>"
+              "<Generator><Property><Name>Leaves:Material</Name><Value>1</Value></Property></Generator>"
+              "<Generator><Property><Name>Leaves:Material</Name><Value>2</Value></Property></Generator>"
+              "</Generators></SpeedTree>"
+        ).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "texture").mkdir()
+            with gzip.open(root / "SK_test.spm", "wb") as handle:
+                handle.write(xml)
+            items = material_texture_items(
+                root,
+                {"atlas_root": str(root / "atlas"),
+                 "required_export_maps": list(sbs_auto.RENDER_MAPS)},
+                [root / "texture"], {},
+            )
+            self.assertEqual(len(items), 2)
+            self.assertEqual(
+                {item["atlas_base"] for item in items},
+                {"M_leaf_test_atlas_01_green", "M_leaf_test_atlas_01_yellow"},
+            )
+            self.assertEqual(len({tuple(item["source_signature"]) for item in items}), 2)
+
+    def test_auto_split_managed_alias_recovers_suffix_free_leaf_source(self):
+        xml = b'''<SpeedTree><Materials>
+<Material_v8 ID="1" Name="M_leaf_nothofagus_atlas_01_green">
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_color.tga</TexFilename>
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_opacity.tga</TexFilename>
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_normal.tga</TexFilename>
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_extra.tga</TexFilename>
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_height.tga</TexFilename>
+<TexFilename>texture/T_leaf_nothofagus_atlas_01_green_subsurface.tga</TexFilename>
+</Material_v8></Materials><Generator><Property>
+<Name>Leaves:Material</Name><Value>1</Value>
+</Property></Generator></SpeedTree>'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            texture.mkdir()
+            with gzip.open(root / "SK_tree_nothofagus.spm", "wb") as handle:
+                handle.write(xml)
+            source_refs = [
+                self._image(root / "source" / f"nothofagus_{role}.png")
+                for role in ("albedo", "opacity", "normal", "roughness", "height", "translucency")
+            ]
+            leaf_source = {
+                "atlas_base": "M_leaf_nothofagus_atlas_01",
+                "albedo": source_refs[0],
+                "alpha": source_refs[1],
+                "source_refs": source_refs,
+                "atlas_blends": [],
+            }
+            items = material_texture_items(
+                root,
+                {"atlas_root": str(root / "atlas"),
+                 "required_export_maps": list(sbs_auto.RENDER_MAPS)},
+                [texture], {}, leaf_mesh_sources=[leaf_source],
+            )
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["atlas_base"],
+                             "M_leaf_nothofagus_atlas_01")
+            self.assertEqual(items[0]["source_refs"], source_refs)
+            self.assertTrue(items[0]["leaf_source_provenance"])
+
+    def test_direct_graph_fills_every_missing_standard_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "texture"
+            out.mkdir()
+            job = {
+                "base": "M_test",
+                "texture_base": "T_test",
+                "mode": "direct",
+                "graph": "T_test",
+                "sbs": str(root / "test.sbs"),
+                "out_dir": str(out),
+                "normal_opengl": True,
+                "direct_maps": ("color", "normal", "extra", "height"),
+                "size_log2": (1, 1),
+                "row": {
+                    "texture_dir": str(out),
+                    "texture_base": "T_test",
+                    "legacy_export_maps": {},
+                },
+            }
+
+            def write_maps(texture_base, output_dir, maps):
+                paths = []
+                for role in maps:
+                    path = Path(output_dir) / f"{texture_base}_{role}.tga"
+                    Image.new("RGB", (2, 2), (128, 128, 128)).save(path)
+                    paths.append(path)
+                return paths
+
+            def render_direct(_sbs, _graph, texture_base, output_dir, **kwargs):
+                files = write_maps(texture_base, output_dir, kwargs["maps"])
+                return {
+                    "files": files, "size_log2": (1, 1),
+                    "pixel_size": (2, 2), "backup_dir": None,
+                    "changed_files": files, "unchanged_files": [],
+                    "created_files": files,
+                }
+
+            def render_fallback(texture_base, _inputs, _params, output_dir, **kwargs):
+                files = write_maps(texture_base, output_dir, kwargs["maps"])
+                return {
+                    "files": files, "backup_dir": None,
+                    "changed_files": files, "unchanged_files": [],
+                    "created_files": files,
+                }
+
+            with mock.patch.object(
+                    sbs_auto, "render_sbs_graph_maps", side_effect=render_direct), \
+                    mock.patch.object(
+                        sbs_auto, "render_maps", side_effect=render_fallback) as fallback, \
+                    mock.patch.object(
+                        sbs_auto, "plan_inputs_from_row", return_value=({}, [])), \
+                    mock.patch.object(
+                        sbs_auto, "set_managed_graph_resolution", return_value={
+                            "changed": False, "backup": None, "size_log2": (1, 1),
+                        }), \
+                    mock.patch.object(
+                        sbs_auto, "delete_legacy_m_outputs", return_value=[]):
+                result = migrate_current_sk_textures.run_job(job, {}, timeout=10)
+
+            self.assertEqual(
+                fallback.call_args.kwargs["maps"], ("opacity", "subsurface"))
+            self.assertTrue(fallback.call_args.kwargs["return_info"])
+            self.assertEqual(len(result["files"]), len(sbs_auto.RENDER_MAPS))
+            self.assertEqual(len(result["changed_files"]), len(sbs_auto.RENDER_MAPS))
+            self.assertEqual(len(result["created_files"]), len(sbs_auto.RENDER_MAPS))
+            self.assertEqual(result["unchanged_files"], [])
+            self.assertTrue(all(Path(path).is_file() for path in result["files"]))
+
     def test_active_generic_material_with_existing_managed_graph_is_included(self):
         xml = b'''<SpeedTree><Materials>
 <Material_v8 ID="1" Name="M_Material 2">
@@ -616,6 +988,60 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["atlas_base"], "M_Material 2")
             self.assertEqual(items[0]["texture_base"], "T_Material 2")
+
+    def test_active_generic_source_material_with_managed_graph_is_included(self):
+        def xml(refs):
+            filenames = "".join(
+                f"<TexFilename>{ref}</TexFilename>" for ref in refs)
+            return f'''<SpeedTree><Materials>
+<Material_v8 ID="2" Name="M_Material 2">{filenames}</Material_v8>
+</Materials><Generator><Property>
+<Name>Leaves:Material</Name><Value>2</Value>
+</Property></Generator></SpeedTree>'''.encode()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            texture.mkdir()
+            source_refs = [
+                "source/leaf_Albedo.jpg", "source/leaf_Opacity.jpg",
+                "source/leaf_Normal.jpg", "source/leaf_Roughness.jpg",
+            ]
+            managed_refs = [
+                f"texture/T_Material 2_{map_name}.tga"
+                for map_name in sbs_auto.RENDER_MAPS
+            ]
+            for path, payload in (
+                    (root / "SM_bush_test.spm", xml(source_refs)),
+                    (root / "SK_bush_test.spm", xml(managed_refs)),
+                    (root / "SK_weed_test.spm", xml(source_refs))):
+                with gzip.open(path, "wb") as handle:
+                    handle.write(payload)
+            leaf_source = {
+                "atlas_base": "M_leaf_test_atlas_01",
+                "albedo": root / source_refs[0],
+                "alpha": root / source_refs[1],
+                "source_refs": [root / ref for ref in source_refs],
+                "atlas_blends": [],
+            }
+            items = material_texture_items(
+                root,
+                {"atlas_root": str(root / "atlas"),
+                 "required_export_maps": list(sbs_auto.RENDER_MAPS)},
+                [texture],
+                {"t_material 2": ("T_Material 2", str(texture / "test.sbs"))},
+                leaf_mesh_sources=[leaf_source],
+            )
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["atlas_base"], "M_Material 2")
+            self.assertEqual(items[0]["texture_base"], "T_Material 2")
+            self.assertEqual(items[0]["material_spms"], [
+                str(root / "SK_bush_test.spm"),
+                str(root / "SK_weed_test.spm"),
+            ])
+            self.assertEqual(
+                items[0]["source_refs"], [str(root / ref) for ref in source_refs])
+            self.assertTrue(items[0]["connection_update_needed"])
 
     def test_sk_managed_outputs_fall_back_to_same_material_in_original_spm(self):
         def xml(name, refs):
@@ -1125,6 +1551,100 @@ class GuiLabelTests(unittest.TestCase):
             "⚠ SK_weed_blackgum_01.spm → Material 2",
         )
 
+    def test_pcg_board_does_not_expose_sk_repair_blend_status(self):
+        source = (TOOL_DIR / "pcg_texture_gui.pyw").read_text(encoding="utf-8")
+        self.assertFalse(hasattr(self.gui.App, "step4_text"))
+        self.assertNotIn("④ SK Blend", source)
+        self.assertNotIn('"step4"', source)
+
+    def test_initial_refresh_runs_in_worker_and_applies_via_root_after(self):
+        class FakeRoot:
+            def __init__(self):
+                self.callbacks = []
+
+            def after(self, delay, callback):
+                self.callbacks.append((delay, callback))
+
+            def update_idletasks(self):
+                pass
+
+        class FakeVar:
+            def __init__(self, value):
+                self.value = value
+                self.values = []
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+                self.values.append(value)
+
+        threads = []
+
+        class FakeThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                self.started = False
+                threads.append(self)
+
+            def start(self):
+                self.started = True
+
+        report = {"items": []}
+        app = self.gui.App.__new__(self.gui.App)
+        app.root = FakeRoot()
+        app.cfg = {"tree_root": "old"}
+        app.root_var = FakeVar("new")
+        app.use_pcg_targets_var = FakeVar(True)
+        app.status_var = FakeVar("대기")
+        app.report = None
+        app.texplan_cache = {"stale": []}
+        app.worker = None
+        app._busy = False
+        app._set_busy = mock.Mock()
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+
+        with mock.patch.object(self.gui, "save_config") as save_config, \
+                mock.patch.object(self.gui, "load_pcg_targets", return_value={"meshes": []}), \
+                mock.patch.object(self.gui, "make_report", return_value=report) as make_report, \
+                mock.patch.object(self.gui, "save_spm_analysis_cache"), \
+                mock.patch.object(self.gui.threading, "Thread", FakeThread):
+            app._start_initial_refresh()
+            self.assertEqual(len(threads), 1)
+            self.assertTrue(threads[0].started)
+            make_report.assert_not_called()
+            self.assertIsNone(app.report)
+            app.refresh()
+            make_report.assert_not_called()
+            self.assertEqual(app.status_var.value, "초기 검사 중... (끝나면 자동으로 다시 검사)")
+
+            threads[0].target()
+            make_report.assert_called_once_with(
+                {"tree_root": "new"}, pcg_targets={"meshes": []})
+            save_config.assert_called_once_with({"tree_root": "new"})
+            self.assertIsNone(app.report)
+            self.assertEqual(len(app.root.callbacks), 1)
+
+            delay, callback = app.root.callbacks.pop()
+            self.assertEqual(delay, 0)
+            callback()
+
+            # The refresh that arrived mid-initial-scan must run after the
+            # initial result lands instead of being silently dropped (race:
+            # target-refresh buttons finishing during the first audit).
+            self.assertEqual(make_report.call_count, 2)
+            self.assertFalse(app._pending_refresh)
+
+        self.assertIs(app.report, report)
+        self.assertEqual(app.texplan_cache, {})
+        self.assertEqual(app._set_busy.call_args_list, [mock.call(True), mock.call(False)])
+        self.assertEqual(app.populate.call_count, 2)
+        self.assertEqual(app._update_summary.call_count, 2)
+        self.assertIsNone(app.worker)
+
     def test_atlas_generation_loads_user_startup_with_clean_preferences(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1149,6 +1669,22 @@ class GuiLabelTests(unittest.TestCase):
             "PCG 2 / 레벨 1",
         )
 
+    def test_target_row_color_distinguishes_pcg_level_and_overlap(self):
+        self.assertEqual(
+            self.gui.App._target_row_tag({"pcg_mesh_names": ["a"]}),
+            "target_pcg",
+        )
+        self.assertEqual(
+            self.gui.App._target_row_tag({"level_mesh_names": ["a"]}),
+            "target_level",
+        )
+        self.assertEqual(
+            self.gui.App._target_row_tag({
+                "pcg_mesh_names": ["a"], "level_mesh_names": ["a"],
+            }),
+            "target_both",
+        )
+
     def test_prefixed_default_material_is_not_a_step1_warning(self):
         normal, generic = self.gui.split_generic(["M_Material 2"])
         self.assertEqual(normal, [])
@@ -1169,6 +1705,57 @@ class GuiLabelTests(unittest.TestCase):
             self.gui.App.step2_text(None, partial),
             "잎 매쉬 1/2개 완료 · 1개 만들기",
         )
+
+    def test_step3_label_reports_sets_exact_map_progress_and_connection(self):
+        pending = {"cluster_items": [
+            {"missing_export_maps": ["opacity", "subsurface"]},
+            {"missing_export_maps": []},
+        ]}
+        connected = {"cluster_items": [{
+            "missing_export_maps": [],
+            "connection_update_needed": True,
+        }]}
+        complete = {"cluster_items": [{"missing_export_maps": []}]}
+
+        self.assertEqual(
+            self.gui.App.step3_text(None, pending),
+            "연결 텍스처 2세트 · 10/12장 · 2장 생성",
+        )
+        self.assertEqual(
+            self.gui.App.step3_text(None, connected),
+            "연결 텍스처 1세트 · 6장 완료 · 연결 정리",
+        )
+        self.assertEqual(
+            self.gui.App.step3_text(None, complete),
+            "연결 텍스처 1세트 · 6장 완료 ✓",
+        )
+
+    def test_step3_button_switches_to_unreal_sync_when_texture_sets_are_complete(self):
+        def entries(row):
+            return {"tree": {
+                "checked": True,
+                "item": {"cluster_items": [row]},
+            }}
+
+        pending = self.gui.step3_selection_state(entries({
+            "missing_export_maps": ["subsurface"],
+        }))
+        connection = self.gui.step3_selection_state(entries({
+            "missing_export_maps": [],
+            "connection_update_needed": True,
+        }))
+        complete = self.gui.step3_selection_state(entries({
+            "missing_export_maps": [],
+        }))
+
+        self.assertEqual(pending["state"], "normal")
+        self.assertIn("누락 1장", pending["text"])
+        self.assertEqual(connection["state"], "normal")
+        self.assertIn("연결 정리", connection["text"])
+        self.assertEqual(complete, {
+            "text": "③ Unreal 동기화 — 완료 텍스처 확인 (1세트)",
+            "state": "normal",
+        })
 
     def test_detail_rows_use_audit_data_without_building_full_plan(self):
         item = {
@@ -1262,6 +1849,27 @@ class GuiLabelTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    def _pre_cluster_normalization_fixture(self, source, graphs, *, broken=False):
+        """Use the transactional backup when the live integration source is normalized."""
+        candidates = sorted(source.parent.glob(
+            f"{source.stem}.pcgtex_backup_before_cluster_normalize_*.sbs"
+        ))
+        candidates.append(source)
+        for candidate in candidates:
+            try:
+                states = [
+                    sbs_auto.graph_cluster_normalization_state(candidate, graph)
+                    for graph in graphs
+                ]
+            except Exception:
+                continue
+            if broken:
+                if all(not state["integrity"]["valid"] for state in states):
+                    return candidate
+            elif all(not state["fully_normalized"] for state in states):
+                return candidate
+        self.skipTest("No pre-Cluster-normalization integration fixture is available")
+
     def test_export_params_disable_color_mask_baking(self):
         params = sbs_auto.normalized_export_params({
             "AO_blend": ("constantValueFloat1", "0.5"),
@@ -1271,6 +1879,37 @@ class SafetyTests(unittest.TestCase):
         for name in sbs_auto.COLOR_PASSTHROUGH_PARAMS:
             self.assertEqual(params[name], ("constantValueFloat1", "0"))
         self.assertEqual(params["Leaf_hue"], ("constantValueFloat1", "0.6"))
+
+    def test_managed_resolution_normalizes_final_cluster_wrapper_size(self):
+        graph = ET.fromstring('''<graph>
+<compNodes>
+  <compNode><compImplementation><compInstance>
+    <path v="pkg:///Cluster_System_01?dependency=1" />
+    <parameters><parameter><name v="outputsize" /><relativeTo v="2" />
+      <paramValue><constantValueInt2 v="-2 -2" /></paramValue>
+    </parameter></parameters>
+  </compInstance></compImplementation></compNode>
+  <compNode><compImplementation><compFilter><filter v="bitmap" />
+    <parameters><parameter><name v="outputsize" /><relativeTo v="2" />
+      <paramValue><constantValueInt2 v="10 10" /></paramValue>
+    </parameter></parameters>
+  </compFilter></compImplementation></compNode>
+</compNodes>
+<options><option><name v="defaultParentSize" /><value v="10x10" /></option></options>
+</graph>''')
+
+        self.assertTrue(sbs_auto._set_graph_resolution(graph, (12, 11)))
+        output_sizes = [
+            (
+                param.find("relativeTo").get("v"),
+                list(param.find("paramValue"))[0].get("v"),
+            )
+            for param in graph.iter("parameter")
+            if param.find("name").get("v") == "outputsize"
+        ]
+        self.assertEqual(output_sizes, [("0", "12 11"), ("0", "12 11")])
+        self.assertEqual(
+            graph.find("options/option/value").get("v"), "12x11")
 
     def test_success_cleanup_deletes_only_exact_legacy_m_outputs(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1303,18 +1942,92 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(deleted, [alias])
             self.assertFalse(alias.exists())
 
-    def test_output_transaction_restores_old_files(self):
+    def test_output_transaction_identical_files_are_noop(self):
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp)
             produced = [out / f"T_test_{name}.tga" for name in ("color", "normal")]
             for path in produced:
-                path.write_bytes(b"old")
-            existing, backup_dir = sbs_auto._prepare_output_transaction(produced, "M_test")
-            self.assertTrue(backup_dir.exists())
-            self.assertTrue(all(not path.exists() for path in produced))
-            produced[0].write_bytes(b"partial")
-            sbs_auto._restore_output_transaction(produced, existing, backup_dir)
-            self.assertEqual([path.read_bytes() for path in produced], [b"old", b"old"])
+                path.write_bytes(b"same")
+            original_mtimes = [path.stat().st_mtime_ns for path in produced]
+            transaction = sbs_auto._prepare_output_transaction(produced, "T_test")
+            try:
+                for staged in transaction["staged_files"]:
+                    staged.write_bytes(b"same")
+                info = sbs_auto._commit_output_transaction(transaction)
+            finally:
+                sbs_auto._restore_output_transaction(transaction)
+
+            self.assertEqual(info["files"], produced)
+            self.assertEqual(info["changed_files"], [])
+            self.assertEqual(info["unchanged_files"], produced)
+            self.assertEqual(info["created_files"], [])
+            self.assertIsNone(info["backup_dir"])
+            self.assertEqual(
+                [path.stat().st_mtime_ns for path in produced], original_mtimes)
+            self.assertFalse(transaction["staging_dir"].exists())
+            self.assertFalse((out / "_pcgtex_backups").exists())
+
+    def test_output_transaction_replaces_only_changed_and_new_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            same = out / "T_test_color.tga"
+            changed = out / "T_test_normal.tga"
+            created = out / "T_test_height.tga"
+            same.write_bytes(b"same")
+            changed.write_bytes(b"old")
+            same_mtime = same.stat().st_mtime_ns
+            transaction = sbs_auto._prepare_output_transaction(
+                [same, changed, created], "T_test")
+            try:
+                for staged, payload in zip(
+                        transaction["staged_files"], (b"same", b"new", b"created")):
+                    staged.write_bytes(payload)
+                info = sbs_auto._commit_output_transaction(transaction)
+            finally:
+                sbs_auto._restore_output_transaction(transaction)
+
+            self.assertEqual(info["changed_files"], [changed, created])
+            self.assertEqual(info["unchanged_files"], [same])
+            self.assertEqual(info["created_files"], [created])
+            self.assertEqual(same.stat().st_mtime_ns, same_mtime)
+            self.assertEqual([same.read_bytes(), changed.read_bytes(), created.read_bytes()],
+                             [b"same", b"new", b"created"])
+            self.assertEqual(
+                [path.name for path in info["backup_dir"].iterdir()],
+                [changed.name],
+            )
+
+    def test_output_transaction_rolls_back_partial_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            existing = out / "T_test_color.tga"
+            created = out / "T_test_normal.tga"
+            existing.write_bytes(b"old")
+            transaction = sbs_auto._prepare_output_transaction(
+                [existing, created], "T_test")
+            for staged, payload in zip(
+                    transaction["staged_files"], (b"new", b"created")):
+                staged.write_bytes(payload)
+            path_type = type(transaction["staged_files"][0])
+            real_replace = path_type.replace
+            calls = 0
+
+            def fail_second(path, target):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic replace failure")
+                return real_replace(path, target)
+
+            try:
+                with mock.patch.object(path_type, "replace", new=fail_second):
+                    with self.assertRaisesRegex(OSError, "synthetic replace failure"):
+                        sbs_auto._commit_output_transaction(transaction)
+            finally:
+                sbs_auto._restore_output_transaction(transaction)
+
+            self.assertEqual(existing.read_bytes(), b"old")
+            self.assertFalse(created.exists())
 
     def test_failed_renderer_restores_all_existing_outputs(self):
         real_sbsar = sbs_auto.cluster_sbsar()
@@ -1340,12 +2053,8 @@ class SafetyTests(unittest.TestCase):
                 [path.read_bytes() for path in produced],
                 [b"old"] * len(sbs_auto.RENDER_MAPS),
             )
-            backup_sets = list((temp / "_pcgtex_backups").iterdir())
-            self.assertEqual(len(backup_sets), 1)
-            self.assertEqual(
-                len(list(backup_sets[0].glob("*.tga"))),
-                len(sbs_auto.RENDER_MAPS),
-            )
+            self.assertFalse((temp / "_pcgtex_backups").exists())
+            self.assertFalse(any(temp.glob(".pcgtx_*")))
 
     def test_directx_normal_green_correction(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1451,6 +2160,113 @@ class SafetyTests(unittest.TestCase):
             self.assertIn("T_test_albedo", text)
             self.assertNotIn("M_test_albedo", text)
             self.assertNotIn("clone.png", text)
+
+    def test_broken_authoring_graph_never_replaces_intact_managed_graph(self):
+        with mock.patch.object(
+                sbs_auto, "exact_graph_name",
+                side_effect=["M_test", "T_test"]), \
+                mock.patch.object(
+                    sbs_auto, "graph_cluster_normalization_state",
+                    return_value={"integrity": {"valid": False}}), \
+                mock.patch.object(
+                    sbs_auto, "inspect_graph_sources") as inspect_sources:
+            candidate = sbs_auto.authoring_graph_promotion_candidate(
+                "test.sbs", "M_test", "T_test")
+
+        self.assertIsNone(candidate)
+        inspect_sources.assert_not_called()
+
+    def test_procedural_graph_routes_hidden_alpha_through_cluster(self):
+        source = Path(
+            r"D:\OneDrive\Forestportfolio\02_nature\Tree\weed_deadleaves\texture\substance\weed_deadleaves_texture_set_01.sbs"
+        )
+        graph = "T_Leaf_deadleaves_atlas_01"
+        if not source.exists():
+            self.skipTest("Deadleaves procedural SBS is unavailable")
+        fixture = self._pre_cluster_normalization_fixture(source, [graph])
+        with tempfile.TemporaryDirectory() as temp:
+            copied = Path(temp) / source.name
+            shutil.copy2(fixture, copied)
+            result = sbs_auto.normalize_graph_through_cluster(copied, graph)
+            graph_result = result["graphs"][0]
+            self.assertTrue(result["changed"])
+            self.assertEqual(
+                graph_result["input_sources"]["Opacity"]["source_kind"],
+                "color_merge_alpha",
+            )
+            state = sbs_auto.graph_cluster_normalization_state(copied, graph)
+            self.assertTrue(state["fully_normalized"])
+            self.assertTrue(state["wrapped_direct"])
+            self.assertTrue(all(state["standard_outputs_through_cluster"].values()))
+            self.assertNotIn(
+                "normal", sbs_auto.parse_m_graph(copied, graph)["params"])
+            second = sbs_auto.normalize_graph_through_cluster(copied, graph)
+            self.assertFalse(second["changed"])
+
+    def test_broken_stem_clones_rebuild_and_normalize_as_one_sbs_transaction(self):
+        source = Path(r"D:\OneDrive\Forestportfolio\Texture\stem\stem_common_01.sbs")
+        graphs = ["T_stem_01", "T_stem_common_03", "T_stem_common_04"]
+        if not source.exists():
+            self.skipTest("Shared stem procedural SBS is unavailable")
+        fixture = self._pre_cluster_normalization_fixture(
+            source, graphs, broken=True)
+        with tempfile.TemporaryDirectory() as temp:
+            copied = Path(temp) / source.name
+            shutil.copy2(fixture, copied)
+            self.assertFalse(
+                sbs_auto.graph_cluster_normalization_state(
+                    copied, graphs[0])["integrity"]["valid"])
+
+            result = sbs_auto.normalize_graphs_through_cluster(copied, graphs)
+
+            self.assertEqual(
+                [row["repaired_from"] for row in result["graphs"]],
+                ["stem_common_01", "stem_common_03", "stem_common_04"],
+            )
+            for graph in graphs:
+                state = sbs_auto.graph_cluster_normalization_state(copied, graph)
+                self.assertTrue(state["integrity"]["valid"])
+                self.assertTrue(state["fully_normalized"])
+                self.assertTrue(state["wrapped_direct"])
+            by_graph = {row["graph"]: row for row in result["graphs"]}
+            self.assertEqual(
+                by_graph["T_stem_common_03"]["input_sources"]["Subsurface"]["identifier"],
+                "scatteringcolor",
+            )
+            self.assertEqual(
+                by_graph["T_stem_common_04"]["input_sources"]["Subsurface_Amount"]["identifier"],
+                "translucency",
+            )
+            self.assertFalse(
+                sbs_auto.normalize_graphs_through_cluster(copied, graphs)["changed"])
+
+    def test_legacy_packed_bark_outputs_are_unpacked_into_cluster_inputs(self):
+        source = Path(
+            r"D:\OneDrive\Forestportfolio\02_nature\Tree\tree_densiflora\texture\tree_densiflora_set_01.sbs"
+        )
+        graph = "T_bark_densiflora_01"
+        if not source.exists():
+            self.skipTest("Densiflora procedural SBS is unavailable")
+        fixture = self._pre_cluster_normalization_fixture(source, [graph])
+        with tempfile.TemporaryDirectory() as temp:
+            copied = Path(temp) / source.name
+            shutil.copy2(fixture, copied)
+
+            result = sbs_auto.normalize_graph_through_cluster(copied, graph)
+
+            graph_result = result["graphs"][0]
+            sources = graph_result["input_sources"]
+            self.assertEqual(sources["Base_Color"]["identifier"], "color")
+            self.assertEqual(sources["Ambient_Occlusion"]["identifier"], "extra.R")
+            self.assertEqual(sources["Roughness"]["identifier"], "extra.G")
+            self.assertEqual(sources["Height"]["identifier"], "extra.B")
+            self.assertEqual(
+                sources["Normal"]["source_kind"], "unique_height_to_normal")
+            self.assertEqual(
+                graph_result["removed_duplicate_outputs"], ["color_1", "extra_1"])
+            state = sbs_auto.graph_cluster_normalization_state(copied, graph)
+            self.assertTrue(state["fully_normalized"])
+            self.assertTrue(state["integrity"]["valid"])
 
 
 if __name__ == "__main__":

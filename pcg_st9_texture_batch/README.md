@@ -22,8 +22,10 @@ PCG_ST9_Texture_Batch.bat
 |---|---|---|
 | ① SK + 머티리얼 이름 | 원본 SPM을 `SK_이름.spm`으로 복사 + 머티리얼 `M_` 이름 및 공용 이름 정리 | **[① 실행] 버튼이 자동 처리** |
 | ② 잎 메시 (Blender) | 아틀라스 리프 제너레이터로 오파시티 없는 잎 지오메트리 생성 | **[② 실행] 버튼이 자동 처리** (헤드리스 Blender) — 직접 할 값도 상세 패널에 나온다 |
-| ③ 텍스처 (Substance) | SpeedTree가 실제 사용하는 각 머티리얼의 원본을 Cluster_System_01에 연결해 `T_` 6장 추출 | **[③ 실행] 버튼이 자동 처리** (sbsrender) — SBS 그래프도 `T_`로 관리 |
-| ④ SK Blend (SK Batch) | SK SPM의 리페어 `.blend` | 별도 도구 `..\sk_batch\SK_Batch.bat` — 여기서는 상태만 표시 |
+| ③ 텍스처 (Substance) | 표시된 SpeedTree Generator가 사용하는 고유 연결 텍스처 세트마다 `T_` 6장 추출 | **[③ 실행] 버튼이 자동 처리** (sbsrender) — SBS 그래프와 SPM 연결도 `T_`로 관리 |
+
+SK SPM 리페어 `.blend`의 상태 확인과 교체는 `..\sk_batch\SK_Batch.bat`가 단독으로 담당한다.
+이 보드는 해당 상태를 판정하거나 작업 완료 여부에 포함하지 않는다.
 
 ## [① 실행] — SK 만들기 + M_ 이름 붙이기
 
@@ -79,23 +81,40 @@ Cluster SPM은 원본 아틀라스 추적 근거일 뿐이며 대상 개수와 �
   Build/Update Target SPMs까지 실행한다. `Material_v8`과 FBX/XML `Mesh` 자산을
   최종 SK SPM에 등록하지만 Leaf Mesh Generator 슬롯에는 자동 연결하지 않는다.
   Cluster SPM은 수정하지 않는다. 등록 직전 각 최종 SK SPM은 `_spm_backups\`에
-  백업되고, 작업 실패 시 자동 복원된다. 최종 SK가 바뀌므로 ④ 재생성이 필요하다.
+  백업되고, 작업 실패 시 자동 복원된다. 최종 SK가 바뀌면 SK Batch의
+  ② Blender Repair에서 리페어 `.blend`를 교체한다.
   메시를 눈으로 먼저 보고 싶으면 끄고, blend 열어 확인한 뒤 애드온에서 직접 반영.
 
-## [③ 실행] — 사용 머티리얼별 T_ 텍스처 6장 만들기 (sbsrender)
+## [③ 실행] — 연결 텍스처 세트별 T_ 텍스처 6장 만들기 (sbsrender)
 
 - 일반 관리 그래프는 세트 .sbs 전체를 쿡하지 않고 **Cluster_System_01.sbsar를
   sbsrender로 직접 렌더**한다. Cluster_System이 없는 procedural/다중 합성 그래프는
-  기존 노드 결과를 보존하기 위해 해당 SBS 그래프를 직접 cook/render한다.
-- 아틀라스만 세지 않는다. 최종 SK의 SpeedTree Generator가 실제 참조하는 모든 `M_`
-  머티리얼을 한 번씩 처리하며, 미사용 테스트 머티리얼은 제외한다. 머티리얼 2개면
-  `2 × 6 = 12장`을 만든다.
+  최종 `basecolor/normal/roughness/height/AO/subsurface/opacity` 노드를 Cluster_System 입력에
+  연결해 정규화한 뒤, 해당 SBS 그래프 자체를 cook/render한다. 이미 패킹된 `color/extra`를
+  입력으로 되먹이지 않으며 6개 출력은 한 번의 렌더 트랜잭션으로 만든다.
+- 아틀라스만 세지 않는다. 최종 SK의 **표시된** SpeedTree Generator가 실제 참조하는
+  bark/stem/surface/leaf 등의 연결 텍스처를 모두 처리한다. 숨김 Generator와 숨김 부모
+  아래 항목, 미사용 테스트 머티리얼은 생성 대상에서 제외한다.
+- `*_yellow`, `*_green`, `*_stem`처럼 SpeedTree Auto Split이 만든 파생 슬롯이 같은
+  원본 텍스처 연결을 공유하면 별도 머티리얼 개수로 세지 않고 한 세트로 합친다. 각
+  슬롯 이름은 alias로 보존해 같은 suffix 없는 `T_` 6장에 연결한다. 이름이 비슷해도
+  실제 원본 연결이 다르면 서로 다른 세트로 유지한다.
+- 각 고유 세트의 완료 계약은 항상
+  `color/normal/extra/height/opacity/subsurface` 6장이다. 직접 제작 SBS 그래프가 일부
+  입력만 제공하면 실제 내부 연결 또는 중립 입력으로 Cluster_System 슬롯을 완성하고,
+  6장의 존재·크기·해상도와 그래프의 Cluster 연결을 확인한 뒤에만 완료 처리한다.
+- 표는 `머티리얼 N개` 대신 `연결 텍스처 N세트 · 완료/전체 장수`를 표시한다. 6장이
+  모두 있고 SPM 연결까지 맞으면 생성 동작은 끝나고 ③ 버튼은 `Unreal 동기화`로 바뀐다.
+  파일은 있고 슬롯 연결만 예전 이름이면 `연결 정리` 작업으로 구분한다.
 - 이름 계약은 `M_머티리얼 → T_SBS그래프 → T_텍스처 6장`이다. 기존 SBS의 `M_` 그래프는
   수정 전 백업한 뒤 `T_`로 이름을 바꾸고, 새 그래프도 `T_`로 삽입한다.
 - 같은 대상의 절차형/직접 제작 `M_` 그래프와 단순 비트맵 `T_` 그래프가 함께 있으면,
   단순 `T_` 복제본을 제거하고 원본 제작 그래프 자체를 `T_`로 승격한다. SBS 노이즈·블렌드·HBAO
   같은 제작 노드를 원본 비트맵 연결로 우회하지 않는다. 원본 그래프에 Opacity 출력이 없으면
   그래프 내부의 실제 Opacity/Alpha 리소스를 별도 출력에 사용한다.
+- 복제 과정에서 내부 UID 참조가 깨진 `T_` 그래프는 같은 SBS 안의 정상 authoring 그래프를
+  전체 UID 재발급 방식으로 복제해 복구한다. 원본 authoring 그래프는 삭제하거나 개명하지
+  않으며, SBS 하나에 여러 대상 그래프가 있으면 파일 단위로 함께 백업·정규화한다.
 - 그래프가 있으면 SBS의 비트맵 연결·인스턴스 파라미터를 정본으로 읽어 그대로 사용한다.
   그래프가 없으면 해당 `Material_v8`의 실제 Color/Opacity 등 원본 슬롯만 읽어 자동 연결한다.
   파일명에 `color`가 없다는 이유로 추정하지 않으며, SpeedTree의 Color 슬롯을 근거로 삼는다.
@@ -118,12 +137,24 @@ Cluster SPM은 원본 아틀라스 추적 근거일 뿐이며 대상 개수와 �
   `SubsurfaceColor`를 활성화하고, bark나 해당 출력이 없는 procedural 그래프는 비활성화한다.
   비활성 Subsurface는 `SubsurfaceColor RGB=0`, `SubsurfaceAmount=0`으로 두고,
   활성 Subsurface는 Amount=1로 둔다. Opacity 스칼라는 비활성 상태에서도 1을 유지한다.
-  SBS의 `Subsurface_Amount` 입력은 흰색(1)로 고정한다.
-- 렌더는 6장을 한 세트로 다시 만든다. 기존 동명 TGA는 먼저
-  `_pcgtex_backups\T_x_타임스탬프\`에 백업하며, 실패하면 기존 파일을 복원한다.
+  SBS의 `Subsurface_Amount` 입력은 기본적으로 흰색(1)을 쓰되, procedural 그래프가 별도의
+  `translucency` 출력을 제공하면 그 값을 Amount에 연결하고 `scatteringcolor`를 Subsurface에 연결한다.
+- 렌더는 별도 staging 폴더에서 6장을 완성한 뒤 기존 TGA와 SHA-256을 비교한다. 동일한
+  파일은 경로·내용·mtime을 전혀 건드리지 않는다. 실제 변경 파일만 교체하고 기존 변경분만
+  `_pcgtex_backups\T_x_타임스탬프\`에 백업하며, 중간 실패 시 전체를 복원한다.
+- 생성/확인 후 canonical `T_` 6장은 `/Game/Textures`로 자동 동기화한다. 실행 중인
+  MyProject2 에디터가 있으면 Remote Python을 사용하고, 에디터가 꺼져 있으면
+  `UnrealEditor-Cmd` 헤드리스 배치를 사용한다. 에디터는 켜져 있지만 Remote가 연결되지
+  않으면 동일 `.uasset`의 동시 저장을 피하기 위해 동기화를 보류한다.
+- Unreal의 `AssetImportData.FileMD5`가 TGA MD5와 같고 설정도 맞으면 checkout/import/save를
+  모두 생략한다. 신규만 Perforce `add`, 변경된 기존 에셋만 checkout/reimport하고 이번 실행이
+  소유한 checkout에만 `revert unchanged`를 적용한다. Virtual Texture Streaming을 켜고
+  Max Texture Size는 0(제한 없음)으로 유지한다.
 
 설정(`pcg_texture_config.json`): `unreal_levels`, `blender_exe`, `designer_dir`(sbsrender 위치),
-`cluster_sbsar`, `cluster_sbsar_normal_behavior`, `atlas_job_timeout`, `sbsrender_timeout`.
+`cluster_sbsar`, `cluster_sbsar_normal_behavior`, `atlas_job_timeout`, `sbsrender_timeout`,
+`unreal_editor_cmd`, `unreal_texture_sync_enabled`, `unreal_texture_commandlet_fallback`,
+`unreal_texture_destination`.
 
 ## PCG + 작업 레벨 대상 목록
 
@@ -146,7 +177,7 @@ python export_all_queues.py --pcg-targets pcg_targets.json --out-dir reports --p
 ```
 
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
-(`--apply`로 안전 항목 일괄 적용), `export_blend_queue.py`(SK Blend 누락/오래됨),
-`export_texture_plan.py`(②③ 작업표), `export_atlas_handoff_queue.py`(Blender 핸드오프),
+(`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),
+`export_atlas_handoff_queue.py`(Blender 핸드오프),
 `export_sbs_handoff_queue.py`(Substance 핸드오프), `export_review_queue.py`/`export_review_brief.py`
 (수동 확인 목록). 모두 읽기 전용이며 GUI와 같은 검사 엔진(`pcg_texture_audit.py`)을 쓴다.

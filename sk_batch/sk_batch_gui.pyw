@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -199,6 +199,25 @@ class App:
             "켜면 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
             "단독 ③ Push는 왼쪽 transport 선택을 따릅니다.",
         )
+        ttk.Label(transport_opts, text="② Repair·③ export 동시:").pack(
+            side="left", padx=(18, 0)
+        )
+        self.blender_parallel_var = tk.IntVar(
+            value=int(self.cfg.get("blender_parallel_jobs", 2))
+        )
+        blender_parallel_spin = ttk.Spinbox(
+            transport_opts,
+            from_=1,
+            to=4,
+            textvariable=self.blender_parallel_var,
+            width=4,
+        )
+        blender_parallel_spin.pack(side="left", padx=4)
+        Tooltip(
+            blender_parallel_spin,
+            "Blender Repair와 headless Send2UE export를 동시에 처리할 개수입니다. "
+            "기본값 2는 시작 비용을 겹치되 메모리 사용량을 제한합니다.",
+        )
 
         lbl = ttk.Label(opts, text="가지당 목표 본 수:")
         lbl.pack(side="left")
@@ -336,9 +355,9 @@ class App:
             "bone_mode": ("본 모드 (▼ 클릭)", 135),
             "wind": ("Wind (▼ 클릭)", 145),
             "spm_status": ("① SPM 본 세팅", 210),
-            "blend_status": ("② Blender", 160),
+            "blend_status": ("② Blender Repair / 교체 상태", 260),
             "push_status": ("③ Unreal", 190),
-            "folder": ("폴더", 300),
+            "folder": ("폴더", 220),
         }
         for key, (label, width) in headers.items():
             self.tree.heading(key, text=label)
@@ -423,6 +442,9 @@ class App:
         for spm in spms:
             iid = str(spm)
             entry = self.state.setdefault(iid, {})
+            # The file system is the source of truth.  A saved "완료" label may
+            # have become stale after the SPM was edited since the last run.
+            entry["blend_status"] = self._blend_status_text(spm)
             wind_override = entry.get("wind_override", "auto")
             if wind_override not in {value for _label, value in WIND_OPTIONS}:
                 wind_override = "auto"
@@ -642,6 +664,9 @@ class App:
             cfg["target_bones_per_branch"] = float(self.target_var.get())
             cfg["max_total_bones"] = int(self.maxtotal_var.get())
             cfg["spm_parallel_jobs"] = max(1, int(self.parallel_var.get()))
+            cfg["blender_parallel_jobs"] = max(
+                1, min(4, int(self.blender_parallel_var.get()))
+            )
             transport = self.transport_var.get()
             cfg["push_transport"] = transport if transport in {"rpc", "headless"} else "rpc"
             cfg["night_headless"] = bool(self.night_headless_var.get())
@@ -905,12 +930,14 @@ class App:
                     ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
                 )
 
-        # Pure inspection and independent SPM calibration are parallelized.
-        # Blender and Push stay serial due to memory and editor RPC constraints.
+        # Independent SPM and Blender jobs can overlap. RPC Push stays serial;
+        # headless Push parallelizes only its Blender export stage below.
         if phase == "spm":
             workers = self.cfg.get("spm_parallel_jobs", 1)
         elif phase == "check":
             workers = self.cfg.get("check_parallel_jobs", 8)
+        elif phase == "blender":
+            workers = self.cfg.get("blender_parallel_jobs", 2)
         else:
             workers = 1
         workers = max(1, min(int(workers), total))
@@ -1022,9 +1049,9 @@ class App:
         """핸드오프 산출물(push에 필요한 것들)이 준비됐는지 → (ok, 설명)."""
         blend = blend_path_for(spm)
         if not blend.exists():
-            return False, "blend 없음 → ② 필요"
+            return False, "생성 필요 — blend 없음 → ② Blender Repair"
         if blend.stat().st_mtime < spm.stat().st_mtime:
-            return False, "blend가 SPM보다 오래됨 → ② 필요"
+            return False, "교체 필요 — blend가 SPM보다 오래됨 → ② Blender Repair"
         wind_json = blend.parent / "JSON" / f"{spm.stem}_dynamic_wind_import_from_megaplant_groups.json"
         if not wind_json.exists():
             return False, "wind JSON 없음 → ② 필요"
@@ -1059,6 +1086,30 @@ class App:
         if normalization.get("status") != "ok":
             return False, "텍스처 정규화 미완료 → ② 필요"
         return True, "텍스처 정규화 완료"
+
+    def _blend_status_text(self, spm):
+        """Return the live SK handoff status; never trust a saved UI label."""
+        blend = blend_path_for(spm)
+        try:
+            if not blend.is_file():
+                return "생성 필요 — blend 없음 · ② Blender Repair 실행"
+            if blend.stat().st_mtime_ns < Path(spm).stat().st_mtime_ns:
+                return "교체 필요 — SPM이 더 최신 · ② Blender Repair 다시 실행"
+        except OSError as exc:
+            return f"확인 실패 — {exc}"
+        texture_ok, texture_reason = self._texture_normalization_ready(spm)
+        if not texture_ok:
+            return f"Repair 필요 — {texture_reason}"
+        return "최신 ✓"
+
+    def _record_live_blend_status(self, iid, spm, persist=True):
+        text = self._blend_status_text(spm)
+        self.ui_queue.put(("cell", (iid, "blend_status", text)))
+        with self.state_lock:
+            self.state.setdefault(iid, {})["blend_status"] = text
+            if persist:
+                save_state(self.state)
+        return text
 
     def _job_check(self, iid, spm):
         from spm_audit import audit_spm, sk_readiness
@@ -1107,15 +1158,7 @@ class App:
             text += f" | {summary}"
         self.ui_queue.put(("cell", (iid, "spm_status", text)))
 
-        blend = blend_path_for(spm)
-        if not blend.exists():
-            blend_text = "없음"
-        elif blend.stat().st_mtime < spm.stat().st_mtime:
-            blend_text = "오래됨 (SPM이 더 최신)"
-        else:
-            texture_ok, texture_reason = self._texture_normalization_ready(spm)
-            blend_text = "최신 ✓" if texture_ok else texture_reason
-        self.ui_queue.put(("cell", (iid, "blend_status", blend_text)))
+        self._record_live_blend_status(iid, spm)
 
         ok, why = self._handoff_ready(spm)
         pushed = entry.get("push_status", "")
@@ -1244,7 +1287,9 @@ class App:
             entry["spm_last_duration_seconds"] = round(duration, 3)
             entry["spm_status"] = f"{summary}{warn}"
             entry["spm_summary"] = summary
+            entry["blend_status"] = self._blend_status_text(spm)
             save_state(self.state)
+        self.ui_queue.put(("cell", (iid, "blend_status", entry["blend_status"])))
         if status == "not-sk-ready":
             raise RuntimeError(f"SK 미제작: {rep.get('error', '보이는 Branch의 본 설정이 모두 꺼져 있음')}")
         self.ui_queue.put(("cell", (iid, "spm_status", f"{summary}{warn}")))
@@ -1261,7 +1306,7 @@ class App:
         blend = blend_path_for(spm)
         handoff_ok, _handoff_reason = self._handoff_ready(spm)
         if not self.force_rerun and handoff_ok:
-            self.ui_queue.put(("cell", (iid, "blend_status", "최신 ✓ (건너뜀)")))
+            self._record_live_blend_status(iid, spm)
             self.log(f"건너뜀 (blend 최신): {spm.name}")
             return
         readiness = sk_readiness(
@@ -1281,13 +1326,18 @@ class App:
             wind = wind_preset_for(spm.stem)
         job_report = LOG_DIR / f"{spm.stem}_bwr_{stamp}.json"
         cmd = [
-            self.cfg["blender_exe"], "-b",
+            self.cfg["blender_exe"], "--factory-startup", "-b",
             "--python", str(TOOL_DIR / "jobs" / "bwr_headless_job.py"), "--",
             "--spm", str(spm), "--blend", str(blend),
             "--wind", wind, "--report", str(job_report),
         ]
-        code, log_file = self._run_limited(cmd, f"{spm.stem}_bwr_{stamp}.log",
-                                           self.cfg.get("blender_job_timeout", 3600))
+        parallel = self.cfg.get("blender_parallel_jobs", 2) > 1
+        code, log_file = self._run_limited(
+            cmd,
+            f"{spm.stem}_bwr_{stamp}.log",
+            self.cfg.get("blender_job_timeout", 3600),
+            affinity=not parallel,
+        )
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             reason = summarize_job_failure(result, log_file)
@@ -1308,10 +1358,11 @@ class App:
                 self.log(f"  [텍스처 누락] {spm.name}: {warning}")
         else:
             warn = " ⚠" if result.get("warnings") else ""
-            blend_status = f"완료 (wind {wind}){warn}"
+            blend_status = f"최신 ✓ · 완료 (wind {wind}){warn}"
         self.ui_queue.put(("cell", (iid, "blend_status", blend_status)))
-        entry["blend_status"] = blend_status
-        save_state(self.state)
+        with self.state_lock:
+            entry["blend_status"] = blend_status
+            save_state(self.state)
         self.log(f"repair 완료: {blend.name}")
 
     def _push_preflight(self, targets):
@@ -1528,6 +1579,7 @@ class App:
             cmd,
             export_log_name,
             self.cfg.get("push_job_timeout", 1800),
+            affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
         )
         result = load_job_report(export_report)
         if code != 0 or result.get("status") != "exported_pending_unreal":
@@ -1558,11 +1610,12 @@ class App:
             )
 
         post_export_source_fingerprint = self._source_push_fingerprint(blend)
-        self.state.setdefault(iid, {})["push_export_cache"] = {
-            "source_fingerprint": post_export_source_fingerprint,
-            "manifest": str(manifest_path),
-            "fingerprint": item["fingerprint"],
-        }
+        with self.state_lock:
+            self.state.setdefault(iid, {})["push_export_cache"] = {
+                "source_fingerprint": post_export_source_fingerprint,
+                "manifest": str(manifest_path),
+                "fingerprint": item["fingerprint"],
+            }
         details = {
             "manifest": str(manifest_path),
             "export_report": str(export_report),
@@ -1660,15 +1713,22 @@ class App:
         batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         total = len(targets)
         self.ui_queue.put(("batch_progress", (0, total)))
-        exported = []
-        for index, item in enumerate(targets, 1):
+        exported_by_index = {}
+        workers = max(
+            1,
+            min(int(self.cfg.get("blender_parallel_jobs", 2)), total),
+        )
+        if workers > 1:
+            self.log(f"Send2UE export: {workers}개 동시 실행")
+
+        def export_one(index, item):
             if self.stop_flag.is_set():
-                break
+                return index, None
             spm = item["spm"]
             iid = str(spm)
             self.ui_queue.put(("cell", (iid, "push_status", "Send2UE export 중...")))
             try:
-                exported.append(self._export_manifest_item(iid, spm, batch_stamp))
+                return index, self._export_manifest_item(iid, spm, batch_stamp)
             except Exception as exc:
                 reason = compact_error_message(exc)
                 kind = getattr(exc, "kind", "data_error")
@@ -1685,7 +1745,22 @@ class App:
                     message=reason,
                 )
                 self.log(f"[headless export {kind}] {spm.name}: {reason}")
-            self.ui_queue.put(("batch_progress", (index, total)))
+                return index, None
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(export_one, index, item): item
+                for index, item in enumerate(targets)
+            }
+            for future in as_completed(futures):
+                index, exported_item = future.result()
+                if exported_item is not None:
+                    exported_by_index[index] = exported_item
+                completed += 1
+                self.ui_queue.put(("batch_progress", (completed, total)))
+
+        exported = [exported_by_index[index] for index in sorted(exported_by_index)]
 
         if self.stop_flag.is_set():
             for item in targets:
