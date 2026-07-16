@@ -371,14 +371,32 @@ def _write_spm(path, text, compressed):
         path.write_text(text, encoding="utf-8")
 
 
-def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True):
-    """Preflight, back up, write, and verify all SPMs as one transaction."""
-    patches = [
-        build_spm_patch(job["spm"], job["materials"], require_outputs=require_outputs)
-        for job in jobs
-    ]
+def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
+                                   skip_unbuildable=False):
+    """Preflight, back up, write, and verify all SPMs as one transaction.
+
+    With skip_unbuildable, an SPM whose patch cannot even be built (e.g. a
+    legacy tree whose materials have no managed T_ outputs yet) is reported
+    under "skipped" instead of aborting every other SPM in the folder.
+    """
+    patches = []
+    skipped = []
+    for job in jobs:
+        try:
+            patches.append(
+                build_spm_patch(job["spm"], job["materials"], require_outputs=require_outputs)
+            )
+        except Exception as exc:
+            if not skip_unbuildable:
+                raise
+            skipped.append({"spm": str(job["spm"]), "reason": str(exc)})
     if not patches:
-        return {"spms": [], "materials": 0, "backup_dir": None}
+        if skipped:
+            raise RuntimeError(
+                "no SPM could be normalized: "
+                + " | ".join(entry["reason"] for entry in skipped)
+            )
+        return {"spms": [], "materials": 0, "backup_dir": None, "skipped": skipped}
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_root = Path(backup_root or (Path(patches[0]["spm"]).parent / "_spm_backups"))
@@ -405,6 +423,7 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True)
         "spms": [patch["spm"] for patch in patches],
         "materials": sum(len(patch["materials"]) for patch in patches),
         "backup_dir": str(backup_dir),
+        "skipped": skipped,
     }
 
 

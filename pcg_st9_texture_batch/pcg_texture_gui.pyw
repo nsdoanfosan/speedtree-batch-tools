@@ -1335,11 +1335,15 @@ class App:
                 normalized = normalize_spms_transactionally(
                     spm_jobs,
                     backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
+                    skip_unbuildable=True,
                 )
                 cleanup = cleanup_preserved_cluster_outputs(plan)
                 self._ui(lambda r=normalized: self.log(
                     f"[③ SK SPM 정리] {len(r['spms'])}개 SPM / "
                     f"{r['materials']}개 머티리얼 — 백업: {r['backup_dir']}"))
+                for entry in normalized.get("skipped", []):
+                    self._ui(lambda e=entry: self.log(
+                        f"[③ SK SPM 정리 건너뜀] {Path(e['spm']).name}: {e['reason']}"))
                 if cleanup["cleaned"]:
                     self._ui(lambda r=cleanup: self.log(
                         f"[③ Cluster 원본 보존] {len(r['cleaned'])}개 머티리얼 복원"))

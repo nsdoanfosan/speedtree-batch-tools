@@ -711,6 +711,52 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(slots["subsurfaceamount"]["enabled"], "false")
             self.assertEqual(slots["subsurfaceamount"]["color_x"], "1")
 
+    def test_spm_normalization_skips_unbuildable_spm_and_commits_the_rest(self):
+        map_template = '''<Map Name="{name}"><ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
+<TexFilename>old.png</TexFilename>
+<TexSource>0</TexSource><TexInvert>false</TexInvert><TexInvertRed>false</TexInvertRed>
+<TexInvertGreen>false</TexInvertGreen><TexInvertBlue>false</TexInvertBlue>
+<TexEnabled>true</TexEnabled></Map>'''
+        maps = "".join(map_template.format(name=name) for name in ("Color", "Opacity", "Normal"))
+        xml = f'''<SpeedTree><Materials><Material_v8 ID="1" Name="M_test">{maps}</Material_v8>
+</Materials><Generator><Property><Name>Branches:Frequency</Name><Value>1</Value></Property></Generator></SpeedTree>'''.encode()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "texture"
+            out.mkdir()
+            for role in ("color", "normal", "extra", "height", "opacity", "subsurface"):
+                (out / f"T_test_{role}.tga").write_bytes(role.encode())
+            good = root / "SK_good.spm"
+            legacy = root / "SK_legacy.spm"
+            for spm in (good, legacy):
+                with gzip.open(spm, "wb") as handle:
+                    handle.write(xml)
+            jobs = [
+                {"spm": str(legacy), "materials": {"m_test": {
+                    # No outputs on disk for this base -> patch cannot be built.
+                    "texture_dir": str(out),
+                    "texture_base": "T_missing",
+                    "subsurface_enabled": False,
+                }}},
+                {"spm": str(good), "materials": {"m_test": {
+                    "texture_dir": str(out),
+                    "texture_base": "T_test",
+                    "subsurface_enabled": False,
+                }}},
+            ]
+            with self.assertRaises(RuntimeError):
+                normalize_spms_transactionally(jobs, backup_root=root / "backups")
+            result = normalize_spms_transactionally(
+                jobs, backup_root=root / "backups", skip_unbuildable=True)
+            self.assertEqual(result["spms"], [str(good)])
+            self.assertEqual(len(result["skipped"]), 1)
+            self.assertIn("T_missing", result["skipped"][0]["reason"])
+            slots = inspect_material_slots(gzip.open(good, "rt", encoding="utf-8").read())["1"]["slots"]
+            self.assertEqual(slots["color"]["filename"], "texture/T_test_color.tga")
+            with self.assertRaises(RuntimeError):
+                normalize_spms_transactionally(
+                    jobs[:1], backup_root=root / "backups", skip_unbuildable=True)
+
     def test_non_square_source_keeps_ratio_with_long_edge_capped_to_4k(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "bark.png"
