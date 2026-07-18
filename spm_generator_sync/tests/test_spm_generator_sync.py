@@ -178,6 +178,61 @@ def make_empty_target_without_links():
     ).replace("<Links></Links>", "")
 
 
+def make_pass_master(base_pass=2):
+    return spm_xml(
+        [
+            generator_xml("master-tree", "Tree", "Tree", 0),
+            generator_xml("master-leaf-base", "Leaf", "Base", 1, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, str(base_pass)),
+                property_xml("Generation:First", "0.25"),
+            ]),
+            # Base is a reusable template boundary, so its child may remain in
+            # pass 1 even when the Base itself is consumed in a later pass.
+            generator_xml("master-leaf-child", "Leaf branch", "Branch", 2, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, "1"),
+            ]),
+        ],
+        [
+            link_xml("master-tree-base", "master-tree", "master-leaf-base", "Tree->Leaf"),
+            link_xml(
+                "master-base-child", "master-leaf-base", "master-leaf-child",
+                "Leaf->Leaf branch",
+            ),
+        ],
+    )
+
+
+def make_pass_target(base_pass=2, ref_pass=2, parent_pass=3, base_filter="Leaf"):
+    return spm_xml(
+        [
+            generator_xml("target-tree", "Tree", "Tree", 0),
+            generator_xml("target-parent", "Reference parent", "Branch", 1, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, str(parent_pass)),
+            ]),
+            generator_xml("target-ref", "Leaf reference", "BaseRef", 2, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, str(ref_pass)),
+                property_xml("Settings:Base filter", base_filter),
+            ]),
+            generator_xml("target-leaf-base", "Leaf", "Base", 1, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, str(base_pass)),
+                property_xml("Generation:First", "0.9"),
+            ]),
+            generator_xml("target-leaf-child", "Leaf branch target", "Branch", 2, [
+                property_xml(sync.GENERATION_PASS_PROPERTY, "1"),
+            ]),
+        ],
+        [
+            link_xml("target-tree-parent", "target-tree", "target-parent", "Tree->Parent"),
+            link_xml("target-parent-ref", "target-parent", "target-ref", "Parent->Reference"),
+            link_xml("target-tree-base", "target-tree", "target-leaf-base", "Tree->Leaf"),
+            link_xml(
+                "target-base-child", "target-leaf-base", "target-leaf-child",
+                "Leaf->Leaf branch target",
+            ),
+        ],
+    )
+
+
 def property_value(generator, name):
     properties = generator.find("Properties")
     for prop in list(properties or []):
@@ -708,6 +763,185 @@ class GeneratorSyncTests(unittest.TestCase):
             document = sync.SPMDocument.from_path(path, full=True)
             errors = document.integrity_errors()
             self.assertTrue(any("Link target GUID 없음" in item for item in errors))
+
+    def test_speedtree_base_filter_search_syntax(self):
+        self.assertTrue(sync.is_protected_property(sync.GENERATION_PASS_PROPERTY))
+        self.assertFalse(sync.is_protected_property("Generation:Shared:Pass override"))
+        self.assertTrue(sync.speedtree_search_matches("Leaf 2", "Leaf"))
+        self.assertFalse(sync.speedtree_search_matches("Leaf 2", "=Leaf"))
+        self.assertTrue(sync.speedtree_search_matches("Leaf", "=leaf"))
+        self.assertFalse(sync.speedtree_search_matches("leaf", "==Leaf"))
+        self.assertTrue(sync.speedtree_search_matches("BranchBig", "Leaf | Branch*"))
+        self.assertFalse(sync.speedtree_search_matches(
+            "BranchSmall", "(Leaf | Branch*) & !Small"
+        ))
+        self.assertTrue(sync.speedtree_search_matches("Leaf|Branch", '"Leaf|Branch"'))
+        with self.assertRaises(sync.SearchSyntaxError):
+            sync.speedtree_search_matches("Leaf", "Leaf |")
+
+    def test_integrity_detects_and_repairs_reference_pass_regression(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.spm"
+            write_spm(path, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
+            document = sync.SPMDocument.from_path(path, full=True)
+
+            errors = document.integrity_errors()
+            self.assertTrue(any("Generation Pass 조상 순서 오류" in item for item in errors))
+            self.assertTrue(any("Reference/Base Pass 순서 오류" in item for item in errors))
+
+            adjustments = sync.repair_generation_passes(document)
+            by_name = {item["name"]: item for item in adjustments}
+            self.assertEqual(by_name["Leaf reference"]["new_pass"], 3)
+            self.assertEqual(by_name["Leaf"]["new_pass"], 4)
+            self.assertEqual(document.generator_pass(document.by_guid["target-ref"]), 3)
+            self.assertEqual(document.generator_pass(document.by_guid["target-leaf-base"]), 4)
+            # Do not propagate the Base scheduling pass into its template subtree.
+            self.assertEqual(document.generator_pass(document.by_guid["target-leaf-child"]), 1)
+            document.validate(document.render())
+
+    def test_sync_protects_target_pass_and_reports_minimum_safe_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            master = Path(temp) / "master.spm"
+            target = Path(temp) / "target.spm"
+            write_spm(master, make_pass_master(base_pass=2))
+            write_spm(target, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
+
+            plan = sync.build_sync_plan(master, target, {"Leaf": "Leaf"})
+            patched = sync.SPMDocument(target, plan.patched_text, True, full=True)
+            self.assertEqual(patched.generator_pass(patched.by_guid["target-ref"]), 3)
+            self.assertEqual(patched.generator_pass(patched.by_guid["target-leaf-base"]), 4)
+            self.assertEqual(len(plan.pass_adjustments), 2)
+            self.assertNotIn(
+                sync.GENERATION_PASS_PROPERTY,
+                [
+                    name
+                    for result in plan.base_results
+                    for name in result.changed_properties
+                ],
+            )
+
+            write_spm(target, plan.patched_text)
+            repeat = sync.build_sync_plan(master, target, {"Leaf": "Leaf"})
+            self.assertFalse(repeat.pass_adjustments)
+
+    def test_valid_target_pass_stays_higher_than_master_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            master = Path(temp) / "master.spm"
+            target = Path(temp) / "target.spm"
+            write_spm(master, make_pass_master(base_pass=2))
+            write_spm(target, make_pass_target(base_pass=4, ref_pass=2, parent_pass=2))
+
+            plan = sync.build_sync_plan(master, target, {"Leaf": "Leaf"})
+            patched = sync.SPMDocument(target, plan.patched_text, True, full=True)
+            self.assertEqual(patched.generator_pass(patched.by_guid["target-ref"]), 2)
+            self.assertEqual(patched.generator_pass(patched.by_guid["target-leaf-base"]), 4)
+            self.assertFalse(plan.pass_adjustments)
+
+    def test_blank_base_filter_repairs_every_available_base(self):
+        root = ET.fromstring(
+            make_pass_target(base_pass=1, ref_pass=1, parent_pass=1, base_filter="")
+        )
+        generators = root.find("Generators")
+        links = root.find("Links")
+        second_base = copy.deepcopy(next(
+            item for item in generators if item.findtext("GUID") == "target-leaf-base"
+        ))
+        second_base.find("GUID").text = "target-branch-base"
+        second_base.find("Name").text = "Branch"
+        generators.append(second_base)
+        links.append(ET.fromstring(link_xml(
+            "target-tree-branch", "target-tree", "target-branch-base", "Tree->Branch"
+        )))
+
+        document = sync.SPMDocument(
+            Path("blank-filter.spm"), ET.tostring(root, encoding="unicode"), True, full=True
+        )
+        adjustments = sync.repair_generation_passes(document)
+        self.assertEqual(
+            {item["name"] for item in adjustments},
+            {"Leaf", "Branch"},
+        )
+        self.assertTrue(all(
+            document.generator_pass(base) == 2 for base in document.base_nodes()
+        ))
+        document.validate(document.render())
+
+    def test_invalid_generation_pass_is_a_hard_integrity_error(self):
+        root = ET.fromstring(make_pass_target())
+        ref = next(
+            item for item in root.find("Generators")
+            if item.findtext("GUID") == "target-ref"
+        )
+        next(
+            prop for prop in ref.findall("./Properties/Property")
+            if prop.findtext("Name") == sync.GENERATION_PASS_PROPERTY
+        ).find("Value").text = "not-an-integer"
+        document = sync.SPMDocument(
+            Path("bad-pass.spm"), ET.tostring(root, encoding="unicode"), True, full=True
+        )
+        with self.assertRaisesRegex(sync.SyncError, "정수가 아닙니다"):
+            document.validate()
+
+    def test_pass_only_repair_transaction_backs_up_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.spm"
+            autosave = Path(temp) / "~target.sbk"
+            write_spm(path, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
+            autosave.write_bytes(b"preserve-live-autosave")
+            original = path.read_bytes()
+            verified = []
+
+            result = sync.apply_pass_repair_transaction(
+                path, verify_callback=lambda candidate: verified.append(Path(candidate).name)
+            )
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(len(result["pass_adjustments"]), 2)
+            self.assertEqual(len(verified), 1)
+            self.assertTrue(verified[0].startswith("__spm_sync_preflight_"))
+            backup_dir = Path(result["backup_dir"])
+            self.assertEqual((backup_dir / "01_target.spm").read_bytes(), original)
+            self.assertEqual(
+                (backup_dir / "02_~target.sbk").read_bytes(),
+                b"preserve-live-autosave",
+            )
+            written = sync.SPMDocument.from_path(path, full=True)
+            self.assertEqual(written.generator_pass(written.by_guid["target-ref"]), 3)
+            self.assertEqual(written.generator_pass(written.by_guid["target-leaf-base"]), 4)
+
+            repeat = sync.apply_pass_repair_transaction(path)
+            self.assertEqual(repeat["status"], "unchanged")
+            self.assertIsNone(repeat["backup_dir"])
+
+    def test_pass_only_repair_preflight_failure_never_writes_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.spm"
+            write_spm(path, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
+            original = path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "preflight failed"):
+                sync.apply_pass_repair_transaction(
+                    path,
+                    verify_callback=lambda _candidate: (_ for _ in ()).throw(
+                        RuntimeError("preflight failed")
+                    ),
+                )
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse((Path(temp) / sync.BACKUP_SUBDIR).exists())
+
+    def test_pass_only_repair_aborts_if_file_changes_during_preflight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.spm"
+            write_spm(path, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
+            external_text = make_pass_target(base_pass=5, ref_pass=2, parent_pass=2)
+            external_bytes = gzip.compress(external_text.encode("utf-8"), mtime=0)
+
+            def mutate_original(_candidate):
+                path.write_bytes(external_bytes)
+
+            with self.assertRaisesRegex(sync.SyncError, "사전검사 중 파일이 변경"):
+                sync.apply_pass_repair_transaction(path, verify_callback=mutate_original)
+            self.assertEqual(path.read_bytes(), external_bytes)
+            self.assertFalse((Path(temp) / sync.BACKUP_SUBDIR).exists())
 
     def test_transaction_rolls_back_every_file_on_verification_failure(self):
         with tempfile.TemporaryDirectory() as temp:

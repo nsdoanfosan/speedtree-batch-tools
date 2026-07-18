@@ -203,6 +203,14 @@ class UnrealIngestSaveTests(unittest.TestCase):
             lambda _send2ue, _asset: {"asset_path": mesh_path}
         )
         runner._material_pipeline_checkouts = lambda: []
+        runner._default_physics_asset_preexisting = lambda _path: False
+        runner._prepare_speedtree_skeletal_optimization = (
+            lambda _path, _preexisting: {
+                "status": "ok",
+                "_delete_physics_asset_path": "",
+            }
+        )
+        runner._finalize_speedtree_skeletal_optimization = lambda value: value
         runner._apply_dynamic_wind = lambda _item: {"status": "ok"}
         runner._save_item_assets = (
             lambda _item, _assets: events.append("save") or [mesh_path]
@@ -259,6 +267,140 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
         self.assertEqual(events, ["save", "validate"])
         self.assertEqual(result["saved"], [mesh_path])
+
+    def test_speedtree_import_disables_physics_asset_generation_temporarily(self):
+        runner = load_runner()
+
+        class Options:
+            create_physics_asset = True
+            physics_asset = object()
+
+        class Importer:
+            def __init__(self):
+                self._options = Options()
+
+            def set_physics_asset(self):
+                self._options.create_physics_asset = True
+
+        module = types.SimpleNamespace(UnrealImportAsset=Importer)
+        original = Importer.set_physics_asset
+        with runner._without_generated_physics_assets(module) as disabled:
+            instance = Importer()
+            instance.set_physics_asset()
+            self.assertTrue(disabled)
+            self.assertFalse(instance._options.create_physics_asset)
+            self.assertIsNone(instance._options.physics_asset)
+
+        self.assertIs(Importer.set_physics_asset, original)
+
+    def test_speedtree_skeletal_optimization_enforces_render_and_collision_settings(self):
+        runner = load_runner()
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        physics_asset_path = mesh_path + "_PhysicsAsset"
+        deleted = []
+
+        class FakeAsset:
+            def __init__(self, path):
+                self.path = path
+
+            def get_path_name(self):
+                return self.path + "." + self.path.rsplit("/", 1)[-1]
+
+        class FakeSettings:
+            def __init__(self):
+                self.values = {"enabled": False, "shape_preservation": "KEEP"}
+
+            def get_editor_property(self, name):
+                return self.values[name]
+
+            def set_editor_property(self, name, value):
+                self.values[name] = value
+
+        class FakeMesh:
+            def __init__(self):
+                self.values = {
+                    "support_ray_tracing": True,
+                    "enable_per_poly_collision": True,
+                    "physics_asset": FakeAsset(physics_asset_path),
+                    "nanite_settings": FakeSettings(),
+                }
+                self.nanite_notifications = 0
+
+            def modify(self):
+                return True
+
+            def get_editor_property(self, name):
+                return self.values[name]
+
+            def set_editor_property(self, name, value):
+                self.values[name] = value
+
+            def notify_nanite_settings_changed(self):
+                self.nanite_notifications += 1
+
+        mesh = FakeMesh()
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def load_asset(path):
+                return mesh if path == mesh_path else None
+
+            @staticmethod
+            def does_asset_exist(path):
+                return path == physics_asset_path
+
+            @staticmethod
+            def find_package_referencers_for_asset(_path, _confirm=True):
+                return [mesh_path]
+
+            @staticmethod
+            def delete_asset(path):
+                deleted.append(path)
+                return True
+
+        runner.unreal.SkeletalMesh = FakeMesh
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner.unreal.NaniteShapePreservation = types.SimpleNamespace(
+            VOXELIZE="VOXELIZE"
+        )
+
+        optimization = runner._prepare_speedtree_skeletal_optimization(
+            mesh_path,
+            default_physics_asset_preexisting=True,
+        )
+
+        self.assertFalse(mesh.values["support_ray_tracing"])
+        self.assertFalse(mesh.values["enable_per_poly_collision"])
+        self.assertIsNone(mesh.values["physics_asset"])
+        self.assertTrue(mesh.values["nanite_settings"].values["enabled"])
+        self.assertEqual(
+            mesh.values["nanite_settings"].values["shape_preservation"],
+            "VOXELIZE",
+        )
+        self.assertEqual(mesh.nanite_notifications, 1)
+
+        finalized = runner._finalize_speedtree_skeletal_optimization(
+            optimization
+        )
+        self.assertEqual(deleted, [physics_asset_path])
+        self.assertTrue(finalized["physics_asset_deleted"])
+
+        mesh.values["physics_asset"] = FakeAsset(physics_asset_path)
+        runner._physics_asset_referencers = lambda _path: [
+            mesh_path,
+            "/Game/Meshes/Other/SK_Shared",
+        ]
+        shared = runner._prepare_speedtree_skeletal_optimization(
+            mesh_path,
+            default_physics_asset_preexisting=True,
+        )
+        shared = runner._finalize_speedtree_skeletal_optimization(shared)
+        self.assertEqual(deleted, [physics_asset_path])
+        self.assertFalse(shared["physics_asset_deleted"])
+        self.assertEqual(
+            shared["default_physics_asset_foreign_referencers"],
+            ["/Game/Meshes/Other/SK_Shared"],
+        )
 
     def test_ingest_item_still_saves_before_material_validation_failure(self):
         runner = load_runner()

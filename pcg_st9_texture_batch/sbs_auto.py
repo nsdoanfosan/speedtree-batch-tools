@@ -208,6 +208,38 @@ def image_pixel_size(path):
         return tuple(image.size)
 
 
+def rendered_map_content_error(path, role):
+    """Return a semantic error for a rendered map that must never be empty.
+
+    A missing or disconnected graph can still make sbsrender exit 0 and emit a
+    correctly sized TGA.  In particular, a tangent-space normal map cannot be
+    RGB black everywhere; even the neutral fallback is (128, 128, 255).
+    """
+    if str(role).lower() != "normal":
+        return None
+    from PIL import Image
+    path = Path(path)
+    try:
+        with Image.open(path) as image:
+            extrema = image.convert("RGB").getextrema()
+    except Exception as exc:
+        return f"unreadable normal output ({exc})"
+    if all(channel_max == 0 for _channel_min, channel_max in extrema):
+        return "all-zero RGB normal output (disconnected or wrong graph source)"
+    return None
+
+
+def validate_rendered_map_contents(paths_by_role):
+    """Raise when rendered files exist but contain a known-invalid payload."""
+    errors = []
+    for role, path in paths_by_role.items():
+        error = rendered_map_content_error(path, role)
+        if error:
+            errors.append(f"{role}={error}")
+    if errors:
+        raise RuntimeError("invalid rendered map content: " + "; ".join(errors))
+
+
 def _size_value(size_log2):
     x_log2, y_log2 = normalize_size_log2(size_log2)
     return f"{x_log2},{y_log2}"
@@ -1431,6 +1463,7 @@ def render_maps(atlas_base, inputs, params, out_dir, cfg=None,
             raise RuntimeError(
                 f"sbsrender output size mismatch; expected "
                 f"{size_log2_pixels(resolved_size)}: {wrong_size}")
+        validate_rendered_map_contents(dict(zip(maps, staged)))
         # The current Cluster_System_01.sbsar always performs OpenGL -> DirectX.
         # A DirectX source therefore needs one compensating G inversion afterward.
         normal_opengl = _param_bool(params, "normal")
@@ -1623,6 +1656,7 @@ def render_sbs_graph_maps(sbs_path, graph_name, texture_base, out_dir,
         if size_log2_pixels(actual_size) != actual_pixels or max(actual_pixels) > (1 << MAX_OUTPUT_LOG2):
             raise RuntimeError(
                 f"SBS graph output size is not a capped power-of-two size: {actual_pixels}")
+        validate_rendered_map_contents(dict(zip(maps, staged)))
         behavior = cfg.get("cluster_sbsar_normal_behavior", "opengl_to_directx")
         if normal_opengl is False and behavior == "opengl_to_directx" and "normal" in maps:
             _invert_normal_green(transaction["staging_dir"] / f"{texture_base}_normal.tga")

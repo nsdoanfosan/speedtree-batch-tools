@@ -51,7 +51,13 @@ from migrate_current_sk_textures import (
     job_needs_source_repair,
     run_job as run_texture_job,
 )
-from unreal_texture_sync import UnrealTextureSyncDeferred, sync_texture_files
+from unreal_texture_sync import (
+    UnrealTextureSyncDeferred,
+    is_texture_synced,
+    load_sync_state,
+    sync_texture_files,
+    validate_unreal_texture_name,
+)
 from spm_texture_normalize import (
     cleanup_preserved_cluster_outputs,
     jobs_from_texture_plan,
@@ -88,6 +94,12 @@ def step3_item_state(item):
         row for row in all_entries if row.get("connection_update_needed")
     ]
     total_maps = len(local_entries) * len(sbs_auto.RENDER_MAPS)
+    complete_rows = [
+        row for row in all_entries if not row.get("missing_export_maps")
+    ]
+    unreal_synced_sets = sum(
+        1 for row in complete_rows if row.get("unreal_synced")
+    )
     return {
         "sets": len(local_entries),
         "shared_sets": len(all_entries) - len(local_entries),
@@ -96,6 +108,13 @@ def step3_item_state(item):
         "complete_maps": total_maps - missing_maps,
         "total_maps": total_maps,
         "connection_sets": len(connection_rows),
+        "unreal_total_sets": len(complete_rows),
+        "unreal_synced_sets": unreal_synced_sets,
+        "unreal_pending_sets": len(complete_rows) - unreal_synced_sets,
+        "unreal_state_known": bool(complete_rows)
+        and all("unreal_synced" in row for row in complete_rows),
+        "unreal_all_synced": bool(complete_rows)
+        and unreal_synced_sets == len(complete_rows),
     }
 
 
@@ -122,9 +141,24 @@ def step3_selection_state(entries):
             "text": f"③ 실행 — 완료 텍스처 연결 정리 ({connection_sets}세트)",
             "state": "normal",
         }
-    if texture_sets:
+    unreal_total = sum(row["unreal_total_sets"] for row in states)
+    unreal_pending = sum(row["unreal_pending_sets"] for row in states)
+    unreal_state_known = bool(states) and all(
+        row["unreal_state_known"] for row in states if row["unreal_total_sets"])
+    if texture_sets and unreal_total and unreal_state_known and not unreal_pending:
         return {
-            "text": f"③ Unreal 동기화 — 완료 텍스처 확인 ({texture_sets}세트)",
+            "text": f"③ Unreal 전체 재확인 ({unreal_total}세트 · 현재 최신 ✓)",
+            "state": "normal",
+            "force_unreal_verify": True,
+        }
+    if texture_sets:
+        if not unreal_state_known:
+            return {
+                "text": f"③ Unreal 동기화 — 완료 텍스처 확인 ({texture_sets}세트)",
+                "state": "normal",
+            }
+        return {
+            "text": f"③ Unreal 동기화 — {unreal_pending or texture_sets}세트 확인",
             "state": "normal",
         }
     return {"text": "③ 실행 — 선택 항목에 텍스처 없음", "state": "disabled"}
@@ -145,6 +179,168 @@ def spm_paths_for_item(item):
     return paths
 
 
+def checked_step3_spms(entries):
+    """Return exact selected final-SK paths, preserving PCG target identity."""
+    result = []
+    seen = set()
+    for entry in entries.values():
+        if not entry.get("checked"):
+            continue
+        for value in spm_paths_for_item(entry.get("item") or {}):
+            path = Path(value)
+            if not path.name.lower().startswith("sk_"):
+                continue
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(str(path))
+    return sorted(result, key=lambda value: os.path.normcase(value))
+
+
+def leaf_target_material_names(target):
+    """Return the source material names used to locate Generator slots."""
+    return list(
+        target.get("source_material_names")
+        or target.get("material_names")
+        or []
+    )
+
+
+def leaf_target_connection_complete(target):
+    """Read the explicit audit result for one final-SK target.
+
+    A missing value is deliberately *not* treated as complete.  Older reports
+    only proved that a blend existed, which is the false-positive this status
+    is intended to prevent.
+    """
+    if "generator_connection_complete" in target:
+        return bool(target.get("generator_connection_complete"))
+    if "generator_connection_update_needed" in target:
+        return not bool(target.get("generator_connection_update_needed"))
+    return False
+
+
+def leaf_source_step2_state(source):
+    """Summarize blend generation and final-SK Generator connection."""
+    has_blend = bool(source.get("atlas_blends"))
+    targets = [
+        target for target in source.get("targets", []) if target.get("spm")
+    ]
+    connection_required = bool(targets)
+    explicit_target_results = connection_required and all(
+        "generator_connection_complete" in target for target in targets
+    )
+    if not connection_required:
+        connection_complete = True
+    elif explicit_target_results:
+        connection_complete = all(
+            leaf_target_connection_complete(target) for target in targets
+        )
+    elif "generator_connection_complete" in source:
+        connection_complete = bool(source.get("generator_connection_complete"))
+    elif "generator_connection_update_needed" in source:
+        connection_complete = not bool(
+            source.get("generator_connection_update_needed"))
+    else:
+        connection_complete = all(
+            leaf_target_connection_complete(target) for target in targets
+        )
+    return {
+        "has_blend": has_blend,
+        "connection_required": connection_required,
+        "connection_complete": connection_complete,
+        "complete": has_blend and connection_complete,
+        "needs_build": not has_blend,
+        "needs_connection": has_blend and connection_required
+        and not connection_complete,
+        "targets": targets,
+    }
+
+
+def step2_target_payload(job):
+    """Build the versioned JSON contract consumed by the Blender job."""
+    targets = []
+    for detail in job.get("target_details") or []:
+        targets.append({
+            "spm": detail["spm"],
+            "source_material_names": list(
+                detail.get("source_material_names") or []),
+            "source_material_ids": list(
+                detail.get("source_material_ids") or []),
+            "generator_bindings": list(
+                detail.get("generator_bindings") or []),
+        })
+    return {"version": 1, "targets": targets}
+
+
+def existing_leaf_blend(source):
+    """Return the first audited blend that still exists on disk."""
+    for value in source.get("atlas_blends") or []:
+        path = Path(value)
+        if path.is_file():
+            return path
+    return None
+
+
+def pending_leaf_targets(source):
+    """Return final-SK targets that still require Generator connection."""
+    targets = [
+        target for target in source.get("targets", []) if target.get("spm")
+    ]
+    pending = [
+        target for target in targets
+        if not leaf_target_connection_complete(target)
+    ]
+    if targets and all(
+            "generator_connection_complete" in target for target in targets):
+        return pending
+    # If only the source aggregate is stale, conservatively revalidate every
+    # target instead of scheduling an empty connection job.
+    if not pending and targets and not leaf_source_step2_state(source)["connection_complete"]:
+        return targets
+    return pending
+
+
+def merge_step2_target_detail(job, target):
+    """Merge one exact target mapping into a shared atlas job."""
+    spm = str(target.get("spm") or "")
+    key = spm.lower()
+    detail = next(
+        (row for row in job["target_details"]
+         if str(row.get("spm") or "").lower() == key),
+        None,
+    )
+    if detail is None:
+        detail = {
+            "spm": spm,
+            "source_material_names": [],
+            "source_material_ids": [],
+            "generator_bindings": [],
+        }
+        job["target_details"].append(detail)
+        job["target_spms"].append(spm)
+    for field, values in (
+        ("source_material_names", leaf_target_material_names(target)),
+        ("source_material_ids", target.get("source_material_ids") or []),
+        ("generator_bindings", target.get("generator_bindings") or []),
+    ):
+        for value in values:
+            if value not in detail[field]:
+                detail[field].append(value)
+
+
+def validate_step2_job_report(data, require_generator_connections=False):
+    """Reject partial Blender reports before the GUI counts a job successful."""
+    if data.get("status") != "ok":
+        raise RuntimeError(data.get("error") or "Blender atlas job failed")
+    if require_generator_connections:
+        if not data.get("spm_built"):
+            raise RuntimeError("최종 SK 반영 결과가 보고되지 않았습니다")
+        if data.get("generator_connections_complete") is not True:
+            raise RuntimeError("Generator Material/Mesh 연결 검증이 완료되지 않았습니다")
+
+
 def blender_user_startup_path(blender_exe):
     version = Path(blender_exe).parent.name.rsplit(" ", 1)[-1]
     appdata = os.environ.get("APPDATA")
@@ -158,14 +354,11 @@ def blender_user_startup_path(blender_exe):
 def atlas_blender_command(blender_exe):
     """Save a clean atlas file with PARK's startup UI/workspaces embedded."""
     startup = blender_user_startup_path(blender_exe)
-    command = [blender_exe]
+    # Always isolate background work from interactive/GPU user add-ons. The
+    # startup file is optional and only supplies PARK's screens/workspaces.
+    command = [blender_exe, "--factory-startup", "--background"]
     if startup:
-        # Factory preferences avoid loading every interactive add-on in a
-        # background process. Opening the user's startup file explicitly still
-        # carries its screens/workspaces into the blend that the job saves.
-        command += ["--factory-startup", "--background", str(startup)]
-    else:
-        command += ["--background"]
+        command.append(str(startup))
     return command + [
         "--python", str(TOOL_DIR / "jobs" / "atlas_blend_job.py"), "--",
     ]
@@ -180,7 +373,10 @@ BLOCKER_TEXT = {
 
 def split_generic(names):
     """머티리얼 이름을 (정상 이름, 'Material 2' 같은 기본 이름)으로 나눈다."""
-    unprefixed = [n for n in names if not str(n).strip().startswith("M_")]
+    unprefixed = [
+        n for n in names
+        if not str(n).strip().lower().startswith("m_")
+    ]
     generic = [n for n in unprefixed if GENERIC_MATERIAL_RE.match(str(n).strip())]
     normal = [n for n in unprefixed if n not in generic]
     return normal, generic
@@ -263,9 +459,15 @@ class App:
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.texplan_cache = {}  # folder -> texture plan rows (선택 시 지연 계산)
+        self.texplan_errors = {}  # folder -> explicit execution blocker
+        self.sync_state = {"entries": {}}
+        self.sync_migration_worker = None
+        self._sync_state_migrating = False
         self.worker = None
         self._busy = False
         self._initial_refreshing = True
+        self._manual_refreshing = False
+        self._target_refresh_active = False
         self._pending_refresh = False
         self.focus_label = focus_data_asset_label(self.cfg.get("pcg_focus_data_assets"))
         root.title("PCG ST9 → SK 전환 준비 보드")
@@ -289,35 +491,54 @@ class App:
         top.pack(fill="x")
         ttk.Label(top, text="나무 루트:").pack(side="left")
         self.root_var = tk.StringVar(value=self.cfg["tree_root"])
-        ttk.Entry(top, textvariable=self.root_var, width=62).pack(side="left", padx=4)
-        ttk.Button(top, text="...", width=3, command=self.pick_root).pack(side="left")
-        btn_refresh = ttk.Button(top, text="🔍 다시 검사 (자산 수정 없음)", command=self.refresh)
-        btn_refresh.pack(side="left", padx=6)
-        Tooltip(btn_refresh, "아무것도 수정하지 않습니다.\n"
-                             "폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 6장 "
-                             "상태를 다시 읽어서 표를 갱신합니다.")
-        ttk.Button(top, text="전체 선택", command=lambda: self._set_all(True)).pack(side="left")
-        ttk.Button(top, text="전체 해제", command=lambda: self._set_all(False)).pack(side="left", padx=4)
+        self.root_entry = ttk.Entry(top, textvariable=self.root_var, width=62)
+        self.root_entry.pack(side="left", padx=4)
+        self.btn_pick_root = ttk.Button(
+            top, text="...", width=3, command=self.pick_root
+        )
+        self.btn_pick_root.pack(side="left")
+        self.btn_refresh = ttk.Button(
+            top, text="🔍 다시 검사 (자산 수정 없음)", command=self.refresh
+        )
+        self.btn_refresh.pack(side="left", padx=6)
+        Tooltip(self.btn_refresh, "아무것도 수정하지 않습니다.\n"
+                                  "폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 6장 "
+                                  "상태를 다시 읽어서 표를 갱신합니다.")
+        self.btn_select_all = ttk.Button(
+            top, text="전체 선택", command=lambda: self._set_all(True)
+        )
+        self.btn_select_all.pack(side="left")
+        self.btn_clear_all = ttk.Button(
+            top, text="전체 해제", command=lambda: self._set_all(False)
+        )
+        self.btn_clear_all.pack(side="left", padx=4)
 
         src = ttk.Frame(self.root, padding=(6, 0, 6, 3))
         src.pack(fill="x")
         ttk.Label(src, text=f"{self.focus_label} PCG + 배치 레벨 대상:").pack(side="left")
-        btn_live = ttk.Button(src, text="Unreal에서 읽기", command=self.refresh_pcg_targets)
-        btn_live.pack(side="left", padx=(6, 0))
-        Tooltip(btn_live, "언리얼 에디터가 켜져 있을 때 사용.\n"
-                          f"{self.focus_label} 활성 항목과 설정된 작업 레벨에 직접 배치된 ST9 메시를 읽습니다.\n"
-                          "현재 설정 레벨: /Game/Level/Cliff_final_01")
-        btn_saved = ttk.Button(src, text="저장된 리포트에서 읽기", command=self.import_saved_pcg_report)
-        btn_saved.pack(side="left", padx=(6, 0))
-        Tooltip(btn_saved, "언리얼 에디터가 꺼져 있을 때 사용.\n"
-                           "이전에 저장해 둔 PCG 덤프 파일에서 메시 목록을 읽어 옵니다.")
+        self.btn_live_targets = ttk.Button(
+            src, text="Unreal에서 읽기", command=self.refresh_pcg_targets
+        )
+        self.btn_live_targets.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_live_targets, "언리얼 에디터가 켜져 있을 때 사용.\n"
+                                       f"{self.focus_label} 활성 항목과 설정된 작업 레벨에 직접 배치된 ST9 메시를 읽습니다.\n"
+                                       "현재 설정 레벨: /Game/Level/Cliff_final_01")
+        self.btn_saved_targets = ttk.Button(
+            src, text="저장된 리포트에서 읽기",
+            command=self.import_saved_pcg_report,
+        )
+        self.btn_saved_targets.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_saved_targets, "언리얼 에디터가 꺼져 있을 때 사용.\n"
+                                        "이전에 저장해 둔 PCG 덤프 파일에서 메시 목록을 읽어 옵니다.")
         self.use_pcg_targets_var = tk.BooleanVar(value=TARGETS_PATH.exists())
-        chk_pcg = ttk.Checkbutton(src, text=f"{self.focus_label}/Cliff 대상만 보기",
-                                  variable=self.use_pcg_targets_var, command=self.refresh)
-        chk_pcg.pack(side="left", padx=10)
-        Tooltip(chk_pcg, f"켜면: {self.focus_label}의 Weight>0 항목 또는 Cliff_final_01 직접 배치와\n"
-                         "매칭되는 나무 폴더만 표에 나옵니다.\n"
-                         "끄면: 루트 아래 모든 나무 폴더가 나옵니다.")
+        self.chk_pcg_targets = ttk.Checkbutton(
+            src, text=f"{self.focus_label}/Cliff 대상만 보기",
+            variable=self.use_pcg_targets_var, command=self.refresh,
+        )
+        self.chk_pcg_targets.pack(side="left", padx=10)
+        Tooltip(self.chk_pcg_targets, f"켜면: {self.focus_label}의 Weight>0 항목 또는 Cliff_final_01 직접 배치와\n"
+                                      "매칭되는 나무 폴더만 표에 나옵니다.\n"
+                                      "끄면: 루트 아래 모든 나무 폴더가 나옵니다.")
         self.targets_info_var = tk.StringVar(value="")
         ttk.Label(src, textvariable=self.targets_info_var, foreground="#666").pack(side="left", padx=8)
 
@@ -346,13 +567,15 @@ class App:
                                   "문제가 있는 항목(중복 매칭·원본 불명·기본 이름 머티리얼)은\n"
                                   "자동으로 건너뛰고 표와 로그에 이유를 표시합니다.")
         self.force_var = tk.BooleanVar(value=False)
-        chk_force = ttk.Checkbutton(actions, text="⚠ 문제 표시된 항목도 적용", variable=self.force_var)
-        chk_force.pack(side="left", padx=10)
-        Tooltip(chk_force, "기본은 끔(안전). 켜면:\n"
-                           "· '중복 매칭' 경고가 있어도 그대로 적용\n"
-                           "· 'Material 2' 같은 기본 이름도 M_Material 2 로 강제 변경\n"
-                           "백업은 똑같이 남습니다.\n"
-                           "원본 SPM을 아예 못 찾은 항목은 켜도 처리할 수 없습니다.")
+        self.chk_force = ttk.Checkbutton(
+            actions, text="⚠ 문제 표시된 항목도 적용", variable=self.force_var
+        )
+        self.chk_force.pack(side="left", padx=10)
+        Tooltip(self.chk_force, "기본은 끔(안전). 켜면:\n"
+                                "· '중복 매칭' 경고가 있어도 그대로 적용\n"
+                                "· 'Material 2' 같은 기본 이름도 M_Material 2 로 강제 변경\n"
+                                "백업은 똑같이 남습니다.\n"
+                                "원본 SPM을 아예 못 찾은 항목은 켜도 처리할 수 없습니다.")
         btn_open = ttk.Button(actions, text="선택 폴더 열기", command=self.open_selected_folder)
         btn_open.pack(side="left", padx=10)
         Tooltip(btn_open, "표에서 클릭한 행의 나무 폴더를 탐색기로 엽니다.")
@@ -375,19 +598,20 @@ class App:
                                 "· 같은 원본 아틀라스를 여러 SPM이 쓰면 한 번만 생성\n"
                                 "· 알베도+알파의 모든 알파 아일랜드를 잎 메시로 생성\n"
                                 "· Quality=Low, Plate=One Plate 고정\n"
-                                "· atlas 폴더에 M_이름.blend 저장 (기존 파일은 안 건드림)\n"
+                                "· atlas 폴더에 M_이름.blend 저장 (기존 파일은 재생성하지 않음)\n"
+                                "· 기존 blend는 수동 편집을 보존한 채 최종 SK 연결에 재사용\n"
                                 "알베도/알파 원본을 못 찾은 묶음은 이유를 표시하고 건너뜁니다.\n"
                                 "메시를 눈으로 확인/정리하려면 저장된 blend를 열면 됩니다.")
-        self.spm_push_var = tk.BooleanVar(value=False)
-        chk_spm = ttk.Checkbutton(
-            actions2, text="최종 SK에 잎 메시 머티리얼 생성",
+        self.spm_push_var = tk.BooleanVar(value=True)
+        self.chk_spm_push = ttk.Checkbutton(
+            actions2, text="최종 SK에 잎 메시 생성 + Generator 연결",
             variable=self.spm_push_var)
-        chk_spm.pack(side="left", padx=8)
-        Tooltip(chk_spm, "켜면 ② 직후 Material_v8과 FBX/XML Mesh 자산을 최종 SK SPM에 등록합니다.\n"
-                         "Cluster SPM은 원본 아틀라스 추적에만 쓰며 수정/개수 계산에서 제외합니다.\n"
-                         "Leaf Mesh Generator의 Material/Mesh 슬롯에는 자동 연결하지 않습니다.\n"
-                         "SPM 파일이 수정되므로, 메시를 먼저 눈으로 확인하고 싶으면 끄고\n"
-                         "blend를 열어 본 뒤 애드온에서 직접 반영하세요.")
+        self.chk_spm_push.pack(side="left", padx=8)
+        Tooltip(self.chk_spm_push, "켜면 ② 직후 Material_v8과 FBX/XML Mesh 자산을 최종 SK SPM에 등록하고\n"
+                                  "원본을 사용하던 Leaf Mesh/Frond Generator의 Material/Mesh 슬롯도 연결합니다.\n"
+                                  "Cluster SPM은 원본 아틀라스 추적에만 쓰며 수정/개수 계산에서 제외합니다.\n"
+                                  "기존 blend가 있으면 다시 만들지 않고 현재 메시 편집을 그대로 사용합니다.\n"
+                                  "SPM은 먼저 백업하며 연결 검증에 실패하면 원본으로 복원합니다.")
         self.btn_step3 = ttk.Button(actions2, text="③ 실행 — 연결 텍스처 만들기 (선택 항목)",
                                     command=self.start_step3)
         self.btn_step3.pack(side="left", padx=10)
@@ -396,9 +620,10 @@ class App:
                                 "· 숨김 Generator와 숨김 부모 아래 항목은 생성 대상에서 제외\n"
                                 "· *_yellow / *_green처럼 같은 원본을 공유하는 파생 슬롯은 한 세트로 통합\n"
                                 "· 아틀라스뿐 아니라 bark/stem/surface 등 표시 Generator의 연결 텍스처도 모두 대상\n"
-                                "· 생성 후 /Game/Textures의 같은 T_ 이름으로 Unreal에 자동 동기화\n"
-                                "· 내용 MD5가 같으면 checkout/import/save하지 않고, 신규만 Perforce add\n"
-                                "· 머티리얼 M_ 이름은 유지하고 출력 텍스처만 T_ 이름으로 저장\n"
+                                 "· 생성 후 /Game/Textures의 같은 T_ 이름으로 Unreal에 자동 동기화\n"
+                                 "· 내용 MD5가 같으면 checkout/import/save하지 않고, 신규만 Perforce add\n"
+                                 "· 모두 최신이면 같은 버튼이 'Unreal 전체 재확인'으로 바뀌어 receipt 캐시를 무시한 검증 경로를 제공\n"
+                                 "· 머티리얼 M_ 이름은 유지하고 출력 텍스처만 T_ 이름으로 저장\n"
                                 "· SBS의 T_ 그래프를 렌더하고, 기존 M_ 그래프는 T_로 안전하게 이름 변경\n"
                                 "· 없으면: 원본 텍스처를 자동 매핑해 렌더하고, 나중에 Designer에서\n"
                                 "  관리할 수 있게 T_ 그래프를 SBS에 새로 넣습니다 (수정 전 백업 저장)\n"
@@ -461,6 +686,8 @@ class App:
             self.root_var.set(path)
 
     def _set_all(self, checked):
+        if getattr(self, "_busy", False):
+            return
         self.checked_rows.set_all(checked)
         self._update_step3_button()
 
@@ -469,6 +696,8 @@ class App:
         self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
 
     def _on_click(self, event):
+        if getattr(self, "_busy", False):
+            return "break"
         if self.tree.identify_region(event.x, event.y) != "tree":
             return
         iid = self.tree.identify_row(event.y)
@@ -506,6 +735,7 @@ class App:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
                 save_spm_analysis_cache()
+                self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
                 error = exc
             self.root.after(
@@ -528,36 +758,194 @@ class App:
         else:
             self.report = report
             self.texplan_cache.clear()
+            if not hasattr(self, "texplan_errors"):
+                self.texplan_errors = {}
+            self.texplan_errors.clear()
             self.populate()
             self._update_summary()
             self._set_busy(False)
-        # A refresh requested mid-initial-scan (e.g. the target refresh
-        # buttons finishing first) must not be dropped: the initial worker
-        # captured the old targets, so run the queued refresh now.
+        if error is None:
+            self._start_sync_state_migration()
+        # A refresh requested mid-initial-scan must not be dropped. Start the
+        # receipt migration first; refresh() will queue behind it when needed
+        # so two filesystem audits never race each other.
         if getattr(self, "_pending_refresh", False):
             self._pending_refresh = False
             self.refresh()
 
+    def _start_sync_state_migration(self):
+        """Verify legacy success reports without delaying the first table paint."""
+        if (self.sync_state or {}).get("migration_complete"):
+            return
+        worker = getattr(self, "sync_migration_worker", None)
+        if worker is not None and worker.is_alive():
+            return
+        self._sync_state_migrating = True
+        self.status_var.set("기존 Unreal 동기화 기록 확인 중…")
+        self._set_busy(True)
+
+        def migrate():
+            try:
+                state = load_sync_state(migrate=True)
+                error = None
+            except Exception as exc:
+                state, error = None, exc
+            self.root.after(
+                0,
+                lambda result=state, failure=error:
+                    self._sync_state_migration_done(result, failure),
+            )
+
+        self.sync_migration_worker = threading.Thread(
+            target=migrate, daemon=True
+        )
+        self.sync_migration_worker.start()
+
+    def _sync_state_migration_done(self, state, error=None):
+        self.sync_migration_worker = None
+        self._sync_state_migrating = False
+        if error is not None:
+            self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
+            self.status_var.set("기존 Unreal 기록 확인 실패 · ③에서 다시 확인")
+            self._set_busy(False)
+            return
+        self.sync_state = state
+        self.populate()
+        self._update_summary()
+        count = len((state or {}).get("entries") or {})
+        self.status_var.set(f"기존 Unreal 동기화 기록 확인 완료 · {count}장")
+        self._set_busy(False)
+        if getattr(self, "_pending_refresh_after_sync_migration", False):
+            self._pending_refresh_after_sync_migration = False
+            self.refresh()
+
     def refresh(self):
+        if getattr(self, "_sync_state_migrating", False):
+            self._pending_refresh_after_sync_migration = True
+            self.status_var.set(
+                "기존 Unreal 동기화 기록 확인 중… (끝나면 자동으로 다시 검사)"
+            )
+            return
         if getattr(self, "_initial_refreshing", False):
             self._pending_refresh = True
             self.status_var.set("초기 검사 중... (끝나면 자동으로 다시 검사)")
-            return
+            return False
+        if getattr(self, "_manual_refreshing", False):
+            self._pending_refresh = True
+            self.status_var.set("검사 중... (끝나면 한 번 더 갱신)")
+            return False
+        if getattr(self, "_busy", False):
+            self._pending_refresh = True
+            self.status_var.set("다른 작업 중... (끝나면 다시 검사)")
+            return False
         self.cfg["tree_root"] = self.root_var.get()
         save_config(self.cfg)
         self.status_var.set("검사 중...")
-        self.root.update_idletasks()
-        try:
-            pcg_targets = load_pcg_targets() if self.use_pcg_targets_var.get() else None
-            self.report = make_report(self.cfg, pcg_targets=pcg_targets)
-            save_spm_analysis_cache()
-        except Exception as exc:
-            messagebox.showerror("검사 실패", str(exc))
+        self._manual_refreshing = True
+        self._set_busy(True)
+        cfg = dict(self.cfg)
+        use_pcg_targets = bool(self.use_pcg_targets_var.get())
+
+        def worker():
+            report = None
+            sync_state = None
+            error = None
+            try:
+                pcg_targets = (
+                    load_pcg_targets() if use_pcg_targets else None
+                )
+                report = make_report(cfg, pcg_targets=pcg_targets)
+                save_spm_analysis_cache()
+                sync_state = load_sync_state(migrate=False)
+            except Exception as exc:
+                error = exc
+            self.root.after(
+                0,
+                lambda result=report, state=sync_state, failure=error:
+                    self._manual_refresh_done(result, state, failure),
+            )
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+        return True
+
+    def _manual_refresh_done(self, report, sync_state, error=None):
+        """Apply a user-requested audit without blocking the Tk thread."""
+        self.worker = None
+        self._manual_refreshing = False
+        if error is not None:
+            messagebox.showerror("검사 실패", str(error))
             self.status_var.set("검사 실패")
+            self._set_busy(False)
+        else:
+            self.report = report
+            self.sync_state = sync_state
+            self.texplan_cache.clear()
+            if not hasattr(self, "texplan_errors"):
+                self.texplan_errors = {}
+            self.texplan_errors.clear()
+            self.populate()
+            self._update_summary()
+            self._set_busy(False)
+
+        if getattr(self, "_pending_refresh", False):
+            self._pending_refresh = False
+            self.refresh()
+
+    def _start_completion_refresh(self, final_status):
+        """Refresh the table off the Tk thread after a batch completes.
+
+        The completed operation's summary remains the authoritative status;
+        the follow-up audit only updates the rows that summary refers to.
+        """
+        if not getattr(self, "_busy", False):
+            self._set_busy(True)
+        self.status_var.set(f"{final_status} · 표 재검사 중...")
+        self.cfg["tree_root"] = self.root_var.get()
+        save_config(self.cfg)
+        cfg = dict(self.cfg)
+        use_pcg_targets = bool(self.use_pcg_targets_var.get())
+
+        def worker():
+            report = None
+            sync_state = None
+            error = None
+            try:
+                pcg_targets = load_pcg_targets() if use_pcg_targets else None
+                report = make_report(cfg, pcg_targets=pcg_targets)
+                save_spm_analysis_cache()
+                sync_state = load_sync_state(migrate=False)
+            except Exception as exc:
+                error = exc
+            self.root.after(
+                0,
+                lambda result=report, state=sync_state, failure=error:
+                    self._completion_refresh_done(
+                        result, state, final_status, failure),
+            )
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
+    def _completion_refresh_done(self, report, sync_state, final_status,
+                                 error=None):
+        """Apply a completed background audit and restore its final summary."""
+        self.worker = None
+        if error is not None:
+            self.log(f"표 재검사 실패: {error}")
+            self._set_busy(False)
+            self.status_var.set(f"{final_status} · 표 재검사 실패")
             return
+        self.report = report
+        self.sync_state = sync_state
         self.texplan_cache.clear()
+        if not hasattr(self, "texplan_errors"):
+            self.texplan_errors = {}
+        self.texplan_errors.clear()
         self.populate()
         self._update_summary()
+        self._set_busy(False)
+        self.status_var.set(final_status)
 
     def _update_summary(self):
         items = self.report["items"]
@@ -626,6 +1014,7 @@ class App:
             self.tree.delete(iid)
         self.items.clear()
         for item in self.report["items"]:
+            self._annotate_unreal_sync(item)
             iid = item["folder"]
             checked = old_checked.get(iid, True)
             self.items[iid] = {"item": item, "checked": checked}
@@ -645,6 +1034,26 @@ class App:
             )
         self.checked_rows.sync_after_reload()
         self._update_step3_button()
+
+    def _annotate_unreal_sync(self, item):
+        destination = self.cfg.get(
+            "unreal_texture_destination", "/Game/Textures")
+        for row in item.get("cluster_items") or []:
+            row["unreal_synced"] = False
+            texture_dir = row.get("texture_dir")
+            texture_base = row.get("texture_base") or row.get("atlas_base")
+            if not texture_dir or not texture_base \
+                    or row.get("missing_export_maps"):
+                continue
+            paths = output_paths(texture_dir, texture_base)
+            row["unreal_synced"] = all(
+                is_texture_synced(
+                    paths[role], state=getattr(
+                        self, "sync_state", {"entries": {}}),
+                    destination=destination,
+                )
+                for role in sbs_auto.RENDER_MAPS
+            )
 
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):
@@ -678,18 +1087,34 @@ class App:
     def step2_text(self, item):
         sources = item.get("leaf_mesh_sources") or []
         if not sources:
+            managed = item.get("managed_leaf_outputs") or []
+            if managed:
+                return f"잎 매쉬 {len(managed)}개 연결 완료 ✓"
             return "원본 잎 아틀라스 없음"
-        have = sum(1 for source in sources if source.get("atlas_blends"))
+        states = [leaf_source_step2_state(source) for source in sources]
+        complete = sum(1 for state in states if state["complete"])
+        builds = sum(1 for state in states if state["needs_build"])
+        connects = sum(1 for state in states if state["needs_connection"])
         targets = {
             target.get("spm", "").lower()
             for source in sources for target in source.get("targets", [])
             if target.get("spm")
         }
-        if have == len(sources):
+        if complete == len(sources):
             return f"잎 매쉬 {len(sources)}개 완료 ✓"
-        remaining = len(sources) - have
-        if have:
-            return f"잎 매쉬 {have}/{len(sources)}개 완료 · {remaining}개 만들기"
+        parts = []
+        if complete:
+            parts.append(f"잎 매쉬 {complete}/{len(sources)}개 완료")
+        else:
+            parts.append(f"잎 매쉬 {len(sources)}개")
+        if builds:
+            parts.append(f"{builds}개 만들기")
+        if connects:
+            parts.append(f"Generator {connects}개 연결")
+        if builds or connects:
+            if not complete and builds == len(sources) and not connects:
+                return f"잎 매쉬 {len(sources)}개 만들기 · 최종 SK {len(targets)}개"
+            return " · ".join(parts)
         return f"잎 매쉬 {len(sources)}개 만들기 · 최종 SK {len(targets)}개"
 
     def step3_text(self, item):
@@ -698,7 +1123,8 @@ class App:
             if state["connection_sets"]:
                 return f"공유 텍스처 · 연결 {state['connection_sets']}세트 정리"
             if state["shared_sets"]:
-                return f"공유 텍스처 {state['shared_sets']}세트 사용 ✓"
+                suffix = " · Unreal 최신 ✓" if state["unreal_all_synced"] else ""
+                return f"공유 텍스처 {state['shared_sets']}세트 사용 ✓{suffix}"
             return "-"
         if state["missing_sets"]:
             return (
@@ -710,6 +1136,17 @@ class App:
             return (
                 f"연결 텍스처 {state['sets']}세트 · "
                 f"{state['total_maps']}장 완료 · 연결 정리"
+            )
+        if state["unreal_all_synced"]:
+            return (
+                f"연결 텍스처 {state['sets']}세트 · "
+                f"{state['total_maps']}장 완료 · Unreal 최신 ✓"
+            )
+        if state["unreal_synced_sets"]:
+            return (
+                f"연결 텍스처 {state['sets']}세트 · "
+                f"Unreal {state['unreal_synced_sets']}/"
+                f"{state['unreal_total_sets']}세트 최신"
             )
         return (
             f"연결 텍스처 {state['sets']}세트 · "
@@ -725,15 +1162,19 @@ class App:
         return entry["item"] if entry else None
 
     def _texplan_rows(self, item):
+        if not hasattr(self, "texplan_errors"):
+            self.texplan_errors = {}
         folder = item["folder"]
         if folder not in self.texplan_cache:
             try:
                 mini = {"items": [item], "pcg_targets": self.report.get("pcg_targets", {})}
                 plan = build_texture_plan_from_report(mini, "<board>")
                 self.texplan_cache[folder] = plan.get("items", [])
-            except Exception:
-                self.texplan_cache[folder] = []
-        return self.texplan_cache[folder]
+                self.texplan_errors.pop(folder, None)
+            except Exception as exc:
+                self.texplan_cache[folder] = None
+                self.texplan_errors[folder] = str(exc)
+        return self.texplan_cache[folder] or []
 
     @staticmethod
     def _detail_texture_rows(item):
@@ -877,7 +1318,13 @@ class App:
             kinds = source.get("source_kinds") or [source.get("source_kind", "direct")]
             route = "Cluster SPM 내부 원본" if "cluster" in kinds else "최종 SPM 직접 원본"
             blends = source.get("atlas_blends") or []
-            state = f"{Path(blends[0]).name} ✓ 있음" if blends else "blend 없음 → [② 실행]"
+            step2_state = leaf_source_step2_state(source)
+            if blends and step2_state["connection_complete"]:
+                state = f"{Path(blends[0]).name} + Generator 연결 ✓"
+            elif blends:
+                state = f"{Path(blends[0]).name} 있음 · Generator 연결 필요 → [② 실행]"
+            else:
+                state = "blend 없음 → [② 실행]"
             L.append(f"  · {source['source_family']}: {state}  ({route})")
             L.append(f"      Albedo: {source['albedo']}")
             L.append(f"      Alpha:  {source['alpha']}")
@@ -886,9 +1333,15 @@ class App:
                 materials = ", ".join(trace.get("material_names") or []) or "머티리얼 미상"
                 L.append(f"      추적 근거(수정 안 함): {trace.get('spm', '')}  /  원본 머티리얼: {materials}")
             for target in source.get("targets", []):
-                materials = ", ".join(target.get("material_names") or [])
+                materials = ", ".join(leaf_target_material_names(target))
                 material_note = f"  /  직접 원본 머티리얼: {materials}" if materials else ""
-                L.append(f"      최종 SK 적용 대상: {target.get('spm', '')}{material_note}")
+                connected = leaf_target_connection_complete(target)
+                connection_note = "연결 완료 ✓" if connected else "Generator 연결 필요"
+                reason = target.get("generator_connection_reason")
+                reason_note = f" ({reason})" if reason and not connected else ""
+                L.append(
+                    f"      최종 SK 적용 대상: {target.get('spm', '')}{material_note}"
+                    f"  /  {connection_note}{reason_note}")
             if len(source.get("targets", [])) > 1:
                 L.append("      ↳ 같은 원본 아틀라스이므로 메시 생성은 한 번, 모든 최종 SK에 함께 반영")
         if leaf_sources:
@@ -986,6 +1439,8 @@ class App:
                 target = targets[0] if targets else {}
                 if target.get("status") == "skipped":
                     blockers.append(f"자동 처리 불가: {target.get('reason', '?')}")
+                elif target.get("status") == "up_to_date":
+                    continue
                 patch = target.get("patch") or {}
                 renames = patch.get("renames", [])
                 normal, generic = split_generic([old for old, _new in renames])
@@ -1005,6 +1460,8 @@ class App:
     def start_prepare(self):
         if not self.report:
             self.refresh()
+            self.status_var.set("검사가 끝난 뒤 ①을 다시 실행하세요.")
+            return
         checked = [e for e in self.items.values() if e["checked"]]
         if not checked:
             messagebox.showinfo("① 실행", "체크된 행이 없습니다. 폴더 이름 왼쪽 ☑를 클릭해 선택하세요.")
@@ -1013,7 +1470,11 @@ class App:
         self.root.update_idletasks()
         rows = self._build_prepare_rows()
         if not rows:
-            messagebox.showinfo("① 실행", "체크된 항목 중 ①이 필요한 것이 없습니다.\n(모두 SK와 M_ 이름이 이미 완료된 상태)")
+            messagebox.showinfo(
+                "① 실행",
+                "체크된 항목 중 ①이 필요한 것이 없습니다.\n"
+                "(변경 없음: 모두 SK와 M_ 이름이 이미 완료된 상태)",
+            )
             self.status_var.set("대기")
             return
         force = bool(self.force_var.get())
@@ -1093,7 +1554,17 @@ class App:
                     if patch.get("backup"):
                         self._ui(lambda p=patch: self.log(f"    백업: {p['backup']}"))
                 done += 1
-                self._ui(lambda i=item: self.tree.set(i["folder"], "step1", "완료 ✓ (방금 적용)"))
+                up_to_date = bool(targets) and all(
+                    target.get("status") == "up_to_date" for target in targets
+                )
+                if up_to_date:
+                    self._ui(lambda lb=label: self.log(
+                        f"[① 변경 없음] {lb}: 이미 최신입니다."))
+                    self._ui(lambda i=item: self.tree.set(
+                        i["folder"], "step1", "완료 ✓ (변경 없음)"))
+                else:
+                    self._ui(lambda i=item: self.tree.set(
+                        i["folder"], "step1", "완료 ✓ (방금 적용)"))
             except Exception as exc:
                 failed += 1
                 self._ui(lambda lb=label, e=exc: self.log(f"[① 실패] {lb}: {e}"))
@@ -1105,13 +1576,27 @@ class App:
     def _set_busy(self, busy):
         self._busy = bool(busy)
         state = "disabled" if busy else "normal"
-        for btn in (self.btn_prepare, self.btn_step2):
-            btn.configure(state=state)
+        control_names = (
+            "btn_prepare", "btn_step2", "btn_refresh", "btn_pick_root",
+            "btn_select_all", "btn_clear_all", "btn_live_targets",
+            "btn_saved_targets", "root_entry", "chk_pcg_targets",
+            "chk_force", "chk_spm_push",
+        )
+        for name in control_names:
+            control = getattr(self, name, None)
+            if control is not None:
+                control.configure(state=state)
         self._update_step3_button()
 
     def _update_step3_button(self):
         """Keep the action truthful after scans and checkbox changes."""
         if not hasattr(self, "btn_step3"):
+            return
+        if getattr(self, "_sync_state_migrating", False):
+            self.btn_step3.configure(
+                text="③ 기존 Unreal 동기화 기록 확인 중…",
+                state="disabled",
+            )
             return
         state = step3_selection_state(getattr(self, "items", {}))
         self.btn_step3.configure(
@@ -1120,9 +1605,9 @@ class App:
         )
 
     def _prepare_finished(self, done, failed):
-        self._set_busy(False)
-        self.log(f"① 완료: 처리 {done}개, 실패 {failed}개. 표를 다시 검사합니다.")
-        self.refresh()
+        summary = f"① 완료: 처리 {done}개, 실패 {failed}개"
+        self.log(f"{summary}. 표를 다시 검사합니다.")
+        self._start_completion_refresh(summary)
 
     # ------------------------------------------------------------- ②③ 공용
     def _checked_texplan_rows(self):
@@ -1164,7 +1649,7 @@ class App:
         return usable("Base_Color"), usable("Opacity")
 
     # ------------------------------------------------------------- ② 실행
-    def _step2_jobs(self):
+    def _step2_jobs(self, connect_spm=True):
         grouped, skipped = {}, []
         atlas_root = Path(self.cfg["atlas_root"])
         for entry in self.items.values():
@@ -1173,68 +1658,110 @@ class App:
             item = entry["item"]
             for source in item.get("leaf_mesh_sources") or []:
                 base = source.get("atlas_base", "")
-                if source.get("atlas_blends"):
+                state = leaf_source_step2_state(source)
+                audited_blend = existing_leaf_blend(source)
+                if state["complete"] and audited_blend:
+                    continue
+                expected_blend = atlas_root / f"{base}.blend"
+                if not audited_blend and expected_blend.is_file():
+                    skipped.append((
+                        item, base,
+                        "동일 이름 blend가 있지만 이 원본과의 일치가 확인되지 않음",
+                    ))
+                    continue
+                if audited_blend and state["needs_connection"] and not connect_spm:
+                    skipped.append((
+                        item, base,
+                        "blend는 있으나 최종 SK Generator 연결 필요 — 연결 옵션을 켜세요",
+                    ))
                     continue
                 albedo = Path(source.get("albedo", ""))
                 alpha = Path(source.get("alpha", ""))
-                if not albedo.exists() or not alpha.exists():
+                if not audited_blend and (not albedo.is_file() or not alpha.is_file()):
                     missing = []
-                    if not albedo.exists():
+                    if not albedo.is_file():
                         missing.append("알베도")
-                    if not alpha.exists():
+                    if not alpha.is_file():
                         missing.append("알파")
                     skipped.append((item, base, f"{'/'.join(missing)} 원본 파일 없음"))
                     continue
-                key = (str(albedo.resolve()).lower(), str(alpha.resolve()).lower())
+
+                pending_targets = pending_leaf_targets(source) if connect_spm else []
+                target_errors = []
+                for target in pending_targets:
+                    spm = Path(target.get("spm", ""))
+                    if not spm.is_file():
+                        target_errors.append(f"{spm.name or spm}: 최종 SK SPM 없음")
+                    elif not leaf_target_material_names(target):
+                        reason = target.get("generator_connection_reason")
+                        suffix = f" ({reason})" if reason else ""
+                        target_errors.append(
+                            f"{spm.name}: 원본 머티리얼 식별 실패{suffix}")
+                if target_errors:
+                    skipped.append((item, base, "; ".join(target_errors)))
+                    continue
+
+                if audited_blend:
+                    key = ("reuse", str(audited_blend.resolve()).lower())
+                else:
+                    key = (
+                        "build",
+                        str(albedo.resolve()).lower(),
+                        str(alpha.resolve()).lower(),
+                    )
                 job = grouped.get(key)
                 if job is None:
                     job = {
                         "item": item, "items": [item], "base": base,
                         "albedo": albedo, "alpha": alpha,
-                        "blend_out": atlas_root / f"{base}.blend",
+                        "blend_out": audited_blend or expected_blend,
+                        "reuse_existing_blend": bool(audited_blend),
                         "target_spms": [], "target_details": [],
                     }
                     grouped[key] = job
                 elif item not in job["items"]:
                     job["items"].append(item)
-                known_spms = {path.lower() for path in job["target_spms"]}
-                for target in source.get("targets", []):
-                    spm = target.get("spm")
-                    if spm and spm.lower() not in known_spms:
-                        job["target_spms"].append(spm)
-                        known_spms.add(spm.lower())
-                    detail = (spm, tuple(target.get("material_names") or []))
-                    if detail not in job["target_details"]:
-                        job["target_details"].append(detail)
+                for target in pending_targets:
+                    merge_step2_target_detail(job, target)
         return list(grouped.values()), skipped
 
     def start_step2(self):
         if not self.report:
             self.refresh()
+            self.status_var.set("검사가 끝난 뒤 ②를 다시 실행하세요.")
+            return
         self.status_var.set("② 대상 확인 중...")
         self.root.update_idletasks()
-        jobs, skipped = self._step2_jobs()
         push_spm = bool(self.spm_push_var.get())
+        jobs, skipped = self._step2_jobs(connect_spm=push_spm)
         for item, base, reason in skipped:
             self.log(f"[② 건너뜀] {item['name']} / {base}: {reason}")
         if not jobs:
-            messagebox.showinfo("② 실행", "체크된 항목 중 잎 메시 blend를 만들 것이 없습니다."
+            messagebox.showinfo("② 실행", "체크된 항목 중 잎 메시를 만들거나 연결할 작업이 없습니다."
                                 + (f"\n(건너뜀 {len(skipped)}개 — 로그 참조)" if skipped else ""))
             self.status_var.set("대기")
             return
         no_spm = [j for j in jobs if push_spm and not j["target_spms"]]
-        msg = ["② 잎 메시 blend 만들기 (헤드리스 Blender)\n"]
-        msg.append(f"만들 blend {len(jobs)}개 (Quality=Low, One Plate, 모든 알파 아일랜드):")
+        build_count = sum(not job["reuse_existing_blend"] for job in jobs)
+        reuse_count = len(jobs) - build_count
+        msg = ["② 잎 메시 만들기 / 최종 SK 연결 (헤드리스 Blender)\n"]
+        msg.append(
+            f"새 blend {build_count}개 · 기존 blend 재사용 {reuse_count}개 "
+            "(Quality=Low, One Plate):")
         for j in jobs[:10]:
+            mode = "기존 blend 재사용" if j["reuse_existing_blend"] else "새로 생성"
+            source_note = (
+                f"알베도: {Path(j['albedo']).name} / "
+                if not j["reuse_existing_blend"] else "")
             msg.append(
-                f" · {j['base']}.blend  (알베도: {Path(j['albedo']).name} / "
+                f" · {Path(j['blend_out']).name}  ({mode} / {source_note}"
                 f"최종 SK: {len(j['target_spms'])}개)")
         if len(jobs) > 10:
             msg.append(f" · ... 외 {len(jobs) - 10}개")
         msg.append(f"저장 위치: {self.cfg['atlas_root']}")
         if push_spm:
-            msg.append("\nMaterial_v8 + Mesh 자산을 최종 SK에 등록합니다.")
-            msg.append("Cluster SPM은 수정하지 않으며 Leaf Mesh Generator에는 자동 연결하지 않습니다.")
+            msg.append("\nMaterial_v8 + Mesh 자산을 최종 SK에 등록하고 Leaf Mesh/Frond Generator를 연결합니다.")
+            msg.append("Cluster SPM은 수정하지 않으며, 실패한 최종 SK는 백업에서 복원합니다.")
             if no_spm:
                 msg.append(f"⚠ 최종 SK가 없는 {len(no_spm)}개는 blend만 만듭니다.")
         if skipped:
@@ -1254,10 +1781,14 @@ class App:
         total = len(jobs)
         for index, job in enumerate(jobs, 1):
             base = job["base"]
-            self._ui(lambda i=index, b=base: self.status_var.set(f"② {i}/{total}: {b} 생성 중..."))
-            self._ui(lambda it=job["item"]: self.tree.set(it["folder"], "step2", "만드는 중..."))
+            action = "기존 blend 연결" if job["reuse_existing_blend"] else "생성"
+            self._ui(lambda i=index, b=base, a=action: self.status_var.set(
+                f"② {i}/{total}: {b} {a} 중..."))
+            self._ui(lambda it=job["item"], a=action: self.tree.set(
+                it["folder"], "step2", f"{a} 중..."))
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_path = REPORT_DIR / f"atlas_job_{base}_{stamp}.json"
+            target_map_path = REPORT_DIR / f"atlas_job_{base}_{stamp}.targets.json"
             cmd = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
                 "--albedo", str(job["albedo"]),
                 "--alpha", str(job["alpha"]),
@@ -1267,9 +1798,16 @@ class App:
                 "--quality", "SPEEDTREE_LOW",
                 "--plate-mode", "SINGLE",
             ]
+            if job["reuse_existing_blend"]:
+                cmd.append("--reuse-existing-blend")
             if push_spm and job["target_spms"]:
+                target_map_path.write_text(
+                    json.dumps(step2_target_payload(job), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 for spm in job["target_spms"]:
                     cmd += ["--spm", str(spm)]
+                cmd += ["--target-map-json", str(target_map_path)]
                 cmd.append("--build-spm")
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True,
@@ -1277,16 +1815,25 @@ class App:
                                         timeout=self.cfg.get("atlas_job_timeout", 1800),
                                         creationflags=0x08000000)
                 data = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
-                if result.returncode != 0 or data.get("status") != "ok":
+                if result.returncode != 0:
                     raise RuntimeError(data.get("error") or (result.stderr or result.stdout)[-400:])
-                register_blend_source_images(
-                    job["blend_out"], (job["albedo"], job["alpha"]),
-                    authoritative=True)
+                validate_step2_job_report(
+                    data,
+                    require_generator_connections=bool(
+                        push_spm and job["target_spms"]),
+                )
+                if not job["reuse_existing_blend"]:
+                    register_blend_source_images(
+                        job["blend_out"], (job["albedo"], job["alpha"]),
+                        authoritative=True)
                 save_spm_analysis_cache()
                 done += 1
-                spm_note = " + 최종 SK에 머티리얼·메시 자산 등록됨" if data.get("spm_built") else ""
-                self._ui(lambda b=base, d=data, s=spm_note: self.log(
-                    f"[② 완료] {b}.blend — 잎 메시 {d.get('meshes', '?')}개{s}"))
+                spm_note = (
+                    " + 최종 SK Generator 연결 완료"
+                    if data.get("generator_connections_complete") else "")
+                reuse_note = " (기존 blend 보존·재사용)" if job["reuse_existing_blend"] else ""
+                self._ui(lambda b=base, d=data, s=spm_note, r=reuse_note: self.log(
+                    f"[② 완료] {b}.blend — 잎 메시 {d.get('meshes', '?')}개{s}{r}"))
                 if data.get("spm_backups"):
                     self._ui(lambda b=base, paths=data["spm_backups"]: self.log(
                         f"[② SPM 백업] {b}: {len(paths)}개 → {Path(paths[0]).parent}"))
@@ -1318,6 +1865,16 @@ class App:
                 jobs.append(job)
             except Exception as exc:
                 skipped.append((item, base, str(exc)))
+        already_reported = {item["folder"] for item, _base, _reason in skipped}
+        for entry in self.items.values():
+            item = entry["item"]
+            folder = item["folder"]
+            if entry["checked"] and folder in self.texplan_errors \
+                    and folder not in already_reported:
+                skipped.append((
+                    item, "텍스처 계획",
+                    self.texplan_errors[folder],
+                ))
         return jobs, skipped
 
     def _step3_sync_files(self):
@@ -1340,35 +1897,148 @@ class App:
                     files.append(str(path))
         return files
 
+    def _sync_pending_texture_files(
+            self, files, progress=None, force_verify=False):
+        """Skip receipt-current files before expensive hashing/Unreal RPC."""
+        state = load_sync_state(migrate=False)
+        destination = self.cfg.get(
+            "unreal_texture_destination", "/Game/Textures"
+        )
+        pending = []
+        receipt_current = 0
+        if force_verify:
+            pending.extend(files)
+        else:
+            for path in files:
+                if is_texture_synced(
+                    path, state=state, destination=destination
+                ):
+                    receipt_current += 1
+                else:
+                    pending.append(path)
+        if pending:
+            report = sync_texture_files(
+                pending, cfg=self.cfg, progress=progress
+            )
+        else:
+            report = {
+                "mode": "receipt_cache",
+                "entries": [],
+                "counts": {},
+                "errors": [],
+            }
+        report["receipt_current"] = receipt_current
+        report["pending_count"] = len(pending)
+        report["forced_verify_count"] = len(files) if force_verify else 0
+        return report
+
+    @staticmethod
+    def _step3_unreal_name_errors(jobs, sync_files):
+        """Validate existing and planned output names before local mutation."""
+        candidates = [Path(path) for path in sync_files]
+        for job in jobs:
+            candidates.extend(
+                output_paths(job["out_dir"], job["texture_base"]).values()
+            )
+        errors = []
+        seen = set()
+        for path in candidates:
+            asset_name = Path(path).stem
+            if asset_name in seen:
+                continue
+            seen.add(asset_name)
+            try:
+                validate_unreal_texture_name(asset_name)
+            except ValueError as exc:
+                errors.append((asset_name, str(exc)))
+        return errors
+
     def start_step3(self):
         if not self.report:
             self.refresh()
+            self.status_var.set("검사가 끝난 뒤 ③을 다시 실행하세요.")
+            return
         self.status_var.set("③ 대상 확인 중...")
         self.root.update_idletasks()
         jobs, skipped = self._step3_jobs()
         sync_files = self._step3_sync_files()
+        selection_state = step3_selection_state(getattr(self, "items", {}))
+        force_unreal_verify = bool(
+            selection_state.get("force_unreal_verify")
+        )
         for item, base, reason in skipped:
             self.log(f"[③ 건너뜀] {item['name']} / {base}: {reason}")
-        checked_folders = sorted({
-            entry["item"]["folder"] for entry in self.items.values()
-            if entry["checked"] and entry["item"].get("sk_spms")
-        })
+        if skipped:
+            lines = [
+                "선택 항목의 텍스처 계획을 완성하지 못해 ③ 실행을 중단합니다.",
+                "일부 항목만 처리해 전체 성공처럼 보이지 않도록 차단했습니다.",
+                "",
+            ]
+            for item, base, reason in skipped[:8]:
+                lines.append(f"· {item['name']} / {base}: {reason}")
+            if len(skipped) > 8:
+                lines.append(f"· ... 외 {len(skipped) - 8}개")
+            messagebox.showerror("③ 실행 차단", "\n".join(lines))
+            self.status_var.set(f"③ 실행 차단 · 계획 오류 {len(skipped)}개")
+            return
+        invalid_names = self._step3_unreal_name_errors(jobs, sync_files)
+        if invalid_names:
+            lines = [
+                "Unreal에서 사용할 수 없는 텍스처 이름이 있어 ③ 실행을 중단합니다.",
+                "로컬 렌더·SBS·SPM을 변경하기 전에 이름을 먼저 수정하세요.",
+                "",
+            ]
+            lines.extend(
+                f"· {name}: {reason}" for name, reason in invalid_names[:8]
+            )
+            if len(invalid_names) > 8:
+                lines.append(f"· ... 외 {len(invalid_names) - 8}개")
+            messagebox.showerror("③ 실행 차단 · Unreal 이름 오류", "\n".join(lines))
+            self.status_var.set(
+                f"③ 실행 차단 · Unreal 이름 오류 {len(invalid_names)}개"
+            )
+            return
+        exact_step3_spms = checked_step3_spms(self.items)
         if not jobs:
-            if not checked_folders and not sync_files:
-                messagebox.showinfo("③ 실행", "체크된 항목 중 텍스처를 만들 것이 없습니다."
-                                    + (f"\n(건너뜀 {len(skipped)}개 — 로그 참조)" if skipped else ""))
+            if not sync_files:
+                messagebox.showinfo(
+                    "③ 실행",
+                    "체크된 항목에서 완성된 TGA 6장 세트나 생성 작업을 찾지 못했습니다.\n"
+                    "③ 컬럼의 누락 파일 또는 텍스처 계획 오류를 먼저 확인하세요.",
+                )
                 self.status_var.set("대기")
                 return
-            if not messagebox.askyesno(
-                    "③ 실행", "6장 출력은 이미 있습니다.\n"
+            if force_unreal_verify:
+                confirm_message = (
+                    "선택한 텍스처는 마지막 성공 기록상 모두 최신입니다.\n\n"
+                    "receipt 캐시를 무시하고 Unreal에서 에셋 존재·MD5·"
+                    "텍스처 설정을 전체 재확인할까요?\n"
+                    "로컬 렌더·SBS·SPM은 변경하지 않습니다."
+                )
+            else:
+                confirm_message = (
+                    "6장 출력은 이미 있습니다.\n"
                     "체크된 SK SPM의 머티리얼 슬롯을 정리하고 Unreal의 T_ 에셋도\n"
-                    "내용 해시 기준으로 확인·동기화할까요?"):
+                    "내용 해시 기준으로 확인·동기화할까요?"
+                )
+            if not messagebox.askyesno("③ 실행", confirm_message):
                 self.status_var.set("대기")
                 return
             self._set_busy(True)
+            self.status_var.set(
+                f"③ Unreal 동기화 시작 · 대상 {len(sync_files)}장"
+            )
+            self.root.update_idletasks()
             self.worker = threading.Thread(
                 target=self._run_step3,
-                args=([], checked_folders, sync_files), daemon=True)
+                args=(
+                    [],
+                    [] if force_unreal_verify else exact_step3_spms,
+                    sync_files,
+                    force_unreal_verify,
+                ),
+                daemon=True,
+            )
             self.worker.start()
             return
         n_render = sum(1 for j in jobs if j["mode"] == "render")
@@ -1398,23 +2068,41 @@ class App:
                 f" · {j['base']} → {j['texture_base']} × {len(sbs_auto.RENDER_MAPS)} ({mode_txt})")
         if len(jobs) > 10:
             msg.append(f" · ... 외 {len(jobs) - 10}개")
-        if skipped:
-            msg.append(f"\n건너뜀 {len(skipped)}개 (원본 못 찾음 — 로그 참조)")
+        if force_unreal_verify:
+            msg.append(
+                "\nUnreal은 receipt 캐시를 무시하고 전체 재확인합니다."
+            )
         msg.append("\n묶음당 ~1분 걸립니다. 계속할까요?")
         if not messagebox.askyesno("③ 실행", "\n".join(msg)):
             self.status_var.set("대기")
             return
         self._set_busy(True)
+        self.status_var.set(
+            f"③ 작업 시작 · 렌더 {len(jobs)}세트 · Unreal 후보 {len(sync_files)}장"
+        )
+        self.root.update_idletasks()
         # Shared texture owners can render on behalf of another checked row,
-        # but every checked SK still needs its own material slots normalized.
-        affected_folders = checked_folders
+        # but only the exact checked/PCG-target SK paths may be normalized.
+        # A folder can contain sibling variants that were not selected.
         self.worker = threading.Thread(
             target=self._run_step3,
-            args=(jobs, affected_folders, sync_files), daemon=True)
+            args=(
+                jobs,
+                exact_step3_spms,
+                sync_files,
+                force_unreal_verify,
+            ),
+            daemon=True,
+        )
         self.worker.start()
 
-    def _run_step3(self, jobs, affected_folders, sync_files=None):
+    def _run_step3(
+            self, jobs, affected_spms, sync_files=None,
+            force_unreal_verify=False):
         done = failed = 0
+        sync_summary = {"latest": 0, "changed": 0, "failed": 0}
+        sync_report_path = None
+        sync_deferred = None
         sync_candidates = list(sync_files or [])
         total = len(jobs)
         timeout = self.cfg.get("sbsrender_timeout", 1800)
@@ -1432,108 +2120,37 @@ class App:
                     f"[③ 완료] {b} → {r['texture_base']} — "
                     f"{len(r['files'])}장 / {Path(r['files'][0]).parent}"))
                 continue
-                if job.get("rename_graph_to"):
-                    rename = sbs_auto.rename_managed_graph(
-                        job["sbs"], job["graph"], job["rename_graph_to"])
-                    job["graph"] = job["rename_graph_to"]
-                    self._ui(lambda b=base, r=rename: self.log(
-                        f"[③ 그래프 이름] {r['old']} → {r['new']} "
-                        f"(백업: {Path(r['backup']).name})"))
-                if job["mode"] == "render":
-                    info = sbs_auto.parse_m_graph(job["sbs"], job["graph"])
-                    inputs, params = info["inputs"], info["params"]
-                    if not inputs.get("Base_Color"):
-                        raise RuntimeError(f"{job['graph']}: 그래프의 원본 연결이 깨져 있음 (Designer에서 확인)")
-                    # A real Translucency/Subsurface source wins over a stale
-                    # neutral-black graph resource.  Amount is always identity 1.
-                    try:
-                        planned_inputs, _notes = sbs_auto.plan_inputs_from_row(
-                            job["row"], require_alpha=False)
-                    except Exception:
-                        planned_inputs = {}
-                    desired_subsurface = planned_inputs.get("Subsurface")
-                    current_subsurface = inputs.get("Subsurface")
-                    if desired_subsurface and (
-                            not current_subsurface
-                            or "neutral_black" in Path(current_subsurface).name.lower()):
-                        patch = sbs_auto.patch_m_graph_input_resource(
-                            job["sbs"], job["graph"], "Subsurface", desired_subsurface)
-                        inputs["Subsurface"] = desired_subsurface
-                        self._ui(lambda b=base, r=patch: self.log(
-                            f"[③ Subsurface 연결] {b}: Translucency 원본 연결 "
-                            f"(백업: {Path(r['backup']).name})"))
-                    white = sbs_auto.neutral_image("white")
-                    current_amount = inputs.get("Subsurface_Amount")
-                    if current_amount and Path(current_amount).resolve() != white.resolve():
-                        patch = sbs_auto.patch_m_graph_input_resource(
-                            job["sbs"], job["graph"], "Subsurface_Amount", white)
-                        self._ui(lambda b=base, r=patch: self.log(
-                            f"[③ Subsurface Amount] {b}: 1로 고정 "
-                            f"(백업: {Path(r['backup']).name})"))
-                    inputs["Subsurface_Amount"] = white
-                else:
-                    inputs = job["inputs"]
-                    params = sbs_auto.default_params(job["normal_opengl"])
-                    for note in job.get("notes", []):
-                        self._ui(lambda b=base, n=note: self.log(f"[③ 참고] {b}: {n}"))
-                had_graph_ao = bool(inputs.get("Ambient_Occlusion"))
-                inputs, hbao_path = sbs_auto.ensure_hbao_input(
-                    texture_base, inputs, job["out_dir"], cfg=self.cfg, timeout=timeout)
-                if hbao_path:
-                    self._ui(lambda b=base, p=hbao_path: self.log(
-                        f"[③ HBAO] {b}: height에서 생성 → {p}"))
-                    if job["mode"] == "render" and had_graph_ao:
-                        patch = sbs_auto.patch_m_graph_input_resource(
-                            job["sbs"], job["graph"], "Ambient_Occlusion", hbao_path)
-                        self._ui(lambda b=base, r=patch: self.log(
-                            f"[③ HBAO 연결] {b}: SBS AO 입력 갱신 "
-                            f"(백업: {Path(r['backup']).name})"))
-                if job["mode"] != "render":
-                    if job["mode"] == "insert":
-                        insert_result = sbs_auto.insert_m_graph(
-                            job["sbs"], texture_base, inputs,
-                            normal_opengl=job["normal_opengl"], cfg=self.cfg)
-                        self._ui(lambda b=texture_base, r=insert_result, s=job["sbs"]: self.log(
-                            f"[③ 그래프 삽입] {b} → {Path(s).name} "
-                            f"(백업: {Path(r['backup']).name})"))
-                    else:
-                        self._ui(lambda b=base: self.log(
-                            f"[③ 참고] {b}: SBS 파일이 없어 그래프 삽입은 생략, 텍스처만 생성"))
-                render_info = sbs_auto.render_maps(
-                    texture_base, inputs, params, job["out_dir"],
-                    cfg=self.cfg, timeout=timeout, return_info=True)
-                files = render_info["files"]
-                if render_info.get("backup_dir"):
-                    self._ui(lambda b=base, p=render_info["backup_dir"]: self.log(
-                        f"[③ 기존 출력 백업] {b}: {p}"))
-                if render_info.get("normal_green_corrected"):
-                    self._ui(lambda b=base: self.log(
-                        f"[③ 노멀] {b}: DirectX 원본 보존을 위해 출력 G 채널 보정"))
-                deleted_legacy = sbs_auto.delete_legacy_m_outputs(
-                    base, job["out_dir"],
-                    legacy_maps=job["row"].get("legacy_export_maps"))
-                if deleted_legacy:
-                    self._ui(lambda b=base, paths=deleted_legacy: self.log(
-                        f"[③ 기존 M_ 출력 삭제] {b}: {len(paths)}개"))
-                done += 1
-                self._ui(lambda b=base, t=texture_base, f=files: self.log(
-                    f"[③ 완료] {b} → {t} — {len(f)}장 저장: {Path(f[0]).parent}"))
             except Exception as exc:
                 failed += 1
                 self._ui(lambda b=base, e=exc: self.log(f"[③ 실패] {b}: {e}"))
-        if failed == 0 and affected_folders:
+        if failed == 0 and affected_spms:
             try:
                 self._ui(lambda: self.status_var.set("③ SK SPM 머티리얼 슬롯 정리 중..."))
+                affected_keys = {
+                    os.path.normcase(os.path.abspath(str(path)))
+                    for path in affected_spms
+                }
+                affected_folders = sorted({
+                    str(Path(path).parent) for path in affected_spms
+                }, key=os.path.normcase)
                 report = make_report(self.cfg, targets=affected_folders)
                 save_spm_analysis_cache()
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
-                spm_jobs = jobs_from_texture_plan(plan)
+                exact_plan = dict(plan)
+                exact_plan["preserved_cluster_materials"] = [
+                    row for row in plan.get("preserved_cluster_materials") or []
+                    if os.path.normcase(os.path.abspath(str(row.get("spm", ""))))
+                    in affected_keys
+                ]
+                spm_jobs = jobs_from_texture_plan(
+                    exact_plan, allowed_spms=affected_spms
+                )
                 normalized = normalize_spms_transactionally(
                     spm_jobs,
                     backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
                     skip_unbuildable=True,
                 )
-                cleanup = cleanup_preserved_cluster_outputs(plan)
+                cleanup = cleanup_preserved_cluster_outputs(exact_plan)
                 self._ui(lambda r=normalized: self.log(
                     f"[③ SK SPM 정리] {len(r['spms'])}개 SPM / "
                     f"{r['materials']}개 머티리얼 — 백업: {r['backup_dir']}"))
@@ -1557,69 +2174,201 @@ class App:
                     if key not in seen_candidates:
                         seen_candidates.add(key)
                         unique_candidates.append(absolute)
-                self._ui(lambda: self.status_var.set(
-                    "③ Unreal 텍스처 내용 해시 확인·동기화 중..."))
-                sync_report = sync_texture_files(unique_candidates, cfg=self.cfg)
+                status_text = (
+                    "③ Unreal 전체 재확인 중..."
+                    if force_unreal_verify else
+                    "③ Unreal 텍스처 내용 해시 확인·동기화 중..."
+                )
+                self._ui(lambda text=status_text: self.status_var.set(text))
+                self._ui(lambda count=len(unique_candidates): self.log(
+                    f"[③ Unreal 동기화 시작] 후보 {count}장 · "
+                    "응답 대기 중에는 5초마다 경과 시간을 표시합니다."))
+
+                def sync_progress(event):
+                    message = event.get("message") or "Unreal 텍스처 확인 중..."
+                    self._ui(lambda text=message: self.status_var.set(
+                        f"③ {text}"))
+
+                heartbeat_stop = threading.Event()
+                heartbeat_started = time.monotonic()
+
+                def sync_heartbeat():
+                    while not heartbeat_stop.wait(5.0):
+                        elapsed = int(time.monotonic() - heartbeat_started)
+                        self._ui(
+                            lambda seconds=elapsed, count=len(unique_candidates):
+                            None if heartbeat_stop.is_set() else
+                            self.status_var.set(
+                                f"③ Unreal 응답 대기 {seconds}초 · 대상 {count}장"
+                            )
+                        )
+
+                heartbeat = threading.Thread(
+                    target=sync_heartbeat, daemon=True
+                )
+                heartbeat.start()
+                try:
+                    sync_report = self._sync_pending_texture_files(
+                        unique_candidates,
+                        progress=sync_progress,
+                        force_verify=force_unreal_verify,
+                    )
+                finally:
+                    heartbeat_stop.set()
                 counts = sync_report.get("counts") or {}
                 mode = sync_report.get("mode", "unknown")
+                sync_summary["latest"] = (
+                    int(sync_report.get("receipt_current", 0))
+                    + int(counts.get("unchanged", 0))
+                )
+                sync_summary["changed"] = sum(
+                    int(counts.get(name, 0))
+                    for name in ("configured", "reimported", "created")
+                )
+                errors = list(sync_report.get("errors") or [])
+                sync_summary["failed"] = max(
+                    len(errors), int(counts.get("error", 0)))
+                failed += sync_summary["failed"]
+                sync_report_path = sync_report.get("report_path")
                 self._ui(lambda c=counts, m=mode: self.log(
                     "[③ Unreal 동기화] "
                     f"방식={m} · 동일 {c.get('unchanged', 0)} · "
                     f"재임포트 {c.get('reimported', 0)} · 설정 {c.get('configured', 0)} · "
                     f"신규 add {c.get('created', 0)}"))
-                for error in sync_report.get("errors") or []:
-                    failed += 1
+                receipt_current = int(sync_report.get("receipt_current", 0))
+                if receipt_current:
+                    self._ui(lambda count=receipt_current: self.log(
+                        f"[③ Unreal 영수증 캐시] 현재 파일 {count}장 재해시/RPC 생략"))
+                forced_verify_count = int(
+                    sync_report.get("forced_verify_count", 0)
+                )
+                if forced_verify_count:
+                    self._ui(lambda count=forced_verify_count: self.log(
+                        f"[③ Unreal 전체 재확인] receipt 캐시 무시 · "
+                        f"{count}장 RPC 검증"))
+                if sync_report_path:
+                    self._ui(lambda path=sync_report_path: self.log(
+                        f"[③ Unreal 동기화 리포트] {path}"))
+                for error in errors:
                     self._ui(lambda e=error: self.log(f"[③ Unreal 동기화 실패] {e}"))
             except UnrealTextureSyncDeferred as exc:
+                failed += 1
+                sync_summary["failed"] += 1
+                sync_deferred = str(exc)
                 self._ui(lambda e=exc: self.log(
                     f"[③ Unreal 동기화 보류] 로컬 TGA/SPM은 완료됨: {e}"))
             except Exception as exc:
                 failed += 1
+                sync_summary["failed"] += 1
                 self._ui(lambda e=exc: self.log(
                     f"[③ Unreal 동기화 실패] 로컬 TGA/SPM은 보존됨: {e}"))
-        self._ui(lambda: self._batch_finished("③", done, failed))
+        self._ui(lambda: self._step3_finished(
+            done, failed, sync_summary, sync_report_path, sync_deferred))
+
+    def _step3_finished(self, render_done, failed, sync_summary,
+                        report_path=None, deferred=None):
+        sync_total = sum(sync_summary.values())
+        render_failed = max(0, failed - sync_summary["failed"])
+        if sync_total or deferred:
+            summary = (
+                f"③ 완료: 렌더 {render_done}세트"
+                f"(실패 {render_failed}) · "
+                f"Unreal 최신 {sync_summary['latest']}장 · "
+                f"변경 {sync_summary['changed']}장 · "
+                f"실패 {sync_summary['failed']}장"
+            )
+        else:
+            summary = f"③ 완료: 렌더 {render_done}세트 · 실패 {failed}개"
+        self.log(summary)
+        if report_path:
+            self.log(f"③ 결과 리포트: {report_path}")
+        if deferred:
+            self.log(f"③ Unreal 보류 사유: {deferred}")
+        final_status = (
+            summary + (f" · 리포트 {report_path}" if report_path else ""))
+        self._start_completion_refresh(final_status)
 
     def _batch_finished(self, label, done, failed):
-        self._set_busy(False)
-        self.log(f"{label} 완료: 성공 {done}개, 실패 {failed}개. 표를 다시 검사합니다.")
-        self.refresh()
+        summary = f"{label} 완료: 성공 {done}개, 실패 {failed}개"
+        self.log(f"{summary}. 표를 다시 검사합니다.")
+        self._start_completion_refresh(summary)
 
     # ---------------------------------------------------------- PCG + placed-level targets
     def refresh_pcg_targets(self):
-        self.status_var.set("Unreal에서 PCG + 작업 레벨 대상 읽는 중...")
-
-        def worker():
-            cmd = [
-                sys.executable.replace("pythonw.exe", "python.exe"),
-                str(TOOL_DIR / "refresh_pcg_targets.py"),
-                "--out", str(TARGETS_PATH),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
-            self.root.after(0, lambda: self._pcg_targets_done(result))
-
-        threading.Thread(target=worker, daemon=True).start()
+        return self._start_target_refresh(
+            "refresh_pcg_targets.py",
+            "Unreal에서 PCG + 작업 레벨 대상 읽는 중...",
+        )
 
     def import_saved_pcg_report(self):
-        self.status_var.set("저장된 PCG 리포트 읽는 중...")
+        return self._start_target_refresh(
+            "import_pcg_display_report.py",
+            "저장된 PCG 리포트 읽는 중...",
+        )
+
+    def _start_target_refresh(self, script_name, progress_text):
+        if getattr(self, "_target_refresh_active", False):
+            self.status_var.set("PCG + 작업 레벨 대상을 이미 읽는 중입니다.")
+            return False
+        if getattr(self, "_busy", False):
+            self.status_var.set("다른 작업이 끝난 뒤 대상을 다시 읽으세요.")
+            return False
+
+        timeout = max(
+            1.0, float(self.cfg.get("pcg_target_refresh_timeout", 120))
+        )
+        self._target_refresh_active = True
+        self._set_busy(True)
+        self.status_var.set(progress_text)
 
         def worker():
             cmd = [
                 sys.executable.replace("pythonw.exe", "python.exe"),
-                str(TOOL_DIR / "import_pcg_display_report.py"),
+                str(TOOL_DIR / script_name),
                 "--out", str(TARGETS_PATH),
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
-            self.root.after(0, lambda: self._pcg_targets_done(result))
+            result = None
+            error = None
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    creationflags=0x08000000 if os.name == "nt" else 0,
+                )
+            except subprocess.TimeoutExpired:
+                error = (
+                    f"대상 읽기가 {timeout:g}초 동안 끝나지 않았습니다. "
+                    "Unreal Editor 또는 저장 리포트 상태를 확인한 뒤 다시 시도하세요."
+                )
+            except Exception as exc:
+                error = str(exc)
+            self.root.after(
+                0,
+                lambda completed=result, failure=error:
+                    self._pcg_targets_done(completed, failure),
+            )
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+        return True
 
-    def _pcg_targets_done(self, result):
+    def _pcg_targets_done(self, result, error=None):
+        self.worker = None
+        self._target_refresh_active = False
+        self._set_busy(False)
+        if error is not None:
+            messagebox.showerror("대상 읽기 실패", error)
+            self.status_var.set("PCG + 작업 레벨 대상 읽기 실패")
+            return
         if result.returncode != 0:
             messagebox.showerror("대상 읽기 실패", (result.stderr or result.stdout)[-2000:])
             self.status_var.set("PCG + 작업 레벨 대상 읽기 실패")
             return
         self.use_pcg_targets_var.set(True)
         self.log((result.stdout or "PCG + 작업 레벨 대상 목록 갱신됨").strip())
+        self._pending_refresh = False
         self.refresh()
 
     def open_selected_folder(self):

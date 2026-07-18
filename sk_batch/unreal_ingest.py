@@ -2,8 +2,9 @@
 
 This module is imported inside Unreal's embedded Python.  It deliberately uses
 Send2UE's own ``dependencies/unreal.py`` importer so the serialized property
-data drives the same FBX, skeleton, PhysicsAsset, LOD, socket, and vertex-color
-rules as the interactive add-on.
+data drives the same FBX, skeleton, LOD, socket, and vertex-color rules as the
+interactive add-on.  SpeedTree-only post-processing disables PhysicsAssets,
+per-poly collision, and ray-tracing geometry while enforcing Nanite Voxelize.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -99,6 +101,227 @@ def _checkout_existing_assets(item):
     if failed:
         raise RuntimeError("source-control checkout failed: " + ", ".join(failed))
     return {"existing": existing, "checked_out": existing}
+
+
+@contextmanager
+def _without_generated_physics_assets(send2ue_unreal):
+    """Disable Send2UE PhysicsAsset generation for this SpeedTree import only."""
+    importer_class = getattr(send2ue_unreal, "UnrealImportAsset", None)
+    original = getattr(importer_class, "set_physics_asset", None)
+    if importer_class is None or not callable(original):
+        yield False
+        return
+
+    def disable_physics_asset(self):
+        options = getattr(self, "_options", None)
+        if options is None:
+            raise RuntimeError("Send2UE import options are not initialized")
+        options.create_physics_asset = False
+        options.physics_asset = None
+
+    importer_class.set_physics_asset = disable_physics_asset
+    try:
+        yield True
+    finally:
+        importer_class.set_physics_asset = original
+
+
+def _asset_package_path(asset):
+    if asset is None:
+        return ""
+    try:
+        return str(asset.get_path_name()).split(".", 1)[0]
+    except Exception:
+        return ""
+
+
+def _nanite_shape_preservation_voxelize():
+    for enum_name in ("NaniteShapePreservation", "ENaniteShapePreservation"):
+        enum_type = getattr(unreal, enum_name, None)
+        if enum_type is None:
+            continue
+        for value_name in ("VOXELIZE", "Voxelize", "voxelize"):
+            value = getattr(enum_type, value_name, None)
+            if value is not None:
+                return value
+        for value_name in dir(enum_type):
+            if "voxel" in value_name.casefold():
+                value = getattr(enum_type, value_name, None)
+                if value is not None:
+                    return value
+    return None
+
+
+def _notify_nanite_settings_changed(mesh):
+    for method_name in ("notify_nanite_settings_changed", "post_edit_change"):
+        method = getattr(mesh, method_name, None)
+        if callable(method):
+            method()
+            return
+
+
+def _physics_asset_referencers(asset_path):
+    finder = getattr(
+        unreal.EditorAssetLibrary,
+        "find_package_referencers_for_asset",
+        None,
+    )
+    if not callable(finder):
+        return None
+    try:
+        referencers = finder(asset_path, True)
+    except TypeError:
+        referencers = finder(asset_path)
+    return sorted(
+        {
+            str(path).split(".", 1)[0]
+            for path in (referencers or [])
+            if path
+        }
+    )
+
+
+def _default_physics_asset_preexisting(mesh_path):
+    return unreal.EditorAssetLibrary.does_asset_exist(
+        f"{mesh_path}_PhysicsAsset"
+    )
+
+
+def _prepare_speedtree_skeletal_optimization(
+    mesh_path,
+    default_physics_asset_preexisting=False,
+):
+    """Apply the asset-level settings shared by every SpeedTree placement."""
+    mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
+    skeletal_mesh_class = getattr(unreal, "SkeletalMesh", None)
+    if mesh is None:
+        raise RuntimeError(f"SpeedTree skeletal mesh not found: {mesh_path}")
+    if skeletal_mesh_class is None or not isinstance(mesh, skeletal_mesh_class):
+        return {
+            "status": "skipped",
+            "reason": "asset is not a SkeletalMesh",
+            "mesh": mesh_path,
+            "_delete_physics_asset_path": "",
+        }
+
+    modify = getattr(mesh, "modify", None)
+    if callable(modify):
+        modify()
+
+    changed = []
+    if bool(mesh.get_editor_property("support_ray_tracing")):
+        mesh.set_editor_property("support_ray_tracing", False)
+        changed.append("support_ray_tracing")
+
+    if bool(mesh.get_editor_property("enable_per_poly_collision")):
+        mesh.set_editor_property("enable_per_poly_collision", False)
+        changed.append("enable_per_poly_collision")
+
+    physics_asset = mesh.get_editor_property("physics_asset")
+    physics_asset_before = _asset_package_path(physics_asset)
+    if physics_asset is not None:
+        mesh.set_editor_property("physics_asset", None)
+        changed.append("physics_asset")
+
+    nanite = mesh.get_editor_property("nanite_settings")
+    nanite_changed = False
+    if not bool(nanite.get_editor_property("enabled")):
+        nanite.set_editor_property("enabled", True)
+        nanite_changed = True
+
+    voxelize = _nanite_shape_preservation_voxelize()
+    if voxelize is None:
+        raise RuntimeError("UE 5.8 Nanite Shape Preservation Voxelize enum missing")
+    if nanite.get_editor_property("shape_preservation") != voxelize:
+        nanite.set_editor_property("shape_preservation", voxelize)
+        nanite_changed = True
+    if nanite_changed:
+        mesh.set_editor_property("nanite_settings", nanite)
+        _notify_nanite_settings_changed(mesh)
+        changed.append("nanite_settings")
+
+    default_physics_asset_path = f"{mesh_path}_PhysicsAsset"
+    default_exists = unreal.EditorAssetLibrary.does_asset_exist(
+        default_physics_asset_path
+    )
+    referencers = None
+    foreign_referencers = []
+    delete_physics_asset_path = ""
+    if default_exists and (
+        physics_asset_before == default_physics_asset_path
+        or not default_physics_asset_preexisting
+    ):
+        referencers = _physics_asset_referencers(default_physics_asset_path)
+        if referencers is not None:
+            foreign_referencers = [
+                path for path in referencers if path != mesh_path
+            ]
+        if not default_physics_asset_preexisting or (
+            referencers is not None and not foreign_referencers
+        ):
+            delete_physics_asset_path = default_physics_asset_path
+
+    support_ray_tracing = bool(
+        mesh.get_editor_property("support_ray_tracing")
+    )
+    per_poly_collision = bool(
+        mesh.get_editor_property("enable_per_poly_collision")
+    )
+    physics_asset_after = _asset_package_path(
+        mesh.get_editor_property("physics_asset")
+    )
+    nanite_after = mesh.get_editor_property("nanite_settings")
+    nanite_enabled = bool(nanite_after.get_editor_property("enabled"))
+    shape_preservation = nanite_after.get_editor_property("shape_preservation")
+    failures = []
+    if support_ray_tracing:
+        failures.append("Support Ray Tracing is still enabled")
+    if per_poly_collision:
+        failures.append("per-poly collision is still enabled")
+    if physics_asset_after:
+        failures.append(f"PhysicsAsset is still assigned: {physics_asset_after}")
+    if not nanite_enabled:
+        failures.append("Nanite is still disabled")
+    if shape_preservation != voxelize:
+        failures.append("Nanite Shape Preservation is not Voxelize")
+    if failures:
+        raise RuntimeError(
+            "SpeedTree skeletal optimization failed: " + "; ".join(failures)
+        )
+
+    return {
+        "status": "ok",
+        "mesh": mesh_path,
+        "changed": changed,
+        "support_ray_tracing": support_ray_tracing,
+        "enable_per_poly_collision": per_poly_collision,
+        "physics_asset_before": physics_asset_before,
+        "physics_asset_after": physics_asset_after,
+        "nanite_enabled": nanite_enabled,
+        "nanite_shape_preservation": str(shape_preservation),
+        "default_physics_asset": default_physics_asset_path,
+        "default_physics_asset_preexisting": bool(
+            default_physics_asset_preexisting
+        ),
+        "default_physics_asset_referencers": referencers,
+        "default_physics_asset_foreign_referencers": foreign_referencers,
+        "physics_asset_deleted": False,
+        "_delete_physics_asset_path": delete_physics_asset_path,
+    }
+
+
+def _finalize_speedtree_skeletal_optimization(optimization):
+    delete_path = optimization.pop("_delete_physics_asset_path", "")
+    if not delete_path:
+        return optimization
+    if not unreal.EditorAssetLibrary.does_asset_exist(delete_path):
+        return optimization
+    if not unreal.EditorAssetLibrary.delete_asset(delete_path):
+        raise RuntimeError(
+            f"generated SpeedTree PhysicsAsset delete failed: {delete_path}"
+        )
+    optimization["physics_asset_deleted"] = True
+    return optimization
 
 
 def _run_lod_and_socket_operations(send2ue_unreal, manifest_asset, asset_data, property_data):
@@ -272,10 +495,20 @@ def _save_item_assets(item, imported_assets):
 def ingest_item(item):
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
     checkout = _checkout_existing_assets(item)
-    imported_assets = [
-        _import_manifest_asset(send2ue_unreal, manifest_asset)
-        for manifest_asset in item.get("assets") or []
-    ]
+    mesh_path = item["mesh_path"]
+    default_physics_asset_preexisting = _default_physics_asset_preexisting(
+        mesh_path
+    )
+    with _without_generated_physics_assets(send2ue_unreal) as generation_disabled:
+        imported_assets = [
+            _import_manifest_asset(send2ue_unreal, manifest_asset)
+            for manifest_asset in item.get("assets") or []
+        ]
+    optimization = _prepare_speedtree_skeletal_optimization(
+        mesh_path,
+        default_physics_asset_preexisting,
+    )
+    optimization["physics_asset_generation_disabled"] = generation_disabled
     material_checkouts = _material_pipeline_checkouts()
     checkout["material_pipeline"] = material_checkouts
     checkout["checked_out"] = list(
@@ -283,13 +516,15 @@ def ingest_item(item):
     )
     wind = _apply_dynamic_wind(item)
     saved = _save_item_assets(item, imported_assets)
-    materials = _material_compile_and_slot_validation(item["mesh_path"])
+    optimization = _finalize_speedtree_skeletal_optimization(optimization)
+    materials = _material_compile_and_slot_validation(mesh_path)
     return {
         "status": "imported_ok",
         "checkout": checkout,
         "assets": imported_assets,
         "wind": wind,
         "materials": materials,
+        "optimization": optimization,
         "saved": saved,
     }
 

@@ -60,6 +60,18 @@ class JobFailureSummaryTests(unittest.TestCase):
             "ValueError: invalid armature",
         )
 
+    def test_empty_material_slot_wins_over_generic_speedtree_export_error(self):
+        report = {
+            "error": (
+                "Unreal handoff validation failed before Send to Unreal. "
+                "Mesh 'SK_tree' slot 1 has no material. SpeedTree export failed"
+            )
+        }
+        summary = summarize_job_failure(report)
+        self.assertIn("머티리얼 빈 슬롯", summary)
+        self.assertIn("SK_tree slot 1", summary)
+        self.assertNotEqual(summary, "SpeedTree export 실패")
+
     def test_background_blender_crash_is_classified(self):
         report = {
             "_report_error": "job report was not created",

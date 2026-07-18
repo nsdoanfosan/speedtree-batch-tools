@@ -21,6 +21,10 @@ not allowed to remap, regenerate, or discard R/G.
   `settings.get_extra_property_group_data_as_dictionary(..., only_key="unreal_type")`
   result. This includes FBX normals/tangents, smoothing, vertex-color replacement,
   skeleton/physics/LOD, material order, Nanite, collision, and destination paths.
+- The serialized PhysicsAsset settings remain in the manifest for audit parity,
+  but SK Batch intentionally overrides PhysicsAsset generation at import time.
+  SpeedTree reference meshes do not use ragdoll, simulation, or skeletal
+  collision; this exception does not change interactive character Send2UE.
 - Extension dispatch order is Send2UE's existing `dir(properties.extensions)`
   order. For the representative SK asset the material pipeline is enabled and
   the other Unreal import modifiers are inactive.
@@ -37,11 +41,16 @@ not allowed to remap, regenerate, or discard R/G.
    MI/MYI, and texture packages that the existing pipeline may mutate.
 6. Material `preflight_mesh_materials` runs.
 7. Send2UE's own `UnrealRemoteCalls.import_asset` imports the FBX with the
-   manifest property data.
+   manifest property data while SK Batch temporarily forces
+   `create_physics_asset=False`.
 8. Material `process_mesh` runs, including texture/MI creation and slot assignment.
 9. LOD and socket operations run when present.
-10. Dynamic wind is applied through `CodexDynamicWindImportLibrary`.
-11. Assets/directories are saved, assigned slots are verified, and relevant
+10. The imported SkeletalMesh is verified with Nanite enabled and Shape
+    Preservation set to Voxelize, while Support Ray Tracing, per-poly collision,
+    and its PhysicsAsset assignment are disabled. A default generated
+    PhysicsAsset is deleted only when it has no foreign referencer.
+11. Dynamic wind is applied through `CodexDynamicWindImportLibrary`.
+12. Assets/directories are saved, assigned slots are verified, and relevant
     materials are compiled/checked.
 
 RPC invokes this transaction through the open editor's existing Send2UE RPC

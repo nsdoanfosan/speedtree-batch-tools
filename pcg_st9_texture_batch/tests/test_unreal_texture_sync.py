@@ -2,6 +2,7 @@ import ast
 import hashlib
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,6 +12,52 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 import unreal_texture_sync
+
+
+class _FakeCommandSocket:
+    def __init__(self):
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
+class _FakeRemoteExecution:
+    instances = []
+    start_error = None
+    run_error = None
+    run_result = {"success": True}
+
+    def __init__(self):
+        self.remote_nodes = [{"node_id": "node", "project": "MyProject2"}]
+        self._command_connection = None
+        self.started = False
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+        if type(self).start_error is not None:
+            raise type(self).start_error
+
+    def open_command_connection(self, _node_id):
+        self._command_connection = types.SimpleNamespace(
+            _command_channel_socket=_FakeCommandSocket())
+
+    def run_command(self, _command, **_kwargs):
+        if type(self).run_error is not None:
+            raise type(self).run_error
+        return type(self).run_result
+
+    def stop(self):
+        self.stopped = True
+
+
+def _fake_remote_execution_module():
+    return types.SimpleNamespace(
+        RemoteExecution=_FakeRemoteExecution,
+        MODE_EXEC_FILE="ExecuteFile",
+    )
 
 
 class CanonicalTextureEntryTests(unittest.TestCase):
@@ -107,6 +154,89 @@ class UnrealPayloadTests(unittest.TestCase):
         self.assertEqual(result["mode"], "headless_commandlet")
         commandlet.assert_called_once()
         remote.assert_not_called()
+
+
+class RemoteExecutionTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        _FakeRemoteExecution.instances = []
+        _FakeRemoteExecution.start_error = None
+        _FakeRemoteExecution.run_error = None
+        _FakeRemoteExecution.run_result = {"success": True}
+
+    def test_response_timeout_is_finite_clear_and_stops_session(self):
+        _FakeRemoteExecution.run_error = TimeoutError("timed out")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "sync.py"
+            script.write_text("print('sync')", encoding="utf-8")
+            with mock.patch.dict(
+                    sys.modules,
+                    {"remote_execution": _fake_remote_execution_module()}):
+                with self.assertRaisesRegex(
+                        unreal_texture_sync.UnrealTextureSyncDeferred,
+                        "12초 동안 응답하지 않았습니다"):
+                    unreal_texture_sync._run_remote(
+                        script,
+                        r"C:\UnrealProjects\MyProject2",
+                        discovery_timeout=0.1,
+                        command_timeout=12,
+                    )
+
+        remote = _FakeRemoteExecution.instances[0]
+        self.assertEqual(
+            remote._command_connection._command_channel_socket.timeout, 12.0)
+        self.assertTrue(remote.stopped)
+
+    def test_session_is_stopped_when_start_fails(self):
+        _FakeRemoteExecution.start_error = RuntimeError("start failed")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "sync.py"
+            script.write_text("print('sync')", encoding="utf-8")
+            with mock.patch.dict(
+                    sys.modules,
+                    {"remote_execution": _fake_remote_execution_module()}):
+                with self.assertRaisesRegex(RuntimeError, "start failed"):
+                    unreal_texture_sync._run_remote(
+                        script,
+                        r"C:\UnrealProjects\MyProject2",
+                        discovery_timeout=0.1,
+                        command_timeout=12,
+                    )
+
+        self.assertTrue(_FakeRemoteExecution.instances[0].stopped)
+
+    def test_sync_uses_configured_timeout_for_remote_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "T_tree_color.tga"
+            source.write_bytes(b"pixels")
+            cfg = {
+                "unreal_project": r"C:\UnrealProjects\MyProject2",
+                "unreal_texture_sync_enabled": True,
+                "unreal_texture_destination": "/Game/Textures",
+                "unreal_texture_sync_timeout": 321,
+            }
+
+            def fake_remote(script_path, _project, **_kwargs):
+                text = Path(script_path).read_text(encoding="utf-8")
+                marker = "OUTPUT_PATH = "
+                line = next(
+                    row for row in text.splitlines() if row.startswith(marker))
+                output = Path(ast.literal_eval(line[len(marker):]))
+                output.write_text(
+                    '{"entries": [], "counts": {}, "errors": []}',
+                    encoding="utf-8",
+                )
+
+            with mock.patch.object(
+                    unreal_texture_sync, "REPORT_DIR", Path(tmp)), \
+                    mock.patch.object(
+                        unreal_texture_sync, "_editor_is_running",
+                        return_value=True), \
+                    mock.patch.object(
+                        unreal_texture_sync, "_run_remote",
+                        side_effect=fake_remote) as remote:
+                unreal_texture_sync.sync_texture_files([source], cfg=cfg)
+
+        self.assertEqual(remote.call_args.kwargs["command_timeout"], 321)
 
 
 if __name__ == "__main__":

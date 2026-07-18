@@ -219,8 +219,9 @@ def _source_material_block(source_spm, canonical_name):
 def build_spm_patch(spm, material_outputs, require_outputs=True):
     """Return a verified in-memory patch for one SPM.
 
-    ``material_outputs`` is keyed by canonical material name and contains
-    ``texture_dir`` and ``texture_base`` for each active material.
+    ``material_outputs`` can be keyed by exact ``@id:<Material_v8 ID>`` or by
+    canonical material name.  Exact ID mappings take priority so duplicate
+    material names can safely use different managed outputs.
     """
     spm = Path(spm)
     text = read_maybe_gzip_text(spm)
@@ -251,7 +252,9 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             continue
         current_name = _material_name(block)
         canonical = canonical_material_name(current_name)
-        output = material_outputs.get(canonical.lower())
+        output = material_outputs.get(f"@id:{material_id}")
+        if output is None:
+            output = material_outputs.get(canonical.lower())
         if not output:
             missing.append(f"{canonical}: no managed output mapping")
             continue
@@ -482,9 +485,27 @@ def cleanup_preserved_cluster_outputs(plan):
     return {"cleaned": cleaned, "conflicts": conflicts}
 
 
-def jobs_from_texture_plan(plan, only_existing_sk=True):
-    """Build per-SPM material mappings from texture-plan rows."""
-    def subsurface_is_real_source(row):
+def jobs_from_texture_plan(plan, only_existing_sk=True, allowed_spms=None):
+    """Build per-SPM material mappings from texture-plan rows.
+
+    ``allowed_spms`` is an exact-path safety boundary for GUI selections. A
+    folder can contain several SK variants; selecting one PCG target must not
+    normalize every sibling merely because the audit plan mentions them.
+    """
+    allowed_keys = None
+    if allowed_spms is not None:
+        allowed_keys = {
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in allowed_spms
+        }
+
+    def spm_is_allowed(spm):
+        return allowed_keys is None or (
+            os.path.normcase(os.path.abspath(str(spm))) in allowed_keys
+        )
+
+    def subsurface_is_real_source(
+            row, target_spm=None, target_material_id=None):
         generated = re.compile(
             r"^[mt]_.*_subsurface\.(?:tga|png|tif|tiff|exr)$", re.IGNORECASE)
         if any(not generated.match(Path(str(ref)).name)
@@ -498,11 +519,19 @@ def jobs_from_texture_plan(plan, only_existing_sk=True):
             for name in (row.get("material_names") or [row.get("atlas_base")])
             if name
         }
-        for spm_value in row.get("material_spms") or []:
+        material_spms = (
+            [target_spm] if target_spm is not None
+            else (row.get("material_spms") or [])
+        )
+        for spm_value in material_spms:
             spm = Path(spm_value)
             if not spm.is_file():
                 continue
-            for material in inspect_material_slots(read_maybe_gzip_text(spm)).values():
+            for material_id, material in inspect_material_slots(
+                    read_maybe_gzip_text(spm)).items():
+                if target_material_id is not None and material_id != str(
+                        target_material_id).strip().lower():
+                    continue
                 if canonical_material_name(material["name"]).lower() not in wanted:
                     continue
                 slot = material["slots"].get("subsurfacecolor")
@@ -535,38 +564,98 @@ def jobs_from_texture_plan(plan, only_existing_sk=True):
                     pass
         return False
 
+    def output_signature(output):
+        mode = output.get("mode") or "managed"
+        if mode == "preserve_source":
+            return (
+                mode,
+                os.path.normcase(os.path.abspath(str(output.get("source_spm", "")))),
+            )
+        return (
+            mode,
+            os.path.normcase(os.path.abspath(str(output.get("texture_dir", "")))),
+            str(output.get("texture_base", "")).lower(),
+            bool(output.get("subsurface_enabled")),
+        )
+
+    def add_material_mapping(spm, key, output):
+        material_map = by_spm.setdefault(str(spm), {})
+        existing = material_map.get(key)
+        if existing is not None and output_signature(existing) != output_signature(output):
+            raise RuntimeError(
+                f"{spm.name}: conflicting managed output mapping for {key}: "
+                f"{existing.get('texture_base') or existing.get('source_spm')} vs "
+                f"{output.get('texture_base') or output.get('source_spm')}")
+        material_map[key] = output
+
     by_spm = {}
     for row in plan.get("items", []):
         texture_dir = row.get("texture_dir")
         texture_base = row.get("texture_base")
         if not texture_dir or not texture_base:
             continue
+        material_targets = row.get("material_targets") or []
+        if material_targets and not isinstance(material_targets, list):
+            raise RuntimeError("material_targets must be a list")
+        if material_targets:
+            for target in material_targets:
+                if not isinstance(target, dict) or not target.get("spm"):
+                    raise RuntimeError(
+                        "material_targets entry requires an SPM path")
+                material_id = target.get("material_id")
+                if material_id is None or not str(material_id).strip():
+                    raise RuntimeError(
+                        f"{Path(target['spm']).name}: material_targets entry "
+                        "requires material_id")
+                spm = Path(target["spm"])
+                if not spm_is_allowed(spm):
+                    continue
+                if only_existing_sk and not spm.name.lower().startswith("sk_"):
+                    continue
+                if not spm.is_file():
+                    continue
+                key = f"@id:{str(material_id).strip().lower()}"
+                add_material_mapping(spm, key, {
+                    "texture_dir": texture_dir,
+                    "texture_base": texture_base,
+                    "subsurface_enabled": subsurface_is_real_source(
+                        row,
+                        target_spm=spm,
+                        target_material_id=material_id,
+                    ),
+                })
+            continue
         names = row.get("material_names") or [row.get("atlas_base")]
         for spm_value in row.get("material_spms") or []:
             spm = Path(spm_value)
+            if not spm_is_allowed(spm):
+                continue
             if only_existing_sk and not spm.name.lower().startswith("sk_"):
                 continue
             if not spm.is_file():
                 continue
-            material_map = by_spm.setdefault(str(spm), {})
             for name in names:
                 canonical = canonical_material_name(name)
-                material_map[canonical.lower()] = {
+                add_material_mapping(spm, canonical.lower(), {
                     "texture_dir": texture_dir,
                     "texture_base": texture_base,
-                    "subsurface_enabled": subsurface_is_real_source(row),
-                }
+                    "subsurface_enabled": subsurface_is_real_source(
+                        row, target_spm=spm
+                    ),
+                })
     for row in plan.get("preserved_cluster_materials") or []:
         spm = Path(row.get("spm", ""))
+        if not spm_is_allowed(spm):
+            continue
         if only_existing_sk and not spm.name.lower().startswith("sk_"):
             continue
         if not spm.is_file() or not Path(row.get("source_spm", "")).is_file():
             continue
         canonical = canonical_material_name(row.get("material_name"))
-        by_spm.setdefault(str(spm), {})[canonical.lower()] = {
+        add_material_mapping(spm, canonical.lower(), {
             "mode": "preserve_source",
             "source_spm": row["source_spm"],
-        }
+        })
     return [
         {"spm": spm, "materials": materials}
         for spm, materials in sorted(by_spm.items(), key=lambda item: item[0].lower())

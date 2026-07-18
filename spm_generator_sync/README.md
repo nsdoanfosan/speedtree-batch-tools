@@ -41,8 +41,15 @@ weed_black_locast
 - Random Seed
 - 재질, 메시, Collection/asset 참조
 - BaseRef의 배치/Generation 설정
+- 기존 자식 Generator의 `Generation > Pass`
 - Node/Freehand Edit (`Nodes` XML은 수정하지 않음)
 - 자식에만 있는 `자식 전용` Generator 구조
+
+`Pass`는 자식별 Reference/Base 계산 순서에 속하므로 마스터 값으로 덮어쓰지 않습니다. 동기화 후에는
+SpeedTree 규칙에 따라 일반 계층의 `Parent pass <= Child pass`와
+`Reference pass < 참조 Base pass`를 정적으로 검사합니다. 기존 값을 내리지 않고 필요한 값만 올리며,
+Base 아래의 재사용 템플릿 subtree에는 Base pass를 전파하지 않습니다. Base filter가 비어 있으면 모든
+Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==` 검색 문법도 해석합니다.
 
 기존 자식 Generator가 정상적인 같은 역할의 다른 재질을 사용하는 경우에는 해당 변형을 보존합니다.
 로컬 ID가 없거나 `Leaf → cluster`처럼 역할이 충돌하는 경우에만 마스터의 에셋 이름을 자식 에셋
@@ -88,6 +95,8 @@ weed_black_locast
 
 - 미리보기는 읽기 전용입니다.
 - 적용 전에 모든 패치를 메모리에서 먼저 만들고 XML/Generator/Link/BaseRef 무결성을 검사합니다.
+- SpeedTree 명령행 export가 성공해도 Generator 오류가 남을 수 있으므로 Pass 의존성은 별도의 정적
+  검사로 저장 전에 차단합니다.
 - 마스터와 자식의 `Tree > Shape:Radius`를 비교합니다.
   - 자식이 1.5배 이상 크면 주의로 표시합니다.
   - 2.5배 이상 크면 거리 기반 생성의 노드·폴리곤 폭증 위험으로 원본 쓰기 전에 차단합니다.
@@ -97,6 +106,12 @@ weed_black_locast
   실패하거나 5분을 넘기면 임시 파일만 제거하고 원본은 수정하지 않습니다.
 - 사전검사가 성공한 뒤 첫 저장 전에 `<나무 폴더>\_spm_backups\generator_sync_날짜시간\`에 모두 백업합니다.
 - 저장·무결성 검사·SpeedTree 검증 중 하나라도 실패하면 모든 파일을 백업으로 복구합니다.
+
+공식 근거:
+
+- [Reference generator 설정](https://docs.unity3d.com/speedtree-modeler/manual/add-and-set-up-a-reference-generator.html)
+- [Generation properties의 Pass 규칙](https://docs.unity3d.com/speedtree-modeler/manual/generation-properties.html)
+- [Base filter 검색 문법](https://docs.unity3d.com/speedtree-modeler/manual/search-syntax.html)
 
 ## 성능
 
@@ -132,6 +147,7 @@ result = apply_group_transaction(
 ```powershell
 python .\spm_generator_sync\spm_generator_sync.py scan "D:\OneDrive\Forestportfolio\02_nature\Tree" --sk-only
 python .\spm_generator_sync\spm_generator_sync.py inspect "...\tree_01.spm"
+python .\spm_generator_sync\spm_generator_sync.py repair-passes "...\tree_02.spm" --speedtree-exe "...\SpeedTree_Modeler.exe" --xml-ini "...\Options_HI_Xml.ini"
 python .\spm_generator_sync\spm_generator_sync.py preview-auto "...\weed_black_locast" SK_tree_black_locast_01.spm SK_tree_black_locast_02.spm SK_tree_black_locast_03.spm
 python .\spm_generator_sync\spm_generator_sync.py preview "...\weed_black_locast" SK_tree_black_locast_01.spm SK_tree_black_locast_02.spm
 python .\spm_generator_sync\spm_generator_sync.py verify-auto-copy "...\weed_black_locast" SK_tree_black_locast_01.spm SK_tree_black_locast_02.spm --speedtree-exe "...\SpeedTree_Modeler.exe" --xml-ini "...\Options_HI_Xml.ini"

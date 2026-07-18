@@ -13,7 +13,13 @@ WPO/마스크 방식 식생을 스켈레탈 메시(SK_*.spm)로 교체하는 반
 SPM 본 세팅 상태(미보정/Relative/무본/M_필요), blend 최신 여부,
 push에 필요한 핸드오프 산출물(wind JSON) 준비 여부. SK Batch를 열 때도 저장된
 과거 문구가 아니라 실제 SPM/blend 시간을 비교해 `생성 필요` 또는
-`교체 필요 — ② Blender Repair 다시 실행`을 바로 표시한다.
+`Blender 갱신 필요 — SPM이 더 최근에 수정됨`을 바로 표시한다.
+SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 실제
+`Leaf Mesh`/`Frond` Generator의 Material과 Mesh가 같은 새 Atlas 자산에 연결됐는지도
+검사한다. 숨김·삭제·컬링 상태이거나 실제 생성 Node가 0개인 Generator는 export 대상이
+아니므로 숫자와 재질 누락 판정에서 제외한다. 연결이 남은 경우에는 내부 용어 대신
+`새 Atlas 연결 N개 / 기존 재질 사용 N개`로 표시하며, 실제 내보내는 참조가 끊긴
+경우에만 별도의 연결 오류로 차단한다.
 오래 걸리는 단계를 돌리기 전에 항상 먼저 눌러보는 용도.
 
 **① SPM 본 세팅 (파일별 편차 있음, 기본 4개 동시 실행)** — SPM만 수정:
@@ -98,9 +104,15 @@ BWR `SpeedTree → Import → Repair` 실행, wind 프리셋은 파일명 기반
 `.blend` + wind JSON 저장. **이미 SPM보다 최신인 blend는 건너뛴다**
 ("완료된 항목도 다시 실행"으로 강제 가능). 재실행 = 갱신. 배치 Blender는
 `--factory-startup`으로 시작하고 BWR만 명시적으로 켜므로 사용자용 애드온의 시작
-오류와 등록 비용을 가져오지 않는다.
+오류와 등록 비용을 가져오지 않는다. SpeedTree가 만든 `.stmat`의 실제 Material
+목록은 Blender를 띄우기 전에 가벼운 SpeedTree FBX 사전 export로 먼저 검사한다.
+이 검사를 통과한 항목만 무거운 Blender Repair로 넘어간다. 실제 생성 Node가 쓰는
+재질이 FBX에서 빠졌다면 해당 SpeedTree Generator의 기존 배경색은 보존하고 전경만
+임시 자홍색으로 표시한다. 원래 전경색은 SPM 백업과 sidecar receipt에 저장되며,
+문제가 해결된 뒤 사용자 색상 충돌이 없을 때만 정확히 원복한다.
 
 **③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
+새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,
 blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비 안 된 항목은
 이유를 표에 남기고 건너뛰고, 준비된 것만 헤드리스 send2ue로 push한다
 (임포트 시 머티리얼 파이프라인이 wind JSON 연결까지 자동 수행 + 디스크 저장).

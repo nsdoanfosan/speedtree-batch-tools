@@ -18,17 +18,31 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
+if str(BATCH_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(BATCH_TOOLS_DIR))
+from speedtree_texture_contract import parse_managed_texture_path, resolve_texture_set
+from speedtree_pipeline_contract import read_spm_text as read_pipeline_spm_text
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from pcg_texture_common import (
-    IMAGE_EXTS,
-    REPORT_DIR,
-    is_backup_path,
-    json_safe_path,
-    load_config,
-    load_pcg_targets,
-)
+    from pcg_texture_common import (
+        IMAGE_EXTS,
+        REPORT_DIR,
+        is_backup_path,
+        json_safe_path,
+        load_config,
+        load_pcg_targets,
+    )
+else:
+    from .pcg_texture_common import (
+        IMAGE_EXTS,
+        REPORT_DIR,
+        is_backup_path,
+        json_safe_path,
+        load_config,
+        load_pcg_targets,
+    )
 
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
 MATERIAL_ID_RE = re.compile(r'<Material_v8\b[^>]*?ID="([^"]+)"', re.IGNORECASE)
@@ -39,6 +53,10 @@ TEX_FILENAME_RE = re.compile(
     re.IGNORECASE | re.DOTALL)
 GENERATOR_BLOCK_RE = re.compile(
     r"<Generator\b[^>]*>.*?</Generator>", re.IGNORECASE | re.DOTALL)
+GENERATOR_TYPE_RE = re.compile(
+    r'<Generator\b[^>]*\bType="([^"]*)"', re.IGNORECASE)
+GENERATOR_NAME_RE = re.compile(
+    r"<Name\b[^>]*>(.*?)</Name>", re.IGNORECASE | re.DOTALL)
 PROPERTY_BLOCK_RE = re.compile(
     r"<Property\b[^>]*>.*?</Property>", re.IGNORECASE | re.DOTALL)
 PROPERTY_NAME_RE = re.compile(
@@ -55,6 +73,28 @@ ELEMENT_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>", re.IGNORECASE)
 ELEMENT_HIDDEN_RE = re.compile(r"<Hidden>([^<]*)</Hidden>", re.IGNORECASE)
 LINK_SOURCE_GUID_RE = re.compile(r"<SourceGUID>([^<]*)</SourceGUID>", re.IGNORECASE)
 LINK_TARGET_GUID_RE = re.compile(r"<TargetGUID>([^<]*)</TargetGUID>", re.IGNORECASE)
+NODE_EXPORT_STATE_RE = re.compile(
+    r"<Node\b[^>]*>\s*"
+    r"<GeneratorGUID>([^<]*)</GeneratorGUID>\s*"
+    r"<ParentGUID>[^<]*</ParentGUID>\s*"
+    r"<Name>[^<]*</Name>\s*"
+    r"<GUID>[^<]*</GUID>\s*"
+    r"<Hidden>([^<]*)</Hidden>\s*"
+    r"<Extra>(.*?)</Extra>",
+    re.IGNORECASE | re.DOTALL,
+)
+NODE_DELETED_RE = re.compile(r"<m_bDeleted>([^<]*)</m_bDeleted>", re.IGNORECASE)
+NODE_CULLED_RE = re.compile(r"<m_bCulled>([^<]*)</m_bCulled>", re.IGNORECASE)
+CUTOUT_MESH_ID_RE = re.compile(
+    r"<CutoutMeshID\b[^>]*>([^<]*)</CutoutMeshID>", re.IGNORECASE)
+SUPPLEMENTAL_CUTOUT_BLOCK_RE = re.compile(
+    r"<SupplementalCutoutMeshIDs\b[^>]*>.*?</SupplementalCutoutMeshIDs>",
+    re.IGNORECASE | re.DOTALL,
+)
+SUPPLEMENTAL_CUTOUT_ID_RE = re.compile(
+    r'<CutoutMesh\b[^>]*\bID="([^"]+)"', re.IGNORECASE)
+MESH_ASSET_ID_RE = re.compile(
+    r'<Mesh\b[^>]*\bID="([^"]+)"', re.IGNORECASE)
 BLEND_IMAGE_EXTENSION_RE = re.compile(
     rb"\.(?:png|tga|tif|tiff|jpg|jpeg|exr|bmp)", re.IGNORECASE)
 BLEND_IMAGE_NAME_BYTES = frozenset(
@@ -65,8 +105,8 @@ ABS_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 TOKEN_SPLIT_RE = re.compile(r"[\s<>'\"=;,\(\)\[\]\{\}]+")
-LEAF_SOURCE_WORDS = ("leaf", "leaves", "foliage", "needle")
 ALPHA_WORDS = ("alpha", "opacity", "transparency", "mask")
+ATLAS_LEAF_BUILDER_MARKER = '"generator":"Atlas Leaf Mesh Builder"'
 GENERATED_EXPORT_RE = re.compile(
     r"^[mt]_.*_(?:color|normal|extra|height|opacity|subsurface)\.(?:tga|png|tif|tiff|exr)$",
     re.IGNORECASE,
@@ -83,8 +123,8 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
-# v3 stores both all referenced IDs (provenance) and visible/export IDs.
-SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v3.json"
+# v4 additionally stores semantic Frond/Leaf Mesh bindings and material mesh IDs.
+SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v4.json"
 SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
 BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v1.json"
 _PERSISTENT_SBS_GRAPHS = None
@@ -102,15 +142,10 @@ GENERIC_MATERIAL_NAME_RE = re.compile(
 
 
 def read_maybe_gzip_text(path):
-    path = Path(path)
     try:
-        with gzip.open(path, "rb") as handle:
-            return handle.read().decode("utf-8", errors="replace")
+        return read_pipeline_spm_text(path)
     except Exception:
-        try:
-            return path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
+        return ""
 
 
 def unique(seq):
@@ -255,7 +290,37 @@ def _referenced_material_ids_from_text(text):
     }
 
 
-def _visible_material_ids_from_text(text):
+def _export_node_counts_from_text(text):
+    """Count generated, non-hidden nodes by Generator GUID.
+
+    A Generator can keep its eye enabled while belonging to a detached graph
+    component that currently produces no nodes. SpeedTree omits that
+    Generator's materials from FBX/STMAT, so graph visibility alone is not
+    export participation evidence.
+    """
+    counts = {}
+    total_nodes = 0
+    for match in NODE_EXPORT_STATE_RE.finditer(text):
+        total_nodes += 1
+        guid = html.unescape(match.group(1).strip())
+        hidden = match.group(2).strip().casefold() in {"1", "true", "yes"}
+        extra = match.group(3)
+        deleted_match = NODE_DELETED_RE.search(extra)
+        culled_match = NODE_CULLED_RE.search(extra)
+        deleted = bool(
+            deleted_match
+            and deleted_match.group(1).strip().casefold() in {"1", "true", "yes"}
+        )
+        culled = bool(
+            culled_match
+            and culled_match.group(1).strip().casefold() in {"1", "true", "yes"}
+        )
+        if guid and not hidden and not deleted and not culled:
+            counts[guid] = counts.get(guid, 0) + 1
+    return counts, total_nodes
+
+
+def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0):
     """Material IDs referenced by generators that would actually export.
 
     SpeedTree keeps ``...:Material`` references on generators whose eye is
@@ -269,7 +334,8 @@ def _visible_material_ids_from_text(text):
     generators = []
     hidden_by_guid = {}
     generator_ids = set()
-    for block_match in GENERATOR_BLOCK_RE.finditer(text):
+    for generator_index, block_match in enumerate(
+            GENERATOR_BLOCK_RE.finditer(text)):
         block = block_match.group(0)
         ids = {
             html.unescape(match.group(2).strip())
@@ -306,9 +372,158 @@ def _visible_material_ids_from_text(text):
 
     active = all_ids - generator_ids
     for guid, ids in generators:
-        if not guid or not effectively_hidden(guid):
+        graph_visible = not guid or not effectively_hidden(guid)
+        has_export_nodes = (
+            not total_nodes
+            or not guid
+            or bool((export_node_counts or {}).get(guid, 0))
+        )
+        if graph_visible and has_export_nodes:
             active |= ids
     return active
+
+
+def _normalized_generator_type(value):
+    value = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return value
+
+
+def _is_leaf_mesh_generator_type(value):
+    normalized = _normalized_generator_type(value)
+    return normalized == "frond" or normalized.replace(" ", "") == "leafmesh"
+
+
+def _leaf_generator_bindings_from_text(
+    text, export_node_counts=None, total_nodes=0
+):
+    """Return material/mesh slot pairs owned by semantic leaf generators.
+
+    Texture filenames and material names are intentionally not part of this
+    decision. A source is a leaf-card source only when a ``Frond`` or
+    ``Leaf Mesh`` Generator points at its Material ID.
+    """
+    generators = []
+    hidden_by_guid = {}
+    for generator_index, block_match in enumerate(
+            GENERATOR_BLOCK_RE.finditer(text)):
+        block = block_match.group(0)
+        guid_match = ELEMENT_GUID_RE.search(block)
+        hidden_match = ELEMENT_HIDDEN_RE.search(block)
+        guid = guid_match.group(1).strip() if guid_match else ""
+        own_hidden = bool(
+            hidden_match and hidden_match.group(1).strip().lower() == "true")
+        if guid:
+            hidden_by_guid[guid] = own_hidden
+        type_match = GENERATOR_TYPE_RE.search(block)
+        generator_type = html.unescape(type_match.group(1).strip()) \
+            if type_match else ""
+        if not _is_leaf_mesh_generator_type(generator_type):
+            continue
+        header = block.split("<Properties", 1)[0]
+        name_match = GENERATOR_NAME_RE.search(header)
+        generator_name = html.unescape(name_match.group(1).strip()) \
+            if name_match else ""
+        properties = []
+        for property_match in PROPERTY_BLOCK_RE.finditer(block):
+            property_block = property_match.group(0)
+            property_name = PROPERTY_NAME_RE.search(property_block)
+            property_value = PROPERTY_VALUE_RE.search(property_block)
+            if not property_name or not property_value:
+                continue
+            properties.append((
+                html.unescape(property_name.group(1).strip()),
+                html.unescape(property_value.group(1).strip()),
+            ))
+        generators.append({
+            "generator_index": generator_index,
+            "guid": guid,
+            "own_hidden": own_hidden,
+            "generator_type": generator_type,
+            "generator_name": generator_name,
+            "properties": properties,
+        })
+
+    parent = {}
+    for link_match in GENERATOR_LINK_RE.finditer(text):
+        block = link_match.group(0)
+        source = LINK_SOURCE_GUID_RE.search(block)
+        target = LINK_TARGET_GUID_RE.search(block)
+        if source and target:
+            parent[target.group(1).strip()] = source.group(1).strip()
+
+    def effectively_hidden(generator):
+        if generator["own_hidden"]:
+            return True
+        guid = generator["guid"]
+        seen = set()
+        while guid and guid not in seen:
+            seen.add(guid)
+            if hidden_by_guid.get(guid):
+                return True
+            guid = parent.get(guid, "")
+        return False
+
+    bindings = []
+    for generator in generators:
+        graph_visible = not effectively_hidden(generator)
+        generated_node_count = int(
+            (export_node_counts or {}).get(generator["guid"], 0)
+        )
+        export_participates = bool(
+            graph_visible
+            and (
+                not total_nodes
+                or not generator["guid"]
+                or generated_node_count > 0
+            )
+        )
+        by_name = {name.lower(): (name, value)
+                   for name, value in generator["properties"]}
+        for property_name, material_id in generator["properties"]:
+            if not property_name.lower().endswith(":material"):
+                continue
+            prefix = property_name[:-len(":Material")]
+            mesh_pair = by_name.get((prefix + ":Mesh").lower())
+            bindings.append({
+                "generator_index": generator["generator_index"],
+                "generator_guid": generator["guid"],
+                "generator_type": generator["generator_type"],
+                "generator_name": generator["generator_name"],
+                "material_property": property_name,
+                "slot_prefix": prefix,
+                "material_id": material_id,
+                "mesh_property": mesh_pair[0] if mesh_pair else "",
+                "mesh_id": mesh_pair[1] if mesh_pair else "",
+                # ``visible`` remains the compatibility field consumed by the
+                # SK contract. It now means actual export participation, not
+                # merely an enabled eye icon.
+                "visible": export_participates,
+                "graph_visible": graph_visible,
+                "generated_node_count": generated_node_count,
+                "export_participates": export_participates,
+            })
+    return bindings
+
+
+def _material_cutout_mesh_ids(block):
+    mesh_ids = []
+    cutout = CUTOUT_MESH_ID_RE.search(block)
+    if cutout and cutout.group(1).strip() not in {"", "-1"}:
+        mesh_ids.append(cutout.group(1).strip())
+    supplemental = SUPPLEMENTAL_CUTOUT_BLOCK_RE.search(block)
+    if supplemental:
+        mesh_ids.extend(
+            match.group(1).strip()
+            for match in SUPPLEMENTAL_CUTOUT_ID_RE.finditer(supplemental.group(0))
+            if match.group(1).strip() not in {"", "-1"}
+        )
+    return unique(mesh_ids)
+
+
+def _material_is_managed_leaf_output(block):
+    low = block.lower()
+    return (ATLAS_LEAF_BUILDER_MARKER.lower() in low
+            or ("atlas leaf mesh builder" in low and '"generator"' in low))
 
 
 def _spm_analysis(path):
@@ -323,12 +538,16 @@ def _spm_analysis(path):
     persistent = _persistent_spm_analysis()
     disk_entry = persistent.get(path_key)
     if disk_entry and disk_entry.get("size") == size \
-            and disk_entry.get("mtime_ns") == mtime_ns:
+            and disk_entry.get("mtime_ns") == mtime_ns \
+            and disk_entry.get("leaf_binding_schema") == 3:
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
             "active_material_ids": set(disk_entry.get("referenced_material_ids", [])),
             "visible_material_ids": set(disk_entry.get("visible_material_ids", [])),
+            "leaf_generator_bindings": disk_entry.get(
+                "leaf_generator_bindings", []),
+            "mesh_asset_ids": set(disk_entry.get("mesh_asset_ids", [])),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
         return analysis
@@ -349,10 +568,23 @@ def _spm_analysis(path):
             "material_id": id_match.group(1) if id_match else None,
             "material_name": name,
             "refs": unique(refs),
+            "cutout_mesh_ids": _material_cutout_mesh_ids(block),
+            "managed_leaf_output": _material_is_managed_leaf_output(block),
         })
 
     referenced = _referenced_material_ids_from_text(text)
-    visible = _visible_material_ids_from_text(text)
+    export_node_counts, total_nodes = _export_node_counts_from_text(text)
+    visible = _visible_material_ids_from_text(
+        text, export_node_counts=export_node_counts, total_nodes=total_nodes
+    )
+    leaf_bindings = _leaf_generator_bindings_from_text(
+        text, export_node_counts=export_node_counts, total_nodes=total_nodes
+    )
+    mesh_assets = {
+        match.group(1).strip()
+        for match in MESH_ASSET_ID_RE.finditer(text)
+        if match.group(1).strip() not in {"", "-1"}
+    }
 
     analysis = {
         "material_rows": rows,
@@ -363,6 +595,8 @@ def _spm_analysis(path):
         # separate visible_material_ids set below.
         "active_material_ids": referenced,
         "visible_material_ids": visible,
+        "leaf_generator_bindings": leaf_bindings,
+        "mesh_asset_ids": mesh_assets,
     }
     # A modified file receives a new stat key. Drop only stale entries for
     # this exact path so long-running GUI refreshes do not grow indefinitely.
@@ -379,6 +613,9 @@ def _spm_analysis(path):
             "material_names": analysis["material_names"],
             "referenced_material_ids": sorted(referenced),
             "visible_material_ids": sorted(visible),
+            "leaf_generator_bindings": leaf_bindings,
+            "mesh_asset_ids": sorted(mesh_assets),
+            "leaf_binding_schema": 3,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     return analysis
@@ -387,7 +624,7 @@ def _spm_analysis(path):
 def canonical_material_name(name):
     """Normalize shared bark-end aliases; preserve tint-specific stem names."""
     name = str(name or "").strip()
-    prefixed = name if name.lower().startswith("m_") else "M_" + name
+    prefixed = "M_" + name[2:] if name.lower().startswith("m_") else "M_" + name
     match = COMMON_BARK_END_RE.match(prefixed)
     if match:
         return f"M_bark_common_end_{int(match.group(1)):02d}"
@@ -492,6 +729,120 @@ def visible_material_names(path):
     )
 
 
+def leaf_generator_bindings(path, visible_only=False):
+    """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
+    bindings = _spm_analysis(path)["leaf_generator_bindings"]
+    if visible_only:
+        return [dict(row) for row in bindings if row.get("visible")]
+    return [dict(row) for row in bindings]
+
+
+def leaf_generator_material_ids(path, visible_only=False):
+    return {
+        row.get("material_id") for row in leaf_generator_bindings(
+            path, visible_only=visible_only)
+        if row.get("material_id") not in {None, "", "-1"}
+    }
+
+
+def mesh_asset_ids(path):
+    """IDs of actual SpeedTree Mesh assets, excluding material cutout lists."""
+    return set(_spm_analysis(path)["mesh_asset_ids"])
+
+
+def managed_leaf_outputs(target_spms):
+    """Connected Atlas Leaf Mesh Builder outputs in the exact target SPMs.
+
+    A material name is not completion evidence.  The material must carry the
+    builder's UserData marker, a semantic ``Leaf Mesh``/``Frond`` generator
+    must point at its Material ID, and the matching Mesh slot must point at a
+    cutout mesh owned by that same material.
+    """
+    outputs = []
+    seen_spms = set()
+    for spm in target_spms or []:
+        spm = Path(spm)
+        spm_key = os.path.abspath(str(spm)).lower()
+        if spm_key in seen_spms:
+            continue
+        seen_spms.add(spm_key)
+
+        rows = extract_material_image_refs(spm)
+        managed_by_id = {
+            str(row["material_id"]): row
+            for row in rows
+            if row.get("material_id") not in {None, "", "-1"}
+            and row.get("managed_leaf_output")
+        }
+        if not managed_by_id:
+            continue
+
+        for material_id, material in managed_by_id.items():
+            atlas_base = material.get("material_name", "")
+            source_ids = []
+            source_names = []
+            expected_bindings = []
+            for payload in _scoped_connection_payloads(spm, atlas_base):
+                connection = payload.get("generator_connection") or {}
+                source_ids.extend(connection.get("source_material_ids") or [])
+                source_names.extend(connection.get("source_material_names") or [])
+                for binding in connection.get("bindings") or []:
+                    if not isinstance(binding, dict):
+                        continue
+                    target_id = binding.get("target_material_id")
+                    if target_id not in {None, ""} \
+                            and str(target_id) != material_id:
+                        continue
+                    source_id = binding.get("source_material_id")
+                    if source_id not in {None, "", -1, "-1"}:
+                        source_ids.append(str(source_id))
+                    source_name = binding.get("source_material_name")
+                    if source_name:
+                        source_names.append(source_name)
+                    expected_bindings.append(binding)
+
+            # A connected slot alone cannot prove completion. The target-
+            # specific builder manifest is the only durable record of every
+            # source Generator slot/leaf ordinal that had to be replaced.
+            if not expected_bindings:
+                continue
+            source_ids = unique(
+                str(value) for value in source_ids
+                if value not in {None, "", -1, "-1"})
+            source_names = unique(source_names)
+            if source_ids:
+                source_names = unique(source_names + [
+                    managed_by_id.get(source_id, {}).get("material_name", "")
+                    for source_id in source_ids
+                ])
+            status = inspect_leaf_generator_connection(
+                spm,
+                source_material_names=source_names,
+                source_material_ids=source_ids,
+                atlas_base=atlas_base,
+                expected_generator_bindings=expected_bindings,
+            )
+            if not status["generator_connection_complete"]:
+                continue
+            bindings = [
+                binding for binding in status["managed_generator_bindings"]
+                if str(binding.get("material_id") or "") == material_id
+            ]
+            if not bindings:
+                continue
+            outputs.append({
+                "spm": str(spm),
+                "material_id": material_id,
+                "material_name": material.get("material_name", ""),
+                "cutout_mesh_ids": list(material.get("cutout_mesh_ids") or []),
+                "generator_bindings": bindings,
+                "expected_slot_count": status["expected_slot_count"],
+                "connected_slot_count": status["connected_slot_count"],
+                "generator_connection_complete": True,
+            })
+    return outputs
+
+
 @functools.lru_cache(maxsize=32768)
 def _resolve_spm_image_ref_cached(base_text, ref_text):
     path_text = ref_text.replace("/", "\\")
@@ -536,20 +887,27 @@ def source_family_name(path):
 def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_only=True):
     """Find coherent leaf albedo/alpha pairs used by one SPM material.
 
-    One material normally owns one atlas pair. If a material happens to list
-    more maps, family-name matching keeps albedo and alpha in the same set.
+    A material qualifies only when a semantic ``Frond``/``Leaf Mesh``
+    Generator references its Material ID. One material normally owns one
+    atlas pair; family-name matching keeps extra maps in the same set.
     """
     results = []
     excluded_albedo_stems = {str(stem).lower() for stem in (excluded_albedo_stems or [])}
-    active_ids = active_material_ids(spm) if active_only else None
+    # Hidden authoring generators are still valid provenance and may be
+    # re-enabled later; the existing audit's ``active`` contract deliberately
+    # retains them. Semantic Generator Type/ID, not eye state, is the gate.
+    semantic_ids = leaf_generator_material_ids(spm, visible_only=False)
+    if not semantic_ids:
+        return results
     for row in extract_material_image_refs(spm):
-        if active_only and active_ids and row.get("material_id") not in active_ids:
+        if row.get("material_id") not in semantic_ids:
+            continue
+        # Atlas Leaf Mesh Builder outputs can themselves become active leaf
+        # materials after connection. They are results, never new inputs.
+        if row.get("managed_leaf_output"):
             continue
         name = row["material_name"]
         refs = row["refs"]
-        searchable = " ".join([name] + refs).lower()
-        if not any(word in searchable for word in LEAF_SOURCE_WORDS):
-            continue
         # Material_v8 keeps the base-color texture in its first texture slot.
         # Do not guess from a missing filename suffix such as leaf_x.tga.
         albedo_refs = [refs[0]] if refs else []
@@ -561,12 +919,11 @@ def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_o
         albedo_refs = [
             ref for ref in albedo_refs
             if Path(ref).stem.lower() not in excluded_albedo_stems
-            and not GENERATED_EXPORT_RE.match(Path(ref).name)
         ]
-        alpha_refs = [
-            ref for ref in alpha_refs
-            if not GENERATED_EXPORT_RE.match(Path(ref).name)
-        ]
+        # An untagged source material may already point at normalized T_* maps
+        # even though its generator still needs the Blender leaf mesh. Builder
+        # outputs are excluded above by UserData ownership, so those managed
+        # maps remain valid provenance without re-discovering generated assets.
         if not albedo_refs or not alpha_refs:
             continue
         albedos = [resolve_spm_image_ref(spm, ref) for ref in albedo_refs]
@@ -601,6 +958,10 @@ def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_o
                 "source_kind": source_kind,
                 "target_spm": str(Path(spm)),
                 "material_names": [name] if name else [],
+                "source_material_ids": [row.get("material_id")]
+                    if row.get("material_id") else [],
+                "material_ids": [row.get("material_id")]
+                    if row.get("material_id") else [],
                 "source_refs": unique(family_refs),
             })
     return results
@@ -703,6 +1064,13 @@ def merge_leaf_mesh_sources(sources, cfg, folder):
         target = {
             "spm": source["target_spm"],
             "material_names": list(source.get("material_names") or []),
+            "source_material_names": list(source.get("material_names") or []),
+            "source_material_ids": list(
+                source.get("source_material_ids")
+                or source.get("material_ids") or []),
+            "material_ids": list(
+                source.get("material_ids")
+                or source.get("source_material_ids") or []),
             "source_kind": source.get("source_kind", "direct"),
         }
         trace = None
@@ -730,10 +1098,18 @@ def merge_leaf_mesh_sources(sources, cfg, folder):
         if existing:
             existing["material_names"] = unique(
                 existing["material_names"] + target["material_names"])
+            existing["source_material_names"] = unique(
+                existing.get("source_material_names", [])
+                + target["source_material_names"])
+            existing["source_material_ids"] = unique(
+                existing.get("source_material_ids", [])
+                + target["source_material_ids"])
+            existing["material_ids"] = unique(
+                existing.get("material_ids", []) + target["material_ids"])
         else:
             entry["targets"].append(target)
     results = list(grouped.values())
-    assign_leaf_atlas_bases(results, folder)
+    assign_leaf_atlas_bases(results, folder, atlas_root=cfg.get("atlas_root"))
     for entry in results:
         material_names = unique(
             material_name
@@ -743,16 +1119,25 @@ def merge_leaf_mesh_sources(sources, cfg, folder):
         entry["atlas_blends"] = find_atlas_blends(
             cfg["atlas_root"], folder, entry["atlas_base"],
             source_images=(entry.get("albedo"),), aliases=material_names)
+    annotate_leaf_generator_connections(results)
     return results
 
 
-def _material_leaf_atlas_name(name):
-    """Convert a meaningful SpeedTree material name to the atlas convention."""
+def _legacy_material_atlas_name(name):
+    """Historical material-derived atlas name, kept for existing files."""
     canonical = canonical_material_name(name)
     match = re.match(r"^(.*?)(?:_atlas)?_0*(\d+)$", canonical, re.IGNORECASE)
     if match:
         return f"{match.group(1)}_atlas_{int(match.group(2)):02d}"
     return f"{canonical}_atlas_01"
+
+
+def _material_leaf_atlas_name(name):
+    """Name a newly generated leaf atlas without reusing cluster identity."""
+    atlas_name = _legacy_material_atlas_name(name)
+    return re.sub(
+        r"^M_cluster_", "M_leaf_", atlas_name,
+        count=1, flags=re.IGNORECASE)
 
 
 def _folder_leaf_atlas_root(folder):
@@ -764,13 +1149,145 @@ def _folder_leaf_atlas_root(folder):
     return f"M_leaf_{safe}_atlas"
 
 
-def assign_leaf_atlas_bases(sources, folder):
+def _atlas_source_pair_key(albedo, alpha):
+    return (
+        os.path.abspath(str(albedo or "")).lower(),
+        os.path.abspath(str(alpha or "")).lower(),
+    )
+
+
+def _existing_atlas_registry(atlas_root, folder):
+    """Index live blends, Blender backups, and scoped source manifests.
+
+    ``.blend1`` is never considered runnable output, but its base remains
+    reserved so a new, unrelated source pair cannot silently inherit it.
+    """
+    registry = {}
+    roots = ([Path(atlas_root)] if atlas_root else []) + [Path(folder)]
+    for root in unique(roots):
+        root = Path(root)
+        if not root.exists():
+            continue
+        report_cache = _REPORT_SCAN_CACHE.get()
+        artifact_cache = report_cache.setdefault("atlas_artifacts", {}) \
+            if report_cache is not None else None
+        root_key = str(root).lower()
+        artifacts = artifact_cache.get(root_key) \
+            if artifact_cache is not None else None
+        if artifacts is None:
+            artifacts = []
+            for pattern in ("*.blend", "*.blend1"):
+                artifacts.extend(
+                    path for path in root.glob(pattern) if path.is_file())
+            if artifact_cache is not None:
+                artifact_cache[root_key] = tuple(artifacts)
+        for path in artifacts:
+            entry = registry.setdefault(path.stem.lower(), {
+                "base": path.stem, "live_blends": [], "backups": [],
+                "source_pairs": [],
+            })
+            key = "live_blends" if path.suffix.lower() == ".blend" \
+                else "backups"
+            entry[key].append(str(path))
+
+    scopes = Path(folder) / ".atlas_leaf_speedtree_scopes"
+    if scopes.is_dir():
+        for manifest_path in scopes.glob("*.json"):
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            blend_file = payload.get("blend_file")
+            textures = payload.get("textures") or {}
+            if not blend_file or not textures.get("albedo") or not textures.get("alpha"):
+                continue
+            base = Path(blend_file).stem
+            entry = registry.setdefault(base.lower(), {
+                "base": base, "live_blends": [], "backups": [],
+                "source_pairs": [],
+            })
+            pair = _atlas_source_pair_key(
+                textures.get("albedo"), textures.get("alpha"))
+            if pair not in entry["source_pairs"]:
+                entry["source_pairs"].append(pair)
+    return registry
+
+
+def _blend_contains_source_pair(blend_path, source):
+    embedded = _blend_image_names(Path(blend_path))
+    if not embedded:
+        return False
+    embedded_names = {Path(value).name.lower() for value in embedded}
+    embedded_families = {source_family_name(value).lower() for value in embedded}
+    for role in ("albedo", "alpha"):
+        value = source.get(role)
+        if not value:
+            return False
+        if (Path(value).name.lower() not in embedded_names
+                and source_family_name(value).lower() not in embedded_families):
+            return False
+    return True
+
+
+def _managed_source_pair_matches_base(source, atlas_base):
+    expected = texture_base_for_material(atlas_base).lower()
+    matched_roles = set()
+    for role in ("albedo", "alpha"):
+        path = source.get(role)
+        if not path or not GENERATED_EXPORT_RE.match(Path(path).name):
+            return False
+        stem = Path(path).stem
+        match = re.match(
+            r"^(.*)_(color|opacity)$", stem, re.IGNORECASE)
+        if not match or match.group(1).lower() != expected:
+            return False
+        matched_roles.add(match.group(2).lower())
+    return matched_roles == {"color", "opacity"}
+
+
+def _existing_atlas_match(registry, base, source):
+    """Return (reusable, canonical existing spelling) for one source/base."""
+    entry = registry.get(str(base).lower())
+    if not entry or not entry["live_blends"]:
+        return False, None
+    pair = _atlas_source_pair_key(source.get("albedo"), source.get("alpha"))
+    if pair in entry["source_pairs"]:
+        return True, entry["base"]
+    # A normalized, untagged source material already named after this exact
+    # T_* atlas is explicit lineage evidence even though the blend manifest
+    # records the pre-normalization TCom/Megascan inputs.
+    if _managed_source_pair_matches_base(source, entry["base"]):
+        return True, entry["base"]
+    if not entry["source_pairs"] and any(
+            _blend_contains_source_pair(path, source)
+            for path in entry["live_blends"]):
+        return True, entry["base"]
+    return False, None
+
+
+def _next_free_atlas_base(preferred, unavailable):
+    match = re.match(r"^(.*?_atlas_)0*(\d+)$", preferred, re.IGNORECASE)
+    if match:
+        root = match.group(1)
+        index = int(match.group(2)) + 1
+    else:
+        root = preferred.rstrip("_") + "_atlas_"
+        index = 1
+    while f"{root}{index:02d}".lower() in unavailable:
+        index += 1
+    return f"{root}{index:02d}"
+
+
+def assign_leaf_atlas_bases(sources, folder, atlas_root=None):
     """Name generated leaf atlases from asset/material context, never source files.
 
     A referenced final material is authoritative when one unambiguous name is
     available.  Cluster internals commonly expose only ``Material`` names, so
     those sources receive the asset fallback and a stable per-source index.
     """
+    registry = _existing_atlas_registry(atlas_root, folder)
+    unavailable = set(registry)
+    plans = []
     fallback = []
     for source in sources:
         names = unique(
@@ -780,8 +1297,22 @@ def assign_leaf_atlas_bases(sources, folder):
             if name and not GENERIC_MATERIAL_NAME_RE.match(str(name))
         )
         canonical = unique(_material_leaf_atlas_name(name) for name in names)
+        legacy = unique(_legacy_material_atlas_name(name) for name in names)
         if len(canonical) == 1:
-            source["atlas_base"] = canonical[0]
+            preferred = canonical[0]
+            reusable, existing = _existing_atlas_match(
+                registry, preferred, source)
+            if (not reusable and len(legacy) == 1
+                    and legacy[0].lower() != preferred.lower()):
+                reusable, existing = _existing_atlas_match(
+                    registry, legacy[0], source)
+            if reusable:
+                preferred = existing
+                source["legacy_atlas_base_preserved"] = True
+            plans.append({
+                "source": source, "preferred": preferred,
+                "reuses_existing": reusable,
+            })
         else:
             fallback.append(source)
 
@@ -792,7 +1323,376 @@ def assign_leaf_atlas_bases(sources, folder):
                 str(row.get("albedo", "")).lower(),
                 str(row.get("alpha", "")).lower(),
             )), 1):
-        source["atlas_base"] = f"{root}_{index:02d}"
+        preferred = f"{root}_{index:02d}"
+        reusable, existing = _existing_atlas_match(
+            registry, preferred, source)
+        plans.append({
+            "source": source,
+            "preferred": existing if reusable else preferred,
+            "reuses_existing": reusable,
+        })
+
+    def source_key(plan):
+        source = plan["source"]
+        preferred = plan["preferred"]
+        return (
+            str(preferred).lower(),
+            not plan["reuses_existing"],
+            str(source.get("albedo", "")).lower(),
+            str(source.get("alpha", "")).lower(),
+        )
+
+    # Every distinct preferred base is reserved for one source before duplicate
+    # names are numbered. This prevents a duplicate _01 from stealing another
+    # source's explicit _02 preference merely because its path sorts first.
+    reserved = unavailable | {plan["preferred"].lower() for plan in plans}
+    used = set()
+    duplicates = []
+    for plan in sorted(plans, key=source_key):
+        source = plan["source"]
+        preferred = plan["preferred"]
+        key = preferred.lower()
+        if key not in used and (key not in unavailable
+                                or plan["reuses_existing"]):
+            source["atlas_base"] = preferred
+            used.add(key)
+        else:
+            duplicates.append((source, preferred))
+    for source, preferred in duplicates:
+        allocated = _next_free_atlas_base(preferred, reserved | used)
+        source["atlas_base"] = allocated
+        used.add(allocated.lower())
+    return sources
+
+
+def _material_name_matches_atlas(material_name, atlas_base):
+    name = canonical_material_name(material_name).lower()
+    base = canonical_material_name(atlas_base).lower()
+    return name == base or name.startswith(base + "_")
+
+
+def _binding_slot_identity(binding):
+    prefix = str(
+        binding.get("slot_prefix")
+        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
+    ).lower()
+    index = binding.get("generator_index")
+    if index is not None and prefix:
+        return "index", str(index), prefix
+    guid = str(binding.get("generator_guid") or "").lower()
+    if guid and prefix:
+        return "guid", guid, prefix
+    return (
+        "named",
+        str(binding.get("generator_type") or "").lower(),
+        str(binding.get("generator_name") or "").lower(),
+        prefix,
+    )
+
+
+def _scoped_connection_payloads(spm, atlas_base=""):
+    """Target-specific Atlas Builder manifests for one exact SPM/atlas."""
+    spm = Path(spm)
+    scopes = spm.parent / ".atlas_leaf_speedtree_scopes"
+    if not scopes.is_dir():
+        return []
+    report_cache = _REPORT_SCAN_CACHE.get()
+    cache = report_cache.setdefault("atlas_connection_manifests", {}) \
+        if report_cache is not None else None
+    cache_key = (str(scopes).lower(), spm.stem.lower())
+    payloads = cache.get(cache_key) if cache is not None else None
+    if payloads is None:
+        payloads = []
+        for path in sorted(scopes.glob(f"*__{spm.stem}.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            payload["_manifest_path"] = str(path)
+            payloads.append(payload)
+        if cache is not None:
+            cache[cache_key] = tuple(payloads)
+    if not atlas_base:
+        return list(payloads)
+
+    matched = []
+    for payload in payloads:
+        names = unique([
+            payload.get("atlas_asset_name"),
+            payload.get("requested_atlas_asset_name"),
+            payload.get("material"),
+        ] + [
+            group.get("material")
+            for group in payload.get("material_groups") or []
+            if isinstance(group, dict)
+        ])
+        if any(name and _material_name_matches_atlas(name, atlas_base)
+               for name in names):
+            matched.append(payload)
+    return matched
+
+
+def _normalize_expected_generator_binding(binding, row_by_id,
+                                          default_source_id=None):
+    source_id = binding.get("source_material_id")
+    if source_id in {None, "", -1, "-1"}:
+        source_id = binding.get("material_id", default_source_id)
+    if source_id in {None, "", -1, "-1"}:
+        source_id = default_source_id
+    source_id = str(source_id) if source_id not in {None, ""} else ""
+    source_mesh_id = binding.get("source_mesh_id")
+    if source_mesh_id in {None, ""}:
+        source_mesh_id = binding.get("mesh_id")
+    source_mesh_id = str(source_mesh_id) \
+        if source_mesh_id not in {None, ""} else ""
+    leaf_ordinal = binding.get("leaf_ordinal")
+    source_row = row_by_id.get(source_id)
+    source_cutouts = list(source_row.get("cutout_mesh_ids") or []) \
+        if source_row else []
+    if leaf_ordinal in {None, ""}:
+        if source_mesh_id == "-10":
+            leaf_ordinal = 1
+        elif source_mesh_id in source_cutouts:
+            leaf_ordinal = source_cutouts.index(source_mesh_id) + 1
+    normalized = dict(binding)
+    normalized.update({
+        "source_material_id": source_id,
+        "source_mesh_id": source_mesh_id,
+        "leaf_ordinal": int(leaf_ordinal) if str(leaf_ordinal).isdigit() else None,
+        "slot_identity": list(_binding_slot_identity(binding)),
+        "target_material_id": str(binding.get("target_material_id"))
+            if binding.get("target_material_id") not in {None, ""} else "",
+        "target_mesh_id": str(binding.get("target_mesh_id"))
+            if binding.get("target_mesh_id") not in {None, ""} else "",
+    })
+    return normalized
+
+
+def _expected_generator_bindings(spm, atlas_base, requested_ids,
+                                 requested_names, row_by_id,
+                                 supplied=None, source_bindings=None):
+    expected = []
+    requested_set = set(requested_ids)
+    for payload in _scoped_connection_payloads(spm, atlas_base):
+        connection = payload.get("generator_connection") or {}
+        connection_names = unique(connection.get("source_material_names") or [])
+        default_source_id = requested_ids[0] if len(requested_ids) == 1 else None
+        if requested_names and connection_names and not {
+                str(name).lower() for name in requested_names
+        }.intersection(str(name).lower() for name in connection_names):
+            continue
+        for binding in connection.get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            row = _normalize_expected_generator_binding(
+                binding, row_by_id, default_source_id=default_source_id)
+            if requested_set and row["source_material_id"] not in requested_set:
+                continue
+            expected.append(row)
+    for binding in supplied or []:
+        if not isinstance(binding, dict):
+            continue
+        row = _normalize_expected_generator_binding(
+            binding, row_by_id,
+            default_source_id=requested_ids[0] if len(requested_ids) == 1 else None)
+        if requested_set and row["source_material_id"] not in requested_set:
+            continue
+        expected.append(row)
+    # Any source slot that still exists is necessarily expected and pending,
+    # even if a stale/partial manifest omitted it.
+    for binding in source_bindings or []:
+        expected.append(_normalize_expected_generator_binding(
+            binding, row_by_id,
+            default_source_id=str(binding.get("material_id") or "")))
+
+    deduped = {}
+    for binding in expected:
+        key = (binding["source_material_id"], tuple(binding["slot_identity"]))
+        previous = deduped.get(key)
+        if previous is None or (
+                not previous.get("target_material_id")
+                and binding.get("target_material_id")):
+            deduped[key] = binding
+    return list(deduped.values())
+
+
+def inspect_leaf_generator_connection(spm, source_material_names=None,
+                                      source_material_ids=None, atlas_base="",
+                                      expected_generator_bindings=None):
+    """Strictly audit every expected source Generator slot and leaf ordinal."""
+    rows = extract_material_image_refs(spm)
+    row_by_id = {
+        str(row.get("material_id")): row
+        for row in rows if row.get("material_id") is not None
+    }
+    requested_names = unique(source_material_names or [])
+    requested_ids = unique(str(value) for value in (source_material_ids or [])
+                           if value not in {None, "", "-1"})
+    if not requested_ids and requested_names:
+        wanted = {canonical_material_name(name).lower()
+                  for name in requested_names}
+        requested_ids = unique(
+            str(row["material_id"]) for row in rows
+            if row.get("material_id") is not None
+            and canonical_material_name(row.get("material_name")).lower() in wanted
+        )
+
+    managed_ids = {
+        str(row["material_id"])
+        for row in rows
+        if row.get("material_id") is not None
+        and row.get("managed_leaf_output")
+        and _material_name_matches_atlas(row.get("material_name"), atlas_base)
+    }
+    bindings = leaf_generator_bindings(spm, visible_only=False)
+    actual_mesh_ids = mesh_asset_ids(spm)
+
+    def decorate(binding):
+        binding = dict(binding)
+        material = row_by_id.get(str(binding.get("material_id")))
+        mesh_ids = list(material.get("cutout_mesh_ids") or []) if material else []
+        binding["material_name"] = material.get("material_name") if material else ""
+        binding["material_cutout_mesh_ids"] = mesh_ids
+        binding["mesh_belongs_to_material"] = bool(
+            binding.get("mesh_id") and str(binding["mesh_id"]) in mesh_ids)
+        binding["mesh_asset_exists"] = bool(
+            binding.get("mesh_id") and str(binding["mesh_id"]) in actual_mesh_ids)
+        binding["managed_leaf_output"] = bool(
+            material and material.get("managed_leaf_output"))
+        binding["slot_identity"] = list(_binding_slot_identity(binding))
+        return binding
+
+    source_bindings = [
+        decorate(binding) for binding in bindings
+        if str(binding.get("material_id")) in set(requested_ids)
+    ]
+    managed_bindings = [
+        decorate(binding) for binding in bindings
+        if str(binding.get("material_id")) in managed_ids
+    ]
+    current_by_slot = {
+        tuple(binding["slot_identity"]): binding
+        for binding in (source_bindings + managed_bindings)
+    }
+    expected = _expected_generator_bindings(
+        spm, atlas_base, requested_ids, requested_names, row_by_id,
+        supplied=expected_generator_bindings,
+        source_bindings=source_bindings)
+    statuses = []
+    for material_id in requested_ids:
+        material = row_by_id.get(material_id)
+        id_bindings = [
+            binding for binding in source_bindings
+            if str(binding.get("material_id")) == material_id
+        ]
+        id_expected = [row for row in expected
+                       if row.get("source_material_id") == material_id]
+        slot_results = []
+        for expected_binding in id_expected:
+            current = current_by_slot.get(
+                tuple(expected_binding["slot_identity"]))
+            errors = []
+            if current is None:
+                errors.append("generator_slot_missing")
+            else:
+                if str(current.get("material_id")) in set(requested_ids):
+                    errors.append("source_material_still_connected")
+                if not current.get("managed_leaf_output"):
+                    errors.append("managed_material_missing")
+                if not current.get("mesh_asset_exists"):
+                    errors.append("mesh_asset_missing")
+                if not current.get("mesh_belongs_to_material"):
+                    errors.append("material_cutout_ownership_mismatch")
+                target_material_id = expected_binding.get("target_material_id")
+                target_mesh_id = expected_binding.get("target_mesh_id")
+                if (target_material_id
+                        and str(current.get("material_id")) != target_material_id):
+                    errors.append("target_material_mismatch")
+                if target_mesh_id and str(current.get("mesh_id")) != target_mesh_id:
+                    errors.append("target_mesh_mismatch")
+            slot_results.append({
+                "slot_identity": list(expected_binding["slot_identity"]),
+                "leaf_ordinal": expected_binding.get("leaf_ordinal"),
+                "expected": expected_binding,
+                "current": current,
+                "errors": unique(errors),
+                "complete": not errors,
+            })
+        id_complete = bool(id_expected) and all(
+            result["complete"] for result in slot_results)
+        statuses.append({
+            "material_id": material_id,
+            "material_name": material.get("material_name") if material else "",
+            "bindings": id_bindings,
+            "expected_slot_count": len(id_expected),
+            "connected_slot_count": sum(
+                1 for result in slot_results if result["complete"]),
+            "slot_results": slot_results,
+            "complete": id_complete,
+        })
+
+    complete = bool(requested_ids) and bool(statuses) and all(
+        status["complete"] for status in statuses)
+    all_errors = unique(
+        error for status in statuses for result in status["slot_results"]
+        for error in result["errors"])
+    if source_bindings:
+        reason = "source_material_still_connected"
+    elif complete:
+        reason = "managed_material_and_mesh_connected"
+    elif not requested_ids:
+        reason = "source_material_not_found"
+    elif not expected:
+        reason = "expected_generator_slots_missing"
+    elif "mesh_asset_missing" in all_errors:
+        reason = "managed_mesh_asset_missing"
+    elif "material_cutout_ownership_mismatch" in all_errors:
+        reason = "managed_material_mesh_mismatch"
+    else:
+        reason = "managed_generator_connection_partial"
+    return {
+        "source_material_names": requested_names,
+        "source_material_ids": requested_ids,
+        "material_ids": list(requested_ids),
+        "source_material_statuses": statuses,
+        "expected_generator_bindings": expected,
+        "expected_slot_count": sum(
+            status["expected_slot_count"] for status in statuses),
+        "connected_slot_count": sum(
+            status["connected_slot_count"] for status in statuses),
+        "source_generator_bindings": source_bindings,
+        "managed_generator_bindings": managed_bindings,
+        "generator_bindings": source_bindings + managed_bindings,
+        "generator_connection_complete": complete,
+        "generator_connection_update_needed": not complete,
+        "generator_connection_reason": reason,
+    }
+
+
+def annotate_leaf_generator_connections(sources):
+    """Attach per-target and aggregate Step 2 completion evidence in-place."""
+    for source in sources:
+        targets = source.get("targets") or []
+        for target in targets:
+            status = inspect_leaf_generator_connection(
+                target["spm"],
+                source_material_names=(
+                    target.get("source_material_names")
+                    or target.get("material_names") or []),
+                source_material_ids=(
+                    target.get("source_material_ids")
+                    or target.get("material_ids") or []),
+                atlas_base=source.get("atlas_base", ""),
+                expected_generator_bindings=target.get(
+                    "expected_generator_bindings"),
+            )
+            target.update(status)
+        source["generator_connection_complete"] = bool(targets) and all(
+            target.get("generator_connection_complete") for target in targets)
+        source["generator_connection_update_needed"] = any(
+            target.get("generator_connection_update_needed") for target in targets)
+        source["leaf_mesh_complete"] = bool(source.get("atlas_blends")) and bool(
+            source["generator_connection_complete"])
     return sources
 
 
@@ -808,6 +1708,12 @@ def cluster_material_usage(target_spms, clusters):
         )
         for material in extract_material_image_refs(spm):
             if active_ids and material.get("material_id") not in active_ids:
+                continue
+            # A connected Atlas Leaf Mesh Builder material is the finished
+            # leaf-card output. Its Color/Opacity may deliberately reference a
+            # Cluster render, but following that render back into the Cluster
+            # SPM would expand the finished output into new source jobs again.
+            if material.get("managed_leaf_output"):
                 continue
             refs = material["refs"]
             canonical = canonical_material_name(material.get("material_name")).lower()
@@ -828,11 +1734,23 @@ def cluster_material_usage(target_spms, clusters):
                 usage = found.setdefault(key, {
                     "spms": [], "material_names": [], "source_refs": [],
                     "source_albedo": [], "source_alpha": [],
+                    "material_names_by_spm": {},
+                    "material_ids_by_spm": {},
                 })
                 if str(spm) not in usage["spms"]:
                     usage["spms"].append(str(spm))
                 if material["material_name"] not in usage["material_names"]:
                     usage["material_names"].append(material["material_name"])
+                spm_key = str(spm)
+                names_for_spm = usage["material_names_by_spm"].setdefault(
+                    spm_key, [])
+                if material["material_name"] not in names_for_spm:
+                    names_for_spm.append(material["material_name"])
+                material_id = material.get("material_id")
+                ids_for_spm = usage["material_ids_by_spm"].setdefault(
+                    spm_key, [])
+                if material_id and material_id not in ids_for_spm:
+                    ids_for_spm.append(material_id)
                 for ref in refs:
                     resolved = resolve_spm_image_ref(spm, ref)
                     if not path_exists(resolved):
@@ -861,41 +1779,58 @@ def referenced_cluster_spms(target_spms, clusters):
 
 def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
     """Discover direct leaf atlases plus leaf atlases inside referenced clusters."""
-    referenced = referenced_cluster_spms(target_spms, clusters)
-    referenced_stems = {Path(path).stem.lower() for path in referenced}
+    cluster_usage = cluster_material_usage(target_spms, clusters)
+    referenced = {
+        key: sorted(usage["spms"])
+        for key, usage in cluster_usage.items()
+    }
     sources = []
     candidates = []
+    direct_target_ids = {}
     candidate_spms = list(target_spms)
     candidate_spms.extend(
         spm for spm in source_spms(folder) if spm not in candidate_spms)
     for candidate_spm in candidate_spms:
         candidates.extend(leaf_sources_from_spm(
-            candidate_spm, "direct", excluded_albedo_stems=referenced_stems,
-            active_only=False))
+            candidate_spm, "direct", active_only=False))
     for spm in target_spms:
         authoritative = spm
         if spm.name.lower().startswith("sk_"):
             source = Path(folder) / spm.name[3:]
             if source.is_file():
                 authoritative = source
-        target_names = {}
+        target_materials = {}
         target_active = active_material_ids(spm)
         for row in extract_material_image_refs(spm):
             if target_active and row.get("material_id") not in target_active:
                 continue
             key = canonical_material_name(row.get("material_name")).lower()
-            target_names.setdefault(key, []).append(row.get("material_name"))
-        for source in leaf_sources_from_spm(
-                authoritative, "direct", excluded_albedo_stems=referenced_stems,
-                active_only=False):
+            target_materials.setdefault(key, []).append(row)
+        direct_sources = leaf_sources_from_spm(
+            authoritative, "direct", active_only=False)
+        # Some authoring SPMs are binary containers that this lightweight
+        # audit cannot parse, while the current SK exposes normalized T_* slots.
+        # The untagged SK source material remains authoritative for mesh work.
+        if not direct_sources and Path(authoritative) != Path(spm):
+            direct_sources = leaf_sources_from_spm(
+                spm, "direct", active_only=False)
+        for source in direct_sources:
             source["target_spm"] = str(spm)
             mapped_names = []
+            mapped_ids = []
             for name in source.get("material_names") or []:
-                mapped_names.extend(
-                    target_names.get(canonical_material_name(name).lower(), []))
+                for row in target_materials.get(
+                        canonical_material_name(name).lower(), []):
+                    mapped_names.append(row.get("material_name"))
+                    if row.get("material_id"):
+                        mapped_ids.append(row["material_id"])
             if not mapped_names:
                 continue
             source["material_names"] = unique(mapped_names)
+            source["source_material_ids"] = unique(mapped_ids)
+            source["material_ids"] = unique(mapped_ids)
+            direct_target_ids.setdefault(str(spm).lower(), set()).update(
+                source["source_material_ids"])
             sources.append(source)
     for cluster in clusters:
         if str(cluster).lower() not in referenced:
@@ -905,15 +1840,37 @@ def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
         for source in leaf_sources_from_spm(cluster, "cluster"):
             final_spms = referenced[str(cluster).lower()]
             for final_spm in final_spms:
+                usage = cluster_usage[str(cluster).lower()]
+                target_ids = list(
+                    usage.get("material_ids_by_spm", {}).get(final_spm, []))
+                covered = direct_target_ids.get(str(final_spm).lower(), set())
+                target_ids = [value for value in target_ids if value not in covered]
+                # A coherent atlas/card pair on the final semantic material is
+                # the deterministic mesh source. Internal Cluster leaves are
+                # only fallback provenance for IDs without that direct pair.
+                if not target_ids:
+                    continue
+                rows_by_id = {
+                    str(row.get("material_id")): row
+                    for row in extract_material_image_refs(final_spm)
+                    if row.get("material_id") is not None
+                }
                 target_source = dict(source)
                 target_source["trace_spm"] = str(cluster)
                 target_source["trace_material_names"] = list(
                     source.get("material_names") or [])
                 target_source["referenced_by_spms"] = final_spms
                 target_source["target_spm"] = final_spm
-                # The Cluster material explains where the original atlas came
-                # from; it is not the material being updated in the final SK.
-                target_source["material_names"] = []
+                # The traced Cluster material owns the source pixels, while the
+                # final SPM's cluster-card material/mesh slots are the exact
+                # connection target. Keep both identities separate.
+                target_source["material_names"] = unique(
+                    rows_by_id[str(value)].get("material_name")
+                    for value in target_ids if str(value) in rows_by_id)
+                target_source["source_material_ids"] = target_ids
+                target_source["material_ids"] = list(
+                    target_source["source_material_ids"])
+                target_source["connection_mode"] = "cluster_trace_fallback"
                 sources.append(target_source)
     canonicalize_leaf_sources(sources, candidates, cfg, folder)
     return merge_leaf_mesh_sources(sources, cfg, folder), referenced
@@ -1049,9 +2006,14 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
                 {"dry_run": True, "renames": m_prefix_plan(target if existing or not dry_run else src, exclude=exclude_materials)}
                 if dry_run else patch_m_prefix(target, exclude=exclude_materials)
             )
+            has_work = bool(would_create if dry_run else created) or bool(
+                patch.get("renames"))
             results.append({
                 "mesh_name": mesh_name,
-                "status": "dry-run" if dry_run else "prepared",
+                "status": (
+                    ("dry-run" if dry_run else "prepared")
+                    if has_work else "up_to_date"
+                ),
                 "sk_spm": str(target),
                 "would_create": would_create if dry_run else None,
                 "created": created,
@@ -1081,10 +2043,17 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
         {"dry_run": True, "renames": m_prefix_plan(target if preferred else src, exclude=exclude_materials)}
         if dry_run else patch_m_prefix(target, exclude=exclude_materials)
     )
+    would_create = str(target) if dry_run and not preferred else None
+    has_work = bool(would_create if dry_run else created) or bool(
+        patch.get("renames"))
     return {
         "folder": str(folder),
+        "status": (
+            ("dry-run" if dry_run else "prepared")
+            if has_work else "up_to_date"
+        ),
         "sk_spm": str(target),
-        "would_create": str(target) if dry_run and not preferred else None,
+        "would_create": would_create,
         "created": created,
         "patch": patch,
     }
@@ -1326,6 +2295,21 @@ def find_export_maps_multi(dirs, atlas_base, required_maps):
     dirs = list(dirs)
     if not dirs:
         return None, {m: None for m in required_maps}
+    # Canonical PCG outputs use a literal T_ base. Resolve those through the
+    # shared SpeedTree contract so a first/partial directory cannot mask a
+    # later complete set. Legacy M_ outputs retain exact-name lookup; material
+    # labels such as Green/Yellow are never inferred as managed T_ sets.
+    if str(atlas_base or "").strip().casefold().startswith("t_"):
+        resolved = resolve_texture_set(dirs, atlas_base, required_maps)
+        export_maps = {
+            map_name: resolved["files"].get(str(map_name).casefold())
+            for map_name in required_maps
+        }
+        selected_dir = resolved.get("texture_dir")
+        return (
+            Path(selected_dir) if selected_dir else dirs[0],
+            export_maps,
+        )
     for d in dirs:
         result = find_export_maps(d, atlas_base, required_maps)
         if any(result.values()):
@@ -1539,7 +2523,7 @@ def _refs_are_only_managed_outputs(refs):
     return bool(refs) and all(GENERATED_EXPORT_RE.match(Path(ref).name) for ref in refs)
 
 
-def _source_material_ref_map(folder, sk_spm):
+def _source_material_ref_entries(folder, sk_spm):
     """Original material refs for one SK copy, keyed by canonical name.
 
     An SK may have been copied from an ``SM_`` authoring variant while an
@@ -1562,8 +2546,30 @@ def _source_material_ref_map(folder, sk_spm):
             key = canonical_material_name(row.get("material_name")).lower()
             refs = row.get("refs") or []
             if key and refs and key not in result:
-                result[key] = list(refs)
+                result[key] = {
+                    "spm": Path(source),
+                    "refs": list(refs),
+                }
     return result
+
+
+def _source_material_ref_map(folder, sk_spm):
+    """Compatibility view of source material references without ownership."""
+    return {
+        key: list(entry["refs"])
+        for key, entry in _source_material_ref_entries(folder, sk_spm).items()
+    }
+
+
+def _managed_texture_directories(spm, refs):
+    """Directories named by literal managed T_ refs, relative to their SPM."""
+    directories = []
+    for ref in refs or []:
+        resolved = resolve_spm_image_ref(spm, ref)
+        if parse_managed_texture_path(resolved) is None:
+            continue
+        directories.append(resolved.parent)
+    return unique(directories)
 
 
 def is_cluster_render_material(folder, spm, refs):
@@ -1750,7 +2756,10 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
     for spm in spms:
         referenced_ids = active_material_ids(spm)
         visible_ids = visible_material_ids(spm)
-        original_refs = _source_material_ref_map(folder, spm) if spm.name.lower().startswith("sk_") else {}
+        original_ref_entries = (
+            _source_material_ref_entries(folder, spm)
+            if spm.name.lower().startswith("sk_") else {}
+        )
         for row in extract_material_image_refs(spm):
             # No Generator material properties means a mesh/material asset and
             # retains the legacy include-all fallback. Otherwise only visible
@@ -1763,6 +2772,7 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                 continue
             current_refs = list(row.get("refs") or [])
             refs = list(current_refs)
+            source_ref_spm = Path(spm)
             current_is_managed = _refs_are_only_managed_outputs(current_refs)
             leaf_source = _leaf_source_for_active_material(
                 spm, current_refs, leaf_mesh_sources or [])
@@ -1782,18 +2792,26 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                 refs = list(leaf_source.get("source_refs") or [
                     leaf_source.get("albedo"), leaf_source.get("alpha")])
                 refs = [str(ref) for ref in refs if ref]
-            elif current_is_managed and original_refs.get(canonical):
-                refs = original_refs[canonical]
+                source_ref_spm = Path(
+                    leaf_source.get("target_spm") or source_ref_spm
+                )
+            elif current_is_managed and original_ref_entries.get(canonical):
+                original_entry = original_ref_entries[canonical]
+                refs = list(original_entry["refs"])
+                source_ref_spm = Path(original_entry["spm"])
                 # Recovered source refs may identify the same atlas that the
                 # current managed T_* slots could not identify by themselves.
                 # Resolve it now so managed and not-yet-managed SK variants
                 # share one provenance/signature.
                 leaf_source = _leaf_source_for_active_material(
-                    spm, refs, leaf_mesh_sources or [])
+                    source_ref_spm, refs, leaf_mesh_sources or [])
                 if leaf_source:
                     refs = list(leaf_source.get("source_refs") or [
                         leaf_source.get("albedo"), leaf_source.get("alpha")])
                     refs = [str(ref) for ref in refs if ref]
+                    source_ref_spm = Path(
+                        leaf_source.get("target_spm") or source_ref_spm
+                    )
             if canonical in preserved_names:
                 continue
             # A cluster-folder image is already a derived SpeedTree cluster
@@ -1824,9 +2842,12 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                 "name": name,
                 "canonical": canonical_name,
                 "spm": spm,
+                "material_id": row.get("material_id"),
                 "current_refs": current_refs,
                 "source_refs": list(refs),
-                "source_signature": _material_ref_signature(spm, refs, name),
+                "source_ref_spm": source_ref_spm,
+                "source_signature": _material_ref_signature(
+                    source_ref_spm, refs, name),
                 "source_albedo": source_albedo,
                 "source_alpha": source_alpha,
                 "current_is_managed": current_is_managed,
@@ -1869,8 +2890,20 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
         names = unique(row["name"] for row in aliases)
         texture_base = texture_base_for_material(base)
         graph = _graph_for_materials(graphs, base, names)
+        authoritative_texture_dirs = unique(
+            directory
+            for row in aliases
+            for directory in (
+                _managed_texture_directories(row["spm"], row["current_refs"])
+                + _managed_texture_directories(
+                    row["source_ref_spm"], row["source_refs"])
+            )
+        )
         maps_dir, export_maps = find_export_maps_multi(
-            tex_dirs, texture_base, cfg["required_export_maps"])
+            unique(list(tex_dirs) + authoritative_texture_dirs),
+            texture_base,
+            cfg["required_export_maps"],
+        )
         _legacy_dir, legacy_export_maps = find_export_maps_multi(
             tex_dirs, base, cfg["required_export_maps"])
         for record in aliases:
@@ -1897,6 +2930,18 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
             "material_names": names,
             "material_aliases": names,
             "material_spms": unique(str(row["spm"]) for row in aliases),
+            "material_targets": [
+                {
+                    "spm": str(row["spm"]),
+                    "material_id": (
+                        str(row["material_id"])
+                        if row.get("material_id") not in {None, ""}
+                        else None),
+                    "material_name": row["name"],
+                    "source_signature": list(row["source_signature"]),
+                }
+                for row in aliases
+            ],
             "atlas_base": base,
             "texture_base": texture_base,
             "is_atlas": any(row.get("leaf_source") for row in aliases)
@@ -1935,7 +2980,7 @@ def infer_normal_convention(refs):
     return "unknown"
 
 
-def audit_folder(folder, cfg, include_refs=False):
+def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
     folder = Path(folder)
     preferred = preferred_sk_spms(folder)
     loose = loose_sk_spms(folder)
@@ -1952,7 +2997,17 @@ def audit_folder(folder, cfg, include_refs=False):
     tex_dirs = texture_dir_candidates(folder, sbs_files) or [texture_dir]
     folder_graphs = folder_m_graph_names(sbs_files)
     clusters = cluster_spms(folder)
-    target_spms = preferred or loose or sources
+    target_spms = []
+    for mesh_name in target_mesh_names or []:
+        target = (find_sk_spm_for_mesh(folder, mesh_name)
+                  or find_source_spm_for_mesh(folder, mesh_name))
+        if target and target not in target_spms:
+            target_spms.append(target)
+    # A folder row without an explicit PCG mesh is represented by its chosen
+    # SPM, not every sibling variant. Explicit PCG targets can still request
+    # multiple exact variants through target_mesh_names.
+    if not target_spms and chosen:
+        target_spms = [chosen]
     leaf_mesh_sources, referenced_clusters = discover_leaf_mesh_sources(
         folder, cfg, target_spms, clusters)
     # ③은 아틀라스 파일 개수가 아니라 실제 Generator가 사용하는 모든
@@ -1993,6 +3048,8 @@ def audit_folder(folder, cfg, include_refs=False):
         "preserved_cluster_materials": preserved_cluster_materials(
             folder, definitions=cluster_definitions),
         "leaf_mesh_sources": leaf_mesh_sources,
+        "leaf_mesh_target_spms": [str(path) for path in target_spms],
+        "managed_leaf_outputs": managed_leaf_outputs(target_spms),
         "ignored_cluster_spms": ignored_cluster_spms,
         "source_refs": all_refs[:40],
         "normal_convention": infer_normal_convention(all_refs),
@@ -2022,6 +3079,9 @@ def derive_status_actions(item):
     leaf_sources = item.get("leaf_mesh_sources") or []
     if any(not source.get("atlas_blends") for source in leaf_sources):
         actions.append("Blender 아틀라스 파일 확인 필요")
+    if any(source.get("generator_connection_update_needed")
+           for source in leaf_sources):
+        actions.append("Blender 잎 매쉬 Generator 연결 필요")
     if any(c["missing_export_maps"] for c in local_entries):
         actions.append("Substance에서 출력 텍스처 저장 필요")
     if any(c.get("connection_update_needed") for c in item["cluster_items"]):
@@ -2402,7 +3462,16 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
     )
     ensure_blend_source_index(cfg)
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
-    items = [audit_folder(folder, cfg, include_refs=include_refs) for folder in folders]
+    report_target_mesh_names = target_mesh_names_from_pcg_targets(pcg_targets)
+    items = [
+        audit_folder(
+            folder, cfg, include_refs=include_refs,
+            target_mesh_names=folder_target_mesh_names(
+                folder, report_target_mesh_names)
+                if report_target_mesh_names else None,
+        )
+        for folder in folders
+    ]
     attach_global_m_graphs(items, cfg)
     resolve_shared_atlas_entries(items, cfg)
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)

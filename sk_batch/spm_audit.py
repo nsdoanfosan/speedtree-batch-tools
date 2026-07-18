@@ -49,6 +49,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sk_common import file_content_fingerprint, load_config
+from speedtree_pipeline_contract import (
+    read_spm_text as read_pipeline_spm_text,
+    spm_container_format,
+)
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
@@ -483,12 +487,19 @@ def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
 
 
 def read_spm(path):
-    return gzip.open(path, "rb").read().decode("utf-8")
+    return read_pipeline_spm_text(path)
 
 
 def write_spm(path, text):
-    with gzip.open(path, "wb") as handle:
-        handle.write(text.encode("utf-8"))
+    candidate = Path(path)
+    compressed = (
+        spm_container_format(candidate) == "gzip" if candidate.is_file() else True
+    )
+    if compressed:
+        with gzip.open(candidate, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+    else:
+        candidate.write_text(text, encoding="utf-8")
 
 
 def probe_cache_path(spm_path):

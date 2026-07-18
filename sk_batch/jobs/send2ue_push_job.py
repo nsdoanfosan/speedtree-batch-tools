@@ -32,6 +32,15 @@ os.environ.setdefault("SEND2UE_DEV", "1")
 
 import bpy
 
+JOBS_DIR = str(Path(__file__).resolve().parent)
+if JOBS_DIR not in sys.path:
+    sys.path.insert(0, JOBS_DIR)
+
+from vertex_color_contract import (
+    inspect_object_vertex_colors,
+    pack_speedtree_vertex_payload,
+)
+
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
@@ -42,6 +51,7 @@ def parse_args():
     parser.add_argument("--rpc-timeout-max", type=float, default=900.0)
     parser.add_argument("--max-push-polygons", type=int, default=2_000_000)
     parser.add_argument("--max-push-bones", type=int, default=1_500)
+    parser.add_argument("--require-green-signal", action="store_true")
     parser.add_argument("--skip-wind", action="store_true")
     parser.add_argument("--transport", choices=("rpc", "headless_export"), default="rpc")
     parser.add_argument("--manifest")
@@ -77,8 +87,76 @@ def file_fingerprint(path):
     return {
         "path": str(candidate.resolve()),
         "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
         "fingerprint": hasher.hexdigest(),
     }
+
+
+def export_material_slot_issues(objects):
+    """Return empty material slots that Send2UE will reject.
+
+    Limit the check to meshes in the Export collection so harmless source or
+    preview objects do not block the handoff.  Send2UE validates every declared
+    slot, including an unused empty slot, so the preflight intentionally does
+    the same.
+    """
+    export_collection = bpy.data.collections.get("Export")
+    if export_collection is None:
+        return []
+    export_objects = set(export_collection.all_objects)
+    issues = []
+    for obj in objects:
+        if obj.type != "MESH" or not obj.data:
+            continue
+        if obj not in export_objects:
+            continue
+        if len(obj.data.materials) == 0 and len(obj.data.polygons) > 0:
+            issues.append({
+                "object": obj.name,
+                "slot": 0,
+                "used_faces": len(obj.data.polygons),
+            })
+            continue
+        for slot_index, material in enumerate(obj.data.materials):
+            if material is not None:
+                continue
+            issues.append(
+                {
+                    "object": obj.name,
+                    "slot": slot_index,
+                    "used_faces": sum(
+                        1 for polygon in obj.data.polygons
+                        if polygon.material_index == slot_index
+                    ),
+                }
+            )
+    return issues
+
+
+def remove_unused_empty_material_slots(objects):
+    """Remove only empty slots that have no polygons, preserving used slots."""
+    export_collection = bpy.data.collections.get("Export")
+    if export_collection is None:
+        return []
+    export_objects = set(export_collection.all_objects)
+    removed = []
+    for obj in objects:
+        if obj.type != "MESH" or not obj.data:
+            continue
+        if obj not in export_objects:
+            continue
+        for slot_index in range(len(obj.data.materials) - 1, -1, -1):
+            if obj.data.materials[slot_index] is not None:
+                continue
+            used_faces = sum(
+                1 for polygon in obj.data.polygons
+                if polygon.material_index == slot_index
+            )
+            if used_faces:
+                continue
+            obj.data.materials.pop(index=slot_index)
+            removed.append({"object": obj.name, "slot": slot_index})
+    return removed
 
 
 def manifest_asset_files(manifest_assets):
@@ -278,14 +356,68 @@ def main():
         report["material_consolidation"] = material_consolidation
         texture_normalization = normalize_speedtree_material_textures(bpy.context.scene.objects)
         report["texture_normalization"] = texture_normalization
-        # Save only when this pass actually mutated the file: verified large
-        # blends should not be rewritten on every push just because their
-        # materials were examined.
+        export_collection = bpy.data.collections.get("Export")
+        export_meshes = [
+            obj for obj in (export_collection.all_objects if export_collection else [])
+            if obj.type == "MESH" and obj.data
+        ]
+        export_collection_issues = []
+        if export_collection is None:
+            export_collection_issues.append("missing_export_collection")
+        elif not export_meshes:
+            export_collection_issues.append("export_collection_has_no_meshes")
+        removed_empty_slots = remove_unused_empty_material_slots(
+            bpy.context.scene.objects
+        )
+        report["removed_unused_empty_material_slots"] = removed_empty_slots
+        empty_material_slots = export_material_slot_issues(bpy.context.scene.objects)
+        vertex_payload_contracts = [
+            pack_speedtree_vertex_payload(obj, mirror_to_nanite_uv=True)
+            for obj in export_meshes
+        ]
+        blocked_vertex_payloads = [
+            item for item in vertex_payload_contracts if item.get("status") == "blocked"
+        ]
+        vertex_color_contracts = [
+            inspect_object_vertex_colors(
+                obj,
+                require_green_signal=args.require_green_signal,
+            )
+            for obj in export_meshes
+        ]
+        blocked_vertex_colors = [
+            item for item in vertex_color_contracts if item.get("status") == "blocked"
+        ]
+        report["vertex_payload_contracts"] = vertex_payload_contracts
+        report["vertex_color_contracts"] = vertex_color_contracts
+        report["export_collection_issues"] = export_collection_issues
+        report["handoff_preflight"] = {
+            "status": "blocked" if (
+                texture_normalization.get("missing")
+                or export_collection_issues
+                or empty_material_slots
+                or blocked_vertex_payloads
+                or blocked_vertex_colors
+            ) else "ok",
+            "export_collection_issues": export_collection_issues,
+            "empty_material_slots": empty_material_slots,
+            "missing_textures": texture_normalization.get("missing", []),
+            "vertex_payload_contracts": vertex_payload_contracts,
+            "vertex_color_contracts": vertex_color_contracts,
+        }
+
+        # ② Blender Repair owns the source artifact. ③ works on this isolated
+        # in-memory scene only, so Push never rewrites a multi-GB .blend and a
+        # later manifest/Unreal failure cannot partially mutate the source.
         consolidation_changed = material_consolidation.get("status") == "applied"
         normalization_changed = bool(texture_normalization.get("changed_count"))
-        report["blend_resaved"] = bool(consolidation_changed or normalization_changed)
-        if report["blend_resaved"]:
-            bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+        report["in_memory_repair_changes"] = bool(
+            consolidation_changed
+            or normalization_changed
+            or removed_empty_slots
+            or any(item.get("changed") for item in vertex_payload_contracts)
+        )
+        report["blend_resaved"] = False
         missing_textures = texture_normalization.get("missing", [])
         if missing_textures:
             details = []
@@ -299,6 +431,31 @@ def main():
                 "PCG ST9 Texture Batch 산출물 누락; Unreal Push 중단: "
                 + " | ".join(details)
             )
+        if export_collection_issues:
+            raise RuntimeError(
+                "Send2UE Export collection contract failed: "
+                + ", ".join(export_collection_issues)
+            )
+        if empty_material_slots:
+            details = " | ".join(
+                f"Mesh '{item['object']}' slot {item['slot']} has no material"
+                for item in empty_material_slots
+            )
+            raise RuntimeError(details)
+        if blocked_vertex_colors:
+            details = " | ".join(
+                f"Mesh '{item.get('object', '?')}': "
+                + ", ".join(item.get("issues") or ["unknown vertex color error"])
+                for item in blocked_vertex_colors
+            )
+            raise RuntimeError("Vertex color contract failed: " + details)
+        if blocked_vertex_payloads:
+            details = " | ".join(
+                f"Mesh '{item.get('object', '?')}': "
+                + ", ".join(item.get("issues") or ["unknown vertex payload error"])
+                for item in blocked_vertex_payloads
+            )
+            raise RuntimeError("SpeedTree AO/Nanite UV payload failed: " + details)
 
         # The polygon/bone values are scaling references for the adaptive RPC
         # timeout, not hard limits: over-reference exports proceed at the

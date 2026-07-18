@@ -51,16 +51,21 @@ def current_sk_owner_rows(plan):
 
 def complete_output_set(row, expected_pixels=None, roles=None):
     paths = output_paths(row["texture_dir"], row["texture_base"])
-    selected = [paths[role] for role in (roles or paths)]
+    selected_roles = tuple(roles or paths)
+    selected = [paths[role] for role in selected_roles]
     if not all(path.is_file() and path.stat().st_size > 0 for path in selected):
         return False
     if expected_pixels:
         try:
-            return all(sbs_auto.image_pixel_size(path) == tuple(expected_pixels)
-                       for path in selected)
+            if not all(sbs_auto.image_pixel_size(path) == tuple(expected_pixels)
+                       for path in selected):
+                return False
         except Exception:
             return False
-    return True
+    return not any(
+        sbs_auto.rendered_map_content_error(paths[role], role)
+        for role in selected_roles
+    )
 
 
 def verify_complete_output_set(texture_dir, texture_base, expected_pixels=None):
@@ -80,6 +85,10 @@ def verify_complete_output_set(texture_dir, texture_base, expected_pixels=None):
                 continue
             if tuple(size) != tuple(expected_pixels):
                 errors.append(f"{role}={size}, expected {tuple(expected_pixels)}")
+                continue
+        content_error = sbs_auto.rendered_map_content_error(path, role)
+        if content_error:
+            errors.append(f"{role}={content_error}")
     if errors:
         raise RuntimeError(
             f"{texture_base}: incomplete six-map output: " + "; ".join(errors))
@@ -98,6 +107,8 @@ def expected_job_size(job):
 
 
 def job_needs_source_repair(job):
+    if job.get("mode") == "direct":
+        return bool(_direct_subsurface_repair(job))
     if job.get("mode") != "render" or not job["row"].get("canonical_source_provenance"):
         return False
     try:
@@ -110,6 +121,34 @@ def job_needs_source_repair(job):
         not current.get(slot) or not _same_path(current[slot], desired)
         for slot, desired in planned.items()
     )
+
+
+def _is_neutral_input(path):
+    return bool(path) and Path(path).stem.lower().startswith("neutral_")
+
+
+def _direct_subsurface_repair(job):
+    """Recover only an authoritative real Subsurface source from a neutral slot.
+
+    Direct procedural graphs may intentionally author Subsurface Amount, so this
+    deliberately does not reconcile every bitmap or force Amount to white.
+    """
+    if job.get("mode") != "direct" \
+            or not job.get("row", {}).get("canonical_source_provenance"):
+        return {}
+    try:
+        current = sbs_auto.parse_m_graph(job["sbs"], job["graph"])["inputs"]
+        planned, _notes = sbs_auto.plan_inputs_from_row(
+            job["row"], require_alpha=False)
+    except Exception:
+        return {}
+    desired = planned.get("Subsurface")
+    existing = current.get("Subsurface")
+    if not desired or _is_neutral_input(desired) or not Path(desired).is_file():
+        return {}
+    if not _is_neutral_input(existing):
+        return {}
+    return {"Subsurface": Path(desired)}
 
 
 def _packaged_resource_replacement(sbs_path, missing_path):
@@ -454,7 +493,12 @@ def run_job(job, cfg, timeout):
     if job["mode"] == "direct":
         normalization_update = None
         resolution_update = None
+        source_repair_updates = []
         try:
+            for slot, replacement in _direct_subsurface_repair(job).items():
+                source_repair_updates.append(
+                    sbs_auto.patch_m_graph_input_resource(
+                        job["sbs"], job["graph"], slot, replacement))
             if job.get("normalize_cluster"):
                 normalization_update = sbs_auto.normalize_graph_through_cluster(
                     job["sbs"], job["graph"],
@@ -524,6 +568,8 @@ def run_job(job, cfg, timeout):
             if normalization_update and normalization_update.get("changed") \
                     and normalization_update.get("backup"):
                 shutil.copy2(normalization_update["backup"], job["sbs"])
+            if source_repair_updates:
+                shutil.copy2(source_repair_updates[0]["backup"], job["sbs"])
             raise
         deleted = sbs_auto.delete_legacy_m_outputs(
             base, job["out_dir"], legacy_maps=job["row"].get("legacy_export_maps"))
@@ -541,6 +587,7 @@ def run_job(job, cfg, timeout):
             "resolution_update": resolution_update,
             "promotion_update": promotion_update,
             "cluster_normalization": normalization_update,
+            "source_repairs": source_repair_updates,
             "deleted_legacy": [str(path) for path in deleted],
         }
     if job["mode"] == "render":
@@ -565,7 +612,7 @@ def run_job(job, cfg, timeout):
         current_subsurface = inputs.get("Subsurface")
         if desired_subsurface and (
                 not current_subsurface
-                or "neutral_black" in Path(current_subsurface).name.lower()):
+                or _is_neutral_input(current_subsurface)):
             sbs_auto.patch_m_graph_input_resource(
                 job["sbs"], job["graph"], "Subsurface", desired_subsurface)
             inputs["Subsurface"] = desired_subsurface

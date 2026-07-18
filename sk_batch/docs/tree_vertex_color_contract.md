@@ -65,14 +65,75 @@ Generator link, generator 이름, index, 화면상의 인접성은 대상 선정
 바꾸지 않는다. 현재 트리 자산의 leaf Generator는 기존 `Offset/0`을 유지해 Branch
 attachment의 R을 상속하는 것이 전제이며, 자동 패치는 그 leaf 설정을 덮어쓰지 않는다.
 
+## SpeedTree FBX payload
+
+SpeedTree VFX FBX의 메시 payload는 다음 순서를 계약으로 사용한다. 기존 두 UV를
+덮어쓰거나 순서를 바꾸지 않는다.
+
+SpeedTree 10.1 batch export preset의 `Options_MA_Fbx.ini`에는
+`IncludeVertexBlends=Include`가 반드시 유지되어야 한다. 현재 BWR preset은 이 값으로
+확인되었으며, 이를 끄면 아래 `blend_ao` 및 Vertex Color 전달 계약을 보장할 수 없다.
+
+| FBX/Blender index | 이름 | 의미 |
+| ---: | --- | --- |
+| UV0 | `uv0` | 기존 재질 텍스처 좌표 |
+| UV1 | `blend_ao` | U는 SpeedTree blend 값, V는 AO 원본 |
+
+SpeedTree는 Vertex Color RGB와 별도로 AO를 `blend_ao.V`에 내보낸다. BWR은 최종
+merged export mesh에서 RGB를 그대로 보존하면서 `blend_ao.V`를 `VertexColor.A`로
+복사한다. 따라서 Blender/FBX의 최종 의미는 다음과 같다.
+
+| payload | 의미 |
+| --- | --- |
+| `VertexColor.R` | leaf 근접도 |
+| `VertexColor.G` | trunk/branch height 감쇠 |
+| `VertexColor.B` | 기존 값 보존 |
+| `VertexColor.A` | `blend_ao.V`에서 복사한 AO |
+
+`VertexColor.G`는 trunk와 일부 branch에만 신호가 있는 **희소 마스크**가 정상이다.
+0인 영역을 채우거나 전체 범위로 재정규화하면 의도한 trunk/branch 감쇠가 깨지므로,
+높은 zero ratio 자체는 데이터 소실로 판단하지 않는다.
+
+`blend_ao.U`는 모든 loop에서 finite이며 `0..1` 범위여야 한다. BWR validator는 이
+범위를 벗어나면 `blend_ao_u_outside_zero_one_nanite_fallback_unsafe`로 Push를
+차단한다. 이 조건은 아래 UV2 presence tag의 `1.5` 임계값과 기존 UV fallback이
+충돌하지 않도록 보장한다.
+
 ## 전달 및 Unreal 소비 계약
 
 | 단계 | 책임 |
 | --- | --- |
 | SK Vegetation Batch | `tree`로 분류된 SPM에만 위 R authoring을 적용하고 기존 G를 보존 |
-| BWR | SpeedTree에서 나온 RGBA를 Blender evaluated mesh까지 값 변경 없이 유지 |
-| Send2UE | FBX vertex color를 내보내고 Unreal import의 `VertexColorImportOption.REPLACE`로 전달 |
-| Unreal `M_TreeAsset_Master` | G를 height/displacement blend mask로, R을 green tint mask로 소비 |
+| BWR | `blend_ao.V -> VertexColor.A`를 적용하고, TREE에는 UV2 `vertex_color_ga`를 추가해 G/A를 mirror |
+| Send2UE | UV0/UV1/UV2와 FBX vertex color를 내보내고 Unreal import의 `VertexColorImportOption.REPLACE`로 전달 |
+| Unreal `M_TreeAsset_Master` | UV2 presence tag가 있으면 decoded G를 height mask로 사용하고, 없으면 `VertexColor.G`로 fallback |
+
+UE 5.8 Skeletal Nanite 렌더 경로는 임포트된 Vertex Color stream을 버리므로, 메시
+데이터와 일반 Skeletal 경로에서 G가 정상이어도 Nanite에서는 `VertexColor.G`만으로
+height 감쇠를 읽을 수 없다. 이를 우회하기 위해 BWR은 기존 UV0/UV1을 보존한 채
+세 번째 채널인 UV2 `vertex_color_ga`를 다음과 같이 기록한다.
+
+```text
+UV2.U = 2 + VertexColor.G   # presence-tagged height mask, 유효 범위 2..3
+UV2.V = 1 - VertexColor.A   # UE FBX V 반전을 상쇄하는 AO transport
+```
+
+머티리얼의 height mask 선택은 다음 계약을 따른다.
+
+```text
+TaggedU = TextureCoordinate[2].R
+HeightMask = (TaggedU > 1.5) ? (TaggedU - 2) : VertexColor.G
+```
+
+즉 `U > 1.5`가 새 payload의 presence tag이며, tag가 없으면 기존
+`VertexColor.G` 경로를 그대로 사용한다. UV2가 이미 다른 용도로 점유되어 있거나
+`vertex_color_ga`가 index 2가 아니면 기존 UV를 덮어쓰거나 재배열하지 않고 Push를
+차단한다.
+
+UE 5.8 Skeletal FBX importer는 UV의 V를 `1 - V`로 변환한다. 따라서 Blender/FBX
+transport에는 미리 `1 - A`를 기록해 Unreal의 최종 `UV2.V`가 다시 `A`, 즉 AO가
+되도록 한다. 현재 머티리얼은 UV2의 U만 소비하며 V/AO는 아직 셰이딩에 연결하지
+않지만, 향후 연결할 때 추가 반전 없이 같은 AO 의미를 사용할 수 있다.
 
 Unreal의 green tint는 `SetMaterialAttributes`의 Base Color를 다음과 같이 감싼다.
 그 결과는 `Surface Weather Effects`와 Substrate 변환을 거쳐 최종 `Front Material`
@@ -87,7 +148,13 @@ BaseColor' = lerp(BaseColor, BaseColor * LeafProximityGreenTint, TintAlpha)
 
 - `Leaf Proximity Green Tint`: 기본값 `(0.75, 1.0, 0.75, 1.0)`
 - `Leaf Proximity Green Tint Strength`: 기본값 `0.35`
-- `VertexColor_HeightBlend`: mask 입력은 `VertexColor.G`
+- `VertexColor_HeightBlend`: 기본값 `true`; True 경로의 mask는 위 UV2 decode/fallback 결과
+- `Height`: 기본값 `0.1`
+- Material Usage의 `Used with Skeletal Mesh`: 활성화
+
+R 기반 green tint는 기존 `VertexColor.R` 경로를 유지하며, UV2 workaround는 현재
+G height 감쇠만 복구한다. 따라서 Skeletal Nanite에서 R도 필요해지면 별도의 payload
+확장 계약과 검증이 필요하다.
 
 머티리얼의 root WPO pin은 Material Attributes의 WPO 출력을 받아 **pass-through**하는
 연결이 있다. 그러나 현재 master/layer/function에는 `SpeedTreeWind`, camera-facing,
@@ -96,10 +163,17 @@ BaseColor' = lerp(BaseColor, BaseColor * LeafProximityGreenTint, TintAlpha)
 
 ## 보존과 실패 원자성
 
-- R 패치 전후 G의 semantic signature가 정확히 같아야 한다. B/A는 red-only 패치의
-  범위 밖이며 그대로 둔다.
+- SPM의 R 패치 전후 G의 semantic signature가 정확히 같아야 한다. B/A는 red-only
+  패치 범위 밖이며 이 단계에서는 그대로 둔다. 이후 BWR 단계에서만 A를
+  `blend_ao.V`로 채운다.
 - R에서는 대상 Branch의 `Style`, `Value`, `ProfileSpline`만 바꾼다. 다른 channel,
   다른 generator, 기존 `CompoundParentSpline`을 다시 직렬화하거나 정규화하지 않는다.
+- BWR packing은 Vertex Color RGB와 UV0 `uv0`, UV1 `blend_ao`를 byte/float tolerance
+  안에서 보존한다. UV2가 없고 기존 UV 수가 정확히 2개일 때만
+  `vertex_color_ga`를 append한다. 같은 이름의 UV2에는 idempotent하게 다시 쓸 수 있지만,
+  다른 UV2를 덮어쓰거나 채널을 재정렬하지 않는다.
+- 정식 Vertex Color 속성 `color`가 존재하면 그것만 source of truth로 사용한다. 해당
+  속성의 domain/type이 잘못된 경우 다른 active color로 대체하지 않고 Push를 차단한다.
 - 대상 하나라도 필수 Red property가 없거나 ProfileSpline이 지원되지 않는 형태이면
   해당 호출은 원본 text 전체를 반환한다. 일부 Branch만 바뀐 상태를 기록하지 않는다.
 - 기본 `backup_spm=true`에서는 ① 단계 시작 전에 `_spm_backups`에 원본을 보관하며,
@@ -112,12 +186,22 @@ BaseColor' = lerp(BaseColor, BaseColor * LeafProximityGreenTint, TintAlpha)
 
 - SPM: R 대상 목록이 Node `ParentGUID -> GeneratorGUID` 경로와 일치하고 GUID가
   dedupe되어야 한다.
-- SpeedTree 실제 geometry export: R에 root `0`, tip `1` 범위가 생기며 G/B/A는
-  패치 전후 동일해야 한다.
+- SpeedTree 실제 geometry export: R에 root `0`, tip `1` 범위가 생기며 G/B와
+  UV0 `uv0`, UV1 `blend_ao`는 패치 전후 동일해야 한다.
 - Blender/BWR 및 FBX 재검사: evaluated mesh와 재수입 FBX의 R/G 통계가 source와
-  일치해야 한다.
-- Unreal graph: height blend는 `VertexColor.G`, Base Color tint alpha는
-  `VertexColor.R`에 연결되어야 한다. 해당 `SetMaterialAttributes`는 legacy
+  일치하고, A는 `blend_ao.V`, UV2.U는 `2 + G`, `1 - UV2.V`는 Blender/FBX 기준
+  A와 일치해야 한다. UV1.U는 finite `0..1`이어야 한다.
+- Blender Repair 보고서는 최종 Export mesh의 RGBA min/max/mean/zero ratio와
+  AO/payload delta, 최종 UV layer 순서를 기록한다.
+  TREE에서 color attribute 자체가 없거나 구조/범위가 잘못되면 Push 전에 차단한다.
+  G가 전부 0이면 선택적인 height 감쇠가 꺼진 상태로 보고 경고만 남기며, G의 90% 이상이
+  0인 희소 마스크도 계약상 가능한 값으로 통과시킨다.
+- Unreal graph: UV2.U가 `1.5`보다 크면 `U - 2`, 아니면 `VertexColor.G`를 선택한
+  결과가 height blend에 연결되어야 한다. `Height` 기본값은 `0.1`, `Used with
+  Skeletal Mesh`는 활성화되어야 한다. Base Color tint alpha는 `VertexColor.R`에
+  연결되어야 한다. 해당 `SetMaterialAttributes`는 legacy
   BaseColor root뿐 아니라 Substrate `Front Material` root에서도 도달 가능해야 하며,
   WPO source는 변경되지 않아야 한다.
+- Unreal FBX 재임포트에서는 UV2.U presence tag와 G decode를 검증하고, FBX V 반전
+  이후의 UV2.V가 VertexColor.A/AO와 일치하는지도 검증한다.
 - Unreal 실제 버전에서 material을 recompile하고 compile error가 없어야 한다.

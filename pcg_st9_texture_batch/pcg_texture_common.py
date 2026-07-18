@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "unreal_texture_destination": "/Game/Textures",
     "unreal_texture_commandlet_fallback": True,
     "unreal_texture_sync_timeout": 1800,
+    "pcg_target_refresh_timeout": 120,
     "pcg_database_content": r"C:\UnrealProjects\MyProject2\Content\PCG\DataBase",
     "unreal_levels": ["/Game/Level/Cliff_final_01"],
     "pcg_focus_data_assets": [

@@ -14,6 +14,10 @@ from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from speedtree_pipeline_contract import BACKUP_DIRECTORY_NAMES, is_live_spm
 
 
 def _default_addon_dir():
@@ -78,6 +82,7 @@ DEFAULT_CONFIG = {
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
     "spm_verify_timeout": 120,
     "blender_job_timeout": 3600,
+    "speedtree_material_preflight_timeout": 900,
     "push_job_timeout": 1800,
     # Avoid wedging Unreal's synchronous RPC queue with assets that are faster
     # to handle manually than to import through the unattended handoff.
@@ -119,6 +124,22 @@ def _atomic_write_json(path, data):
         try:
             payload = json.dumps(data, indent=2, ensure_ascii=False)
             temp.write_text(payload, encoding="utf-8")
+            os.replace(temp, target)
+        finally:
+            if temp.exists():
+                temp.unlink()
+
+
+def atomic_write_bytes(path, payload):
+    """Atomically replace a small receipt/report without exposing partial data."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    with _JSON_WRITE_LOCK:
+        try:
+            temp.write_bytes(payload)
             os.replace(temp, target)
         finally:
             if temp.exists():
@@ -185,6 +206,24 @@ def file_content_snapshot(path):
                 "mtime_ns": after.st_mtime_ns,
             }
     raise RuntimeError(f"File changed while hashing: {candidate}")
+
+
+def cached_file_content_snapshot(path, cache=None):
+    """Reuse a verified content snapshot while the file stat is unchanged."""
+    candidate = Path(path)
+    stat = candidate.stat()
+    if (
+        isinstance(cache, dict)
+        and cache.get("fingerprint")
+        and cache.get("size") == stat.st_size
+        and cache.get("mtime_ns") == stat.st_mtime_ns
+    ):
+        return {
+            "fingerprint": cache["fingerprint"],
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }, True
+    return file_content_snapshot(candidate), False
 
 
 def _push_source_stat_identity(path, required=False):
@@ -319,8 +358,17 @@ def manifest_item_files_match(item):
                 path = Path(identity["path"])
                 if not path.is_file():
                     return False
-                if path.stat().st_size != identity.get("size"):
+                stat = path.stat()
+                if stat.st_size != identity.get("size"):
                     return False
+                if not identity.get("fingerprint"):
+                    return False
+                # New manifests retain the exact stat observed after hashing.
+                # Reusing a multi-GB cached FBX should be an O(1) metadata check,
+                # not another full disk read.  Older manifests have no mtime and
+                # deliberately fall back to the content hash once.
+                if identity.get("mtime_ns") == stat.st_mtime_ns:
+                    continue
                 if file_content_fingerprint(path) != identity.get("fingerprint"):
                     return False
             except (KeyError, OSError, TypeError):
@@ -328,26 +376,27 @@ def manifest_item_files_match(item):
     return True
 
 
-def _dependency_identity(path, hash_content=False):
+def _dependency_identity(path, hash_content=False, include_hashed_stat=False):
     candidate = Path(path) if path else None
     if not candidate or not candidate.exists():
         return {"path": str(candidate or ""), "missing": True}
     try:
         stat = candidate.stat()
-        identity = {
-            "path": str(candidate.resolve()),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-        }
+        identity = {"path": str(candidate.resolve())}
         if hash_content:
             identity["fingerprint"] = file_content_fingerprint(candidate)
+            if include_hashed_stat:
+                identity["size"] = stat.st_size
+                identity["mtime_ns"] = stat.st_mtime_ns
+        else:
+            identity["size"] = stat.st_size
+            identity["mtime_ns"] = stat.st_mtime_ns
         return identity
     except OSError as exc:
         return {"path": str(candidate), "error": str(exc)}
 
 
-def calibration_settings_signature(cfg):
-    """Invalidate result caches when behavior, presets, or target values change."""
+def _calibration_settings_signature(cfg, include_hashed_stat=False):
     setting_keys = (
         "target_bones_per_branch",
         "max_total_bones",
@@ -366,9 +415,21 @@ def calibration_settings_signature(cfg):
     payload = {
         "version": CALIBRATION_CACHE_VERSION,
         "settings": {key: cfg.get(key) for key in setting_keys},
-        "spm_audit": _dependency_identity(TOOL_DIR / "spm_audit.py", hash_content=True),
-        "xml_ini": _dependency_identity(cfg.get("xml_ini"), hash_content=True),
-        "fbx_ini": _dependency_identity(cfg.get("fbx_ini"), hash_content=True),
+        "spm_audit": _dependency_identity(
+            TOOL_DIR / "spm_audit.py",
+            hash_content=True,
+            include_hashed_stat=include_hashed_stat,
+        ),
+        "xml_ini": _dependency_identity(
+            cfg.get("xml_ini"),
+            hash_content=True,
+            include_hashed_stat=include_hashed_stat,
+        ),
+        "fbx_ini": _dependency_identity(
+            cfg.get("fbx_ini"),
+            hash_content=True,
+            include_hashed_stat=include_hashed_stat,
+        ),
         # Hashing the large executable would erase the speed win; size+mtime
         # changes whenever the installed SpeedTree build is replaced.
         "speedtree_exe": _dependency_identity(cfg.get("speedtree_exe")),
@@ -377,12 +438,30 @@ def calibration_settings_signature(cfg):
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
-def calibration_cache_matches(cache, spm_fingerprint, settings_signature):
+def calibration_settings_signature(cfg):
+    """Invalidate calibration only when behavior or dependency content changes."""
+    return _calibration_settings_signature(cfg, include_hashed_stat=False)
+
+
+def legacy_calibration_settings_signature(cfg):
+    """Return the pre-v2.1 signature so current caches migrate without a rerun."""
+    return _calibration_settings_signature(cfg, include_hashed_stat=True)
+
+
+def calibration_cache_matches(
+    cache,
+    spm_fingerprint,
+    settings_signature,
+    legacy_settings_signature=None,
+):
+    accepted_signatures = {settings_signature}
+    if legacy_settings_signature:
+        accepted_signatures.add(legacy_settings_signature)
     return bool(
         isinstance(cache, dict)
         and cache.get("version") == CALIBRATION_CACHE_VERSION
         and cache.get("spm_fingerprint") == spm_fingerprint
-        and cache.get("settings_signature") == settings_signature
+        and cache.get("settings_signature") in accepted_signatures
     )
 
 
@@ -496,6 +575,20 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
     text = "\n".join(value for value in (report_text, log_text) if value)
     lowered = text.lower()
 
+    empty_slot = re.search(
+        r"(?:mesh\s+['\"]([^'\"]+)['\"]\s+)?slot\s+(\d+)\s+has no material",
+        text,
+        re.IGNORECASE,
+    )
+    if empty_slot:
+        mesh_name = empty_slot.group(1)
+        slot_index = empty_slot.group(2)
+        location = f"{mesh_name} slot {slot_index}" if mesh_name else f"slot {slot_index}"
+        return compact_error_message(
+            f"머티리얼 빈 슬롯: {location} — ② Blender Repair에서 확인 필요",
+            max_chars,
+        )
+
     if "unreal editor crashed or exited during push" in lowered:
         return "Unreal Editor 크래시 — Push 중 에디터 종료"
 
@@ -575,7 +668,7 @@ BACKUP_SUBDIR = "_spm_backups"
 MANUAL_BONES_SUFFIX = ".skbatch_manual_bones.json"
 # Older runs used a per-tool folder name; still skip it so stragglers never
 # reappear in the working list.
-LEGACY_BACKUP_SUBDIRS = ("_skbatch_backup",)
+LEGACY_BACKUP_SUBDIRS = ("_skbatch_backup", "_pcgtex_backups")
 
 
 def manual_bones_marker_path(spm_path):
@@ -616,18 +709,19 @@ def set_manual_bones_marker(spm_path, locked):
 def scan_sk_spms(root):
     """All live SK_*.spm while pruning backup trees before descending."""
     out = []
-    skip_dirs = {BACKUP_SUBDIR, *LEGACY_BACKUP_SUBDIRS}
+    skip_dirs = set(BACKUP_DIRECTORY_NAMES)
     root = Path(root)
     if not root.exists():
         return out
     for current, dirs, files in os.walk(root, topdown=True):
-        dirs[:] = [name for name in dirs if name not in skip_dirs]
+        dirs[:] = [name for name in dirs if name.casefold() not in skip_dirs]
         for name in files:
             if not name.lower().startswith("sk_") or not name.lower().endswith(".spm"):
                 continue
-            if BACKUP_RE.search(name):
+            candidate = Path(current) / name
+            if BACKUP_RE.search(name) or not is_live_spm(candidate):
                 continue
-            out.append(Path(current) / name)
+            out.append(candidate)
     return sorted(out)
 
 
@@ -673,6 +767,139 @@ def set_process_affinity(pid, cores):
         kernel32.CloseHandle(handle)
 
 
+def _create_kill_on_close_job(proc):
+    """Create and assign a Windows Job that owns *proc* and its descendants.
+
+    Closing the returned handle terminates every process still in the Job.  A
+    Job is the only reliable cleanup boundary when the direct Blender/Python
+    parent crashes before the GUI has a chance to run ``taskkill /T``.
+
+    Return ``None`` when Jobs are unavailable or assignment is denied.  Some
+    hosts place children in a non-nestable Job already; callers must retain the
+    existing process-tree fallback for that case.
+    """
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = (
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        )
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = (
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        )
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = (
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        )
+
+    job_object_extended_limit_information = 9
+    job_object_limit_kill_on_job_close = 0x00002000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+    )
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    assigned = False
+    try:
+        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = (
+            job_object_limit_kill_on_job_close
+        )
+        if not kernel32.SetInformationJobObject(
+            job,
+            job_object_extended_limit_information,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            return None
+        process_handle = getattr(proc, "_handle", None)
+        if process_handle is None or not kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(process_handle)
+        ):
+            return None
+        assigned = True
+        return job
+    finally:
+        if not assigned:
+            kernel32.CloseHandle(job)
+
+
+def attach_process_kill_job(proc):
+    """Best-effort Job assignment; never prevents a child from launching."""
+    job = None
+    try:
+        job = _create_kill_on_close_job(proc)
+    except Exception:
+        # Sandboxes and inherited non-nestable Jobs can reject assignment.
+        # ``terminate_process_tree`` remains the safe fallback.
+        job = None
+    proc.sk_job_handle = job
+    return job is not None
+
+
+def _close_windows_handle(handle):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return bool(kernel32.CloseHandle(wintypes.HANDLE(handle)))
+
+
+def close_process_kill_job(proc):
+    """Close a managed Job once, killing any descendants that still survive."""
+    job = getattr(proc, "sk_job_handle", None)
+    proc.sk_job_handle = None
+    if job is None or os.name != "nt":
+        return False
+    try:
+        return _close_windows_handle(job)
+    except Exception:
+        return False
+
+
 def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     """Start a background child at reduced priority + optional CPU affinity.
 
@@ -687,15 +914,21 @@ def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     flags = PRIORITY_FLAGS.get(cfg.get("priority", "belownormal"), PRIORITY_FLAGS["belownormal"])
     flags |= CREATE_NO_WINDOW
     handle = open(log_file, "w", encoding="utf-8", errors="replace") if log_file else None
-    proc = subprocess.Popen(
-        cmd,
-        stdout=handle if handle else subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        cwd=cwd,
-        env=env,
-        creationflags=flags,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=handle if handle else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+            creationflags=flags,
+        )
+    except Exception:
+        if handle:
+            handle.close()
+        raise
     proc.sk_log_handle = handle  # caller closes after wait (see GUI _run_limited)
+    attach_process_kill_job(proc)
     try:
         if affinity:
             set_process_affinity(proc.pid, cfg.get("cpu_cores", os.cpu_count()))

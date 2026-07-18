@@ -165,6 +165,61 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertNotIn("blend", status)
             self.assertNotIn("blend_stale", status)
 
+    def test_prepare_existing_sk_without_changes_reports_up_to_date(self):
+        xml = b'''<SpeedTree><Materials>
+<Material_v8 ID="1" Name="M_leaf_test"><TexFilename>leaf.tga</TexFilename></Material_v8>
+</Materials><Generator><Property><Name>Leaves:Material</Name><Value>1</Value>
+</Property></Generator></SpeedTree>'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = root / "SK_tree_test.spm"
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+            original = spm.read_bytes()
+            original_mtime = spm.stat().st_mtime_ns
+
+            preview = pcg_texture_audit.prepare_sk(
+                root, ["tree_test"], dry_run=True)
+            result = pcg_texture_audit.prepare_sk(
+                root, ["tree_test"], dry_run=False)
+            target = result["targets"][0]
+
+            self.assertEqual(preview["targets"][0]["status"], "up_to_date")
+            self.assertEqual(target["status"], "up_to_date")
+            self.assertFalse(target["patch"]["changed"])
+            self.assertIsNone(target["created"])
+            self.assertEqual(spm.read_bytes(), original)
+            self.assertEqual(spm.stat().st_mtime_ns, original_mtime)
+            self.assertFalse((root / "_spm_backups").exists())
+
+    def test_lowercase_m_prefix_is_normalized_instead_of_becoming_a_noop(self):
+        xml = b'''<SpeedTree><Materials>
+<Material_v8 ID="1" Name="m_leaf_test"><TexFilename>leaf.tga</TexFilename></Material_v8>
+</Materials><Generator><Property><Name>Leaves:Material</Name><Value>1</Value>
+</Property></Generator></SpeedTree>'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = root / "SK_tree_test.spm"
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+
+            status = pcg_texture_audit.target_spm_status(root, "tree_test")
+            result = pcg_texture_audit.prepare_sk(
+                root, ["tree_test"], dry_run=False)["targets"][0]
+
+            self.assertEqual(
+                status["material_renames_needed"],
+                [["m_leaf_test", "M_leaf_test"]],
+            )
+            self.assertEqual(result["status"], "prepared")
+            self.assertTrue(result["patch"]["changed"])
+            self.assertEqual(
+                result["patch"]["renames"],
+                [["m_leaf_test", "M_leaf_test"]],
+            )
+            with gzip.open(spm, "rt", encoding="utf-8") as handle:
+                self.assertIn('Name="M_leaf_test"', handle.read())
+
     def test_repair_blend_is_not_part_of_folder_status(self):
         item = {
             "sk_spms": [r"D:\Trees\oak\SK_oak.spm"],
@@ -661,12 +716,15 @@ class SourceSelectionTests(unittest.TestCase):
             )
             self.assertNotIn("M_leaf_chestnut_atlas_02_unused",
                              items[0]["material_names"])
+            self.assertEqual(
+                {target["material_id"] for target in items[0]["material_targets"]},
+                {"1", "2"},
+            )
             spm_jobs = jobs_from_texture_plan({"items": items})
             self.assertEqual(len(spm_jobs), 1)
             self.assertEqual(
                 set(spm_jobs[0]["materials"]),
-                {"m_leaf_chestnut_atlas_01_green_light",
-                 "m_leaf_chestnut_atlas_01_yellow"},
+                {"@id:1", "@id:2"},
             )
             self.assertEqual(
                 {row["texture_base"] for row in spm_jobs[0]["materials"].values()},
@@ -733,6 +791,81 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(row["source_normal"], [source_normal])
             self.assertEqual(row["source_roughness"], [source_roughness])
             self.assertEqual(row["source_subsurface"], [source_subsurface])
+
+    def test_managed_aliases_use_complete_texture_set_referenced_outside_asset(self):
+        def material(material_id, name, refs):
+            filenames = "".join(
+                f"<TexFilename>{ref}</TexFilename>" for ref in refs
+            )
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f"{filenames}</Material_v8>"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "Weed_Common_grass"
+            local_texture = asset / "texture" / "substance"
+            shared_texture = root / "weed_velvet_grass" / "texture"
+            local_texture.mkdir(parents=True)
+            shared_texture.mkdir(parents=True)
+            texture_base = "T_Leaf_Grass_atlas_01"
+            for role in sbs_auto.RENDER_MAPS:
+                (shared_texture / f"{texture_base}_{role}.tga").write_bytes(
+                    role.encode("ascii")
+                )
+            # SpeedTree 10.1 may omit opacity/subsurface in the exported
+            # material references. The referenced directory must still prove
+            # that the complete six-map set exists.
+            current_refs = [
+                os.path.relpath(
+                    shared_texture / f"{texture_base}_{role}.tga", asset
+                )
+                for role in ("color", "normal", "extra", "height")
+            ]
+            xml = (
+                "<SpeedTree><Materials>"
+                + material("1", "M_Leaf_Grass_atlas_01_green", current_refs)
+                + material("2", "M_Leaf_Grass_atlas_01_dead", current_refs)
+                + "</Materials><Generators>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>1</Value>"
+                  "</Property></Generator>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>2</Value>"
+                  "</Property></Generator>"
+                  "</Generators></SpeedTree>"
+            ).encode()
+            with gzip.open(asset / "SK_Weed_Common_grass_c_01.spm", "wb") as handle:
+                handle.write(xml)
+
+            items = material_texture_items(
+                asset,
+                {
+                    "atlas_root": str(asset / "atlas"),
+                    "required_export_maps": list(sbs_auto.RENDER_MAPS),
+                },
+                [local_texture],
+                {},
+            )
+
+            self.assertEqual(len(items), 1)
+            row = items[0]
+            self.assertEqual(row["atlas_base"], "M_Leaf_Grass_atlas_01")
+            self.assertEqual(row["texture_base"], texture_base)
+            self.assertEqual(
+                set(row["material_names"]),
+                {
+                    "M_Leaf_Grass_atlas_01_green",
+                    "M_Leaf_Grass_atlas_01_dead",
+                },
+            )
+            self.assertEqual(row["missing_export_maps"], [])
+            self.assertEqual(Path(row["texture_dir"]), shared_texture.resolve())
+            self.assertTrue(
+                all(
+                    Path(path).parent == shared_texture.resolve()
+                    for path in row["export_maps"].values()
+                )
+            )
 
     def test_visible_auto_split_aliases_share_one_source_texture_set(self):
         def material(material_id, name, refs):
@@ -889,6 +1022,85 @@ class SourceSelectionTests(unittest.TestCase):
                              "M_leaf_nothofagus_atlas_01")
             self.assertEqual(items[0]["source_refs"], source_refs)
             self.assertTrue(items[0]["leaf_source_provenance"])
+
+    def test_direct_neutral_subsurface_requires_source_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            desired = Path(temp) / "leaf_translucency.png"
+            Image.new("RGB", (2, 2), (80, 120, 30)).save(desired)
+            job = {
+                "mode": "direct",
+                "sbs": str(Path(temp) / "test.sbs"),
+                "graph": "T_leaf_test",
+                "row": {"canonical_source_provenance": True},
+            }
+            with mock.patch.object(
+                    sbs_auto, "parse_m_graph", return_value={
+                        "inputs": {"Subsurface": sbs_auto.neutral_image("white")},
+                    }), mock.patch.object(
+                        sbs_auto, "plan_inputs_from_row",
+                        return_value=({"Subsurface": desired}, [])):
+                self.assertTrue(
+                    migrate_current_sk_textures.job_needs_source_repair(job))
+
+            with mock.patch.object(
+                    sbs_auto, "parse_m_graph", return_value={
+                        "inputs": {"Subsurface": desired},
+                    }), mock.patch.object(
+                        sbs_auto, "plan_inputs_from_row",
+                        return_value=({"Subsurface": desired}, [])):
+                self.assertFalse(
+                    migrate_current_sk_textures.job_needs_source_repair(job))
+
+    def test_failed_direct_render_rolls_back_subsurface_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sbs = root / "test.sbs"
+            backup = root / "before_subsurface_patch.sbs"
+            desired = root / "leaf_translucency.png"
+            sbs.write_bytes(b"original")
+            Image.new("RGB", (2, 2), (80, 120, 30)).save(desired)
+            job = {
+                "base": "M_leaf_test",
+                "texture_base": "T_leaf_test",
+                "mode": "direct",
+                "graph": "T_leaf_test",
+                "sbs": str(sbs),
+                "out_dir": str(root),
+                "normal_opengl": True,
+                "direct_maps": sbs_auto.RENDER_MAPS,
+                "size_log2": (1, 1),
+                "row": {
+                    "canonical_source_provenance": True,
+                    "legacy_export_maps": {},
+                },
+            }
+
+            def patch_subsurface(*_args, **_kwargs):
+                shutil.copy2(sbs, backup)
+                sbs.write_bytes(b"patched")
+                return {"backup": str(backup), "resource": "isolated"}
+
+            with mock.patch.object(
+                    sbs_auto, "parse_m_graph", return_value={
+                        "inputs": {"Subsurface": sbs_auto.neutral_image("white")},
+                    }), mock.patch.object(
+                        sbs_auto, "plan_inputs_from_row",
+                        return_value=({"Subsurface": desired}, [])), \
+                    mock.patch.object(
+                        sbs_auto, "patch_m_graph_input_resource",
+                        side_effect=patch_subsurface) as patcher, \
+                    mock.patch.object(
+                        sbs_auto, "set_managed_graph_resolution", return_value={
+                            "changed": False, "backup": None, "size_log2": (1, 1),
+                        }), mock.patch.object(
+                            sbs_auto, "render_sbs_graph_maps",
+                            side_effect=RuntimeError("render failed")):
+                with self.assertRaisesRegex(RuntimeError, "render failed"):
+                    migrate_current_sk_textures.run_job(job, {}, timeout=10)
+
+            patcher.assert_called_once_with(
+                str(sbs), "T_leaf_test", "Subsurface", desired)
+            self.assertEqual(sbs.read_bytes(), b"original")
 
     def test_direct_graph_fills_every_missing_standard_output(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1531,6 +1743,148 @@ class SourceSelectionTests(unittest.TestCase):
             )
 
 
+class MaterialTargetNormalizationTests(unittest.TestCase):
+    MAP_TEMPLATE = '''<Map Name="{name}"><ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
+<TexFilename>old.png</TexFilename><TexSource>0</TexSource>
+<TexInvert>false</TexInvert><TexInvertRed>false</TexInvertRed>
+<TexInvertGreen>false</TexInvertGreen><TexInvertBlue>false</TexInvertBlue>
+<TexEnabled>true</TexEnabled></Map>'''
+
+    def make_duplicate_name_spm(self, root):
+        maps = "".join(
+            self.MAP_TEMPLATE.format(name=name)
+            for name in ("Color", "Opacity", "Normal", "Custom")
+        )
+        xml = f'''<SpeedTree><Assets>
+<Material_v8 ID="1" Name="M_leaf_shared">{maps}</Material_v8>
+<Material_v8 ID="2" Name="M_leaf_shared">{maps}</Material_v8>
+</Assets><Generator Type="Branch"><Properties>
+<Property><Name>Leaves:Type:0:Material</Name><Value>1</Value></Property>
+<Property><Name>Leaves:Type:1:Material</Name><Value>2</Value></Property>
+</Properties></Generator></SpeedTree>'''.encode()
+        spm = root / "SK_duplicate_names.spm"
+        with gzip.open(spm, "wb") as handle:
+            handle.write(xml)
+        return spm
+
+    def make_outputs(self, root, texture_base):
+        texture_dir = root / "texture"
+        texture_dir.mkdir(exist_ok=True)
+        for role in ("color", "normal", "extra", "height", "opacity", "subsurface"):
+            (texture_dir / f"{texture_base}_{role}.tga").write_bytes(role.encode())
+        return texture_dir
+
+    def test_build_spm_patch_prefers_exact_id_over_name_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = self.make_duplicate_name_spm(root)
+            texture_dir = self.make_outputs(root, "T_leaf_exact")
+            self.make_outputs(root, "T_leaf_fallback")
+
+            patch = build_spm_patch(spm, {
+                "@id:1": {
+                    "texture_dir": str(texture_dir),
+                    "texture_base": "T_leaf_exact",
+                    "subsurface_enabled": False,
+                },
+                "m_leaf_shared": {
+                    "texture_dir": str(texture_dir),
+                    "texture_base": "T_leaf_fallback",
+                    "subsurface_enabled": False,
+                },
+            })
+
+            slots = inspect_material_slots(patch["text"])
+            self.assertIn("T_leaf_exact_color.tga", slots["1"]["slots"]["color"]["filename"])
+            self.assertIn("T_leaf_fallback_color.tga", slots["2"]["slots"]["color"]["filename"])
+
+    def test_exact_material_targets_split_duplicate_names_by_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = self.make_duplicate_name_spm(root)
+            texture_dir = self.make_outputs(root, "T_leaf_one")
+            self.make_outputs(root, "T_leaf_two")
+            plan = {"items": [
+                {
+                    "texture_dir": str(texture_dir),
+                    "texture_base": "T_leaf_one",
+                    "material_names": ["M_leaf_shared"],
+                    "material_targets": [{"spm": str(spm), "material_id": "1"}],
+                },
+                {
+                    "texture_dir": str(texture_dir),
+                    "texture_base": "T_leaf_two",
+                    "material_names": ["M_leaf_shared"],
+                    "material_targets": [{"spm": str(spm), "material_id": "2"}],
+                },
+            ]}
+
+            jobs = jobs_from_texture_plan(plan)
+            self.assertEqual(set(jobs[0]["materials"]), {"@id:1", "@id:2"})
+            patch = build_spm_patch(spm, jobs[0]["materials"])
+            slots = inspect_material_slots(patch["text"])
+            self.assertIn("T_leaf_one_color.tga", slots["1"]["slots"]["color"]["filename"])
+            self.assertIn("T_leaf_two_color.tga", slots["2"]["slots"]["color"]["filename"])
+
+    def test_exact_material_target_conflict_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = self.make_duplicate_name_spm(root)
+            plan = {"items": [
+                {
+                    "texture_dir": str(root / "texture"),
+                    "texture_base": texture_base,
+                    "material_targets": [{"spm": str(spm), "material_id": 1}],
+                }
+                for texture_base in ("T_leaf_one", "T_leaf_two")
+            ]}
+            with self.assertRaisesRegex(
+                    RuntimeError, r"conflicting managed output mapping for @id:1"):
+                jobs_from_texture_plan(plan)
+
+    def test_legacy_name_conflict_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = self.make_duplicate_name_spm(root)
+            plan = {"items": [
+                {
+                    "texture_dir": str(root / "texture"),
+                    "texture_base": texture_base,
+                    "material_names": ["M_leaf_shared"],
+                    "material_spms": [str(spm)],
+                }
+                for texture_base in ("T_leaf_one", "T_leaf_two")
+            ]}
+            with self.assertRaisesRegex(
+                    RuntimeError, r"conflicting managed output mapping for m_leaf_shared"):
+                jobs_from_texture_plan(plan)
+
+
+class Step3ExactTargetTests(unittest.TestCase):
+    def test_texture_plan_jobs_only_include_exact_allowed_sk_variant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = root / "SK_weed_ladyfern_01.spm"
+            sibling = root / "SK_weed_ladyfern_b_01.spm"
+            selected.write_text("<SpeedTree/>", encoding="utf-8")
+            sibling.write_text("<SpeedTree/>", encoding="utf-8")
+            plan = {"items": [{
+                "atlas_base": "M_leaf_ladyfern",
+                "texture_base": "T_leaf_ladyfern",
+                "texture_dir": str(root / "texture"),
+                "material_names": ["M_leaf_ladyfern"],
+                "material_spms": [str(selected), str(sibling)],
+            }]}
+
+            jobs = jobs_from_texture_plan(
+                plan, allowed_spms=[selected]
+            )
+
+        self.assertEqual([Path(job["spm"]).name for job in jobs], [
+            "SK_weed_ladyfern_01.spm"
+        ])
+
+
 class GuiLabelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1556,6 +1910,19 @@ class GuiLabelTests(unittest.TestCase):
         self.assertFalse(hasattr(self.gui.App, "step4_text"))
         self.assertNotIn("④ SK Blend", source)
         self.assertNotIn('"step4"', source)
+
+    def test_step3_uses_exact_target_status_not_folder_sibling_variants(self):
+        selected = r"D:\Trees\ladyfern\SK_weed_ladyfern_01.spm"
+        sibling = r"D:\Trees\ladyfern\SK_weed_ladyfern_b_01.spm"
+        entries = {"ladyfern": {
+            "checked": True,
+            "item": {
+                "target_spm_statuses": [{"sk_spm": selected}],
+                "sk_spms": [selected, sibling],
+            },
+        }}
+
+        self.assertEqual(self.gui.checked_step3_spms(entries), [selected])
 
     def test_initial_refresh_runs_in_worker_and_applies_via_root_after(self):
         class FakeRoot:
@@ -1600,9 +1967,11 @@ class GuiLabelTests(unittest.TestCase):
         app.use_pcg_targets_var = FakeVar(True)
         app.status_var = FakeVar("대기")
         app.report = None
+        app.sync_state = {"migration_complete": True, "entries": {}}
         app.texplan_cache = {"stale": []}
         app.worker = None
         app._busy = False
+        app._manual_refreshing = False
         app._set_busy = mock.Mock()
         app.populate = mock.Mock()
         app._update_summary = mock.Mock()
@@ -1611,6 +1980,9 @@ class GuiLabelTests(unittest.TestCase):
                 mock.patch.object(self.gui, "load_pcg_targets", return_value={"meshes": []}), \
                 mock.patch.object(self.gui, "make_report", return_value=report) as make_report, \
                 mock.patch.object(self.gui, "save_spm_analysis_cache"), \
+                mock.patch.object(
+                    self.gui, "load_sync_state",
+                    return_value={"migration_complete": True, "entries": {}}), \
                 mock.patch.object(self.gui.threading, "Thread", FakeThread):
             app._start_initial_refresh()
             self.assertEqual(len(threads), 1)
@@ -1635,15 +2007,262 @@ class GuiLabelTests(unittest.TestCase):
             # The refresh that arrived mid-initial-scan must run after the
             # initial result lands instead of being silently dropped (race:
             # target-refresh buttons finishing during the first audit).
-            self.assertEqual(make_report.call_count, 2)
+            self.assertEqual(make_report.call_count, 1)
+            self.assertEqual(len(threads), 2)
+            self.assertTrue(threads[1].started)
             self.assertFalse(app._pending_refresh)
+
+            threads[1].target()
+            self.assertEqual(make_report.call_count, 2)
+            self.assertEqual(len(app.root.callbacks), 1)
+            delay, callback = app.root.callbacks.pop()
+            self.assertEqual(delay, 0)
+            callback()
 
         self.assertIs(app.report, report)
         self.assertEqual(app.texplan_cache, {})
-        self.assertEqual(app._set_busy.call_args_list, [mock.call(True), mock.call(False)])
+        self.assertEqual(app._set_busy.call_args_list, [
+            mock.call(True), mock.call(False),
+            mock.call(True), mock.call(False),
+        ])
         self.assertEqual(app.populate.call_count, 2)
         self.assertEqual(app._update_summary.call_count, 2)
         self.assertIsNone(app.worker)
+
+    def test_manual_refresh_runs_audit_in_worker(self):
+        class FakeRoot:
+            def __init__(self):
+                self.callbacks = []
+
+            def after(self, delay, callback):
+                self.callbacks.append((delay, callback))
+
+        class FakeVar:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        threads = []
+
+        class FakeThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                threads.append(self)
+
+            def start(self):
+                pass
+
+        report = {"items": []}
+        sync_state = {"migration_complete": True, "entries": {}}
+        app = self.gui.App.__new__(self.gui.App)
+        app.root = FakeRoot()
+        app.cfg = {"tree_root": "old"}
+        app.root_var = FakeVar("new")
+        app.use_pcg_targets_var = FakeVar(True)
+        app.status_var = FakeVar("대기")
+        app.report = {"items": ["stale"]}
+        app.sync_state = {"entries": {"stale": {}}}
+        app.texplan_cache = {"stale": []}
+        app.texplan_errors = {"stale": "error"}
+        app._busy = False
+        app._initial_refreshing = False
+        app._manual_refreshing = False
+        app._sync_state_migrating = False
+        app._pending_refresh = False
+        app._set_busy = mock.Mock()
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+
+        with mock.patch.object(self.gui, "save_config"), \
+                mock.patch.object(
+                    self.gui, "load_pcg_targets", return_value={"meshes": []}), \
+                mock.patch.object(
+                    self.gui, "make_report", return_value=report) as make_report, \
+                mock.patch.object(self.gui, "save_spm_analysis_cache"), \
+                mock.patch.object(
+                    self.gui, "load_sync_state", return_value=sync_state), \
+                mock.patch.object(self.gui.threading, "Thread", FakeThread):
+            self.assertTrue(app.refresh())
+            make_report.assert_not_called()
+            self.assertEqual(len(threads), 1)
+
+            threads[0].target()
+            make_report.assert_called_once_with(
+                {"tree_root": "new"}, pcg_targets={"meshes": []}
+            )
+            delay, callback = app.root.callbacks.pop()
+            self.assertEqual(delay, 0)
+            callback()
+
+        self.assertIs(app.report, report)
+        self.assertIs(app.sync_state, sync_state)
+        self.assertFalse(app._manual_refreshing)
+        self.assertEqual(app.texplan_cache, {})
+        self.assertEqual(app.texplan_errors, {})
+        app.populate.assert_called_once_with()
+        app._update_summary.assert_called_once_with()
+        self.assertEqual(app._set_busy.call_args_list, [
+            mock.call(True), mock.call(False),
+        ])
+
+    def test_busy_disables_refresh_target_and_selection_controls(self):
+        control_names = (
+            "btn_prepare", "btn_step2", "btn_refresh", "btn_pick_root",
+            "btn_select_all", "btn_clear_all", "btn_live_targets",
+            "btn_saved_targets", "root_entry", "chk_pcg_targets",
+            "chk_force", "chk_spm_push",
+        )
+        app = self.gui.App.__new__(self.gui.App)
+        controls = {}
+        for name in control_names:
+            controls[name] = mock.Mock()
+            setattr(app, name, controls[name])
+        app.items = {}
+        app._sync_state_migrating = False
+        app.btn_step3 = mock.Mock()
+
+        app._set_busy(True)
+        app._set_busy(False)
+
+        for control in controls.values():
+            self.assertEqual(control.configure.call_args_list, [
+                mock.call(state="disabled"), mock.call(state="normal"),
+            ])
+
+    def test_target_refresh_rejects_duplicate_and_times_out(self):
+        class FakeRoot:
+            def __init__(self):
+                self.callbacks = []
+
+            def after(self, delay, callback):
+                self.callbacks.append((delay, callback))
+
+        class FakeVar:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        threads = []
+
+        class FakeThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                threads.append(self)
+
+            def start(self):
+                pass
+
+        app = self.gui.App.__new__(self.gui.App)
+        app.root = FakeRoot()
+        app.cfg = {"pcg_target_refresh_timeout": 7}
+        app.status_var = FakeVar()
+        app._busy = False
+        app._target_refresh_active = False
+        app._set_busy = mock.Mock()
+
+        with mock.patch.object(self.gui.threading, "Thread", FakeThread), \
+                mock.patch.object(
+                    self.gui.subprocess, "run",
+                    side_effect=self.gui.subprocess.TimeoutExpired("cmd", 7),
+                ) as run, \
+                mock.patch.object(self.gui.messagebox, "showerror") as showerror:
+            self.assertTrue(app.refresh_pcg_targets())
+            self.assertFalse(app.import_saved_pcg_report())
+            self.assertEqual(len(threads), 1)
+
+            threads[0].target()
+            self.assertEqual(run.call_args.kwargs["timeout"], 7)
+            delay, callback = app.root.callbacks.pop()
+            self.assertEqual(delay, 0)
+            callback()
+
+        self.assertFalse(app._target_refresh_active)
+        self.assertIn("실패", app.status_var.value)
+        self.assertIn("7초", showerror.call_args.args[1])
+        self.assertEqual(app._set_busy.call_args_list, [
+            mock.call(True), mock.call(False),
+        ])
+
+    def test_target_refresh_success_releases_guard_and_starts_async_audit(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app.worker = mock.Mock()
+        app._target_refresh_active = True
+        app._busy = True
+        app._pending_refresh = True
+        app._set_busy = mock.Mock()
+        app.use_pcg_targets_var = mock.Mock()
+        app.log = mock.Mock()
+        app.refresh = mock.Mock(return_value=True)
+        result = mock.Mock(returncode=0, stdout="targets updated", stderr="")
+
+        app._pcg_targets_done(result)
+
+        self.assertIsNone(app.worker)
+        self.assertFalse(app._target_refresh_active)
+        self.assertFalse(app._pending_refresh)
+        app._set_busy.assert_called_once_with(False)
+        app.use_pcg_targets_var.set.assert_called_once_with(True)
+        app.refresh.assert_called_once_with()
+
+    def test_step3_normalization_filters_plan_to_exact_selected_spm(self):
+        selected = r"D:\Trees\ladyfern\SK_weed_ladyfern_01.spm"
+        sibling = r"D:\Trees\ladyfern\SK_weed_ladyfern_b_01.spm"
+        app = self.gui.App.__new__(self.gui.App)
+        app.cfg = {
+            "tree_root": r"D:\Trees",
+            "sbsrender_timeout": 10,
+            "unreal_texture_sync_enabled": False,
+        }
+        app.status_var = mock.Mock()
+        app.log = mock.Mock()
+        app._ui = lambda callback: callback()
+        app._step3_finished = mock.Mock()
+        plan = {
+            "items": [],
+            "preserved_cluster_materials": [
+                {"spm": selected, "material_name": "M_leaf_a"},
+                {"spm": sibling, "material_name": "M_leaf_b"},
+            ],
+        }
+
+        with mock.patch.object(
+                self.gui, "make_report", return_value={}
+        ) as make_report, mock.patch.object(
+                self.gui, "save_spm_analysis_cache"
+        ), mock.patch.object(
+                self.gui, "build_texture_plan_from_report", return_value=plan
+        ), mock.patch.object(
+                self.gui, "jobs_from_texture_plan", return_value=[]
+        ) as build_jobs, mock.patch.object(
+                self.gui, "normalize_spms_transactionally",
+                return_value={
+                    "spms": [], "materials": 0,
+                    "backup_dir": None, "skipped": [],
+                },
+        ), mock.patch.object(
+                self.gui, "cleanup_preserved_cluster_outputs",
+                return_value={"cleaned": [], "conflicts": []},
+        ) as cleanup:
+            app._run_step3([], [selected], sync_files=[])
+
+        make_report.assert_called_once_with(
+            app.cfg, targets=[r"D:\Trees\ladyfern"]
+        )
+        exact_plan = build_jobs.call_args.args[0]
+        self.assertEqual(
+            [row["spm"] for row in exact_plan["preserved_cluster_materials"]],
+            [selected],
+        )
+        self.assertEqual(build_jobs.call_args.kwargs["allowed_spms"], [selected])
+        self.assertIs(cleanup.call_args.args[0], exact_plan)
 
     def test_atlas_generation_loads_user_startup_with_clean_preferences(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1659,6 +2278,16 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIn("--background", command)
         self.assertIn(str(startup), command)
         self.assertLess(command.index(str(startup)), command.index("--python"))
+
+    def test_atlas_generation_uses_factory_startup_without_user_startup_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            blender = Path(temp) / "Blender 5.1" / "blender.exe"
+            with mock.patch.dict("os.environ", {"APPDATA": ""}):
+                command = self.gui.atlas_blender_command(str(blender))
+
+        self.assertIn("--factory-startup", command)
+        self.assertIn("--background", command)
+        self.assertLess(command.index("--factory-startup"), command.index("--python"))
 
     def test_target_column_uses_readable_source_names(self):
         self.assertEqual(
@@ -1690,6 +2319,11 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(normal, [])
         self.assertEqual(generic, [])
 
+    def test_lowercase_m_prefix_is_not_double_counted_as_unprefixed(self):
+        normal, generic = self.gui.split_generic(["m_leaf_test"])
+        self.assertEqual(normal, [])
+        self.assertEqual(generic, [])
+
     def test_step2_label_distinguishes_complete_and_partial(self):
         complete = {"leaf_mesh_sources": [
             {"atlas_blends": ["a.blend"], "targets": []},
@@ -1704,6 +2338,20 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(
             self.gui.App.step2_text(None, partial),
             "잎 매쉬 1/2개 완료 · 1개 만들기",
+        )
+
+    def test_step2_label_keeps_managed_connected_output_truthful(self):
+        item = {
+            "leaf_mesh_sources": [],
+            "managed_leaf_outputs": [
+                {"spm": "SK_weed_ladyfern_01.spm", "material_id": "5"},
+                {"spm": "SK_weed_ladyfern_01.spm", "material_id": "6"},
+            ],
+        }
+
+        self.assertEqual(
+            self.gui.App.step2_text(None, item),
+            "잎 매쉬 2개 연결 완료 ✓",
         )
 
     def test_step3_label_reports_sets_exact_map_progress_and_connection(self):
@@ -1847,6 +2495,213 @@ class GuiLabelTests(unittest.TestCase):
             [r"D:\Trees\oak\SK_oak_01.spm", r"D:\Trees\oak\oak_02.spm"],
         )
 
+    def test_step2_blend_is_not_complete_until_generators_are_connected(self):
+        pending = {"leaf_mesh_sources": [{
+            "atlas_blends": ["M_leaf_test_atlas_01.blend"],
+            "generator_connection_complete": False,
+            "targets": [{
+                "spm": "SK_test.spm",
+                "source_material_names": ["M_leaf_test_01"],
+                "generator_connection_complete": False,
+            }],
+        }]}
+        complete = {"leaf_mesh_sources": [{
+            **pending["leaf_mesh_sources"][0],
+            "generator_connection_complete": True,
+            "targets": [{
+                **pending["leaf_mesh_sources"][0]["targets"][0],
+                "generator_connection_complete": True,
+            }],
+        }]}
+
+        self.assertEqual(
+            self.gui.App.step2_text(None, pending),
+            "잎 매쉬 1개 · Generator 1개 연결",
+        )
+        self.assertEqual(
+            self.gui.App.step2_text(None, complete),
+            "잎 매쉬 1개 완료 ✓",
+        )
+
+    def test_step2_explicit_complete_targets_override_stale_source_aggregate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            blend = root / "M_leaf_test_atlas_01.blend"
+            blend.write_bytes(b"BLENDER")
+            source = {
+                "atlas_base": "M_leaf_test_atlas_01",
+                "atlas_blends": [str(blend)],
+                "generator_connection_complete": False,
+                "generator_connection_update_needed": True,
+                "targets": [{
+                    "spm": str(root / "SK_tree_test.spm"),
+                    "source_material_names": ["M_leaf_test"],
+                    "generator_connection_complete": True,
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {"atlas_root": str(root)}
+            app.items = {"tree_test": {
+                "checked": True,
+                "item": {"name": "tree_test", "leaf_mesh_sources": [source]},
+            }}
+
+            state = self.gui.leaf_source_step2_state(source)
+            pending = self.gui.pending_leaf_targets(source)
+            jobs, skipped = app._step2_jobs(connect_spm=True)
+
+        self.assertTrue(state["connection_complete"])
+        self.assertTrue(state["complete"])
+        self.assertEqual(pending, [])
+        self.assertEqual(jobs, [])
+        self.assertEqual(skipped, [])
+
+    def test_prepare_noop_is_displayed_as_no_change(self):
+        class FakeTree:
+            def __init__(self):
+                self.values = []
+
+            def set(self, iid, column, value):
+                self.values.append((iid, column, value))
+
+        app = self.gui.App.__new__(self.gui.App)
+        app.tree = FakeTree()
+        app.log = mock.Mock()
+        app._prepare_finished = mock.Mock()
+        app._ui = lambda fn: fn()
+        row = {
+            "item": {"folder": r"D:\Trees\tree_test", "name": "tree_test"},
+            "mesh": "tree_test",
+        }
+        result = {"targets": [{
+            "status": "up_to_date",
+            "created": None,
+            "patch": {"changed": False, "renames": []},
+        }]}
+
+        with mock.patch.object(self.gui, "prepare_sk", return_value=result):
+            app._run_prepare([row])
+
+        self.assertEqual(app.tree.values, [(
+            r"D:\Trees\tree_test", "step1", "완료 ✓ (변경 없음)",
+        )])
+        app.log.assert_called_once_with(
+            "[① 변경 없음] tree_test: 이미 최신입니다.")
+        app._prepare_finished.assert_called_once_with(1, 0)
+
+    def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app.items = {"tree_test": {
+            "checked": True,
+            "item": {
+                "folder": r"D:\Trees\tree_test",
+                "name": "tree_test",
+                "target_spm_statuses": [{
+                    "mesh_name": "tree_test",
+                    "status": "needs_m_prefix",
+                }],
+            },
+        }}
+        preview = {"targets": [{
+            "status": "up_to_date",
+            "would_create": None,
+            "patch": {"dry_run": True, "renames": []},
+        }]}
+
+        with mock.patch.object(self.gui, "prepare_sk", return_value=preview):
+            rows = app._build_prepare_rows()
+
+        self.assertEqual(rows, [])
+
+    def test_step2_reuses_existing_blend_and_passes_exact_target_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            atlas = root / "atlas"
+            atlas.mkdir()
+            blend = atlas / "M_leaf_parsley_atlas_02.blend"
+            blend.write_bytes(b"BLENDER")
+            spm = root / "SK_weed_parsley_01.spm"
+            spm.write_bytes(b"SPM")
+            item = {
+                "name": "weed_parsley",
+                "leaf_mesh_sources": [{
+                    "atlas_base": "M_leaf_parsley_atlas_02",
+                    "albedo": root / "missing_albedo.tga",
+                    "alpha": root / "missing_alpha.tga",
+                    "atlas_blends": [str(blend)],
+                    "generator_connection_complete": False,
+                    "targets": [{
+                        "spm": str(spm),
+                        "material_names": ["legacy_name_is_not_used"],
+                        "source_material_names": ["M_leaf_parsley_02"],
+                        "source_material_ids": [4],
+                        "generator_bindings": [{"material_id": 4, "mesh_id": 6}],
+                        "generator_connection_complete": False,
+                    }],
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {"atlas_root": str(atlas)}
+            app.items = {"weed_parsley": {"checked": True, "item": item}}
+
+            jobs, skipped = app._step2_jobs(connect_spm=True)
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(jobs[0]["reuse_existing_blend"])
+        self.assertEqual(jobs[0]["blend_out"], blend)
+        payload = self.gui.step2_target_payload(jobs[0])
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["targets"], [{
+            "spm": str(spm),
+            "source_material_names": ["M_leaf_parsley_02"],
+            "source_material_ids": [4],
+            "generator_bindings": [{"material_id": 4, "mesh_id": 6}],
+        }])
+
+    def test_step2_preflight_reports_missing_source_before_blender(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            atlas = root / "atlas"
+            atlas.mkdir()
+            item = {
+                "name": "weed_ladyfern",
+                "leaf_mesh_sources": [{
+                    "atlas_base": "M_leaf_ladyfern_atlas_01",
+                    "albedo": root / "missing_albedo.tga",
+                    "alpha": root / "missing_alpha.tga",
+                    "atlas_blends": [],
+                    "targets": [],
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {"atlas_root": str(atlas)}
+            app.items = {"weed_ladyfern": {"checked": True, "item": item}}
+
+            jobs, skipped = app._step2_jobs(connect_spm=True)
+
+        self.assertEqual(jobs, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("알베도/알파 원본 파일 없음", skipped[0][2])
+
+    def test_step2_does_not_count_unverified_generator_result_as_success(self):
+        with self.assertRaisesRegex(RuntimeError, "Generator Material/Mesh 연결 검증"):
+            self.gui.validate_step2_job_report({
+                "status": "ok",
+                "spm_built": True,
+                "generator_connections_complete": False,
+            }, require_generator_connections=True)
+        self.gui.validate_step2_job_report({
+            "status": "ok",
+            "spm_built": True,
+            "generator_connections_complete": True,
+        }, require_generator_connections=True)
+
+    def test_step2_copy_no_longer_claims_generators_are_not_connected(self):
+        source = (TOOL_DIR / "pcg_texture_gui.pyw").read_text(encoding="utf-8")
+        self.assertNotIn("Leaf Mesh Generator에는 자동 연결하지 않습니다", source)
+        self.assertIn("Generator 연결", source)
+
 
 class SafetyTests(unittest.TestCase):
     def _pre_cluster_normalization_fixture(self, source, graphs, *, broken=False):
@@ -1966,6 +2821,43 @@ class SafetyTests(unittest.TestCase):
                 [path.stat().st_mtime_ns for path in produced], original_mtimes)
             self.assertFalse(transaction["staging_dir"].exists())
             self.assertFalse((out / "_pcgtex_backups").exists())
+
+    def test_rendered_map_content_rejects_all_zero_normal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            black_normal = root / "T_test_normal.tga"
+            flat_normal = root / "T_test_flat_normal.tga"
+            black_extra = root / "T_test_extra.tga"
+            Image.new("RGB", (2, 2), (0, 0, 0)).save(black_normal)
+            Image.new("RGB", (2, 2), (128, 128, 255)).save(flat_normal)
+            Image.new("RGB", (2, 2), (0, 0, 0)).save(black_extra)
+
+            self.assertIn(
+                "all-zero RGB normal output",
+                sbs_auto.rendered_map_content_error(black_normal, "normal"),
+            )
+            self.assertIsNone(
+                sbs_auto.rendered_map_content_error(flat_normal, "normal"))
+            self.assertIsNone(
+                sbs_auto.rendered_map_content_error(black_extra, "extra"))
+
+    def test_complete_output_set_rejects_existing_black_normal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture_base = "T_test"
+            for role in sbs_auto.RENDER_MAPS:
+                color = (0, 0, 0) if role == "normal" else (128, 128, 128)
+                Image.new("RGB", (2, 2), color).save(
+                    root / f"{texture_base}_{role}.tga")
+            row = {"texture_dir": str(root), "texture_base": texture_base}
+
+            self.assertFalse(
+                migrate_current_sk_textures.complete_output_set(
+                    row, expected_pixels=(2, 2)))
+            with self.assertRaisesRegex(
+                    RuntimeError, "all-zero RGB normal output"):
+                migrate_current_sk_textures.verify_complete_output_set(
+                    root, texture_base, expected_pixels=(2, 2))
 
     def test_output_transaction_replaces_only_changed_and_new_files(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2267,6 +3159,49 @@ class SafetyTests(unittest.TestCase):
             state = sbs_auto.graph_cluster_normalization_state(copied, graph)
             self.assertTrue(state["fully_normalized"])
             self.assertTrue(state["integrity"]["valid"])
+
+
+class SharedTextureContractConsumptionTests(unittest.TestCase):
+    REQUIRED = ("color", "normal", "extra", "height", "opacity", "subsurface")
+
+    def _write_set(self, directory, texture_base, roles=None):
+        directory.mkdir(parents=True, exist_ok=True)
+        for role in roles or self.REQUIRED:
+            (directory / f"{texture_base}_{role}.png").write_bytes(
+                role.encode("ascii")
+            )
+
+    def test_find_export_maps_multi_prefers_later_complete_t_set(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            partial = root / "a_partial"
+            complete = root / "z_complete"
+            self._write_set(partial, "T_Shared_01", ("color", "normal"))
+            self._write_set(complete, "T_Shared_01")
+
+            selected_dir, maps = pcg_texture_audit.find_export_maps_multi(
+                [partial, complete], "T_Shared_01", self.REQUIRED
+            )
+
+            self.assertEqual(Path(selected_dir), complete.resolve())
+            self.assertEqual(list(maps), list(self.REQUIRED))
+            self.assertTrue(all(maps.values()))
+            self.assertTrue(
+                all(Path(path).parent == complete.resolve() for path in maps.values())
+            )
+
+    def test_material_labels_do_not_infer_managed_texture_or_instance_variants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_set(root, "T_Shared_01")
+
+            for material_label in ("Green", "Yellow", "M_Shared_01"):
+                selected_dir, maps = pcg_texture_audit.find_export_maps_multi(
+                    [root], material_label, self.REQUIRED
+                )
+                self.assertEqual(Path(selected_dir), root)
+                self.assertEqual(list(maps), list(self.REQUIRED))
+                self.assertTrue(all(path is None for path in maps.values()))
 
 
 if __name__ == "__main__":

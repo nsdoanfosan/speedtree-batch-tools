@@ -75,6 +75,7 @@ SELF_CLOSING_SECTION_RE = {
 }
 ASSETS_SECTION_RE = re.compile(r"<Assets(?:\s[^>]*)?>.*?</Assets>", re.DOTALL)
 ASSETS_SELF_CLOSING_RE = re.compile(r"<Assets\b[^>]*/>")
+GENERATION_PASS_PROPERTY = "Generation:Shared:Pass"
 
 
 class SyncError(RuntimeError):
@@ -209,6 +210,119 @@ def canonical_base_name(name: str) -> str:
     return value.replace(" ", "_")
 
 
+class SearchSyntaxError(ValueError):
+    """Malformed SpeedTree search expression used by a Base filter."""
+
+
+def _split_search_expression(expression: str, operator: str) -> list[str]:
+    """Split one SpeedTree search operator outside quotes and parentheses."""
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quoted = False
+    for index, character in enumerate(expression):
+        if character == '"':
+            quoted = not quoted
+            continue
+        if quoted:
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                raise SearchSyntaxError("닫는 괄호가 더 많습니다")
+        elif character == operator and depth == 0:
+            parts.append(expression[start:index].strip())
+            start = index + 1
+    if quoted:
+        raise SearchSyntaxError("닫히지 않은 따옴표가 있습니다")
+    if depth != 0:
+        raise SearchSyntaxError("닫히지 않은 괄호가 있습니다")
+    parts.append(expression[start:].strip())
+    if any(not part for part in parts):
+        raise SearchSyntaxError(f"'{operator}' 연산자 양쪽에 검색식이 필요합니다")
+    return parts
+
+
+def _strip_search_parentheses(expression: str) -> str:
+    value = expression.strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        quoted = False
+        closes_at_end = False
+        for index, character in enumerate(value):
+            if character == '"':
+                quoted = not quoted
+                continue
+            if quoted:
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(value) - 1
+                    break
+        if not closes_at_end:
+            break
+        value = value[1:-1].strip()
+    return value
+
+
+def speedtree_search_matches(value: str, expression: str) -> bool:
+    """Evaluate documented SpeedTree search syntax against one Base name."""
+    query = str(expression or "").strip()
+    if not query:
+        return True
+
+    def evaluate(term: str) -> bool:
+        term = _strip_search_parentheses(term)
+        alternatives = _split_search_expression(term, "|")
+        if len(alternatives) > 1:
+            return any(evaluate(item) for item in alternatives)
+        requirements = _split_search_expression(term, "&")
+        if len(requirements) > 1:
+            return all(evaluate(item) for item in requirements)
+        if term.startswith("!"):
+            remainder = term[1:].strip()
+            if not remainder:
+                raise SearchSyntaxError("'!' 뒤에 검색식이 필요합니다")
+            return not evaluate(remainder)
+        if term.startswith("(") or term.endswith(")"):
+            raise SearchSyntaxError("괄호 위치가 올바르지 않습니다")
+
+        case_sensitive = False
+        exact = False
+        if term.startswith("=="):
+            case_sensitive = True
+            exact = True
+            term = term[2:].strip()
+        elif term.startswith("="):
+            exact = True
+            term = term[1:].strip()
+        quoted_term = len(term) >= 2 and term.startswith('"') and term.endswith('"')
+        if quoted_term:
+            term = term[1:-1]
+        elif '"' in term:
+            raise SearchSyntaxError("따옴표는 검색어 전체를 감싸야 합니다")
+        if not term:
+            raise SearchSyntaxError("빈 검색어입니다")
+
+        candidate = str(value)
+        if exact:
+            return candidate == term if case_sensitive else candidate.casefold() == term.casefold()
+        if quoted_term or not any(character in term for character in "*?"):
+            return term.casefold() in candidate.casefold()
+        wildcard = "".join(
+            ".*" if character == "*" else "." if character == "?" else re.escape(character)
+            for character in term
+        )
+        return re.search(wildcard, candidate, re.IGNORECASE) is not None
+
+    return evaluate(query)
+
+
 def classify_base_name(name: str) -> str | None:
     token = canonical_base_name(name)
     if "leaf" in token or "leaves" in token:
@@ -267,6 +381,8 @@ def _format_color(value: float) -> str:
 def is_protected_property(name: str) -> bool:
     """Properties kept from the follower to preserve identity and assets."""
     lowered = str(name or "").strip().lower()
+    if lowered == "generation:shared:pass":
+        return True
     protected_prefixes = (
         "random seeds:",
         "generation:collections:",
@@ -313,6 +429,7 @@ class SyncPlan:
     base_ref_filter_updates: int = 0
     master_reference_renames: list[dict[str, str]] = field(default_factory=list)
     reference_renames: list[dict[str, str]] = field(default_factory=list)
+    pass_adjustments: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     scale_risk: dict[str, object] = field(default_factory=dict)
     changed: bool = False
@@ -396,6 +513,13 @@ class SyncPlan:
             lines.extend(
                 f"  Ref: {item['old']} → {item['new']}"
                 for item in self.reference_renames
+            )
+        if self.pass_adjustments:
+            lines.append(f"Generation Pass 안전 보정: {len(self.pass_adjustments)}개")
+            lines.extend(
+                f"  {item['type']} {item['name']}: "
+                f"{item['old_pass']} → {item['new_pass']} ({item['reason']})"
+                for item in self.pass_adjustments
             )
         lines.extend(f"⚠ {warning}" for warning in self.warnings)
         lines.append("")
@@ -588,6 +712,46 @@ class SPMDocument:
     def base_refs(self) -> list[ET.Element]:
         return [item for item in self.generators if self.generator_type(item) == "BaseRef"]
 
+    def generator_pass(self, generator: ET.Element) -> int:
+        properties = generator.find("Properties")
+        raw_value = "1"
+        if properties is not None:
+            for prop in list(properties):
+                if _property_name(prop) == GENERATION_PASS_PROPERTY:
+                    raw_value = _property_value(prop).strip() or "1"
+                    break
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise SyncError(
+                f"{self.generator_type(generator)} '{self.generator_name(generator)}'의 "
+                f"Generation Pass가 정수가 아닙니다: {raw_value}"
+            ) from exc
+        if value < 1:
+            raise SyncError(
+                f"{self.generator_type(generator)} '{self.generator_name(generator)}'의 "
+                f"Generation Pass는 1 이상이어야 합니다: {value}"
+            )
+        return value
+
+    def set_generator_pass(self, generator: ET.Element, value: int) -> bool:
+        value = int(value)
+        current = self.generator_pass(generator)
+        if current == value:
+            return False
+        properties = generator.find("Properties")
+        if properties is None:
+            properties = ET.SubElement(generator, "Properties")
+        prop = next(
+            (item for item in list(properties) if _property_name(item) == GENERATION_PASS_PROPERTY),
+            None,
+        )
+        if prop is None:
+            prop = ET.SubElement(properties, "Property")
+            _set_child_text(prop, "Name", GENERATION_PASS_PROPERTY)
+        _set_child_text(prop, "Value", str(value))
+        return True
+
     def resolve_base(self, name: str) -> ET.Element | None:
         exact = [item for item in self.base_nodes() if self.generator_name(item).casefold() == str(name).casefold()]
         if len(exact) == 1:
@@ -628,11 +792,16 @@ class SPMDocument:
         return ""
 
     def refs_for_base(self, base: ET.Element) -> list[ET.Element]:
-        identity = canonical_base_name(self.generator_name(base))
-        return [
-            ref for ref in self.base_refs()
-            if canonical_base_name(self.base_ref_filter(ref)) == identity
-        ]
+        base_name = self.generator_name(base)
+        return [ref for ref in self.base_refs() if speedtree_search_matches(
+            base_name, self.base_ref_filter(ref)
+        )]
+
+    def bases_for_ref(self, ref: ET.Element) -> list[ET.Element]:
+        expression = self.base_ref_filter(ref)
+        return [base for base in self.base_nodes() if speedtree_search_matches(
+            self.generator_name(base), expression
+        )]
 
     def base_type_signature(self, base: ET.Element) -> tuple[tuple[str, int], ...]:
         counter = Counter(
@@ -645,6 +814,13 @@ class SPMDocument:
     def integrity_errors(self) -> list[str]:
         errors: list[str] = []
         link_guids: set[str] = set()
+        passes: dict[str, int] = {}
+        for generator in self.generators:
+            guid = self.generator_guid(generator)
+            try:
+                passes[guid] = self.generator_pass(generator)
+            except SyncError as exc:
+                errors.append(str(exc))
         for link in self.links:
             source = _child_text(link, "SourceGUID")
             target = _child_text(link, "TargetGUID")
@@ -658,12 +834,51 @@ class SPMDocument:
             elif link_guid in link_guids:
                 errors.append(f"중복 Link GUID: {link_guid}")
             link_guids.add(link_guid)
+            source_generator = self.by_guid.get(source)
+            target_generator = self.by_guid.get(target)
+            # Base generators are special template boundaries. Their own pass
+            # schedules Reference consumption and does not constrain the pass
+            # of generators authored inside the reusable Base template.
+            if (
+                source_generator is not None
+                and target_generator is not None
+                and self.generator_type(source_generator) != "Base"
+                and source in passes
+                and target in passes
+                and passes[target] < passes[source]
+            ):
+                errors.append(
+                    f"Generation Pass 조상 순서 오류: "
+                    f"{self.generator_name(source_generator)}({passes[source]}) > "
+                    f"{self.generator_name(target_generator)}({passes[target]})"
+                )
         for ref in self.base_refs():
             filter_name = self.base_ref_filter(ref)
-            if filter_name and self.resolve_base(filter_name) is None:
+            try:
+                bases = self.bases_for_ref(ref)
+            except SearchSyntaxError as exc:
                 errors.append(
-                    f"BaseRef '{self.generator_name(ref)}'의 Base filter를 찾지 못함: {filter_name}"
+                    f"BaseRef '{self.generator_name(ref)}'의 Base filter 검색식 오류: "
+                    f"{filter_name!r} ({exc})"
                 )
+                continue
+            if not bases:
+                errors.append(
+                    f"BaseRef '{self.generator_name(ref)}'의 Base filter를 찾지 못함: "
+                    f"{filter_name or '<비어 있음>'}"
+                )
+                continue
+            ref_guid = self.generator_guid(ref)
+            if ref_guid not in passes:
+                continue
+            for base in bases:
+                base_guid = self.generator_guid(base)
+                if base_guid in passes and passes[ref_guid] >= passes[base_guid]:
+                    errors.append(
+                        f"Reference/Base Pass 순서 오류: {self.generator_name(ref)}"
+                        f"({passes[ref_guid]}) < {self.generator_name(base)}"
+                        f"({passes[base_guid]}) 이어야 합니다"
+                    )
         return errors
 
     def validate(self, rendered_text: str | None = None) -> None:
@@ -686,6 +901,79 @@ class SPMDocument:
         )
         text = append_assets_section(text, self.pending_asset_elements)
         return text
+
+
+def repair_generation_passes(document: SPMDocument) -> list[dict[str, object]]:
+    """Increase only the passes needed by SpeedTree hierarchy/reference rules.
+
+    Existing target scheduling remains intact whenever it is valid. Base
+    template children are excluded from ancestor propagation because the Base
+    pass schedules Reference consumption, not the reusable template subtree.
+    """
+    original = {
+        document.generator_guid(generator): document.generator_pass(generator)
+        for generator in document.generators
+    }
+    reasons: dict[str, set[str]] = defaultdict(set)
+    limit = max(1, len(document.generators) + 1)
+    for _round in range(limit):
+        changed = False
+        for parent_guid, child_guids in document.children.items():
+            parent = document.by_guid.get(parent_guid)
+            if parent is None or document.generator_type(parent) == "Base":
+                continue
+            parent_pass = document.generator_pass(parent)
+            for child_guid in child_guids:
+                child = document.by_guid.get(child_guid)
+                if child is None or document.generator_pass(child) >= parent_pass:
+                    continue
+                document.set_generator_pass(child, parent_pass)
+                reasons[child_guid].add(
+                    f"조상 {document.generator_name(parent)} pass {parent_pass}"
+                )
+                changed = True
+
+        for ref in document.base_refs():
+            try:
+                bases = document.bases_for_ref(ref)
+            except SearchSyntaxError as exc:
+                raise SyncError(
+                    f"BaseRef '{document.generator_name(ref)}'의 Base filter 검색식 오류: "
+                    f"{document.base_ref_filter(ref)!r} ({exc})"
+                ) from exc
+            ref_pass = document.generator_pass(ref)
+            for base in bases:
+                required = ref_pass + 1
+                if document.generator_pass(base) >= required:
+                    continue
+                document.set_generator_pass(base, required)
+                reasons[document.generator_guid(base)].add(
+                    f"Reference {document.generator_name(ref)} pass {ref_pass}보다 이후"
+                )
+                changed = True
+        if not changed:
+            break
+    else:
+        raise SyncError(
+            f"{document.path.name} Generation Pass 제약에 순환이 있어 자동 보정할 수 없습니다"
+        )
+
+    adjustments: list[dict[str, object]] = []
+    for generator in document.generators:
+        guid = document.generator_guid(generator)
+        old_pass = original[guid]
+        new_pass = document.generator_pass(generator)
+        if old_pass == new_pass:
+            continue
+        adjustments.append({
+            "guid": guid,
+            "name": document.generator_name(generator),
+            "type": document.generator_type(generator),
+            "old_pass": old_pass,
+            "new_pass": new_pass,
+            "reason": "; ".join(sorted(reasons.get(guid, {"의존성 제약"}))),
+        })
+    return adjustments
 
 
 def _scale_color(color: tuple[float, float, float, float], factor: float):
@@ -1489,6 +1777,7 @@ def build_sync_plan(
         used_source.add(source_name)
 
     target.reindex()
+    plan.pass_adjustments = repair_generation_passes(target)
     plan.reference_renames = standardize_base_ref_names(target)
     target_color_categories: dict[str, str | None] = {}
     unique_guids: set[str] = set()
@@ -2028,6 +2317,87 @@ def verify_temporary_patches(
                         pass
 
 
+def apply_pass_repair_transaction(
+    spm_path: Path,
+    verify_callback=None,
+) -> dict:
+    """Repair only Generation Pass dependencies with backup and rollback."""
+    spm_path = Path(spm_path)
+    if not spm_path.is_file():
+        raise SyncError(f"SPM이 없습니다: {spm_path}")
+    original_bytes = spm_path.read_bytes()
+    document = SPMDocument.from_path(spm_path, full=True)
+    adjustments = repair_generation_passes(document)
+    if not adjustments:
+        document.validate()
+        return {
+            "status": "unchanged",
+            "file": str(spm_path),
+            "backup_dir": None,
+            "pass_adjustments": [],
+        }
+
+    rendered = document.render()
+    document.validate(rendered)
+    if verify_callback is not None:
+        verify_temporary_patches(
+            [(spm_path, rendered, document.compressed)],
+            verify_callback,
+        )
+    if spm_path.read_bytes() != original_bytes:
+        raise SyncError(
+            f"사전검사 중 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+        )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = spm_path.parent / BACKUP_SUBDIR / f"pass_repair_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    spm_backup = backup_dir / f"01_{spm_path.name}"
+    temporary = spm_path.with_name(
+        f".__spm_pass_repair_{uuid.uuid4().hex[:10]}_{spm_path.name}"
+    )
+    replaced_original = False
+    try:
+        write_spm_text(temporary, rendered, document.compressed)
+        candidate_text, candidate_compressed = read_spm_text(temporary)
+        candidate = SPMDocument(
+            temporary, candidate_text, candidate_compressed, full=True
+        )
+        candidate.validate(candidate_text)
+
+        shutil.copy2(spm_path, spm_backup)
+        if spm_backup.read_bytes() != original_bytes:
+            raise SyncError(
+                f"백업 직전 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+            )
+        autosave_path = spm_path.with_name(f"~{spm_path.stem}.sbk")
+        if autosave_path.is_file():
+            shutil.copy2(autosave_path, backup_dir / f"02_{autosave_path.name}")
+        # Keep the final comparison adjacent to the atomic replacement so an
+        # open Modeler or OneDrive update is far less likely to be overwritten.
+        if spm_path.read_bytes() != original_bytes:
+            raise SyncError(
+                f"저장 직전 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+            )
+        os.replace(temporary, spm_path)
+        replaced_original = True
+        written_text, written_compressed = read_spm_text(spm_path)
+        written = SPMDocument(spm_path, written_text, written_compressed, full=True)
+        written.validate(written_text)
+    except Exception:
+        if replaced_original:
+            shutil.copy2(spm_backup, spm_path)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "status": "applied",
+        "file": str(spm_path),
+        "backup_dir": str(backup_dir),
+        "pass_adjustments": adjustments,
+    }
+
+
 def verify_auto_copies(
     folder: Path,
     master_name: str,
@@ -2302,11 +2672,15 @@ def inspect_file(path: Path) -> dict:
     bases = []
     for base in document.base_nodes():
         name = document.generator_name(base)
+        try:
+            reference_count = len(document.refs_for_base(base))
+        except SearchSyntaxError:
+            reference_count = 0
         bases.append({
             "name": name,
             "category": classify_base_name(name),
             "signature": dict(document.base_type_signature(base)),
-            "refs": len(document.refs_for_base(base)),
+            "refs": reference_count,
         })
     return {"file": Path(path).name, "bases": bases, "errors": document.integrity_errors()}
 
@@ -2331,6 +2705,12 @@ def main(argv: list[str] | None = None) -> int:
 
     inspect_parser = sub.add_parser("inspect")
     inspect_parser.add_argument("spm", nargs="+")
+
+    repair_pass_parser = sub.add_parser("repair-passes")
+    repair_pass_parser.add_argument("spm")
+    repair_pass_parser.add_argument("--no-speedtree-verify", action="store_true")
+    repair_pass_parser.add_argument("--speedtree-exe")
+    repair_pass_parser.add_argument("--xml-ini")
 
     preview_parser = sub.add_parser("preview")
     preview_parser.add_argument("folder")
@@ -2367,6 +2747,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "inspect":
         print(json.dumps([inspect_file(Path(path)) for path in args.spm], ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "repair-passes":
+        callback = None
+        if not args.no_speedtree_verify:
+            if not args.speedtree_exe or not args.xml_ini:
+                raise SyncError("SpeedTree 검증 경로가 설정되지 않았습니다")
+            speedtree_exe = Path(args.speedtree_exe)
+            xml_ini = Path(args.xml_ini)
+            callback = lambda path: verify_speedtree_export(path, speedtree_exe, xml_ini)
+        result = apply_pass_repair_transaction(Path(args.spm), verify_callback=callback)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "preview":
         folder = Path(args.folder)
