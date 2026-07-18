@@ -14,6 +14,7 @@
 모든 무거운 작업은 낮은 우선순위 + CPU 코어 제한이 걸린 백그라운드 프로세스로
 실행된다 (자식 SpeedTree CLI에 상속. 헤드리스 Blender는 GPU를 쓰지 않음).
 """
+import hashlib
 import json
 import os
 import queue
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -88,6 +90,167 @@ WIND_OPTIONS = (
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
+
+
+def compact_table_status(value, max_chars=28):
+    """Keep the overview table compact; the full value stays in row details."""
+    text = " ".join(str(value or "-").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars - 1].rstrip()}…"
+
+
+def _normalized_path(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _sha256_snapshot(path):
+    """Read a stable SHA-256 snapshot without changing the source file."""
+    candidate = Path(path)
+    for _attempt in range(2):
+        before = candidate.stat()
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = candidate.stat()
+        if (before.st_size, before.st_mtime_ns) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return {
+                "sha256": digest.hexdigest(),
+                "size": after.st_size,
+            }
+    raise OSError(f"File changed while reading: {candidate}")
+
+
+def current_speedtree_bone_measurement(spm):
+    """Return a verified exported bone count for the current SPM, or None.
+
+    The XML is accepted only when its artifact hash matches the export receipt.
+    The receipt's SPM input hash marks the count as current or last-measured.
+    This is deliberately read-only and content-based: a timestamp-only change
+    cannot schedule or invalidate work.
+    """
+    spm = Path(spm)
+    xml_path = spm.parent / "xml" / f"{spm.stem}.xml"
+    receipt_path = (
+        xml_path.parent / ".speedtree_export_cache" / f"{xml_path.name}.json"
+    )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        source = receipt["inputs"]["spm"]
+        if _normalized_path(source["path"]) != _normalized_path(spm):
+            return None
+        source_snapshot = _sha256_snapshot(spm)
+        source_current = not (
+            source_snapshot["size"] != int(source["size"])
+            or source_snapshot["sha256"].lower()
+            != str(source["sha256"]).lower()
+        )
+
+        artifact = next(
+            item
+            for item in receipt["artifacts"]
+            if item.get("relative_path") == xml_path.name
+        )
+        xml_snapshot = _sha256_snapshot(xml_path)
+        if (
+            xml_snapshot["size"] != int(artifact["size"])
+            or xml_snapshot["sha256"].lower()
+            != str(artifact["sha256"]).lower()
+        ):
+            return None
+
+        root = ET.parse(xml_path).getroot()
+        xml_source = root.get("Source")
+        if xml_source and _normalized_path(xml_source) != _normalized_path(spm):
+            return None
+        bones = root.find(".//Bones")
+        if bones is None:
+            return None
+        actual_count = len(bones.findall("Bone"))
+        declared_count = int(bones.get("Count", actual_count))
+        if declared_count != actual_count:
+            return None
+        return {
+            "count": actual_count,
+            "current": source_current,
+            "xml_path": xml_path,
+            "receipt_path": receipt_path,
+        }
+    except (ET.ParseError, OSError, TypeError, ValueError, KeyError, StopIteration):
+        return None
+
+
+def manual_bone_status_text(spm):
+    measurement = current_speedtree_bone_measurement(spm)
+    if measurement is None:
+        return "수동 본 유지 🔒 · 본 수 미측정 (검증된 SpeedTree XML 없음)"
+    if not measurement["current"]:
+        return (
+            f"수동 본 유지 🔒 · 최근 실측 본 {measurement['count']}개 "
+            "(SPM 변경 후 미재검증)"
+        )
+    return (
+        f"수동 본 유지 🔒 · SpeedTree 본 {measurement['count']}개 "
+        "(현재 SPM과 일치하는 XML)"
+    )
+
+
+def selected_row_detail_text(spm, statuses):
+    return "\n".join(
+        (
+            f"경로  {spm}",
+            f"① SPM  {statuses.get('spm_status', '-')}",
+            f"② Blender  {statuses.get('blend_status', '-')}",
+            f"③ Unreal  {statuses.get('push_status', '-')}",
+        )
+    )
+
+
+def spm_check_status_parts(audit):
+    """Return human-readable SPM settings without implying a failure."""
+    generators = audit.get("generators") or []
+    fixed = sum(
+        1
+        for generator in generators
+        if generator.get("style") == 0.0
+        and (generator.get("bones") or 0) > 0
+    )
+    relative = sum(
+        1 for generator in generators if generator.get("style") == 1.0
+    )
+    disabled = sum(
+        1
+        for generator in generators
+        if generator.get("style") == 0.0
+        and (generator.get("bones") or 0) == 0
+    )
+    material_renames = sum(
+        1 for material in (audit.get("materials") or [])
+        if material.get("needs_prefix")
+    )
+    parts = []
+    if fixed:
+        parts.append(f"고정 본(Absolute) {fixed}개")
+    if relative:
+        parts.append(f"자동 본(Relative) {relative}개")
+    if disabled:
+        parts.append(f"본 꺼짐 {disabled}개")
+    if material_renames:
+        parts.append(f"M_ 필요 {material_renames}개")
+    graph = audit.get("bone_graph") or {}
+    if graph.get("root_target_generator_count"):
+        parts.append(
+            f"자동 대상 {graph['root_target_generator_count']} / "
+            f"Base 제외 {graph['base_excluded_generator_count']}"
+        )
+    if graph.get("unknown_base_generators"):
+        parts.append(f"Base 미분류 {len(graph['unknown_base_generators'])}")
+    return parts
 
 
 class BatchItemError(RuntimeError):
@@ -139,6 +302,7 @@ class App:
         self.cfg = load_config()
         self.state = load_state()
         self.items = {}  # iid -> {"spm": Path, "checked": bool, "wind_override": str}
+        self._table_full_values = {}
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.ui_queue = queue.Queue()
         self.worker = None
@@ -157,7 +321,7 @@ class App:
         )
 
         root.title("SK Vegetation Batch — 검사 → 본 세팅 → Blender → Unreal")
-        root.geometry("1460x760")
+        root.geometry("1460x840")
         self._build_ui()
         self.root.after(100, self._drain_ui_queue)
         self.scan()
@@ -313,6 +477,12 @@ class App:
         Tooltip(self.btn_check, ("아무것도 수정하지 않습니다.\n"
                                  "SPM 본 세팅 상태 / M_ 머티리얼 / blend 최신 여부 / 핸드오프 JSON "
                                  "준비 여부를 빠르게 확인해서 표에 채웁니다.\n"
+                                 "'고정 본(Absolute)'은 자동 보정 실패가 아니라 가지마다 고정된 "
+                                 "본 수를 쓰는 Generator이고, '자동 본(Relative)'은 가지 길이에 따라 "
+                                 "본 밀도가 계산되는 Generator입니다.\n"
+                                 "수동 본 유지 항목은 검증된 최근 XML의 실제 SpeedTree 본 수를 "
+                                 "표시하고, 이후 SPM이 바뀌었으면 미재검증으로 구분합니다. "
+                                 "검사 결과는 파일이나 실행 캐시에 저장하지 않습니다.\n"
                                  "오래 걸리는 ①②③을 돌리기 전에 먼저 눌러보세요."))
         self.btn_spm = ttk.Button(actions, text="① SPM 본 세팅 (빠름)",
                                   command=lambda: self.start_batch("spm"))
@@ -372,28 +542,78 @@ class App:
         ).pack(side="left", padx=(14, 0))
 
         cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status", "folder")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
+        visible_cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status")
+        tablef = ttk.LabelFrame(
+            self.root,
+            text="파일 목록 (표는 요약 · 행을 선택하면 아래에 전체 내용 표시)",
+            padding=4,
+        )
+        tablef.pack(fill="both", expand=True, padx=6)
+        tablef.columnconfigure(0, weight=1)
+        tablef.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            tablef,
+            columns=cols,
+            displaycolumns=visible_cols,
+            show="tree headings",
+            height=12,
+        )
         self.tree.heading("#0", text="파일 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
-        self.tree.column("#0", width=310, anchor="w")
+        self.tree.column("#0", width=300, minwidth=220, anchor="w")
         headers = {
-            "bone_mode": ("본 모드 (▼ 클릭)", 135),
-            "wind": ("Wind (▼ 클릭)", 145),
-            "spm_status": ("① SPM 본 세팅", 210),
-            "blend_status": ("② Blender Repair / 교체 상태", 260),
+            "bone_mode": ("본 모드 (▼)", 125),
+            "wind": ("Wind (▼)", 110),
+            "spm_status": ("① SPM", 205),
+            "blend_status": ("② Blender", 245),
             "push_status": ("③ Unreal", 190),
-            "folder": ("폴더", 220),
+            "folder": ("폴더", 0),
         }
         for key, (label, width) in headers.items():
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=6)
+        tree_y = ttk.Scrollbar(tablef, orient="vertical", command=self.tree.yview)
+        tree_x = ttk.Scrollbar(tablef, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_y.grid(row=0, column=1, sticky="ns")
+        tree_x.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Control-c>", self.copy_selected_paths, add="+")
+        self.tree.bind("<<TreeviewSelect>>", self._refresh_selected_detail, add="+")
+
+        detailf = ttk.LabelFrame(
+            self.root,
+            text="선택 항목 상세 (읽기 전용)",
+            padding=4,
+        )
+        detailf.pack(fill="x", padx=6, pady=(4, 0))
+        detailf.columnconfigure(0, weight=1)
+        detailf.rowconfigure(0, weight=1)
+        self.detail_text = tk.Text(
+            detailf,
+            height=5,
+            wrap="word",
+            state="disabled",
+            borderwidth=0,
+        )
+        detail_y = ttk.Scrollbar(
+            detailf, orient="vertical", command=self.detail_text.yview
+        )
+        self.detail_text.configure(yscrollcommand=detail_y.set)
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_y.grid(row=0, column=1, sticky="ns")
 
         logf = ttk.LabelFrame(self.root, text="로그", padding=4)
         logf.pack(fill="both", padx=6, pady=4)
-        self.log_text = tk.Text(logf, height=9, wrap="none", state="disabled")
-        self.log_text.pack(fill="both", expand=True)
+        logf.columnconfigure(0, weight=1)
+        logf.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(logf, height=7, wrap="none", state="disabled")
+        log_y = ttk.Scrollbar(logf, orient="vertical", command=self.log_text.yview)
+        log_x = ttk.Scrollbar(logf, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=log_y.set, xscrollcommand=log_x.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_y.grid(row=0, column=1, sticky="ns")
+        log_x.grid(row=1, column=0, sticky="ew")
 
     def _pick_root(self):
         path = filedialog.askdirectory(initialdir=self.root_var.get())
@@ -402,6 +622,40 @@ class App:
 
     def log(self, msg):
         self.ui_queue.put(("log", msg))
+
+    def _table_display_value(self, iid, column, value):
+        if column not in STATUS_COLUMNS:
+            return value
+        if not hasattr(self, "_table_full_values"):
+            self._table_full_values = {}
+        full_value = str(value or "-")
+        self._table_full_values[(iid, column)] = full_value
+        return compact_table_status(full_value)
+
+    def _set_table_cell(self, iid, column, value):
+        self.tree.set(iid, column, self._table_display_value(iid, column, value))
+        self._refresh_selected_detail()
+
+    def _refresh_selected_detail(self, _event=None):
+        detail = getattr(self, "detail_text", None)
+        if detail is None:
+            return
+        selected = self.tree.selection()
+        if not selected or selected[0] not in self.items:
+            text = "행을 선택하면 전체 경로와 ①②③ 상태가 여기에 표시됩니다."
+        else:
+            iid = selected[0]
+            statuses = {
+                column: getattr(self, "_table_full_values", {}).get(
+                    (iid, column), self.tree.set(iid, column) or "-"
+                )
+                for column in STATUS_COLUMNS
+            }
+            text = selected_row_detail_text(self.items[iid]["spm"], statuses)
+        detail.configure(state="normal")
+        detail.delete("1.0", "end")
+        detail.insert("1.0", text)
+        detail.configure(state="disabled")
 
     def _drain_ui_queue(self):
         try:
@@ -416,7 +670,7 @@ class App:
                 elif kind == "cell":
                     iid, column, value = payload
                     if iid in self.items:
-                        self.tree.set(iid, column, value)
+                        self._set_table_cell(iid, column, value)
                 elif kind == "progress":
                     self.progress_var.set(payload)
                 elif kind == "batch_progress":
@@ -609,6 +863,10 @@ class App:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
+        if not hasattr(self, "_table_full_values"):
+            self._table_full_values = {}
+        else:
+            self._table_full_values.clear()
         spms = prepared["spms"]
         snapshots = prepared["snapshots"]
         for iid, snapshot_error in prepared.get("errors", []):
@@ -671,15 +929,22 @@ class App:
                 "live_texture_paths": (),
                 "live_status_signature": None,
             }
+            spm_status = (
+                manual_bone_status_text(spm)
+                if manual_bones_locked
+                else entry.get("spm_status", "-")
+            )
+            blend_status = entry.get("blend_status", "-")
+            push_status = self._current_push_status_text(iid, spm)
             self.tree.insert(
                 "", "end", iid=iid,
                 text=self._item_label(iid),
                 values=(
                     self._bone_mode_label(iid),
                     self._wind_label(iid),
-                    entry.get("spm_status", "-"),
-                    entry.get("blend_status", "-"),
-                    self._current_push_status_text(iid, spm),
+                    self._table_display_value(iid, "spm_status", spm_status),
+                    self._table_display_value(iid, "blend_status", blend_status),
+                    self._table_display_value(iid, "push_status", push_status),
                     str(spm.parent),
                 ),
             )
@@ -974,15 +1239,14 @@ class App:
         entry = self.state.setdefault(iid, {})
         if locked:
             entry["manual_bones_locked"] = True
-            entry["spm_status"] = "수동 본 유지 🔒"
-            entry["spm_summary"] = "수동 본 유지 🔒"
+            entry["spm_status"] = manual_bone_status_text(item["spm"])
         else:
             entry.pop("manual_bones_locked", None)
             entry["spm_status"] = "자동 계산 대상"
             entry.pop("spm_summary", None)
         self.tree.item(iid, text=self._item_label(iid))
         self.tree.set(iid, "bone_mode", self._bone_mode_label(iid))
-        self.tree.set(iid, "spm_status", entry["spm_status"])
+        self._set_table_cell(iid, "spm_status", entry["spm_status"])
         save_state(self.state)
         self.log(
             f"{'수동 본 유지 설정' if locked else '자동 계산 복귀'}: "
@@ -1075,7 +1339,8 @@ class App:
         self.legacy_spm_calibration_signature = (
             legacy_calibration_settings_signature(self.cfg)
         )
-        save_config(self.cfg)
+        if phase != "check":
+            save_config(self.cfg)
         self.active_push_transport = self.cfg.get("push_transport", "rpc")
         # snapshot tk vars on the main thread; the worker must not touch them
         self.force_rerun = bool(self.force_var.get())
@@ -1300,7 +1565,13 @@ class App:
                 if getattr(exc, "report_file", None):
                     details["report"] = str(exc.report_file)
                 self._record_phase_status(
-                    iid, column, status_text, kind, reason, details=details
+                    iid,
+                    column,
+                    status_text,
+                    kind,
+                    reason,
+                    details=details,
+                    persist=phase != "check",
                 )
                 with self.state_lock:
                     failed_items.add(iid)
@@ -1360,7 +1631,8 @@ class App:
 
         with self.state_lock:
             self._phase_failed_items = set(failed_items)
-            save_state(self.state)
+            if phase != "check":
+                save_state(self.state)
         if emit_done:
             progress = (
                 f"{title} 중단 — {self._phase_abort_reason}"
@@ -1689,60 +1961,37 @@ class App:
     def _record_live_blend_status(self, iid, spm, persist=True):
         text = self._blend_status_text(spm)
         self.ui_queue.put(("cell", (iid, "blend_status", text)))
-        with self.state_lock:
-            self.state.setdefault(iid, {})["blend_status"] = text
-            if persist:
+        if persist:
+            with self.state_lock:
+                self.state.setdefault(iid, {})["blend_status"] = text
                 save_state(self.state)
         return text
 
     def _job_check(self, iid, spm):
         from spm_audit import audit_spm, sk_readiness
 
-        audit = audit_spm(spm, analyze_bone_graph=True)
-        readiness = sk_readiness(audit)
-        gens = audit["generators"]
-        n_rel = sum(1 for g in gens if g["style"] == 1.0)
-        n_abs = sum(1 for g in gens if g["style"] == 0.0 and (g["bones"] or 0) > 0)
-        n_off = sum(1 for g in gens if g["style"] == 0.0 and (g["bones"] or 0) == 0)
-        n_mat = sum(1 for m in audit["materials"] if m["needs_prefix"])
-        entry = self.state.setdefault(iid, {})
+        entry = self.state.get(iid, {})
         manual_bones_locked = self.items[iid].get("manual_bones_locked", False)
         summary = entry.get("spm_summary", "")
-        parts = []
-        if n_abs:
-            parts.append(f"미보정 {n_abs}")
-        if n_rel:
-            parts.append(f"Relative {n_rel}")
-        if n_off:
-            parts.append(f"무본 {n_off}")
-        if n_mat:
-            parts.append(f"M_필요 {n_mat}")
-        graph = audit.get("bone_graph") or {}
-        if graph.get("root_target_generator_count"):
-            parts.append(
-                f"자동 대상 {graph['root_target_generator_count']} / "
-                f"Base 제외 {graph['base_excluded_generator_count']}"
-            )
-        if graph.get("unknown_base_generators"):
-            parts.append(f"Base 미분류 {len(graph['unknown_base_generators'])}")
         if manual_bones_locked:
-            detail = " · ".join(parts) if parts else "본 설정 없음"
-            if not readiness["ready"]:
-                detail = "현재 본 0 — ② 실행 전 SpeedTree에서 직접 설정 필요"
-            text = f"수동 본 유지 🔒 · {detail}"
-        elif not readiness["ready"]:
-            disabled = ", ".join(
-                f"{item['generator']}({item['style']:g}/{item['bones']:g})"
-                for item in readiness["disabled_generators"]
-            )
-            text = f"오류: SK 미제작 · {disabled}"
+            text = manual_bone_status_text(spm)
         else:
-            text = " · ".join(parts) if parts else "본 설정 없음"
-        if summary and summary not in text:
+            audit = audit_spm(spm, analyze_bone_graph=True)
+            readiness = sk_readiness(audit)
+            parts = spm_check_status_parts(audit)
+            if not readiness["ready"]:
+                disabled = ", ".join(
+                    f"{item['generator']}({item['style']:g}/{item['bones']:g})"
+                    for item in readiness["disabled_generators"]
+                )
+                text = f"오류: SK 미제작 · {disabled}"
+            else:
+                text = " · ".join(parts) if parts else "본 설정 없음"
+        if not manual_bones_locked and summary and summary not in text:
             text += f" | {summary}"
         self.ui_queue.put(("cell", (iid, "spm_status", text)))
 
-        self._record_live_blend_status(iid, spm)
+        self._record_live_blend_status(iid, spm, persist=False)
 
         ok, why = self._handoff_ready(spm)
         pushed = self._current_push_status_text(iid, spm)
@@ -1779,11 +2028,10 @@ class App:
         entry = self.state.setdefault(iid, {})
         item = self.items[iid]
         if item.get("manual_bones_locked", False):
-            summary = "수동 본 유지 🔒 (① 전체 건너뜀)"
+            summary = f"{manual_bone_status_text(spm)} · ① 전체 건너뜀"
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
-                entry["spm_summary"] = summary
                 save_state(self.state)
             self.log(f"본 세팅 건너뜀 (수동 본 유지): {spm.name}")
             return

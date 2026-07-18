@@ -10,10 +10,23 @@ WPO/마스크 방식 식생을 스켈레탈 메시(SK_*.spm)로 교체하는 반
 ## 사용 순서 (빠른 것 → 느린 것)
 
 **🔍 검사 (수정 없음)** — 표에 상태만 채운다:
-SPM 본 세팅 상태(미보정/Relative/무본/M_필요), blend 최신 여부,
+SPM 본 세팅 상태(고정 본/자동 본/본 꺼짐/M_ 필요), blend 최신 여부,
 push에 필요한 핸드오프 산출물(wind JSON) 준비 여부. SK Batch를 열 때도 저장된
 과거 문구가 아니라 실제 SPM/blend 시간을 비교해 `생성 필요` 또는
 `Blender 갱신 필요 — SPM이 더 최근에 수정됨`을 바로 표시한다.
+`고정 본(Absolute)`은 미보정 오류가 아니라 가지마다 고정된 본 수를 쓰는
+Generator이고, `자동 본(Relative)`은 가지 길이에 따라 본 밀도가 계산되는
+Generator다. 따라서 ①을 완료한 뒤에도 의도적으로 고정 본 항목이 남을 수 있다.
+`수동 본 유지` 항목의 총 본 수는 Generator 설정 개수로 추정하지 않는다. 검증된
+SpeedTree XML export receipt의 실제 Bone 수를 표시하고, SPM SHA-256까지 같으면
+현재 실측값, 이후 SPM 내용이 바뀌었으면 `최근 실측`과 `미재검증`을 함께 표시한다.
+검증할 XML이 없을 때만 `본 수 미측정`으로 표시한다. 이 검사는 파일 저장,
+timestamp 변경, SpeedTree 실행, 상태 캐시 저장을 하지 않으므로 ①~③ 재실행을
+예약하지 않는다.
+
+목록 표에는 ①~③ 상태를 짧게 줄여 표시한다. 행을 선택하면 표 아래 `선택 항목
+상세`에서 전체 경로와 줄이지 않은 상태 문구를 볼 수 있으며, `Ctrl+C`로 선택한
+SPM 경로를 복사할 수 있다.
 SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 실제
 `Leaf Mesh`/`Frond` Generator의 Material과 Mesh가 같은 새 Atlas 자산에 연결됐는지도
 검사한다. 숨김·삭제·컬링 상태이거나 실제 생성 Node가 0개인 Generator는 export 대상이
@@ -107,9 +120,11 @@ BWR `SpeedTree → Import → Repair` 실행, wind 프리셋은 파일명 기반
 오류와 등록 비용을 가져오지 않는다. SpeedTree가 만든 `.stmat`의 실제 Material
 목록은 Blender를 띄우기 전에 가벼운 SpeedTree FBX 사전 export로 먼저 검사한다.
 이 검사를 통과한 항목만 무거운 Blender Repair로 넘어간다. 실제 생성 Node가 쓰는
-재질이 FBX에서 빠졌다면 해당 SpeedTree Generator의 기존 배경색은 보존하고 전경만
-임시 자홍색으로 표시한다. 원래 전경색은 SPM 백업과 sidecar receipt에 저장되며,
-문제가 해결된 뒤 사용자 색상 충돌이 없을 때만 정확히 원복한다.
+재질이 FBX에서 빠졌다면 정확한 Generator 이름/GUID를 보고하고 차단하되 SPM은
+수정하지 않는다. 구형 `Cluster` 렌더 텍스처를 참조하는 Generator의 전경 자홍색
+표시는 PCG ①에서 새 SK SPM을 생성한 직후에만 1회 기록한다. 기존 SK 데이터는
+`migrate_legacy_cluster_markers.py --apply`로 1회 이관하며, SPM별 백업과 영구
+receipt를 남긴다. 이후 재질 사전검사는 이 색을 변경하거나 원복하지 않는다.
 
 **③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
 새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,

@@ -1,3 +1,4 @@
+import copy
 import queue
 import json
 import sys
@@ -90,7 +91,7 @@ class ManualBonesTests(unittest.TestCase):
         iid = str(spm)
         app = gui.App.__new__(gui.App)
         app.items = {iid: {"spm": spm, "manual_bones_locked": True}}
-        app.state = {}
+        app.state = {iid: {"spm_summary": "본 282 / 가지 90"}}
         app.state_lock = threading.Lock()
         app.ui_queue = queue.Queue()
         app.log = lambda _message: None
@@ -101,6 +102,91 @@ class ManualBonesTests(unittest.TestCase):
             app._job_spm(iid, spm)
 
         self.assertIn("① 전체 건너뜀", app.state[iid]["spm_status"])
+        self.assertEqual(app.state[iid]["spm_summary"], "본 282 / 가지 90")
+
+    def test_manual_check_uses_verified_count_and_does_not_persist_or_touch_spm(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            spm = Path(tmp) / "SK_tree_birch_paper_03.spm"
+            spm.write_bytes(b"stable-spm")
+            iid = str(spm)
+            app = gui.App.__new__(gui.App)
+            app.items = {iid: {"spm": spm, "manual_bones_locked": True}}
+            app.state = {
+                iid: {
+                    "spm_summary": "SK 미제작",
+                    "calibration_cache": {"summary": "SK 미제작"},
+                }
+            }
+            app.state_lock = threading.RLock()
+            app.ui_queue = queue.Queue()
+            app._blend_status_text = mock.Mock(return_value="최신 ✓")
+            app._handoff_ready = mock.Mock(return_value=(True, "준비됨 ✓"))
+            app._current_push_status_text = mock.Mock(return_value="미전송")
+            before_state = copy.deepcopy(app.state)
+            before_source = (
+                spm.read_bytes(),
+                spm.stat().st_size,
+                spm.stat().st_mtime_ns,
+            )
+
+            with mock.patch.object(
+                gui,
+                "manual_bone_status_text",
+                return_value=(
+                    "수동 본 유지 🔒 · SpeedTree 본 282개 "
+                    "(현재 SPM과 일치하는 XML)"
+                ),
+            ), mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
+                "spm_audit.sk_readiness", return_value={"ready": False}
+            ), mock.patch.object(gui, "save_state") as save_mock:
+                app._job_check(iid, spm)
+
+            queued = []
+            while not app.ui_queue.empty():
+                queued.append(app.ui_queue.get_nowait())
+            spm_text = next(
+                payload[2]
+                for kind, payload in queued
+                if kind == "cell" and payload[1] == "spm_status"
+            )
+            self.assertIn("282개", spm_text)
+            self.assertNotIn("현재 본 0", spm_text)
+            self.assertNotIn("SK 미제작", spm_text)
+            self.assertEqual(app.state, before_state)
+            self.assertEqual(
+                before_source,
+                (spm.read_bytes(), spm.stat().st_size, spm.stat().st_mtime_ns),
+            )
+            save_mock.assert_not_called()
+
+    def test_check_batch_does_not_persist_state_or_dispatch_processing_jobs(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        spm = Path("SK_read_only_check.spm")
+        target = {"spm": spm, "checked": True}
+        app.stop_flag = threading.Event()
+        app.state_lock = threading.RLock()
+        app.state = {str(spm): {"calibration_cache": {"summary": "kept"}}}
+        app.ui_queue = queue.Queue()
+        app.cfg = {"check_parallel_jobs": 1}
+        app.log = mock.Mock()
+        app._job_check = mock.Mock()
+        app._job_spm = mock.Mock(side_effect=AssertionError("must not run"))
+        app._job_blender = mock.Mock(side_effect=AssertionError("must not run"))
+        app._job_push = mock.Mock(side_effect=AssertionError("must not run"))
+        before_state = copy.deepcopy(app.state)
+
+        with mock.patch.object(gui, "save_state") as save_mock:
+            result = app._run_batch("check", [target], emit_done=False)
+
+        self.assertTrue(result)
+        app._job_check.assert_called_once_with(str(spm), spm)
+        app._job_spm.assert_not_called()
+        app._job_blender.assert_not_called()
+        app._job_push.assert_not_called()
+        self.assertEqual(app.state, before_state)
+        save_mock.assert_not_called()
 
     def test_unchanged_cached_spm_returns_before_launching_any_process(self):
         gui = load_gui_module()
@@ -228,7 +314,10 @@ class ManualBonesTests(unittest.TestCase):
                     "manual_bones_locked": False,
                 },
             }
-            app.state = {first_iid: {}, second_iid: {}}
+            app.state = {
+                first_iid: {"spm_summary": "본 282 / 가지 90"},
+                second_iid: {},
+            }
             app.tree = FakeTree()
             app.log = lambda _message: None
 
@@ -239,6 +328,9 @@ class ManualBonesTests(unittest.TestCase):
             self.assertEqual(app.items[first_iid]["bone_mode"], "manual")
             self.assertFalse(app.items[second_iid]["manual_bones_locked"])
             self.assertNotIn("manual_bones_locked", app.state[second_iid])
+            self.assertEqual(
+                app.state[first_iid]["spm_summary"], "본 282 / 가지 90"
+            )
             self.assertIn("수동 본 유지", app.tree.values[(first_iid, "bone_mode")])
 
     def test_wind_dropdown_sets_explicit_value_for_only_the_target_row(self):

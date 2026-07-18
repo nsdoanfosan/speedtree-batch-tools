@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -73,6 +75,127 @@ class FakeTree:
 
 
 class SkBatchUiConvenienceTests(unittest.TestCase):
+    def test_verified_xml_bone_count_is_read_only_and_content_matched(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_manual_01.spm"
+            spm.write_bytes(b"current-spm")
+            xml_path = root / "xml" / f"{spm.stem}.xml"
+            xml_path.parent.mkdir()
+            xml_path.write_text(
+                (
+                    f'<SpeedTreeRaw Source="{spm}"><Bones Count="2">'
+                    '<Bone ID="0" Generator="Branch" />'
+                    '<Bone ID="1" Generator="Branch 2" />'
+                    "</Bones></SpeedTreeRaw>"
+                ),
+                encoding="utf-8",
+            )
+            receipt_path = (
+                xml_path.parent
+                / ".speedtree_export_cache"
+                / f"{xml_path.name}.json"
+            )
+            receipt_path.parent.mkdir()
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "inputs": {
+                            "spm": {
+                                "path": str(spm),
+                                "size": spm.stat().st_size,
+                                "sha256": hashlib.sha256(spm.read_bytes()).hexdigest(),
+                            }
+                        },
+                        "artifacts": [
+                            {
+                                "relative_path": xml_path.name,
+                                "size": xml_path.stat().st_size,
+                                "sha256": hashlib.sha256(
+                                    xml_path.read_bytes()
+                                ).hexdigest(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = (
+                spm.read_bytes(),
+                spm.stat().st_mtime_ns,
+                xml_path.read_bytes(),
+                xml_path.stat().st_mtime_ns,
+            )
+
+            measurement = gui.current_speedtree_bone_measurement(spm)
+
+            self.assertEqual(measurement["count"], 2)
+            self.assertTrue(measurement["current"])
+            self.assertEqual(
+                before,
+                (
+                    spm.read_bytes(),
+                    spm.stat().st_mtime_ns,
+                    xml_path.read_bytes(),
+                    xml_path.stat().st_mtime_ns,
+                ),
+            )
+            spm.write_bytes(b"changed-spm")
+            stale = gui.current_speedtree_bone_measurement(spm)
+            self.assertEqual(stale["count"], 2)
+            self.assertFalse(stale["current"])
+
+    def test_compact_table_keeps_full_selected_row_detail(self):
+        gui = load_gui_module()
+        full = "수동 본 유지 🔒 · SpeedTree 본 282개 (현재 SPM과 일치하는 XML)"
+
+        compact = gui.compact_table_status(full, max_chars=24)
+        detail = gui.selected_row_detail_text(
+            Path("SK_tree_birch_paper_03.spm"),
+            {
+                "spm_status": full,
+                "blend_status": "최신 ✓",
+                "push_status": "준비됨 ✓",
+            },
+        )
+
+        self.assertLessEqual(len(compact), 24)
+        self.assertTrue(compact.endswith("…"))
+        self.assertIn(full, detail)
+        self.assertIn("SK_tree_birch_paper_03.spm", detail)
+
+    def test_spm_check_uses_clear_bone_style_names(self):
+        gui = load_gui_module()
+        parts = gui.spm_check_status_parts(
+            {
+                "generators": [
+                    {"style": 0.0, "bones": 2.0},
+                    {"style": 1.0, "bones": 0.5},
+                    {"style": 0.0, "bones": 0.0},
+                ],
+                "materials": [{"needs_prefix": True}],
+                "bone_graph": {
+                    "root_target_generator_count": 2,
+                    "base_excluded_generator_count": 1,
+                    "unknown_base_generators": [{"name": "Unknown"}],
+                },
+            }
+        )
+
+        self.assertEqual(
+            parts,
+            [
+                "고정 본(Absolute) 1개",
+                "자동 본(Relative) 1개",
+                "본 꺼짐 1개",
+                "M_ 필요 1개",
+                "자동 대상 2 / Base 제외 1",
+                "Base 미분류 1",
+            ],
+        )
+        self.assertNotIn("미보정", " · ".join(parts))
+
     def test_first_click_isolates_row_and_ctrl_c_copies_that_spm_path(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:

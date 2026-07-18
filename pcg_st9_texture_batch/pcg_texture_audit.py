@@ -1971,6 +1971,24 @@ def target_spm_status(folder, mesh_name):
     }
 
 
+def _mark_new_sk_or_rollback(target):
+    """Apply the creation-only marker or remove the incomplete new SK."""
+    target = Path(target)
+    try:
+        return mark_legacy_cluster_generators_once(target)
+    except Exception as exc:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            raise RuntimeError(
+                f"legacy Cluster marker failed and new SK cleanup failed: "
+                f"{target}: {cleanup_exc}"
+            ) from exc
+        raise
+
+
 def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=None):
     folder = Path(folder)
     if target_mesh_names:
@@ -2002,6 +2020,23 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
                 if not dry_run:
                     shutil.copy2(src, target)
                     created = str(target)
+            if created:
+                legacy_marker = _mark_new_sk_or_rollback(target)
+            elif dry_run and would_create:
+                candidates = legacy_cluster_generator_candidates(src)
+                legacy_marker = {
+                    "status": "planned_for_new_sk",
+                    "changed": bool(candidates),
+                    "generator_count": len(candidates),
+                    "source_spm": str(src),
+                    "target_spm": str(target),
+                }
+            else:
+                legacy_marker = {
+                    "status": "not_run_existing_sk",
+                    "changed": False,
+                    "generator_count": 0,
+                }
             patch = (
                 {"dry_run": True, "renames": m_prefix_plan(target if existing or not dry_run else src, exclude=exclude_materials)}
                 if dry_run else patch_m_prefix(target, exclude=exclude_materials)
@@ -2018,6 +2053,7 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
                 "would_create": would_create if dry_run else None,
                 "created": created,
                 "patch": patch,
+                "legacy_cluster_marker": legacy_marker,
             })
         return {"folder": str(folder), "targets": results}
 
@@ -2039,11 +2075,28 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
             created = str(target)
         else:
             created = None
+    would_create = str(target) if dry_run and not preferred else None
+    if created:
+        legacy_marker = _mark_new_sk_or_rollback(target)
+    elif dry_run and would_create:
+        candidates = legacy_cluster_generator_candidates(src)
+        legacy_marker = {
+            "status": "planned_for_new_sk",
+            "changed": bool(candidates),
+            "generator_count": len(candidates),
+            "source_spm": str(src),
+            "target_spm": str(target),
+        }
+    else:
+        legacy_marker = {
+            "status": "not_run_existing_sk",
+            "changed": False,
+            "generator_count": 0,
+        }
     patch = (
         {"dry_run": True, "renames": m_prefix_plan(target if preferred else src, exclude=exclude_materials)}
         if dry_run else patch_m_prefix(target, exclude=exclude_materials)
     )
-    would_create = str(target) if dry_run and not preferred else None
     has_work = bool(would_create if dry_run else created) or bool(
         patch.get("renames"))
     return {
@@ -2056,6 +2109,7 @@ def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=
         "would_create": would_create,
         "created": created,
         "patch": patch,
+        "legacy_cluster_marker": legacy_marker,
     }
 
 
@@ -2584,6 +2638,71 @@ def is_cluster_render_material(folder, spm, refs):
     # The semantic boundary is the Cluster directory itself, not ownership by
     # the current asset folder.
     return any(part.lower() == "cluster" for part in Path(color).parts[:-1])
+
+
+def legacy_cluster_generator_candidates(spm):
+    """Generators whose material Color source is an old Cluster render.
+
+    This provenance works before a managed Atlas material exists, so it is
+    suitable for the one-time hook immediately after an SK copy is created.
+    Hidden source Generators are included intentionally: after Atlas handoff
+    they remain in the model as the authored legacy reference to distinguish.
+    """
+    spm = Path(spm)
+    material_names = {}
+    for row in extract_material_image_refs(spm):
+        refs = row.get("refs") or []
+        material_id = str(row.get("material_id") or "").strip()
+        if material_id and is_cluster_render_material(spm.parent, spm, refs):
+            material_names[material_id] = str(row.get("material_name") or "")
+
+    candidates = {}
+    for binding in leaf_generator_bindings(spm):
+        material_id = str(binding.get("material_id") or "").strip()
+        if material_id not in material_names:
+            continue
+        guid = str(binding.get("generator_guid") or "").strip()
+        if not guid:
+            continue
+        row = candidates.setdefault(guid, {
+            "generator_guid": guid,
+            "generator_name": str(binding.get("generator_name") or ""),
+            "generator_type": str(binding.get("generator_type") or ""),
+            "visible": bool(binding.get("visible")),
+            "export_participates": bool(binding.get("export_participates")),
+            "generated_node_count": int(
+                binding.get("generated_node_count") or 0),
+            "material_ids": [],
+            "material_names": [],
+            "slot_prefixes": [],
+        })
+        for key, value in (
+            ("material_ids", material_id),
+            ("material_names", material_names[material_id]),
+            ("slot_prefixes", str(binding.get("slot_prefix") or "")),
+        ):
+            if value and value not in row[key]:
+                row[key].append(value)
+        row["visible"] = bool(row["visible"] or binding.get("visible"))
+        row["export_participates"] = bool(
+            row["export_participates"] or binding.get("export_participates")
+        )
+        row["generated_node_count"] = max(
+            row["generated_node_count"],
+            int(binding.get("generated_node_count") or 0),
+        )
+    return [candidates[guid] for guid in sorted(candidates)]
+
+
+def mark_legacy_cluster_generators_once(spm, dry_run=False):
+    """Apply the permanent SK-creation marker; never run material preflight."""
+    from sk_batch.spm_legacy_cluster_marker import mark_generator_guids_once
+
+    return mark_generator_guids_once(
+        spm,
+        legacy_cluster_generator_candidates(spm),
+        dry_run=dry_run,
+    )
 
 
 def cluster_render_source_definitions(folder):
