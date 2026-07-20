@@ -171,6 +171,9 @@ def main():
         )
         if args.wind == "NONE":
             # Dead vegetation: keep the JSON contract but zero all sway.
+            # flexibility=0.0 makes the add-on emit all-zero non-trunk groups
+            # and bIsEnabled=false (trunk groups would still rock in Unreal's
+            # shader regardless of influence, so the add-on avoids them).
             settings.wind_preset = "CUSTOM"
             settings.dynamic_wind_flexibility = 0.0
             settings.dynamic_wind_gust_attenuation = 0.0
