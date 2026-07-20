@@ -106,6 +106,16 @@ def parse_managed_texture_path(value):
     }
 
 
+def _canonical_texture_base(spelling_counts):
+    """Pick one canonical spelling among case-variant texture base names.
+
+    Windows filesystems treat differently cased spellings as one managed set,
+    so the spelling used by the most role files wins; a single stray file such
+    as ``T_leaf_x_atlas_02_extra`` cannot rename or split the set.
+    """
+    return min(spelling_counts, key=lambda name: (-spelling_counts[name], name))
+
+
 def _coerce_directories(texture_dirs):
     if texture_dirs is None:
         return []
@@ -123,7 +133,8 @@ def index_texture_sets(texture_dirs):
 
     The result maps each normalized set key to a sorted list of directory-local
     candidates.  Keeping candidates separate prevents same-named sets in two
-    folders from being silently merged.
+    folders from being silently merged.  Base names that differ only by case
+    are one set; ``texture_bases`` reports one canonical spelling per set.
     """
     extension_rank = {
         extension: rank for rank, extension in enumerate(TEXTURE_EXTENSIONS)
@@ -149,12 +160,14 @@ def index_texture_sets(texture_dirs):
                 {
                     "directory": str(directory),
                     "set_key": set_key,
-                    "texture_bases": set(),
+                    "texture_bases": {},
                     "files": {},
                     "file_ranks": {},
                 },
             )
-            row["texture_bases"].add(parsed["texture_base"])
+            base = parsed["texture_base"]
+            spelling_counts = row["texture_bases"].setdefault(base.casefold(), {})
+            spelling_counts[base] = spelling_counts.get(base, 0) + 1
             rank = extension_rank[path.suffix.casefold()]
             previous = row["file_ranks"].get(role)
             candidate_rank = (rank, path.name.casefold(), path.name)
@@ -164,7 +177,11 @@ def index_texture_sets(texture_dirs):
 
         for set_key, mutable in local_rows.items():
             bases = sorted(
-                mutable["texture_bases"], key=lambda item: (item.casefold(), item)
+                (
+                    _canonical_texture_base(spelling_counts)
+                    for spelling_counts in mutable["texture_bases"].values()
+                ),
+                key=lambda item: (item.casefold(), item),
             )
             files_by_role = {
                 role: mutable["files"][role]
@@ -370,7 +387,9 @@ def _resolve_indexed_texture_set(
     return {
         "status": "ok" if complete else "incomplete_texture_set",
         "set_key": set_key,
-        "texture_base": requested_base if complete else candidate["texture_base"],
+        # Prefer the on-disk canonical spelling so a differently cased STMAT
+        # reference cannot leak into downstream asset naming.
+        "texture_base": candidate["texture_base"] or requested_base,
         "texture_dir": candidate["directory"],
         "files": {
             role: candidate["files"][role]

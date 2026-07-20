@@ -86,6 +86,59 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
             self.assertEqual(result["missing"], [])
             json.dumps(result, sort_keys=True)
 
+    def test_case_variant_role_file_stays_in_one_set(self):
+        # Regression: T_Leaf_velvet_grass_Atlas_02_* plus a stray lower-case
+        # T_leaf_velvet_grass_atlas_02_extra.tga must resolve as one complete
+        # set with the majority spelling, not as ambiguous bases.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            textures = root / "texture"
+            self._write_set(
+                textures,
+                "T_Leaf_velvet_grass_Atlas_02",
+                roles=("color", "normal", "height", "opacity", "subsurface"),
+            )
+            (textures / "T_leaf_velvet_grass_atlas_02_extra.png").write_bytes(
+                b"extra"
+            )
+            stmat = root / "plant.stmat"
+            self._write_stmat(
+                stmat,
+                [
+                    (
+                        "M_Leaf_velvet_grass_Atlas_02_Mat",
+                        [
+                            (
+                                "Color",
+                                "texture/T_leaf_velvet_grass_atlas_02_color.png",
+                            ),
+                            (
+                                "Normal",
+                                "texture/T_leaf_velvet_grass_atlas_02_normal.png",
+                            ),
+                        ],
+                    )
+                ],
+            )
+
+            indexed = index_texture_sets(textures)["leafvelvetgrassatlas02"]
+            result = resolve_texture_bindings(stmat)
+
+            self.assertEqual(len(indexed), 1)
+            self.assertFalse(indexed[0]["ambiguous_bases"])
+            self.assertTrue(indexed[0]["complete"])
+            self.assertEqual(
+                indexed[0]["texture_bases"], ["T_Leaf_velvet_grass_Atlas_02"]
+            )
+            self.assertEqual(result["status"], "ok")
+            binding = result["bindings"][0]
+            self.assertEqual(binding["status"], "ok")
+            self.assertEqual(
+                binding["texture_base"], "T_Leaf_velvet_grass_Atlas_02"
+            )
+            self.assertEqual(set(binding["files"]), set(REQUIRED_TEXTURE_ROLES))
+            self.assertEqual(result["missing"], [])
+
     def test_complete_candidate_wins_over_earlier_partial_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
