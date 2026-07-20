@@ -376,13 +376,13 @@ class App:
         )
         night_check = ttk.Checkbutton(
             transport_opts,
-            text="전체 자동(야간)은 headless",
+            text="목록 전체 자동(야간)은 headless",
             variable=self.night_headless_var,
         )
         night_check.pack(side="left", padx=(12, 0))
         Tooltip(
             night_check,
-            "켜면 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
+            "켜면 목록 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
             "단독 ③ Push는 왼쪽 transport 선택을 따릅니다.",
         )
         ttk.Label(transport_opts, text="② Repair·③ export 동시:").pack(
@@ -511,15 +511,16 @@ class App:
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
         self.btn_all = ttk.Button(
             actions,
-            text="🌙 전체 자동 ①→②→③",
+            text="🌙 목록 전체 자동 ①→②→③",
             command=self.start_full_pipeline,
         )
         self.btn_all.pack(side="left", padx=(10, 4))
         Tooltip(
             self.btn_all,
-            "선택된 항목을 밤새 순서대로 처리합니다.\n"
+            "체크 상태와 무관하게 현재 목록의 모든 항목을 밤새 순서대로 처리합니다.\n"
             "① SPM 본 세팅 전체 완료 → ② Blender Repair 전체 완료 → "
             "③ Unreal Push 순서입니다.\n"
+            "개별 ①/②/③ 버튼만 체크된 항목을 대상으로 합니다.\n"
             "개별 실패·수동 처리 항목은 기록하고 나머지 파일은 계속 진행합니다.",
         )
         self.btn_stop = ttk.Button(actions, text="중지", command=self.stop_batch, state="disabled")
@@ -1359,9 +1360,9 @@ class App:
 
     def start_full_pipeline(self):
         self._close_cell_editor()
-        targets = [item for item in self.items.values() if item["checked"]]
+        targets = list(self.items.values())
         if not targets:
-            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+            messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
             return
         self.cfg = self._collect_cfg()
         self.spm_calibration_signature = calibration_settings_signature(self.cfg)
@@ -1385,7 +1386,10 @@ class App:
         ):
             btn.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.log("🌙 전체 자동 시작: ① SPM → ② Blender → ③ Unreal")
+        self.log(
+            f"🌙 목록 전체 자동 시작: {len(targets)}개 · "
+            "① SPM → ② Blender → ③ Unreal"
+        )
         self.worker = threading.Thread(
             target=self._run_full_pipeline,
             args=(targets,),
@@ -1822,7 +1826,7 @@ class App:
         except (OSError, ValueError) as exc:
             return False, f"텍스처 정규화 보고서 오류: {exc}"
         envelope = report.get("speedtree_pipeline_contract")
-        if envelope is None and report.get("speedtree_pipeline_contract_required"):
+        if envelope is None:
             return False, (
                 "공통 SpeedTree 계약 정보 없음 → ② Blender Repair 다시 실행"
             )
@@ -2415,6 +2419,49 @@ class App:
             ),
         ]
 
+    @staticmethod
+    def _push_material_contract(spm):
+        """Write a strict, live-validated contract wrapper for Blender Push."""
+        spm = Path(spm)
+        repair_report = (
+            spm.parent / "reports" /
+            f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+        )
+        try:
+            payload = json.loads(repair_report.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"SpeedTree Repair contract report could not be read: {exc}"
+            ) from exc
+        envelope = payload.get("speedtree_pipeline_contract")
+        if not isinstance(envelope, dict):
+            raise RuntimeError(
+                "SpeedTree Repair report has no current pipeline contract; "
+                "run Blender Repair again"
+            )
+        if (payload.get("handoff_preflight") or {}).get("status") != "ok":
+            raise RuntimeError(
+                "SpeedTree Repair handoff preflight is not ready; "
+                "run Blender Repair again"
+            )
+        validate_preflight_envelope(envelope, spm, require_ok=True)
+        source_fingerprint = str(envelope.get("source_fingerprint") or "")
+        suffix = source_fingerprint[:16] or hashlib.sha256(
+            _normalized_path(spm).encode("utf-8")
+        ).hexdigest()[:16]
+        contract_path = LOG_DIR / (
+            f"{spm.stem}_push_material_contract_{suffix}.json"
+        )
+        atomic_write_json(
+            contract_path,
+            {
+                "status": "ok",
+                "speedtree_pipeline_contract": envelope,
+                "source_repair_report": str(repair_report.resolve()),
+            },
+        )
+        return contract_path
+
     def _current_push_status_text(self, iid, spm):
         """Show current receipt validity without hashing multi-GB blend files."""
         entry = self.state.get(iid, {})
@@ -2524,6 +2571,7 @@ class App:
         send2ue_unreal_py = (
             Path(self.cfg["send2ue_dir"]) / "dependencies" / "unreal.py"
         )
+        material_contract = self._push_material_contract(spm)
         cmd = [
             self.cfg["blender_exe"],
             "--factory-startup",
@@ -2536,6 +2584,10 @@ class App:
             "headless_export",
             "--report",
             str(export_report),
+            "--spm",
+            str(spm),
+            "--material-contract",
+            str(material_contract),
             "--manifest",
             str(manifest_path),
             "--checkpoint",
@@ -2973,10 +3025,13 @@ class App:
         send2ue_unreal_py = (
             Path(self.cfg["send2ue_dir"]) / "dependencies" / "unreal.py"
         )
+        material_contract = self._push_material_contract(spm)
         cmd = [
             self.cfg["blender_exe"], "--factory-startup", "-b", str(blend),
             "--python", str(TOOL_DIR / "jobs" / "send2ue_push_job.py"), "--",
             "--report", str(job_report),
+            "--spm", str(spm),
+            "--material-contract", str(material_contract),
             "--transport", "rpc",
             "--manifest", str(manifest_path),
             "--checkpoint", str(checkpoint_path),

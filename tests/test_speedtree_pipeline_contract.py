@@ -14,7 +14,7 @@ for path in (REPO, PCG_DIR, SK_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pcg_texture_audit import AUTO_SPLIT_SUFFIXES, canonical_material_name
+from pcg_texture_audit import canonical_material_name, derived_material_base
 from spm_audit import read_spm as read_sk_spm, write_spm as write_sk_spm
 from speedtree_pipeline_contract import (
     BACKUP_DIRECTORY_NAMES,
@@ -242,11 +242,14 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 with self.subTest(directory=directory):
                     self.assertFalse(is_live_spm(backup))
 
-    def test_pcg_auto_split_tokens_match_the_central_namespace(self):
+    def test_pcg_production_group_uses_numeric_suffix_not_token_allowlist(self):
         self.assertEqual(
-            set(AUTO_SPLIT_SUFFIXES),
-            set(shared_contract_api().pcg_atlas_auto_split_tokens()),
+            derived_material_base(
+                "M_Leaf_common_grass_01_UserDefinedWinter"
+            ),
+            "M_Leaf_common_grass_01",
         )
+        self.assertIsNone(derived_material_base("M_stem_common_01"))
 
     def test_golden_vectors_are_consumed_from_the_central_api(self):
         api = shared_contract_api()

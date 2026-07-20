@@ -1508,7 +1508,8 @@ def cook_sbs_package(sbs_path, cache_root, cfg=None, timeout=1800):
     return sbsar
 
 
-def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None, timeout=1800):
+def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
+                           timeout=1800, force_recook=False):
     """Cook only the requested graphs while retaining package resources/dependencies.
 
     Legacy SBS packages often contain unrelated broken graphs, so package-wide
@@ -1523,6 +1524,10 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None, timeout=
         (f"{sbs_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
          + "|".join(name.lower() for name in requested)).encode("utf-8")
     ).hexdigest()[:16]
+    if force_recook:
+        # This is an explicit user action after Cluster_System changes.  Use a
+        # fresh cache location so no previously cooked dependency can survive.
+        key += "_manual_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     cache_dir = Path(cache_root) / f"{sbs_path.stem}_graphs_{key}"
     stable_sbsar = cache_dir / f"{sbs_path.stem}_{key}.sbsar"
     if stable_sbsar.is_file() and stable_sbsar.stat().st_size > 0:
@@ -1610,11 +1615,12 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None, timeout=
 def render_sbs_graph_maps(sbs_path, graph_name, texture_base, out_dir,
                           cache_root, cfg=None, maps=RENDER_MAPS,
                           size_log2=None, timeout=1800, return_info=False,
-                          normal_opengl=None):
+                          normal_opengl=None, force_recook=False):
     """Render final maps directly from a procedural/composite SBS graph."""
     cfg = cfg or load_config()
     sbsar = cook_sbs_graph_package(
-        sbs_path, [graph_name], cache_root, cfg=cfg, timeout=timeout)
+        sbs_path, [graph_name], cache_root, cfg=cfg, timeout=timeout,
+        force_recook=force_recook)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     produced = [out_dir / f"{texture_base}_{name}.tga" for name in maps]

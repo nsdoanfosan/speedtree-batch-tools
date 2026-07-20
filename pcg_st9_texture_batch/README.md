@@ -62,6 +62,11 @@ SK SPM 리페어 `.blend`의 상태 확인과 교체는 `..\sk_batch\SK_Batch.ba
 동일한 절대경로의 알베도+알파 쌍을 여러 Cluster SPM이 재사용하면 blend/메시는
 한 번만 만들고, 그 Cluster 결과를 사용하던 **최종 SK SPM 목록**만 합친다.
 Cluster SPM은 원본 아틀라스 추적 근거일 뿐이며 대상 개수와 파일 수정에서 제외한다.
+최종 SPM의 옛 Cluster Generator도 같은 원칙이다. 공용 Legacy Cluster 계약의
+receipt에 기록된 Generator GUID는 숨김/표시 여부와 무관하게 과거 출처로만 보존한다.
+receipt가 없는 현재 Generator만 실제 export 참여 여부를 보고 ② 작업 대상으로 센다.
+또한 현재 Material+Mesh 연결과 같은 이름의 Blender 아틀라스가 이미 완성돼 있으면
+예전 원본 텍스처가 남아 있어도 재제작 작업으로 되돌리지 않는다.
 
 - 다른 폴더의 아틀라스를 쓰는 경우(densiflora→scotspine)는 **그래프가 있는
   폴더 소유**로 정리된다: 작업은 소유 폴더 행에 나오고, 사용하는 폴더에는
@@ -87,6 +92,12 @@ Cluster SPM은 원본 아틀라스 추적 근거일 뿐이며 대상 개수와 �
 
 ## [③ 실행] — 연결 텍스처 세트별 T_ 텍스처 6장 만들기 (sbsrender)
 
+- 일반 `③ 실행`은 누락·불완전한 세트만 처리한다. `Cluster_System_01.sbsar`를
+  수정해 완성된 결과까지 갱신해야 할 때는 별도 `③ 전체 다시 뽑기` 버튼을 사용한다.
+  이 수동 실행은 체크 여부와 무관하게 현재 표의 완성 세트도 세트당 6장 전부 다시 렌더하며, 절차형
+  SBS 그래프의 기존 쿡 캐시도 재사용하지 않고 현재 Cluster_System으로 다시 쿡한다.
+  자동 변경 감지는 하지 않으며, 모든 렌더가 성공하면 결과 전체를 모아 Unreal 동기화를
+  한 번만 실행한다. SPM 연결 정리는 이 전용 버튼에서 실행하지 않는다.
 - 일반 관리 그래프는 세트 .sbs 전체를 쿡하지 않고 **Cluster_System_01.sbsar를
   sbsrender로 직접 렌더**한다. Cluster_System이 없는 procedural/다중 합성 그래프는
   최종 `basecolor/normal/roughness/height/AO/subsurface/opacity` 노드를 Cluster_System 입력에

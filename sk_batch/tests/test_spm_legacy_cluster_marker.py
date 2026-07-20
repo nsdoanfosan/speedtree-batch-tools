@@ -23,6 +23,7 @@ from pcg_texture_audit import (  # noqa: E402
 )
 from spm_legacy_cluster_marker import (  # noqa: E402
     MARKER_VALUES,
+    inspect_legacy_cluster_state,
     marker_receipt_path,
 )
 from migrate_legacy_cluster_markers import (  # noqa: E402
@@ -196,6 +197,74 @@ class LegacyClusterMarkerTests(unittest.TestCase):
             result = mark_legacy_cluster_generators_once(spm)
             self.assertEqual(result["status"], "not_applicable")
             self.assertFalse(marker_receipt_path(spm).exists())
+
+    def test_receipt_guid_classification_survives_reconnect_and_color_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_tree_lineage.spm")
+            mark_legacy_cluster_generators_once(spm)
+
+            model = ET.fromstring(gzip.decompress(spm.read_bytes()))
+            source = next(
+                item for item in model.findall("./Assets/Material_v8")
+                if item.attrib.get("ID") == "2"
+            )
+            source.find("./Textures/TexFilename").text = (
+                r"texture\new_atlas_color.tga"
+            )
+            visible = next(
+                item for item in model.findall("./Generator")
+                if item.findtext("GUID") == "legacy-visible"
+            )
+            extra = visible.find("Extra")
+            for tag, value in FOREGROUND.items():
+                extra.find(tag).text = value
+            spm.write_bytes(gzip.compress(ET.tostring(model, encoding="utf-8")))
+            before = (spm.read_bytes(), spm.stat().st_mtime_ns)
+
+            state = inspect_legacy_cluster_state(spm)
+            candidates = legacy_cluster_generator_candidates(spm)
+
+            self.assertTrue(state["receipt_valid"])
+            self.assertEqual(
+                set(state["classified_generator_guids"]),
+                {"legacy-visible", "legacy-hidden"},
+            )
+            self.assertEqual(state["marker_drift_guids"], ["legacy-visible"])
+            self.assertEqual(
+                {row["generator_guid"] for row in candidates},
+                {"legacy-visible", "legacy-hidden"},
+            )
+            self.assertTrue(all(
+                row["classification_evidence"] == "legacy_marker_receipt"
+                for row in candidates
+            ))
+            self.assertEqual(
+                (spm.read_bytes(), spm.stat().st_mtime_ns), before
+            )
+
+    def test_color_without_receipt_is_never_classified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = write_spm(
+                Path(temporary) / "SK_tree_problem_color.spm",
+                include_cluster=False,
+            )
+            model = ET.fromstring(gzip.decompress(spm.read_bytes()))
+            generator = next(
+                item for item in model.findall("./Generator")
+                if item.findtext("GUID") == "legacy-visible"
+            )
+            extra = generator.find("Extra")
+            for tag, value in MARKER_VALUES.items():
+                extra.find(tag).text = value
+            spm.write_bytes(gzip.compress(ET.tostring(model, encoding="utf-8")))
+
+            state = inspect_legacy_cluster_state(spm)
+
+            self.assertFalse(state["receipt_valid"])
+            self.assertEqual(state["classified_generator_guids"], [])
+            self.assertEqual(state["ambiguous_marker_guids"], [])
+            self.assertEqual(legacy_cluster_generator_candidates(spm), [])
 
     def test_prepare_sk_applies_marker_only_when_the_sk_is_created(self):
         with tempfile.TemporaryDirectory() as temporary:

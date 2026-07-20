@@ -22,7 +22,11 @@ BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 from speedtree_texture_contract import parse_managed_texture_path, resolve_texture_set
-from speedtree_pipeline_contract import read_spm_text as read_pipeline_spm_text
+from speedtree_pipeline_contract import (
+    read_spm_text as read_pipeline_spm_text,
+    shared_contract_api,
+)
+from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -732,6 +736,25 @@ def visible_material_names(path):
 def leaf_generator_bindings(path, visible_only=False):
     """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
     bindings = _spm_analysis(path)["leaf_generator_bindings"]
+    legacy_state = inspect_legacy_cluster_state(path)
+    legacy_guids = set(legacy_state["classified_generator_guids"])
+    drift_guids = set(legacy_state["marker_drift_guids"])
+    evidence = legacy_state.get("evidence_by_guid") or {}
+    bindings = [
+        {
+            **row,
+            "legacy_cluster_origin": (
+                str(row.get("generator_guid") or "") in legacy_guids
+            ),
+            "legacy_cluster_evidence": evidence.get(
+                str(row.get("generator_guid") or ""), ""
+            ),
+            "legacy_cluster_marker_drift": (
+                str(row.get("generator_guid") or "") in drift_guids
+            ),
+        }
+        for row in bindings
+    ]
     if visible_only:
         return [dict(row) for row in bindings if row.get("visible")]
     return [dict(row) for row in bindings]
@@ -1134,7 +1157,10 @@ def _legacy_material_atlas_name(name):
 
 def _material_leaf_atlas_name(name):
     """Name a newly generated leaf atlas without reusing cluster identity."""
-    atlas_name = _legacy_material_atlas_name(name)
+    # Atlas Builder collection names are production groups, not atlas
+    # identities. Keep the authored numeric base when a user-defined suffix
+    # follows it (for example ``M_Leaf_common_grass_01_dead``).
+    atlas_name = derived_material_base(name) or _legacy_material_atlas_name(name)
     return re.sub(
         r"^M_cluster_", "M_leaf_", atlas_name,
         count=1, flags=re.IGNORECASE)
@@ -1163,7 +1189,10 @@ def _existing_atlas_registry(atlas_root, folder):
     reserved so a new, unrelated source pair cannot silently inherit it.
     """
     registry = {}
-    roots = ([Path(atlas_root)] if atlas_root else []) + [Path(folder)]
+    roots = ([Path(atlas_root)] if atlas_root else []) + [
+        Path(folder) / "atlas",
+        Path(folder),
+    ]
     for root in unique(roots):
         root = Path(root)
         if not root.exists():
@@ -1184,8 +1213,10 @@ def _existing_atlas_registry(atlas_root, folder):
         for path in artifacts:
             entry = registry.setdefault(path.stem.lower(), {
                 "base": path.stem, "live_blends": [], "backups": [],
-                "source_pairs": [],
+                "source_pairs": [], "scoped_manifests": [],
+                "material_names": [],
             })
+            entry.setdefault("material_names", [])
             key = "live_blends" if path.suffix.lower() == ".blend" \
                 else "backups"
             entry[key].append(str(path))
@@ -1201,15 +1232,44 @@ def _existing_atlas_registry(atlas_root, folder):
             textures = payload.get("textures") or {}
             if not blend_file or not textures.get("albedo") or not textures.get("alpha"):
                 continue
-            base = Path(blend_file).stem
+            blend_path = Path(blend_file)
+            if not blend_path.is_absolute():
+                blend_path = (manifest_path.parent / blend_path).resolve()
+            base = blend_path.stem
             entry = registry.setdefault(base.lower(), {
                 "base": base, "live_blends": [], "backups": [],
-                "source_pairs": [],
+                "source_pairs": [], "scoped_manifests": [],
+                "material_names": [],
             })
+            entry.setdefault("scoped_manifests", [])
+            entry.setdefault("material_names", [])
+            if str(manifest_path) not in entry["scoped_manifests"]:
+                entry["scoped_manifests"].append(str(manifest_path))
+            if blend_path.is_file():
+                key = (
+                    "live_blends"
+                    if blend_path.suffix.lower() == ".blend"
+                    else "backups"
+                )
+                if str(blend_path) not in entry[key]:
+                    entry[key].append(str(blend_path))
             pair = _atlas_source_pair_key(
                 textures.get("albedo"), textures.get("alpha"))
             if pair not in entry["source_pairs"]:
                 entry["source_pairs"].append(pair)
+            manifest_materials = unique([
+                payload.get("atlas_asset_name"),
+                payload.get("requested_atlas_asset_name"),
+                payload.get("material"),
+            ] + [
+                group.get("material")
+                for group in payload.get("material_groups") or []
+                if isinstance(group, dict)
+            ])
+            entry["material_names"] = unique(
+                entry["material_names"] + [
+                    name for name in manifest_materials if name
+                ])
     return registry
 
 
@@ -1265,6 +1325,21 @@ def _existing_atlas_match(registry, base, source):
     return False, None
 
 
+def _unique_scoped_atlas_match(registry, source):
+    """Return one asset-local manifest match, never an ambiguous global reuse."""
+    pair = _atlas_source_pair_key(source.get("albedo"), source.get("alpha"))
+    matches = [
+        entry
+        for entry in registry.values()
+        if entry.get("scoped_manifests")
+        and entry.get("live_blends")
+        and pair in entry.get("source_pairs", [])
+    ]
+    if len(matches) == 1:
+        return True, matches[0]["base"]
+    return False, None
+
+
 def _next_free_atlas_base(preferred, unavailable):
     match = re.match(r"^(.*?_atlas_)0*(\d+)$", preferred, re.IGNORECASE)
     if match:
@@ -1300,15 +1375,24 @@ def assign_leaf_atlas_bases(sources, folder, atlas_root=None):
         legacy = unique(_legacy_material_atlas_name(name) for name in names)
         if len(canonical) == 1:
             preferred = canonical[0]
+            legacy_reusable = False
             reusable, existing = _existing_atlas_match(
                 registry, preferred, source)
             if (not reusable and len(legacy) == 1
                     and legacy[0].lower() != preferred.lower()):
                 reusable, existing = _existing_atlas_match(
                     registry, legacy[0], source)
+                legacy_reusable = reusable
+            if not reusable:
+                reusable, existing = _unique_scoped_atlas_match(
+                    registry, source
+                )
+                if reusable:
+                    source["scoped_atlas_base_preserved"] = True
             if reusable:
                 preferred = existing
-                source["legacy_atlas_base_preserved"] = True
+                if legacy_reusable:
+                    source["legacy_atlas_base_preserved"] = True
             plans.append({
                 "source": source, "preferred": preferred,
                 "reuses_existing": reusable,
@@ -1696,18 +1780,48 @@ def annotate_leaf_generator_connections(sources):
     return sources
 
 
+def _legacy_only_export_material_ids(spm, bindings=None):
+    """Material IDs whose current export slots are all receipt-owned legacy."""
+    grouped = {}
+    for binding in bindings or leaf_generator_bindings(spm):
+        if not binding.get("export_participates"):
+            continue
+        material_id = str(binding.get("material_id") or "").strip()
+        if not material_id:
+            continue
+        grouped.setdefault(material_id, []).append(
+            bool(binding.get("legacy_cluster_origin")))
+    return {
+        material_id for material_id, legacy_flags in grouped.items()
+        if legacy_flags and all(legacy_flags)
+    }
+
+
 def cluster_material_usage(target_spms, clusters):
-    """Active final-SPM materials that actually use each Cluster render."""
+    """Export-participating final-SPM materials using each Cluster render.
+
+    Receipt-owned legacy Generators deliberately keep their original Cluster
+    material references. They are lineage evidence even when graph-visible,
+    not current mesh-build targets, and must never reopen a finished atlas.
+    """
     by_stem = {cluster.stem.lower(): cluster for cluster in clusters}
     found = {}
     for spm in target_spms:
-        active_ids = active_material_ids(spm)
+        referenced_ids = active_material_ids(spm)
+        active_ids = visible_material_ids(spm)
+        legacy_only_ids = _legacy_only_export_material_ids(spm)
         original_refs = (
             _source_material_ref_map(Path(spm).parent, Path(spm))
             if Path(spm).name.lower().startswith("sk_") else {}
         )
         for material in extract_material_image_refs(spm):
-            if active_ids and material.get("material_id") not in active_ids:
+            if (referenced_ids
+                    and material.get("material_id") not in active_ids):
+                continue
+            # A legacy receipt is the durable classification. Even when an old
+            # Generator is still graph-visible, it remains provenance and must
+            # not reopen its Cluster render as a new build job.
+            if str(material.get("material_id") or "") in legacy_only_ids:
                 continue
             # A connected Atlas Leaf Mesh Builder material is the finished
             # leaf-card output. Its Color/Opacity may deliberately reference a
@@ -1777,14 +1891,236 @@ def referenced_cluster_spms(target_spms, clusters):
     return found
 
 
-def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
-    """Discover direct leaf atlases plus leaf atlases inside referenced clusters."""
+LEAF_ATLAS_LINEAGE_SCHEMA_VERSION = 2
+
+
+def _merge_leaf_source_provenance(sources):
+    """Merge read-only source evidence without turning it into a build job."""
+    grouped = {}
+    for source in sources:
+        key = _atlas_source_pair_key(source.get("albedo"), source.get("alpha"))
+        entry = grouped.get(key)
+        target = {
+            "spm": source.get("target_spm", ""),
+            "material_names": list(source.get("material_names") or []),
+            "source_material_ids": list(
+                source.get("source_material_ids")
+                or source.get("material_ids") or []),
+            "active": False,
+            "resolution_status": source.get(
+                "resolution_status", "inactive_source_preserved"),
+        }
+        if entry is None:
+            entry = dict(source)
+            entry["targets"] = [target]
+            entry["read_only"] = True
+            entry["actionable"] = False
+            grouped[key] = entry
+            continue
+        existing = next(
+            (row for row in entry["targets"]
+             if str(row.get("spm") or "").lower()
+             == str(target.get("spm") or "").lower()),
+            None,
+        )
+        if existing is None:
+            entry["targets"].append(target)
+            continue
+        existing["material_names"] = unique(
+            existing["material_names"] + target["material_names"])
+        existing["source_material_ids"] = unique(
+            existing["source_material_ids"] + target["source_material_ids"])
+    return list(grouped.values())
+
+
+def _current_leaf_binding_ready(binding, material, actual_mesh_ids):
+    """Validate a current semantic Material/Mesh pair without editing the SPM."""
+    if not material:
+        return False
+    cutouts = {
+        str(value) for value in material.get("cutout_mesh_ids") or []
+        if value not in {None, "", -1, "-1"}
+    }
+    mesh_id = str(binding.get("mesh_id") or "")
+    actual = {str(value) for value in actual_mesh_ids}
+    if mesh_id == "-10":
+        # SpeedTree's random-cutout sentinel is valid when the material owns
+        # at least one real cutout mesh asset.
+        return bool(cutouts.intersection(actual))
+    return bool(mesh_id and mesh_id in cutouts and mesh_id in actual)
+
+
+def _current_leaf_atlas_base(material_name, registry):
+    """Resolve one current material to an existing atlas asset by exact lineage."""
+    canonical = canonical_material_name(material_name)
+    candidates = []
+    atlas_match = re.match(r"^(.*?_atlas_\d+)", canonical, re.IGNORECASE)
+    if atlas_match:
+        candidates.append(atlas_match.group(1))
+    try:
+        derived = derived_material_base(canonical)
+    except (OSError, RuntimeError, ValueError):
+        derived = None
+    if derived:
+        candidates.append(derived)
+    candidates.append(canonical)
+    for candidate in unique(candidates):
+        entry = registry.get(str(candidate).lower())
+        if entry and entry.get("live_blends"):
+            return entry["base"], list(entry["live_blends"])
+    candidate_keys = {
+        canonical_material_name(candidate).lower()
+        for candidate in candidates if candidate
+    }
+    scoped_matches = [
+        entry for entry in registry.values()
+        if entry.get("live_blends")
+        and entry.get("scoped_manifests")
+        and candidate_keys.intersection(
+            canonical_material_name(name).lower()
+            for name in entry.get("material_names") or []
+            if name
+        )
+    ]
+    if len(scoped_matches) == 1:
+        return (
+            scoped_matches[0]["base"],
+            list(scoped_matches[0]["live_blends"]),
+        )
+    # Keep the authored base as read-only evidence even when its blend was
+    # moved or deleted. It remains non-actionable until an exact live asset is
+    # found; fuzzy name guesses never authorize an SPM update.
+    return (candidates[0] if candidates else canonical), []
+
+
+def current_leaf_atlas_inventory(folder, cfg, target_spms):
+    """Inventory atlases already used by current semantic Generator slots.
+
+    This is deliberately independent from source-provenance matching. A final
+    SK may retain its old source Material row while its active Generator points
+    at a split Atlas Builder/legacy atlas Material. Those are two identities,
+    and combining them is what previously produced false zeroes and unsafe
+    re-connect jobs.
+    """
+    registry = _existing_atlas_registry(cfg.get("atlas_root"), folder)
+    grouped = {}
+    for spm in target_spms or []:
+        rows = extract_material_image_refs(spm)
+        by_id = {
+            str(row.get("material_id")): row
+            for row in rows if row.get("material_id") not in {None, ""}
+        }
+        actual_mesh_ids = mesh_asset_ids(spm)
+        for binding in leaf_generator_bindings(spm, visible_only=False):
+            material_id = str(binding.get("material_id") or "")
+            material = by_id.get(material_id)
+            if not material:
+                continue
+            material_name = material.get("material_name") or ""
+            atlas_like = bool(
+                material.get("managed_leaf_output")
+                or re.match(r"^M_.*?_atlas_\d+", material_name, re.IGNORECASE)
+                or registry.get(canonical_material_name(material_name).lower())
+            )
+            if not atlas_like:
+                continue
+            atlas_base, blends = _current_leaf_atlas_base(
+                material_name, registry)
+            key = atlas_base.lower()
+            entry = grouped.setdefault(key, {
+                "atlas_base": atlas_base,
+                "atlas_blends": [],
+                "target_spms": [],
+                "targets": [],
+                "material_names": [],
+                "material_ids": [],
+                "binding_count": 0,
+                "visible_binding_count": 0,
+                "ready_binding_count": 0,
+                "managed": False,
+                "read_only": True,
+                "actionable": False,
+                "evidence": ["current_semantic_generator_slot"],
+            })
+            entry["atlas_blends"] = unique(entry["atlas_blends"] + blends)
+            if str(spm) not in entry["target_spms"]:
+                entry["target_spms"].append(str(spm))
+            if material_name not in entry["material_names"]:
+                entry["material_names"].append(material_name)
+            if material_id not in entry["material_ids"]:
+                entry["material_ids"].append(material_id)
+            ready = _current_leaf_binding_ready(
+                binding, material, actual_mesh_ids)
+            entry["binding_count"] += 1
+            entry["visible_binding_count"] += int(bool(binding.get("visible")))
+            entry["ready_binding_count"] += int(ready)
+            entry["managed"] = bool(
+                entry["managed"] or material.get("managed_leaf_output"))
+            target = next(
+                (row for row in entry["targets"]
+                 if row["spm"].lower() == str(spm).lower()),
+                None,
+            )
+            if target is None:
+                target = {
+                    "spm": str(spm), "material_names": [],
+                    "material_ids": [], "binding_count": 0,
+                    "ready_binding_count": 0,
+                }
+                entry["targets"].append(target)
+            target["material_names"] = unique(
+                target["material_names"] + [material_name])
+            target["material_ids"] = unique(
+                target["material_ids"] + [material_id])
+            target["binding_count"] += 1
+            target["ready_binding_count"] += int(ready)
+
+    results = []
+    for entry in grouped.values():
+        for target in entry["targets"]:
+            target["generator_connection_complete"] = bool(
+                target["binding_count"]
+                and target["ready_binding_count"] == target["binding_count"])
+        entry["generator_connection_complete"] = bool(
+            entry["binding_count"]
+            and entry["ready_binding_count"] == entry["binding_count"])
+        entry["complete"] = bool(
+            entry["atlas_blends"]
+            and entry["generator_connection_complete"])
+        if not entry["atlas_blends"]:
+            entry["reason"] = "atlas_blend_missing"
+        elif not entry["generator_connection_complete"]:
+            entry["reason"] = "current_material_mesh_connection_incomplete"
+        else:
+            entry["reason"] = "current_atlas_material_mesh_connected"
+        results.append(entry)
+    return sorted(results, key=lambda row: row["atlas_base"].lower())
+
+
+def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
+    """Resolve source provenance, current atlas state, and safe actions once."""
+    current_atlases = current_leaf_atlas_inventory(folder, cfg, target_spms)
+    complete_material_ids_by_spm = {}
+    for atlas in current_atlases:
+        if not atlas.get("atlas_blends"):
+            continue
+        for target in atlas.get("targets") or []:
+            if not target.get("generator_connection_complete"):
+                continue
+            key = str(target.get("spm") or "").lower()
+            complete_material_ids_by_spm.setdefault(key, set()).update(
+                str(value).strip()
+                for value in target.get("material_ids") or []
+                if str(value or "").strip()
+            )
     cluster_usage = cluster_material_usage(target_spms, clusters)
     referenced = {
         key: sorted(usage["spms"])
         for key, usage in cluster_usage.items()
     }
     sources = []
+    preserved_sources = []
+    target_resolutions = []
     candidates = []
     direct_target_ids = {}
     candidate_spms = list(target_spms)
@@ -1800,12 +2136,32 @@ def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
             if source.is_file():
                 authoritative = source
         target_materials = {}
-        target_active = active_material_ids(spm)
+        active_target_materials = {}
+        # Mutation targets are the material slots that actually export.  The
+        # broader active_material_ids() set intentionally includes hidden
+        # authoring/legacy Generators and is provenance-only.
+        target_referenced = active_material_ids(spm)
+        target_active = visible_material_ids(spm)
+        all_bindings = leaf_generator_bindings(spm)
+        legacy_bindings = [
+            binding for binding in all_bindings
+            if binding.get("legacy_cluster_origin")
+        ]
+        legacy_only_ids = _legacy_only_export_material_ids(
+            spm, bindings=all_bindings)
+        legacy_material_guids = {}
+        for binding in legacy_bindings:
+            material_id = str(binding.get("material_id") or "")
+            guid = str(binding.get("generator_guid") or "")
+            if material_id and guid:
+                legacy_material_guids.setdefault(material_id, set()).add(guid)
+        legacy_state = inspect_legacy_cluster_state(spm)
         for row in extract_material_image_refs(spm):
-            if target_active and row.get("material_id") not in target_active:
-                continue
             key = canonical_material_name(row.get("material_name")).lower()
             target_materials.setdefault(key, []).append(row)
+            if (not target_referenced
+                    or row.get("material_id") in target_active):
+                active_target_materials.setdefault(key, []).append(row)
         direct_sources = leaf_sources_from_spm(
             authoritative, "direct", active_only=False)
         # Some authoring SPMs are binary containers that this lightweight
@@ -1814,24 +2170,98 @@ def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
         if not direct_sources and Path(authoritative) != Path(spm):
             direct_sources = leaf_sources_from_spm(
                 spm, "direct", active_only=False)
+        resolution = {
+            "target_spm": str(spm),
+            "authoritative_spm": str(authoritative),
+            "source_count": len(direct_sources),
+            "actionable_source_count": 0,
+            "preserved_source_count": 0,
+            "legacy_cluster_generator_count": len(
+                legacy_state["classified_generator_guids"]),
+            "legacy_cluster_marker_drift_count": len(
+                legacy_state["marker_drift_guids"]),
+            "rejections": [],
+        }
         for source in direct_sources:
             source["target_spm"] = str(spm)
-            mapped_names = []
-            mapped_ids = []
+            mapped_rows = []
+            active_rows = []
             for name in source.get("material_names") or []:
-                for row in target_materials.get(
-                        canonical_material_name(name).lower(), []):
-                    mapped_names.append(row.get("material_name"))
-                    if row.get("material_id"):
-                        mapped_ids.append(row["material_id"])
-            if not mapped_names:
+                key = canonical_material_name(name).lower()
+                mapped_rows.extend(target_materials.get(key, []))
+                active_rows.extend(active_target_materials.get(key, []))
+            mapped_rows = unique(mapped_rows)
+            active_rows = unique(active_rows)
+            if not mapped_rows:
+                resolution["rejections"].append({
+                    "source_family": source.get("source_family", ""),
+                    "reason": "target_material_lineage_missing",
+                    "source_material_names": list(
+                        source.get("material_names") or []),
+                })
                 continue
-            source["material_names"] = unique(mapped_names)
-            source["source_material_ids"] = unique(mapped_ids)
-            source["material_ids"] = unique(mapped_ids)
+            selected = active_rows or mapped_rows
+            mapped_names = unique(
+                row.get("material_name") for row in selected
+                if row.get("material_name"))
+            mapped_ids = unique(
+                row.get("material_id") for row in selected
+                if row.get("material_id"))
+            source["material_names"] = mapped_names
+            source["source_material_ids"] = mapped_ids
+            source["material_ids"] = list(mapped_ids)
+            mapped_id_set = {str(value) for value in mapped_ids}
+            if (active_rows and mapped_id_set
+                    and mapped_id_set.issubset(legacy_only_ids)):
+                source["resolution_status"] = (
+                    "legacy_cluster_source_preserved"
+                )
+                source["legacy_cluster_origin"] = True
+                source["legacy_cluster_generator_guids"] = sorted({
+                    guid for material_id in mapped_id_set
+                    for guid in legacy_material_guids.get(material_id, set())
+                })
+                preserved_sources.append(source)
+                direct_target_ids.setdefault(str(spm).lower(), set()).update(
+                    mapped_id_set)
+                resolution["preserved_source_count"] += 1
+                continue
+            complete_ids = complete_material_ids_by_spm.get(
+                str(spm).lower(), set())
+            if (active_rows and mapped_id_set
+                    and mapped_id_set.issubset(complete_ids)):
+                source["resolution_status"] = (
+                    "current_atlas_material_connected"
+                )
+                preserved_sources.append(source)
+                direct_target_ids.setdefault(str(spm).lower(), set()).update(
+                    mapped_id_set)
+                resolution["preserved_source_count"] += 1
+                continue
+            if not active_rows:
+                legacy_ids = {
+                    str(value) for value in mapped_ids
+                    if str(value) in legacy_material_guids
+                }
+                if legacy_ids:
+                    source["resolution_status"] = (
+                        "legacy_cluster_source_preserved"
+                    )
+                    source["legacy_cluster_origin"] = True
+                    source["legacy_cluster_generator_guids"] = sorted({
+                        guid for material_id in legacy_ids
+                        for guid in legacy_material_guids[material_id]
+                    })
+                else:
+                    source["resolution_status"] = "inactive_source_preserved"
+                preserved_sources.append(source)
+                resolution["preserved_source_count"] += 1
+                continue
             direct_target_ids.setdefault(str(spm).lower(), set()).update(
                 source["source_material_ids"])
             sources.append(source)
+            resolution["actionable_source_count"] += 1
+        target_resolutions.append(resolution)
     for cluster in clusters:
         if str(cluster).lower() not in referenced:
             continue
@@ -1872,8 +2302,35 @@ def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
                     target_source["source_material_ids"])
                 target_source["connection_mode"] = "cluster_trace_fallback"
                 sources.append(target_source)
-    canonicalize_leaf_sources(sources, candidates, cfg, folder)
-    return merge_leaf_mesh_sources(sources, cfg, folder), referenced
+    canonicalize_leaf_sources(
+        sources + preserved_sources, candidates, cfg, folder)
+    return {
+        "schema_version": LEAF_ATLAS_LINEAGE_SCHEMA_VERSION,
+        "actionable_sources": merge_leaf_mesh_sources(sources, cfg, folder),
+        "source_provenance": _merge_leaf_source_provenance(
+            preserved_sources),
+        "current_atlases": current_atlases,
+        "target_resolutions": target_resolutions,
+        "legacy_cluster_states": [
+            {
+                "spm": str(spm),
+                **{
+                    key: value
+                    for key, value in inspect_legacy_cluster_state(spm).items()
+                    if key not in {"spm", "evidence_by_guid"}
+                },
+            }
+            for spm in target_spms
+        ],
+        "referenced_clusters": referenced,
+    }
+
+
+def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
+    """Compatibility wrapper returning only mutation-safe source jobs."""
+    lineage = resolve_leaf_atlas_lineage(
+        folder, cfg, target_spms, clusters)
+    return lineage["actionable_sources"], lineage["referenced_clusters"]
 
 
 def patch_m_prefix(spm, exclude=None):
@@ -2261,7 +2718,7 @@ def ensure_blend_source_index(cfg):
 def find_atlas_blends(atlas_root, folder, atlas_base, source_images=None,
                       aliases=None):
     """Find a completed leaf blend by output name or embedded source image."""
-    roots = [Path(atlas_root), Path(folder)]
+    roots = [Path(atlas_root), Path(folder) / "atlas", Path(folder)]
     needles = [atlas_base.lower()]
     # Also allow existing files with small case differences such as M_Leaf_*.
     parts = [p for p in atlas_base.lower().split("_") if p not in {"m", "01"}]
@@ -2440,10 +2897,6 @@ def cluster_spms(folder):
 #     클러스터 없이 아틀라스를 직접 쓰는 잎 머티리얼이다.
 ATLAS_NAME_RE = re.compile(r"^(.*_atlas_\d+)", re.IGNORECASE)
 # 아틀라스 리프 제너레이터 Auto Split 그룹 접미사 (M_x_atlas_01_green 등)
-AUTO_SPLIT_SUFFIXES = {
-    "green", "green_light", "yellow", "dead", "flower", "bud",
-    "stem", "twig", "cluster", "flower_leaf",
-}
 # 이름에 이 단어가 있으면 잎 지오메트리(② blend)가 필요한 아틀라스로 본다.
 # bark/decal/stem 계열은 텍스처(③)만 추적한다.
 LEAF_MESH_KEYWORDS = ("leaf", "cluster", "branch")
@@ -2496,18 +2949,18 @@ def auto_split_atlas_base(name, blend_stems, graphs):
     the original leaf sources) still groups M_x_atlas_01_green under
     M_x_atlas_01 instead of spawning a texture set for the suffixed name.
     """
-    low = str(name).lower()
-    for stem_low, blend in blend_stems.items():
-        if low.startswith(stem_low + "_") and low[len(stem_low) + 1:] in AUTO_SPLIT_SUFFIXES:
-            return blend.stem
-    for graph_low, (graph, _sbs) in graphs.items():
-        if low.startswith(graph_low + "_") and low[len(graph_low) + 1:] in AUTO_SPLIT_SUFFIXES:
-            return "M_" + graph[2:] if graph.lower().startswith("t_") else graph
-    match = ATLAS_NAME_RE.match(str(name))
-    if match:
-        suffix = str(name)[len(match.group(1)):].lstrip("_").lower()
-        if suffix in AUTO_SPLIT_SUFFIXES:
-            return match.group(1)
+    candidate = derived_material_base(name)
+    if not candidate:
+        return None
+    candidate_low = candidate.lower()
+    if candidate_low in blend_stems:
+        return blend_stems[candidate_low].stem
+    if candidate_low in graphs:
+        graph = graphs[candidate_low][0]
+        return "M_" + graph[2:] if graph.lower().startswith("t_") else graph
+    match = ATLAS_NAME_RE.match(canonical_material_name(name))
+    if match and match.group(1).lower() == candidate_low:
+        return match.group(1)
     return None
 
 
@@ -2520,10 +2973,11 @@ def derived_material_base(name):
     its authored name unless atlas/leaf provenance proves the base.
     """
     canonical = canonical_material_name(name)
-    for suffix in sorted(AUTO_SPLIT_SUFFIXES, key=len, reverse=True):
-        marker = "_" + suffix
-        if canonical.lower().endswith(marker):
-            return canonical[:-len(marker)]
+    api = shared_contract_api()
+    groups = api.production_group_tokens(canonical)
+    base = api.production_group_base_name(canonical)
+    if groups and base and base.lower() != canonical.lower():
+        return base
     return None
 
 
@@ -2534,12 +2988,13 @@ def material_atlas_base(name, blend_stems, graphs):
         return blend_stems[low].stem
     if low in graphs:
         return graphs[low][0]
-    for stem_low, blend in blend_stems.items():
-        if low.startswith(stem_low + "_") and low[len(stem_low) + 1:] in AUTO_SPLIT_SUFFIXES:
-            return blend.stem
-    for graph_low, (graph, _sbs) in graphs.items():
-        if low.startswith(graph_low + "_") and low[len(graph_low) + 1:] in AUTO_SPLIT_SUFFIXES:
-            return graph
+    candidate = derived_material_base(name)
+    if candidate:
+        candidate_low = candidate.lower()
+        if candidate_low in blend_stems:
+            return blend_stems[candidate_low].stem
+        if candidate_low in graphs:
+            return graphs[candidate_low][0]
     match = ATLAS_NAME_RE.match(str(name))
     if match:
         return match.group(1)
@@ -2641,25 +3096,29 @@ def is_cluster_render_material(folder, spm, refs):
 
 
 def legacy_cluster_generator_candidates(spm):
-    """Generators whose material Color source is an old Cluster render.
+    """Generators seeded by Cluster Color or preserved by the GUID contract.
 
-    This provenance works before a managed Atlas material exists, so it is
-    suitable for the one-time hook immediately after an SK copy is created.
-    Hidden source Generators are included intentionally: after Atlas handoff
-    they remain in the model as the authored legacy reference to distinguish.
+    The Color-path rule is used only to seed a new marker. Once the one-time
+    receipt exists, its Generator GUIDs remain authoritative even after the
+    current material is reconnected to a managed atlas.
     """
     spm = Path(spm)
+    all_material_names = {}
     material_names = {}
     for row in extract_material_image_refs(spm):
         refs = row.get("refs") or []
         material_id = str(row.get("material_id") or "").strip()
+        if material_id:
+            all_material_names[material_id] = str(
+                row.get("material_name") or "")
         if material_id and is_cluster_render_material(spm.parent, spm, refs):
-            material_names[material_id] = str(row.get("material_name") or "")
+            material_names[material_id] = all_material_names[material_id]
 
     candidates = {}
     for binding in leaf_generator_bindings(spm):
         material_id = str(binding.get("material_id") or "").strip()
-        if material_id not in material_names:
+        legacy_origin = bool(binding.get("legacy_cluster_origin"))
+        if material_id not in material_names and not legacy_origin:
             continue
         guid = str(binding.get("generator_guid") or "").strip()
         if not guid:
@@ -2672,13 +3131,17 @@ def legacy_cluster_generator_candidates(spm):
             "export_participates": bool(binding.get("export_participates")),
             "generated_node_count": int(
                 binding.get("generated_node_count") or 0),
+            "classification_evidence": (
+                binding.get("legacy_cluster_evidence")
+                if legacy_origin else "cluster_color_path"
+            ),
             "material_ids": [],
             "material_names": [],
             "slot_prefixes": [],
         })
         for key, value in (
             ("material_ids", material_id),
-            ("material_names", material_names[material_id]),
+            ("material_names", all_material_names.get(material_id, "")),
             ("slot_prefixes", str(binding.get("slot_prefix") or "")),
         ):
             if value and value not in row[key]:
@@ -3127,8 +3590,10 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
     # multiple exact variants through target_mesh_names.
     if not target_spms and chosen:
         target_spms = [chosen]
-    leaf_mesh_sources, referenced_clusters = discover_leaf_mesh_sources(
+    leaf_lineage = resolve_leaf_atlas_lineage(
         folder, cfg, target_spms, clusters)
+    leaf_mesh_sources = leaf_lineage["actionable_sources"]
+    referenced_clusters = leaf_lineage["referenced_clusters"]
     # ③은 아틀라스 파일 개수가 아니라 실제 Generator가 사용하는 모든
     # M_ 머티리얼을 기준으로 한 행씩 만든다. Cluster SPM의 미사용 테스트
     # 머티리얼은 이 목록에 들어오지 않는다.
@@ -3167,6 +3632,10 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         "preserved_cluster_materials": preserved_cluster_materials(
             folder, definitions=cluster_definitions),
         "leaf_mesh_sources": leaf_mesh_sources,
+        "leaf_atlas_lineage": leaf_lineage,
+        "leaf_source_provenance": leaf_lineage["source_provenance"],
+        "leaf_atlas_inventory": leaf_lineage["current_atlases"],
+        "legacy_cluster_states": leaf_lineage["legacy_cluster_states"],
         "leaf_mesh_target_spms": [str(path) for path in target_spms],
         "managed_leaf_outputs": managed_leaf_outputs(target_spms),
         "ignored_cluster_spms": ignored_cluster_spms,

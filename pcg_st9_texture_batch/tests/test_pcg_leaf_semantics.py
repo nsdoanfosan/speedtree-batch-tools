@@ -11,6 +11,11 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 import pcg_texture_audit as audit
+from speedtree_legacy_cluster_contract import (
+    RECEIPT_KIND,
+    RECEIPT_VERSION,
+    marker_receipt_path,
+)
 
 
 LADYFERN = Path(
@@ -100,6 +105,20 @@ def write_connection_manifest(spm, atlas_base, bindings,
     return path
 
 
+def write_legacy_receipt(spm, guids):
+    receipt = marker_receipt_path(spm)
+    receipt.parent.mkdir(exist_ok=True)
+    receipt.write_text(json.dumps({
+        "kind": RECEIPT_KIND,
+        "version": RECEIPT_VERSION,
+        "status": "applied",
+        "spm": str(spm.resolve()),
+        "generator_guids": list(guids),
+        "entries": {},
+    }), encoding="utf-8")
+    return receipt
+
+
 class SemanticLeafSourceTests(unittest.TestCase):
     def test_frond_material_without_leaf_word_is_detected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -182,10 +201,18 @@ class SemanticLeafSourceTests(unittest.TestCase):
             final_spm = root / "SK_weed_ladyfern_01.spm"
             write_spm(
                 final_spm,
-                [material(
-                    "10", "M_leaf_ladyfern_atlas_01",
-                    [render_color, render_alpha], (14, 15), managed=True)],
-                [generator("Leaf Mesh", "10", "14")],
+                [
+                    material(
+                        "3", "M_cluster_ladyfern_01",
+                        [render_color, render_alpha], (3,)),
+                    material(
+                        "10", "M_leaf_ladyfern_atlas_01",
+                        [render_color, render_alpha], (14, 15), managed=True),
+                ],
+                [
+                    generator("Leaf Mesh", "10", "14"),
+                    generator("Leaf Mesh", "3", "3", 1, hidden=True),
+                ],
             )
             atlas = root.parent / "atlas"
             atlas.mkdir()
@@ -206,6 +233,222 @@ class SemanticLeafSourceTests(unittest.TestCase):
             self.assertNotIn(
                 "Blender 잎 매쉬 Generator 연결 필요", item["actions"])
 
+    def test_visible_receipt_owned_cluster_is_provenance_not_a_new_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "weed_velvet_grass"
+            cluster_dir = root / "cluster"
+            cluster_dir.mkdir(parents=True)
+            render_color = image(
+                root / "texture" / "cluster_velvet_grass_01.tga")
+            render_alpha = image(
+                root / "texture" / "cluster_velvet_grass_01_Opacity.tga")
+            source_color = image(cluster_dir / "velvet_source.tga")
+            source_alpha = image(
+                cluster_dir / "velvet_source_Opacity.tga")
+            cluster_spm = cluster_dir / "cluster_velvet_grass_01.spm"
+            write_spm(
+                cluster_spm,
+                [material(
+                    "1", "Material", [source_color, source_alpha], (1,))],
+                [generator("Leaf Mesh", "1", "1")],
+            )
+            target_spm = root / "SK_weed_velvet_grass_03.spm"
+            write_spm(
+                target_spm,
+                [material(
+                    "3", "M_cluster_velvet_grass_01",
+                    [render_color, render_alpha], (21, 22, 23))],
+                [generator("Leaf Mesh", "3", "21")],
+            )
+            write_legacy_receipt(target_spm, ["guid-0"])
+            cfg = {
+                "atlas_root": str(root.parent / "atlas"),
+                "required_export_maps": ["color", "opacity"],
+                "source_texture_roots": [],
+            }
+
+            lineage = audit.resolve_leaf_atlas_lineage(
+                root, cfg, [target_spm], [cluster_spm])
+
+            self.assertEqual(lineage["schema_version"], 2)
+            self.assertEqual(lineage["actionable_sources"], [])
+            self.assertEqual(lineage["referenced_clusters"], {})
+            self.assertEqual(len(lineage["source_provenance"]), 1)
+            provenance = lineage["source_provenance"][0]
+            self.assertEqual(
+                provenance["resolution_status"],
+                "legacy_cluster_source_preserved",
+            )
+            self.assertEqual(
+                provenance["legacy_cluster_generator_guids"], ["guid-0"])
+
+    def test_complete_current_atlas_material_suppresses_old_source_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "weed_velvet_grass"
+            root.mkdir()
+            color = image(root / "source" / "velvet_source.tga")
+            alpha = image(
+                root / "source" / "velvet_source_Opacity.tga")
+            target_spm = root / "SK_weed_velvet_grass_03.spm"
+            write_spm(
+                target_spm,
+                [material(
+                    "1", "M_leaf_velvet_grass_01",
+                    [color, alpha], (21, 22, 23))],
+                [generator("Leaf Mesh", "1", "-10")],
+            )
+            atlas = root.parent / "atlas"
+            atlas.mkdir()
+            blend = atlas / "M_Leaf_velvet_grass_01.blend"
+            blend.write_bytes(b"BLENDER")
+            cfg = {
+                "atlas_root": str(atlas),
+                "required_export_maps": ["color", "opacity"],
+                "source_texture_roots": [],
+            }
+
+            lineage = audit.resolve_leaf_atlas_lineage(
+                root, cfg, [target_spm], [])
+
+            self.assertEqual(lineage["actionable_sources"], [])
+            self.assertEqual(len(lineage["source_provenance"]), 1)
+            self.assertEqual(
+                lineage["source_provenance"][0]["resolution_status"],
+                "current_atlas_material_connected",
+            )
+            self.assertEqual(len(lineage["current_atlases"]), 1)
+            self.assertTrue(lineage["current_atlases"][0]["complete"])
+            self.assertEqual(
+                lineage["current_atlases"][0]["atlas_blends"], [str(blend)])
+
+    def test_lineage_separates_inactive_source_from_split_current_atlas(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "weed_susan"
+            root.mkdir()
+            source_color = image(root / "source" / "Susan_albedo.tif")
+            source_alpha = image(root / "source" / "Susan_alpha.tif")
+            current_color = image(
+                root / "texture" / "T_leaf_susan_atlas_01_color.tga")
+            current_alpha = image(
+                root / "texture" / "T_leaf_susan_atlas_01_opacity.tga")
+            source_spm = root / "weed_flower_susan_01.spm"
+            target_spm = root / "SK_weed_flower_susan_01.spm"
+            write_spm(
+                source_spm,
+                [material(
+                    "1", "leaf_susan_01",
+                    [source_color, source_alpha], (1,))],
+                [generator("Leaf Mesh", "1", "1")],
+            )
+            write_spm(
+                target_spm,
+                [
+                    material(
+                        "1", "M_leaf_susan_01",
+                        [source_color, source_alpha], (1,)),
+                    material(
+                        "7", "M_leaf_susan_atlas_01_green",
+                        [current_color, current_alpha], (20, 21),
+                        managed=True),
+                    material(
+                        "8", "M_leaf_susan_atlas_01_flower",
+                        [source_color, source_alpha], (30,), managed=True),
+                ],
+                [
+                    generator("Leaf Mesh", "7", "-10", 0),
+                    generator("Leaf Mesh", "8", "30", 1),
+                    # The authored pre-atlas Generator stays hidden for
+                    # lineage/debugging. It must not become a fresh build job.
+                    generator("Leaf Mesh", "1", "1", 2, hidden=True),
+                ],
+            )
+            atlas = root.parent / "atlas"
+            atlas.mkdir()
+            blend = atlas / "M_leaf_susan_atlas_01.blend"
+            blend.write_bytes(b"BLENDER")
+            cfg = {
+                "atlas_root": str(atlas),
+                "required_export_maps": ["color", "opacity"],
+                "source_texture_roots": [],
+            }
+            before = (target_spm.read_bytes(), target_spm.stat().st_mtime_ns)
+
+            lineage = audit.resolve_leaf_atlas_lineage(
+                root, cfg, [target_spm], [])
+            sources, _referenced = audit.discover_leaf_mesh_sources(
+                root, cfg, [target_spm], [])
+
+            self.assertEqual(sources, [])
+            self.assertEqual(lineage["actionable_sources"], [])
+            self.assertEqual(len(lineage["source_provenance"]), 1)
+            provenance = lineage["source_provenance"][0]
+            self.assertEqual(provenance["albedo"], source_color)
+            self.assertEqual(provenance["alpha"], source_alpha)
+            self.assertEqual(
+                provenance["targets"][0]["source_material_ids"], ["1"])
+            self.assertNotIn("T_leaf_susan_atlas_01", provenance["albedo"])
+            self.assertEqual(len(lineage["current_atlases"]), 1)
+            current = lineage["current_atlases"][0]
+            self.assertEqual(current["atlas_base"],
+                             "M_leaf_susan_atlas_01")
+            self.assertEqual(current["atlas_blends"], [str(blend)])
+            self.assertEqual(
+                set(current["material_ids"]), {"7", "8"})
+            self.assertTrue(current["generator_connection_complete"])
+            self.assertTrue(current["complete"])
+            self.assertEqual(
+                (target_spm.read_bytes(), target_spm.stat().st_mtime_ns),
+                before,
+            )
+
+    def test_lineage_does_not_promote_unmapped_generated_target_to_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "weed_thistle"
+            root.mkdir()
+            source_color = image(root / "source" / "Thistle_albedo.tif")
+            source_alpha = image(root / "source" / "Thistle_alpha.tif")
+            generated_color = image(
+                root / "texture" / "T_leaf_thistle_atlas_01_color.tga")
+            generated_alpha = image(
+                root / "texture" / "T_leaf_thistle_atlas_01_opacity.tga")
+            source_spm = root / "weed_thistle_01.spm"
+            target_spm = root / "SK_weed_thistle_01.spm"
+            write_spm(
+                source_spm,
+                [material(
+                    "1", "leaf_thistle_01",
+                    [source_color, source_alpha], (1,))],
+                [generator("Leaf Mesh", "1", "1")],
+            )
+            # The source row was deleted entirely. A coherent generated T_*
+            # pair in the final SK is current-state evidence, not provenance.
+            write_spm(
+                target_spm,
+                [material(
+                    "7", "M_leaf_thistle_atlas_01",
+                    [generated_color, generated_alpha], (20,))],
+                [generator("Leaf Mesh", "7", "20")],
+            )
+            atlas = root.parent / "atlas"
+            atlas.mkdir()
+            (atlas / "M_leaf_thistle_atlas_01.blend").write_bytes(b"BLENDER")
+            cfg = {
+                "atlas_root": str(atlas),
+                "required_export_maps": ["color", "opacity"],
+                "source_texture_roots": [],
+            }
+
+            lineage = audit.resolve_leaf_atlas_lineage(
+                root, cfg, [target_spm], [])
+
+            self.assertEqual(lineage["actionable_sources"], [])
+            self.assertEqual(lineage["source_provenance"], [])
+            self.assertEqual(len(lineage["current_atlases"]), 1)
+            self.assertEqual(
+                lineage["target_resolutions"][0]["rejections"][0]["reason"],
+                "target_material_lineage_missing",
+            )
+
     def test_untagged_normalized_maps_still_expose_parsley_mesh_source(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -224,7 +467,7 @@ class SemanticLeafSourceTests(unittest.TestCase):
             self.assertEqual(sources[0]["source_family"],
                              "T_leaf_parsley_atlas_02")
 
-    def test_ladyfern_final_material_pairs_are_distinct_direct_targets(self):
+    def test_ladyfern_hidden_pair_is_provenance_not_direct_target(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "weed_ladyfern"
             root.mkdir()
@@ -259,19 +502,24 @@ class SemanticLeafSourceTests(unittest.TestCase):
             }
             sources, _referenced = audit.discover_leaf_mesh_sources(
                 root, cfg, [target_spm], [])
+            lineage = audit.resolve_leaf_atlas_lineage(
+                root, cfg, [target_spm], [])
 
             by_id = {
                 target["source_material_ids"][0]: source
                 for source in sources for target in source["targets"]
             }
-            self.assertEqual(set(by_id), {"4", "9"})
-            self.assertEqual(by_id["4"]["source_family"],
-                             "cluster_ladyfern_01")
-            self.assertEqual(by_id["4"]["atlas_base"],
-                             "M_leaf_ladyfern_atlas_01")
+            self.assertEqual(set(by_id), {"9"})
             self.assertEqual(by_id["9"]["source_family"], "LadyFern06")
             self.assertEqual(by_id["9"]["atlas_base"],
                              "M_leaf_ladyfern_atlas_02")
+            self.assertEqual(len(lineage["source_provenance"]), 1)
+            self.assertEqual(
+                lineage["source_provenance"][0]["targets"][0][
+                    "source_material_ids"
+                ],
+                ["4"],
+            )
             self.assertTrue(all(
                 source["generator_connection_update_needed"]
                 for source in sources))
@@ -365,6 +613,63 @@ class AtlasNameAllocationTests(unittest.TestCase):
 
             self.assertEqual(source["atlas_base"], legacy.stem)
             self.assertTrue(source["legacy_atlas_base_preserved"])
+
+    def test_unique_asset_scope_manifest_preserves_authored_atlas_base(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "Weed_Common_grass"
+            atlas = folder / "atlas"
+            scopes = folder / ".atlas_leaf_speedtree_scopes"
+            atlas.mkdir(parents=True)
+            scopes.mkdir()
+            source = self.source(
+                root, "03", material_name="M_Leaf_Grass_01"
+            )
+            authored = atlas / "M_Leaf_common_grass_01.blend"
+            authored.write_bytes(b"BLENDER")
+            (scopes / "scope.json").write_text(json.dumps({
+                "blend_file": str(authored),
+                "textures": {
+                    "albedo": source["albedo"],
+                    "alpha": source["alpha"],
+                },
+                "material_groups": [
+                    {"group": "Green", "material": "M_Leaf_common_grass_01_green"},
+                    {"group": "Dead", "material": "M_Leaf_common_grass_01_dead"},
+                ],
+            }), encoding="utf-8")
+
+            audit.assign_leaf_atlas_bases([source], folder)
+
+            self.assertEqual(source["atlas_base"], authored.stem)
+            self.assertTrue(source["scoped_atlas_base_preserved"])
+
+    def test_ambiguous_asset_scope_source_pair_is_not_chosen_by_name_guess(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "Weed_Common_grass"
+            atlas = folder / "atlas"
+            scopes = folder / ".atlas_leaf_speedtree_scopes"
+            atlas.mkdir(parents=True)
+            scopes.mkdir()
+            source = self.source(
+                root, "03", material_name="M_Leaf_Grass_01"
+            )
+            for index in (1, 2):
+                authored = atlas / f"M_Leaf_common_grass_{index:02d}.blend"
+                authored.write_bytes(b"BLENDER")
+                (scopes / f"scope{index}.json").write_text(json.dumps({
+                    "blend_file": str(authored),
+                    "textures": {
+                        "albedo": source["albedo"],
+                        "alpha": source["alpha"],
+                    },
+                }), encoding="utf-8")
+
+            audit.assign_leaf_atlas_bases([source], folder)
+
+            self.assertEqual(source["atlas_base"], "M_Leaf_Grass_atlas_01")
+            self.assertNotIn("scoped_atlas_base_preserved", source)
 
 
 class GeneratorConnectionTests(unittest.TestCase):

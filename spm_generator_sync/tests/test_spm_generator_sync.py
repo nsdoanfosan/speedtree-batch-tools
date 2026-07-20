@@ -14,6 +14,12 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 import spm_generator_sync as sync
+from speedtree_legacy_cluster_contract import (
+    LEGACY_CLUSTER_MARKER_VALUES,
+    RECEIPT_KIND,
+    RECEIPT_VERSION,
+    marker_receipt_path,
+)
 
 
 def extra_xml():
@@ -665,6 +671,67 @@ class GeneratorSyncTests(unittest.TestCase):
         self.assertEqual(big[2], 1.0)
         self.assertLess(small[2], big[2])
         self.assertEqual(small, sync.base_role_color("branch", "BranchSmall"))
+
+    def test_sync_preserves_receipt_owned_legacy_foreground(self):
+        with tempfile.TemporaryDirectory() as temp:
+            master = Path(temp) / "master.spm"
+            target = Path(temp) / "target.spm"
+            write_spm(master, make_master())
+            target_root = ET.fromstring(make_target())
+            legacy = next(
+                item for item in target_root.findall("./Generators/Generator")
+                if item.findtext("GUID") == "target-leaf-mesh"
+            )
+            extra = legacy.find("Extra")
+            for tag, value in LEGACY_CLUSTER_MARKER_VALUES.items():
+                child = extra.find(tag)
+                if child is None:
+                    child = ET.SubElement(extra, tag)
+                child.text = value
+            write_spm(target, ET.tostring(target_root, encoding="unicode"))
+            receipt = marker_receipt_path(target)
+            receipt.parent.mkdir()
+            receipt.write_text(json.dumps({
+                "kind": RECEIPT_KIND,
+                "version": RECEIPT_VERSION,
+                "status": "applied",
+                "spm": str(target),
+                "generator_guids": ["target-leaf-mesh"],
+                "entries": {},
+            }), encoding="utf-8")
+            self.assertEqual(
+                sync.inspect_legacy_cluster_state(target)[
+                    "classified_generator_guids"
+                ],
+                ["target-leaf-mesh"],
+            )
+
+            plan = sync.build_sync_plan(
+                master,
+                target,
+                {
+                    "Leaf 2": "Leaf",
+                    "BranchBig": "Branch",
+                    "BranchSmall": None,
+                    "End 2": "End",
+                },
+            )
+            patched = sync.SPMDocument(
+                target, plan.patched_text, True, full=True
+            )
+            generator = patched.by_guid["target-leaf-mesh"]
+
+            self.assertEqual(
+                {
+                    tag: generator.findtext(f"Extra/{tag}")
+                    for tag in LEGACY_CLUSTER_MARKER_VALUES
+                },
+                LEGACY_CLUSTER_MARKER_VALUES,
+            )
+            self.assertEqual(
+                generator.findtext("Extra/m_bSetBackgroundIconColor"),
+                "true",
+            )
 
     def test_missing_master_base_is_added_under_tree_and_mapping_is_persisted(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -3,6 +3,7 @@ wire the dynamic-wind JSON into the imported skeletal mesh and save to disk.
 
 Run (Unreal editor must be open):
   blender.exe -b X.blend --python send2ue_push_job.py -- --report result.json
+      --spm X.spm --material-contract current_preflight.json
 
 Steps:
   1. verify the send2ue <-> Unreal RPC connection
@@ -46,6 +47,8 @@ def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", required=True)
+    parser.add_argument("--spm", required=True)
+    parser.add_argument("--material-contract", required=True)
     parser.add_argument("--ue-timeout", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-min", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-max", type=float, default=900.0)
@@ -346,15 +349,38 @@ def main():
 
         from speedtree_bone_weight_repair.core import (
             consolidate_speedtree_group_materials,
+            load_speedtree_texture_readiness_contract,
             normalize_speedtree_material_textures,
         )
 
         report["stage"] = "texture_validation"
+        spm_path = Path(args.spm).resolve()
+        source_fbx = spm_path.parent / "fbx" / f"{spm_path.stem}.fbx"
+        texture_contract = load_speedtree_texture_readiness_contract(
+            args.material_contract,
+            spm_path=str(spm_path),
+            source_fbx_path=str(source_fbx),
+        )
+        if not texture_contract.get("strict_speedtree_pipeline_contract"):
+            raise RuntimeError(
+                "Unreal Push requires a strict SpeedTree pipeline texture contract"
+            )
+        report["texture_contract"] = {
+            "status": texture_contract.get("status"),
+            "path": texture_contract.get("contract_path"),
+            "strict_speedtree_pipeline_contract": bool(
+                texture_contract.get("strict_speedtree_pipeline_contract")
+            ),
+        }
         material_consolidation = consolidate_speedtree_group_materials(
-            bpy.context.scene.objects
+            bpy.context.scene.objects,
+            texture_contract=texture_contract,
         )
         report["material_consolidation"] = material_consolidation
-        texture_normalization = normalize_speedtree_material_textures(bpy.context.scene.objects)
+        texture_normalization = normalize_speedtree_material_textures(
+            bpy.context.scene.objects,
+            texture_contract=texture_contract,
+        )
         report["texture_normalization"] = texture_normalization
         export_collection = bpy.data.collections.get("Export")
         export_meshes = [

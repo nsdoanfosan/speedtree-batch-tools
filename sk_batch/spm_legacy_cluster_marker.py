@@ -11,16 +11,21 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
+if str(BATCH_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(BATCH_TOOLS_DIR))
 
 try:
     from .spm_problem_node_marker import (
         FOREGROUND_TAGS,
         GENERATOR_BLOCK_RE,
         GUID_RE,
-        MARKER_VALUES,
         _patch_generator_fields,
         _read_spm_text,
         _tag_value,
@@ -30,20 +35,26 @@ except ImportError:  # Direct execution with sk_batch on sys.path.
         FOREGROUND_TAGS,
         GENERATOR_BLOCK_RE,
         GUID_RE,
-        MARKER_VALUES,
         _patch_generator_fields,
         _read_spm_text,
         _tag_value,
     )
 
+from speedtree_legacy_cluster_contract import (
+    LEGACY_CLUSTER_MARKER_VALUES,
+    RECEIPT_KIND,
+    RECEIPT_VERSION,
+    inspect_legacy_cluster_state,
+    legacy_cluster_generator_guids,
+    marker_receipt_path as _contract_marker_receipt_path,
+)
 
-RECEIPT_KIND = "skbatch_legacy_cluster_marker_once"
-RECEIPT_VERSION = 1
+
+MARKER_VALUES = dict(LEGACY_CLUSTER_MARKER_VALUES)
 
 
 def marker_receipt_path(spm_path):
-    spm = Path(spm_path)
-    return spm.parent / "reports" / f"{spm.stem}_legacy_cluster_marker_once.json"
+    return _contract_marker_receipt_path(spm_path)
 
 
 def _sha256_bytes(payload):
@@ -267,6 +278,8 @@ def mark_generator_guids_once(spm_path, candidates, *, dry_run=False):
 
 __all__ = [
     "MARKER_VALUES",
+    "inspect_legacy_cluster_state",
+    "legacy_cluster_generator_guids",
     "marker_receipt_path",
     "mark_generator_guids_once",
 ]

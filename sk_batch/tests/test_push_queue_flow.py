@@ -1,3 +1,4 @@
+import ast
 import queue
 import json
 import sys
@@ -96,6 +97,79 @@ class PushQueueFlowTests(unittest.TestCase):
     @staticmethod
     def targets(*names):
         return [{"spm": Path(name), "checked": True} for name in names]
+
+    def test_push_contract_wrapper_requires_and_preserves_current_envelope(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir) / "logs"
+        ), mock.patch.object(gui, "validate_preflight_envelope") as validate:
+            root = Path(temp_dir) / "asset"
+            spm = root / "SK_tree_contract_01.spm"
+            spm.parent.mkdir(parents=True)
+            spm.write_bytes(b"spm")
+            envelope = {"source_fingerprint": "a" * 64}
+            report = root / "reports" / (
+                "SK_tree_contract_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": envelope,
+                    "handoff_preflight": {"status": "ok"},
+                }),
+                encoding="utf-8",
+            )
+
+            contract_path = gui.App._push_material_contract(spm)
+
+            payload = json.loads(contract_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["speedtree_pipeline_contract"], envelope)
+            self.assertTrue(contract_path.name.endswith(f"{'a' * 16}.json"))
+            validate.assert_called_once_with(envelope, spm, require_ok=True)
+
+    def test_push_entrypoints_forward_strict_contract_to_blender_job(self):
+        gui_source = (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(encoding="utf-8")
+        gui_tree = ast.parse(gui_source)
+        gui_functions = {
+            node.name: node
+            for node in ast.walk(gui_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for function_name in ("_export_manifest_item", "_job_push"):
+            strings = {
+                node.value
+                for node in ast.walk(gui_functions[function_name])
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            self.assertIn("--spm", strings)
+            self.assertIn("--material-contract", strings)
+
+        push_source = (
+            SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
+        ).read_text(encoding="utf-8")
+        push_tree = ast.parse(push_source)
+        calls = [node for node in ast.walk(push_tree) if isinstance(node, ast.Call)]
+
+        def call_name(call):
+            if isinstance(call.func, ast.Name):
+                return call.func.id
+            if isinstance(call.func, ast.Attribute):
+                return call.func.attr
+            return ""
+
+        for function_name in (
+            "load_speedtree_texture_readiness_contract",
+            "consolidate_speedtree_group_materials",
+            "normalize_speedtree_material_textures",
+        ):
+            matches = [call for call in calls if call_name(call) == function_name]
+            self.assertEqual(len(matches), 1)
+            keywords = {item.arg for item in matches[0].keywords}
+            if function_name == "load_speedtree_texture_readiness_contract":
+                self.assertTrue({"spm_path", "source_fbx_path"} <= keywords)
+            else:
+                self.assertIn("texture_contract", keywords)
 
     def test_data_and_manual_failures_do_not_stop_later_push_items(self):
         gui = load_gui_module()

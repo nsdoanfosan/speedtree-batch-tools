@@ -524,6 +524,138 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertEqual(texture_base_for_material("M_leaf_test"), "T_leaf_test")
         self.assertEqual(texture_base_for_material("leaf_test"), "T_leaf_test")
 
+    def test_user_collection_suffix_uses_numeric_production_base(self):
+        self.assertEqual(
+            pcg_texture_audit.derived_material_base(
+                "M_Leaf_common_grass_01_Winter_Dry"
+            ),
+            "M_Leaf_common_grass_01",
+        )
+        self.assertIsNone(
+            pcg_texture_audit.derived_material_base("M_stem_common_01")
+        )
+
+        sources = [{
+            "albedo": r"D:\Texture\common_grass_color.tif",
+            "alpha": r"D:\Texture\common_grass_opacity.tif",
+            "targets": [{
+                "material_names": [
+                    "M_Leaf_common_grass_01_dead",
+                    "M_Leaf_common_grass_01_UserCollection",
+                ],
+            }],
+        }]
+        assign_leaf_atlas_bases(
+            sources, Path(r"D:\Trees\Weed_Common_grass")
+        )
+        self.assertEqual(sources[0]["atlas_base"], "M_Leaf_common_grass_01")
+
+    def test_user_collection_aliases_share_job_only_for_same_source(self):
+        def material(material_id, name, color, alpha):
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f'<TexFilename>{color}</TexFilename>'
+                f'<TexFilename>{alpha}</TexFilename>'
+                '</Material_v8>'
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            texture.mkdir()
+            color = self._image(root / "source" / "common_grass_color.png")
+            alpha = self._image(root / "source" / "common_grass_alpha.png")
+            xml = (
+                "<SpeedTree><Materials>"
+                + material("1", "M_Leaf_common_grass_01_dead", color, alpha)
+                + material(
+                    "2", "M_Leaf_common_grass_01_UserCollection", color, alpha
+                )
+                + "</Materials><Generators>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>1</Value>"
+                  "</Property></Generator>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>2</Value>"
+                  "</Property></Generator>"
+                  "</Generators></SpeedTree>"
+            ).encode()
+            with gzip.open(root / "SK_Weed_Common_grass_01.spm", "wb") as handle:
+                handle.write(xml)
+
+            items = material_texture_items(
+                root,
+                {
+                    "atlas_root": str(root / "atlas"),
+                    "required_export_maps": list(sbs_auto.RENDER_MAPS),
+                },
+                [texture],
+                {},
+            )
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["atlas_base"], "M_Leaf_common_grass_01")
+            self.assertEqual(items[0]["texture_base"], "T_Leaf_common_grass_01")
+            self.assertEqual(
+                set(items[0]["material_names"]),
+                {
+                    "M_Leaf_common_grass_01_dead",
+                    "M_Leaf_common_grass_01_UserCollection",
+                },
+            )
+
+    def test_user_collection_aliases_with_different_sources_stay_separate(self):
+        def material(material_id, name, color, alpha):
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f'<TexFilename>{color}</TexFilename>'
+                f'<TexFilename>{alpha}</TexFilename>'
+                '</Material_v8>'
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            texture.mkdir()
+            color_a = self._image(root / "source_a" / "color.png")
+            alpha_a = self._image(root / "source_a" / "alpha.png")
+            color_b = self._image(root / "source_b" / "color.png")
+            alpha_b = self._image(root / "source_b" / "alpha.png")
+            xml = (
+                "<SpeedTree><Materials>"
+                + material(
+                    "1", "M_Leaf_common_grass_01_FirstCustom", color_a, alpha_a
+                )
+                + material(
+                    "2", "M_Leaf_common_grass_01_SecondCustom", color_b, alpha_b
+                )
+                + "</Materials><Generators>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>1</Value>"
+                  "</Property></Generator>"
+                  "<Generator><Property><Name>Leaves:Material</Name><Value>2</Value>"
+                  "</Property></Generator>"
+                  "</Generators></SpeedTree>"
+            ).encode()
+            with gzip.open(root / "SK_Weed_Common_grass_01.spm", "wb") as handle:
+                handle.write(xml)
+
+            items = material_texture_items(
+                root,
+                {
+                    "atlas_root": str(root / "atlas"),
+                    "required_export_maps": list(sbs_auto.RENDER_MAPS),
+                },
+                [texture],
+                {},
+            )
+
+            self.assertEqual(len(items), 2)
+            self.assertEqual(
+                {item["atlas_base"] for item in items},
+                {
+                    "M_Leaf_common_grass_01_FirstCustom",
+                    "M_Leaf_common_grass_01_SecondCustom",
+                },
+            )
+
     def test_common_bark_end_aliases_share_one_material_name(self):
         self.assertEqual(
             canonical_material_name("M_bark_common_locast_end_01"),
@@ -1402,6 +1534,34 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(slots["subsurfacecolor"]["enabled"], "true")
             self.assertEqual(slots["subsurfaceamount"]["enabled"], "false")
             self.assertEqual(slots["subsurfaceamount"]["color_x"], "1")
+
+            # Running the same normalization again must be a true no-op. In
+            # particular, do not recompress the SPM: gzip header/mtime churn
+            # would invalidate Repair and force an otherwise redundant Push.
+            before_bytes = spm.read_bytes()
+            before_mtime = spm.stat().st_mtime_ns
+            backup_entries = sorted(
+                str(path.relative_to(root))
+                for path in (root / "backups").rglob("*"))
+            second = normalize_spms_transactionally([{
+                "spm": str(spm),
+                "materials": {"m_test": {
+                    "texture_dir": str(out),
+                    "texture_base": "T_test",
+                    "subsurface_enabled": True,
+                }},
+            }], backup_root=root / "backups")
+            self.assertEqual(second["spms"], [])
+            self.assertEqual(second["materials"], 0)
+            self.assertIsNone(second["backup_dir"])
+            self.assertEqual(second["unchanged_spms"], [str(spm)])
+            self.assertEqual(spm.read_bytes(), before_bytes)
+            self.assertEqual(spm.stat().st_mtime_ns, before_mtime)
+            self.assertEqual(
+                sorted(str(path.relative_to(root))
+                       for path in (root / "backups").rglob("*")),
+                backup_entries,
+            )
 
     def test_spm_normalization_skips_unbuildable_spm_and_commits_the_rest(self):
         map_template = '''<Map Name="{name}"><ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
@@ -2334,10 +2494,11 @@ class GuiLabelTests(unittest.TestCase):
             {"atlas_blends": [], "targets": []},
         ]}
         self.assertEqual(
-            self.gui.App.step2_text(None, complete), "잎 매쉬 2개 완료 ✓")
+            self.gui.App.step2_text(None, complete),
+            "현재 잎 매쉬 2세트 · 연결 완료 ✓")
         self.assertEqual(
             self.gui.App.step2_text(None, partial),
-            "잎 매쉬 1/2개 완료 · 1개 만들기",
+            "작업 필요 · 현재 연결 완료 1세트 · 새로 만들기 1세트",
         )
 
     def test_step2_label_keeps_managed_connected_output_truthful(self):
@@ -2351,8 +2512,85 @@ class GuiLabelTests(unittest.TestCase):
 
         self.assertEqual(
             self.gui.App.step2_text(None, item),
-            "잎 매쉬 2개 연결 완료 ✓",
+            "현재 연결된 잎 매쉬 2개 ✓",
         )
+
+    def test_step2_label_counts_read_only_current_atlas_inventory(self):
+        complete = {
+            "leaf_mesh_sources": [],
+            "leaf_source_provenance": [{"source_family": "Susan"}],
+            "leaf_atlas_inventory": [{
+                "atlas_base": "M_leaf_susan_atlas_01",
+                "atlas_blends": ["M_leaf_susan_atlas_01.blend"],
+                "generator_connection_complete": True,
+                "complete": True,
+            }],
+        }
+        partial = {
+            "leaf_mesh_sources": [],
+            "leaf_atlas_inventory": [
+                {
+                    "atlas_base": "M_leaf_velvet_grass_atlas_01",
+                    "atlas_blends": ["M_leaf_velvet_grass_atlas_01.blend"],
+                    "generator_connection_complete": True,
+                    "complete": True,
+                },
+                {
+                    "atlas_base": "M_leaf_grass_atlas_01",
+                    "atlas_blends": [],
+                    "generator_connection_complete": True,
+                    "complete": False,
+                },
+            ],
+        }
+
+        self.assertEqual(
+            self.gui.App.step2_text(None, complete),
+            "현재 잎 매쉬 1세트 · 연결 완료 ✓",
+        )
+        self.assertEqual(
+            self.gui.App.step2_text(None, partial),
+            "현재 잎 매쉬 2세트 · 연결 완료 1 · 제작 파일 없음 1",
+        )
+
+    def test_step2_label_separates_work_from_model_scope(self):
+        item = {"leaf_mesh_sources": [{
+            "atlas_blends": [],
+            "targets": [
+                {"spm": "SK_tree_01.spm"},
+                {"spm": "SK_tree_02.spm"},
+            ],
+        }]}
+
+        self.assertEqual(
+            self.gui.App.step2_text(None, item),
+            "작업 필요 · 새로 만들기 1세트 · 적용 모델 2개",
+        )
+
+    def test_read_only_current_inventory_never_schedules_spm_reconnect(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app.cfg = {"atlas_root": r"D:\Trees\atlas"}
+        app.items = {"weed_susan": {
+            "checked": True,
+            "item": {
+                "name": "weed_susan",
+                "leaf_mesh_sources": [],
+                "leaf_source_provenance": [{
+                    "source_family": "Susan",
+                    "actionable": False,
+                }],
+                "leaf_atlas_inventory": [{
+                    "atlas_base": "M_leaf_susan_atlas_01",
+                    "complete": True,
+                    "actionable": False,
+                }],
+            },
+        }}
+
+        jobs, skipped = app._step2_jobs(connect_spm=True)
+
+        self.assertEqual(jobs, [])
+        self.assertEqual(skipped, [])
 
     def test_step3_label_reports_sets_exact_map_progress_and_connection(self):
         pending = {"cluster_items": [
@@ -2516,11 +2754,11 @@ class GuiLabelTests(unittest.TestCase):
 
         self.assertEqual(
             self.gui.App.step2_text(None, pending),
-            "잎 매쉬 1개 · Generator 1개 연결",
+            "작업 필요 · 기존 매쉬 연결 1세트 · 적용 모델 1개",
         )
         self.assertEqual(
             self.gui.App.step2_text(None, complete),
-            "잎 매쉬 1개 완료 ✓",
+            "현재 잎 매쉬 1세트 · 연결 완료 ✓",
         )
 
     def test_step2_explicit_complete_targets_override_stale_source_aggregate(self):

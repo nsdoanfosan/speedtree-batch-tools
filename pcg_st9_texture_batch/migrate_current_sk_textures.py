@@ -389,6 +389,8 @@ def preflight(plan, force=False):
     for row in current_sk_owner_rows(plan):
         try:
             job = build_job(row)
+            if force:
+                job["force_cluster_recook"] = True
             job["size_log2"] = expected_job_size(job)
             expected_pixels = sbs_auto.size_log2_pixels(job["size_log2"])
             graph_needs_update = False
@@ -523,7 +525,8 @@ def run_job(job, cfg, timeout):
                 cfg=cfg, maps=direct_maps,
                 size_log2=job.get("size_log2"),
                 timeout=timeout, return_info=True,
-                normal_opengl=job["normal_opengl"])
+                normal_opengl=job["normal_opengl"],
+                force_recook=bool(job.get("force_cluster_recook")))
             render_results = [rendered]
             actual_size = tuple(rendered["size_log2"])
             if actual_size != job["size_log2"]:

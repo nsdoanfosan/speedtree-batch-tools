@@ -91,15 +91,17 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.parent.mkdir()
             report.write_text(
                 json.dumps({
+                    "speedtree_pipeline_contract": {},
                     "texture_normalization": {"status": "ok", "missing": []},
                     "handoff_preflight": {"status": "ok"},
                 }),
                 encoding="utf-8",
             )
             self.set_time(blend, 3_000_000_000)
-            self.assertEqual(app._blend_status_text(spm), "최신 ✓")
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                self.assertEqual(app._blend_status_text(spm), "최신 ✓")
 
-    def test_legacy_report_without_handoff_preflight_requires_repair(self):
+    def test_legacy_report_without_pipeline_contract_requires_repair(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -125,7 +127,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             ready, reason = app._texture_normalization_ready(spm)
 
             self.assertFalse(ready)
-            self.assertIn("사전검사 정보 없음", reason)
+            self.assertIn("공통 SpeedTree 계약 정보 없음", reason)
             self.assertIn("Repair 필요", app._blend_status_text(spm))
 
     def test_content_receipt_keeps_touch_only_spm_current(self):
@@ -221,6 +223,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             report.parent.mkdir()
             data = {
+                "speedtree_pipeline_contract": {},
                 "texture_normalization": {
                     "status": "ok",
                     "missing": [],
@@ -241,7 +244,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(spm, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
 
-            ready, reason = app._texture_normalization_ready(spm)
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._texture_normalization_ready(spm)
             self.assertFalse(ready)
             self.assertIn("빈 슬롯", reason)
 
@@ -249,7 +253,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(json.dumps(data), encoding="utf-8")
             self.set_time(report, 3_000_000_000)
             texture.unlink()
-            ready, reason = app._texture_normalization_ready(spm)
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._texture_normalization_ready(spm)
             self.assertFalse(ready)
             self.assertIn("텍스처 준비 안 됨", reason)
 
@@ -266,6 +271,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.parent.mkdir()
             report.write_text(
                 json.dumps({
+                    "speedtree_pipeline_contract": {},
                     "texture_normalization": {"status": "ok", "missing": []},
                     "handoff_preflight": {
                         "status": "blocked",
@@ -283,7 +289,9 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             with mock.patch.object(
                 gui.App, "_material_export_ready", return_value=(True, "정상")
-            ) as live_check:
+            ) as live_check, mock.patch.object(
+                gui, "validate_preflight_envelope"
+            ):
                 ready, reason = app._texture_normalization_ready(spm)
 
             self.assertFalse(ready)
@@ -333,6 +341,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.parent.mkdir()
             report.write_text(
                 json.dumps({
+                    "speedtree_pipeline_contract": {},
                     "texture_normalization": {
                         "status": "preserved_cluster",
                         "missing": [],
@@ -349,10 +358,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(spm, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
 
-            self.assertEqual(
-                app._texture_normalization_ready(spm),
-                (True, "텍스처 준비 완료 · 보존 Cluster 1세트"),
-            )
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                self.assertEqual(
+                    app._texture_normalization_ready(spm),
+                    (True, "텍스처 준비 완료 · 보존 Cluster 1세트"),
+                )
 
     def test_live_signature_tracks_reported_texture_deletion(self):
         gui = load_gui_module()

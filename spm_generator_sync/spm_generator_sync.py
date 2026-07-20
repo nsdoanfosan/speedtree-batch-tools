@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -38,6 +39,13 @@ from pathlib import Path
 
 
 TOOL_DIR = Path(__file__).resolve().parent
+REPO_DIR = TOOL_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
+
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
 SKIP_DIRS = {BACKUP_SUBDIR, "_skbatch_backup", "_pcgtex_backups"}
@@ -1009,6 +1017,7 @@ def set_icon_palette(
     generator: ET.Element,
     background: tuple[float, float, float, float] | None,
     unique: bool = False,
+    preserve_foreground: bool = False,
 ) -> bool:
     if background is None:
         return False
@@ -1019,17 +1028,20 @@ def set_icon_palette(
         index = list(generator).index(properties) if properties is not None else len(generator)
         generator.insert(index, extra)
     expected = {
-        "m_bSetForegroundIconColor": "true",
-        "m_vecForegroundIconColor_r": "1" if unique else "0",
-        "m_vecForegroundIconColor_g": "1" if unique else "0",
-        "m_vecForegroundIconColor_b": "1" if unique else "0",
-        "m_vecForegroundIconColor_a": "1",
         "m_bSetBackgroundIconColor": "true",
         "m_vecBackgroundIconColor_r": _format_color(background[0]),
         "m_vecBackgroundIconColor_g": _format_color(background[1]),
         "m_vecBackgroundIconColor_b": _format_color(background[2]),
         "m_vecBackgroundIconColor_a": _format_color(background[3]),
     }
+    if not preserve_foreground:
+        expected.update({
+            "m_bSetForegroundIconColor": "true",
+            "m_vecForegroundIconColor_r": "1" if unique else "0",
+            "m_vecForegroundIconColor_g": "1" if unique else "0",
+            "m_vecForegroundIconColor_b": "1" if unique else "0",
+            "m_vecForegroundIconColor_a": "1",
+        })
     changed = False
     for name, value in expected.items():
         child = extra.find(name)
@@ -1043,6 +1055,37 @@ def set_icon_palette(
     return changed
 
 
+def _icon_foreground_values(generator: ET.Element):
+    extra = generator.find("Extra")
+    if extra is None:
+        return None
+    values = {
+        tag: extra.findtext(tag) for tag in FOREGROUND_TAGS
+    }
+    return values if all(value is not None for value in values.values()) else None
+
+
+def _restore_icon_foreground(
+    generator: ET.Element, values: dict[str, str] | None
+) -> None:
+    if not values:
+        return
+    extra = generator.find("Extra")
+    if extra is None:
+        extra = ET.Element("Extra")
+        properties = generator.find("Properties")
+        index = (
+            list(generator).index(properties)
+            if properties is not None else len(generator)
+        )
+        generator.insert(index, extra)
+    for tag, value in values.items():
+        child = extra.find(tag)
+        if child is None:
+            child = ET.SubElement(extra, tag)
+        child.text = value
+
+
 def set_icon_background(generator: ET.Element, category: str) -> bool:
     """Compatibility wrapper for callers that only know the role."""
     return set_icon_palette(generator, CATEGORY_COLORS.get(category), unique=False)
@@ -1052,10 +1095,12 @@ def standardize_base_colors(
     document: SPMDocument,
     categories: dict[str, str | None],
     unique_guids: set[str] | None = None,
+    preserve_foreground_guids: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     updates = 0
     warnings: list[str] = []
     unique_guids = unique_guids or set()
+    preserve_foreground_guids = preserve_foreground_guids or set()
     processed: set[str] = set()
     for base in document.base_nodes():
         name = document.generator_name(base)
@@ -1071,7 +1116,9 @@ def standardize_base_colors(
             node = document.by_guid.get(guid)
             is_unique = guid in unique_guids
             color = unique_color if is_unique else regular_color
-            if node is not None and set_icon_palette(node, color, unique=is_unique):
+            if node is not None and set_icon_palette(
+                    node, color, unique=is_unique,
+                    preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
         for ref in document.refs_for_base(base):
@@ -1080,7 +1127,9 @@ def standardize_base_colors(
                 continue
             is_unique = guid in unique_guids
             color = unique_color if is_unique else regular_color
-            if set_icon_palette(ref, color, unique=is_unique):
+            if set_icon_palette(
+                    ref, color, unique=is_unique,
+                    preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
     return updates, warnings
@@ -1682,6 +1731,15 @@ def build_sync_plan(
     source = master_document or SPMDocument.from_path(master_path, full=True)
     target = SPMDocument.from_path(target_path, full=True)
     original_target_text = target.text
+    legacy_cluster_guids = set(
+        inspect_legacy_cluster_state(target_path)[
+            "classified_generator_guids"
+        ]
+    )
+    legacy_foregrounds = {
+        guid: _icon_foreground_values(target.by_guid[guid])
+        for guid in legacy_cluster_guids if guid in target.by_guid
+    }
     categories = source_base_categories(source, base_categories)
     plan = SyncPlan(master=str(master_path), target=str(target_path), compressed=target.compressed)
     plan.scale_risk = assess_scale_risk(source, target)
@@ -1787,8 +1845,19 @@ def build_sync_plan(
             detail["guid"] for detail in item.target_only_details
             if detail.get("guid")
         )
+    # sync_subtree applies the role palette while copying settings. Restore
+    # the exact receipt-owned foreground observed at transaction start before
+    # the final background-only palette pass. Drifted/user-edited foregrounds
+    # are preserved as-is; this is not an automatic marker repair.
+    for guid, values in legacy_foregrounds.items():
+        node = target.by_guid.get(guid)
+        if node is not None:
+            _restore_icon_foreground(node, values)
     target_color_updates, color_warnings = standardize_base_colors(
-        target, target_color_categories, unique_guids=unique_guids
+        target,
+        target_color_categories,
+        unique_guids=unique_guids,
+        preserve_foreground_guids=legacy_cluster_guids,
     )
     plan.target_color_updates = target_color_updates
     plan.warnings.extend(color_warnings)
@@ -1811,7 +1880,16 @@ def standardize_master_document(
     document = SPMDocument.from_path(master_path, full=True)
     categories = source_base_categories(document, base_categories)
     reference_renames = standardize_base_ref_names(document)
-    updates, warnings = standardize_base_colors(document, categories)
+    legacy_cluster_guids = set(
+        inspect_legacy_cluster_state(master_path)[
+            "classified_generator_guids"
+        ]
+    )
+    updates, warnings = standardize_base_colors(
+        document,
+        categories,
+        preserve_foreground_guids=legacy_cluster_guids,
+    )
     document.reindex()
     document.validate()
     rendered = document.render()

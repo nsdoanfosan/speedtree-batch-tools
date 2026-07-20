@@ -242,6 +242,7 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         }
     changed = []
     missing = []
+    matched_count = 0
     chunks = []
     cursor = 0
 
@@ -258,10 +259,13 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         if not output:
             missing.append(f"{canonical}: no managed output mapping")
             continue
+        matched_count += 1
         if output.get("mode") == "preserve_source":
             source_block = _source_material_block(output["source_spm"], canonical)
             patched = restore_material_maps(block, canonical, source_block)
             expected_row = next(iter(inspect_material_slots(patched).values()))
+            if patched == block:
+                continue
             chunks.extend((text[cursor:match.start()], patched))
             cursor = match.end()
             changed.append({
@@ -289,6 +293,8 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         }
         patched = normalize_material_block(
             block, canonical, refs, subsurface_enabled=subsurface_enabled)
+        if patched == block:
+            continue
         chunks.extend((text[cursor:match.start()], patched))
         cursor = match.end()
         changed.append({
@@ -302,12 +308,25 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
 
     if missing:
         raise RuntimeError(f"{spm.name}: " + " | ".join(missing))
-    if not changed:
+    if not matched_count:
         raise RuntimeError(f"{spm.name}: no active materials were normalized")
+    if not changed:
+        return {
+            "spm": str(spm), "text": text, "materials": [],
+            "changed": False,
+        }
     chunks.append(text[cursor:])
     patched_text = "".join(chunks)
+    if patched_text == text:
+        return {
+            "spm": str(spm), "text": text, "materials": [],
+            "changed": False,
+        }
     verify_spm_text(spm, patched_text, changed)
-    return {"spm": str(spm), "text": patched_text, "materials": changed}
+    return {
+        "spm": str(spm), "text": patched_text, "materials": changed,
+        "changed": True,
+    }
 
 
 def inspect_material_slots(text):
@@ -390,23 +409,31 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
     under "skipped" instead of aborting every other SPM in the folder.
     """
     patches = []
+    unchanged_spms = []
     skipped = []
     for job in jobs:
         try:
-            patches.append(
-                build_spm_patch(job["spm"], job["materials"], require_outputs=require_outputs)
-            )
+            patch = build_spm_patch(
+                job["spm"], job["materials"],
+                require_outputs=require_outputs)
+            if patch.get("changed") is False:
+                unchanged_spms.append(patch["spm"])
+            else:
+                patches.append(patch)
         except Exception as exc:
             if not skip_unbuildable:
                 raise
             skipped.append({"spm": str(job["spm"]), "reason": str(exc)})
     if not patches:
-        if skipped:
+        if skipped and not unchanged_spms:
             raise RuntimeError(
                 "no SPM could be normalized: "
                 + " | ".join(entry["reason"] for entry in skipped)
             )
-        return {"spms": [], "materials": 0, "backup_dir": None, "skipped": skipped}
+        return {
+            "spms": [], "materials": 0, "backup_dir": None,
+            "skipped": skipped, "unchanged_spms": unchanged_spms,
+        }
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_root = Path(backup_root or (Path(patches[0]["spm"]).parent / "_spm_backups"))
@@ -434,6 +461,7 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
         "materials": sum(len(patch["materials"]) for patch in patches),
         "backup_dir": str(backup_dir),
         "skipped": skipped,
+        "unchanged_spms": unchanged_spms,
     }
 
 

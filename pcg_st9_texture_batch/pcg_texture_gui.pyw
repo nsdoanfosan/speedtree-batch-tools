@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -162,6 +163,20 @@ def step3_selection_state(entries):
             "state": "normal",
         }
     return {"text": "③ 실행 — 선택 항목에 텍스처 없음", "state": "disabled"}
+
+
+def step3_force_selection_state(entries):
+    """Return the explicit manual full-rerender action for the whole board."""
+    texture_sets = sum(
+        step3_item_state(entry.get("item") or {})["sets"]
+        for entry in entries.values()
+    )
+    if not texture_sets:
+        return {"text": "③ 전체 다시 뽑기 — 대상 없음", "state": "disabled"}
+    return {
+        "text": f"③ 전체 다시 뽑기 ({texture_sets}세트)",
+        "state": "normal",
+    }
 
 
 def spm_paths_for_item(item):
@@ -630,6 +645,21 @@ class App:
                                 "AO 없으면 height에서 Designer HBAO 생성, SDF=0, 노멀 방식은 원본 출처로 자동 판정.\n"
                                 "기존 T_ 6장은 렌더 전에 _pcgtex_backups\\ 에 백업하고,\n"
                                 "새 T_ 렌더가 성공하면 대응하는 기존 M_ 출력은 삭제합니다.")
+        self.btn_step3_force = ttk.Button(
+            actions2,
+            text="③ 전체 다시 뽑기 (선택 항목)",
+            command=self.start_step3_force,
+        )
+        self.btn_step3_force.pack(side="left", padx=4)
+        Tooltip(
+            self.btn_step3_force,
+            "Cluster_System_01.sbsar를 수정한 뒤 수동으로 사용하는 전체 재추출입니다.\n"
+            "체크 여부와 무관하게 현재 표의 모든 세트를 세트당 T_ 6장씩 다시 렌더합니다.\n"
+            "절차형 SBS 그래프도 기존 쿡 캐시를 재사용하지 않고 현재 Cluster_System을 다시 쿡합니다.\n"
+            "모든 렌더가 성공하면 결과 전체를 모아 Unreal 동기화를 한 번만 실행합니다.\n"
+            "SPM 연결 정리는 실행하지 않습니다.\n"
+            "기존 출력은 일반 ③ 실행과 같이 안전하게 백업합니다.",
+        )
         cols = ("pcg", "step1", "step2", "step3", "next")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
         self.tree.heading("#0", text="나무 폴더 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
@@ -1087,10 +1117,39 @@ class App:
     def step2_text(self, item):
         sources = item.get("leaf_mesh_sources") or []
         if not sources:
+            inventory = item.get("leaf_atlas_inventory") or []
+            if inventory:
+                complete = sum(
+                    1 for atlas in inventory if atlas.get("complete"))
+                missing_blends = sum(
+                    1 for atlas in inventory
+                    if not atlas.get("atlas_blends"))
+                connection_issues = sum(
+                    1 for atlas in inventory
+                    if atlas.get("atlas_blends")
+                    and not atlas.get("generator_connection_complete"))
+                if complete == len(inventory):
+                    return (
+                        f"현재 잎 매쉬 {len(inventory)}세트 · 연결 완료 ✓"
+                    )
+                parts = [f"현재 잎 매쉬 {len(inventory)}세트"]
+                if complete:
+                    parts.append(f"연결 완료 {complete}")
+                if missing_blends:
+                    parts.append(f"제작 파일 없음 {missing_blends}")
+                if connection_issues:
+                    parts.append(f"연결 점검 {connection_issues}")
+                return " · ".join(parts)
             managed = item.get("managed_leaf_outputs") or []
             if managed:
-                return f"잎 매쉬 {len(managed)}개 연결 완료 ✓"
-            return "원본 잎 아틀라스 없음"
+                return f"현재 연결된 잎 매쉬 {len(managed)}개 ✓"
+            provenance = item.get("leaf_source_provenance") or []
+            if provenance:
+                return (
+                    f"과거 잎 원본 {len(provenance)}세트 보존 · "
+                    "현재 사용 안 함"
+                )
+            return "현재 잎 매쉬 없음"
         states = [leaf_source_step2_state(source) for source in sources]
         complete = sum(1 for state in states if state["complete"])
         builds = sum(1 for state in states if state["needs_build"])
@@ -1101,21 +1160,17 @@ class App:
             if target.get("spm")
         }
         if complete == len(sources):
-            return f"잎 매쉬 {len(sources)}개 완료 ✓"
-        parts = []
+            return f"현재 잎 매쉬 {len(sources)}세트 · 연결 완료 ✓"
+        parts = ["작업 필요"]
         if complete:
-            parts.append(f"잎 매쉬 {complete}/{len(sources)}개 완료")
-        else:
-            parts.append(f"잎 매쉬 {len(sources)}개")
+            parts.append(f"현재 연결 완료 {complete}세트")
         if builds:
-            parts.append(f"{builds}개 만들기")
+            parts.append(f"새로 만들기 {builds}세트")
         if connects:
-            parts.append(f"Generator {connects}개 연결")
-        if builds or connects:
-            if not complete and builds == len(sources) and not connects:
-                return f"잎 매쉬 {len(sources)}개 만들기 · 최종 SK {len(targets)}개"
-            return " · ".join(parts)
-        return f"잎 매쉬 {len(sources)}개 만들기 · 최종 SK {len(targets)}개"
+            parts.append(f"기존 매쉬 연결 {connects}세트")
+        if targets:
+            parts.append(f"적용 모델 {len(targets)}개")
+        return " · ".join(parts)
 
     def step3_text(self, item):
         state = step3_item_state(item)
@@ -1312,7 +1367,48 @@ class App:
         rows = self._detail_texture_rows(item) if clusters else []
         L.append("── ② 잎 메시 만들기 ──   ([② 실행] 버튼이 자동 처리 · Blender 아틀라스 리프 제너레이터)")
         leaf_sources = item.get("leaf_mesh_sources") or []
-        if not leaf_sources:
+        leaf_inventory = item.get("leaf_atlas_inventory") or []
+        leaf_provenance = item.get("leaf_source_provenance") or []
+        leaf_targets = item.get("leaf_mesh_target_spms") or []
+        legacy_states = item.get("legacy_cluster_states") or []
+        legacy_count = sum(
+            len(state.get("classified_generator_guids") or [])
+            for state in legacy_states
+        )
+        L.append(
+            f"  · 검사 범위: 현재 적용 모델 {len(leaf_targets)}개"
+            + (
+                " — " + ", ".join(Path(path).name for path in leaf_targets)
+                if leaf_targets else ""
+            )
+        )
+        if legacy_count:
+            L.append(
+                f"  · 과거 Cluster 기록: Generator {legacy_count}개 "
+                "(숨김 기록은 자동 작업 수에서 제외)"
+            )
+        if not leaf_sources and leaf_inventory:
+            L.append("  · 현재 상태 — 사용 중인 잎 매쉬:")
+            for atlas in leaf_inventory:
+                blends = atlas.get("atlas_blends") or []
+                if atlas.get("complete"):
+                    state = f"{Path(blends[0]).name} + 현재 Generator 연결 ✓"
+                elif blends:
+                    state = f"{Path(blends[0]).name} 있음 · 현재 연결 점검 필요"
+                else:
+                    state = "현재 Generator에서 사용 중 · 대응 blend 없음"
+                materials = ", ".join(atlas.get("material_names") or [])
+                L.append(f"  · {atlas.get('atlas_base', '')}: {state}")
+                if materials:
+                    L.append(f"      현재 머티리얼: {materials}")
+                L.append("      판정: 읽기 전용 현재 상태 · 자동 재연결 대상 아님")
+        if leaf_provenance:
+            L.append("  · 과거 기록 — 현재 사용하지 않는 원본(자동 작업 제외):")
+            for source in leaf_provenance:
+                L.append(
+                    f"      {source.get('source_family', '')}: "
+                    f"{source.get('albedo', '')} / {source.get('alpha', '')}")
+        if not leaf_sources and not leaf_inventory and not leaf_provenance:
             L.append("  · 최종/Cluster SPM에서 메시화할 원본 잎 아틀라스를 찾지 못했습니다.")
         for source in leaf_sources:
             kinds = source.get("source_kinds") or [source.get("source_kind", "direct")]
@@ -1325,7 +1421,10 @@ class App:
                 state = f"{Path(blends[0]).name} 있음 · Generator 연결 필요 → [② 실행]"
             else:
                 state = "blend 없음 → [② 실행]"
-            L.append(f"  · {source['source_family']}: {state}  ({route})")
+            L.append(
+                f"  · 실행할 작업 — {source['source_family']}: "
+                f"{state}  ({route})"
+            )
             L.append(f"      Albedo: {source['albedo']}")
             L.append(f"      Alpha:  {source['alpha']}")
             L.append(f"      생성 이름: {source['atlas_base']} / Quality: Low / Plate Mode: One Plate")
@@ -1597,12 +1696,26 @@ class App:
                 text="③ 기존 Unreal 동기화 기록 확인 중…",
                 state="disabled",
             )
+            if hasattr(self, "btn_step3_force"):
+                self.btn_step3_force.configure(state="disabled")
             return
         state = step3_selection_state(getattr(self, "items", {}))
         self.btn_step3.configure(
             text=state["text"],
             state="disabled" if getattr(self, "_busy", False) else state["state"],
         )
+        if hasattr(self, "btn_step3_force"):
+            force_state = step3_force_selection_state(
+                getattr(self, "items", {})
+            )
+            self.btn_step3_force.configure(
+                text=force_state["text"],
+                state=(
+                    "disabled"
+                    if getattr(self, "_busy", False)
+                    else force_state["state"]
+                ),
+            )
 
     def _prepare_finished(self, done, failed):
         summary = f"① 완료: 처리 {done}개, 실패 {failed}개"
@@ -1610,11 +1723,11 @@ class App:
         self._start_completion_refresh(summary)
 
     # ------------------------------------------------------------- ②③ 공용
-    def _checked_texplan_rows(self):
-        """체크된 행의 (item, texplan row) 목록. 같은 atlas_base는 폴더당 1번."""
+    def _scoped_texplan_rows(self, checked_only=True):
+        """Return unique (item, texture row) pairs in the requested board scope."""
         result = []
         for entry in self.items.values():
-            if not entry["checked"]:
+            if checked_only and not entry["checked"]:
                 continue
             item = entry["item"]
             if not item.get("cluster_items"):
@@ -1627,6 +1740,14 @@ class App:
                 seen.add(base.lower())
                 result.append((item, row))
         return result
+
+    def _checked_texplan_rows(self):
+        """체크된 행의 (item, texplan row) 목록. 같은 atlas_base는 폴더당 1번."""
+        return self._scoped_texplan_rows(checked_only=True)
+
+    def _all_texplan_rows(self):
+        """현재 표 전체의 고유 로컬 텍스처 행을 반환한다."""
+        return self._scoped_texplan_rows(checked_only=False)
 
     def _graph_albedo_alpha(self, row):
         """SBS의 T_ 그래프(또는 레거시 M_) 원본 연결을 그대로 쓴다."""
@@ -1843,9 +1964,12 @@ class App:
         self._ui(lambda: self._batch_finished("②", done, failed))
 
     # ------------------------------------------------------------- ③ 실행
-    def _step3_jobs(self):
+    def _step3_jobs(self, force_rerender=False, all_rows=False):
         jobs, skipped = [], []
-        for item, row in self._checked_texplan_rows():
+        scoped_rows = (
+            self._all_texplan_rows() if all_rows else self._checked_texplan_rows()
+        )
+        for item, row in scoped_rows:
             base = row["atlas_base"]
             if row.get("shared_from"):
                 continue  # 다른 폴더에서 관리 — 그쪽 행에서 처리
@@ -1860,7 +1984,10 @@ class App:
                         job["sbs"], job["graph"])["needs_update"]
                 source_needs_repair = job_needs_source_repair(job)
                 complete = complete_output_set(row, expected_pixels=expected_pixels)
-                if complete and not graph_needs_update and not source_needs_repair:
+                if force_rerender:
+                    job["force_cluster_recook"] = True
+                if (complete and not force_rerender
+                        and not graph_needs_update and not source_needs_repair):
                     continue
                 jobs.append(job)
             except Exception as exc:
@@ -1869,7 +1996,8 @@ class App:
         for entry in self.items.values():
             item = entry["item"]
             folder = item["folder"]
-            if entry["checked"] and folder in self.texplan_errors \
+            in_scope = all_rows or entry["checked"]
+            if in_scope and folder in self.texplan_errors \
                     and folder not in already_reported:
                 skipped.append((
                     item, "텍스처 계획",
@@ -1952,6 +2080,58 @@ class App:
             except ValueError as exc:
                 errors.append((asset_name, str(exc)))
         return errors
+
+    def start_step3_force(self):
+        if not self.report:
+            self.refresh()
+            self.status_var.set("검사가 끝난 뒤 전체 재추출을 다시 실행하세요.")
+            return
+        self.status_var.set("③ 전체 재추출 대상 확인 중...")
+        self.root.update_idletasks()
+        jobs, skipped = self._step3_jobs(force_rerender=True, all_rows=True)
+        for item, base, reason in skipped:
+            self.log(f"[③ 전체 재추출 건너뜀] {item['name']} / {base}: {reason}")
+        if skipped:
+            lines = [
+                "선택 항목의 텍스처 계획을 완성하지 못해 전체 재추출을 중단합니다.",
+                "일부 항목만 새 결과로 바뀌지 않도록 시작 전에 차단했습니다.",
+                "",
+            ]
+            for item, base, reason in skipped[:8]:
+                lines.append(f"· {item['name']} / {base}: {reason}")
+            if len(skipped) > 8:
+                lines.append(f"· ... 외 {len(skipped) - 8}개")
+            messagebox.showerror("③ 전체 재추출 차단", "\n".join(lines))
+            self.status_var.set(f"③ 전체 재추출 차단 · 계획 오류 {len(skipped)}개")
+            return
+        if not jobs:
+            messagebox.showinfo(
+                "③ 전체 다시 뽑기",
+                "현재 표에서 전체 재추출할 로컬 텍스처 세트를 찾지 못했습니다.",
+            )
+            self.status_var.set("대기")
+            return
+
+        message = (
+            f"현재 표의 연결 텍스처 {len(jobs)}세트에서 T_ 6장을 전부 다시 뽑습니다.\n"
+            f"총 출력: {len(jobs) * len(sbs_auto.RENDER_MAPS)}장\n\n"
+            f"Cluster: {sbs_auto.cluster_sbsar(self.cfg)}\n\n"
+            "모든 렌더가 성공하면 Unreal 동기화를 한 번만 실행합니다.\n"
+            "SPM 연결 정리는 실행하지 않습니다.\n"
+            "계속할까요?"
+        )
+        if not messagebox.askyesno("③ 전체 다시 뽑기", message):
+            self.status_var.set("대기")
+            return
+        self._set_busy(True)
+        self.status_var.set(f"③ 전체 재추출 시작 · {len(jobs)}세트")
+        self.root.update_idletasks()
+        self.worker = threading.Thread(
+            target=self._run_step3,
+            args=(jobs, [], [], False, True),
+            daemon=True,
+        )
+        self.worker.start()
 
     def start_step3(self):
         if not self.report:
@@ -2098,7 +2278,7 @@ class App:
 
     def _run_step3(
             self, jobs, affected_spms, sync_files=None,
-            force_unreal_verify=False):
+            force_unreal_verify=False, require_all_renders_for_sync=False):
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
@@ -2164,7 +2344,13 @@ class App:
                 failed += 1
                 self._ui(lambda e=exc: self.log(
                     f"[③ SK SPM 정리 실패] 출력 파일은 보존됨, SPM은 변경하지 않음: {e}"))
-        if sync_candidates and self.cfg.get("unreal_texture_sync_enabled", True):
+        sync_allowed = not require_all_renders_for_sync or failed == 0
+        if require_all_renders_for_sync and failed and sync_candidates:
+            self._ui(lambda count=failed: self.log(
+                f"[③ Unreal 동기화 건너뜀] 렌더 실패 {count}개 — "
+                "전체 재추출 성공 후 한 번에 동기화합니다."))
+        if (sync_allowed and sync_candidates
+                and self.cfg.get("unreal_texture_sync_enabled", True)):
             try:
                 unique_candidates = []
                 seen_candidates = set()

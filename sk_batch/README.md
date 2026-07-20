@@ -124,7 +124,11 @@ BWR `SpeedTree → Import → Repair` 실행, wind 프리셋은 파일명 기반
 수정하지 않는다. 구형 `Cluster` 렌더 텍스처를 참조하는 Generator의 전경 자홍색
 표시는 PCG ①에서 새 SK SPM을 생성한 직후에만 1회 기록한다. 기존 SK 데이터는
 `migrate_legacy_cluster_markers.py --apply`로 1회 이관하며, SPM별 백업과 영구
-receipt를 남긴다. 이후 재질 사전검사는 이 색을 변경하거나 원복하지 않는다.
+receipt를 남긴다. 이후 판정은 공용 `speedtree_legacy_cluster_contract.py`가
+receipt의 최초 Generator GUID를 읽어 담당한다. 현재 재질 경로나 표시색이 바뀌어도
+계보는 유지되며, Generator Sync는 receipt 소유 GUID의 전경색을 덮어쓰지 않는다.
+표시색만 있고 receipt가 없는 경우는 과거 문제 표시와 구분할 수 없으므로 자동
+분류하지 않는다. 이후 재질 사전검사는 이 색을 변경하거나 원복하지 않는다.
 
 **③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
 새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,
@@ -138,8 +142,9 @@ headless transport의 Blender export도 기본 2개씩 처리하며 Unreal impor
 `add-on 로드 실패`, `FBX 메시 지오메트리 없음`, `시간 초과`처럼 짧은 원인을
 남긴다. 전체 traceback과 상세 경로는 `sk_batch/logs/`의 JSON/log에 보존한다.
 
-**🌙 전체 자동 ①→②→③** — 선택한 항목의 ①을 모두 끝낸 뒤 ② 전체, 마지막으로
-③ 전체를 실행하는 야간 일괄 버튼이다. 개별 실패·수동 처리 항목은 상태와 로그에
+**🌙 목록 전체 자동 ①→②→③** — 체크 상태와 무관하게 현재 목록의 모든 항목에서
+①을 모두 끝낸 뒤 ② 전체, 마지막으로 ③ 전체를 실행하는 야간 일괄 버튼이다. 개별
+①/②/③ 버튼만 체크된 항목을 대상으로 한다. 개별 실패·수동 처리 항목은 상태와 로그에
 남기고 다른 파일은 계속 진행한다. 중지 버튼은 현재 단계의 자식 프로세스까지 종료한다.
 
 ## 옵션 설명 (GUI 툴팁과 동일)
