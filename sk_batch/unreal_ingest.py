@@ -24,6 +24,7 @@ import unreal
 SCHEMA_VERSION = 1
 TERMINAL_STATES = {"imported_ok", "data_error", "manual_required", "not_run"}
 _SEND2UE_UNREAL_MODULES = {}
+PLACEHOLDER_SKELETON_NAME = "SK_PlaceholderCube_Skeleton"
 
 
 def _now():
@@ -405,6 +406,46 @@ def _import_manifest_asset(send2ue_unreal, manifest_asset):
     }
 
 
+def _clear_placeholder_skeleton_before_import(item):
+    """Force a fresh, dedicated ``<mesh>_Skeleton`` on reimport.
+
+    The migration seeded every not-yet-converted slot with a dummy that shares a
+    single ``SK_PlaceholderCube_Skeleton``.  Reimporting the real FBX *in place*
+    keeps whatever skeleton the existing asset already references, so the real
+    mesh silently inherits that shared placeholder skeleton.  DynamicWind batches
+    instanced skinning per skeleton, so meshes with different bone counts sharing
+    one skeleton assert-crash the renderer the instant a wind provider attaches.
+
+    Deleting only the placeholder *mesh* (never the shared skeleton, which the
+    other dummies still reference) makes the subsequent Send2UE import a fresh
+    import, which creates a new dedicated skeleton the same way cleanly-imported
+    siblings got theirs.  A mesh that already has its own skeleton, or a slot with
+    nothing imported yet, is left untouched.
+    """
+    mesh_path = item.get("mesh_path")
+    if not mesh_path:
+        return {"status": "skipped", "reason": "item has no mesh_path"}
+    asset_path = mesh_path.split(".")[0]
+    if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return {"status": "fresh"}
+    mesh = unreal.EditorAssetLibrary.load_asset(asset_path)
+    skeleton = mesh.get_editor_property("skeleton") if mesh else None
+    if skeleton is None or skeleton.get_name() != PLACEHOLDER_SKELETON_NAME:
+        return {
+            "status": "ok",
+            "skeleton": skeleton.get_path_name() if skeleton else None,
+        }
+    if not unreal.EditorAssetLibrary.delete_asset(asset_path):
+        raise RuntimeError(
+            f"failed to delete placeholder mesh for fresh skeleton: {asset_path}"
+        )
+    return {
+        "status": "cleared_placeholder",
+        "deleted": asset_path,
+        "shared_skeleton": skeleton.get_path_name(),
+    }
+
+
 def _apply_dynamic_wind(item):
     wind_json = item.get("wind_json")
     if not wind_json:
@@ -494,6 +535,7 @@ def _save_item_assets(item, imported_assets):
 
 def ingest_item(item):
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
+    skeleton = _clear_placeholder_skeleton_before_import(item)
     checkout = _checkout_existing_assets(item)
     mesh_path = item["mesh_path"]
     default_physics_asset_preexisting = _default_physics_asset_preexisting(
@@ -522,6 +564,7 @@ def ingest_item(item):
         "status": "imported_ok",
         "checkout": checkout,
         "assets": imported_assets,
+        "skeleton": skeleton,
         "wind": wind,
         "materials": materials,
         "optimization": optimization,

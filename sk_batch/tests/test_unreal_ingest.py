@@ -211,6 +211,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
             }
         )
         runner._finalize_speedtree_skeletal_optimization = lambda value: value
+        runner._clear_placeholder_skeleton_before_import = lambda _item: {"status": "ok"}
         runner._apply_dynamic_wind = lambda _item: {"status": "ok"}
         runner._save_item_assets = (
             lambda _item, _assets: events.append("save") or [mesh_path]
@@ -267,6 +268,124 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
         self.assertEqual(events, ["save", "validate"])
         self.assertEqual(result["saved"], [mesh_path])
+
+    @staticmethod
+    def _skeleton_fixture(runner, skeleton_name, exists=True):
+        calls = {"deleted": []}
+
+        class FakeSkeleton:
+            def __init__(self, name):
+                self._name = name
+
+            def get_name(self):
+                return self._name
+
+            def get_path_name(self):
+                return f"/Game/Meshes/_Placeholder/{self._name}.{self._name}"
+
+        class FakeMesh:
+            def __init__(self):
+                self.skeleton = (
+                    FakeSkeleton(skeleton_name) if skeleton_name else None
+                )
+
+            def get_editor_property(self, name):
+                assert name == "skeleton"
+                return self.skeleton
+
+        mesh = FakeMesh() if exists else None
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(_path):
+                return exists
+
+            @staticmethod
+            def load_asset(_path):
+                return mesh
+
+            @staticmethod
+            def delete_asset(path):
+                calls["deleted"].append(path)
+                return True
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        return calls
+
+    def test_clear_skeleton_noop_when_slot_is_empty(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(runner, None, exists=False)
+
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+        )
+
+        self.assertEqual(result["status"], "fresh")
+        self.assertEqual(calls["deleted"], [])
+
+    def test_clear_skeleton_left_alone_when_dedicated(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(runner, "SK_Test_Skeleton")
+
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(calls["deleted"], [])
+
+    def test_clear_skeleton_deletes_placeholder_mesh(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(runner, "SK_PlaceholderCube_Skeleton")
+
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+        )
+
+        self.assertEqual(result["status"], "cleared_placeholder")
+        self.assertEqual(calls["deleted"], ["/Game/Meshes/Trees/SK_Test"])
+        self.assertIn("SK_PlaceholderCube_Skeleton", result["shared_skeleton"])
+
+    def test_clear_skeleton_raises_when_delete_fails(self):
+        runner = load_runner()
+        self._skeleton_fixture(runner, "SK_PlaceholderCube_Skeleton")
+        runner.unreal.EditorAssetLibrary.delete_asset = staticmethod(
+            lambda _path: False
+        )
+
+        with self.assertRaises(RuntimeError):
+            runner._clear_placeholder_skeleton_before_import(
+                {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+            )
+
+    def test_ingest_item_clears_skeleton_before_import(self):
+        runner = load_runner()
+        events = []
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        self._configure_ingest_runner(runner, events, mesh_path)
+        runner._clear_placeholder_skeleton_before_import = (
+            lambda _item: events.append("skeleton") or {"status": "ok"}
+        )
+        runner._import_manifest_asset = (
+            lambda _send2ue, _asset: events.append("import")
+            or {"asset_path": mesh_path}
+        )
+        runner._apply_dynamic_wind = (
+            lambda _item: events.append("wind") or {"status": "ok"}
+        )
+        runner._material_compile_and_slot_validation = lambda _path: {}
+
+        result = runner.ingest_item(
+            {
+                "send2ue_unreal_py": "send2ue_unreal.py",
+                "assets": [{}],
+                "mesh_path": mesh_path,
+            }
+        )
+
+        self.assertEqual(events[0], "skeleton")
+        self.assertLess(events.index("skeleton"), events.index("import"))
+        self.assertEqual(result["skeleton"], {"status": "ok"})
 
     def test_speedtree_import_disables_physics_asset_generation_temporarily(self):
         runner = load_runner()
