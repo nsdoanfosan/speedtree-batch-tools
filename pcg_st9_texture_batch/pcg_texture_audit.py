@@ -38,6 +38,9 @@ if __package__ in (None, ""):
         load_config,
         load_pcg_targets,
     )
+    from pcg_cluster_assembly_contract import (
+        persist_cluster_assembly_receipts,
+    )
 else:
     from .pcg_texture_common import (
         IMAGE_EXTS,
@@ -46,6 +49,9 @@ else:
         json_safe_path,
         load_config,
         load_pcg_targets,
+    )
+    from .pcg_cluster_assembly_contract import (
+        persist_cluster_assembly_receipts,
     )
 
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
@@ -637,6 +643,10 @@ def canonical_material_name(name):
 
 def material_rename_plan(spm, exclude=None):
     names = visible_material_names(spm)
+    return _material_rename_plan_for_names(names, exclude=exclude)
+
+
+def _material_rename_plan_for_names(names, exclude=None):
     exclude = {str(name) for name in (exclude or [])}
     renames = []
     for name in names:
@@ -646,6 +656,18 @@ def material_rename_plan(spm, exclude=None):
         if target != name:
             renames.append([name, target])
     return renames
+
+
+def cluster_material_rename_plan(spm, exclude=None):
+    """Normalize every Generator-referenced Cluster material.
+
+    Some source leaf SPMs export materials even when their authored visibility
+    chain cannot be reconstructed by the audit.  Cluster ①-C therefore uses
+    the broader Generator-reference set.  The later FBX/STMAT receipt remains
+    the content-driven check for which material/mesh pairs actually exported.
+    """
+    return _material_rename_plan_for_names(
+        active_material_names(spm), exclude=exclude)
 
 
 def root_spms(folder):
@@ -1847,6 +1869,7 @@ def cluster_material_usage(target_spms, clusters):
                 key = str(cluster).lower()
                 usage = found.setdefault(key, {
                     "spms": [], "material_names": [], "source_refs": [],
+                    "connected_refs": [], "missing_source_refs": [],
                     "source_albedo": [], "source_alpha": [],
                     "material_names_by_spm": {},
                     "material_ids_by_spm": {},
@@ -1867,9 +1890,17 @@ def cluster_material_usage(target_spms, clusters):
                     ids_for_spm.append(material_id)
                 for ref in refs:
                     resolved = resolve_spm_image_ref(spm, ref)
-                    if not path_exists(resolved):
-                        continue
                     text = str(resolved)
+                    if text.lower() not in {
+                            value.lower()
+                            for value in usage["connected_refs"]}:
+                        usage["connected_refs"].append(text)
+                    if not path_exists(resolved):
+                        if text.lower() not in {
+                                value.lower()
+                                for value in usage["missing_source_refs"]}:
+                            usage["missing_source_refs"].append(text)
+                        continue
                     if text.lower() not in {value.lower() for value in usage["source_refs"]}:
                         usage["source_refs"].append(text)
                     stem = Path(ref).stem.lower()
@@ -2037,6 +2068,7 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
                 "binding_count": 0,
                 "visible_binding_count": 0,
                 "ready_binding_count": 0,
+                "visible_ready_binding_count": 0,
                 "managed": False,
                 "read_only": True,
                 "actionable": False,
@@ -2054,6 +2086,8 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             entry["binding_count"] += 1
             entry["visible_binding_count"] += int(bool(binding.get("visible")))
             entry["ready_binding_count"] += int(ready)
+            entry["visible_ready_binding_count"] += int(
+                bool(binding.get("visible")) and ready)
             entry["managed"] = bool(
                 entry["managed"] or material.get("managed_leaf_output"))
             target = next(
@@ -2065,7 +2099,9 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
                 target = {
                     "spm": str(spm), "material_names": [],
                     "material_ids": [], "binding_count": 0,
+                    "visible_binding_count": 0,
                     "ready_binding_count": 0,
+                    "visible_ready_binding_count": 0,
                 }
                 entry["targets"].append(target)
             target["material_names"] = unique(
@@ -2073,17 +2109,35 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             target["material_ids"] = unique(
                 target["material_ids"] + [material_id])
             target["binding_count"] += 1
+            target["visible_binding_count"] += int(
+                bool(binding.get("visible")))
             target["ready_binding_count"] += int(ready)
+            target["visible_ready_binding_count"] += int(
+                bool(binding.get("visible")) and ready)
 
     results = []
     for entry in grouped.values():
         for target in entry["targets"]:
+            target["export_participating"] = bool(
+                target["visible_binding_count"])
             target["generator_connection_complete"] = bool(
+                target["visible_binding_count"]
+                and target["visible_ready_binding_count"]
+                == target["visible_binding_count"]
+            ) if target["export_participating"] else bool(
                 target["binding_count"]
-                and target["ready_binding_count"] == target["binding_count"])
+                and target["ready_binding_count"] == target["binding_count"]
+            )
+        entry["export_participating"] = bool(
+            entry["visible_binding_count"])
         entry["generator_connection_complete"] = bool(
+            entry["visible_binding_count"]
+            and entry["visible_ready_binding_count"]
+            == entry["visible_binding_count"]
+        ) if entry["export_participating"] else bool(
             entry["binding_count"]
-            and entry["ready_binding_count"] == entry["binding_count"])
+            and entry["ready_binding_count"] == entry["binding_count"]
+        )
         entry["complete"] = bool(
             entry["atlas_blends"]
             and entry["generator_connection_complete"])
@@ -2333,10 +2387,14 @@ def discover_leaf_mesh_sources(folder, cfg, target_spms, clusters):
     return lineage["actionable_sources"], lineage["referenced_clusters"]
 
 
-def patch_m_prefix(spm, exclude=None):
+def patch_m_prefix(spm, exclude=None, cluster_active_scope=False):
     spm = Path(spm)
     text = read_maybe_gzip_text(spm)
-    renames = dict(material_rename_plan(spm, exclude=exclude))
+    planner = (
+        cluster_material_rename_plan
+        if cluster_active_scope else material_rename_plan
+    )
+    renames = dict(planner(spm, exclude=exclude))
     if not renames:
         return {"spm": str(spm), "changed": False, "renames": []}
 
@@ -2364,6 +2422,44 @@ def patch_m_prefix(spm, exclude=None):
 
 def m_prefix_plan(spm, exclude=None):
     return material_rename_plan(spm, exclude=exclude)
+
+
+def prepare_cluster_m_prefix(spm, dry_run=False, exclude_materials=None):
+    """Apply only M_ material normalization to one exact Cluster source.
+
+    Cluster sources keep their authored filename so SpeedTree card-render TGA
+    basenames remain stable.  This path never creates an ``SK_*.spm`` copy;
+    the corresponding SK name belongs only to the Blender output.
+    """
+    source = Path(spm)
+    if source.parent.name.casefold() != "cluster":
+        raise RuntimeError(f"not an exact Cluster source SPM: {source}")
+    if source.name.casefold().startswith("sk_") or source.suffix.casefold() != ".spm":
+        raise RuntimeError(f"Cluster M_ target must be a non-SK .spm: {source}")
+    if not source.is_file() or is_backup_path(source):
+        raise RuntimeError(f"Cluster source SPM is unavailable: {source}")
+    renames = cluster_material_rename_plan(
+        source, exclude=exclude_materials)
+    if dry_run:
+        return {
+            "spm": str(source),
+            "status": "dry-run" if renames else "up_to_date",
+            "changed": False,
+            "renames": renames,
+            "blend_output": str(
+                source.with_name(f"SK_{source.stem}.blend")
+            ),
+        }
+    patch = patch_m_prefix(
+        source,
+        exclude=exclude_materials,
+        cluster_active_scope=True,
+    )
+    return {
+        **patch,
+        "status": "prepared" if patch.get("changed") else "up_to_date",
+        "blend_output": str(source.with_name(f"SK_{source.stem}.blend")),
+    }
 
 
 def spm_matches_mesh_name(spm_path, mesh_name):
@@ -2448,6 +2544,11 @@ def _mark_new_sk_or_rollback(target):
 
 def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=None):
     folder = Path(folder)
+    if folder.name.casefold() == "cluster":
+        raise RuntimeError(
+            "Cluster source SPM names are fixed; use "
+            "prepare_cluster_m_prefix() instead of creating SK_*.spm"
+        )
     if target_mesh_names:
         results = []
         for mesh_name in sorted(set(target_mesh_names)):
@@ -2889,7 +2990,63 @@ def cluster_spms(folder):
     cluster_dir = Path(folder) / "Cluster"
     if not cluster_dir.exists():
         return []
-    return sorted(p for p in cluster_dir.glob("*.spm") if p.is_file() and not is_backup_path(p))
+    return sorted(
+        p for p in cluster_dir.glob("*.spm")
+        if p.is_file()
+        and not p.name.lower().startswith("sk_")
+        and not is_backup_path(p)
+    )
+
+
+def cluster_source_inventory(clusters, cluster_usage=None,
+                             assembly_contract=None):
+    """Return every exact Cluster source SPM independently of Assembly roles.
+
+    Bush/Weed assets commonly use ``cluster_*`` names rather than the
+    branch/leaf role prefixes consumed by the Assembly contract.  The GUI must
+    still expose those real source files for path copy and step ①.  Assembly
+    classification therefore remains optional annotation on this inventory.
+    """
+    usage_by_path = cluster_usage or {}
+    dependencies = (assembly_contract or {}).get("dependencies") or []
+    assembly_by_path = {
+        str(row.get("spm") or "").lower(): row
+        for row in dependencies if row.get("spm")
+    }
+    rows = []
+    for source in sorted(
+            (Path(path) for path in clusters or []),
+            key=lambda path: str(path).lower()):
+        key = str(source).lower()
+        usage = usage_by_path.get(key) or {}
+        assembly = assembly_by_path.get(key) or {}
+        connected_refs = list(
+            usage.get("connected_refs")
+            if usage.get("connected_refs") is not None
+            else usage.get("source_refs") or []
+        )
+        missing_refs = list(usage.get("missing_source_refs") or [])
+        rows.append({
+            "kind": "cluster_spm",
+            "name": source.stem,
+            "source_spm": str(source),
+            "referenced": bool(usage),
+            "referenced_by_spms": list(usage.get("spms") or []),
+            "target_material_names": list(
+                usage.get("material_names") or []),
+            # These are rendered Cluster outputs linked by the final SPM, not
+            # the Cluster source material's internal input textures.
+            "cluster_output_textures": unique(
+                str(value) for value in connected_refs
+                if value
+            ),
+            "missing_cluster_output_textures": unique(
+                str(value) for value in missing_refs if value
+            ),
+            "assembly_role": assembly.get("role"),
+            "assembly_decision": assembly.get("decision"),
+        })
+    return rows
 
 
 # ---- SPM 머티리얼 이름에서 아틀라스 사용을 감지 (클러스터 SPM이 없는 폴더용) ----
@@ -3594,6 +3751,41 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         folder, cfg, target_spms, clusters)
     leaf_mesh_sources = leaf_lineage["actionable_sources"]
     referenced_clusters = leaf_lineage["referenced_clusters"]
+    try:
+        from pcg_cluster_assembly_contract import (
+            build_cluster_assembly_contract,
+        )
+    except ImportError:
+        from .pcg_cluster_assembly_contract import (
+            build_cluster_assembly_contract,
+        )
+    assembly_dependency_spms = list(target_spms)
+    assembly_source_spms = []
+    for target_spm in target_spms:
+        target_spm = Path(target_spm)
+        assembly_source_spm = target_spm
+        if target_spm.name.lower().startswith("sk_"):
+            source_spm = target_spm.with_name(target_spm.name[3:])
+            if source_spm.is_file():
+                assembly_source_spm = source_spm
+                if source_spm not in assembly_dependency_spms:
+                    assembly_dependency_spms.append(source_spm)
+        if assembly_source_spm not in assembly_source_spms:
+            assembly_source_spms.append(assembly_source_spm)
+    assembly_cluster_usage = cluster_material_usage(
+        assembly_dependency_spms, clusters)
+    cluster_assembly = build_cluster_assembly_contract(
+        folder,
+        target_spms,
+        clusters,
+        cluster_usage=assembly_cluster_usage,
+        assembly_source_spms=assembly_source_spms,
+    )
+    cluster_sources = cluster_source_inventory(
+        clusters,
+        cluster_usage=assembly_cluster_usage,
+        assembly_contract=cluster_assembly,
+    )
     # ③은 아틀라스 파일 개수가 아니라 실제 Generator가 사용하는 모든
     # M_ 머티리얼을 기준으로 한 행씩 만든다. Cluster SPM의 미사용 테스트
     # 머티리얼은 이 목록에 들어오지 않는다.
@@ -3638,6 +3830,10 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         "legacy_cluster_states": leaf_lineage["legacy_cluster_states"],
         "leaf_mesh_target_spms": [str(path) for path in target_spms],
         "managed_leaf_outputs": managed_leaf_outputs(target_spms),
+        "cluster_assembly": cluster_assembly,
+        "cluster_hierarchy": cluster_assembly["hierarchy"],
+        "cluster_source_rows": cluster_sources,
+        "assembly_handoff": cluster_assembly["handoff"],
         "ignored_cluster_spms": ignored_cluster_spms,
         "source_refs": all_refs[:40],
         "normal_convention": infer_normal_convention(all_refs),
@@ -3674,6 +3870,15 @@ def derive_status_actions(item):
         actions.append("Substance에서 출력 텍스처 저장 필요")
     if any(c.get("connection_update_needed") for c in item["cluster_items"]):
         actions.append("SpeedTree 연결 텍스처 정리 필요")
+    cluster_assembly = item.get("cluster_assembly") or {}
+    bark_status = (cluster_assembly.get("canonical_bark") or {}).get("status")
+    if bark_status == "replacement_required":
+        actions.append("Cluster bark를 canonical material로 정규화 필요")
+    handoff_status = (cluster_assembly.get("handoff") or {}).get("status")
+    if handoff_status == "blocked":
+        actions.append("FBX role material–mesh dependency 오류 해결 필요")
+    elif handoff_status == "pending_export":
+        actions.append("SK export 후 branch/leaf Assembly handoff 검증 필요")
     if local_entries and not item["sbs_files"]:
         actions.append("Substance SBS 파일 확인 필요")
     if actions and status == "ready":
@@ -4197,8 +4402,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", dest="json_path")
     parser.add_argument("--csv", dest="csv_path")
-    parser.add_argument("--target", action="append", help="Tree folder to audit; repeatable")
-    parser.add_argument("--prepare-sk", action="append", help="Tree folder to copy/patch SK SPM")
+    parser.add_argument(
+        "--target", action="append",
+        help="Vegetation folder to audit; repeatable",
+    )
+    parser.add_argument(
+        "--prepare-sk", action="append",
+        help=(
+            "Non-Cluster vegetation folder whose SK SPM should be copied/"
+            "patched; exact Cluster sources are rejected"
+        ),
+    )
     parser.add_argument("--prepare-target-mesh", action="append", help="PCG mesh name to prepare with --prepare-sk")
     parser.add_argument("--dry-run", action="store_true", help="Plan prepare actions without writing files")
     parser.add_argument("--include-refs", action="store_true", help="Read embedded source texture references")
@@ -4211,6 +4425,7 @@ def main():
         return
     pcg_targets = load_pcg_targets(args.pcg_targets) if args.pcg_targets else None
     report = make_report(cfg, args.target, include_refs=args.include_refs, pcg_targets=pcg_targets)
+    persist_cluster_assembly_receipts(report)
     save_spm_analysis_cache()
     if args.json_path:
         Path(args.json_path).parent.mkdir(parents=True, exist_ok=True)

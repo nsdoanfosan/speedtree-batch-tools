@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -60,6 +61,213 @@ def item(queue_id, fingerprint):
     }
 
 
+class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
+    def test_content_absent_assembly_plan_passes_through_without_a_toggle(self):
+        runner = load_runner()
+        result = runner._ingest_cluster_assembly(
+            None,
+            {
+                "cluster_assembly": {
+                    "ingest_plan": {"status": "pass_through"}
+                }
+            },
+            {"status": "ok"},
+        )
+        self.assertEqual(result["status"], "pass_through")
+
+    def test_ready_assembly_requires_full_final_skeleton_wind_success(self):
+        runner = load_runner()
+        with self.assertRaisesRegex(RuntimeError, "final-skeleton wind"):
+            runner._ingest_cluster_assembly(
+                None,
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {"status": "ready"},
+                    }
+                },
+                {"status": "skipped"},
+            )
+
+    @staticmethod
+    def _runner_with_result(result):
+        runner = load_runner()
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: object()
+        )
+        runner.unreal.CodexDynamicWindImportLibrary = types.SimpleNamespace(
+            import_dynamic_wind_json_to_skeletal_mesh=lambda _mesh, _json: result
+        )
+        return runner
+
+    def test_confirmed_final_skeleton_contract_passes(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text("{}", encoding="utf-8")
+            report = runner._apply_dynamic_wind(
+                {"wind_json": str(wind_json), "mesh_path": "/Game/Test/SK_Tree"}
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(
+            report["result"]["skeleton_contract"], "final_skeleton_v2"
+        )
+
+    def test_failed_name_index_contract_stops_ingest(self):
+        runner = self._runner_with_result(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": "wind name/index/parent does not match final skeleton",
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "final-skeleton contract failed"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Tree",
+                    }
+                )
+
+    def test_success_without_skeleton_hash_stops_ingest(self):
+        runner = self._runner_with_result(
+            json.dumps(
+                {
+                    "success": True,
+                    "skeleton_contract": "final_skeleton_v2",
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "no skeleton hash"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Tree",
+                    }
+                )
+
+    def test_transient_instanced_dynamic_wind_runtime_probe_is_required(self):
+        runner = load_runner()
+
+        class FakeMesh:
+            pass
+
+        mesh = FakeMesh()
+        runner.unreal.SkeletalMesh = FakeMesh
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: mesh
+        )
+        runner._editor_world = lambda: object()
+        runner.unreal.CodexDynamicWindDebugLibrary = types.SimpleNamespace(
+            run_instanced_dynamic_wind_runtime_probe=lambda _world, _mesh: json.dumps(
+                {
+                    "success": True,
+                    "transient_component": True,
+                    "level_actor_created": False,
+                    "validation": {
+                        "render_proxy_created": True,
+                        "provider_is_dynamic_wind_data": True,
+                    },
+                }
+            )
+        )
+
+        report = runner._validate_instanced_dynamic_wind_runtime(
+            "/Game/Codex/Tests/Assembly"
+        )
+        self.assertTrue(report["success"])
+        self.assertTrue(report["transient_component"])
+        self.assertFalse(report["level_actor_created"])
+
+    def test_failed_instanced_dynamic_wind_runtime_probe_stops_ingest(self):
+        runner = load_runner()
+
+        class FakeMesh:
+            pass
+
+        runner.unreal.SkeletalMesh = FakeMesh
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: FakeMesh()
+        )
+        runner._editor_world = lambda: object()
+        runner.unreal.CodexDynamicWindDebugLibrary = types.SimpleNamespace(
+            run_instanced_dynamic_wind_runtime_probe=lambda _world, _mesh: json.dumps(
+                {"success": False, "error": "render proxy missing"}
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "runtime probe failed"):
+            runner._validate_instanced_dynamic_wind_runtime(
+                "/Game/Codex/Tests/Assembly"
+            )
+
+    def test_two_phase_runtime_probe_returns_pending_token_then_passes(self):
+        runner = load_runner()
+
+        class FakeMesh:
+            pass
+
+        mesh = FakeMesh()
+        runner.unreal.SkeletalMesh = FakeMesh
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: mesh
+        )
+        runner._editor_world = lambda: object()
+        finish_results = iter(
+            [
+                {"success": True, "status": "pending"},
+                {
+                    "success": True,
+                    "status": "passed",
+                    "render_frame_residency_verified": True,
+                },
+            ]
+        )
+        runner.unreal.CodexDynamicWindDebugLibrary = types.SimpleNamespace(
+            begin_instanced_dynamic_wind_runtime_probe=(
+                lambda _world, _mesh: json.dumps(
+                    {
+                        "success": True,
+                        "status": "pending",
+                        "probe_token": "probe-1",
+                    }
+                )
+            ),
+            finish_instanced_dynamic_wind_runtime_probe=(
+                lambda _world, _token: json.dumps(next(finish_results))
+            ),
+        )
+
+        begin = runner._begin_instanced_dynamic_wind_runtime(
+            "/Game/Codex/Tests/Assembly"
+        )
+        self.assertEqual(begin["probe_token"], "probe-1")
+        self.assertEqual(
+            runner._finish_instanced_dynamic_wind_runtime("probe-1")["status"],
+            "pending",
+        )
+        finish = runner._finish_instanced_dynamic_wind_runtime("probe-1")
+        self.assertEqual(finish["status"], "passed")
+        self.assertTrue(finish["render_frame_residency_verified"])
+
+
 def test_data_error_is_item_local_and_queue_continues(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     manifest, checkpoint, _report = write_manifest(
@@ -77,6 +285,136 @@ def test_data_error_is_item_local_and_queue_continues(tmp_path, monkeypatch):
 
     assert result["items"]["bad"]["status"] == "data_error"
     assert result["items"]["good"]["status"] == "imported_ok"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_runtime_pending_checkpoint_finishes_without_reimport(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest(
+        tmp_path,
+        [item("elm", "elm-v1")],
+    )
+    import_calls = []
+
+    def ingest(current):
+        import_calls.append(current["queue_id"])
+        return {
+            "status": "runtime_pending",
+            "cluster_assembly": {
+                "status": "runtime_pending",
+                "runtime": {
+                    "success": True,
+                    "status": "pending",
+                    "probe_token": "probe-elm",
+                },
+            },
+        }
+
+    monkeypatch.setattr(runner, "ingest_item", ingest)
+    first = runner.run_manifest(manifest)
+    assert first["status"] == "runtime_pending"
+    assert first["items"]["elm"]["status"] == "runtime_pending"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is False
+
+    monkeypatch.setattr(
+        runner,
+        "_finish_instanced_dynamic_wind_runtime",
+        lambda _token: {
+            "success": True,
+            "status": "passed",
+            "render_frame_residency_verified": True,
+        },
+    )
+    finished = runner.finish_runtime_probe(checkpoint, report, "elm")
+    assert finished["status"] == "imported_ok"
+    assert finished["cluster_assembly"]["runtime"]["status"] == "passed"
+    assert import_calls == ["elm"]
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_runtime_pending_checkpoint_cancel_is_terminal(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest(
+        tmp_path,
+        [item("elm", "elm-v1")],
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {
+            "status": "runtime_pending",
+            "cluster_assembly": {
+                "status": "runtime_pending",
+                "runtime": {
+                    "success": True,
+                    "status": "pending",
+                    "probe_token": "probe-elm",
+                },
+            },
+        },
+    )
+    runner.run_manifest(manifest)
+    monkeypatch.setattr(
+        runner,
+        "_cancel_instanced_dynamic_wind_runtime",
+        lambda token: {"success": True, "status": "cancelled", "token": token},
+    )
+
+    cancelled = runner.cancel_runtime_probe(
+        checkpoint,
+        report,
+        "elm",
+        "cross-frame timeout",
+    )
+
+    assert cancelled["status"] == "data_error"
+    assert cancelled["message"] == "cross-frame timeout"
+    assert cancelled["runtime_cancel"]["status"] == "cancelled"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_runtime_cancel_failure_preserves_terminal_report(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest(
+        tmp_path,
+        [item("elm", "elm-v1")],
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {
+            "status": "runtime_pending",
+            "cluster_assembly": {
+                "status": "runtime_pending",
+                "runtime": {
+                    "success": True,
+                    "status": "pending",
+                    "probe_token": "probe-elm",
+                },
+            },
+        },
+    )
+    runner.run_manifest(manifest)
+
+    def fail_cancel(_token):
+        raise RuntimeError("token mismatch")
+
+    monkeypatch.setattr(
+        runner,
+        "_cancel_instanced_dynamic_wind_runtime",
+        fail_cancel,
+    )
+    cancelled = runner.cancel_runtime_probe(
+        checkpoint,
+        report,
+        "elm",
+        "cross-frame timeout",
+    )
+
+    assert cancelled["status"] == "data_error"
+    assert cancelled["message"] == "cross-frame timeout"
+    assert cancelled["cleanup_confirmed"] is False
+    assert cancelled["cancel_error"] == "token mismatch"
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
 
 

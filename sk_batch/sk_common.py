@@ -719,10 +719,50 @@ def scan_sk_spms(root):
             if not name.lower().startswith("sk_") or not name.lower().endswith(".spm"):
                 continue
             candidate = Path(current) / name
-            if BACKUP_RE.search(name) or not is_live_spm(candidate):
+            if (
+                candidate.parent.name.casefold() == "cluster"
+                or BACKUP_RE.search(name)
+                or not is_live_spm(candidate)
+            ):
                 continue
             out.append(candidate)
     return sorted(out)
+
+
+def scan_cluster_spm_sources(root):
+    """Inventory exact read-only Cluster inputs and SK-named Blend outputs."""
+    rows = []
+    skip_dirs = set(BACKUP_DIRECTORY_NAMES)
+    root = Path(root)
+    if not root.exists():
+        return rows
+    for current, dirs, files in os.walk(root, topdown=True):
+        dirs[:] = [name for name in dirs if name.casefold() not in skip_dirs]
+        cluster_folder = Path(current)
+        if cluster_folder.name.casefold() != "cluster":
+            continue
+        for name in files:
+            lowered = name.casefold()
+            if (
+                not lowered.endswith(".spm")
+                or lowered.startswith("sk_")
+                or lowered.startswith("~")
+                or BACKUP_RE.search(name)
+            ):
+                continue
+            source = cluster_folder / name
+            if not is_live_spm(source):
+                continue
+            rows.append({
+                "kind": "cluster_spm",
+                "source_spm": source,
+                "blend_path": source.with_name(f"SK_{source.stem}.blend"),
+                "cluster_folder": cluster_folder,
+                "owner_folder": cluster_folder.parent,
+                "display_name": source.name,
+                "legacy_sk_spm": source.with_name(f"SK_{source.name}"),
+            })
+    return sorted(rows, key=lambda row: str(row["source_spm"]).casefold())
 
 
 # Wind preset from the file name (checklist item 4). Dead vegetation must not
@@ -740,9 +780,25 @@ def wind_preset_for(stem):
     return "GRASS"
 
 
-def blend_path_for(spm_path):
-    """One .blend per SPM, next to it (matches SK_tree_elm_01.blend convention)."""
+def wind_preset_for_spm(spm_path):
+    """Resolve Cluster child wind from its owning vegetation folder."""
     spm = Path(spm_path)
+    owner = spm.parent.parent.name if spm.parent.name.casefold() == "cluster" else ""
+    return wind_preset_for(f"{spm.stem} {owner}")
+
+
+def blend_path_for(spm_path):
+    """Return the established Blend output without changing source identity.
+
+    Full SK inputs keep the same stem.  A non-SK Cluster source stays in place
+    and writes only its Blender output with the SK_ prefix.
+    """
+    spm = Path(spm_path)
+    if (
+        spm.parent.name.casefold() == "cluster"
+        and not spm.name.casefold().startswith("sk_")
+    ):
+        return spm.with_name(f"SK_{spm.stem}.blend")
     return spm.with_suffix(".blend")
 
 

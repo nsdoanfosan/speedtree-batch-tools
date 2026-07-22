@@ -75,6 +75,116 @@ class FakeTree:
 
 
 class SkBatchUiConvenienceTests(unittest.TestCase):
+    def test_cluster_sources_are_read_only_inputs_with_sk_named_blend_outputs(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cluster = root / "bush_Silky_Dogwood" / "Cluster"
+            cluster.mkdir(parents=True)
+            source = cluster / "cluster_Silky_Dogwood_01.spm"
+            source.write_bytes(b"source")
+            legacy_sk = cluster / "SK_cluster_Silky_Dogwood_01.spm"
+            legacy_sk.write_bytes(b"legacy-work-spm")
+            speedtree_temp = cluster / "~cluster_Silky_Dogwood_01.spm"
+            speedtree_temp.write_bytes(b"temporary")
+            full_sk = root / "bush_Silky_Dogwood" / "SK_bush_Silky_Dogwood_01.spm"
+            full_sk.write_bytes(b"full")
+
+            rows = gui.scan_cluster_spm_sources(root)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["source_spm"], source)
+            self.assertNotIn(
+                speedtree_temp,
+                [row["source_spm"] for row in rows],
+            )
+            self.assertEqual(
+                rows[0]["blend_path"],
+                cluster / "SK_cluster_Silky_Dogwood_01.blend",
+            )
+            self.assertEqual(
+                gui.scan_sk_spms(root),
+                [full_sk],
+            )
+            self.assertEqual(
+                gui.blend_path_for(source),
+                cluster / "SK_cluster_Silky_Dogwood_01.blend",
+            )
+            self.assertEqual(
+                gui.blend_path_for(full_sk),
+                full_sk.with_suffix(".blend"),
+            )
+
+    def test_cluster_folder_chain_and_owner_wind_cover_tree_bush_and_weed(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = (
+                ("Tree_elm", "branch_elm_01.spm", "TREE"),
+                ("bush_Silky_Dogwood", "cluster_Dogwood_01.spm", "BUSH"),
+                ("weed_ladyfern", "cluster_ladyfern_01.spm", "GRASS"),
+            )
+            for owner, name, expected_wind in cases:
+                spm = root / owner / "Cluster" / name
+                self.assertEqual(gui.wind_preset_for_spm(spm), expected_wind)
+                self.assertEqual(
+                    gui.sk_batch_folder_chain(root, spm),
+                    [root / owner, root / owner / "Cluster"],
+                )
+
+    def test_cluster_row_shows_sk_blend_but_never_an_sk_spm(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        iid = "cluster-source"
+        app.items = {
+            iid: {
+                "spm": Path("Tree_elm/Cluster/branch_elm_01.spm"),
+                "cluster_source_spm": Path(
+                    "Tree_elm/Cluster/branch_elm_01.spm"
+                ),
+                "display_name": "branch_elm_01.spm",
+                "source_read_only": True,
+                "checked": True,
+                "manual_bones_locked": False,
+            }
+        }
+
+        label = app._item_label(iid)
+
+        self.assertIn("branch_elm_01.spm", label)
+        self.assertIn("Blend → SK_branch_elm_01.blend", label)
+        self.assertNotIn("SK_branch_elm_01.spm", label)
+        self.assertFalse(gui.should_calibrate_spm(app.items[iid]))
+
+    def test_folder_click_clears_stale_actionable_checks(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.root = FakeRoot()
+        app.tree = FakeTree()
+        app.worker = None
+        app.cell_editor = None
+        spm = Path("Tree_elm/SK_Tree_elm_01.spm")
+        app.items = {
+            str(spm): {
+                "spm": spm,
+                "checked": True,
+                "manual_bones_locked": False,
+            }
+        }
+        folder_iid = "folder::cluster"
+        app.folder_rows = {folder_iid: Path("Tree_elm/Cluster")}
+        app.checked_rows = gui.CheckedRowController(
+            app.items, app._redraw_checked_row
+        )
+        app.checked_rows.sync_after_reload()
+
+        event = type("Event", (), {"x": 0, "y": folder_iid})()
+        self.assertEqual(app._on_click(event), "break")
+
+        self.assertFalse(app.items[str(spm)]["checked"])
+        self.assertEqual(app.tree.selection(), (folder_iid,))
+        self.assertEqual(app.tree.focused, folder_iid)
+
     def test_verified_xml_bone_count_is_read_only_and_content_matched(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:

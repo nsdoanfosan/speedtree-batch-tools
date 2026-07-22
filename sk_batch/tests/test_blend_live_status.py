@@ -160,6 +160,53 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             self.assertEqual(status, "최신 ✓")
 
+    def test_source_review_is_current_blend_but_remains_push_blocked(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "branch_elm_01.spm"
+            write_empty_spm(spm)
+            blend = gui.blend_path_for(spm)
+            blend.write_bytes(b"blend")
+            report = cluster / "reports" / (
+                "branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {},
+                    "texture_normalization": {
+                        "status": "preserved_cluster",
+                        "missing": [],
+                        "materials": [],
+                    },
+                    "handoff_preflight": {
+                        "status": "source_review",
+                        "unreal_push_ready": False,
+                        "empty_material_slots": [
+                            {"object": "branch_elm_01", "slot": 0}
+                        ],
+                    },
+                }),
+                encoding="utf-8",
+            )
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(blend, 2_000_000_000)
+            self.set_time(report, 2_000_000_000)
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
+
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                self.assertTrue(app._repair_contract_current(spm))
+                self.assertEqual(
+                    app._blend_status_text(spm),
+                    "Blend 완료 · 원본 검토 필요 · Unreal Push 차단",
+                )
+                ready, _reason = app._texture_normalization_ready(spm)
+
+            self.assertFalse(ready)
+
     def test_live_status_explains_unconnected_managed_atlas(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -589,6 +636,77 @@ class BlendLiveStatusTests(unittest.TestCase):
             contract_path = commands[1][commands[1].index("--material-contract") + 1]
             first_report = commands[0][commands[0].index("--report") + 1]
             self.assertEqual(contract_path, first_report)
+
+    def test_blender_job_accepts_source_review_and_leaves_push_blocked(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cluster = root / "Tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "branch_elm_01.spm"
+            write_empty_spm(spm)
+            app.force_rerun = True
+            app.cfg = {
+                "speedtree_exe": "SpeedTree.exe",
+                "fbx_ini": str(
+                    root / "speedtree_bone_weight_repair"
+                    / "presets" / "speedtree_10_1" / "Options_MA_Fbx.ini"
+                ),
+                "blender_exe": "blender.exe",
+                "blender_parallel_jobs": 1,
+                "blender_job_timeout": 3600,
+                "speedtree_material_preflight_timeout": 900,
+            }
+            speedtree_cli = (
+                Path(app.cfg["fbx_ini"]).resolve().parents[2]
+                / "speedtree_cli.py"
+            )
+            speedtree_cli.parent.mkdir(parents=True, exist_ok=True)
+            speedtree_cli.write_text("# test", encoding="utf-8")
+            app.log = mock.Mock()
+
+            def fake_run(cmd, log_name, _timeout, **_kwargs):
+                report = Path(cmd[cmd.index("--report") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                if any(
+                    str(value).endswith("speedtree_material_preflight.py")
+                    for value in cmd
+                ):
+                    payload = {"status": "ok"}
+                else:
+                    payload = {
+                        "status": "ok",
+                        "warnings": [],
+                        "source_review_required": True,
+                        "unreal_push_ready": False,
+                        "handoff_preflight": {
+                            "status": "source_review",
+                            "unreal_push_ready": False,
+                        },
+                    }
+                report.write_text(json.dumps(payload), encoding="utf-8")
+                return 0, root / log_name
+
+            app._run_limited = fake_run
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
+            app._handoff_ready = mock.Mock(
+                side_effect=[(False, "생성 필요"), (False, "원본 검토 필요")]
+            )
+            app._blend_status_text = mock.Mock(
+                return_value="Blend 완료 · 원본 검토 필요 · Unreal Push 차단"
+            )
+            item = {"manual_bones_locked": False, "wind_override": "auto"}
+
+            with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
+                "spm_audit.sk_readiness", return_value={"ready": True}
+            ), mock.patch.object(gui, "save_state"):
+                app._job_blender(str(spm), spm, item)
+
+            self.assertTrue(any(
+                "Unreal Push 차단" in call.args[0]
+                for call in app.log.call_args_list
+            ))
 
     def test_failed_blender_job_restores_previous_pipeline_report(self):
         gui = load_gui_module()

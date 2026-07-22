@@ -2084,6 +2084,23 @@ class GuiLabelTests(unittest.TestCase):
 
         self.assertEqual(self.gui.checked_step3_spms(entries), [selected])
 
+    def test_step3_never_normalizes_raw_cluster_sources(self):
+        raw_cluster = r"D:\Trees\Tree_elm\Cluster\branch_elm_01.spm"
+        full_sk = r"D:\Trees\Tree_elm\SK_Tree_elm_01.spm"
+        entries = {
+            "tree_elm": {
+                "checked": True,
+                "item": {
+                    "target_spm_statuses": [
+                        {"sk_spm": full_sk},
+                        {"sk_spm": raw_cluster},
+                    ],
+                },
+            },
+        }
+
+        self.assertEqual(self.gui.checked_step3_spms(entries), [full_sk])
+
     def test_initial_refresh_runs_in_worker_and_applies_via_root_after(self):
         class FakeRoot:
             def __init__(self):
@@ -2551,6 +2568,40 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(
             self.gui.App.step2_text(None, partial),
             "현재 잎 매쉬 2세트 · 연결 완료 1 · 제작 파일 없음 1",
+        )
+
+    def test_step2_label_separates_export_active_from_inactive_blender_history(self):
+        mixed = {
+            "leaf_mesh_sources": [],
+            "leaf_atlas_inventory": [
+                {
+                    "atlas_base": "M_leaf_elm_atlas_01",
+                    "atlas_blends": ["M_leaf_elm_atlas_01.blend"],
+                    "generator_connection_complete": True,
+                    "complete": True,
+                    "export_participating": True,
+                },
+                {
+                    "atlas_base": "M_branch_elm_atlas_01",
+                    "atlas_blends": ["M_branch_elm_atlas_01.blend"],
+                    "generator_connection_complete": True,
+                    "complete": True,
+                    "export_participating": False,
+                },
+            ],
+        }
+        inactive_only = {
+            "leaf_mesh_sources": [],
+            "leaf_atlas_inventory": [mixed["leaf_atlas_inventory"][1]],
+        }
+
+        self.assertEqual(
+            self.gui.App.step2_text(None, mixed),
+            "현재 잎 매쉬 1세트 · 연결 완료 ✓ · 비활성 기록 1",
+        )
+        self.assertEqual(
+            self.gui.App.step2_text(None, inactive_only),
+            "현재 잎 매쉬 없음 · 비활성 Blender 기록 1세트",
         )
 
     def test_step2_label_separates_work_from_model_scope(self):

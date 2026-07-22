@@ -63,12 +63,13 @@ from sk_common import (
     manual_bones_marker_path,
     save_config,
     save_state,
+    scan_cluster_spm_sources,
     scan_sk_spms,
     set_manual_bones_marker,
     push_source_snapshot,
     summarize_job_failure,
     terminate_process_tree,
-    wind_preset_for,
+    wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
     inspect_all_speedtree_material_export,
@@ -81,7 +82,7 @@ from spm_leaf_handoff_contract import (
 from speedtree_pipeline_contract import validate_preflight_envelope
 
 WIND_OPTIONS = (
-    ("자동 (파일명 기준)", "auto"),
+    ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
     ("BUSH", "BUSH"),
     ("GRASS", "GRASS"),
@@ -91,6 +92,32 @@ BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
+
+
+def is_cluster_source_spm(spm):
+    path = Path(spm)
+    return (
+        path.suffix.casefold() == ".spm"
+        and path.parent.name.casefold() == "cluster"
+        and not path.name.casefold().startswith("sk_")
+    )
+
+
+def should_calibrate_spm(item):
+    """Cluster authoring SPMs are Blender inputs, never calibration targets."""
+    return not (
+        item.get("source_read_only")
+        or is_cluster_source_spm(item.get("spm", ""))
+    )
+
+
+def sk_batch_folder_chain(root, spm):
+    """Return the owner/Cluster hierarchy used by the SK Batch table."""
+    root = Path(root)
+    spm = Path(spm)
+    if is_cluster_source_spm(spm):
+        return [spm.parent.parent, spm.parent]
+    return [spm.parent] if spm.parent != root else [root]
 
 
 def compact_table_status(value, max_chars=28):
@@ -302,6 +329,8 @@ class App:
         self.cfg = load_config()
         self.state = load_state()
         self.items = {}  # iid -> {"spm": Path, "checked": bool, "wind_override": str}
+        self.folder_rows = {}
+        self.row_copy_paths = {}
         self._table_full_values = {}
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.ui_queue = queue.Queue()
@@ -642,7 +671,10 @@ class App:
         if detail is None:
             return
         selected = self.tree.selection()
-        if not selected or selected[0] not in self.items:
+        folder_rows = getattr(self, "folder_rows", {})
+        if selected and selected[0] in folder_rows:
+            text = f"경로 복사 전용 폴더 행\n{folder_rows[selected[0]]}"
+        elif not selected or selected[0] not in self.items:
             text = "행을 선택하면 전체 경로와 ①②③ 상태가 여기에 표시됩니다."
         else:
             iid = selected[0]
@@ -715,12 +747,14 @@ class App:
     @classmethod
     def _collect_scan_result(cls, root, snapshot_caches):
         spms = scan_sk_spms(root)
+        cluster_sources = scan_cluster_spm_sources(root)
+        all_spms = spms + [row["source_spm"] for row in cluster_sources]
         snapshots = {}
         errors = []
         cache_hits = 0
-        if spms:
+        if all_spms:
             tasks = [
-                (spm, snapshot_caches.get(str(spm))) for spm in spms
+                (spm, snapshot_caches.get(str(spm))) for spm in all_spms
             ]
             with ThreadPoolExecutor(max_workers=min(8, len(spms))) as pool:
                 for iid, snapshot, error, cache_hit in pool.map(
@@ -733,6 +767,7 @@ class App:
                         errors.append((iid, error))
         return {
             "spms": spms,
+            "cluster_sources": cluster_sources,
             "snapshots": snapshots,
             "errors": errors,
             "snapshot_cache_hits": cache_hits,
@@ -864,12 +899,56 @@ class App:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
+        if not hasattr(self, "folder_rows"):
+            self.folder_rows = {}
+        else:
+            self.folder_rows.clear()
+        if not hasattr(self, "row_copy_paths"):
+            self.row_copy_paths = {}
+        else:
+            self.row_copy_paths.clear()
         if not hasattr(self, "_table_full_values"):
             self._table_full_values = {}
         else:
             self._table_full_values.clear()
-        spms = prepared["spms"]
+        cluster_sources = prepared.get("cluster_sources") or []
+        cluster_by_source = {
+            _normalized_path(row["source_spm"]): row
+            for row in cluster_sources
+        }
+        spms = list(prepared["spms"]) + [
+            row["source_spm"] for row in cluster_sources
+        ]
         snapshots = prepared["snapshots"]
+
+        def ensure_folder_row(folder, parent=""):
+            folder = Path(folder)
+            folder_iid = f"folder::{_normalized_path(folder)}"
+            if folder_iid in self.folder_rows:
+                return folder_iid
+            values = ("", "", "", "", "", str(folder))
+            try:
+                self.tree.insert(
+                    parent,
+                    "end",
+                    iid=folder_iid,
+                    text=folder.name or str(folder),
+                    values=values,
+                    open=True,
+                )
+            except TypeError:
+                # Lightweight test Treeviews do not expose Tk's `open` option.
+                self.tree.insert(
+                    parent,
+                    "end",
+                    iid=folder_iid,
+                    text=folder.name or str(folder),
+                    values=values,
+                )
+            self.folder_rows[folder_iid] = folder
+            self.row_copy_paths[folder_iid] = [folder]
+            return folder_iid
+
         for iid, snapshot_error in prepared.get("errors", []):
             self.log(
                 f"[경고] SPM 지문 계산 실패: {Path(iid).name}: "
@@ -877,6 +956,8 @@ class App:
             )
         for spm in spms:
             iid = str(spm)
+            cluster_source = cluster_by_source.get(_normalized_path(spm))
+            source_read_only = cluster_source is not None
             entry = self.state.setdefault(iid, {})
             # The file system is the source of truth.  A saved "완료" label may
             # have become stale after the SPM was edited since the last run.
@@ -884,9 +965,10 @@ class App:
             if snapshots.get(iid):
                 entry["spm_snapshot_cache"] = snapshots[iid]
                 calibration_cache = entry.get("calibration_cache")
-                self._migrate_restored_marker_calibration_cache(
-                    spm, calibration_cache, snapshots[iid]
-                )
+                if not source_read_only:
+                    self._migrate_restored_marker_calibration_cache(
+                        spm, calibration_cache, snapshots[iid]
+                    )
                 if (
                     isinstance(calibration_cache, dict)
                     and calibration_cache.get("settings_signature")
@@ -910,7 +992,10 @@ class App:
             if wind_override not in {value for _label, value in WIND_OPTIONS}:
                 wind_override = "auto"
                 entry["wind_override"] = "auto"
-            manual_bones_locked = is_manual_bones_locked(spm, entry)
+            manual_bones_locked = (
+                False if source_read_only
+                else is_manual_bones_locked(spm, entry)
+            )
             if manual_bones_locked:
                 entry["manual_bones_locked"] = True
                 self.state[iid] = entry
@@ -922,6 +1007,13 @@ class App:
                         self.log(f"[경고] 수동 본 marker 저장 실패: {spm.name}: {exc}")
             self.items[iid] = {
                 "spm": spm,
+                "display_name": (
+                    cluster_source["display_name"]
+                    if source_read_only else spm.name
+                ),
+                "cluster_source_spm": spm if source_read_only else None,
+                "source_read_only": source_read_only,
+                "blend_path": blend_path_for(spm),
                 "checked": True,
                 "wind_override": wind_override,
                 "bone_mode": "manual" if manual_bones_locked else "auto",
@@ -931,14 +1023,21 @@ class App:
                 "live_status_signature": None,
             }
             spm_status = (
-                manual_bone_status_text(spm)
+                "건너뜀 · Cluster source read-only"
+                if source_read_only
+                else manual_bone_status_text(spm)
                 if manual_bones_locked
                 else entry.get("spm_status", "-")
             )
             blend_status = entry.get("blend_status", "-")
             push_status = self._current_push_status_text(iid, spm)
+            owner = spm.parent.parent if source_read_only else spm.parent
+            owner_iid = ensure_folder_row(owner)
+            parent_iid = owner_iid
+            if source_read_only:
+                parent_iid = ensure_folder_row(spm.parent, owner_iid)
             self.tree.insert(
-                "", "end", iid=iid,
+                parent_iid, "end", iid=iid,
                 text=self._item_label(iid),
                 values=(
                     self._bone_mode_label(iid),
@@ -949,12 +1048,14 @@ class App:
                     str(spm.parent),
                 ),
             )
+            self.row_copy_paths[iid] = [spm]
         self.checked_rows.sync_after_reload()
         save_state(self.state)
         cache_count = sum(
             1
             for iid, item in self.items.items()
-            if item.get("spm_snapshot")
+            if should_calibrate_spm(item)
+            and item.get("spm_snapshot")
             and calibration_cache_matches(
                 self.state.get(iid, {}).get("calibration_cache"),
                 item["spm_snapshot"]["fingerprint"],
@@ -1111,7 +1212,13 @@ class App:
         item = self.items[iid]
         mark = CHECK_ON if item["checked"] else CHECK_OFF
         lock = "🔒 " if item.get("manual_bones_locked", False) else ""
-        return f"{mark} {lock}{item['spm'].name}"
+        name = item.get("display_name") or item["spm"].name
+        if item.get("source_read_only"):
+            return (
+                f"{mark} {name} · Blend → {blend_path_for(item['spm']).name} "
+                "· source read-only"
+            )
+        return f"{mark} {lock}{name}"
 
     def _redraw_checked_row(self, iid, _item):
         self.tree.item(iid, text=self._item_label(iid))
@@ -1123,7 +1230,7 @@ class App:
 
     def _wind_label(self, iid):
         item = self.items[iid]
-        auto = wind_preset_for(item["spm"].stem)
+        auto = wind_preset_for_spm(item["spm"])
         if item["wind_override"] == "auto":
             return f"{auto} (자동)  ▼"
         return f"{item['wind_override']} (수동)  ▼"
@@ -1172,6 +1279,12 @@ class App:
         self._close_cell_editor()
         region = self.tree.identify_region(event.x, event.y)
         iid = self.tree.identify_row(event.y)
+        if iid in getattr(self, "folder_rows", {}):
+            self.checked_rows.set_all(False)
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.focus_set()
+            return "break"
         if iid not in self.items:
             return
         if region == "tree":
@@ -1217,16 +1330,22 @@ class App:
         self.checked_rows.set_all(checked)
 
     def copy_selected_paths(self, _event=None):
+        if not hasattr(self, "row_copy_paths"):
+            self.row_copy_paths = {
+                iid: [item.get("spm")]
+                for iid, item in self.items.items()
+                if item.get("spm")
+            }
         count = copy_selected_row_paths(
             self.root,
             self.tree,
-            self.items,
-            lambda item: item.get("spm"),
+            self.row_copy_paths,
+            lambda paths: paths,
         )
         if count:
-            self.progress_var.set(f"SPM 경로 복사 완료 · {count}개")
+            self.progress_var.set(f"경로 복사 완료 · {count}개")
         else:
-            self.progress_var.set("복사할 SPM 행을 먼저 클릭하세요")
+            self.progress_var.set("복사할 폴더 또는 SPM 행을 먼저 클릭하세요")
         return "break"
 
     def _set_bone_mode(self, iid, mode):
@@ -1319,6 +1438,8 @@ class App:
         )
 
     def _spm_schedule_key(self, item):
+        if not should_calibrate_spm(item):
+            return (0, 0.0, item["spm"].name.lower())
         if item.get("manual_bones_locked", False):
             return (0, 0.0, item["spm"].name.lower())
         if not self.force_rerun and self._spm_cache_matches(item):
@@ -1732,7 +1853,9 @@ class App:
         )
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            if (report.get("handoff_preflight") or {}).get("status") != "ok":
+            if (report.get("handoff_preflight") or {}).get("status") not in {
+                "ok", "source_review",
+            }:
                 return False
             envelope = report.get("speedtree_pipeline_contract")
             if not isinstance(envelope, dict):
@@ -1938,6 +2061,18 @@ class App:
             return leaf_reason
         blend = blend_path_for(spm)
         receipt_current = self._repair_contract_current(spm)
+        if receipt_current:
+            report_path = (
+                Path(spm).parent / "reports" /
+                f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+            )
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                report = {}
+            if (report.get("handoff_preflight") or {}).get("status") \
+                    == "source_review":
+                return "Blend 완료 · 원본 검토 필요 · Unreal Push 차단"
         try:
             if not blend.is_file():
                 return "생성 필요 — blend 없음 · ② Blender Repair 실행"
@@ -1975,6 +2110,11 @@ class App:
         from spm_audit import audit_spm, sk_readiness
 
         entry = self.state.get(iid, {})
+        if not should_calibrate_spm(self.items[iid]):
+            text = "건너뜀 · Cluster source read-only · Blender 입력 전용"
+            self.ui_queue.put(("cell", (iid, "spm_status", text)))
+            self._record_live_blend_status(iid, spm, persist=False)
+            return
         manual_bones_locked = self.items[iid].get("manual_bones_locked", False)
         summary = entry.get("spm_summary", "")
         if manual_bones_locked:
@@ -2031,6 +2171,14 @@ class App:
     def _job_spm(self, iid, spm):
         entry = self.state.setdefault(iid, {})
         item = self.items[iid]
+        if not should_calibrate_spm(item):
+            summary = "건너뜀 · Cluster 원본 SPM 유지 · SK_*.spm 미생성"
+            self.ui_queue.put(("cell", (iid, "spm_status", summary)))
+            with self.state_lock:
+                entry["spm_status"] = summary
+                save_state(self.state)
+            self.log(f"SPM 본 보정 건너뜀 (Cluster source read-only): {spm.name}")
+            return
         if item.get("manual_bones_locked", False):
             summary = f"{manual_bone_status_text(spm)} · ① 전체 건너뜀"
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
@@ -2163,14 +2311,17 @@ class App:
             self._record_live_blend_status(iid, spm)
             self.log(f"건너뜀 (blend 최신): {spm.name}")
             return
-        readiness = sk_readiness(
-            audit_spm(
-                spm,
-                analyze_bone_graph=not item.get("manual_bones_locked", False),
+        if should_calibrate_spm(item):
+            readiness = sk_readiness(
+                audit_spm(
+                    spm,
+                    analyze_bone_graph=not item.get(
+                        "manual_bones_locked", False
+                    ),
+                )
             )
-        )
-        if not readiness["ready"]:
-            raise RuntimeError(f"SK 미제작: {readiness['error']}")
+            if not readiness["ready"]:
+                raise RuntimeError(f"SK 미제작: {readiness['error']}")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         entry = self.state.setdefault(iid, {})
         self.log(f"재질 사전검사 시작: {spm.name} (Blender 실행 전)")
@@ -2228,7 +2379,7 @@ class App:
         self.ui_queue.put(("cell", (iid, "blend_status", "Blender repair 중...")))
         wind = item["wind_override"]
         if wind == "auto":
-            wind = wind_preset_for(spm.stem)
+            wind = wind_preset_for_spm(spm)
         job_report = LOG_DIR / f"{spm.stem}_bwr_{stamp}.json"
         pipeline_report = (
             spm.parent / "reports" /
@@ -2284,13 +2435,29 @@ class App:
         with self.state_lock:
             entry["blend_status"] = blend_status
             save_state(self.state)
-        if not handoff_ok:
+        source_review = bool(
+            result.get("source_review_required")
+            or (result.get("handoff_preflight") or {}).get("status")
+            == "source_review"
+        )
+        if not handoff_ok and not source_review:
             raise BatchItemError(
                 f"② 완료 후 사전검사 실패: {handoff_reason}",
                 kind="data_error",
                 report=result,
                 log_file=log_file,
                 report_file=job_report,
+            )
+        if source_review:
+            push_status = "차단 · 원본/재질 검토 필요"
+            self.ui_queue.put(("cell", (iid, "push_status", push_status)))
+            with self.state_lock:
+                entry["push_status"] = push_status
+                entry["push_status_kind"] = "source_review"
+                save_state(self.state)
+            self.log(
+                f"② 완료 · source review 필요 · Unreal Push 차단: "
+                f"{spm.name} ({handoff_reason})"
             )
         for warning in result.get("warnings", []):
             self.log(f"  [② 경고] {spm.name}: {warning}")
@@ -2613,7 +2780,7 @@ class App:
         ]
         wind_override = self.items.get(iid, {}).get("wind_override", "auto")
         resolved_wind = (
-            wind_preset_for(spm.stem)
+            wind_preset_for_spm(spm)
             if wind_override == "auto"
             else wind_override
         )
@@ -3049,7 +3216,7 @@ class App:
         ]
         wind_override = self.items.get(iid, {}).get("wind_override", "auto")
         resolved_wind = (
-            wind_preset_for(spm.stem)
+            wind_preset_for_spm(spm)
             if wind_override == "auto"
             else wind_override
         )

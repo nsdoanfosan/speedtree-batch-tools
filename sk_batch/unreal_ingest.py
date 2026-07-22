@@ -14,11 +14,23 @@ import json
 import os
 import sys
 import traceback
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import unreal
+
+MODULE_DIR = str(Path(__file__).resolve().parent)
+if MODULE_DIR not in sys.path:
+    sys.path.insert(0, MODULE_DIR)
+
+from cluster_assembly_builder import (  # noqa: E402
+    build_unreal_nanite_assembly,
+    file_fingerprint,
+    validate_file_fingerprint,
+    validate_manifest_artifacts,
+)
 
 
 SCHEMA_VERSION = 1
@@ -462,7 +474,384 @@ def _apply_dynamic_wind(item):
         mesh,
         str(wind_json),
     )
-    return {"status": "ok", "mesh": mesh_path, "result": str(result)}
+    try:
+        payload = json.loads(str(result))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"dynamic wind import returned invalid result: {result!r}"
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        raise RuntimeError(
+            "dynamic wind final-skeleton contract failed: "
+            + str(error or result)
+        )
+    if payload.get("skeleton_contract") != "final_skeleton_v2":
+        raise RuntimeError(
+            "dynamic wind importer did not confirm final_skeleton_v2 contract"
+        )
+    if not payload.get("skeleton_hash"):
+        raise RuntimeError("dynamic wind importer returned no skeleton hash")
+    return {
+        "status": "ok",
+        "mesh": mesh_path,
+        "wind_json": file_fingerprint(wind_json),
+        "result": payload,
+    }
+
+
+def _save_final_skeleton_contract_assets(full_mesh):
+    """Persist the Full mesh, generated USkeleton, and imported wind together.
+
+    Send2UE creates the dedicated Skeleton as a separate package. Saving only the
+    mesh can leave a valid in-session reference whose Skeleton reloads empty after
+    an editor restart, so Assembly import and runtime probing must not begin until
+    both packages have been written.
+    """
+    if full_mesh is None:
+        raise RuntimeError("cannot save a missing Full SK final mesh")
+    skeleton = full_mesh.get_editor_property("skeleton")
+    if skeleton is None:
+        raise RuntimeError("cannot save Full SK without its final Skeleton")
+    # Save the referenced dependency first, then the referring mesh package.
+    asset_paths = [skeleton.get_path_name(), full_mesh.get_path_name()]
+    saved = []
+    for object_path in asset_paths:
+        asset_path = str(object_path).split(".")[0]
+        if not unreal.EditorAssetLibrary.save_asset(
+            asset_path,
+            only_if_is_dirty=False,
+        ):
+            raise RuntimeError(
+                f"failed to persist final Skeleton contract asset: {asset_path}"
+            )
+        saved.append(asset_path)
+    return {
+        "mesh": saved[1],
+        "skeleton": saved[0],
+        "saved": saved,
+    }
+
+
+def _clear_generated_mesh_with_mismatched_skeleton(asset_path, expected_skeleton):
+    """Make generated Assembly meshes fresh-import when reimport kept stale Skeletons.
+
+    Send2UE/FBX reimport may retain the Skeleton already assigned to an existing
+    skeletal mesh even when ``unreal_skeleton_asset_path`` names the new Full SK
+    Skeleton. These meshes are generated Assembly-owned outputs, so delete only
+    the mismatched mesh package and leave every Skeleton package intact.
+    """
+    candidate = str(asset_path or "").split(".")[0]
+    if not candidate or not unreal.EditorAssetLibrary.does_asset_exist(candidate):
+        return {"status": "fresh", "asset": candidate}
+    mesh = unreal.EditorAssetLibrary.load_asset(candidate)
+    current_skeleton = (
+        mesh.get_editor_property("skeleton")
+        if isinstance(mesh, unreal.SkeletalMesh)
+        else None
+    )
+    expected_path = expected_skeleton.get_path_name() if expected_skeleton else ""
+    current_path = current_skeleton.get_path_name() if current_skeleton else ""
+    if current_path == expected_path:
+        return {
+            "status": "matched",
+            "asset": candidate,
+            "skeleton": current_path,
+        }
+    if not unreal.EditorAssetLibrary.delete_asset(candidate):
+        raise RuntimeError(
+            "failed to replace generated Assembly mesh with stale Skeleton: "
+            + candidate
+        )
+    return {
+        "status": "cleared_mismatch",
+        "asset": candidate,
+        "previous_skeleton": current_path or None,
+        "expected_skeleton": expected_path,
+    }
+
+
+def _editor_world():
+    if hasattr(unreal, "UnrealEditorSubsystem") and hasattr(
+        unreal, "get_editor_subsystem"
+    ):
+        subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+        if subsystem is not None:
+            world = subsystem.get_editor_world()
+            if world is not None:
+                return world
+    if hasattr(unreal, "EditorLevelLibrary"):
+        return unreal.EditorLevelLibrary.get_editor_world()
+    return None
+
+
+def _validate_instanced_dynamic_wind_runtime(mesh_path):
+    mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
+    if not isinstance(mesh, unreal.SkeletalMesh):
+        raise RuntimeError(f"runtime DynamicWind mesh is missing: {mesh_path}")
+    library = getattr(unreal, "CodexDynamicWindDebugLibrary", None)
+    method = getattr(
+        library,
+        "run_instanced_dynamic_wind_runtime_probe",
+        None,
+    )
+    if not callable(method):
+        raise RuntimeError(
+            "latest CodexDynamicWind runtime probe is unavailable; "
+            "rebuild and restart the editor"
+        )
+    world = _editor_world()
+    if world is None:
+        raise RuntimeError("no editor world for transient DynamicWind runtime probe")
+    raw = method(world, mesh)
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"DynamicWind runtime probe returned invalid JSON: {raw!r}"
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise RuntimeError(
+            "UInstancedSkinnedMeshComponent + UDynamicWindData runtime probe failed: "
+            + str(payload.get("error") if isinstance(payload, dict) else raw)
+        )
+    return payload
+
+
+def _parse_dynamic_wind_probe_result(raw, label):
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"DynamicWind {label} probe returned invalid JSON: {raw!r}"
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise RuntimeError(
+            f"DynamicWind {label} probe failed: "
+            + (
+                json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                if isinstance(payload, dict)
+                else str(raw)
+            )
+        )
+    return payload
+
+
+def _begin_instanced_dynamic_wind_runtime(mesh_path):
+    mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
+    if not isinstance(mesh, unreal.SkeletalMesh):
+        raise RuntimeError(f"runtime DynamicWind mesh is missing: {mesh_path}")
+    library = getattr(unreal, "CodexDynamicWindDebugLibrary", None)
+    method = getattr(
+        library,
+        "begin_instanced_dynamic_wind_runtime_probe",
+        None,
+    )
+    if not callable(method):
+        raise RuntimeError(
+            "latest two-phase CodexDynamicWind runtime probe is unavailable; "
+            "rebuild and restart the editor"
+        )
+    world = _editor_world()
+    if world is None:
+        raise RuntimeError("no editor world for transient DynamicWind runtime probe")
+    payload = _parse_dynamic_wind_probe_result(method(world, mesh), "begin")
+    if payload.get("status") != "pending" or not payload.get("probe_token"):
+        raise RuntimeError("DynamicWind begin probe did not return a pending token")
+    return payload
+
+
+def _finish_instanced_dynamic_wind_runtime(probe_token):
+    library = getattr(unreal, "CodexDynamicWindDebugLibrary", None)
+    method = getattr(
+        library,
+        "finish_instanced_dynamic_wind_runtime_probe",
+        None,
+    )
+    if not callable(method):
+        raise RuntimeError("latest two-phase DynamicWind finish probe is unavailable")
+    world = _editor_world()
+    if world is None:
+        raise RuntimeError("no editor world for DynamicWind finish probe")
+    payload = _parse_dynamic_wind_probe_result(
+        method(world, str(probe_token)),
+        "finish",
+    )
+    if payload.get("status") not in {"pending", "passed"}:
+        raise RuntimeError("DynamicWind finish probe returned an invalid status")
+    return payload
+
+
+def _cancel_instanced_dynamic_wind_runtime(probe_token):
+    library = getattr(unreal, "CodexDynamicWindDebugLibrary", None)
+    method = getattr(
+        library,
+        "cancel_instanced_dynamic_wind_runtime_probe",
+        None,
+    )
+    if callable(method):
+        return _parse_dynamic_wind_probe_result(
+            method(str(probe_token or "")),
+            "cancel",
+        )
+    return {"success": False, "cancelled": False, "unavailable": True}
+
+
+def _best_effort_cancel_instanced_dynamic_wind_runtime(probe_token):
+    """Never let a cleanup failure hide the original runtime failure."""
+    try:
+        result = _cancel_instanced_dynamic_wind_runtime(probe_token)
+        return {
+            "success": bool(result.get("success")),
+            "cleanup_confirmed": bool(result.get("success")),
+            "result": result,
+            "cancel_error": None,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "cleanup_confirmed": False,
+            "result": None,
+            "cancel_error": str(exc),
+            "cancel_traceback": traceback.format_exc(),
+        }
+
+
+def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
+    payload = item.get("cluster_assembly")
+    if not payload:
+        return {"status": "skipped", "reason": "no content-driven Assembly manifest"}
+    plan = payload.get("ingest_plan") or {}
+    if plan.get("status") == "pass_through":
+        return {"status": "pass_through", "assets": []}
+    if plan.get("status") != "ready":
+        raise RuntimeError("Cluster Assembly ingest plan is not ready")
+    if (full_wind or {}).get("status") != "ok":
+        raise RuntimeError(
+            "Cluster Assembly requires successful Full SK final-skeleton wind import"
+        )
+    manifest = payload.get("manifest") or {}
+    validate_manifest_artifacts(manifest)
+    expected_wind = (manifest.get("wind_contract") or {}).get("wind_json") or {}
+    full_wind_file = (full_wind or {}).get("wind_json") or {}
+    if (
+        int(full_wind_file.get("size") or -1)
+        != int(expected_wind.get("size") or -2)
+        or str(full_wind_file.get("sha256") or "").casefold()
+        != str(expected_wind.get("sha256") or "").casefold()
+    ):
+        raise RuntimeError(
+            "Full SK and Assembly did not consume the same final Skeleton wind JSON"
+        )
+    expected_skeleton_hash = str(
+        (manifest.get("final_skeleton") or {}).get(
+            "bone_name_index_parent_sha1"
+        )
+        or ""
+    ).casefold()
+    full_skeleton_hash = str(
+        ((full_wind or {}).get("result") or {}).get("skeleton_hash") or ""
+    ).casefold()
+    if not expected_skeleton_hash or full_skeleton_hash != expected_skeleton_hash:
+        raise RuntimeError(
+            "Full SK DynamicWind Skeleton hash does not match the BWR final Skeleton"
+        )
+    asset_contract = plan.get("asset_contract") or {}
+    full_mesh = unreal.EditorAssetLibrary.load_asset(
+        asset_contract.get("full_skeletal_mesh")
+    )
+    if full_mesh is None:
+        raise RuntimeError("Cluster Assembly Full SK asset is missing after import")
+    full_skeleton = full_mesh.get_editor_property("skeleton")
+    if full_skeleton is None:
+        raise RuntimeError("Cluster Assembly Full SK has no final Skeleton")
+    full_skeleton_path = full_skeleton.get_path_name()
+    persisted_final_contract = _save_final_skeleton_contract_assets(full_mesh)
+
+    generated_assets = []
+    optimizations = []
+    skeleton_reimports = []
+    with _without_generated_physics_assets(send2ue_unreal):
+        for source in plan.get("assets") or []:
+            manifest_asset = deepcopy(source)
+            data = manifest_asset.get("asset_data") or {}
+            validate_file_fingerprint(
+                data.get("_material_pipeline_json_fingerprint"),
+                "generated Assembly material sidecar",
+            )
+            uses_full_final_skeleton = (
+                data.get("skeleton_asset_path") == "__FULL_FINAL_SKELETON__"
+            )
+            if uses_full_final_skeleton:
+                data["skeleton_asset_path"] = full_skeleton_path
+                property_data = manifest_asset.get("property_data") or {}
+                skeleton_setting = property_data.get("unreal_skeleton_asset_path")
+                if isinstance(skeleton_setting, dict):
+                    skeleton_setting["value"] = full_skeleton_path
+            asset_path = data.get("asset_path")
+            if uses_full_final_skeleton:
+                skeleton_reimports.append(
+                    _clear_generated_mesh_with_mismatched_skeleton(
+                        asset_path,
+                        full_skeleton,
+                    )
+                )
+            else:
+                skeleton_reimports.append(
+                    {
+                        "status": "dedicated_part_skeleton_preserved",
+                        "asset": asset_path,
+                    }
+                )
+            preexisting = _default_physics_asset_preexisting(asset_path)
+            imported = _import_manifest_asset(send2ue_unreal, manifest_asset)
+            generated_assets.append(imported)
+            optimization = _prepare_speedtree_skeletal_optimization(
+                asset_path,
+                preexisting,
+            )
+            optimization["physics_asset_generation_disabled"] = True
+            optimizations.append(optimization)
+
+    for optimization in optimizations:
+        _finalize_speedtree_skeletal_optimization(optimization)
+    persisted_generated_assets = []
+    for imported in generated_assets:
+        asset_path = imported.get("asset_path") if isinstance(imported, dict) else None
+        if asset_path:
+            if not unreal.EditorAssetLibrary.save_asset(
+                asset_path,
+                only_if_is_dirty=False,
+            ):
+                raise RuntimeError(
+                    f"failed to persist Assembly prototype before build: {asset_path}"
+                )
+            persisted_generated_assets.append(asset_path)
+    result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
+    assembly_path = result.get("assembly")
+    if assembly_path and not unreal.EditorAssetLibrary.save_asset(
+        assembly_path,
+        only_if_is_dirty=False,
+    ):
+        raise RuntimeError(
+            f"failed to persist Cluster Assembly before runtime probe: {assembly_path}"
+        )
+    materials = (
+        _material_compile_and_slot_validation(assembly_path)
+        if assembly_path
+        else None
+    )
+    return {
+        "status": "ready_for_runtime",
+        "assets": generated_assets,
+        "optimizations": optimizations,
+        "persisted_generated_assets": persisted_generated_assets,
+        "skeleton_reimports": skeleton_reimports,
+        "build": result,
+        "materials": materials,
+        "full_final_skeleton": full_skeleton_path,
+        "persisted_final_contract": persisted_final_contract,
+    }
 
 
 def _material_compile_and_slot_validation(mesh_path):
@@ -525,11 +914,18 @@ def _save_item_assets(item, imported_assets):
     saved = []
     for asset_path in asset_paths:
         if asset_path and unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-            unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+            if not unreal.EditorAssetLibrary.save_asset(
+                asset_path,
+                only_if_is_dirty=False,
+            ):
+                raise RuntimeError(f"failed to save imported asset: {asset_path}")
             saved.append(asset_path)
     folder = item.get("unreal_folder")
-    if folder:
-        unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True)
+    if folder and not unreal.EditorAssetLibrary.save_directory(
+        folder,
+        only_if_is_dirty=True,
+    ):
+        raise RuntimeError(f"failed to save imported asset directory: {folder}")
     return saved
 
 
@@ -557,15 +953,25 @@ def ingest_item(item):
         dict.fromkeys(list(checkout["checked_out"]) + material_checkouts)
     )
     wind = _apply_dynamic_wind(item)
+    assembly = _ingest_cluster_assembly(send2ue_unreal, item, wind)
+    imported_assets.extend(assembly.get("assets") or [])
     saved = _save_item_assets(item, imported_assets)
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
     materials = _material_compile_and_slot_validation(mesh_path)
+    item_status = "imported_ok"
+    if assembly.get("status") == "ready_for_runtime":
+        assembly_path = (assembly.get("build") or {}).get("assembly")
+        runtime = _begin_instanced_dynamic_wind_runtime(assembly_path)
+        assembly["runtime"] = runtime
+        assembly["status"] = "runtime_pending"
+        item_status = "runtime_pending"
     return {
-        "status": "imported_ok",
+        "status": item_status,
         "checkout": checkout,
         "assets": imported_assets,
         "skeleton": skeleton,
         "wind": wind,
+        "cluster_assembly": assembly,
         "materials": materials,
         "optimization": optimization,
         "saved": saved,
@@ -658,18 +1064,33 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         checkpoint["updated_at"] = _now()
         _atomic_write_json(checkpoint_path, checkpoint)
 
+        result = None
         try:
             result = ingest_item(item)
             state.update(result)
-            state["status"] = "imported_ok"
-            state["completed_at"] = _now()
+            state["status"] = result.get("status", "imported_ok")
+            if state["status"] == "imported_ok":
+                state["completed_at"] = _now()
             state["updated_at"] = _now()
         except Exception as exc:
+            original_traceback = traceback.format_exc()
+            assembly = (result or {}).get("cluster_assembly") or {}
+            begin = assembly.get("runtime") or {}
+            token = begin.get("probe_token")
+            runtime_cancel = (
+                _best_effort_cancel_instanced_dynamic_wind_runtime(token)
+                if token
+                else None
+            )
             state.update(
                 {
                     "status": "data_error",
                     "message": str(exc),
-                    "traceback": traceback.format_exc(),
+                    "traceback": original_traceback,
+                    "runtime_cancel": (
+                        (runtime_cancel or {}).get("result") or runtime_cancel
+                    ),
+                    "runtime_cancel_cleanup": runtime_cancel,
                     "completed_at": _now(),
                     "updated_at": _now(),
                 }
@@ -684,8 +1105,12 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             if item.get("report_path"):
                 _atomic_write_json(item["report_path"], item_report)
 
-    checkpoint["complete"] = True
-    checkpoint["completed_at"] = _now()
+    checkpoint["complete"] = all(
+        state.get("status") in TERMINAL_STATES
+        for state in checkpoint.get("items", {}).values()
+    )
+    if checkpoint["complete"]:
+        checkpoint["completed_at"] = _now()
     checkpoint["updated_at"] = _now()
     counts = {}
     for state in checkpoint.get("items", {}).values():
@@ -693,16 +1118,169 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         counts[status] = counts.get(status, 0) + 1
     report = {
         "schema_version": SCHEMA_VERSION,
-        "status": "complete",
+        "status": "complete" if checkpoint["complete"] else "runtime_pending",
         "manifest": manifest_path,
         "checkpoint": checkpoint_path,
-        "completed_at": checkpoint["completed_at"],
+        "completed_at": checkpoint.get("completed_at"),
         "counts": counts,
         "items": checkpoint.get("items", {}),
     }
     _atomic_write_json(checkpoint_path, checkpoint)
     _atomic_write_json(report_path, report)
     return report
+
+
+def finish_runtime_probe(checkpoint_path, report_path, queue_id):
+    checkpoint_path = str(Path(checkpoint_path).resolve())
+    report_path = str(Path(report_path).resolve())
+    checkpoint = _load_json(checkpoint_path, default=None)
+    if not checkpoint:
+        raise RuntimeError("runtime checkpoint is missing")
+    state = checkpoint.get("items", {}).get(str(queue_id))
+    if not state:
+        raise RuntimeError("runtime checkpoint item is missing")
+    if state.get("status") in TERMINAL_STATES:
+        return state
+    if state.get("status") != "runtime_pending":
+        raise RuntimeError(
+            f"runtime checkpoint is not pending: {state.get('status')}"
+        )
+
+    assembly = state.get("cluster_assembly") or {}
+    begin = assembly.get("runtime") or {}
+    token = begin.get("probe_token")
+    if not token:
+        raise RuntimeError("runtime checkpoint has no probe token")
+    try:
+        finish = _finish_instanced_dynamic_wind_runtime(token)
+        assembly["runtime_finish"] = finish
+        state["cluster_assembly"] = assembly
+        state["updated_at"] = _now()
+        if finish.get("status") == "passed":
+            assembly["status"] = "ok"
+            assembly["runtime"] = {
+                "status": "passed",
+                "begin": begin,
+                "finish": finish,
+            }
+            state["status"] = "imported_ok"
+            state["completed_at"] = _now()
+    except Exception as exc:
+        original_traceback = traceback.format_exc()
+        cancel = _best_effort_cancel_instanced_dynamic_wind_runtime(token)
+        state.update(
+            {
+                "status": "data_error",
+                "message": str(exc),
+                "original_error": str(exc),
+                "traceback": original_traceback,
+                "runtime_cancel": cancel.get("result") or cancel,
+                "runtime_cancel_cleanup": cancel,
+                "cancel_error": cancel.get("cancel_error"),
+                "cleanup_confirmed": cancel.get("cleanup_confirmed", False),
+                "completed_at": _now(),
+                "updated_at": _now(),
+            }
+        )
+
+    checkpoint["updated_at"] = _now()
+    checkpoint["complete"] = all(
+        item.get("status") in TERMINAL_STATES
+        for item in checkpoint.get("items", {}).values()
+    )
+    if checkpoint["complete"]:
+        checkpoint["completed_at"] = _now()
+    _atomic_write_json(checkpoint_path, checkpoint)
+
+    if state.get("report"):
+        item_report = dict(state)
+        item_report["queue_id"] = str(queue_id)
+        item_report["checkpoint"] = checkpoint_path
+        _atomic_write_json(state["report"], item_report)
+    counts = {}
+    for item_state in checkpoint.get("items", {}).values():
+        status = item_state.get("status", "not_run")
+        counts[status] = counts.get(status, 0) + 1
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete" if checkpoint["complete"] else "runtime_pending",
+        "manifest": checkpoint.get("manifest"),
+        "checkpoint": checkpoint_path,
+        "completed_at": checkpoint.get("completed_at"),
+        "counts": counts,
+        "items": checkpoint.get("items", {}),
+    }
+    _atomic_write_json(report_path, report)
+    return state
+
+
+def cancel_runtime_probe(checkpoint_path, report_path, queue_id, reason):
+    checkpoint_path = str(Path(checkpoint_path).resolve())
+    report_path = str(Path(report_path).resolve())
+    checkpoint = _load_json(checkpoint_path, default=None)
+    if not checkpoint:
+        raise RuntimeError("runtime checkpoint is missing")
+    state = checkpoint.get("items", {}).get(str(queue_id))
+    if not state:
+        raise RuntimeError("runtime checkpoint item is missing")
+    if state.get("status") in TERMINAL_STATES:
+        return state
+    if state.get("status") != "runtime_pending":
+        raise RuntimeError(
+            f"runtime checkpoint is not pending: {state.get('status')}"
+        )
+
+    assembly = state.get("cluster_assembly") or {}
+    begin = assembly.get("runtime") or {}
+    token = begin.get("probe_token")
+    if not token:
+        raise RuntimeError("runtime checkpoint has no probe token")
+    cancel = _best_effort_cancel_instanced_dynamic_wind_runtime(token)
+    assembly["runtime_cancel"] = cancel.get("result") or cancel
+    assembly["runtime_cancel_cleanup"] = cancel
+    state.update(
+        {
+            "status": "data_error",
+            "message": str(reason or "runtime probe cancelled"),
+            "runtime_cancel": cancel.get("result") or cancel,
+            "runtime_cancel_cleanup": cancel,
+            "cancel_error": cancel.get("cancel_error"),
+            "cleanup_confirmed": cancel.get("cleanup_confirmed", False),
+            "cluster_assembly": assembly,
+            "completed_at": _now(),
+            "updated_at": _now(),
+        }
+    )
+
+    checkpoint["updated_at"] = _now()
+    checkpoint["complete"] = all(
+        item.get("status") in TERMINAL_STATES
+        for item in checkpoint.get("items", {}).values()
+    )
+    if checkpoint["complete"]:
+        checkpoint["completed_at"] = _now()
+    _atomic_write_json(checkpoint_path, checkpoint)
+
+    if state.get("report"):
+        item_report = dict(state)
+        item_report["queue_id"] = str(queue_id)
+        item_report["checkpoint"] = checkpoint_path
+        _atomic_write_json(state["report"], item_report)
+    counts = {}
+    for item_state in checkpoint.get("items", {}).values():
+        status = item_state.get("status", "not_run")
+        counts[status] = counts.get(status, 0) + 1
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete" if checkpoint["complete"] else "runtime_pending",
+        "manifest": checkpoint.get("manifest"),
+        "checkpoint": checkpoint_path,
+        "completed_at": checkpoint.get("completed_at"),
+        "counts": counts,
+        "items": checkpoint.get("items", {}),
+    }
+    _atomic_write_json(report_path, report)
+    return state
 
 
 def main():

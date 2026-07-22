@@ -654,5 +654,31 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             self.assertEqual(spm_path.stat().st_mtime_ns, original_mtime_ns)
 
 
+class ClusterOwnerClassificationTests(unittest.TestCase):
+    def test_exact_cluster_owner_supplies_generic_part_kind(self):
+        cases = (
+            (Path("Tree_elm/Cluster/SK_branch_elm_01.spm"), "tree"),
+            (Path("bush_Silky_Dogwood/Cluster/SK_cluster_01.spm"), "bush"),
+            (Path("weed_ladyfern/Cluster/SK_cluster_01.spm"), "weed"),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                self.assertEqual(spm_audit.classify_asset_kind(path), expected)
+
+    def test_filename_kind_wins_and_arbitrary_ancestors_are_not_used(self):
+        self.assertEqual(
+            spm_audit.classify_asset_kind(
+                Path("bush_owner/Cluster/SK_tree_explicit_01.spm")
+            ),
+            "tree",
+        )
+        self.assertEqual(
+            spm_audit.classify_asset_kind(
+                Path("Tree/shared/not_cluster/SK_branch_generic_01.spm")
+            ),
+            "other",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

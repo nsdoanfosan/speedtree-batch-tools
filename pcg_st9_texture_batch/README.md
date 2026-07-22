@@ -20,7 +20,8 @@ PCG_ST9_Texture_Batch.bat
 
 | 컬럼 | 뜻 | 누가 하나 |
 |---|---|---|
-| ① SK + 머티리얼 이름 | 원본 SPM을 `SK_이름.spm`으로 복사 + 머티리얼 `M_` 이름 및 공용 이름 정리 | **[① 실행] 버튼이 자동 처리** |
+| ① 기존 SK + 머티리얼 이름 | 일반 식생 원본을 `SK_이름.spm`으로 복사 + 머티리얼 `M_` 이름 및 공용 이름 정리 | **[① 실행] 버튼이 자동 처리** |
+| ①-C Cluster M_만 | 선택한 Cluster 원본 SPM의 파일명과 TGA basename은 유지하고 머티리얼 `M_`만 정리 | **[①-C 실행] 버튼이 자동 처리** |
 | ② 잎 메시 (Blender) | 아틀라스 리프 제너레이터로 오파시티 없는 잎 지오메트리 생성 | **[② 실행] 버튼이 자동 처리** (헤드리스 Blender) — 직접 할 값도 상세 패널에 나온다 |
 | ③ 텍스처 (Substance) | 표시된 SpeedTree Generator가 사용하는 고유 연결 텍스처 세트마다 `T_` 6장 추출 | **[③ 실행] 버튼이 자동 처리** (sbsrender) — SBS 그래프와 SPM 연결도 `T_`로 관리 |
 
@@ -72,6 +73,47 @@ receipt가 없는 현재 Generator만 실제 export 참여 여부를 보고 ② 
   폴더 소유**로 정리된다: 작업은 소유 폴더 행에 나오고, 사용하는 폴더에는
   "공유 — 그쪽 행에서 처리"로 표시된다.
 - 출력 텍스처는 sbs 옆, `texture\`, `texture\substance\` 를 모두 뒤져서 찾는다.
+
+## Cluster → Assembly dependency와 handoff
+
+기존 감사와 같은 행 안에서 Tree/Bush/Weed의 실제 `Cluster` 폴더와 그 직하의
+모든 non-SK SPM을 파일별 독립 행으로 표시한다. `branch_*`/`leaf_*`뿐 아니라
+`cluster_*` 같은 기존 이름도 숨기지 않는다. 각 자식 행은 정확한 원본 SPM 경로를
+복사하지만 PCG ①의 SK SPM 생성 대상은 아니다. Cluster 원본 SPM은 이름을 바꾸거나
+이동하지 않는다. 필요한 `M_` 정리는 별도 ①-C에서 같은 원본에 백업 후 적용하며,
+SK Batch ②가 이 원본을 읽어 `SK_<원본명>.blend`만 만든다.
+
+GUI의 `Cluster 출력 TGA 연결 N장`은 해당 Cluster SPM이 최종 렌더 결과로 연결한
+TGA 경로 수다. 실제 파일이 없으면 `누락 M장`을 따로 표시한다. 잎 메시 ②가
+추적하는 내부 원본 알베도/알파나 머티리얼 슬롯 수와는 다른 값이다. 같은 자산
+아래의 `Blender` 행은 표 데이터가 아니라 식생 폴더 경로를 복사하기 위한 보조
+행이며, 파일이나 폴더를 새로 만들지 않는다.
+
+Assembly 역할은 이 전체 inventory와 분리한다. export FBX에서 material–mesh
+완전쌍이 확인된 `branch`/`leaf`만 Assembly 후보가 되고, 일반 `cluster_*` 행은
+독립 SPM 처리 대상으로 그대로 남는다.
+
+branch/leaf 처리는 export FBX 내용으로 각각 독립 판정한다.
+
+- 해당 역할 material이 mesh Model에 연결된 완전쌍이면 Assembly part 정규화 후보
+- material과 역할 mesh가 모두 없으면 기존 Full SK 흐름을 그대로 통과
+- 둘 중 하나만 있거나 FBX를 읽을 수 없으면 해당 역할을 차단하고 오류 근거 기록
+
+감사 JSON의 각 항목에는 `cluster_assembly` 전체 근거와
+`assembly_handoff` receipt가 함께 들어간다. receipt에는 Tree/Cluster SPM hash,
+source material·mesh·texture dependency, FBX material–mesh 연결, canonical bark 교체
+판정, TGA basename 검증, reference mesh 근거와 차단 사유가 포함된다. 후속 SK
+Batch/Assembly 단계는 receipt를 입력 근거로 쓰되 실제 FBX를 다시 검증해야 한다.
+Full SK와 별도 Nanite Assembly는 같은 최종 생성 Skeleton을 사용하고, wind JSON과
+DynamicWind 데이터는 그 Skeleton 기준으로 재생성·bone index·binding hierarchy를
+검증한다. 기존 production DynamicWind 데이터를 복사하는 계약은 사용하지 않는다.
+
+GUI의 초기 검사·새로고침과 ①–③ 완료 후 재검사는 이 계약을
+`reports\cluster_assembly\cluster_assembly_{폴더}_{source-path-hash}.json`에
+atomic write한다. 동일 내용은 다시 쓰지 않으며 원본 SPM/TGA에는 쓰지 않는다.
+후속 파이프라인은 `locate_cluster_assembly_receipt(spm_path)`로 SK SPM 또는 일반
+source SPM에 해당하는 receipt를 정확히 하나만 선택할 수 있다. 선택 시 Tree/Cluster
+SPM과 Cluster TGA SHA-256을 다시 확인하므로 변경된 stale receipt는 거부된다.
 
 ## [② 실행] — 잎 메시 blend 만들기 (헤드리스 Blender)
 

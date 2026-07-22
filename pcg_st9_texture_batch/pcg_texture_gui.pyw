@@ -5,8 +5,8 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
 나무 폴더마다 "뭐가 되어 있고 뭐가 남았는지"를 한 화면에서 보여준다.
 
 단계 (표의 컬럼 순서 = 작업 순서):
-  ① SK SPM + M_ 이름 : 원본 SPM을 SK_이름.spm 으로 복사하고 머티리얼 이름에
-                       M_ 을 붙인다. 이 도구가 자동으로 해 준다.
+  ① 기존 SK SPM + M_ : 일반 식생은 SK_이름.spm 복사와 M_ 정리를 함께 한다.
+  ①-C Cluster M_만   : Cluster 원본 SPM 이름은 유지하고 M_만 정리한다.
   ② 잎 메시 (Blender) : 헤드리스 아틀라스 리프 제너레이터로 오파시티 없는 잎
                        지오메트리와 blend를 만들고, 선택 시 SK SPM에도 반영한다.
   ③ 텍스처 (Substance) : SBS에 원본을 연결해 6장
@@ -38,6 +38,8 @@ from pcg_texture_common import (
 )
 from pcg_texture_audit import (
     make_report,
+    persist_cluster_assembly_receipts,
+    prepare_cluster_m_prefix,
     prepare_sk,
     register_blend_source_images,
     save_spm_analysis_cache,
@@ -68,6 +70,7 @@ from spm_texture_normalize import (
 
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+DEFAULT_USE_PCG_TARGETS = False
 TARGET_ROW_COLORS = {
     "target_pcg": "#E8F3FF",
     "target_level": "#FFF0D0",
@@ -211,6 +214,169 @@ def checked_step3_spms(entries):
             seen.add(key)
             result.append(str(path))
     return sorted(result, key=lambda value: os.path.normcase(value))
+
+
+def cluster_hierarchy_rows(item):
+    """Return exact Cluster source rows independently of Assembly roles."""
+    contract = item.get("cluster_assembly") or {}
+    hierarchy = contract.get("hierarchy") or {}
+    dependencies = contract.get("dependencies") or []
+    bark_status = (contract.get("canonical_bark") or {}).get("status", "")
+    source_rows = list(item.get("cluster_source_rows") or [])
+    if not source_rows:
+        # Compatibility with reports written before exact Cluster source rows
+        # were added.  Keep every primary/reference SPM individually visible.
+        for child in hierarchy.get("children") or []:
+            source_rows.append({
+                "name": child.get("name", ""),
+                "source_spm": child.get("source_spm", ""),
+                "referenced": True,
+                "assembly_role": child.get("role"),
+                "assembly_decision": child.get("decision"),
+            })
+            for reference in child.get("references") or []:
+                source_rows.append({
+                    "name": reference.get("name", ""),
+                    "source_spm": reference.get("source_spm", ""),
+                    "referenced": True,
+                    "assembly_role": child.get("role"),
+                    "assembly_decision": reference.get("decision"),
+                })
+    if not source_rows:
+        return []
+    dependency_by_path = {
+        os.path.normcase(os.path.abspath(str(row.get("spm")))): row
+        for row in dependencies if row.get("spm")
+    }
+    cluster_path = hierarchy.get("path") or ""
+    if source_rows[0].get("source_spm"):
+        cluster_path = str(Path(source_rows[0]["source_spm"]).parent)
+    rows = [{
+        "kind": "cluster",
+        "name": hierarchy.get("name") or "Cluster",
+        "source": cluster_path,
+        "materials": "",
+        "textures": "",
+        "handoff": (contract.get("handoff") or {}).get("status", ""),
+    }]
+    decision_labels = {
+        "normalize_part": "FBX 완전쌍 · Assembly 파츠",
+        "pass_through": "FBX 역할쌍 없음 · 기존 통과",
+        "pending_export": "FBX export 후 검증",
+        "blocked": "⚠ FBX material–mesh 불완전",
+        "reference_only": "Assembly 참고 전용",
+    }
+    for source_row in source_rows:
+        source = source_row.get("source_spm") or source_row.get("source") or ""
+        dependency = dependency_by_path.get(
+            os.path.normcase(os.path.abspath(str(source)))) if source else None
+        if not dependency:
+            dependency = next((
+                row for row in dependencies
+                if row.get("name", "").casefold()
+                == str(source_row.get("name") or Path(source).stem).casefold()
+                and (
+                    not source_row.get("assembly_role")
+                    or row.get("role") == source_row.get("assembly_role")
+                )
+            ), None)
+        dependency = dependency or {}
+        owned = [dependency] if dependency else []
+        material_names = sorted({
+            material.get("material_name", "")
+            for dependency in owned
+            for material in dependency.get("source_materials") or []
+            if material.get("material_name")
+        })
+        mesh_ids = {
+            str(mesh_id)
+            for dependency in owned
+            for mesh_id in dependency.get("source_mesh_ids") or []
+        }
+        output_textures = list(
+            source_row.get("cluster_output_textures")
+            or dependency.get("texture_dependencies")
+            or []
+        )
+        output_paths = [
+            row.get("path") if isinstance(row, dict) else str(row)
+            for row in output_textures
+        ]
+        output_paths = [path for path in output_paths if path]
+        missing_output_paths = list(
+            source_row.get("missing_cluster_output_textures")
+            or (dependency.get("tga_basename_validation") or {}).get("missing")
+            or []
+        )
+        decision = (
+            source_row.get("assembly_decision")
+            or dependency.get("decision")
+            or ""
+        )
+        referenced = bool(source_row.get("referenced"))
+        handoff = decision_labels.get(decision, decision)
+        if not handoff:
+            handoff = "현재 모델에서 사용" if referenced else "현재 모델에서 사용 안 함"
+        if bark_status == "replacement_required" and decision:
+            handoff += " · bark 이름/연결 확인 필요"
+        rows.append({
+            "kind": "cluster_spm",
+            "role": source_row.get("assembly_role") or dependency.get("role") or "",
+            "name": source_row.get("name") or Path(source).stem,
+            "source": source,
+            "materials": (
+                f"material {len(material_names)} · mesh {len(mesh_ids)}"
+            ),
+            "textures": (
+                f"Cluster 출력 TGA 연결 {len(output_paths)}장"
+                + (
+                    f" · 누락 {len(missing_output_paths)}장"
+                    if missing_output_paths else ""
+                )
+                if output_paths else "Cluster 출력 TGA 연결 없음"
+            ),
+            "output_textures": output_paths,
+            "missing_output_textures": missing_output_paths,
+            "handoff": handoff,
+            "referenced": referenced,
+            "references": [],
+        })
+    return rows
+
+
+def cluster_m_step1_text(source_spm):
+    """Describe the Cluster-only M_ action without creating an SK SPM."""
+    preview = prepare_cluster_m_prefix(source_spm, dry_run=True)
+    count = len(preview.get("renames") or [])
+    if count:
+        return f"Cluster M_ 정리 {count}개 필요"
+    return "Cluster M_ 완료 ✓"
+
+
+def selected_cluster_m_targets(selected_iids, row_copy_paths):
+    """Return exact non-SK Cluster SPMs selected in the hierarchy."""
+    targets = []
+    seen = set()
+    for iid in selected_iids:
+        for value in row_copy_paths.get(iid) or []:
+            source = Path(value)
+            key = os.path.normcase(os.path.abspath(str(source)))
+            if (
+                key in seen
+                or source.suffix.casefold() != ".spm"
+                or source.name.casefold().startswith("sk_")
+                or source.parent.name.casefold() != "cluster"
+            ):
+                continue
+            seen.add(key)
+            targets.append(source)
+    return targets
+
+
+def blender_helper_copy_paths(item):
+    """Return only the vegetation folder for the path-copy helper row."""
+    folder = item.get("folder")
+    return [folder] if folder else []
 
 
 def leaf_target_material_names(target):
@@ -472,6 +638,7 @@ class App:
         self.cfg = load_config()
         self.report = None
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
+        self.row_copy_paths = {}  # every visible iid -> exact copied paths
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.texplan_cache = {}  # folder -> texture plan rows (선택 시 지연 계산)
         self.texplan_errors = {}  # folder -> explicit execution blocker
@@ -496,7 +663,7 @@ class App:
     def _build_ui(self):
         intro = ttk.Label(
             self.root, padding=(8, 6, 8, 0), foreground="#444",
-            text="PCG에서 쓰는 ST9 나무를 SK_(나나이트+논마스크+VT)로 바꾸는 준비 보드입니다. "
+            text="PCG에서 쓰는 ST9 식생을 SK_(나나이트+논마스크+VT)로 바꾸는 준비 보드입니다. "
                  "행을 클릭하면 아래에 '다음에 뭘 하면 되는지'가 나옵니다. "
                  "①~③은 실행 전 대상·변경·백업 범위를 확인합니다.",
         )
@@ -504,7 +671,7 @@ class App:
 
         top = ttk.Frame(self.root, padding=6)
         top.pack(fill="x")
-        ttk.Label(top, text="나무 루트:").pack(side="left")
+        ttk.Label(top, text="식생 루트:").pack(side="left")
         self.root_var = tk.StringVar(value=self.cfg["tree_root"])
         self.root_entry = ttk.Entry(top, textvariable=self.root_var, width=62)
         self.root_entry.pack(side="left", padx=4)
@@ -517,7 +684,7 @@ class App:
         )
         self.btn_refresh.pack(side="left", padx=6)
         Tooltip(self.btn_refresh, "아무것도 수정하지 않습니다.\n"
-                                  "폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 6장 "
+                                  "식생 폴더마다 SK SPM / M_ 이름 / 잎 메시 blend / 텍스처 6장 "
                                   "상태를 다시 읽어서 표를 갱신합니다.")
         self.btn_select_all = ttk.Button(
             top, text="전체 선택", command=lambda: self._set_all(True)
@@ -545,15 +712,19 @@ class App:
         self.btn_saved_targets.pack(side="left", padx=(6, 0))
         Tooltip(self.btn_saved_targets, "언리얼 에디터가 꺼져 있을 때 사용.\n"
                                         "이전에 저장해 둔 PCG 덤프 파일에서 메시 목록을 읽어 옵니다.")
-        self.use_pcg_targets_var = tk.BooleanVar(value=TARGETS_PATH.exists())
+        # The default inventory must include every Tree/Bush/Weed Cluster.
+        # A saved PCG report is an optional focus filter, not authorization to
+        # hide real source folders merely because the report exists.
+        self.use_pcg_targets_var = tk.BooleanVar(
+            value=DEFAULT_USE_PCG_TARGETS)
         self.chk_pcg_targets = ttk.Checkbutton(
             src, text=f"{self.focus_label}/Cliff 대상만 보기",
             variable=self.use_pcg_targets_var, command=self.refresh,
         )
         self.chk_pcg_targets.pack(side="left", padx=10)
         Tooltip(self.chk_pcg_targets, f"켜면: {self.focus_label}의 Weight>0 항목 또는 Cliff_final_01 직접 배치와\n"
-                                      "매칭되는 나무 폴더만 표에 나옵니다.\n"
-                                      "끄면: 루트 아래 모든 나무 폴더가 나옵니다.")
+                                      "매칭되는 식생 폴더만 표에 나옵니다.\n"
+                                      "끄면(기본): 루트 아래 모든 Tree/Bush/Weed 폴더가 나옵니다.")
         self.targets_info_var = tk.StringVar(value="")
         ttk.Label(src, textvariable=self.targets_info_var, foreground="#666").pack(side="left", padx=8)
 
@@ -572,7 +743,7 @@ class App:
 
         actions = ttk.Frame(self.root, padding=6)
         actions.pack(fill="x")
-        self.btn_prepare = ttk.Button(actions, text="① 실행 — SK 만들기 + M_ 이름 붙이기 (선택 항목)",
+        self.btn_prepare = ttk.Button(actions, text="① 기존 식생 — SK 만들기 + M_ 이름 붙이기 (체크 행)",
                                       command=self.start_prepare)
         self.btn_prepare.pack(side="left")
         Tooltip(self.btn_prepare, "체크된 행 중 ①이 필요한 항목에만:\n"
@@ -581,6 +752,19 @@ class App:
                                   "수정 전 원본은 각 폴더의 _spm_backups\\ 에 백업됩니다.\n"
                                   "문제가 있는 항목(중복 매칭·원본 불명·기본 이름 머티리얼)은\n"
                                   "자동으로 건너뛰고 표와 로그에 이유를 표시합니다.")
+        self.btn_cluster_m = ttk.Button(
+            actions,
+            text="①-C 실행 — Cluster M_만 정리 (선택 자식)",
+            command=self.start_cluster_m_prefix,
+        )
+        self.btn_cluster_m.pack(side="left", padx=(6, 0))
+        Tooltip(
+            self.btn_cluster_m,
+            "선택한 Cluster 자식 SPM의 머티리얼 이름에만 M_ 규격을 적용합니다.\n"
+            "SK_*.spm은 만들지 않으며 원본 SPM 파일명과 판용 TGA basename을 유지합니다.\n"
+            "수정 전에 Cluster\\_spm_backups\\에 정확한 백업을 남깁니다.\n"
+            "Blender 산출물 이름은 SK_<원본명>.blend입니다.",
+        )
         self.force_var = tk.BooleanVar(value=False)
         self.chk_force = ttk.Checkbutton(
             actions, text="⚠ 문제 표시된 항목도 적용", variable=self.force_var
@@ -595,10 +779,14 @@ class App:
         btn_open.pack(side="left", padx=10)
         Tooltip(btn_open, "표에서 클릭한 행의 나무 폴더를 탐색기로 엽니다.")
         btn_copy = ttk.Button(
-            actions, text="선택 SPM 경로 복사", command=self.copy_selected_paths
+            actions, text="선택 경로 복사", command=self.copy_selected_paths
         )
         btn_copy.pack(side="left")
-        Tooltip(btn_copy, "선택한 행의 SPM 전체 경로를 복사합니다. Everything에 바로 붙여넣을 수 있습니다.")
+        Tooltip(
+            btn_copy,
+            "나무/식생 행은 SPM, Cluster는 폴더, Cluster 자식은 해당 SPM, "
+            "Blender는 식생 폴더 경로만 복사합니다.",
+        )
         self.status_var = tk.StringVar(value="대기")
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
@@ -662,11 +850,11 @@ class App:
         )
         cols = ("pcg", "step1", "step2", "step3", "next")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
-        self.tree.heading("#0", text="나무 폴더 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
+        self.tree.heading("#0", text="식생 폴더 (첫 클릭=이 행만 활성 · Ctrl+C=선택 경로)")
         self.tree.column("#0", width=250, anchor="w")
         headers = {
             "pcg": ("PCG/레벨 사용", 145),
-            "step1": ("① SK + M_ 이름", 300),
+            "step1": ("① 기존 SK+M_ / Cluster M_만", 300),
             "step2": ("② 잎 메시 (Blender)", 150),
             "step3": ("③ 텍스처 (Substance)", 180),
             "next": ("다음 할 일", 300),
@@ -731,6 +919,19 @@ class App:
         if self.tree.identify_region(event.x, event.y) != "tree":
             return
         iid = self.tree.identify_row(event.y)
+        if iid not in self.items and iid in self.row_copy_paths:
+            identify_element = getattr(self.tree, "identify_element", None)
+            if identify_element and identify_element(event.x, event.y) == "Treeitem.indicator":
+                return
+            # Cluster/Blender helper rows are selectable and copyable but do
+            # not inherit stale checked parent work.  A Cluster SPM child is
+            # still consumed explicitly by start_prepare() from selection.
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.focus_set()
+            self.checked_rows.set_all(False)
+            self._update_step3_button()
+            return "break"
         self.checked_rows.click(iid)
         self._update_step3_button()
 
@@ -738,13 +939,13 @@ class App:
         count = copy_selected_row_paths(
             self.root,
             self.tree,
-            self.items,
-            lambda entry: spm_paths_for_item(entry["item"]),
+            self.row_copy_paths,
+            lambda paths: paths,
         )
         if count:
-            self.status_var.set(f"SPM 경로 복사 완료 · {count}개")
+            self.status_var.set(f"경로 복사 완료 · {count}개")
         else:
-            self.status_var.set("복사할 SPM이 있는 행을 먼저 클릭하세요")
+            self.status_var.set("복사할 경로가 있는 행을 먼저 클릭하세요")
         return "break"
 
     # ------------------------------------------------------------------ scan
@@ -764,6 +965,7 @@ class App:
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
+                persist_cluster_assembly_receipts(report)
                 save_spm_analysis_cache()
                 self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -885,6 +1087,7 @@ class App:
                     load_pcg_targets() if use_pcg_targets else None
                 )
                 report = make_report(cfg, pcg_targets=pcg_targets)
+                persist_cluster_assembly_receipts(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -943,6 +1146,7 @@ class App:
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
+                persist_cluster_assembly_receipts(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -996,11 +1200,11 @@ class App:
             self.targets_info_var.set(
                 f"고유 대상 {pcg['mesh_count']}개 ({self.focus_label} PCG {pcg.get('pcg_mesh_count', 0)} · "
                 f"{level_label} 직접 배치 {pcg.get('level_mesh_count', 0)}{overlap_text}) 중 "
-                f"{pcg['matched_mesh_count']}개가 나무 폴더에 매칭됨{source_time}"
+                f"{pcg['matched_mesh_count']}개가 식생 폴더에 매칭됨{source_time}"
             )
             unmatched = pcg.get("unmatched_mesh_names", [])
             if unmatched:
-                self.log(f"⚠ 사용 메시 {len(unmatched)}개는 매칭되는 나무 폴더를 못 찾았습니다: "
+                self.log(f"⚠ 사용 메시 {len(unmatched)}개는 매칭되는 식생 폴더를 못 찾았습니다: "
                          + ", ".join(unmatched[:10])
                          + (" ..." if len(unmatched) > 10 else ""))
             dup = pcg.get("duplicate_mesh_matches", {})
@@ -1008,7 +1212,7 @@ class App:
                 self.log(f"⚠ 사용 메시 {len(dup)}개는 폴더가 2개 이상 매칭됩니다 (표에 '중복' 표시): "
                          + ", ".join(dup))
         else:
-            head = f"나무 폴더 {n}개 (대상 필터 없음)"
+            head = f"식생 폴더 {n}개 (대상 필터 없음)"
             self.targets_info_var.set("")
         self.status_var.set(
             f"{head} — ✅ 다 됨 {done} · ① 필요 {need1} · ②③ 남음 {need23} · ⚠ 확인 필요 {review}"
@@ -1043,11 +1247,13 @@ class App:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
+        self.row_copy_paths.clear()
         for item in self.report["items"]:
             self._annotate_unreal_sync(item)
             iid = item["folder"]
             checked = old_checked.get(iid, True)
             self.items[iid] = {"item": item, "checked": checked}
+            self.row_copy_paths[iid] = spm_paths_for_item(item)
             mark = CHECK_ON if checked else CHECK_OFF
             row_tag = self._target_row_tag(item)
             self.tree.insert(
@@ -1061,7 +1267,53 @@ class App:
                     item["actions"][0] if item["actions"] else "없음 — 준비 끝 ✓",
                 ),
                 tags=(row_tag,) if row_tag else (),
+                open=True,
             )
+            hierarchy_rows = cluster_hierarchy_rows(item)
+            if hierarchy_rows:
+                cluster = hierarchy_rows[0]
+                cluster_iid = f"{iid}::cluster"
+                self.tree.insert(
+                    iid, "end", iid=cluster_iid,
+                    text=cluster["name"],
+                    values=("", "실제 Cluster 파일", "", "", cluster["handoff"]),
+                    open=True,
+                )
+                self.row_copy_paths[cluster_iid] = [cluster["source"]]
+                for child_index, child in enumerate(hierarchy_rows[1:]):
+                    role_iid = f"{cluster_iid}::spm::{child_index}"
+                    source_name = Path(child["source"]).name if child["source"] else ""
+                    self.row_copy_paths[role_iid] = [child["source"]]
+                    try:
+                        m_note = cluster_m_step1_text(child["source"])
+                    except Exception as exc:
+                        m_note = f"⚠ Cluster M_ 검사 실패: {exc}"
+                    step1_note = (
+                        f"{m_note} · SPM 이름 유지 · "
+                        f"Blend → SK_{Path(child['source']).stem}.blend"
+                    )
+                    assembly_evidence = (
+                        f" · {child['materials']}"
+                        if child.get("role") and child.get("materials") else ""
+                    )
+                    self.tree.insert(
+                        cluster_iid, "end", iid=role_iid,
+                        text=child["name"],
+                        values=(
+                            "",
+                            f"{source_name} · {step1_note}",
+                            "—",
+                            child["textures"],
+                            child["handoff"] + assembly_evidence,
+                        ),
+                    )
+            blender_iid = f"{iid}::blender"
+            self.tree.insert(
+                iid, "end", iid=blender_iid,
+                text="Blender",
+                values=("", "", "", "", "복사 전용 · 식생 폴더 경로"),
+            )
+            self.row_copy_paths[blender_iid] = blender_helper_copy_paths(item)
         self.checked_rows.sync_after_reload()
         self._update_step3_button()
 
@@ -1119,26 +1371,41 @@ class App:
         if not sources:
             inventory = item.get("leaf_atlas_inventory") or []
             if inventory:
+                active_inventory = [
+                    atlas for atlas in inventory
+                    if atlas.get("export_participating", True)
+                ]
+                inactive_count = len(inventory) - len(active_inventory)
+                if not active_inventory:
+                    return (
+                        "현재 잎 매쉬 없음"
+                        f" · 비활성 Blender 기록 {inactive_count}세트"
+                    )
                 complete = sum(
-                    1 for atlas in inventory if atlas.get("complete"))
+                    1 for atlas in active_inventory if atlas.get("complete"))
                 missing_blends = sum(
-                    1 for atlas in inventory
+                    1 for atlas in active_inventory
                     if not atlas.get("atlas_blends"))
                 connection_issues = sum(
-                    1 for atlas in inventory
+                    1 for atlas in active_inventory
                     if atlas.get("atlas_blends")
                     and not atlas.get("generator_connection_complete"))
-                if complete == len(inventory):
-                    return (
-                        f"현재 잎 매쉬 {len(inventory)}세트 · 연결 완료 ✓"
+                if complete == len(active_inventory):
+                    result = (
+                        f"현재 잎 매쉬 {len(active_inventory)}세트 · 연결 완료 ✓"
                     )
-                parts = [f"현재 잎 매쉬 {len(inventory)}세트"]
+                    if inactive_count:
+                        result += f" · 비활성 기록 {inactive_count}"
+                    return result
+                parts = [f"현재 잎 매쉬 {len(active_inventory)}세트"]
                 if complete:
                     parts.append(f"연결 완료 {complete}")
                 if missing_blends:
                     parts.append(f"제작 파일 없음 {missing_blends}")
                 if connection_issues:
                     parts.append(f"연결 점검 {connection_issues}")
+                if inactive_count:
+                    parts.append(f"비활성 기록 {inactive_count}")
                 return " · ".join(parts)
             managed = item.get("managed_leaf_outputs") or []
             if managed:
@@ -1213,7 +1480,10 @@ class App:
         sel = self.tree.selection()
         if not sel:
             return None
-        entry = self.items.get(sel[0])
+        iid = sel[0]
+        while iid and iid not in self.items:
+            iid = self.tree.parent(iid)
+        entry = self.items.get(iid)
         return entry["item"] if entry else None
 
     def _texplan_rows(self, item):
@@ -1298,6 +1568,46 @@ class App:
             L.append(f"⚠ '{dup}' 은(는) 다른 폴더에도 매칭됩니다 — 어느 폴더가 진짜인지 먼저 정한 뒤 ①을 실행하세요.")
         L.append("")
 
+        hierarchy_rows = cluster_hierarchy_rows(item)
+        if hierarchy_rows:
+            contract = item.get("cluster_assembly") or {}
+            L.append("── Cluster 파일 → SK/Assembly 전달 ──   (실제 폴더 기준)")
+            L.append(
+                "  · 'Cluster 출력 TGA 연결'은 최종 SPM 슬롯에 기록된 렌더 결과 경로입니다. "
+                "실제 파일이 없으면 누락 수를 따로 표시합니다. "
+                "Cluster 내부 원본 텍스처와는 다른 항목입니다."
+            )
+            for row in hierarchy_rows[1:]:
+                role_note = (
+                    f" / Assembly 역할: {row['role']} / {row['materials']}"
+                    if row.get("role") else " / Assembly 역할 판정 없음"
+                )
+                L.append(f"  · {row['name']}: {row['textures']} / {row['handoff']}{role_note}")
+                L.append(f"      source SPM: {row['source']}")
+                output_names = [
+                    Path(path).name for path in row.get("output_textures") or []
+                ]
+                if output_names:
+                    L.append("      연결된 Cluster 출력: " + ", ".join(output_names))
+            bark = contract.get("canonical_bark") or {}
+            L.append(
+                f"  · canonical bark: {bark.get('canonical_material', '')} / "
+                f"{bark.get('status', '')} "
+                "(① 접두사 정리와 별도 판정 · 나머지 작업은 계속 가능)"
+            )
+            wind = (contract.get("handoff") or {}).get(
+                "skeleton_wind_contract") or {}
+            if wind:
+                L.append(
+                    "  · Skeleton/Wind: 최종 생성 Skeleton 기준 재생성 · "
+                    "Full SK/Assembly 동일 계약 · binding 계층 검증"
+                )
+            receipt_path = item.get("cluster_assembly_receipt")
+            if receipt_path:
+                L.append(f"  · persisted receipt: {receipt_path}")
+            L.append(f"  · Blender 행 복사 경로: {item['folder']}")
+            L.append("")
+
         # ① SK + M_
         L.append("── ① SK SPM + M_ 머티리얼 이름 ──   (이 도구의 [① 실행] 버튼이 자동 처리)")
         statuses = item.get("target_spm_statuses") or []
@@ -1368,6 +1678,14 @@ class App:
         L.append("── ② 잎 메시 만들기 ──   ([② 실행] 버튼이 자동 처리 · Blender 아틀라스 리프 제너레이터)")
         leaf_sources = item.get("leaf_mesh_sources") or []
         leaf_inventory = item.get("leaf_atlas_inventory") or []
+        active_leaf_inventory = [
+            atlas for atlas in leaf_inventory
+            if atlas.get("export_participating", True)
+        ]
+        inactive_leaf_inventory = [
+            atlas for atlas in leaf_inventory
+            if not atlas.get("export_participating", True)
+        ]
         leaf_provenance = item.get("leaf_source_provenance") or []
         leaf_targets = item.get("leaf_mesh_target_spms") or []
         legacy_states = item.get("legacy_cluster_states") or []
@@ -1387,9 +1705,9 @@ class App:
                 f"  · 과거 Cluster 기록: Generator {legacy_count}개 "
                 "(숨김 기록은 자동 작업 수에서 제외)"
             )
-        if not leaf_sources and leaf_inventory:
+        if not leaf_sources and active_leaf_inventory:
             L.append("  · 현재 상태 — 사용 중인 잎 매쉬:")
-            for atlas in leaf_inventory:
+            for atlas in active_leaf_inventory:
                 blends = atlas.get("atlas_blends") or []
                 if atlas.get("complete"):
                     state = f"{Path(blends[0]).name} + 현재 Generator 연결 ✓"
@@ -1402,6 +1720,15 @@ class App:
                 if materials:
                     L.append(f"      현재 머티리얼: {materials}")
                 L.append("      판정: 읽기 전용 현재 상태 · 자동 재연결 대상 아님")
+        if inactive_leaf_inventory:
+            L.append("  · 비활성/과거 Blender 결과 — 자동 작업 제외:")
+            for atlas in inactive_leaf_inventory:
+                blends = atlas.get("atlas_blends") or []
+                blend_note = Path(blends[0]).name if blends else "대응 blend 없음"
+                L.append(
+                    f"      {atlas.get('atlas_base', '')}: {blend_note} · "
+                    "현재 export Generator에 참여하지 않음"
+                )
         if leaf_provenance:
             L.append("  · 과거 기록 — 현재 사용하지 않는 원본(자동 작업 제외):")
             for source in leaf_provenance:
@@ -1498,10 +1825,100 @@ class App:
         return "\n".join(L)
 
     # ------------------------------------------------------------- ① 실행
-    def _build_prepare_rows(self):
-        """체크된 행에서 ①이 필요한 작업 목록을 만들고, 문제(blocker)를 분류한다."""
+    def start_cluster_m_prefix(self):
+        sources = selected_cluster_m_targets(
+            self.tree.selection(), self.row_copy_paths)
+        if not sources:
+            messagebox.showinfo(
+                "①-C Cluster M_",
+                "Cluster 아래의 원본 SPM 자식 행을 먼저 선택하세요.\n"
+                "이 작업은 SK_*.spm을 만들지 않습니다.",
+            )
+            return
+        force = bool(self.force_var.get())
         rows = []
-        for iid, entry in self.items.items():
+        generic_kept = []
+        for source in sources:
+            preview = prepare_cluster_m_prefix(source, dry_run=True)
+            renames = list(preview.get("renames") or [])
+            _normal, generic = split_generic([old for old, _new in renames])
+            excluded = [] if force else generic
+            allowed = [row for row in renames if row[0] not in excluded]
+            generic_kept.extend((source, name) for name in excluded)
+            if allowed:
+                rows.append({
+                    "source": source,
+                    "exclude": excluded,
+                    "renames": allowed,
+                    "blend_output": preview["blend_output"],
+                })
+        if not rows:
+            note = (
+                "\n'Material 2' 같은 기본 이름은 SpeedTree에서 의미 있는 이름을 "
+                "지은 뒤 다시 실행하세요."
+                if generic_kept and not force else ""
+            )
+            messagebox.showinfo(
+                "①-C Cluster M_",
+                "선택한 Cluster SPM에 적용할 M_ 이름 변경이 없습니다." + note,
+            )
+            return
+        msg = [
+            "①-C Cluster 머티리얼 M_만 정리\n",
+            "SK_*.spm은 만들지 않고 아래 원본 SPM의 머티리얼 이름만 정리합니다.",
+        ]
+        for row in rows:
+            msg.append(
+                f" · {row['source'].name}: {len(row['renames'])}개 · "
+                f"Blender 출력 {Path(row['blend_output']).name}"
+            )
+        if generic_kept and not force:
+            msg.append(
+                f" · 기본 이름 {len(generic_kept)}개는 제외 (강제 옵션으로 포함 가능)"
+            )
+        msg.append(" · 수정 전 Cluster\\_spm_backups\\에 백업합니다.")
+        msg.append("\n계속할까요?")
+        if not messagebox.askyesno("①-C Cluster M_", "\n".join(msg)):
+            return
+        self._set_busy(True)
+        self.status_var.set(f"①-C Cluster M_ 적용 중... ({len(rows)}개)")
+        self.worker = threading.Thread(
+            target=self._run_cluster_m_prefix,
+            args=(rows,),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _run_cluster_m_prefix(self, rows):
+        done = 0
+        failed = 0
+        for row in rows:
+            source = row["source"]
+            try:
+                result = prepare_cluster_m_prefix(
+                    source,
+                    dry_run=False,
+                    exclude_materials=row.get("exclude"),
+                )
+                for old, new in result.get("renames") or []:
+                    self._ui(lambda o=old, n=new, s=source: self.log(
+                        f"[①-C Cluster M_] {s.name}: {o} → {n}"))
+                if result.get("backup"):
+                    self._ui(lambda p=result["backup"]: self.log(
+                        f"    백업: {p}"))
+                done += 1
+            except Exception as exc:
+                failed += 1
+                self._ui(lambda s=source, e=exc: self.log(
+                    f"[①-C 실패] {s.name}: {e}"))
+        summary = f"①-C 완료: 처리 {done}개, 실패 {failed}개"
+        self._ui(lambda: self._start_completion_refresh(summary))
+
+    def _build_prepare_rows(self, entries=None):
+        """선택 범위에서 ① 작업 목록을 만들고 문제(blocker)를 분류한다."""
+        rows = []
+        source_entries = self.items if entries is None else entries
+        for iid, entry in source_entries.items():
             if not entry["checked"]:
                 continue
             item = entry["item"]
@@ -1563,7 +1980,12 @@ class App:
             return
         checked = [e for e in self.items.values() if e["checked"]]
         if not checked:
-            messagebox.showinfo("① 실행", "체크된 행이 없습니다. 폴더 이름 왼쪽 ☑를 클릭해 선택하세요.")
+            messagebox.showinfo(
+                "① 실행",
+                "체크된 식생 행이 없습니다.\n"
+                "Cluster 자식은 별도 [①-C Cluster M_만]을 사용하고, "
+                "SK Batch ②에서 SK_*.blend만 생성합니다.",
+            )
             return
         self.status_var.set("① 준비 상태 확인 중...")
         self.root.update_idletasks()
@@ -1571,7 +1993,7 @@ class App:
         if not rows:
             messagebox.showinfo(
                 "① 실행",
-                "체크된 항목 중 ①이 필요한 것이 없습니다.\n"
+                "선택 범위에 ①이 필요한 것이 없습니다.\n"
                 "(변경 없음: 모두 SK와 M_ 이름이 이미 완료된 상태)",
             )
             self.status_var.set("대기")
@@ -1626,7 +2048,11 @@ class App:
         for row in skipped:
             label = row["mesh"] or row["item"]["name"]
             self.log(f"[① 건너뜀] {label}: " + "; ".join(self._blocker_text(b) for b in row["blockers"]))
-            self.tree.set(row["item"]["folder"], "step1", "⚠ 건너뜀 (로그 참조)")
+            self.tree.set(
+                row["item"].get("_tree_iid", row["item"]["folder"]),
+                "step1",
+                "⚠ 건너뜀 (로그 참조)",
+            )
         self._set_busy(True)
         self.status_var.set(f"① 적용 중... ({len(doable)}개)")
         self.worker = threading.Thread(target=self._run_prepare, args=(doable,), daemon=True)
@@ -1660,10 +2086,12 @@ class App:
                     self._ui(lambda lb=label: self.log(
                         f"[① 변경 없음] {lb}: 이미 최신입니다."))
                     self._ui(lambda i=item: self.tree.set(
-                        i["folder"], "step1", "완료 ✓ (변경 없음)"))
+                        i.get("_tree_iid", i["folder"]),
+                        "step1", "완료 ✓ (변경 없음)"))
                 else:
                     self._ui(lambda i=item: self.tree.set(
-                        i["folder"], "step1", "완료 ✓ (방금 적용)"))
+                        i.get("_tree_iid", i["folder"]),
+                        "step1", "완료 ✓ (방금 적용)"))
             except Exception as exc:
                 failed += 1
                 self._ui(lambda lb=label, e=exc: self.log(f"[① 실패] {lb}: {e}"))
@@ -1676,7 +2104,7 @@ class App:
         self._busy = bool(busy)
         state = "disabled" if busy else "normal"
         control_names = (
-            "btn_prepare", "btn_step2", "btn_refresh", "btn_pick_root",
+            "btn_prepare", "btn_cluster_m", "btn_step2", "btn_refresh", "btn_pick_root",
             "btn_select_all", "btn_clear_all", "btn_live_targets",
             "btn_saved_targets", "root_entry", "chk_pcg_targets",
             "chk_force", "chk_spm_push",
@@ -2314,6 +2742,7 @@ class App:
                     str(Path(path).parent) for path in affected_spms
                 }, key=os.path.normcase)
                 report = make_report(self.cfg, targets=affected_folders)
+                persist_cluster_assembly_receipts(report)
                 save_spm_analysis_cache()
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
                 exact_plan = dict(plan)

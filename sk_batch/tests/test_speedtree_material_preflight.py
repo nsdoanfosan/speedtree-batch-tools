@@ -21,7 +21,7 @@ import speedtree_material_preflight as preflight
 from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES
 
 
-def write_spm(path):
+def write_spm(path, mesh_filenames=()):
     model = ET.Element("SpeedTreeModel")
     assets = ET.SubElement(model, "Assets")
     for material_id, name, mesh_id in (
@@ -33,6 +33,12 @@ def write_spm(path):
         )
         ET.SubElement(material, "CutoutMeshID").text = str(mesh_id)
         ET.SubElement(assets, "Mesh", ID=str(mesh_id), Name=f"mesh_{mesh_id}")
+    for index, filename in enumerate(mesh_filenames, 90):
+        mesh = ET.SubElement(
+            assets, "Mesh", ID=str(index), Name=f"plate_{index}"
+        )
+        ET.SubElement(mesh, "Filename").text = filename
+        ET.SubElement(mesh, "Embedded").text = "false"
 
     tree = ET.SubElement(model, "Generator", Type="Tree")
     properties = ET.SubElement(tree, "Properties")
@@ -125,12 +131,19 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             report=str(report_path),
             timeout=30,
         )
+        exited = False
         with mock.patch.object(preflight, "parse_args", return_value=args), mock.patch.object(
             preflight, "load_speedtree_cli", return_value=object()
         ), mock.patch.object(
-            preflight, "run_export", return_value={"status": "cached"}
-        ):
-            preflight.main()
+            preflight,
+            "run_export",
+            return_value={"status": "cached", "exists": True, "size": 1},
+        ) as export_mock:
+            try:
+                preflight.main()
+            except SystemExit:
+                exited = True
+        return exited, export_mock
 
     def test_report_contains_versioned_sources_and_authoritative_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -168,6 +181,71 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 )
             )
 
+    def test_missing_mesh_file_blocks_before_speedtree_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_fern_missing_mesh.spm"
+            report_path = root / "report.json"
+            mesh_dir = root / "meshes"
+            mesh_dir.mkdir()
+            (mesh_dir / "01_leaf_present.fbx").write_bytes(b"fbx")
+            write_spm(
+                spm,
+                mesh_filenames=(
+                    "meshes/01_leaf_present.fbx",
+                    "meshes/18_leaf_gone.fbx",
+                ),
+            )
+            write_stmat(
+                spm,
+                ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
+            )
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertTrue(exited)
+            export_mock.assert_not_called()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            envelope = report["speedtree_pipeline_contract"]
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(envelope["outcome"], "blocked")
+            self.assertIn("18_leaf_gone.fbx", report["error"])
+            self.assertNotIn("speedtree_export", report)
+            self.assertIn(
+                "SPM_MESH_FILE_MISSING",
+                {issue["code"] for issue in envelope["issues"]},
+            )
+            contract = report["mesh_file_reference_contract"]
+            self.assertEqual(contract["status"], "missing_mesh_files")
+            self.assertEqual(
+                [row["filename"] for row in contract["missing"]],
+                ["meshes/18_leaf_gone.fbx"],
+            )
+
+    def test_existing_mesh_files_do_not_block_the_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_fern_meshes_ok.spm"
+            report_path = root / "report.json"
+            mesh_dir = root / "meshes"
+            mesh_dir.mkdir()
+            (mesh_dir / "01_leaf_present.fbx").write_bytes(b"fbx")
+            write_spm(spm, mesh_filenames=("meshes/01_leaf_present.fbx",))
+            write_stmat(
+                spm,
+                ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
+            )
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(
+                report["mesh_file_reference_contract"]["status"], "ok"
+            )
+
     def test_missing_visible_stem_blocks_with_all_export_issue(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -177,9 +255,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             write_stmat(spm, ["M_leaf_grass_dead_Mat"])
             source_before = spm.read_bytes()
 
-            with self.assertRaises(SystemExit):
-                self.run_preflight(spm, report_path)
+            exited, _export_mock = self.run_preflight(spm, report_path)
 
+            self.assertTrue(exited)
             report = json.loads(report_path.read_text(encoding="utf-8"))
             envelope = report["speedtree_pipeline_contract"]
             self.assertEqual(report["status"], "blocked")
@@ -197,7 +275,6 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(
                 report["problem_node_marker"]["status"], "reported_only"
             )
-
 
 if __name__ == "__main__":
     unittest.main()

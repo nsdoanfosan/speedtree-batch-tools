@@ -1,0 +1,408 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+SK_BATCH_DIR = Path(__file__).resolve().parents[1]
+if str(SK_BATCH_DIR) not in sys.path:
+    sys.path.insert(0, str(SK_BATCH_DIR))
+BATCH_TOOLS_DIR = SK_BATCH_DIR.parent
+if str(BATCH_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(BATCH_TOOLS_DIR))
+
+from cluster_assembly_handoff_contract import (  # noqa: E402
+    assembly_source_fbx_from_contract,
+    build_assembly_handoff,
+    build_blender_fbx_inventory,
+    classify_inventory_role,
+    file_fingerprint,
+    normalize_export_name,
+    resolve_cluster_receipt_path,
+)
+
+
+class FakeMaterial:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeVertex:
+    def __init__(self, co):
+        self.co = co
+
+
+class FakePolygon:
+    def __init__(self, index, material_index, vertices):
+        self.index = index
+        self.material_index = material_index
+        self.vertices = vertices
+
+
+class FakeMesh:
+    def __init__(self, name, materials, polygons, vertex_count=32):
+        self.name = name
+        self.materials = [FakeMaterial(value) if value else None for value in materials]
+        self.polygons = polygons
+        self.vertices = [FakeVertex((index, index % 3, 0.0)) for index in range(vertex_count)]
+
+
+class FakeObject(dict):
+    type = "MESH"
+
+    def __init__(self, name, mesh, source_fbx):
+        super().__init__(codex_source_fbx=str(source_fbx))
+        self.name = name
+        self.data = mesh
+        self.matrix_world = (
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+
+
+def role_object(source_fbx, *, material="M_branch_elm_01", used=True, name="TreeMesh"):
+    polygons = [
+        FakePolygon(0, 0 if used else 1, (0, 1, 2)),
+        FakePolygon(1, 0 if used else 1, (2, 3, 0)),
+        FakePolygon(2, 0 if used else 1, (10, 11, 12)),
+    ]
+    materials = [material, "M_bark_elm_01"]
+    return FakeObject(name, FakeMesh(name + "Data", materials, polygons), source_fbx)
+
+
+def write_receipt(
+    path, spm, fbx, roles, *, fingerprint=None, assembly_spm=None
+):
+    fingerprint = dict(fingerprint or file_fingerprint(fbx))
+    assembly_spm = Path(assembly_spm or spm)
+    contract_roles = []
+    for role, identity, decision in roles:
+        contract_roles.append({
+            "role": role,
+            "name": identity,
+            "decision": decision,
+            "spm": str(spm),
+            "targets": [{
+                "spm": str(assembly_spm),
+                "export_bundle": {"fbx": fingerprint},
+                "fbx_material_mesh_pair": {"decision": decision},
+            }],
+        })
+    payload = {
+        "items": [{
+            "spm": str(spm),
+            "cluster_assembly": {
+                "schema_version": 1,
+                "folder": str(spm.parent / "Tree_elm"),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(spm),
+                    "authoritative_tree_source": file_fingerprint(assembly_spm),
+                }],
+                "dependencies": [],
+                "handoff": {"status": "pending_export", "roles": contract_roles},
+            },
+        }],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+class ClusterAssemblyHandoffTests(unittest.TestCase):
+    def test_persisted_cluster_receipt_is_preferred_without_a_new_batch_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            embedded = root / "material_contract.json"
+            persisted = root / "persisted_cluster_receipt.json"
+            fbx = root / "Tree_elm_01.fbx"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            persisted.write_text("{}", encoding="utf-8")
+            with mock.patch(
+                "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+                "locate_cluster_assembly_receipt",
+                return_value=persisted,
+            ):
+                resolved = resolve_cluster_receipt_path(spm, embedded)
+            self.assertEqual(resolved, persisted.resolve())
+
+    def test_embedded_cluster_contract_remains_a_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            embedded = root / "material_contract.json"
+            fbx = root / "Tree_elm_01.fbx"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            with mock.patch(
+                "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+                "locate_cluster_assembly_receipt",
+                side_effect=FileNotFoundError,
+            ):
+                resolved = resolve_cluster_receipt_path(spm, embedded)
+            self.assertEqual(resolved, embedded.resolve())
+
+    def test_export_name_normalization_keeps_role_identity(self):
+        self.assertEqual(
+            normalize_export_name("Material::M_branch_elm_01_Mat"),
+            "branch_elm_01",
+        )
+
+    def test_actual_polygon_assignment_is_complete_and_componentized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fbx = Path(tmp) / "tree.fbx"
+            fbx.write_bytes(b"fbx")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)],
+                fbx,
+                {"branch": "branch_elm_01", "leaf": "leaf_elm_01"},
+            )
+            role = classify_inventory_role(inventory, "branch", "branch_elm_01")
+            self.assertEqual(role["status"], "complete_pair")
+            self.assertEqual(role["decision"], "normalize_part")
+            self.assertEqual(role["assignments"][0]["used_polygon_count"], 3)
+            self.assertEqual(len(role["assignments"][0]["components"]), 2)
+
+    def test_assembly_source_fbx_comes_from_receipt_not_full_sk_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            full_spm = root / "SK_Tree_elm_01.spm"
+            source_spm = root / "Tree_elm_01.spm"
+            source_fbx = root / "fbx" / "Tree_elm_01.fbx"
+            receipt = root / "pcg_receipt.json"
+            full_spm.write_bytes(b"full")
+            source_spm.write_bytes(b"source")
+            source_fbx.parent.mkdir()
+            source_fbx.write_bytes(b"source fbx")
+            write_receipt(
+                receipt,
+                full_spm,
+                source_fbx,
+                [
+                    ("branch", "branch_elm_01", "normalize_part"),
+                    ("leaf", "leaf_elm_01", "normalize_part"),
+                ],
+                assembly_spm=source_spm,
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            contract = payload["items"][0]["cluster_assembly"]
+            selected = assembly_source_fbx_from_contract(contract, full_spm)
+            self.assertEqual(selected.resolve(), source_fbx.resolve())
+            self.assertNotEqual(selected.name, "SK_Tree_elm_01.fbx")
+
+    def test_full_sk_identity_selects_one_source_from_multi_target_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            full_spm = root / "SK_Tree_elm_01.spm"
+            source_spm = root / "Tree_elm_01.spm"
+            other_spm = root / "Tree_elm_02.spm"
+            source_fbx = root / "fbx" / "Tree_elm_01.fbx"
+            other_fbx = root / "fbx" / "Tree_elm_02.fbx"
+            for path, data in (
+                (full_spm, b"full"),
+                (source_spm, b"source"),
+                (other_spm, b"other"),
+                (source_fbx, b"source fbx"),
+                (other_fbx, b"other fbx"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            contract = {
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(full_spm),
+                    "authoritative_tree_source": file_fingerprint(source_spm),
+                }],
+                "handoff": {
+                    "roles": [{
+                        "role": "branch",
+                        "name": "branch_elm_01",
+                        "targets": [
+                            {
+                                "spm": str(source_spm),
+                                "export_bundle": {
+                                    "fbx": file_fingerprint(source_fbx)
+                                },
+                            },
+                            {
+                                "spm": str(other_spm),
+                                "export_bundle": {
+                                    "fbx": file_fingerprint(other_fbx)
+                                },
+                            },
+                        ],
+                    }],
+                },
+            }
+            selected = assembly_source_fbx_from_contract(contract, full_spm)
+            self.assertEqual(selected.resolve(), source_fbx.resolve())
+
+    def test_contract_without_cluster_roles_needs_no_assembly_source_fbx(self):
+        contract = {
+            "folder": r"D:\Trees\Tree_plain",
+            "dependencies": [],
+            "handoff": {"status": "pass_through", "roles": []},
+        }
+        self.assertIsNone(
+            assembly_source_fbx_from_contract(
+                contract, r"D:\Trees\Tree_plain\SK_Tree_plain_01.spm"
+            )
+        )
+
+    def test_declared_but_unused_material_is_blocked_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fbx = Path(tmp) / "tree.fbx"
+            fbx.write_bytes(b"fbx")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, used=False)],
+                fbx,
+                {"branch": "branch_elm_01"},
+            )
+            role = classify_inventory_role(inventory, "branch", "branch_elm_01")
+            self.assertEqual(role["status"], "material_without_mesh")
+            self.assertEqual(role["decision"], "blocked")
+
+    def test_role_named_mesh_without_material_is_blocked_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fbx = Path(tmp) / "tree.fbx"
+            fbx.write_bytes(b"fbx")
+            obj = role_object(
+                fbx,
+                material="M_bark_elm_01",
+                name="Model::branch_elm_01",
+            )
+            inventory = build_blender_fbx_inventory(
+                [obj], fbx, {"branch": "branch_elm_01"}
+            )
+            role = classify_inventory_role(inventory, "branch", "branch_elm_01")
+            self.assertEqual(role["status"], "mesh_without_material")
+            self.assertEqual(role["decision"], "blocked")
+
+    def test_both_absent_is_legacy_pass_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fbx = Path(tmp) / "tree.fbx"
+            fbx.write_bytes(b"fbx")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_bark_elm_01")],
+                fbx,
+                {"branch": "branch_elm_01"},
+            )
+            role = classify_inventory_role(inventory, "branch", "branch_elm_01")
+            self.assertEqual(role["status"], "absent")
+            self.assertEqual(role["decision"], "pass_through")
+
+    def test_complete_branch_and_absent_leaf_build_separate_assembly_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "fbx" / "SK_Tree_elm_01.fbx"
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.parent.mkdir()
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [
+                    ("branch", "branch_elm_01", "pending_export"),
+                    ("leaf", "leaf_elm_01", "pass_through"),
+                ],
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)],
+                fbx,
+                {"branch": "branch_elm_01", "leaf": "leaf_elm_01"},
+            )
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+            self.assertEqual(handoff["status"], "ready")
+            self.assertTrue(handoff["full_skeletal_mesh"]["preserved"])
+            self.assertTrue(handoff["assembly"]["requested"])
+            self.assertEqual(
+                [row["role"] for row in handoff["assembly"]["part_builder_inputs"]],
+                ["branch"],
+            )
+            self.assertFalse(
+                handoff["skeleton_wind_contract"]["production_310_bone_hard_gate"]
+            )
+
+    def test_receipt_pass_through_disagreeing_with_real_pair_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "SK_Tree_elm_01.fbx"
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pass_through")],
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+            self.assertEqual(handoff["status"], "blocked")
+            self.assertIn(
+                "pcg_receipt_fbx_decision_mismatch",
+                [row.get("reason") for row in handoff["issues"]],
+            )
+
+    def test_stale_fbx_receipt_fingerprint_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "SK_Tree_elm_01.fbx"
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"current fbx")
+            stale = dict(file_fingerprint(fbx))
+            stale["size"] += 1
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+                fingerprint=stale,
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+            self.assertEqual(handoff["status"], "blocked")
+            self.assertIn(
+                "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
+                [row["code"] for row in handoff["issues"]],
+            )
+
+    def test_inventory_excludes_objects_from_another_fbx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = root / "expected.fbx"
+            other = root / "other.fbx"
+            expected.write_bytes(b"expected")
+            other.write_bytes(b"other")
+            inventory = build_blender_fbx_inventory(
+                [role_object(other)], expected, {"branch": "branch_elm_01"}
+            )
+            self.assertEqual(inventory["objects"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

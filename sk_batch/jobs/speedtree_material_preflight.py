@@ -26,6 +26,7 @@ from spm_leaf_handoff_contract import (  # noqa: E402
     inspect_speedtree_material_export,
     inspect_speedtree_texture_sources,
     inspect_spm_leaf_contract,
+    inspect_spm_mesh_file_references,
     leaf_contract_user_message,
 )
 from speedtree_texture_contract import resolve_texture_bindings  # noqa: E402
@@ -163,6 +164,24 @@ def preflight_contract_issues(report):
                 details={
                     "material_names": ownership.get("material_names") or [],
                     "validation": "shadow_only_no_mutation_change",
+                },
+            )
+        )
+
+    mesh_files = report.get("mesh_file_reference_contract") or {}
+    if mesh_files.get("missing"):
+        issues.append(
+            _issue(
+                "SPM_MESH_FILE_MISSING",
+                "spm",
+                report.get("spm"),
+                report.get("error")
+                or "SPM이 참조하는 외부 메시 FBX가 디스크에 없음",
+                details={
+                    "missing_mesh_files": [
+                        str(row.get("filename") or "")
+                        for row in mesh_files.get("missing") or []
+                    ],
                 },
             )
         )
@@ -337,9 +356,27 @@ def main():
         leaf_contract = inspect_spm_leaf_contract(args.spm)
         leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
         report["leaf_reference_contract"] = leaf_contract
+        mesh_files = inspect_spm_mesh_file_references(args.spm)
+        report["mesh_file_reference_contract"] = mesh_files
+        missing_mesh_files = list(mesh_files.get("missing") or [])
         if not leaf_ok:
             report["status"] = "blocked"
             report["error"] = leaf_message
+        elif missing_mesh_files:
+            names = ", ".join(
+                str(row.get("filename") or "?")
+                for row in missing_mesh_files[:8]
+            )
+            if len(missing_mesh_files) > 8:
+                names += f" 외 {len(missing_mesh_files) - 8}개"
+            report["status"] = "blocked"
+            report["error"] = (
+                "SPM이 참조하는 외부 메시 FBX "
+                f"{len(missing_mesh_files)}개가 디스크에 없음 — " + names
+                + ". 이 상태의 SpeedTree 익스포트는 타임아웃까지 멈추므로 "
+                "실행 전에 차단했습니다. Modeler에서 Mesh Asset 참조를 "
+                "정리하거나 파일을 복구하세요."
+            )
         else:
             report["speedtree_export"] = run_export(args, speedtree_cli)
             material = inspect_speedtree_material_export(

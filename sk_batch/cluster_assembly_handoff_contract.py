@@ -1,0 +1,740 @@
+"""Fail-closed PCG Cluster -> Blender/SK Assembly handoff contract.
+
+The PCG audit proves the authored SPM/FBX dependency graph.  This module is the
+downstream half of that contract: it inspects the *actual Blender import* of the
+same FBX and accepts a branch/leaf role only when the role material is assigned
+to one or more real polygons.  It deliberately has no ``bpy`` import so the
+decision and receipt reconciliation can be unit-tested with small fakes.
+
+This is not an Assembly switch.  Each role is classified from content as one
+of complete-pair, absent (legacy pass-through), or partial (blocked).
+"""
+from __future__ import annotations
+
+import functools
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+
+SCHEMA_VERSION = 1
+CONTRACT_KIND = "pcg_cluster_blender_assembly_handoff"
+ROLE_ORDER = ("branch", "leaf")
+ROLE_PREFIX_RE = re.compile(r"^(branch|leaf)(?:_|$)", re.IGNORECASE)
+
+
+def normalize_export_name(value):
+    """Strip exporter wrappers while preserving the authored role identity."""
+    name = str(value or "").split("\x00", 1)[0]
+    name = name.strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if "::" in name:
+        name = name.rsplit("::", 1)[-1]
+    if name.casefold().endswith("_mat"):
+        name = name[:-4]
+    if name.casefold().startswith("m_"):
+        name = name[2:]
+    return name.strip().casefold()
+
+
+def dependency_role(value):
+    match = ROLE_PREFIX_RE.match(normalize_export_name(value))
+    return match.group(1).casefold() if match else None
+
+
+def _normalized_path(value):
+    if not value:
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+
+
+@functools.lru_cache(maxsize=512)
+def _sha256_cached(path_text, size, mtime_ns):
+    digest = hashlib.sha256()
+    with Path(path_text).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_fingerprint(path, *, hash_content=True):
+    candidate = Path(path)
+    try:
+        stat = candidate.stat()
+    except OSError:
+        return {
+            "path": str(candidate),
+            "exists": False,
+            "size": None,
+            "mtime_ns": None,
+            "sha256": None,
+        }
+    absolute = _normalized_path(candidate)
+    return {
+        "path": str(candidate.resolve()),
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": (
+            _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns)
+            if hash_content else None
+        ),
+    }
+
+
+def _json_safe_matrix(matrix):
+    if matrix is None:
+        return None
+    try:
+        return [[float(value) for value in row] for row in matrix]
+    except (TypeError, ValueError):
+        return None
+
+
+def _material_name(material):
+    return str(getattr(material, "name", "") or "") if material else ""
+
+
+def _object_source_fbx(obj):
+    try:
+        return str(obj.get("codex_source_fbx", "") or "")
+    except (AttributeError, TypeError):
+        return ""
+
+
+def _component_rows(mesh, polygons):
+    """Return disconnected polygon islands for one material assignment."""
+    if not polygons:
+        return []
+    parent = list(range(len(polygons)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        left = find(left)
+        right = find(right)
+        if left != right:
+            parent[right] = left
+
+    vertex_owner = {}
+    polygon_vertices = []
+    for local_index, polygon in enumerate(polygons):
+        vertices = tuple(int(value) for value in getattr(polygon, "vertices", ()))
+        polygon_vertices.append(vertices)
+        for vertex in vertices:
+            previous = vertex_owner.setdefault(vertex, local_index)
+            union(local_index, previous)
+
+    groups = {}
+    for local_index, polygon in enumerate(polygons):
+        root = find(local_index)
+        row = groups.setdefault(root, {"polygon_indices": [], "vertex_indices": set()})
+        row["polygon_indices"].append(int(getattr(polygon, "index", local_index)))
+        row["vertex_indices"].update(polygon_vertices[local_index])
+
+    vertices = getattr(mesh, "vertices", ())
+    result = []
+    for row in groups.values():
+        vertex_indices = sorted(row["vertex_indices"])
+        bounds = None
+        coordinates = []
+        for vertex_index in vertex_indices:
+            try:
+                co = vertices[vertex_index].co
+                coordinates.append(tuple(float(value) for value in co[:3]))
+            except (IndexError, AttributeError, TypeError, ValueError):
+                coordinates = []
+                break
+        if coordinates:
+            bounds = {
+                "min": [min(values) for values in zip(*coordinates)],
+                "max": [max(values) for values in zip(*coordinates)],
+            }
+        result.append({
+            "polygon_indices": sorted(row["polygon_indices"]),
+            "vertex_indices": vertex_indices,
+            "polygon_count": len(row["polygon_indices"]),
+            "vertex_count": len(vertex_indices),
+            "local_bounds": bounds,
+        })
+    result.sort(key=lambda row: row["polygon_indices"][0])
+    return result
+
+
+def build_blender_fbx_inventory(objects, source_fbx_path, role_identities):
+    """Inspect real FBX-imported mesh polygons through bpy-compatible objects.
+
+    ``objects`` should be the original objects in BWR's ``SpeedTree_Source``
+    collection, not later merged copies.  Only objects tagged with the exact
+    source FBX are admitted.
+    """
+    source_key = _normalized_path(source_fbx_path)
+    expected = {
+        role: normalize_export_name(identity)
+        for role, identity in (role_identities or {}).items()
+        if role in ROLE_ORDER and identity
+    }
+    rows = []
+    declared_materials = []
+    for obj in objects or []:
+        if getattr(obj, "type", "") != "MESH" or not getattr(obj, "data", None):
+            continue
+        tagged = _normalized_path(_object_source_fbx(obj))
+        if source_key and tagged != source_key:
+            continue
+        mesh = obj.data
+        polygons = list(getattr(mesh, "polygons", ()) or ())
+        materials = list(getattr(mesh, "materials", ()) or ())
+        material_names = [_material_name(material) for material in materials]
+        declared_materials.extend(name for name in material_names if name)
+        polygons_by_slot = {}
+        for polygon in polygons:
+            polygons_by_slot.setdefault(
+                int(getattr(polygon, "material_index", 0)), []
+            ).append(polygon)
+        usages = []
+        for slot_index, material_name in enumerate(material_names):
+            used = polygons_by_slot.get(slot_index, [])
+            role = next(
+                (
+                    candidate
+                    for candidate, identity in expected.items()
+                    if normalize_export_name(material_name) == identity
+                ),
+                None,
+            )
+            usage = {
+                "slot_index": slot_index,
+                "material": material_name,
+                "used_polygon_count": len(used),
+            }
+            if role and used:
+                usage["role"] = role
+                usage["polygon_indices"] = [
+                    int(getattr(polygon, "index", index))
+                    for index, polygon in enumerate(used)
+                ]
+                usage["components"] = _component_rows(mesh, used)
+            usages.append(usage)
+        rows.append({
+            "object": str(getattr(obj, "name", "") or ""),
+            "mesh": str(getattr(mesh, "name", "") or ""),
+            "vertex_count": len(getattr(mesh, "vertices", ()) or ()),
+            "polygon_count": len(polygons),
+            "matrix_world": _json_safe_matrix(getattr(obj, "matrix_world", None)),
+            "material_usages": usages,
+        })
+    return {
+        "source_fbx": file_fingerprint(source_fbx_path),
+        "objects": rows,
+        "mesh_names": sorted({
+            value
+            for row in rows for value in (row["object"], row["mesh"])
+            if value
+        }),
+        "materials": sorted(set(declared_materials)),
+    }
+
+
+def classify_inventory_role(inventory, role, role_identity):
+    """Apply the independent complete/absent/partial content gate."""
+    expected = normalize_export_name(role_identity)
+    material_matches = [
+        value for value in inventory.get("materials") or []
+        if normalize_export_name(value) == expected
+    ]
+    mesh_name_matches = [
+        value for value in inventory.get("mesh_names") or []
+        if normalize_export_name(value) == expected
+    ]
+    assignments = []
+    for mesh_row in inventory.get("objects") or []:
+        for usage in mesh_row.get("material_usages") or []:
+            if normalize_export_name(usage.get("material")) != expected:
+                continue
+            if int(usage.get("used_polygon_count") or 0) <= 0:
+                continue
+            assignments.append({
+                "object": mesh_row.get("object"),
+                "mesh": mesh_row.get("mesh"),
+                "matrix_world": mesh_row.get("matrix_world"),
+                **usage,
+            })
+    if assignments:
+        status, decision = "complete_pair", "normalize_part"
+    elif material_matches:
+        status, decision = "material_without_mesh", "blocked"
+    elif mesh_name_matches:
+        status, decision = "mesh_without_material", "blocked"
+    else:
+        status, decision = "absent", "pass_through"
+    return {
+        "role": role,
+        "role_identity": role_identity,
+        "status": status,
+        "decision": decision,
+        "material_matches": material_matches,
+        "mesh_name_matches": mesh_name_matches,
+        "assignments": assignments,
+    }
+
+
+def _contract_candidates(payload):
+    if not isinstance(payload, dict):
+        return []
+    candidates = []
+    if isinstance(payload.get("handoff"), dict) and isinstance(
+        payload.get("dependencies"), list
+    ):
+        candidates.append(payload)
+    for key in ("cluster_assembly", "assembly_handoff_contract"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.extend(_contract_candidates(value))
+    for key in ("items", "targets", "results"):
+        values = payload.get(key)
+        if isinstance(values, dict):
+            values = values.values()
+        if isinstance(values, (list, tuple)) or type(values) is type({}.values()):
+            for value in values:
+                if isinstance(value, dict):
+                    candidates.extend(_contract_candidates(value))
+    return candidates
+
+
+def _contract_spm_paths(contract):
+    paths = set()
+    for row in contract.get("tree_source_identities") or []:
+        for key in ("target_spm", "authoritative_tree_source"):
+            fingerprint = row.get(key) or {}
+            if fingerprint.get("path"):
+                paths.add(_normalized_path(fingerprint["path"]))
+    for role in (contract.get("handoff") or {}).get("roles") or []:
+        for target in role.get("targets") or []:
+            if target.get("spm"):
+                paths.add(_normalized_path(target["spm"]))
+    return paths
+
+
+def select_cluster_contract(payload, spm_path):
+    candidates = _contract_candidates(payload)
+    if not candidates:
+        raise ValueError("PCG receipt contains no cluster_assembly contract")
+    spm_key = _normalized_path(spm_path)
+    matching = [
+        candidate for candidate in candidates
+        if spm_key in _contract_spm_paths(candidate)
+    ]
+    if len(matching) == 1:
+        return matching[0]
+    if not matching and len(candidates) == 1:
+        return candidates[0]
+    if not matching:
+        raise ValueError("PCG receipt does not identify the requested SPM")
+    raise ValueError("PCG receipt has multiple Cluster contracts for the requested SPM")
+
+
+def load_cluster_contract(receipt_path, spm_path):
+    receipt = Path(receipt_path)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    return payload, select_cluster_contract(payload, spm_path)
+
+
+def resolve_cluster_receipt_path(spm_path, embedded_contract_path=None):
+    """Resolve the additive PCG receipt without adding a new batch argument.
+
+    PCG persists the Cluster contract independently from the existing SK
+    material preflight report.  Prefer that current, hash-validated receipt;
+    older reports that already embed ``cluster_assembly`` remain a fallback.
+    A stale or ambiguous persisted receipt is intentionally not swallowed.
+    """
+    from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+        locate_cluster_assembly_receipt,
+    )
+
+    try:
+        return Path(locate_cluster_assembly_receipt(spm_path)).resolve()
+    except FileNotFoundError:
+        pass
+
+    if not embedded_contract_path:
+        return None
+    embedded = Path(embedded_contract_path)
+    if not embedded.is_file():
+        return None
+    try:
+        payload = json.loads(embedded.read_text(encoding="utf-8"))
+        select_cluster_contract(payload, spm_path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return embedded.resolve()
+
+
+def _role_receipt_rows(contract):
+    rows = {}
+    for row in (contract.get("handoff") or {}).get("roles") or []:
+        role = str(row.get("role") or dependency_role(row.get("name")) or "").casefold()
+        if role in ROLE_ORDER:
+            rows[role] = row
+    return rows
+
+
+def _contract_species(contract):
+    name = Path(str(contract.get("folder") or "")).name
+    name = re.sub(
+        r"^(?:tree|bush|shrub|weed|grass)_",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    return name.strip("_-").casefold()
+
+
+def _role_identity(role, receipt_row, contract=None):
+    identity = str((receipt_row or {}).get("name") or "")
+    if dependency_role(identity) == role:
+        return identity
+    species = _contract_species(contract or {}) or "asset"
+    return f"{role}_{species}_01"
+
+
+def role_identities_from_contract(contract):
+    """Return the exact role identities authored by the selected PCG receipt."""
+    rows = _role_receipt_rows(contract)
+    return {
+        role: _role_identity(role, rows.get(role), contract)
+        for role in ROLE_ORDER
+    }
+
+
+def _target_for_spm(receipt_row, spm_path):
+    key = _normalized_path(spm_path)
+    targets = list((receipt_row or {}).get("targets") or [])
+    matches = [row for row in targets if _normalized_path(row.get("spm")) == key]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and len(targets) == 1:
+        return targets[0]
+    return None
+
+
+def _authoritative_spm_for_requested(contract, spm_path):
+    """Resolve an SK batch item to the exact general-tree source in PCG."""
+    key = _normalized_path(spm_path)
+    matches = []
+    for row in contract.get("tree_source_identities") or []:
+        target = row.get("target_spm") or {}
+        source = row.get("authoritative_tree_source") or {}
+        if key not in {
+            _normalized_path(target.get("path")),
+            _normalized_path(source.get("path")),
+        }:
+            continue
+        source_path = source.get("path")
+        if source_path:
+            matches.append(str(source_path))
+    normalized = {
+        _normalized_path(value): value
+        for value in matches
+    }
+    if len(normalized) == 1:
+        return Path(next(iter(normalized.values())))
+    if len(normalized) > 1:
+        raise ValueError(
+            "PCG receipt maps the requested SPM to multiple authoritative sources"
+        )
+    return Path(spm_path)
+
+
+def assembly_source_fbx_from_contract(contract, full_spm_path):
+    """Return the one authoritative Assembly-source FBX named by the receipt.
+
+    The Full SK SPM identifies the batch item, but its derived ``SK_*.fbx`` is
+    not the role-pair evidence.  PCG records the general-tree source target in
+    every role row; branch and leaf must agree on that exact FBX.
+    """
+    paths = {}
+    role_rows = _role_receipt_rows(contract)
+    if not role_rows:
+        return None
+    authoritative_spm = _authoritative_spm_for_requested(
+        contract, full_spm_path
+    )
+    for receipt_row in role_rows.values():
+        target = _target_for_spm(receipt_row, authoritative_spm)
+        expected = ((target or {}).get("export_bundle") or {}).get("fbx") or {}
+        path = expected.get("path")
+        if path:
+            paths[_normalized_path(path)] = str(path)
+    if not paths:
+        raise ValueError("PCG receipt contains no Assembly source FBX")
+    if len(paths) != 1:
+        raise ValueError("PCG branch/leaf receipts disagree on Assembly source FBX")
+    return Path(next(iter(paths.values())))
+
+
+def _compare_artifact(expected, actual, *, allow_pending=False):
+    if not expected:
+        return {"status": "missing_receipt_fingerprint", "ok": False}
+    expected_path = _normalized_path(expected.get("path"))
+    actual_path = _normalized_path(actual.get("path"))
+    if expected_path != actual_path:
+        return {
+            "status": "path_mismatch",
+            "ok": False,
+            "expected": expected,
+            "actual": actual,
+        }
+    if not expected.get("exists") and not actual.get("exists"):
+        return {
+            "status": "consistent_missing",
+            "ok": True,
+            "expected": expected,
+            "actual": actual,
+        }
+    if not expected.get("exists") and allow_pending and actual.get("exists"):
+        return {
+            "status": "pending_export_resolved",
+            "ok": True,
+            "expected": expected,
+            "actual": actual,
+        }
+    for field in ("size", "mtime_ns", "sha256"):
+        value = expected.get(field)
+        if value is not None and value != actual.get(field):
+            return {
+                "status": f"{field}_mismatch",
+                "ok": False,
+                "expected": expected,
+                "actual": actual,
+            }
+    return {
+        "status": "exact" if expected.get("sha256") else "metadata_exact",
+        "ok": bool(expected.get("exists") and actual.get("exists")),
+        "expected": expected,
+        "actual": actual,
+    }
+
+
+def _export_artifact_validation(contract, role_rows, spm_path, inventory):
+    validations = []
+    seen = set()
+    authoritative_spm = _authoritative_spm_for_requested(contract, spm_path)
+    for role, receipt_row in role_rows.items():
+        target = _target_for_spm(receipt_row, authoritative_spm)
+        if not target:
+            continue
+        bundle = target.get("export_bundle") or {}
+        for artifact in ("fbx", "xml", "stmat"):
+            expected = bundle.get(artifact)
+            if not expected or not expected.get("path"):
+                continue
+            key = (artifact, _normalized_path(expected["path"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            actual = (
+                inventory.get("source_fbx")
+                if artifact == "fbx"
+                else file_fingerprint(expected["path"])
+            )
+            validations.append({
+                "artifact": artifact,
+                **_compare_artifact(expected, actual, allow_pending=True),
+            })
+    return validations
+
+
+def _dependency_artifact_validation(contract, spm_path):
+    """Validate the source SPM, Cluster SPMs, and texture receipt identities."""
+    expected_rows = []
+    spm_key = _normalized_path(spm_path)
+    for row in contract.get("tree_source_identities") or []:
+        target = row.get("target_spm") or {}
+        source = row.get("authoritative_tree_source") or {}
+        if spm_key in {
+            _normalized_path(target.get("path")),
+            _normalized_path(source.get("path")),
+        }:
+            expected_rows.append(("tree_spm", target))
+            expected_rows.append(("authoritative_tree_spm", source))
+    handoff = contract.get("handoff") or {}
+    dependencies = (
+        handoff.get("cluster_dependencies")
+        or contract.get("dependencies")
+        or []
+    )
+    for dependency in dependencies:
+        expected_rows.append(("cluster_spm", dependency.get("spm_fingerprint") or {}))
+        for texture in dependency.get("texture_dependencies") or []:
+            expected_rows.append(("cluster_texture", texture))
+
+    validations = []
+    seen = set()
+    for artifact, expected in expected_rows:
+        path = expected.get("path")
+        if not path:
+            validations.append({
+                "artifact": artifact,
+                "status": "missing_receipt_fingerprint",
+                "ok": False,
+            })
+            continue
+        key = (artifact, _normalized_path(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        actual = file_fingerprint(
+            path,
+            hash_content=expected.get("sha256") is not None,
+        )
+        validations.append({
+            "artifact": artifact,
+            **_compare_artifact(expected, actual),
+        })
+    if not any(row["artifact"] == "tree_spm" for row in validations):
+        validations.append({
+            "artifact": "tree_spm",
+            "status": "requested_spm_missing_from_receipt",
+            "ok": False,
+        })
+    return validations
+
+
+def _reconcile_role(receipt_row, actual):
+    receipt_decision = str((receipt_row or {}).get("decision") or "")
+    actual_decision = actual["decision"]
+    if actual_decision == "blocked":
+        return "blocked", "actual_fbx_partial_pair"
+    if receipt_row is None:
+        if actual_decision == "pass_through":
+            return "pass_through", "receipt_and_fbx_absent"
+        return "blocked", "fbx_role_missing_from_pcg_receipt"
+    if receipt_decision == "blocked":
+        return "blocked", "pcg_receipt_blocked"
+    if receipt_decision in {"pending_export", ""}:
+        return actual_decision, "pending_receipt_resolved_by_actual_fbx"
+    if receipt_decision != actual_decision:
+        return "blocked", "pcg_receipt_fbx_decision_mismatch"
+    return actual_decision, "pcg_receipt_and_actual_fbx_agree"
+
+
+def build_assembly_handoff(receipt_path, spm_path, inventory):
+    """Reconcile one PCG receipt with the exact imported FBX inventory."""
+    _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    role_rows = _role_receipt_rows(contract)
+    roles = []
+    issues = []
+    for role in ROLE_ORDER:
+        receipt_row = role_rows.get(role)
+        identity = _role_identity(role, receipt_row, contract)
+        actual = classify_inventory_role(inventory, role, identity)
+        decision, evidence = _reconcile_role(receipt_row, actual)
+        row = {
+            **actual,
+            "decision": decision,
+            "receipt_decision": (
+                str(receipt_row.get("decision") or "") if receipt_row else "absent"
+            ),
+            "reconciliation": evidence,
+        }
+        roles.append(row)
+        if decision == "blocked":
+            issues.append({
+                "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
+                "role": role,
+                "reason": evidence,
+                "actual_status": actual["status"],
+                "receipt_decision": row["receipt_decision"],
+            })
+
+    artifacts = (
+        _dependency_artifact_validation(contract, spm_path)
+        + _export_artifact_validation(
+            contract, role_rows, spm_path, inventory
+        )
+    )
+    for artifact in artifacts:
+        if not artifact.get("ok"):
+            issues.append({
+                "code": "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
+                "artifact": artifact.get("artifact"),
+                "reason": artifact.get("status"),
+            })
+
+    pcg_handoff_status = str((contract.get("handoff") or {}).get("status") or "")
+    if pcg_handoff_status in {"blocked", "needs_bark_normalization"}:
+        issues.append({
+            "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
+            "reason": pcg_handoff_status,
+        })
+
+    normalize_roles = [row for row in roles if row["decision"] == "normalize_part"]
+    if issues:
+        status = "blocked"
+    elif normalize_roles:
+        status = "ready"
+    else:
+        status = "pass_through"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": CONTRACT_KIND,
+        "status": status,
+        "pcg_receipt": file_fingerprint(receipt_path),
+        "spm": file_fingerprint(spm_path),
+        "actual_fbx": inventory.get("source_fbx") or {},
+        "artifact_validation": artifacts,
+        "pcg_handoff_status": pcg_handoff_status,
+        "roles": roles,
+        "full_skeletal_mesh": {
+            "preserved": True,
+            "source_spm": str(Path(spm_path).resolve()),
+            "output_contract": "existing_sk_batch_full_mesh_unchanged",
+        },
+        "assembly": {
+            "requested": bool(normalize_roles) and not issues,
+            "mode": "separate_skeletal_nanite_assembly",
+            "role_pair_source_fbx": (
+                inventory.get("source_fbx") or {}
+            ).get("path"),
+            "base_geometry_contract": "full_mesh_minus_role_polygon_components",
+            "part_builder_inputs": [
+                {
+                    "role": row["role"],
+                    "role_identity": row["role_identity"],
+                    "assignments": row["assignments"],
+                }
+                for row in normalize_roles
+            ],
+        },
+        "skeleton_wind_contract": {
+            "mode": "regenerate_from_final_skeleton",
+            "shared_by": ["full_skeletal_mesh", "nanite_assembly"],
+            "production_310_bone_hard_gate": False,
+            "validate_wind_bone_names_and_indices": True,
+            "validate_part_binding_hierarchy": True,
+        },
+        "issues": issues,
+    }
+
+
+__all__ = [
+    "CONTRACT_KIND",
+    "ROLE_ORDER",
+    "assembly_source_fbx_from_contract",
+    "build_assembly_handoff",
+    "build_blender_fbx_inventory",
+    "classify_inventory_role",
+    "dependency_role",
+    "file_fingerprint",
+    "load_cluster_contract",
+    "normalize_export_name",
+    "resolve_cluster_receipt_path",
+    "role_identities_from_contract",
+    "select_cluster_contract",
+]

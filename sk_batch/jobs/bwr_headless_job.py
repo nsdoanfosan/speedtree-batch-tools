@@ -38,6 +38,16 @@ from spm_leaf_handoff_contract import (
     leaf_contract_user_message,
 )
 from speedtree_pipeline_contract import validate_preflight_report
+from cluster_assembly_handoff_contract import (
+    assembly_source_fbx_from_contract,
+    build_assembly_handoff,
+    build_blender_fbx_inventory,
+    file_fingerprint,
+    load_cluster_contract,
+    resolve_cluster_receipt_path,
+    role_identities_from_contract,
+)
+from cluster_assembly_builder import build_blender_assembly_inputs
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -69,6 +79,15 @@ def parse_args():
 def write_report(path, data):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def is_cluster_source_spm(path):
+    candidate = Path(path)
+    return (
+        candidate.suffix.casefold() == ".spm"
+        and candidate.parent.name.casefold() == "cluster"
+        and not candidate.name.casefold().startswith("sk_")
+    )
 
 
 def material_slot_issues(obj):
@@ -117,9 +136,72 @@ def remove_unused_empty_material_slots(obj):
     return removed
 
 
+def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
+    """Import the exact FBX in-memory and reconcile it before BWR can save.
+
+    The later BWR operator clears these tagged objects and performs its normal
+    clean import.  If the contract blocks, this background Blender process exits
+    without saving, so an existing user-managed Full SK blend stays untouched.
+    """
+    _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    role_identities = role_identities_from_contract(contract)
+    data_collections = ("meshes", "armatures", "materials", "images", "actions")
+    before_objects = {obj.as_pointer() for obj in bpy.data.objects}
+    before_data = {
+        name: {value.as_pointer() for value in getattr(bpy.data, name)}
+        for name in data_collections
+    }
+    imported = []
+    try:
+        result = bpy.ops.import_scene.fbx(
+            filepath=str(Path(source_fbx_path).resolve())
+        )
+        if "FINISHED" not in result:
+            raise RuntimeError(f"Assembly FBX inspection import returned {result}")
+        imported = [
+            obj for obj in bpy.data.objects
+            if obj.as_pointer() not in before_objects
+        ]
+        for obj in imported:
+            obj["codex_source_fbx"] = str(Path(source_fbx_path).resolve())
+        inventory = build_blender_fbx_inventory(
+            imported,
+            source_fbx_path,
+            role_identities,
+        )
+        return build_assembly_handoff(receipt_path, spm_path, inventory)
+    finally:
+        for obj in list(imported):
+            if obj.name in bpy.data.objects:
+                bpy.data.objects.remove(obj, do_unlink=True)
+        for name in data_collections:
+            collection = getattr(bpy.data, name)
+            for value in list(collection):
+                if (
+                    value.as_pointer() not in before_data[name]
+                    and value.users == 0
+                ):
+                    collection.remove(value)
+
+
+def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
+    """Find the additive PCG receipt inside the existing required contract."""
+    try:
+        _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    except ValueError as exc:
+        if str(exc) == "PCG receipt contains no cluster_assembly contract":
+            return None
+        raise
+    return contract
+
+
 def main():
     args = parse_args()
     report = {"spm": args.spm, "blend": args.blend, "wind": args.wind, "status": "failed"}
+    source_review_allowed = is_cluster_source_spm(args.spm)
+    report["source_review_policy"] = (
+        "cluster_source_read_only" if source_review_allowed else "strict"
+    )
     try:
         material_preflight = None
         if args.material_contract:
@@ -162,6 +244,44 @@ def main():
         else:
             bpy.ops.wm.read_homefile(use_empty=True)
 
+        cluster_assembly_handoff = None
+        cluster_receipt_path = resolve_cluster_receipt_path(
+            args.spm,
+            args.material_contract or None,
+        )
+        cluster_assembly_contract = (
+            cluster_assembly_contract_from_material_contract(
+                cluster_receipt_path, args.spm
+            )
+            if cluster_receipt_path
+            else None
+        )
+        if cluster_assembly_contract is not None:
+            report["cluster_assembly_receipt"] = file_fingerprint(
+                cluster_receipt_path
+            )
+            source_fbx_path = assembly_source_fbx_from_contract(
+                cluster_assembly_contract,
+                args.spm,
+            )
+            if source_fbx_path is not None:
+                cluster_assembly_handoff = inspect_cluster_assembly_fbx(
+                    cluster_receipt_path,
+                    args.spm,
+                    source_fbx_path,
+                )
+                report["cluster_assembly_handoff"] = cluster_assembly_handoff
+                if cluster_assembly_handoff.get("status") == "blocked":
+                    reasons = "; ".join(
+                        f"{item.get('role') or item.get('artifact') or '?'}: "
+                        f"{item.get('reason') or item.get('code')}"
+                        for item in cluster_assembly_handoff.get("issues") or []
+                    )
+                    raise RuntimeError(
+                        "PCG Cluster Assembly handoff blocked before Blender Repair: "
+                        + (reasons or "unknown contract error")
+                    )
+
         settings = bpy.context.scene.speedtree_bwr_settings
         settings.spm_path = os.path.abspath(args.spm)
         settings.texture_contract_path = (
@@ -182,6 +302,10 @@ def main():
             settings.wind_preset = args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
+        # The additive Assembly stage fingerprints the existing Full SK FBX;
+        # keep the established BWR Full export enabled instead of synthesizing
+        # a second, differently-configured Full mesh inside the builder.
+        settings.export_fbx = True
 
         # default_paths anchors out_dir/JSON to bpy.data.filepath. open_mainfile
         # already set it for existing blends, so only a fresh file needs the
@@ -237,6 +361,10 @@ def main():
         }
         if pipeline_path.is_file():
             pipeline_data = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            if cluster_assembly_handoff is not None:
+                pipeline_data["cluster_assembly_handoff"] = (
+                    cluster_assembly_handoff
+                )
             if material_preflight is not None:
                 pipeline_data["speedtree_pipeline_contract"] = (
                     material_preflight["speedtree_pipeline_contract"]
@@ -289,9 +417,11 @@ def main():
         if (
             vertex_payload_contract.get("status") == "ok"
             and vertex_color_contract.get("status") == "ok"
-            and not empty_material_slots
             and not leaf_reference_blocked
-            and not material_export_blocked
+            and (
+                source_review_allowed
+                or (not empty_material_slots and not material_export_blocked)
+            )
         ):
             bpy.ops.wm.save_as_mainfile(filepath=blend_path)
             report["blend_resaved"] = True
@@ -304,16 +434,29 @@ def main():
         for path in missing_outputs:
             report.setdefault("warnings", []).append(f"expected output missing: {path}")
 
+        reviewable_source_issues = bool(
+            texture_normalization.get("missing")
+            or empty_material_slots
+            or material_export_blocked
+        )
+        structural_handoff_blocked = bool(
+            missing_outputs
+            or vertex_color_contract.get("status") == "blocked"
+            or vertex_payload_contract.get("status") == "blocked"
+            or leaf_reference_blocked
+        )
+        hard_handoff_blocked = bool(
+            structural_handoff_blocked
+            or (reviewable_source_issues and not source_review_allowed)
+        )
+        if hard_handoff_blocked:
+            handoff_status = "blocked"
+        elif reviewable_source_issues:
+            handoff_status = "source_review"
+        else:
+            handoff_status = "ok"
         preflight = {
-            "status": "blocked" if (
-                texture_normalization.get("missing")
-                or empty_material_slots
-                or missing_outputs
-                or vertex_color_contract.get("status") == "blocked"
-                or vertex_payload_contract.get("status") == "blocked"
-                or leaf_reference_blocked
-                or material_export_blocked
-            ) else "ok",
+            "status": handoff_status,
             "empty_material_slots": empty_material_slots,
             "missing_textures": texture_normalization.get("missing", []),
             "missing_outputs": missing_outputs,
@@ -321,15 +464,47 @@ def main():
             "vertex_payload_contract": vertex_payload_contract,
             "leaf_reference_contract": leaf_reference_contract,
             "material_export": material_export_contract,
+            "cluster_assembly_handoff": cluster_assembly_handoff,
             "missing_materials": material_export_contract.get(
                 "missing_materials", []
             ),
+            "source_review_required": handoff_status == "source_review",
+            "unreal_push_ready": handoff_status == "ok",
         }
         report["handoff_preflight"] = preflight
+        report["source_review_required"] = handoff_status == "source_review"
+        report["unreal_push_ready"] = handoff_status == "ok"
+        assembly_manifest = None
+        if preflight["status"] == "ok" and cluster_assembly_handoff is not None:
+            if pipeline_data is None or merged_object is None:
+                raise RuntimeError(
+                    "Cluster Assembly builder requires the final BWR pipeline mesh"
+                )
+            final_armature = merged_object.find_armature()
+            if final_armature is None:
+                raise RuntimeError(
+                    "Cluster Assembly builder could not resolve the final BWR armature"
+                )
+            full_fbx_path = str((pipeline_data.get("paths") or {}).get("fbx") or "")
+            if not full_fbx_path:
+                raise RuntimeError(
+                    "Cluster Assembly builder found no final Full SK FBX path"
+                )
+            assembly_manifest = build_blender_assembly_inputs(
+                cluster_assembly_handoff,
+                final_armature,
+                merged_object,
+                Path(blend_dir) / "assembly",
+                full_fbx_path,
+                report["dynamic_wind_json"],
+            )
+            report["cluster_assembly_manifest"] = assembly_manifest
         if pipeline_data is not None:
             pipeline_data["handoff_preflight"] = preflight
+            if assembly_manifest is not None:
+                pipeline_data["cluster_assembly_manifest"] = assembly_manifest
             write_report(pipeline_path, pipeline_data)
-        if preflight["status"] != "ok":
+        if preflight["status"] == "blocked":
             reasons = []
             if texture_normalization.get("missing"):
                 reasons.append(f"텍스처 세트 {len(texture_normalization['missing'])}개 미준비")

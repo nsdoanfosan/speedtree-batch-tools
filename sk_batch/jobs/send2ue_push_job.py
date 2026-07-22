@@ -36,11 +36,52 @@ import bpy
 JOBS_DIR = str(Path(__file__).resolve().parent)
 if JOBS_DIR not in sys.path:
     sys.path.insert(0, JOBS_DIR)
+SK_BATCH_DIR = str(Path(__file__).resolve().parent.parent)
+if SK_BATCH_DIR not in sys.path:
+    sys.path.insert(0, SK_BATCH_DIR)
 
 from vertex_color_contract import (
     inspect_object_vertex_colors,
     pack_speedtree_vertex_payload,
 )
+from cluster_assembly_builder import (
+    build_unreal_ingest_plan,
+    file_fingerprint as cluster_file_fingerprint,
+    scope_material_pipeline_to_codex_tests,
+    validate_file_fingerprint,
+    validate_manifest_artifacts,
+)
+
+
+def load_cluster_assembly_manifest(blend_dir, spm_path):
+    """Load the BWR-produced additive manifest, if this content has one."""
+    pipeline_path = (
+        Path(blend_dir)
+        / "reports"
+        / f"{Path(spm_path).stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+    if not pipeline_path.is_file():
+        return None
+    pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+    embedded = pipeline.get("cluster_assembly_manifest")
+    if not isinstance(embedded, dict):
+        return None
+    if embedded.get("status") == "pass_through":
+        return embedded
+    manifest_path = ((embedded.get("manifest") or {}).get("path") or "")
+    if not manifest_path or not Path(manifest_path).is_file():
+        raise RuntimeError(
+            "BWR Cluster Assembly manifest file is missing: " + str(manifest_path)
+        )
+    validate_file_fingerprint(
+        embedded.get("manifest"), "BWR Cluster Assembly manifest"
+    )
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    manifest["manifest"] = embedded.get("manifest")
+    if manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs":
+        raise RuntimeError("unsupported BWR Cluster Assembly manifest kind")
+    validate_manifest_artifacts(manifest)
+    return manifest
 
 
 def parse_args():
@@ -260,6 +301,8 @@ def unreal_editor_running():
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
             capture_output=True,
             text=True,
+            encoding="mbcs",
+            errors="replace",
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -592,7 +635,44 @@ def main():
         if not manifest_assets:
             raise RuntimeError("Send2UE produced no manifest assets")
 
+        cluster_manifest = load_cluster_assembly_manifest(blend_dir, spm_path)
+        cluster_assembly = None
+        material_asset_scope = None
+        if cluster_manifest is not None:
+            material_asset_scope = scope_material_pipeline_to_codex_tests(
+                manifest_assets,
+                folder,
+                export_root,
+            )
+            report["material_asset_scope"] = material_asset_scope
+            full_templates = [
+                asset
+                for asset in manifest_assets
+                if (asset.get("asset_data") or {}).get("_asset_type")
+                == "SkeletalMesh"
+                and (asset.get("asset_data") or {}).get("asset_path") == mesh_path
+            ]
+            if len(full_templates) != 1:
+                raise RuntimeError(
+                    "Cluster Assembly requires exactly one Full SK Send2UE manifest asset"
+                )
+            cluster_plan = build_unreal_ingest_plan(
+                cluster_manifest,
+                full_templates[0],
+                mesh_path,
+                folder,
+            )
+            cluster_assembly = {
+                "manifest": cluster_manifest,
+                "ingest_plan": cluster_plan,
+            }
+
         exported_files = manifest_asset_files(manifest_assets)
+        if cluster_assembly is not None:
+            for generated in (cluster_assembly["ingest_plan"].get("assets") or []):
+                source = (generated.get("asset_data") or {}).get("file_path")
+                if source:
+                    exported_files.append(file_fingerprint(source))
         json_dir = blend_dir / "JSON"
         handoff_paths = []
         if json_dir.is_dir():
@@ -610,10 +690,32 @@ def main():
             if args.skip_wind or not wind_json.is_file()
             else file_fingerprint(wind_json)
         )
+        if cluster_assembly is not None and cluster_assembly["ingest_plan"].get("status") == "ready":
+            expected_wind = (
+                cluster_assembly["manifest"].get("wind_contract") or {}
+            ).get("wind_json")
+            validate_file_fingerprint(expected_wind, "BWR final Skeleton wind JSON")
+            if wind_file is None:
+                raise RuntimeError(
+                    "Cluster Assembly requires the Full SK final Skeleton wind JSON"
+                )
+            canonical_full_wind = cluster_file_fingerprint(wind_json)
+            if (
+                int(canonical_full_wind.get("size") or -1)
+                != int((expected_wind or {}).get("size") or -2)
+                or str(canonical_full_wind.get("sha256") or "").casefold()
+                != str((expected_wind or {}).get("sha256") or "").casefold()
+            ):
+                raise RuntimeError(
+                    "Full SK and Assembly wind JSON fingerprints do not match"
+                )
         code_files = [
             file_fingerprint(args.unreal_ingest),
             file_fingerprint(args.send2ue_unreal_py),
         ]
+        cluster_builder = Path(__file__).resolve().parents[1] / "cluster_assembly_builder.py"
+        if cluster_builder.is_file():
+            code_files.append(file_fingerprint(cluster_builder))
         material_pipeline = (
             Path(args.send2ue_unreal_py).resolve().parents[1]
             / "resources"
@@ -635,6 +737,8 @@ def main():
             "handoff_files": handoff_files,
             "wind_file": wind_file,
             "code_files": code_files,
+            "cluster_assembly": cluster_assembly,
+            "material_asset_scope": material_asset_scope,
         }
         fingerprint = stable_fingerprint(contract)
         queue_id = args.queue_id or str(Path(blend_path).resolve())
@@ -653,7 +757,24 @@ def main():
                 mesh_path,
                 mesh_path + "_Skeleton",
                 mesh_path + "_PhysicsAsset",
-            ],
+            ] + (
+                [
+                    cluster_assembly["ingest_plan"]["asset_contract"][key]
+                    for key in ("base_skeletal_mesh", "assembly")
+                ]
+                + list(
+                    cluster_assembly["ingest_plan"]["asset_contract"]["parts"].values()
+                )
+                + [
+                    path + "_Skeleton"
+                    for path in cluster_assembly["ingest_plan"]["asset_contract"][
+                        "parts"
+                    ].values()
+                ]
+                if cluster_assembly
+                and cluster_assembly["ingest_plan"].get("status") == "ready"
+                else []
+            ),
             "report_path": str(Path(item_import_report).resolve()),
             "export_report_path": str(Path(args.report).resolve()),
         }
@@ -691,7 +812,7 @@ def main():
             if batch_report_path.exists():
                 batch_report_path.unlink()
             runner_path = str(Path(args.unreal_ingest).resolve())
-            rpc_lines = [
+            runner_load_lines = [
                 "import importlib.util, sys",
                 f"_runner_path = {runner_path!r}",
                 "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
@@ -700,6 +821,8 @@ def main():
                 "_runner = importlib.util.module_from_spec(_spec)",
                 "sys.modules[_spec.name] = _runner",
                 "_spec.loader.exec_module(_runner)",
+            ]
+            rpc_lines = runner_load_lines + [
                 (
                     f"_runner.run_manifest({str(manifest_path)!r}, "
                     f"checkpoint_path={str(checkpoint_path)!r}, "
@@ -714,6 +837,48 @@ def main():
                 "SK Batch RPC manifest ingest",
             )
             item_result = (batch_result.get("items") or {}).get(queue_id, {})
+            if item_result.get("status") == "runtime_pending":
+                report["stage"] = "rpc_runtime_frame_validation"
+                for runtime_attempt in range(1, 31):
+                    time.sleep(0.1)
+                    run_commands(
+                        runner_load_lines
+                        + [
+                            (
+                                f"_runner.finish_runtime_probe({str(checkpoint_path)!r}, "
+                                f"{str(batch_report_path)!r}, {queue_id!r})"
+                            )
+                        ]
+                    )
+                    batch_result = json.loads(
+                        batch_report_path.read_text(encoding="utf-8")
+                    )
+                    item_result = (batch_result.get("items") or {}).get(
+                        queue_id, {}
+                    )
+                    report["runtime_finish_attempts"] = runtime_attempt
+                    if item_result.get("status") != "runtime_pending":
+                        break
+                if item_result.get("status") == "runtime_pending":
+                    timeout_reason = (
+                        "runtime probe did not complete within 30 cross-frame RPC attempts"
+                    )
+                    run_commands(
+                        runner_load_lines
+                        + [
+                            (
+                                f"_runner.cancel_runtime_probe({str(checkpoint_path)!r}, "
+                                f"{str(batch_report_path)!r}, {queue_id!r}, "
+                                f"{timeout_reason!r})"
+                            )
+                        ]
+                    )
+                    batch_result = json.loads(
+                        batch_report_path.read_text(encoding="utf-8")
+                    )
+                    item_result = (batch_result.get("items") or {}).get(
+                        queue_id, {}
+                    )
             report["unreal_result"] = item_result
             report["wind"] = item_result.get("wind")
             report["materials"] = item_result.get("materials")

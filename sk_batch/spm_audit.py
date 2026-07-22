@@ -212,13 +212,25 @@ def _descendants_to_depth(seeds, edges, max_depth):
 
 
 def classify_asset_kind(spm_path):
-    """Classify the authored SK role from its established filename prefix."""
-    stem = Path(spm_path).stem.casefold() if spm_path else ""
+    """Classify by filename, then the exact owner of a Cluster child.
+
+    Generic parts such as ``SK_branch_elm_01`` omit the vegetation kind.  For
+    an immediate ``Cluster`` parent only, the owner folder one level above is
+    the established source of that kind.  Arbitrary ancestor walking is not
+    allowed because Bush/Weed assets share a physical ``Tree`` library root.
+    """
+    path = Path(spm_path) if spm_path else None
+    stem = path.stem.casefold() if path else ""
     if stem.startswith("sk_"):
         stem = stem[3:]
     for kind in ("tree", "bush", "weed"):
         if stem == kind or stem.startswith(kind + "_"):
             return kind
+    if path and path.parent.name.casefold() == "cluster":
+        owner = path.parent.parent.name.casefold()
+        for kind in ("tree", "bush", "weed"):
+            if owner == kind or owner.startswith(kind + "_"):
+                return kind
     return "other"
 
 

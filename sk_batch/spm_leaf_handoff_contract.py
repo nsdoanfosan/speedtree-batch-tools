@@ -674,6 +674,82 @@ def leaf_contract_user_message(contract):
     return True, "현재 내보내는 잎 재질 연결 정상"
 
 
+@functools.lru_cache(maxsize=512)
+def _mesh_file_references_cached(path_text, _size, _mtime_ns):
+    path = Path(path_text)
+    try:
+        root = _load_spm_root(path)
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "inspection_error",
+            "spm": str(path),
+            "error": str(exc),
+            "checked_references": 0,
+            "missing": [],
+        }
+
+    checked = 0
+    missing = []
+    for mesh in root.iter("Mesh"):
+        if mesh.attrib.get("ID") is None:
+            continue
+        # Embedded meshes carry their geometry inside the SPM; their Filename
+        # is provenance only and must not block the export.
+        embedded = str(mesh.findtext("Embedded") or "").strip().casefold() in {
+            "1", "true", "yes",
+        }
+        if embedded:
+            continue
+        filenames = [str(mesh.findtext("Filename") or "").strip()]
+        for lod_tag in ("Lod_1", "Lod_2"):
+            lod = mesh.find(lod_tag)
+            if lod is not None:
+                filenames.append(str(lod.findtext("Filename") or "").strip())
+        for filename in filenames:
+            if not filename:
+                continue
+            checked += 1
+            resolved = (
+                Path(filename)
+                if os.path.isabs(filename)
+                else path.parent / filename
+            )
+            if not resolved.is_file():
+                missing.append({
+                    "mesh_id": _integer(mesh.attrib.get("ID")),
+                    "mesh_name": str(mesh.attrib.get("Name") or ""),
+                    "filename": filename,
+                    "resolved_path": str(resolved),
+                })
+    return {
+        "status": "missing_mesh_files" if missing else "ok",
+        "spm": str(path),
+        "checked_references": checked,
+        "missing": missing,
+    }
+
+
+def inspect_spm_mesh_file_references(spm_path):
+    """Verify that every external mesh FBX the SPM references exists on disk.
+
+    Dead references (renamed or deleted leaf-plate meshes) stall the SpeedTree
+    CLI export until its timeout, so the preflight checks them before ever
+    launching SpeedTree.
+    """
+    path = Path(spm_path)
+    try:
+        path_text, size, mtime_ns = _file_key(path)
+    except OSError as exc:
+        return {
+            "status": "inspection_error",
+            "spm": str(path),
+            "error": str(exc),
+            "checked_references": 0,
+            "missing": [],
+        }
+    return copy.deepcopy(_mesh_file_references_cached(path_text, size, mtime_ns))
+
+
 def save_leaf_contract_cache():
     """Persist shared compact SPM metadata after a background status pass."""
     return save_spm_analysis_cache()
