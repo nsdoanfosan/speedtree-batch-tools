@@ -86,16 +86,186 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         )
         self.assertIn("7", app.status_var.set.call_args.args[0])
 
+    def test_cluster_blend_is_one_folder_relation_row_not_one_row_per_sk(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            owner = Path(r"D:\Trees\Tree_elm")
+            cluster = owner / "Cluster"
+            blend = cluster / "SK_branch_elm_01.blend"
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.root_var = tk.StringVar(root, value=str(owner))
+            app.tree = ttk.Treeview(
+                root,
+                columns=("role", "bases", "structure", "status", "last"),
+            )
+            app.item_meta = {}
+            app.signature_cache = OrderedDict()
+            app.analysis_cache = OrderedDict()
+            app.board = [{
+                "folder": str(owner),
+                "spms": ["SK_Tree_elm_01.spm", "SK_Tree_elm_02.spm"],
+                "manifest": {"version": 1, "groups": [], "independent": []},
+                "master_candidates": [],
+                "cluster_blends": [{
+                    "cluster_folder": str(cluster),
+                    "source_spm": str(cluster / "branch_elm_01.spm"),
+                    "blend": str(blend),
+                    "folder_relation": "partial",
+                    "owner_target_count": 2,
+                    "owner_on_count": 1,
+                    "targets": [
+                        {
+                            "owner_target": True,
+                            "target_spm": str(owner / "SK_Tree_elm_01.spm"),
+                            "relation_on": True,
+                            "status": "synced",
+                            "material": "M_branch_elm_01",
+                        },
+                        {
+                            "owner_target": True,
+                            "target_spm": str(owner / "SK_Tree_elm_02.spm"),
+                            "relation_on": False,
+                            "status": "off",
+                            "material": None,
+                        },
+                    ],
+                }],
+            }]
+
+            with mock.patch.object(GUI, "save_analysis_cache"):
+                app.render_board()
+
+            relations = [
+                (iid, row) for iid, row in app.item_meta.items()
+                if row.get("kind") == "cluster_relation"
+            ]
+            self.assertEqual(len(relations), 1)
+            iid, relation = relations[0]
+            self.assertEqual(relation["folder_relation"], "partial")
+            self.assertEqual(relation["target_count"], 2)
+            self.assertEqual(len(relation["target_spms"]), 2)
+            self.assertEqual(app.tree.set(iid, "role"), "PARTIAL")
+            self.assertEqual(app.tree.get_children(iid), ())
+        finally:
+            root.destroy()
+
+    def test_changed_cluster_source_is_shown_as_refresh_required(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            owner = Path(r"D:\Trees\Tree_elm")
+            cluster = owner / "Cluster"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            blend = cluster / "SK_branch_elm_01.blend"
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.root_var = tk.StringVar(root, value=str(owner))
+            app.tree = ttk.Treeview(
+                root,
+                columns=("role", "bases", "structure", "status", "last"),
+            )
+            app.item_meta = {}
+            app.signature_cache = OrderedDict()
+            app.analysis_cache = OrderedDict()
+            app.board = [{
+                "folder": str(owner),
+                "spms": ["SK_Tree_elm_01.spm"],
+                "manifest": {"version": 1, "groups": [], "independent": []},
+                "master_candidates": [],
+                "cluster_blends": [{
+                    "cluster_folder": str(cluster),
+                    "source_spm": str(canonical),
+                    "canonical_spm": str(canonical),
+                    "mirror_spm": str(cluster / "branch_elm_01.spm"),
+                    "blend": str(blend),
+                    "folder_relation": "on",
+                    "owner_target_count": 1,
+                    "owner_on_count": 1,
+                    "refresh_required_count": 1,
+                    "refresh_reasons": ["canonical_source_changed"],
+                    "targets": [{
+                        "owner_target": True,
+                        "target_spm": str(owner / "SK_Tree_elm_01.spm"),
+                        "relation_on": True,
+                        "status": "refresh_required",
+                        "material": "M_branch_elm_01",
+                    }],
+                }],
+            }]
+
+            with mock.patch.object(GUI, "save_analysis_cache"):
+                app.render_board()
+
+            iid, relation = next(
+                (iid, row) for iid, row in app.item_meta.items()
+                if row.get("kind") == "cluster_relation"
+            )
+            self.assertFalse(relation["all_synced"])
+            self.assertEqual(relation["refresh_required_count"], 1)
+            self.assertEqual(
+                app.tree.set(iid, "status"),
+                "Cluster 원본 변경 · 폴더 SK 1개 갱신 필요",
+            )
+        finally:
+            root.destroy()
+
+    def test_cluster_refresh_reapplies_only_current_on_targets(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        current = owner / "SK_Tree_elm_01.spm"
+        unrelated = owner / "SK_Tree_elm_02.spm"
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app.selected_cluster_relations = lambda: [{
+            "blend": blend,
+            "folder_relation": "partial",
+            "target_count": 2,
+            "on_target_spms": [current],
+            "target_spms": [current, unrelated],
+            "all_synced": False,
+        }]
+
+        def run_now(_label, work, done):
+            done(work(lambda *_args: None))
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.messagebox, "showinfo"
+        ), mock.patch.object(
+            GUI,
+            "run_cluster_relation_transaction",
+            return_value={"status": "ok", "mode": "sync"},
+        ) as refresh, mock.patch.object(
+            GUI, "run_cluster_folder_relation_transaction"
+        ) as normalize:
+            app.refresh_selected_cluster_relation()
+
+        refresh.assert_called_once_with(
+            blend,
+            [current],
+            enabled=True,
+            blender_exe=Path(r"C:\Blender\blender.exe"),
+        )
+        normalize.assert_not_called()
+
     def test_clipboard_rows_are_deduplicated_and_folder_rows_are_supported(self):
         rows = [
             {"kind": "spm", "folder": Path(r"D:\Trees"), "file": "a.spm"},
             {"kind": "spm", "folder": Path(r"D:\Trees"), "file": "a.spm"},
             {"kind": "folder", "folder": Path(r"D:\Trees\oak")},
         ]
-        values = GUI.clipboard_text_for_rows(rows).splitlines()
-        self.assertEqual(len(values), 2)
-        self.assertTrue(values[0].endswith(r"Trees\a.spm"))
-        self.assertTrue(values[1].endswith(r"Trees\oak"))
+        query = GUI.clipboard_text_for_rows(rows)
+        self.assertEqual(
+            query,
+            r'"D:\Trees\a.spm"|"D:\Trees\oak"',
+        )
 
     def test_background_job_shows_stage_percent_elapsed_and_completion(self):
         root = tk.Tk()

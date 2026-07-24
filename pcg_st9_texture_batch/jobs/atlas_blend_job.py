@@ -227,6 +227,11 @@ def main():
             raise RuntimeError("애드온 atlas_leaf_mesh_builder 활성화 실패 (Blender addons 설치 확인)")
 
         props = bpy.context.scene.atlas_leaf_builder
+        from atlas_leaf_mesh_builder.props import (
+            add_spm_target_item,
+            save_spm_target_registry,
+            sync_spm_target_registry,
+        )
         work_dir = args.work_dir or str(Path(args.blend_out).parent / "_atlas_job_work")
         Path(work_dir).mkdir(parents=True, exist_ok=True)
         props.output_dir = work_dir
@@ -252,14 +257,19 @@ def main():
         if mesh_count == 0:
             raise RuntimeError("사용할 잎 메시가 없음 (알파 아일랜드/기존 Collection 확인)")
 
-        props.speedtree_spm_items.clear()
+        if args.reuse_existing_blend:
+            from atlas_leaf_mesh_builder.target_registry import load_target_registry
+            if load_target_registry(blend_out) is not None:
+                sync_spm_target_registry(props, initialize_missing=False)
+        else:
+            props.speedtree_spm_items.clear()
         for spm in args.spm:
-            item = props.speedtree_spm_items.add()
-            item.path = spm
+            add_spm_target_item(props, spm)
 
         blend_out.parent.mkdir(parents=True, exist_ok=True)
         if not args.reuse_existing_blend:
             bpy.ops.wm.save_as_mainfile(filepath=str(blend_out))
+        save_spm_target_registry(props)
 
         spm_summary = None
         target_results = []

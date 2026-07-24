@@ -145,9 +145,33 @@ class PushQueueFlowTests(unittest.TestCase):
             self.assertIn("--spm", strings)
             self.assertIn("--material-contract", strings)
 
+        blender_job_strings = {
+            node.value
+            for node in ast.walk(gui_functions["_job_blender"])
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("--speedtree-spm", blender_job_strings)
+        self.assertIn("--canonical-spm", blender_job_strings)
+
+        bwr_source = (
+            SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("name_stem=speedtree_spm.stem", bwr_source)
+        self.assertIn("settings.name_stem = canonical_spm.stem", bwr_source)
+        self.assertNotIn("canonical_spm.name[3:]", bwr_source)
+        self.assertIn("export_collection_contract_issues()", bwr_source)
+        self.assertIn("orphan_owned_export_empty:", bwr_source)
+
         push_source = (
             SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
         ).read_text(encoding="utf-8")
+        self.assertIn("resolve_cluster_spm_pair(spm_path)", push_source)
+        sync_call = push_source.index("utilities.sync_unreal_mesh_folder_path()")
+        folder_read = push_source.index(
+            "folder = scene_props.unreal_mesh_folder_path", sync_call
+        )
+        self.assertLess(sync_call, folder_read)
+        self.assertIn("orphan_owned_export_empty:", push_source)
         push_tree = ast.parse(push_source)
         calls = [node for node in ast.walk(push_tree) if isinstance(node, ast.Call)]
 
@@ -409,6 +433,22 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_limited.assert_not_called()
         self.assertEqual(app.state[iid]["push_status_kind"], "imported_ok")
         self.assertIn("건너뜀", app.log.call_args.args[0])
+
+    def test_saved_preflight_skip_is_rechecked_against_current_handoff(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("branch_elm_01.spm")
+        iid = str(spm)
+        app.state[iid] = {
+            "push_status": "건너뜀: Blender 갱신 필요",
+            "push_status_kind": "preflight_skip",
+        }
+        app._handoff_ready = mock.Mock(return_value=(True, "준비됨 ✓"))
+
+        text = app._current_push_status_text(iid, spm)
+
+        self.assertEqual(text, "준비됨 ✓")
+        app._handoff_ready.assert_called_once_with(spm)
 
     def test_saved_push_completion_is_not_current_after_input_change(self):
         gui = load_gui_module()

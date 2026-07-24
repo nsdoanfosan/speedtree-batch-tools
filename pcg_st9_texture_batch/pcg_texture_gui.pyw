@@ -5,13 +5,14 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
 나무 폴더마다 "뭐가 되어 있고 뭐가 남았는지"를 한 화면에서 보여준다.
 
 단계 (표의 컬럼 순서 = 작업 순서):
-  ① 기존 SK SPM + M_ : 일반 식생은 SK_이름.spm 복사와 M_ 정리를 함께 한다.
-  ①-C Cluster M_만   : Cluster 원본 SPM 이름은 유지하고 M_만 정리한다.
+  ① SK SPM + M_      : 일반 식생과 Cluster 모두 SK 생성과 M_ 정리를 함께 한다.
   ② 잎 메시 (Blender) : 헤드리스 아틀라스 리프 제너레이터로 오파시티 없는 잎
                        지오메트리와 blend를 만들고, 선택 시 SK SPM에도 반영한다.
   ③ 텍스처 (Substance) : SBS에 원본을 연결해 6장
                        (color/normal/extra/height/opacity/subsurface)
                        익스포트하고, 필요하면 HBAO와 T_ 그래프도 만든다.
+  ④ Blend ↔ SPM 확인   : 실제 blend 파일과 현재/예정 SPM Generator 연결을
+                       별도 관리 정보로 감사한다.
 
 ①~③은 실행 전 확인창을 띄우며, SPM/SBS/기존 출력은 수정 전에 백업한다.
 """
@@ -32,6 +33,12 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
+from atlas_target_registry import (
+    TargetRegistryError,
+    load_target_registry,
+    save_target_registry,
+)
+from cluster_blend_sync import discover_cluster_blend_relations
 
 from pcg_texture_common import (
     TARGETS_PATH, load_config, load_pcg_targets, save_config,
@@ -39,7 +46,6 @@ from pcg_texture_common import (
 from pcg_texture_audit import (
     make_report,
     persist_cluster_assembly_receipts,
-    prepare_cluster_m_prefix,
     prepare_sk,
     register_blend_source_images,
     save_spm_analysis_cache,
@@ -76,6 +82,57 @@ TARGET_ROW_COLORS = {
     "target_level": "#FFF0D0",
     "target_both": "#E4F4E4",
 }
+
+
+def cluster_pair_step1_text(child):
+    """Render one exact Cluster pair state in user-facing Korean."""
+    target_status = dict(child.get("target_status") or {})
+    pair_status = child.get("pair_status") or "unknown"
+    pair_action = child.get("pair_action") or ""
+    pair_conflicts = list(child.get("pair_conflicts") or [])
+    if pair_conflicts:
+        text = f"⚠ Cluster pair 충돌 · {pair_status}"
+    elif target_status.get("status") == "material_name_conflict":
+        text = "⚠ Cluster M_ 이름 충돌 · 자동 처리 차단"
+    elif target_status.get("status") == "needs_sk":
+        text = "Output 이름 SK_ 정규화 필요"
+    elif target_status.get("status") == "needs_m_prefix":
+        text = "canonical SK의 M_ 이름 정리 필요"
+    elif pair_status == "current" and pair_action in {"", "none"}:
+        return "완료 ✓"
+    else:
+        text = f"Cluster pair {pair_status}"
+    if pair_action and pair_action != "none":
+        text += f" · {pair_action}"
+    return text
+
+
+def cluster_texture_status_text(child, output_paths, missing_output_paths):
+    """Prefer physical-capture completion over legacy raw map counts."""
+    if child.get("normalization_workflow_mode") == "PHYSICAL_DIRECT_CAPTURE":
+        missing_core = list(child.get("physical_capture_core_missing") or [])
+        missing_count = max(len(missing_output_paths), len(missing_core))
+        if missing_count:
+            return f"Blender 촬영 TGA 누락 {missing_count}장"
+        resolution = list(child.get("physical_capture_resolution") or [])
+        if len(resolution) == 2:
+            try:
+                width, height = (int(resolution[0]), int(resolution[1]))
+            except (TypeError, ValueError):
+                width = height = 0
+            if width > 0 and height > 0:
+                size = f"{width}²" if width == height else f"{width}×{height}"
+                return f"Blender 촬영 {size} · 완료 ✓"
+        return "Blender 촬영 완료 ✓"
+    if output_paths:
+        return (
+            f"Cluster 출력 TGA 연결 {len(output_paths)}장"
+            + (
+                f" · 누락 {len(missing_output_paths)}장"
+                if missing_output_paths else ""
+            )
+        )
+    return "Cluster 출력 TGA 연결 없음"
 
 
 def focus_data_asset_label(paths):
@@ -195,6 +252,58 @@ def spm_paths_for_item(item):
     if not paths and item.get("chosen_spm"):
         paths.append(item["chosen_spm"])
     return paths
+
+
+def spm_display_rows(item):
+    """Return the individual current/expected SPM rows shown under a folder."""
+
+    statuses = list(item.get("target_spm_statuses") or [])
+    if not statuses:
+        statuses = [
+            {
+                "mesh_name": Path(value).stem.removeprefix("SK_"),
+                "sk_spm": value if Path(value).name.lower().startswith("sk_") else None,
+                "source_spm": value if not Path(value).name.lower().startswith("sk_") else None,
+                "status": "ready" if Path(value).name.lower().startswith("sk_") else "needs_sk",
+            }
+            for value in spm_paths_for_item(item)
+        ]
+
+    labels = {
+        "ready": "완료 ✓",
+        "needs_sk": "Output 이름 SK_ 정규화 필요 → [① 실행]",
+        "needs_m_prefix": "M_ 이름 정리 필요 → [① 실행]",
+        "pair_conflict": "⚠ Output 이름 정규화 충돌 · 자동 처리 차단",
+        "material_name_conflict": "⚠ M_ 이름 충돌 · 자동 처리 차단",
+        "needs_source_review": "⚠ 원본 SPM 확인 필요",
+    }
+    rows = []
+    seen = set()
+    for status in statuses:
+        source = Path(status["source_spm"]) if status.get("source_spm") else None
+        current = Path(status["sk_spm"]) if status.get("sk_spm") else source
+        mesh_name = status.get("mesh_name") or (
+            current.stem.removeprefix("SK_") if current else "SPM"
+        )
+        if status.get("sk_spm"):
+            display = Path(status["sk_spm"])
+        elif source:
+            display = source.with_name(f"SK_{source.name}")
+        else:
+            display = Path(item.get("folder", "")) / f"SK_{mesh_name}.spm"
+        key = (str(item.get("folder", "")).casefold(), str(mesh_name).casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "mesh_name": mesh_name,
+            "display_spm": display,
+            "current_spm": current,
+            "source_spm": source,
+            "status": status,
+            "step1": labels.get(status.get("status"), status.get("status") or "-"),
+        })
+    return rows
 
 
 def checked_step3_spms(entries):
@@ -324,19 +433,41 @@ def cluster_hierarchy_rows(item):
             "role": source_row.get("assembly_role") or dependency.get("role") or "",
             "name": source_row.get("name") or Path(source).stem,
             "source": source,
+            "canonical_spm": source_row.get("authoring_spm") or source,
+            "mirror_spm": source_row.get("mirror_spm") or "",
+            "pair_status": source_row.get("pair_status") or "",
+            "pair_action": source_row.get("pair_action") or "",
+            "pair_conflicts": list(source_row.get("pair_conflicts") or []),
+            "target_status": source_row.get("target_status") or {},
             "materials": (
                 f"material {len(material_names)} · mesh {len(mesh_ids)}"
             ),
-            "textures": (
-                f"Cluster 출력 TGA 연결 {len(output_paths)}장"
-                + (
-                    f" · 누락 {len(missing_output_paths)}장"
-                    if missing_output_paths else ""
-                )
-                if output_paths else "Cluster 출력 TGA 연결 없음"
+            "textures": cluster_texture_status_text(
+                source_row,
+                output_paths,
+                missing_output_paths,
             ),
             "output_textures": output_paths,
             "missing_output_textures": missing_output_paths,
+            "normalization_workflow_mode": source_row.get(
+                "normalization_workflow_mode"
+            ) or "",
+            "direct_uv_source": source_row.get("direct_uv_source") or "",
+            "physical_capture_manifest": source_row.get(
+                "physical_capture_manifest"
+            ) or "",
+            "physical_capture_contract_sha256": source_row.get(
+                "physical_capture_contract_sha256"
+            ) or "",
+            "physical_capture_resolution": list(
+                source_row.get("physical_capture_resolution") or []
+            ),
+            "physical_capture_core_complete": bool(
+                source_row.get("physical_capture_core_complete")
+            ),
+            "physical_capture_core_missing": list(
+                source_row.get("physical_capture_core_missing") or []
+            ),
             "handoff": handoff,
             "referenced": referenced,
             "references": [],
@@ -344,39 +475,292 @@ def cluster_hierarchy_rows(item):
     return rows
 
 
-def cluster_m_step1_text(source_spm):
-    """Describe the Cluster-only M_ action without creating an SK SPM."""
-    preview = prepare_cluster_m_prefix(source_spm, dry_run=True)
-    count = len(preview.get("renames") or [])
-    if count:
-        return f"Cluster M_ 정리 {count}개 필요"
-    return "Cluster M_ 완료 ✓"
+def apply_target_registry_to_connection_row(row):
+    """Replace inferred targets with the exact JSON list when it exists."""
+    try:
+        registry = load_target_registry(row["blend"])
+    except TargetRegistryError as exc:
+        row["registry_error"] = str(exc)
+        return row
+    if registry is None:
+        return row
+
+    audited = row["spms_by_key"]
+    listed = {}
+    for raw_spm in registry["target_spms"]:
+        spm = Path(raw_spm).expanduser().absolute()
+        spm_key = os.path.normcase(str(spm)).casefold()
+        target = dict(audited.get(spm_key) or {
+            "spm": spm,
+            "connected": None,
+            "export_participating": row.get("export_participating", True),
+            "priority": -1,
+        })
+        target["spm"] = spm
+        target["listed_in_registry"] = True
+        target["exists"] = spm.is_file()
+        listed[spm_key] = target
+    row["spms_by_key"] = listed
+    row["registry_managed"] = True
+    row["registry_path"] = registry["registry_path"]
+    return row
 
 
-def selected_cluster_m_targets(selected_iids, row_copy_paths):
-    """Return exact non-SK Cluster SPMs selected in the hierarchy."""
-    targets = []
-    seen = set()
-    for iid in selected_iids:
-        for value in row_copy_paths.get(iid) or []:
-            source = Path(value)
-            key = os.path.normcase(os.path.abspath(str(source)))
-            if (
-                key in seen
-                or source.suffix.casefold() != ".spm"
-                or source.name.casefold().startswith("sk_")
-                or source.parent.name.casefold() != "cluster"
-            ):
-                continue
-            seen.add(key)
-            targets.append(source)
-    return targets
+def blender_connection_rows(item):
+    """Return concrete blend files and their audited final-SPM connections.
+
+    ``leaf_mesh_sources`` describes work/provenance while
+    ``leaf_atlas_inventory`` describes the current Generator state. Both can
+    mention the same blend, so current inventory has the final say for an
+    explicit per-SPM connection result.
+    """
+    rows_by_blend = {}
+    collections = (
+        (0, item.get("leaf_mesh_sources") or ()),
+        (1, item.get("leaf_atlas_inventory") or ()),
+    )
+    for priority, sources in collections:
+        for source in sources:
+            targets = list(source.get("targets") or ())
+            if not targets:
+                targets = [
+                    {"spm": spm}
+                    for spm in source.get("target_spms") or ()
+                    if spm
+                ]
+            source_active = bool(source.get("export_participating", True))
+            source_connected = source.get("generator_connection_complete")
+            for raw_blend in source.get("atlas_blends") or ():
+                if not raw_blend:
+                    continue
+                blend = Path(raw_blend).expanduser().absolute()
+                key = os.path.normcase(str(blend)).casefold()
+                row = rows_by_blend.setdefault(key, {
+                    "blend": blend,
+                    "spms_by_key": {},
+                    "export_participating": False,
+                    "active_priority": -1,
+                })
+                if priority > row["active_priority"]:
+                    row["export_participating"] = source_active
+                    row["active_priority"] = priority
+                elif priority == row["active_priority"]:
+                    row["export_participating"] = bool(
+                        row["export_participating"] or source_active
+                    )
+                for target in targets:
+                    raw_spm = target.get("spm")
+                    if not raw_spm:
+                        continue
+                    spm = Path(raw_spm).expanduser().absolute()
+                    spm_key = os.path.normcase(str(spm)).casefold()
+                    connected = target.get("generator_connection_complete")
+                    if connected is None:
+                        connected = source_connected
+                    if connected is not None:
+                        connected = bool(connected)
+                    existing = row["spms_by_key"].get(spm_key)
+                    if existing is None:
+                        row["spms_by_key"][spm_key] = {
+                            "spm": spm,
+                            "connected": connected,
+                            "export_participating": bool(
+                                target.get(
+                                    "export_participating", source_active
+                                )
+                            ),
+                            "priority": priority,
+                        }
+                    elif priority >= existing["priority"]:
+                        if connected is not None or existing["connected"] is None:
+                            existing["connected"] = connected
+                        existing["export_participating"] = bool(
+                            target.get("export_participating", source_active)
+                        )
+                        existing["priority"] = priority
+
+    # Cluster Normalizer outputs live beside their authoritative non-SK camera
+    # SPM in the owner's Cluster folder.  Unlike ordinary atlas provenance,
+    # every owner SK is a concrete ON/OFF candidate and must stay visible when
+    # it is OFF.  Generator Sync is the mutation owner; PCG reads the same JSON.
+    try:
+        cluster_blends = discover_cluster_blend_relations(item.get("folder") or "")
+    except Exception as exc:
+        cluster_blends = []
+        item["cluster_blend_scan_error"] = str(exc)
+    for cluster in cluster_blends:
+        blend = Path(cluster["blend"]).expanduser().absolute()
+        key = os.path.normcase(str(blend)).casefold()
+        row = rows_by_blend.setdefault(key, {
+            "blend": blend,
+            "spms_by_key": {},
+            "export_participating": True,
+            "active_priority": 2,
+        })
+        row.update({
+            "cluster_normalized": True,
+            "managed_by": "spm_generator_sync",
+            "source_spm": Path(cluster["source_spm"]),
+            "registry_managed": cluster.get("registry_managed", False),
+            "registry_path": str(cluster.get("registry_path") or ""),
+            "registry_error": cluster.get("registry_error"),
+            "folder_relation": cluster.get("folder_relation"),
+            "owner_target_count": cluster.get("owner_target_count", 0),
+            "owner_on_count": cluster.get("owner_on_count", 0),
+            "owner_off_count": cluster.get("owner_off_count", 0),
+            "export_participating": True,
+            "active_priority": 2,
+        })
+        row["spms_by_key"] = {}
+        for target in cluster.get("targets") or ():
+            spm = Path(target["target_spm"]).expanduser().absolute()
+            spm_key = os.path.normcase(str(spm)).casefold()
+            row["spms_by_key"][spm_key] = {
+                "spm": spm,
+                "connected": target.get("connected"),
+                "export_participating": bool(target.get("relation_on")),
+                "priority": 2,
+                "relation_on": bool(target.get("relation_on")),
+                "relation_status": target.get("status") or "unknown",
+                "material": target.get("material"),
+                "manifest": target.get("manifest"),
+                "listed_in_registry": bool(target.get("relation_on")),
+                "exists": bool(target.get("exists")),
+                "managed_by": "spm_generator_sync",
+            }
+
+    rows = []
+    for row in rows_by_blend.values():
+        if not row.get("cluster_normalized"):
+            apply_target_registry_to_connection_row(row)
+        spms = list(row.pop("spms_by_key").values())
+        row.pop("active_priority", None)
+        for target in spms:
+            target.pop("priority", None)
+        row["spms"] = sorted(
+            spms,
+            key=lambda target: (
+                target["spm"].name.casefold(), str(target["spm"]).casefold()
+            ),
+        )
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["blend"].name.casefold(), str(row["blend"]).casefold()
+        ),
+    )
 
 
-def blender_helper_copy_paths(item):
-    """Return only the vegetation folder for the path-copy helper row."""
-    folder = item.get("folder")
-    return [folder] if folder else []
+def blender_connection_summary(row):
+    """Return a compact connection summary for one concrete blend file."""
+    targets = row.get("spms") or ()
+    prefix = "비활성 기록 · " if not row.get("export_participating", True) else ""
+    if row.get("registry_error"):
+        return prefix + "대상 JSON 오류"
+    if not targets:
+        return prefix + "연결 SPM 없음"
+    if row.get("cluster_normalized"):
+        on_count = sum(bool(target.get("relation_on")) for target in targets)
+        off_count = len(targets) - on_count
+        folder_relation = row.get("folder_relation")
+        if folder_relation == "partial":
+            return (
+                f"관계 PARTIAL {on_count}/{len(targets)} · "
+                "Generator Sync에서 ON/OFF 정규화 필요"
+            )
+        if folder_relation == "off":
+            return f"관계 OFF · 폴더 SK {len(targets)}개"
+        pending = sum(
+            target.get("relation_on")
+            and target.get("relation_status") not in {"synced"}
+            for target in targets
+        )
+        summary = f"관계 ON {on_count} · OFF {off_count}"
+        if pending:
+            summary += f" · 동기화 필요 {pending}개"
+        elif on_count:
+            summary += " · 메시 교체 완료 ✓"
+        return summary
+    pending = sum(target.get("connected") is False for target in targets)
+    unknown = sum(target.get("connected") is None for target in targets)
+    missing = sum(target.get("exists") is False for target in targets)
+    summary = f"연결 SPM {len(targets)}개"
+    if pending:
+        summary += f" · 점검 필요 {pending}개"
+    if unknown:
+        summary += f" · 상태 미확인 {unknown}개"
+    if missing:
+        summary += f" · 파일 없음 {missing}개"
+    if not pending and not unknown:
+        summary += " · 연결 완료 ✓"
+    return prefix + summary
+
+
+def blender_connection_overview(item):
+    """Summarize active blend/SPM connections for the fourth board column."""
+    rows = blender_connection_rows(item)
+    if not rows:
+        return "blend 없음"
+    active = [row for row in rows if row.get("export_participating", True)]
+    inactive_count = len(rows) - len(active)
+    pending = sum(
+        target.get("connected") is False
+        and target.get("relation_on", True)
+        for row in active for target in row.get("spms") or ()
+    )
+    unknown = sum(
+        target.get("connected") is None
+        and target.get("relation_on", True)
+        for row in active for target in row.get("spms") or ()
+    )
+    missing = sum(
+        target.get("exists") is False
+        for row in active for target in row.get("spms") or ()
+    )
+    registry_errors = sum(bool(row.get("registry_error")) for row in active)
+    partial_relations = sum(
+        bool(
+            row.get("cluster_normalized")
+            and row.get("folder_relation") == "partial"
+        )
+        for row in active
+    )
+    unlinked = sum(not row.get("spms") for row in active)
+    parts = [f"blend {len(rows)}개"]
+    relation_off = sum(
+        bool(
+            row.get("cluster_normalized")
+            and row.get("folder_relation") == "off"
+        )
+        for row in active
+    ) + sum(
+        target.get("relation_on") is False
+        for row in active if not row.get("cluster_normalized")
+        for target in row.get("spms") or ()
+    )
+    if not active:
+        parts.append("활성 연결 없음")
+    elif pending or unknown or unlinked or missing or registry_errors or partial_relations:
+        if pending:
+            parts.append(f"점검 {pending}개")
+        if unknown:
+            parts.append(f"미확인 {unknown}개")
+        if unlinked:
+            parts.append(f"SPM 없음 {unlinked}개")
+        if missing:
+            parts.append(f"파일 없음 {missing}개")
+        if registry_errors:
+            parts.append(f"JSON 오류 {registry_errors}개")
+        if partial_relations:
+            parts.append(f"부분 연결 {partial_relations}개")
+    else:
+        parts.append("연결 완료 ✓")
+    if inactive_count:
+        parts.append(f"비활성 {inactive_count}개")
+    if relation_off:
+        parts.append(f"관계 OFF {relation_off}개")
+    return " · ".join(parts)
 
 
 def leaf_target_material_names(target):
@@ -549,6 +933,8 @@ BLOCKER_TEXT = {
     "duplicate": "같은 이름이 다른 폴더에도 매칭됨 — 어느 폴더가 진짜인지 먼저 확인",
     "source_review": "이 폴더에서 원본 SPM을 못 찾음 — 파일 이름을 직접 확인 필요",
     "generic_only": "남은 작업이 'Material 2' 같은 기본 이름뿐 — SpeedTree에서 이름 지은 뒤 다시 ① 실행",
+    "pair_conflict": "Cluster output 이름을 canonical SK 규격으로 정규화할 수 없어 중단",
+    "material_name_conflict": "Cluster M_ 정리 결과가 기존 재료 이름과 겹침 — 중복 이름을 만들지 않고 중단",
 }
 
 
@@ -638,8 +1024,12 @@ class App:
         self.cfg = load_config()
         self.report = None
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
+        self.target_items = {}  # iid(SPM) -> exact per-mesh ① target
         self.row_copy_paths = {}  # every visible iid -> exact copied paths
+        self.blend_connection_meta = {}
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
+        self.target_checked_rows = CheckedRowController(
+            self.target_items, self._redraw_target_checked_row)
         self.texplan_cache = {}  # folder -> texture plan rows (선택 시 지연 계산)
         self.texplan_errors = {}  # folder -> explicit execution blocker
         self.sync_state = {"entries": {}}
@@ -743,7 +1133,7 @@ class App:
 
         actions = ttk.Frame(self.root, padding=6)
         actions.pack(fill="x")
-        self.btn_prepare = ttk.Button(actions, text="① 기존 식생 — SK 만들기 + M_ 이름 붙이기 (체크 행)",
+        self.btn_prepare = ttk.Button(actions, text="① 식생 — SK 만들기 + M_ 이름 붙이기 (체크 행)",
                                       command=self.start_prepare)
         self.btn_prepare.pack(side="left")
         Tooltip(self.btn_prepare, "체크된 행 중 ①이 필요한 항목에만:\n"
@@ -751,20 +1141,9 @@ class App:
                                   "· 머티리얼 이름 앞에 M_ 을 붙임 (send2ue 임포트 규칙 때문)\n"
                                   "수정 전 원본은 각 폴더의 _spm_backups\\ 에 백업됩니다.\n"
                                   "문제가 있는 항목(중복 매칭·원본 불명·기본 이름 머티리얼)은\n"
-                                  "자동으로 건너뛰고 표와 로그에 이유를 표시합니다.")
-        self.btn_cluster_m = ttk.Button(
-            actions,
-            text="①-C 실행 — Cluster M_만 정리 (선택 자식)",
-            command=self.start_cluster_m_prefix,
-        )
-        self.btn_cluster_m.pack(side="left", padx=(6, 0))
-        Tooltip(
-            self.btn_cluster_m,
-            "선택한 Cluster 자식 SPM의 머티리얼 이름에만 M_ 규격을 적용합니다.\n"
-            "SK_*.spm은 만들지 않으며 원본 SPM 파일명과 판용 TGA basename을 유지합니다.\n"
-            "수정 전에 Cluster\\_spm_backups\\에 정확한 백업을 남깁니다.\n"
-            "Blender 산출물 이름은 SK_<원본명>.blend입니다.",
-        )
+                                  "자동으로 건너뛰고 표와 로그에 이유를 표시합니다.\n"
+                                  "Cluster는 최초 raw→SK 생성 후 canonical SK만 수정하고,\n"
+                                  "완료된 SK를 원래 이름의 raw 출력 SPM으로 단방향 게시합니다.")
         self.force_var = tk.BooleanVar(value=False)
         self.chk_force = ttk.Checkbutton(
             actions, text="⚠ 문제 표시된 항목도 적용", variable=self.force_var
@@ -785,7 +1164,7 @@ class App:
         Tooltip(
             btn_copy,
             "나무/식생 행은 SPM, Cluster는 폴더, Cluster 자식은 해당 SPM, "
-            "Blender는 식생 폴더 경로만 복사합니다.",
+            "blend 파일 행은 실제 .blend, 그 자식은 연결 대상 SPM을 복사합니다.",
         )
         self.status_var = tk.StringVar(value="대기")
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
@@ -848,22 +1227,61 @@ class App:
             "SPM 연결 정리는 실행하지 않습니다.\n"
             "기존 출력은 일반 ③ 실행과 같이 안전하게 백업합니다.",
         )
-        cols = ("pcg", "step1", "step2", "step3", "next")
+        registry_actions = ttk.Frame(self.root, padding=(6, 0, 6, 6))
+        registry_actions.pack(fill="x")
+        ttk.Label(registry_actions, text="④ Atlas 대상 JSON:").pack(side="left")
+        self.btn_add_target = ttk.Button(
+            registry_actions,
+            text="선택 blend에 SPM 추가",
+            command=self.add_blend_target_spm,
+        )
+        self.btn_add_target.pack(side="left", padx=(6, 4))
+        Tooltip(
+            self.btn_add_target,
+            "표의 ◆ blend 행이나 그 자식 SPM을 선택한 뒤 대상 .spm을 추가합니다.\n"
+            "목록은 blend 옆 .atlas_leaf_targets.json에 저장되어 Blender 애드온과 공유됩니다.",
+        )
+        self.btn_remove_target = ttk.Button(
+            registry_actions,
+            text="선택 SPM 제거",
+            command=self.remove_blend_target_spms,
+        )
+        self.btn_remove_target.pack(side="left")
+        Tooltip(
+            self.btn_remove_target,
+            "◆ blend 아래에서 선택한 SPM만 대상 JSON 목록에서 제거합니다.\n"
+            "원래 Generator 슬롯을 복원하고 해당 Atlas scope 자산을 SPM에서 정리한 뒤 목록에서 제거합니다.\n"
+            "SPM은 먼저 _spm_backups에 백업하며 실제 .spm 파일 자체는 삭제하지 않습니다.",
+        )
+        cols = ("pcg", "step1", "step2", "step3", "step4", "next")
         self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=16)
-        self.tree.heading("#0", text="식생 폴더 (첫 클릭=이 행만 활성 · Ctrl+C=선택 경로)")
-        self.tree.column("#0", width=250, anchor="w")
+        self.tree.heading("#0", text="식생 폴더 / SPM (첫 클릭=이 행만 활성 · Ctrl+C=선택 경로)")
+        self.tree.column("#0", width=285, anchor="w")
         headers = {
-            "pcg": ("PCG/레벨 사용", 145),
-            "step1": ("① 기존 SK+M_ / Cluster M_만", 300),
-            "step2": ("② 잎 메시 (Blender)", 150),
-            "step3": ("③ 텍스처 (Substance)", 180),
-            "next": ("다음 할 일", 300),
+            "pcg": ("PCG/레벨 사용", 120),
+            "step1": ("① SK_ + M_ 정규화", 250),
+            "step2": ("② 잎 메시 (Blender)", 140),
+            "step3": ("③ 텍스처 (Substance)", 160),
+            "step4": ("④ Blend ↔ SPM 확인", 190),
+            "next": ("다음 할 일", 220),
         }
         for key, (label, width) in headers.items():
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w")
         for tag, color in TARGET_ROW_COLORS.items():
             self.tree.tag_configure(tag, background=color)
+        self.tree.tag_configure("target_spm_ready", background="#f4faf4")
+        self.tree.tag_configure(
+            "target_spm_attention", background="#fff7d6", foreground="#6f4b00"
+        )
+        self.tree.tag_configure(
+            "blender_file", background="#e9eff5", font=("Segoe UI", 9, "bold")
+        )
+        self.tree.tag_configure("blender_spm", background="#f7f9fb")
+        self.tree.tag_configure(
+            "blender_attention", background="#fff0c2", foreground="#7a4700"
+        )
+        self.tree.tag_configure("blender_inactive", foreground="#777777")
         self.tree.pack(fill="both", expand=True, padx=6, pady=(0, 2))
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Control-c>", self.copy_selected_paths, add="+")
@@ -872,7 +1290,8 @@ class App:
                       "PCG/레벨 사용: 각 위치에서 사용하는 메시 이름 개수\n"
                       "①: SK SPM 존재 + 머티리얼 M_ 이름 (이 도구가 자동 처리)\n"
                       "②: 잎 지오메트리 blend — 헤드리스 Blender 자동 생성\n"
-                      "③: 사용 머티리얼별 T_ 텍스처 6장 — sbsrender 자동 생성")
+                      "③: 사용 머티리얼별 T_ 텍스처 6장 — sbsrender 자동 생성\n"
+                      "④: 실제 blend 파일과 연결 대상 SPM 감사 — 펼쳐서 상세 확인")
         Tooltip(self.tree, header_tip, wrap=460)
 
         details = ttk.LabelFrame(self.root, text="선택한 폴더의 할 일 (위 표에서 행을 클릭)", padding=4)
@@ -907,18 +1326,74 @@ class App:
         if getattr(self, "_busy", False):
             return
         self.checked_rows.set_all(checked)
+        target_rows = getattr(self, "target_checked_rows", None)
+        if target_rows is not None:
+            target_rows.set_all(checked)
+        self._sync_folder_checks_from_targets()
         self._update_step3_button()
 
     def _redraw_checked_row(self, iid, entry):
         mark = CHECK_ON if entry["checked"] else CHECK_OFF
-        self.tree.item(iid, text=f"{mark} {entry['item']['name']}")
+        targets = [
+            row for row in getattr(self, "target_items", {}).values()
+            if row.get("folder_iid") == iid
+        ]
+        suffix = ""
+        if targets:
+            selected = sum(bool(row.get("checked")) for row in targets)
+            suffix = f" · SPM {selected}/{len(targets)}"
+        self.tree.item(iid, text=f"{mark} {entry['item']['name']}{suffix}")
+
+    def _redraw_target_checked_row(self, iid, entry):
+        mark = CHECK_ON if entry["checked"] else CHECK_OFF
+        self.tree.item(iid, text=f"{mark} {entry['display_name']}")
+
+    def _sync_target_checks_from_folders(self):
+        for iid, entry in getattr(self, "target_items", {}).items():
+            parent = self.items.get(entry["folder_iid"])
+            entry["checked"] = bool(parent and parent.get("checked"))
+            self._redraw_target_checked_row(iid, entry)
+        controller = getattr(self, "target_checked_rows", None)
+        if controller is not None:
+            controller.sync_after_reload()
+        for iid, entry in self.items.items():
+            self._redraw_checked_row(iid, entry)
+
+    def _sync_folder_checks_from_targets(self):
+        target_items = getattr(self, "target_items", {})
+        if not target_items:
+            return
+        for iid, entry in self.items.items():
+            children = [
+                row for row in target_items.values()
+                if row.get("folder_iid") == iid
+            ]
+            if children:
+                entry["checked"] = any(row.get("checked") for row in children)
+            self._redraw_checked_row(iid, entry)
+        self.checked_rows.armed = False
 
     def _on_click(self, event):
         if getattr(self, "_busy", False):
+            # Freeze checked execution targets, but keep read-only row
+            # selection available for details and path copying.
+            iid = self.tree.identify_row(event.y)
+            if iid in self.row_copy_paths:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.focus_set()
             return "break"
         if self.tree.identify_region(event.x, event.y) != "tree":
             return
         iid = self.tree.identify_row(event.y)
+        if iid in getattr(self, "target_items", {}):
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.focus_set()
+            self.target_checked_rows.click(iid)
+            self._sync_folder_checks_from_targets()
+            self._update_step3_button()
+            return "break"
         if iid not in self.items and iid in self.row_copy_paths:
             identify_element = getattr(self.tree, "identify_element", None)
             if identify_element and identify_element(event.x, event.y) == "Treeitem.indicator":
@@ -930,9 +1405,14 @@ class App:
             self.tree.focus(iid)
             self.tree.focus_set()
             self.checked_rows.set_all(False)
+            target_rows = getattr(self, "target_checked_rows", None)
+            if target_rows is not None:
+                target_rows.set_all(False)
+                self._sync_folder_checks_from_targets()
             self._update_step3_button()
             return "break"
         self.checked_rows.click(iid)
+        self._sync_target_checks_from_folders()
         self._update_step3_button()
 
     def copy_selected_paths(self, _event=None):
@@ -947,6 +1427,194 @@ class App:
         else:
             self.status_var.set("복사할 경로가 있는 행을 먼저 클릭하세요")
         return "break"
+
+    def _selected_blend_connection_rows(self):
+        return [
+            self.blend_connection_meta[iid]
+            for iid in self.tree.selection()
+            if iid in self.blend_connection_meta
+        ]
+
+    def _current_targets_for_blend(self, blend):
+        registry = load_target_registry(blend)
+        if registry is not None:
+            return [Path(value) for value in registry["target_spms"]]
+        targets = []
+        seen = set()
+        blend_key = os.path.normcase(str(Path(blend).absolute())).casefold()
+        for meta in self.blend_connection_meta.values():
+            if meta.get("spm") is None:
+                continue
+            if os.path.normcase(str(Path(meta["blend"]).absolute())).casefold() != blend_key:
+                continue
+            spm = Path(meta["spm"]).absolute()
+            key = os.path.normcase(str(spm)).casefold()
+            if key not in seen:
+                seen.add(key)
+                targets.append(spm)
+        return targets
+
+    def add_blend_target_spm(self):
+        rows = self._selected_blend_connection_rows()
+        if any(row.get("managed_by") == "spm_generator_sync" for row in rows):
+            messagebox.showinfo(
+                "Cluster 관계",
+                "SpeedTree Cluster Normalizer blend의 ON/OFF와 실제 메시 동기화는 "
+                "SPM Generator Sync에서 관리합니다.",
+                parent=self.root,
+            )
+            return
+        blends = {
+            os.path.normcase(str(Path(row["blend"]).absolute())).casefold():
+                Path(row["blend"]).absolute()
+            for row in rows
+        }
+        if len(blends) != 1:
+            messagebox.showinfo(
+                "대상 SPM 추가",
+                "④ 아래의 ◆ blend 행 또는 그 자식 SPM 한 묶음을 선택하세요.",
+                parent=self.root,
+            )
+            return
+        blend = next(iter(blends.values()))
+        selected = filedialog.askopenfilename(
+            title=f"{blend.name} 대상 SPM 추가",
+            initialdir=str(blend.parent),
+            filetypes=(("SpeedTree SPM", "*.spm"), ("모든 파일", "*.*")),
+            parent=self.root,
+        )
+        if not selected:
+            return
+        try:
+            targets = self._current_targets_for_blend(blend)
+            selected_path = Path(selected).absolute()
+            keys = {
+                os.path.normcase(str(path.absolute())).casefold()
+                for path in targets
+            }
+            selected_key = os.path.normcase(str(selected_path)).casefold()
+            if selected_key not in keys:
+                targets.append(selected_path)
+            payload = save_target_registry(blend, targets)
+        except (OSError, TargetRegistryError) as exc:
+            messagebox.showerror("대상 SPM 추가 실패", str(exc), parent=self.root)
+            return
+        self.populate()
+        self.status_var.set(f"Atlas 대상 추가 · {selected_path.name} · 총 {len(payload['target_spms'])}개")
+        self.log(f"Atlas 대상 JSON 추가: {blend.name} → {selected_path}")
+
+    def remove_blend_target_spms(self):
+        rows = [row for row in self._selected_blend_connection_rows() if row.get("spm")]
+        if any(row.get("managed_by") == "spm_generator_sync" for row in rows):
+            messagebox.showinfo(
+                "Cluster 관계",
+                "SpeedTree Cluster Normalizer blend의 ON/OFF와 원본 메시 복원은 "
+                "SPM Generator Sync에서 관리합니다.",
+                parent=self.root,
+            )
+            return
+        blends = {
+            os.path.normcase(str(Path(row["blend"]).absolute())).casefold():
+                Path(row["blend"]).absolute()
+            for row in rows
+        }
+        if not rows or len(blends) != 1:
+            messagebox.showinfo(
+                "대상 SPM 제거",
+                "④에서 ◆ blend 아래의 제거할 SPM 행을 선택하세요.",
+                parent=self.root,
+            )
+            return
+        blend = next(iter(blends.values()))
+        remove_paths = [Path(row["spm"]).absolute() for row in rows]
+        preview = "\n".join(f"• {path}" for path in remove_paths)
+        if not messagebox.askyesno(
+            "대상 SPM 제거",
+            f"{blend.name}의 대상 JSON 목록에서 다음 {len(remove_paths)}개를 제거합니다.\n"
+            "실제 SPM 파일은 삭제하지 않습니다.\n\n"
+            f"{preview}",
+            parent=self.root,
+        ):
+            return
+        if getattr(self, "_busy", False):
+            return
+        self._set_busy(True)
+        self.status_var.set(f"Atlas 대상 해제 중 · {len(remove_paths)}개")
+        self.worker = threading.Thread(
+            target=self._run_remove_blend_target_spms,
+            args=(blend, remove_paths),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def handle_delete_key(self):
+        """Use Delete as target unlink for Atlas SPM child rows."""
+        rows = [
+            row for row in self._selected_blend_connection_rows()
+            if row.get("spm")
+        ]
+        if not rows:
+            return False
+        self.remove_blend_target_spms()
+        return True
+
+    def _run_remove_blend_target_spms(self, blend, remove_paths):
+        report_path = TOOL_DIR / f".atlas_target_remove_{os.getpid()}_{threading.get_ident()}.json"
+        command = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
+            "--python", str(TOOL_DIR / "jobs" / "atlas_target_remove_job.py"), "--",
+            "--blend", str(blend),
+            "--report", str(report_path),
+        ]
+        for path in remove_paths:
+            command.extend(["--spm", str(path)])
+        data = None
+        error = None
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.cfg.get("atlas_job_timeout", 1800),
+                creationflags=0x08000000,
+            )
+            if report_path.is_file():
+                data = json.loads(report_path.read_text(encoding="utf-8"))
+            if result.returncode != 0 or not data or data.get("status") != "ok":
+                detail = (data or {}).get("error") or (result.stderr or result.stdout)[-1200:]
+                raise RuntimeError(detail or "Atlas 대상 해제 작업이 실패했습니다")
+        except Exception as exc:
+            error = exc
+        finally:
+            try:
+                report_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._ui(
+            lambda result=data, failure=error, source=blend, paths=remove_paths:
+                self._remove_blend_targets_done(source, paths, result, failure)
+        )
+
+    def _remove_blend_targets_done(self, blend, remove_paths, data, error):
+        self.worker = None
+        self._set_busy(False)
+        if error is not None:
+            messagebox.showerror("대상 SPM 해제 실패", str(error), parent=self.root)
+            self.status_var.set("Atlas 대상 해제 실패 · JSON/SPM 복원됨")
+            self.log(f"Atlas 대상 해제 실패: {blend.name} · {error}")
+            return
+        self.populate()
+        remaining = len((data or {}).get("remaining_target_spms") or [])
+        cleaned = sum(
+            row.get("status") in {"cleaned", "already_clean"}
+            for row in (data or {}).get("results") or []
+        )
+        self.status_var.set(
+            f"Atlas 대상 해제 완료 · {len(remove_paths)}개 · SPM 정리 {cleaned}개 · 남음 {remaining}개"
+        )
+        self.log(
+            f"Atlas 대상 해제: {blend.name} → "
+            + ", ".join(path.name for path in remove_paths)
+        )
 
     # ------------------------------------------------------------------ scan
     def _start_initial_refresh(self):
@@ -1244,31 +1912,107 @@ class App:
 
     def populate(self):
         old_checked = {iid: e["checked"] for iid, e in self.items.items()}
+        old_target_checked = {
+            entry.get("selection_key"): entry.get("checked", False)
+            for entry in getattr(self, "target_items", {}).values()
+            if entry.get("selection_key")
+        }
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
+        if not hasattr(self, "target_items"):
+            self.target_items = {}
+        else:
+            self.target_items.clear()
+        if not hasattr(self, "target_checked_rows"):
+            self.target_checked_rows = CheckedRowController(
+                self.target_items, self._redraw_target_checked_row)
         self.row_copy_paths.clear()
+        if not hasattr(self, "blend_connection_meta"):
+            self.blend_connection_meta = {}
+        else:
+            self.blend_connection_meta.clear()
         for item in self.report["items"]:
             self._annotate_unreal_sync(item)
             iid = item["folder"]
-            checked = old_checked.get(iid, True)
+            folder_default = old_checked.get(iid, True)
+            target_rows = []
+            for target_index, target in enumerate(spm_display_rows(item)):
+                selection_key = (
+                    str(item["folder"]).casefold(),
+                    str(target["mesh_name"]).casefold(),
+                )
+                target_rows.append({
+                    **target,
+                    "iid": f"{iid}::target::{target_index}",
+                    "selection_key": selection_key,
+                    "checked": old_target_checked.get(
+                        selection_key, folder_default),
+                })
+            checked = (
+                any(row["checked"] for row in target_rows)
+                if target_rows else folder_default
+            )
             self.items[iid] = {"item": item, "checked": checked}
             self.row_copy_paths[iid] = spm_paths_for_item(item)
             mark = CHECK_ON if checked else CHECK_OFF
             row_tag = self._target_row_tag(item)
+            target_suffix = ""
+            if target_rows:
+                selected_count = sum(row["checked"] for row in target_rows)
+                target_suffix = f" · SPM {selected_count}/{len(target_rows)}"
             self.tree.insert(
                 "", "end", iid=iid,
-                text=f"{mark} {item['name']}",
+                text=f"{mark} {item['name']}{target_suffix}",
                 values=(
                     self._target_source_text(item),
                     self.step1_text(item),
                     self.step2_text(item),
                     self.step3_text(item),
+                    blender_connection_overview(item),
                     item["actions"][0] if item["actions"] else "없음 — 준비 끝 ✓",
                 ),
                 tags=(row_tag,) if row_tag else (),
                 open=True,
             )
+            for target in target_rows:
+                target_iid = target["iid"]
+                target_mark = CHECK_ON if target["checked"] else CHECK_OFF
+                display_name = target["display_spm"].name
+                source_name = (
+                    target["source_spm"].name
+                    if target.get("source_spm") else ""
+                )
+                current_path = target.get("current_spm")
+                self.target_items[target_iid] = {
+                    "item": item,
+                    "folder_iid": iid,
+                    "mesh": target["mesh_name"],
+                    "target_status": target["status"],
+                    "display_name": display_name,
+                    "selection_key": target["selection_key"],
+                    "checked": target["checked"],
+                }
+                self.tree.insert(
+                    iid, "end", iid=target_iid,
+                    text=f"{target_mark} {display_name}",
+                    values=(
+                        target["mesh_name"],
+                        target["step1"],
+                        "폴더 공유",
+                        "폴더 공유",
+                        "",
+                        f"원본 {source_name}" if source_name else "",
+                    ),
+                    tags=(
+                        "target_spm_ready"
+                        if target["status"].get("status") == "ready"
+                        else "target_spm_attention",
+                    ),
+                )
+                self.row_copy_paths[target_iid] = (
+                    [current_path] if current_path else []
+                )
             hierarchy_rows = cluster_hierarchy_rows(item)
             if hierarchy_rows:
                 cluster = hierarchy_rows[0]
@@ -1276,45 +2020,148 @@ class App:
                 self.tree.insert(
                     iid, "end", iid=cluster_iid,
                     text=cluster["name"],
-                    values=("", "실제 Cluster 파일", "", "", cluster["handoff"]),
+                    values=(
+                        "", "실제 Cluster 파일", "", "", "", cluster["handoff"]
+                    ),
                     open=True,
                 )
                 self.row_copy_paths[cluster_iid] = [cluster["source"]]
                 for child_index, child in enumerate(hierarchy_rows[1:]):
                     role_iid = f"{cluster_iid}::spm::{child_index}"
-                    source_name = Path(child["source"]).name if child["source"] else ""
-                    self.row_copy_paths[role_iid] = [child["source"]]
-                    try:
-                        m_note = cluster_m_step1_text(child["source"])
-                    except Exception as exc:
-                        m_note = f"⚠ Cluster M_ 검사 실패: {exc}"
-                    step1_note = (
-                        f"{m_note} · SPM 이름 유지 · "
-                        f"Blend → SK_{Path(child['source']).stem}.blend"
+                    canonical = Path(
+                        child.get("canonical_spm") or child["source"]
                     )
+                    mirror = Path(
+                        child.get("mirror_spm")
+                        or canonical.with_name(canonical.name[3:])
+                    )
+                    target_status = dict(child.get("target_status") or {})
+                    step1_note = cluster_pair_step1_text(child)
+                    selection_key = (
+                        "cluster",
+                        str(canonical).casefold(),
+                    )
+                    checked = old_target_checked.get(
+                        selection_key, folder_default)
+                    self.target_items[role_iid] = {
+                        "item": {
+                            "folder": str(canonical.parent),
+                            "name": mirror.stem,
+                            "duplicate_target_mesh_names": [],
+                            "duplicate_pcg_target_mesh_names": [],
+                            "target_spm_statuses": [target_status],
+                        },
+                        "folder_iid": iid,
+                        "mesh": mirror.stem,
+                        "target_status": target_status,
+                        "display_name": canonical.name,
+                        "selection_key": selection_key,
+                        "checked": checked,
+                    }
+                    self.row_copy_paths[role_iid] = [
+                        canonical if canonical.is_file() else mirror
+                    ]
                     assembly_evidence = (
                         f" · {child['materials']}"
                         if child.get("role") and child.get("materials") else ""
                     )
+                    target_mark = CHECK_ON if checked else CHECK_OFF
                     self.tree.insert(
                         cluster_iid, "end", iid=role_iid,
-                        text=child["name"],
+                        text=f"{target_mark} {canonical.name}",
                         values=(
-                            "",
-                            f"{source_name} · {step1_note}",
+                            mirror.stem,
+                            step1_note,
                             "—",
                             child["textures"],
+                            "",
                             child["handoff"] + assembly_evidence,
                         ),
                     )
-            blender_iid = f"{iid}::blender"
-            self.tree.insert(
-                iid, "end", iid=blender_iid,
-                text="Blender",
-                values=("", "", "", "", "복사 전용 · 식생 폴더 경로"),
-            )
-            self.row_copy_paths[blender_iid] = blender_helper_copy_paths(item)
+            for blend_index, blend_row in enumerate(
+                    blender_connection_rows(item)):
+                blend_iid = f"{iid}::blend::{blend_index}"
+                summary = blender_connection_summary(blend_row)
+                needs_attention = any(
+                    target.get("connected") is not True
+                    and target.get("relation_on", True)
+                    for target in blend_row["spms"]
+                ) or not blend_row["spms"]
+                if not blend_row["export_participating"]:
+                    blend_tag = "blender_inactive"
+                elif needs_attention:
+                    blend_tag = "blender_attention"
+                else:
+                    blend_tag = "blender_file"
+                self.tree.insert(
+                    iid, "end", iid=blend_iid,
+                    text=f"◆ {blend_row['blend'].name}",
+                    values=("", "", "", "", summary, ""),
+                    tags=(blend_tag,),
+                    open=False,
+                )
+                self.row_copy_paths[blend_iid] = [blend_row["blend"]]
+                self.blend_connection_meta[blend_iid] = {
+                    "blend": blend_row["blend"], "spm": None,
+                    "managed_by": blend_row.get("managed_by"),
+                    "cluster_normalized": bool(blend_row.get("cluster_normalized")),
+                }
+                if not blend_row["spms"]:
+                    empty_iid = f"{blend_iid}::spm::none"
+                    self.tree.insert(
+                        blend_iid, "end", iid=empty_iid,
+                        text="↳ 연결 SPM 없음",
+                        values=("", "", "", "", "관리 확인 필요", ""),
+                        tags=("blender_attention",),
+                    )
+                    self.row_copy_paths[empty_iid] = []
+                    self.blend_connection_meta[empty_iid] = {
+                        "blend": blend_row["blend"], "spm": None,
+                        "managed_by": blend_row.get("managed_by"),
+                        "cluster_normalized": bool(blend_row.get("cluster_normalized")),
+                    }
+                for spm_index, target in enumerate(blend_row["spms"]):
+                    spm_iid = f"{blend_iid}::spm::{spm_index}"
+                    if target.get("relation_on") is False:
+                        connection = "관계 OFF · Generator Sync에서 ON 가능"
+                        target_tag = "blender_inactive"
+                    elif target["connected"] is True:
+                        connection = "Generator 연결 완료 ✓"
+                        target_tag = "blender_spm"
+                    elif target["connected"] is False:
+                        connection = "Generator 연결 점검 필요"
+                        target_tag = "blender_attention"
+                    else:
+                        connection = (
+                            "목록 등록 · 연결 상태 미확인"
+                            if target.get("listed_in_registry")
+                            else "연결 상태 미확인"
+                        )
+                        target_tag = "blender_attention"
+                    if target.get("exists") is False:
+                        connection = "목록 등록 · SPM 파일 없음"
+                        target_tag = "blender_attention"
+                    if (
+                        not target["export_participating"]
+                        and not blend_row.get("cluster_normalized")
+                    ):
+                        connection = f"비활성 기록 · {connection}"
+                        target_tag = "blender_inactive"
+                    self.tree.insert(
+                        blend_iid, "end", iid=spm_iid,
+                        text=f"↳ {target['spm'].name}",
+                        values=("", "", "", "", connection, ""),
+                        tags=(target_tag,),
+                    )
+                    self.row_copy_paths[spm_iid] = [target["spm"]]
+                    self.blend_connection_meta[spm_iid] = {
+                        "blend": blend_row["blend"], "spm": target["spm"],
+                        "managed_by": target.get("managed_by") or blend_row.get("managed_by"),
+                        "cluster_normalized": bool(blend_row.get("cluster_normalized")),
+                        "relation_on": target.get("relation_on"),
+                    }
         self.checked_rows.sync_after_reload()
+        self.target_checked_rows.sync_after_reload()
         self._update_step3_button()
 
     def _annotate_unreal_sync(self, item):
@@ -1825,114 +2672,54 @@ class App:
         return "\n".join(L)
 
     # ------------------------------------------------------------- ① 실행
-    def start_cluster_m_prefix(self):
-        sources = selected_cluster_m_targets(
-            self.tree.selection(), self.row_copy_paths)
-        if not sources:
-            messagebox.showinfo(
-                "①-C Cluster M_",
-                "Cluster 아래의 원본 SPM 자식 행을 먼저 선택하세요.\n"
-                "이 작업은 SK_*.spm을 만들지 않습니다.",
-            )
-            return
-        force = bool(self.force_var.get())
-        rows = []
-        generic_kept = []
-        for source in sources:
-            preview = prepare_cluster_m_prefix(source, dry_run=True)
-            renames = list(preview.get("renames") or [])
-            _normal, generic = split_generic([old for old, _new in renames])
-            excluded = [] if force else generic
-            allowed = [row for row in renames if row[0] not in excluded]
-            generic_kept.extend((source, name) for name in excluded)
-            if allowed:
-                rows.append({
-                    "source": source,
-                    "exclude": excluded,
-                    "renames": allowed,
-                    "blend_output": preview["blend_output"],
-                })
-        if not rows:
-            note = (
-                "\n'Material 2' 같은 기본 이름은 SpeedTree에서 의미 있는 이름을 "
-                "지은 뒤 다시 실행하세요."
-                if generic_kept and not force else ""
-            )
-            messagebox.showinfo(
-                "①-C Cluster M_",
-                "선택한 Cluster SPM에 적용할 M_ 이름 변경이 없습니다." + note,
-            )
-            return
-        msg = [
-            "①-C Cluster 머티리얼 M_만 정리\n",
-            "SK_*.spm은 만들지 않고 아래 원본 SPM의 머티리얼 이름만 정리합니다.",
-        ]
-        for row in rows:
-            msg.append(
-                f" · {row['source'].name}: {len(row['renames'])}개 · "
-                f"Blender 출력 {Path(row['blend_output']).name}"
-            )
-        if generic_kept and not force:
-            msg.append(
-                f" · 기본 이름 {len(generic_kept)}개는 제외 (강제 옵션으로 포함 가능)"
-            )
-        msg.append(" · 수정 전 Cluster\\_spm_backups\\에 백업합니다.")
-        msg.append("\n계속할까요?")
-        if not messagebox.askyesno("①-C Cluster M_", "\n".join(msg)):
-            return
-        self._set_busy(True)
-        self.status_var.set(f"①-C Cluster M_ 적용 중... ({len(rows)}개)")
-        self.worker = threading.Thread(
-            target=self._run_cluster_m_prefix,
-            args=(rows,),
-            daemon=True,
-        )
-        self.worker.start()
-
-    def _run_cluster_m_prefix(self, rows):
-        done = 0
-        failed = 0
-        for row in rows:
-            source = row["source"]
-            try:
-                result = prepare_cluster_m_prefix(
-                    source,
-                    dry_run=False,
-                    exclude_materials=row.get("exclude"),
-                )
-                for old, new in result.get("renames") or []:
-                    self._ui(lambda o=old, n=new, s=source: self.log(
-                        f"[①-C Cluster M_] {s.name}: {o} → {n}"))
-                if result.get("backup"):
-                    self._ui(lambda p=result["backup"]: self.log(
-                        f"    백업: {p}"))
-                done += 1
-            except Exception as exc:
-                failed += 1
-                self._ui(lambda s=source, e=exc: self.log(
-                    f"[①-C 실패] {s.name}: {e}"))
-        summary = f"①-C 완료: 처리 {done}개, 실패 {failed}개"
-        self._ui(lambda: self._start_completion_refresh(summary))
-
     def _build_prepare_rows(self, entries=None):
         """선택 범위에서 ① 작업 목록을 만들고 문제(blocker)를 분류한다."""
         rows = []
-        source_entries = self.items if entries is None else entries
+        if entries is None:
+            source_entries = getattr(self, "target_items", {}) or self.items
+        else:
+            source_entries = entries
         for iid, entry in source_entries.items():
             if not entry["checked"]:
                 continue
             item = entry["item"]
             duplicates = set(item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names", []))
-            statuses = item.get("target_spm_statuses") or []
+            exact_status = entry.get("target_status")
+            statuses = (
+                [exact_status]
+                if exact_status is not None
+                else item.get("target_spm_statuses") or []
+            )
             jobs = []  # (mesh_name or None)
             if statuses:
                 for s in statuses:
-                    if s["status"] in ("needs_sk", "needs_m_prefix"):
+                    if s["status"] in (
+                        "needs_sk", "needs_m_prefix"
+                    ):
                         jobs.append(s["mesh_name"])
+                    elif s["status"] == "pair_conflict":
+                        rows.append({
+                            "item": item,
+                            "mesh": s["mesh_name"],
+                            "preview": None,
+                            "blockers": ["pair_conflict"],
+                            "generic": [],
+                            "tree_iid": iid,
+                        })
+                    elif s["status"] == "material_name_conflict":
+                        rows.append({
+                            "item": item,
+                            "mesh": s["mesh_name"],
+                            "preview": None,
+                            "blockers": ["material_name_conflict"],
+                            "generic": [],
+                            "tree_iid": iid,
+                        })
                     elif s["status"] == "needs_source_review":
                         rows.append({
                             "item": item, "mesh": s["mesh_name"], "preview": None,
                             "blockers": ["source_review"], "generic": [],
+                            "tree_iid": iid,
                         })
             else:
                 if (not item.get("sk_spms") or item.get("materials_missing_m_prefix")
@@ -1949,12 +2736,19 @@ class App:
                     preview = prepare_sk(item["folder"], [mesh] if mesh else None, dry_run=True)
                 except Exception as exc:
                     rows.append({"item": item, "mesh": mesh, "preview": None,
-                                 "blockers": [f"오류: {exc}"], "generic": []})
+                                 "blockers": [f"오류: {exc}"], "generic": [],
+                                 "tree_iid": iid})
                     continue
                 targets = preview.get("targets") or [preview]
                 target = targets[0] if targets else {}
                 if target.get("status") == "skipped":
                     blockers.append(f"자동 처리 불가: {target.get('reason', '?')}")
+                elif target.get("status") == "blocked":
+                    blockers.append(
+                        "material_name_conflict"
+                        if target.get("material_name_conflicts")
+                        else "pair_conflict"
+                    )
                 elif target.get("status") == "up_to_date":
                     continue
                 patch = target.get("patch") or {}
@@ -1966,7 +2760,7 @@ class App:
                     blockers.append("generic_only")
                 rows.append({"item": item, "mesh": mesh, "preview": target,
                              "blockers": blockers, "generic": generic,
-                             "normal_renames": normal})
+                             "normal_renames": normal, "tree_iid": iid})
         return rows
 
     @staticmethod
@@ -1978,13 +2772,13 @@ class App:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 ①을 다시 실행하세요.")
             return
-        checked = [e for e in self.items.values() if e["checked"]]
+        prepare_entries = getattr(self, "target_items", {}) or self.items
+        checked = [e for e in prepare_entries.values() if e["checked"]]
         if not checked:
             messagebox.showinfo(
                 "① 실행",
-                "체크된 식생 행이 없습니다.\n"
-                "Cluster 자식은 별도 [①-C Cluster M_만]을 사용하고, "
-                "SK Batch ②에서 SK_*.blend만 생성합니다.",
+                "체크된 SPM 행이 없습니다.\n"
+                "일반 식생 또는 Cluster의 canonical SK 자식 행을 체크하세요.",
             )
             return
         self.status_var.set("① 준비 상태 확인 중...")
@@ -2004,7 +2798,10 @@ class App:
         for row in rows:
             hard_block = row["preview"] is None or any(
                 b.startswith("자동 처리 불가") or b.startswith("오류")
-                or b in ("source_review", "generic_only")
+                or b in (
+                    "source_review", "generic_only", "pair_conflict",
+                    "material_name_conflict",
+                )
                 for b in row["blockers"]
             )
             if hard_block or (row["blockers"] and not force):
@@ -2049,7 +2846,8 @@ class App:
             label = row["mesh"] or row["item"]["name"]
             self.log(f"[① 건너뜀] {label}: " + "; ".join(self._blocker_text(b) for b in row["blockers"]))
             self.tree.set(
-                row["item"].get("_tree_iid", row["item"]["folder"]),
+                row.get("tree_iid")
+                or row["item"].get("_tree_iid", row["item"]["folder"]),
                 "step1",
                 "⚠ 건너뜀 (로그 참조)",
             )
@@ -2078,6 +2876,13 @@ class App:
                             f"[① 머티리얼 이름] {lb}: {o} → {n}"))
                     if patch.get("backup"):
                         self._ui(lambda p=patch: self.log(f"    백업: {p['backup']}"))
+                    normalized = target.get("bootstrap") or {}
+                    if normalized.get("status") == "applied":
+                        self._ui(lambda t=target: self.log(
+                            "[① Output 이름 정규화] "
+                            f"{Path(t['mirror_spm']).name} → "
+                            f"{Path(t['canonical_spm']).name}"
+                        ))
                 done += 1
                 up_to_date = bool(targets) and all(
                     target.get("status") == "up_to_date" for target in targets
@@ -2085,12 +2890,14 @@ class App:
                 if up_to_date:
                     self._ui(lambda lb=label: self.log(
                         f"[① 변경 없음] {lb}: 이미 최신입니다."))
-                    self._ui(lambda i=item: self.tree.set(
-                        i.get("_tree_iid", i["folder"]),
+                    self._ui(lambda i=item, r=row: self.tree.set(
+                        r.get("tree_iid")
+                        or i.get("_tree_iid", i["folder"]),
                         "step1", "완료 ✓ (변경 없음)"))
                 else:
-                    self._ui(lambda i=item: self.tree.set(
-                        i.get("_tree_iid", i["folder"]),
+                    self._ui(lambda i=item, r=row: self.tree.set(
+                        r.get("tree_iid")
+                        or i.get("_tree_iid", i["folder"]),
                         "step1", "완료 ✓ (방금 적용)"))
             except Exception as exc:
                 failed += 1
@@ -2104,10 +2911,11 @@ class App:
         self._busy = bool(busy)
         state = "disabled" if busy else "normal"
         control_names = (
-            "btn_prepare", "btn_cluster_m", "btn_step2", "btn_refresh", "btn_pick_root",
+            "btn_prepare", "btn_step2", "btn_refresh", "btn_pick_root",
             "btn_select_all", "btn_clear_all", "btn_live_targets",
             "btn_saved_targets", "root_entry", "chk_pcg_targets",
             "chk_force", "chk_spm_push",
+            "btn_add_target", "btn_remove_target",
         )
         for name in control_names:
             control = getattr(self, name, None)

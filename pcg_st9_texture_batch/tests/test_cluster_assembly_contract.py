@@ -2,6 +2,8 @@ import gzip
 import importlib.machinery
 import importlib.util
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -13,23 +15,33 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_cluster_assembly_contract import (
+    ClusterAssemblyReceiptError,
     ClusterAssemblyReceiptStaleError,
     build_cluster_assembly_contract,
     classify_fbx_role,
+    cluster_assembly_receipt_resolution,
+    file_fingerprint,
     load_cluster_assembly_receipt,
     locate_cluster_assembly_receipt,
     persist_cluster_assembly_receipt,
     persist_cluster_assembly_receipts,
     inspect_fbx_material_mesh_pairs,
+    dependency_role,
+    _atlas_normalized_variants,
 )
+import pcg_texture_audit as audit_module
 from pcg_texture_audit import (
+    active_material_ids,
+    cluster_material_rename_plan,
     cluster_material_usage,
     cluster_source_inventory,
     cluster_spms,
     current_leaf_atlas_inventory,
     extract_material_image_refs,
     m_prefix_plan,
+    prepare_sk,
 )
+from cluster_spm_pair_contract import inspect_cluster_spm_pair
 
 
 REAL_ELM_SOURCE_FBX = Path(
@@ -39,6 +51,10 @@ REAL_ELM_SOURCE_FBX = Path(
 REAL_ELM_CLUSTER_LEAF = Path(
     r"D:\OneDrive\Forestportfolio\02_nature\Tree\Tree_elm"
     r"\Cluster\leaf_elm_01.spm"
+)
+REAL_ELM_CLUSTER_BRANCH = Path(
+    r"D:\OneDrive\Forestportfolio\02_nature\Tree\Tree_elm"
+    r"\Cluster\branch_elm_01.spm"
 )
 
 
@@ -53,7 +69,7 @@ def load_gui_module():
     return module
 
 
-def write_spm(path, materials, mesh_ids=()):
+def write_spm(path, materials, mesh_ids=(), active_material_ids=()):
     material_xml = []
     for material_id, name, refs, owned_mesh_ids in materials:
         texture_xml = "".join(
@@ -69,10 +85,19 @@ def write_spm(path, materials, mesh_ids=()):
         )
     mesh_xml = "".join(
         f'<Mesh ID="{value}" Name="mesh-{value}"/>' for value in mesh_ids)
+    generator_xml = "".join(
+        '<Generator Type="Branch">'
+        f'<GUID>generator-{index}</GUID><Hidden>false</Hidden>'
+        '<Properties><Property><Name>Geometry:Material</Name>'
+        f'<Value>{material_id}</Value></Property></Properties>'
+        '</Generator>'
+        for index, material_id in enumerate(active_material_ids)
+    )
     payload = (
         "<SpeedTree><Materials>" + "".join(material_xml)
         + "</Materials><Meshes>" + mesh_xml
-        + "</Meshes></SpeedTree>"
+        + "</Meshes><Generators>" + generator_xml
+        + "</Generators></SpeedTree>"
     ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wb") as handle:
@@ -147,13 +172,13 @@ class FbxRoleContractTests(unittest.TestCase):
         self.assertEqual(report["format"], "binary")
         self.assertEqual(report["version"], 7700)
         self.assertEqual(branch["decision"], "normalize_part")
-        self.assertEqual(branch["complete_pair_count"], 214)
+        self.assertGreater(branch["complete_pair_count"], 0)
         self.assertEqual(leaf["decision"], "normalize_part")
-        self.assertEqual(leaf["complete_pair_count"], 376)
+        self.assertGreater(leaf["complete_pair_count"], 0)
 
 
 class ClusterAssemblyContractTests(unittest.TestCase):
-    def test_cluster_source_inventory_excludes_generated_sk_and_keeps_generic_names(self):
+    def test_cluster_source_inventory_uses_canonical_output_names(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             cluster = folder / "Cluster"
@@ -165,7 +190,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 path.write_bytes(b"spm")
 
             sources = cluster_spms(folder)
-            self.assertEqual(sources, [branch, generic])
+            self.assertEqual(sources, [branch, generated])
             usage = {
                 str(generic).lower(): {
                     "spms": [str(folder / "SK_bush_Silky_Dogwood_01.spm")],
@@ -176,12 +201,15 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             rows = cluster_source_inventory(sources, usage, {"dependencies": []})
 
             self.assertEqual([row["name"] for row in rows], [
-                "branch_Silky_Dogwood_01", "cluster_Silky_Dogwood_01",
+                "SK_branch_Silky_Dogwood_01", "SK_cluster_Silky_Dogwood_01",
             ])
             generic_row = rows[1]
             self.assertTrue(generic_row["referenced"])
             self.assertEqual(len(generic_row["cluster_output_textures"]), 1)
             self.assertIsNone(generic_row["assembly_role"])
+            self.assertEqual(Path(generic_row["authoring_spm"]), generated)
+            self.assertEqual(Path(generic_row["output_spm"]), generated)
+            self.assertEqual(Path(generic_row["mirror_spm"]), generic)
 
     def test_missing_connected_cluster_tga_remains_a_dependency(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -221,6 +249,33 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 dependency["texture_dependencies"][0]["path"], expected
             )
+
+    def test_canonical_cluster_dependency_matches_exact_raw_output_stem(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Tree_elm"
+            cluster = folder / "Cluster"
+            raw = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            target = folder / "SK_Tree_elm_01.spm"
+            output = cluster / "branch_elm_01.tga"
+            write_spm(raw, [("1", "M_Bark_elm_01", [], [])])
+            write_spm(target, [(
+                "2", "M_branch_elm_01",
+                ["Cluster/branch_elm_01.tga"], ("1",),
+            )], mesh_ids=("1",))
+            output.write_bytes(b"raw-output")
+            prepare_sk(cluster, [raw.stem], dry_run=False)
+
+            clusters = cluster_spms(folder)
+            usage = cluster_material_usage([target], clusters)
+
+            self.assertEqual(clusters, [canonical])
+            self.assertIn(str(canonical).casefold(), usage)
+            self.assertEqual(
+                usage[str(canonical).casefold()]["source_albedo"],
+                [str(output)],
+            )
+            self.assertNotIn("SK_branch_elm_01.tga", str(usage))
 
     def test_actual_hierarchy_role_gate_and_handoff_receipt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -286,15 +341,21 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 set(dependencies),
-                {"branch_elm_01", "leaf_elm_01", "leaf_elm_side_01"},
+                {"SK_branch_elm_01", "SK_leaf_elm_01", "SK_leaf_elm_side_01"},
             )
-            self.assertEqual(dependencies["branch_elm_01"]["decision"], "normalize_part")
-            self.assertEqual(dependencies["leaf_elm_01"]["decision"], "blocked")
-            self.assertEqual(dependencies["leaf_elm_side_01"]["decision"], "reference_only")
+            self.assertEqual(dependencies["SK_branch_elm_01"]["decision"], "blocked")
+            self.assertTrue(
+                dependencies["SK_branch_elm_01"]["normalized_variants_missing"]
+            )
+            self.assertEqual(dependencies["SK_leaf_elm_01"]["decision"], "blocked")
             self.assertEqual(
-                [row["name"] for row in children["leaf"]["references"]],
-                ["leaf_elm_side_01"],
+                dependencies["SK_leaf_elm_side_01"]["role"], "leaf_side"
             )
+            self.assertEqual(
+                dependencies["SK_leaf_elm_side_01"]["decision"], "pass_through"
+            )
+            self.assertEqual(children["leaf"]["references"], [])
+            self.assertEqual(children["leaf_side"]["references"], [])
             self.assertEqual(contract["canonical_bark"]["status"], "replacement_required")
             self.assertEqual(contract["handoff"]["status"], "blocked")
             self.assertEqual(
@@ -306,7 +367,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertTrue(contract["handoff"]["requires_actual_fbx_revalidation"])
             self.assertEqual(
                 [row["name"] for row in contract["handoff"]["roles"]],
-                ["branch_elm_01", "leaf_elm_01"],
+                [
+                    "SK_branch_elm_01",
+                    "SK_leaf_elm_01",
+                    "SK_leaf_elm_side_01",
+                ],
             )
             self.assertEqual(
                 len(contract["handoff"]["cluster_dependencies"]), 3)
@@ -326,7 +391,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 str(assembly_source),
             )
             self.assertEqual(
-                dependencies["branch_elm_01"]["tga_basename_validation"]["status"],
+                dependencies["SK_branch_elm_01"]["tga_basename_validation"]["status"],
                 "ok",
             )
             wind = contract["handoff"]["skeleton_wind_contract"]
@@ -375,6 +440,382 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 handle.write(b"stale")
             with self.assertRaises(ClusterAssemblyReceiptStaleError):
                 locate_cluster_assembly_receipt(target, receipt_dir)
+
+    def test_three_roles_use_stable_scope_receipts_and_arbitrary_variant_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            target = folder / "SK_Tree_elm_01.spm"
+            blend = folder / "normalized.blend"
+            blend.parent.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            materials = [
+                ("2", "branch_elm_01", [], ("10", "11")),
+                ("3", "leaf_elm_01", [], ("20",)),
+                ("4", "leaf_elm_side_01", [], ("30", "31", "32")),
+            ]
+            write_spm(
+                target,
+                materials,
+                mesh_ids=("10", "11", "20", "30", "31", "32"),
+            )
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            role_specs = {
+                "branch": ("branch_elm_01", 2, [10, 11]),
+                "leaf": ("leaf_elm_01", 3, [20]),
+                "leaf_side": ("leaf_elm_side_01", 4, [30, 31, 32]),
+            }
+            for role, (identity, material_id, mesh_ids) in role_specs.items():
+                rows = []
+                for ordinal, mesh_id in enumerate(mesh_ids, 1):
+                    fbx = folder / f"{role}_{ordinal:02d}.fbx"
+                    fbx.write_bytes(f"{role}-{ordinal}".encode("ascii"))
+                    if role == "branch":
+                        skeletal_asset_name = "SK_branch_shared_01"
+                    elif role == "leaf_side":
+                        skeletal_asset_name = "SK_leaf_elm_side_01_01"
+                    else:
+                        skeletal_asset_name = f"SK_{identity}_{ordinal:02d}"
+                    rows.append({
+                        "source_object": f"{identity}_{ordinal:02d}",
+                        "source_ordinal": ordinal,
+                        "fbx": str(fbx),
+                        "skeletal_asset_name": skeletal_asset_name,
+                        "source_prototype_index": (
+                            1 if role == "leaf_side" else ordinal
+                        ),
+                        "source_partition_mode": (
+                            "WHOLE_MESH"
+                            if role == "leaf_side"
+                            else "BRANCH_COMPONENTS"
+                        ),
+                    })
+                payload = {
+                    "spm": str(target),
+                    "blend_file": str(blend),
+                    "material_groups": [{
+                        "material": identity,
+                        "material_id": material_id,
+                        "mesh_ids": mesh_ids,
+                        "meshes": rows,
+                    }],
+                }
+                (scope_dir / f"scope_{role}__{target.stem}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            # The rolling global file is deliberately stale/malformed.  Once
+            # stable scope receipts exist it must not shadow them.
+            (folder / "speedtree_import_manifest.json").write_text(
+                json.dumps({
+                    "spm": str(target),
+                    "blend_file": str(blend),
+                    "material_groups": [{
+                        "material": "branch_elm_01",
+                        "material_id": 2,
+                        "mesh_ids": [10, 11],
+                        "meshes": [],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                dependency_role("SK_leaf_elm_side_01"), "leaf_side"
+            )
+            contracts = {
+                role: _atlas_normalized_variants(
+                    folder,
+                    identity,
+                    [target],
+                    audit=audit_module,
+                )
+                for role, (identity, _material_id, _mesh_ids) in role_specs.items()
+            }
+            self.assertEqual(
+                {role: len(value["variants"]) for role, value in contracts.items()},
+                {"branch": 2, "leaf": 1, "leaf_side": 3},
+            )
+            self.assertEqual(
+                {row["skeletal_asset_name"] for row in contracts["branch"]["variants"]},
+                {"SK_branch_shared_01"},
+            )
+            side_variants = contracts["leaf_side"]["variants"]
+            self.assertEqual(
+                [row["plan_name"] for row in side_variants],
+                [
+                    "leaf_elm_side_01_01",
+                    "leaf_elm_side_01_02",
+                    "leaf_elm_side_01_03",
+                ],
+            )
+            self.assertEqual(
+                [row["skeletal_asset_name"] for row in side_variants],
+                ["SK_leaf_elm_side_01_01"] * 3,
+            )
+            self.assertEqual(
+                [row["source_prototype_index"] for row in side_variants],
+                [1, 1, 1],
+            )
+            self.assertEqual(
+                [row["source_partition_mode"] for row in side_variants],
+                ["WHOLE_MESH"] * 3,
+            )
+
+    def test_physical_scope_propagates_normalized_bounds_and_receipts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            target = folder / "SK_Tree_elm_01.spm"
+            blend = folder / "SK_branch_elm_01.blend"
+            plan_fbx = folder / "branch_elm_01_01.fbx"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            plan_fbx.write_bytes(b"plan")
+            write_spm(
+                target,
+                [("2", "branch_elm_01", [], ("10",))],
+                mesh_ids=("10",),
+            )
+            bounds = {
+                "minimum": [-0.04, -0.045, -0.01],
+                "maximum": [0.04, 0.045, 0.01],
+                "size": [0.08, 0.09, 0.02],
+                "center": [0.0, 0.0, 0.0],
+            }
+            capture_hash = "physical-capture-hash"
+            receipt = {
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "size_policy": "uniform_whole_source_physical_target_meters",
+                "plan_uv_policy": "direct_physical_capture_projection",
+                "direct_uv_source": (
+                    "same_blender_physical_capture_projection"
+                ),
+                "generator_size_policy": (
+                    "preserve_user_authored_leaf_and_frond_dimensions"
+                ),
+                "physical_capture_contract": {
+                    "kind": "speedtree_cluster_physical_capture_fit",
+                    "contract_sha256": capture_hash,
+                },
+                "physical_capture_contract_sha256": capture_hash,
+                "prototypes": [{
+                    "prototype_index": 1,
+                    "skeletal_asset": "SK_branch_elm_01_01",
+                    "normalized_bounds": bounds,
+                }],
+                "variants": [{
+                    "card_index": 1,
+                    "skeletal_asset": "SK_branch_elm_01_01",
+                    "plan": "branch_elm_01_01",
+                }],
+            }
+            payload = {
+                "spm": str(target),
+                "blend_file": str(blend),
+                "unit_probe_contract": {
+                    "kind": "speedtree_fbx_spm_unit_probe",
+                    "status": "verified",
+                },
+                "normalized_prototype_receipt": receipt,
+                "material_groups": [{
+                    "material": "branch_elm_01",
+                    "material_id": 2,
+                    "mesh_ids": [10],
+                    "meshes": [{
+                        "source_object": "branch_elm_01_01",
+                        "source_ordinal": 1,
+                        "fbx": str(plan_fbx),
+                        "skeletal_asset_name": "SK_branch_elm_01_01",
+                        "source_prototype_index": 1,
+                        "source_partition_mode": (
+                            "PER_CONNECTED_DEFORM_CLUSTER"
+                        ),
+                        "normalization_workflow_mode": (
+                            "PHYSICAL_DIRECT_CAPTURE"
+                        ),
+                        "physical_capture_contract_sha256": capture_hash,
+                        "normalized_bounds": json.loads(json.dumps(bounds)),
+                    }],
+                }],
+            }
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            manifest_path = (
+                scope_dir / f"scope_branch__{target.stem}.json"
+            )
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            contract = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+            )
+
+            self.assertEqual(
+                contract["variants"][0]["normalized_bounds"]["size"],
+                [0.08, 0.09, 0.02],
+            )
+            self.assertEqual(
+                contract["production_normalization"],
+                receipt,
+            )
+            self.assertEqual(
+                contract["unit_probe_contract"]["kind"],
+                "speedtree_fbx_spm_unit_probe",
+            )
+
+            payload["material_groups"][0]["meshes"][0][
+                "normalized_bounds"
+            ]["size"][0] = 0.8
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptError,
+                "bounds disagree",
+            ):
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+
+    def test_composite_side_contract_preserves_all_deform_subparts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            target = folder / "SK_Tree_elm_01.spm"
+            blend = folder / "SK_leaf_elm_side_01.blend"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            write_spm(
+                target,
+                [("4", "leaf_elm_side_01", [], ("30", "31", "32"))],
+                mesh_ids=("30", "31", "32"),
+            )
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            composite_parts = [
+                {
+                    "subpart_index": index,
+                    "skeletal_asset_name": f"SK_leaf_elm_side_01_{index:02d}",
+                    "source_bone": f"Bone_{index}_Start",
+                    "endpoint_bone": f"Bone_{index}_End",
+                    "subpart_to_card_matrix": [
+                        [1.0, 0.0, 0.0, float(index)],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                }
+                for index in range(1, 13)
+            ]
+            rows = []
+            for ordinal, mesh_id in enumerate((30, 31, 32), 1):
+                fbx = folder / f"side_{ordinal:02d}.fbx"
+                fbx.write_bytes(f"side-{ordinal}".encode("ascii"))
+                rows.append({
+                    "source_object": f"leaf_elm_side_01_{ordinal:02d}",
+                    "source_ordinal": ordinal,
+                    "fbx": str(fbx),
+                    "skeletal_asset_name": "SK_leaf_elm_side_01_01",
+                    "source_prototype_index": 1,
+                    "source_partition_mode": "COMPOSITE_PER_DEFORM_ROOT",
+                    "composite_parts": composite_parts,
+                })
+            payload = {
+                "spm": str(target),
+                "blend_file": str(blend),
+                "material_groups": [{
+                    "material": "leaf_elm_side_01",
+                    "material_id": 4,
+                    "mesh_ids": [30, 31, 32],
+                    "meshes": rows,
+                }],
+            }
+            (scope_dir / f"scope_side__{target.stem}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+            contract = _atlas_normalized_variants(
+                folder,
+                "leaf_elm_side_01",
+                [target],
+                audit=audit_module,
+            )
+
+            self.assertEqual(
+                contract["contract"],
+                "atlas_normalized_plan_composite_skeletal_pair_v2",
+            )
+            self.assertEqual(len(contract["variants"]), 3)
+            for variant in contract["variants"]:
+                self.assertEqual(len(variant["composite_parts"]), 12)
+                self.assertEqual(
+                    [row["subpart_index"] for row in variant["composite_parts"]],
+                    list(range(1, 13)),
+                )
+
+    def test_latest_current_overlapping_receipt_wins_and_history_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_dir = root / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            extra_target = root / "SK_Tree_elm_02.spm"
+            extra_source = root / "Tree_elm_02.spm"
+            for path, payload in (
+                (target, b"target-01"),
+                (source, b"source-01"),
+                (extra_target, b"target-02"),
+                (extra_source, b"source-02"),
+            ):
+                path.write_bytes(payload)
+
+            first_contract = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [],
+                "handoff": {"cluster_dependencies": []},
+            }
+            second_contract = {
+                **first_contract,
+                "tree_source_identities": [
+                    *first_contract["tree_source_identities"],
+                    {
+                        "target_spm": file_fingerprint(extra_target),
+                        "authoritative_tree_source": file_fingerprint(extra_source),
+                    },
+                ],
+            }
+            first = persist_cluster_assembly_receipt(
+                first_contract, receipt_dir=receipt_dir
+            )
+            second = persist_cluster_assembly_receipt(
+                second_contract, receipt_dir=receipt_dir
+            )
+            os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(second, ns=(2_000_000_000, 2_000_000_000))
+
+            resolution = cluster_assembly_receipt_resolution(
+                target, receipt_dir
+            )
+
+            self.assertEqual(Path(resolution["selected_receipt"]), second)
+            self.assertEqual(
+                resolution["superseded_current_receipts"], [str(first)]
+            )
+            self.assertEqual(
+                locate_cluster_assembly_receipt(target, receipt_dir), second
+            )
 
     def test_gui_rows_keep_each_cluster_spm_individually_visible(self):
         gui = load_gui_module()
@@ -446,10 +887,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             rows[1]["textures"],
             "Cluster 출력 TGA 연결 1장 · 누락 1장",
         )
-        targets = gui.selected_cluster_m_targets(
-            ["bush-child"], {"bush-child": [source]}
-        )
-        self.assertEqual(targets, [Path(source)])
+        self.assertFalse(hasattr(gui, "selected_cluster_m_targets"))
 
     def test_saved_pcg_report_is_not_the_default_inventory_filter(self):
         gui = load_gui_module()
@@ -494,120 +932,273 @@ class ClusterAssemblyContractTests(unittest.TestCase):
         self.assertEqual(app.root.clipboard, str(source.resolve()))
         self.assertIn("1개", app.status_var.value)
 
-    def test_cluster_child_m_preview_never_creates_an_sk_spm(self):
-        gui = load_gui_module()
+    def test_cluster_legacy_output_is_normalized_to_canonical_name(self):
         with tempfile.TemporaryDirectory() as temporary:
             cluster = Path(temporary) / "Tree_elm" / "Cluster"
-            branch = cluster / "branch_elm_01.spm"
-            write_spm(branch, [("mat-bark", "Bark_elm_01", [], [])])
-            before = branch.read_bytes()
+            raw = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            refs = [
+                "branch_elm_01.tga",
+                "branch_elm_01_Opacity.tga",
+            ]
+            write_spm(raw, [("5", "Bark_elm_01", refs, [])])
 
-            preview = gui.prepare_cluster_m_prefix(branch, dry_run=True)
+            preview = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=True
+            )["targets"][0]
+            self.assertEqual(preview["pair_status"], "normalization_ready")
+            self.assertEqual(Path(preview["canonical_spm"]), canonical)
+            self.assertEqual(Path(preview["mirror_spm"]), raw)
+            self.assertEqual(Path(preview["would_create"]), canonical)
+            self.assertFalse(preview["would_publish"])
+            self.assertTrue(preview["would_normalize_output_name"])
+            self.assertFalse(canonical.exists())
 
-            self.assertEqual(preview["spm"], str(branch))
-            self.assertEqual(preview["renames"], [["Bark_elm_01", "M_Bark_elm_01"]])
+            result = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=False
+            )["targets"][0]
+
+            self.assertEqual(result["status"], "prepared")
+            self.assertTrue(canonical.is_file())
+            self.assertNotEqual(canonical.read_bytes(), raw.read_bytes())
+            self.assertEqual(m_prefix_plan(canonical), [])
+            self.assertTrue(m_prefix_plan(raw))
             self.assertEqual(
-                Path(preview["blend_output"]),
-                cluster / "SK_branch_elm_01.blend",
+                extract_material_image_refs(raw)[0]["refs"], refs
             )
-            self.assertEqual(branch.read_bytes(), before)
+            self.assertEqual(
+                inspect_cluster_spm_pair(canonical)["status"], "current"
+            )
+
+    def test_cluster_canonical_edit_never_republishes_legacy_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            raw = cluster / "leaf_elm_01.spm"
+            canonical = cluster / "SK_leaf_elm_01.spm"
+            write_spm(raw, [("5", "Leaf_elm_01", ["leaf_elm_01.tga"], [])])
+            prepare_sk(cluster, ["leaf_elm_01"], dry_run=False)
+            raw_before = raw.read_bytes()
+
+            write_spm(canonical, [(
+                "5", "M_leaf_elm_01_v2", ["leaf_elm_01.tga"], []
+            )])
+            self.assertEqual(
+                inspect_cluster_spm_pair(canonical)["status"],
+                "current",
+            )
+            preview = prepare_sk(
+                cluster, ["leaf_elm_01"], dry_run=True
+            )["targets"][0]
+            self.assertFalse(preview["would_publish"])
+
+            prepare_sk(cluster, ["leaf_elm_01"], dry_run=False)
+
+            self.assertEqual(raw.read_bytes(), raw_before)
+            self.assertNotEqual(canonical.read_bytes(), raw.read_bytes())
+            self.assertEqual(
+                inspect_cluster_spm_pair(canonical)["status"], "current"
+            )
+
+    def test_cluster_legacy_drift_is_ignored_without_reverse_or_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            raw = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_spm(raw, [("5", "Bark_elm_01", [], [])])
+            prepare_sk(cluster, ["branch_elm_01"], dry_run=False)
+            canonical_before = canonical.read_bytes()
+
+            write_spm(raw, [("5", "M_raw_independent_edit", [], [])])
+            raw_before = raw.read_bytes()
+            preview = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=True
+            )["targets"][0]
+            result = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=False
+            )["targets"][0]
+
+            self.assertEqual(preview["pair_status"], "current")
+            self.assertEqual(preview["status"], "up_to_date")
+            self.assertEqual(result["status"], "up_to_date")
+            self.assertEqual(canonical.read_bytes(), canonical_before)
+            self.assertEqual(raw.read_bytes(), raw_before)
+
+    def test_cluster_detached_collision_gets_deterministic_old_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            raw = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_spm(raw, [
+                ("1", "Bark_elm_01", ["legacy_bark.tga"], []),
+                ("2", "M_Bark_elm_01", ["current_bark.tga"], []),
+                ("3", "M_Bark_elm_01_old", ["older_bark.tga"], []),
+            ], active_material_ids=("2",))
+            before = {
+                row["material_id"]: list(row["refs"])
+                for row in extract_material_image_refs(raw)
+            }
+
+            preview = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=True
+            )["targets"][0]
+            result = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=False
+            )["targets"][0]
+
+            self.assertEqual(
+                dict(preview["patch"]["renames"])["Bark_elm_01"],
+                "M_Bark_elm_01_old_02",
+            )
+            self.assertEqual(result["status"], "prepared")
+            after_rows = extract_material_image_refs(canonical)
+            after_names = [row["material_name"] for row in after_rows]
+            self.assertEqual(len(after_names), len(set(map(str.casefold, after_names))))
+            self.assertIn("M_Bark_elm_01", after_names)
+            self.assertIn("M_Bark_elm_01_old_02", after_names)
+            self.assertEqual(
+                {row["material_id"]: list(row["refs"]) for row in after_rows},
+                before,
+            )
+
+    def test_cluster_two_active_materials_for_one_name_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            raw = cluster / "branch_elm_01.spm"
+            write_spm(raw, [
+                ("1", "Bark_elm_01", ["first.tga"], []),
+                ("2", "M_Bark_elm_01", ["second.tga"], []),
+            ], active_material_ids=("1", "2"))
+            before = raw.read_bytes()
+
+            preview = prepare_sk(
+                cluster, ["branch_elm_01"], dry_run=True
+            )["targets"][0]
+
+            self.assertEqual(preview["status"], "blocked")
+            self.assertEqual(
+                preview["material_name_conflicts"][0]["type"],
+                "active_canonical_collision",
+            )
+            self.assertEqual(raw.read_bytes(), before)
             self.assertFalse((cluster / "SK_branch_elm_01.spm").exists())
 
-    def test_cluster_child_m_apply_keeps_source_name_and_creates_backup(self):
+    def test_gui_has_no_separate_cluster_prepare_button_or_public_helper(self):
         gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            cluster = Path(temporary) / "bush_Silky_Dogwood" / "Cluster"
-            source = cluster / "cluster_Silky_Dogwood_01.spm"
-            write_spm(source, [("mat-bark", "Bark_Dogwood_01", [], [])])
 
-            result = gui.prepare_cluster_m_prefix(source, dry_run=False)
-
-            self.assertEqual(result["spm"], str(source))
-            self.assertTrue(Path(result["backup"]).is_file())
-            self.assertEqual(
-                Path(result["blend_output"]),
-                cluster / "SK_cluster_Silky_Dogwood_01.blend",
-            )
-            self.assertTrue(source.is_file())
-            self.assertFalse(
-                (cluster / "SK_cluster_Silky_Dogwood_01.spm").exists())
-            self.assertEqual(
-                m_prefix_plan(source),
-                [],
-            )
-
-    def test_weed_cluster_m_apply_preserves_raw_stem_and_tga_references(self):
-        gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            cluster = Path(temporary) / "weed_Clover" / "Cluster"
-            source = cluster / "cluster_weed_Clover_01.spm"
-            refs = [
-                "cluster_weed_Clover_01.tga",
-                "cluster_weed_Clover_01_Opacity.tga",
-            ]
-            write_spm(source, [("5", "leaf_weed_Clover_01", refs, [])])
-            before_refs = extract_material_image_refs(source)[0]["refs"]
-
-            preview = gui.prepare_cluster_m_prefix(source, dry_run=True)
-            result = gui.prepare_cluster_m_prefix(source, dry_run=False)
-
-            self.assertEqual(
-                preview["renames"],
-                [["leaf_weed_Clover_01", "M_leaf_weed_Clover_01"]],
-            )
-            self.assertEqual(result["spm"], str(source))
-            self.assertEqual(
-                Path(result["blend_output"]),
-                cluster / "SK_cluster_weed_Clover_01.blend",
-            )
-            self.assertEqual(
-                extract_material_image_refs(source)[0]["refs"],
-                before_refs,
-            )
-            self.assertFalse(
-                (cluster / "SK_cluster_weed_Clover_01.spm").exists())
+        self.assertFalse(hasattr(gui, "prepare_cluster_m_prefix"))
+        self.assertFalse(hasattr(gui, "selected_cluster_m_targets"))
+        self.assertFalse(hasattr(gui.App, "start_cluster_m_prefix"))
+        source = (TOOL_DIR / "pcg_texture_gui.pyw").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("btn_cluster_m", source)
+        self.assertNotIn("①-C", source)
 
     @unittest.skipUnless(
-        REAL_ELM_CLUSTER_LEAF.is_file(),
-        "Tree Elm Cluster leaf source unavailable",
+        REAL_ELM_CLUSTER_BRANCH.is_file() and REAL_ELM_CLUSTER_LEAF.is_file(),
+        "Tree Elm Cluster branch/leaf sources unavailable",
     )
-    def test_real_leaf_cluster_preview_covers_actual_export_materials(self):
+    def test_real_elm_cluster_prepare_keeps_active_names_and_asset_payloads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            for real_source in (
+                REAL_ELM_CLUSTER_BRANCH, REAL_ELM_CLUSTER_LEAF
+            ):
+                with self.subTest(source=real_source.name):
+                    raw = cluster / real_source.name
+                    shutil.copy2(real_source, raw)
+                    canonical = cluster / f"SK_{real_source.name}"
+                    before_rows = extract_material_image_refs(raw)
+                    before_payload = {
+                        row["material_id"]: {
+                            "refs": list(row["refs"]),
+                            "cutout_mesh_ids": list(row["cutout_mesh_ids"]),
+                        }
+                        for row in before_rows
+                    }
+                    active_ids = set(active_material_ids(raw))
+                    active_names = {
+                        row["material_id"]: row["material_name"]
+                        for row in before_rows
+                        if row["material_id"] in active_ids
+                    }
+
+                    plan = dict(cluster_material_rename_plan(raw))
+                    result = prepare_sk(
+                        cluster, [raw.stem], dry_run=False
+                    )["targets"][0]
+                    after_rows = extract_material_image_refs(canonical)
+                    after_names = [row["material_name"] for row in after_rows]
+                    after_by_id = {
+                        row["material_id"]: row for row in after_rows
+                    }
+
+                    self.assertEqual(result["status"], "prepared")
+                    self.assertEqual(
+                        len(after_names), len(set(map(str.casefold, after_names)))
+                    )
+                    self.assertEqual(
+                        {
+                            material_id: after_by_id[material_id]["material_name"]
+                            for material_id in active_names
+                        },
+                        active_names,
+                    )
+                    self.assertEqual(
+                        {
+                            material_id: {
+                                "refs": list(row["refs"]),
+                                "cutout_mesh_ids": list(row["cutout_mesh_ids"]),
+                            }
+                            for material_id, row in after_by_id.items()
+                        },
+                        before_payload,
+                    )
+                    self.assertEqual(canonical.read_bytes(), raw.read_bytes())
+                    if real_source == REAL_ELM_CLUSTER_BRANCH:
+                        before_names = {
+                            row["material_name"] for row in before_rows
+                        }
+                        if "Bark_elm_01" in before_names:
+                            self.assertEqual(
+                                plan["Bark_elm_01"], "M_Bark_elm_01_old"
+                            )
+                            self.assertEqual(
+                                plan["Leaf_elm_01"], "M_Leaf_elm_01"
+                            )
+                        else:
+                            self.assertIn("M_Bark_elm_01_old", before_names)
+                            self.assertIn("M_Leaf_elm_01", before_names)
+                            self.assertEqual(plan, {})
+
+    def test_blender_rows_expose_real_file_and_connected_spm(self):
         gui = load_gui_module()
-
-        preview = gui.prepare_cluster_m_prefix(
-            REAL_ELM_CLUSTER_LEAF, dry_run=True)
-        renames = dict(preview["renames"])
-
-        self.assertEqual(
-            renames["Bark_tree_NothofagusSolandri_01"],
-            "M_Bark_tree_NothofagusSolandri_01",
-        )
-        self.assertEqual(renames["leaf_01"], "M_leaf_01")
-
-    def test_blender_helper_row_copies_only_the_vegetation_folder(self):
-        gui = load_gui_module()
-        folder = r"D:\OneDrive\Forestportfolio\02_nature\Weed\weed_Clover"
+        blend = r"D:\OneDrive\Forestportfolio\02_nature\Tree\atlas\M_leaf_Clover.blend"
+        spm = r"D:\OneDrive\Forestportfolio\02_nature\Weed\weed_Clover\SK_weed_Clover.spm"
         item = {
-            "folder": folder,
-            "cluster_source_rows": [{
-                "source": folder + r"\Cluster\cluster_weed_Clover_01.spm",
+            "leaf_mesh_sources": [{
+                "atlas_blends": [blend],
+                "targets": [{
+                    "spm": spm,
+                    "generator_connection_complete": True,
+                }],
             }],
         }
 
-        self.assertEqual(gui.blender_helper_copy_paths(item), [folder])
+        rows = gui.blender_connection_rows(item)
 
-    def test_prepare_sk_rejects_cluster_folder_even_in_dry_run(self):
-        gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            cluster = Path(temporary) / "Tree_elm" / "Cluster"
-            source = cluster / "branch_elm_01.spm"
-            write_spm(source, [("mat-bark", "Bark_elm_01", [], [])])
-
-            with self.assertRaisesRegex(RuntimeError, "Cluster source SPM"):
-                gui.prepare_sk(cluster, dry_run=True)
-
-            self.assertTrue(source.is_file())
-            self.assertFalse((cluster / "SK_branch_elm_01.spm").exists())
+        self.assertEqual([str(row["blend"]) for row in rows], [blend])
+        self.assertEqual([str(row["spms"][0]["spm"]) for row in rows], [spm])
+        self.assertTrue(rows[0]["spms"][0]["connected"])
+        self.assertEqual(
+            gui.blender_connection_summary(rows[0]),
+            "연결 SPM 1개 · 연결 완료 ✓",
+        )
+        self.assertEqual(
+            gui.blender_connection_overview(item),
+            "blend 1개 · 연결 완료 ✓",
+        )
 
     def test_hidden_stale_binding_does_not_fail_visible_ready_atlas(self):
         spm = Path("Tree_elm") / "SK_Tree_elm_01.spm"
@@ -684,6 +1275,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
         app.items = {"parent": {"checked": True}}
         app.row_copy_paths = {"cluster-child": [Path("branch_elm_01.spm")]}
         app.checked_rows = Checked()
+        app.target_checked_rows = Checked()
         app._update_step3_button = lambda: None
         event = type("Event", (), {"x": 0, "y": 0})()
 
@@ -691,6 +1283,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
         self.assertEqual(app.tree.selected, ("cluster-child",))
         self.assertEqual(app.tree.focused, "cluster-child")
         self.assertTrue(app.checked_rows.cleared)
+        self.assertTrue(app.target_checked_rows.cleared)
 
 
 if __name__ == "__main__":

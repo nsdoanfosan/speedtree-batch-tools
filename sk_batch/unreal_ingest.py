@@ -31,6 +31,9 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_file_fingerprint,
     validate_manifest_artifacts,
 )
+from nanite_assembly_materials import (  # noqa: E402
+    audit_unreal_skeletal_mesh_material_sections,
+)
 
 
 SCHEMA_VERSION = 1
@@ -41,6 +44,43 @@ PLACEHOLDER_SKELETON_NAME = "SK_PlaceholderCube_Skeleton"
 
 def _now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _is_headless_manifest_runtime():
+    """Return whether this module is running as the batch commandlet script."""
+    return bool(os.environ.get("SK_BATCH_MANIFEST_PATH"))
+
+
+def _defer_headless_runtime_validation(assembly, recovered_from_pending=False):
+    """Record that GPU frame validation must run later in a live editor/RPC."""
+    previous = assembly.get("runtime") if recovered_from_pending else None
+    assembly["status"] = "ok"
+    assembly["runtime"] = {
+        "success": True,
+        "status": "headless_deferred",
+        "render_frame_validation_performed": False,
+        "reason": (
+            "GPU render-frame validation requires a live editor/RPC; "
+            "headless commandlet import contracts passed"
+        ),
+        "recovered_from_pending": bool(recovered_from_pending),
+    }
+    if isinstance(previous, dict):
+        assembly["runtime"]["previous_begin"] = previous
+    return assembly
+
+
+def _prepare_assembly_runtime_validation(assembly):
+    if assembly.get("status") != "ready_for_runtime":
+        return "imported_ok"
+    if _is_headless_manifest_runtime():
+        _defer_headless_runtime_validation(assembly)
+        return "imported_ok"
+    assembly_path = (assembly.get("build") or {}).get("assembly")
+    runtime = _begin_instanced_dynamic_wind_runtime(assembly_path)
+    assembly["runtime"] = runtime
+    assembly["status"] = "runtime_pending"
+    return "runtime_pending"
 
 
 def _atomic_write_json(path, data):
@@ -387,6 +427,9 @@ def _import_manifest_asset(send2ue_unreal, manifest_asset):
         manifest_asset.get("pre_import_commands"),
         "pre_import",
     )
+    slot_normalization = _normalize_existing_skeletal_mesh_imported_slot_names(
+        asset_data.get("asset_path")
+    )
     imported = send2ue_unreal.UnrealRemoteCalls.import_asset(
         file_path,
         asset_data,
@@ -415,7 +458,86 @@ def _import_manifest_asset(send2ue_unreal, manifest_asset):
         "asset_path": asset_data.get("asset_path"),
         "file_path": file_path,
         "imported": imported,
+        "pre_import_material_slot_normalization": slot_normalization,
     }
+
+
+def _parse_codex_material_tool_result(raw):
+    values = raw if isinstance(raw, tuple) else (raw,)
+    payload = next(
+        (
+            value
+            for value in values
+            if isinstance(value, str) and value.lstrip().startswith("{")
+        ),
+        "{}",
+    )
+    errors = next((value for value in values if isinstance(value, list)), [])
+    result = json.loads(payload)
+    result["returned_errors"] = [str(error) for error in errors]
+    return result
+
+
+def _normalize_existing_skeletal_mesh_imported_slot_names(asset_path):
+    """Make existing SpeedTree slots match FBX names before a reimport.
+
+    A legacy slot with ``ImportedMaterialSlotName=None`` is not matched by the
+    FBX importer.  UE then appends duplicate slots and points new sections at
+    those unassigned duplicates.  Normalize only missing imported names; an
+    explicit non-empty imported name is preserved as user/importer intent.
+    """
+
+    path = str(asset_path or "").split(".", 1)[0]
+    if not path:
+        return {"status": "skipped", "reason": "no asset path", "changes": []}
+    mesh = unreal.EditorAssetLibrary.load_asset(path)
+    if mesh is None:
+        return {"status": "fresh", "asset": path, "changes": []}
+    if not isinstance(mesh, unreal.SkeletalMesh):
+        return {"status": "skipped", "asset": path, "reason": "not skeletal", "changes": []}
+
+    slots = list(mesh.get_editor_property("materials") or [])
+    missing = []
+    for index, slot in enumerate(slots):
+        imported_name = str(slot.get_editor_property("imported_material_slot_name"))
+        if imported_name and imported_name.casefold() != "none":
+            continue
+        slot_name = str(slot.get_editor_property("material_slot_name"))
+        material = slot.get_editor_property("material_interface")
+        material_path = material.get_path_name() if material else ""
+        if not slot_name or slot_name.casefold() == "none" or not material_path:
+            raise RuntimeError(
+                "cannot normalize a preexisting skeletal material slot before reimport: "
+                f"asset={path}, index={index}, slot={slot_name!r}, material={material_path!r}"
+            )
+        missing.append((index, slot_name, material_path))
+    if not missing:
+        return {"status": "canonical", "asset": path, "changes": []}
+
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    normalize = getattr(library, "normalize_skeletal_mesh_material_slot", None)
+    if not callable(normalize):
+        raise RuntimeError(
+            "CodexMaterialToolsLibrary is required to normalize imported material slot names"
+        )
+    changes = []
+    for index, slot_name, material_path in missing:
+        result = _parse_codex_material_tool_result(
+            normalize(
+                path,
+                index,
+                unreal.Name("None"),
+                unreal.Name(slot_name),
+                material_path,
+                True,
+            )
+        )
+        if result.get("returned_errors") or not result.get("desired_is_set"):
+            raise RuntimeError(
+                f"pre-import material slot normalization failed: {result}"
+            )
+        changes.append(result)
+    return {"status": "normalized", "asset": path, "changes": changes}
 
 
 def _clear_placeholder_skeleton_before_import(item):
@@ -891,10 +1013,16 @@ def _material_compile_and_slot_validation(mesh_path):
         raise RuntimeError("unassigned material slots: " + ", ".join(missing))
     if compile_errors:
         raise RuntimeError("material compile failed: " + " | ".join(compile_errors))
+    section_validation = audit_unreal_skeletal_mesh_material_sections(
+        unreal,
+        mesh_path,
+        len(slots),
+    )
     return {
         "mesh": mesh_path,
         "slots": details,
         "compiled_base_materials": sorted(compiled_base_materials),
+        "section_material_validation": section_validation,
     }
 
 
@@ -958,13 +1086,7 @@ def ingest_item(item):
     saved = _save_item_assets(item, imported_assets)
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
     materials = _material_compile_and_slot_validation(mesh_path)
-    item_status = "imported_ok"
-    if assembly.get("status") == "ready_for_runtime":
-        assembly_path = (assembly.get("build") or {}).get("assembly")
-        runtime = _begin_instanced_dynamic_wind_runtime(assembly_path)
-        assembly["runtime"] = runtime
-        assembly["status"] = "runtime_pending"
-        item_status = "runtime_pending"
+    item_status = _prepare_assembly_runtime_validation(assembly)
     return {
         "status": item_status,
         "checkout": checkout,
@@ -1043,6 +1165,29 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         queue_id = str(item["queue_id"])
         fingerprint = item["fingerprint"]
         previous = checkpoint.setdefault("items", {}).get(queue_id, {})
+        if (
+            previous.get("fingerprint") == fingerprint
+            and previous.get("status") == "runtime_pending"
+            and _is_headless_manifest_runtime()
+        ):
+            assembly = previous.get("cluster_assembly") or {}
+            _defer_headless_runtime_validation(
+                assembly,
+                recovered_from_pending=True,
+            )
+            previous["cluster_assembly"] = assembly
+            previous["status"] = "imported_ok"
+            previous["completed_at"] = _now()
+            previous["updated_at"] = _now()
+            checkpoint["current_item"] = None
+            checkpoint["updated_at"] = _now()
+            _atomic_write_json(checkpoint_path, checkpoint)
+            if previous.get("report"):
+                item_report = dict(previous)
+                item_report["queue_id"] = queue_id
+                item_report["checkpoint"] = checkpoint_path
+                _atomic_write_json(previous["report"], item_report)
+            continue
         if (
             previous.get("fingerprint") == fingerprint
             and previous.get("status") in TERMINAL_STATES

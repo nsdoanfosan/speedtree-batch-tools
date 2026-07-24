@@ -23,6 +23,10 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import clipboard_text, copy_selected_row_paths
+from cluster_blend_sync import (
+    run_cluster_folder_relation_transaction,
+    run_cluster_relation_transaction,
+)
 
 
 def _load_sibling_engine():
@@ -57,6 +61,9 @@ DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
 )
+DEFAULT_BLENDER = Path(
+    r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+)
 
 
 def find_default_xml_ini() -> str:
@@ -84,6 +91,7 @@ def load_config() -> dict:
         "tree_root": str(DEFAULT_TREE_ROOT if DEFAULT_TREE_ROOT.is_dir() else Path.home()),
         "speedtree_exe": str(DEFAULT_SPEEDTREE),
         "xml_ini": find_default_xml_ini(),
+        "blender_exe": str(DEFAULT_BLENDER),
         "verify_speedtree": True,
         "sk_only": True,
     }
@@ -151,6 +159,15 @@ def paths_for_row(row):
         return (folder / row["file"],)
     if row.get("kind") == "folder" and row.get("folder"):
         return (folder,)
+    if row.get("kind") == "cluster_blend" and row.get("blend"):
+        return (Path(row["blend"]),)
+    if row.get("kind") == "cluster_relation":
+        return tuple(
+            Path(path) for path in (
+                row.get("blend"), row.get("source_spm"),
+                *(row.get("target_spms") or ()),
+            ) if path
+        )
     return ()
 
 
@@ -460,6 +477,21 @@ class App:
         )
         ttk.Button(relation, text="○ 선택을 독립으로", command=self.set_selected_independent).pack(side="left")
         ttk.Separator(relation, orient="vertical").pack(side="left", fill="y", padx=10)
+        self.cluster_on_button = ttk.Button(
+            relation, text="Cluster 관계 ON", command=lambda: self.set_selected_cluster_relation(True)
+        )
+        self.cluster_on_button.pack(side="left")
+        self.cluster_refresh_button = ttk.Button(
+            relation,
+            text="Cluster 갱신",
+            command=self.refresh_selected_cluster_relation,
+        )
+        self.cluster_refresh_button.pack(side="left", padx=(5, 0))
+        self.cluster_off_button = ttk.Button(
+            relation, text="Cluster 관계 OFF", command=lambda: self.set_selected_cluster_relation(False)
+        )
+        self.cluster_off_button.pack(side="left", padx=5)
+        ttk.Separator(relation, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(relation, text="Base 매핑", command=self.edit_selected_base_map).pack(side="left")
         ttk.Button(relation, text="Base 색 분류", command=self.edit_selected_categories).pack(side="left", padx=5)
 
@@ -534,6 +566,17 @@ class App:
         self.tree.tag_configure("independent", foreground="#555")
         self.tree.tag_configure("candidate", font=("Segoe UI", 9, "bold"), background="#fff3c4")
         self.tree.tag_configure("unassigned", foreground="#8a4b00")
+        self.tree.tag_configure(
+            "cluster_blend", font=("Segoe UI", 9, "bold"),
+            foreground="#4b2c63", background="#eee5f5",
+        )
+        self.tree.tag_configure(
+            "cluster_on", foreground="#0b5d2a", background="#e5f5e9",
+        )
+        self.tree.tag_configure(
+            "cluster_pending", foreground="#8a4b00", background="#fff3c4",
+        )
+        self.tree.tag_configure("cluster_off", foreground="#666")
         self.tree.tag_configure(
             "drop_target", font=("Segoe UI", 10, "bold"),
             foreground="#073b24", background="#a9edc5",
@@ -664,7 +707,10 @@ class App:
         self.render_board()
         folder_count = len(self.board)
         spm_count = sum(len(item["spms"]) for item in self.board)
-        self.status_var.set(f"{folder_count}개 폴더 · {spm_count}개 SPM")
+        cluster_count = sum(len(item.get("cluster_blends") or ()) for item in self.board)
+        self.status_var.set(
+            f"{folder_count}개 폴더 · {spm_count}개 SPM · Cluster blend {cluster_count}개"
+        )
         if reveal:
             reveal_folder, reveal_file = reveal
             for iid, meta in self.item_meta.items():
@@ -838,6 +884,137 @@ class App:
                 self.item_meta[iid] = {
                     "kind": "spm", "folder": folder, "file": name, "role": role,
                 }
+            cluster_blends = folder_item.get("cluster_blends") or []
+            if cluster_blends:
+                cluster_iid = f"cluster::{len(self.item_meta)}"
+                cluster_path = Path(cluster_blends[0]["cluster_folder"])
+                self.tree.insert(
+                    folder_iid, "end", iid=cluster_iid,
+                    text=f"▾ {cluster_path.name}",
+                    values=("CLUSTER", "—", "정규화 3D + plan", "", ""),
+                    open=True, tags=("cluster_blend",),
+                )
+                self.item_meta[cluster_iid] = {
+                    "kind": "folder", "folder": cluster_path,
+                }
+                for blend_index, blend_row in enumerate(cluster_blends):
+                    blend_iid = f"{cluster_iid}::blend::{blend_index}"
+                    targets = [
+                        target for target in (blend_row.get("targets") or [])
+                        if target.get("owner_target")
+                    ]
+                    relation = blend_row.get("folder_relation") or "empty"
+                    total_count = int(blend_row.get("owner_target_count") or len(targets))
+                    on_count = int(blend_row.get("owner_on_count") or 0)
+                    refresh_required_count = int(
+                        blend_row.get("refresh_required_count") or 0
+                    )
+                    refresh_reasons = list(
+                        blend_row.get("refresh_reasons") or []
+                    )
+                    all_synced = bool(
+                        relation == "on"
+                        and targets
+                        and all(target.get("status") == "synced" for target in targets)
+                    )
+                    if blend_row.get("registry_error"):
+                        status_text = "대상 JSON 오류"
+                        tag = "cluster_pending"
+                    elif relation == "empty":
+                        status_text = "부모 폴더에 SK_*.spm 없음"
+                        tag = "cluster_pending"
+                    elif relation == "off":
+                        status_text = f"폴더 SK {total_count}개 전체 미적용"
+                        tag = "cluster_off"
+                    elif relation == "partial":
+                        if refresh_required_count:
+                            status_text = (
+                                f"부분 연결 {on_count}/{total_count} · 원본 변경 · "
+                                f"ON 대상 {refresh_required_count}개 갱신 필요"
+                            )
+                        else:
+                            status_text = (
+                                f"부분 연결 {on_count}/{total_count} · "
+                                "ON/OFF로 정규화 필요"
+                            )
+                        tag = "cluster_pending"
+                    elif refresh_required_count:
+                        status_text = (
+                            f"Cluster 원본 변경 · 폴더 SK "
+                            f"{refresh_required_count}개 갱신 필요"
+                        )
+                        tag = "cluster_pending"
+                    elif all_synced:
+                        status_text = f"폴더 SK {total_count}개 메시 교체 완료 ✓"
+                        tag = "cluster_on"
+                    else:
+                        status_text = f"폴더 SK {total_count}개 전체 ON · 동기화 점검 필요"
+                        tag = "cluster_pending"
+                    relation_label = {
+                        "on": "ON", "off": "OFF",
+                        "partial": "PARTIAL", "empty": "—",
+                    }.get(relation, relation.upper())
+                    material_names = sorted({
+                        str(target.get("material"))
+                        for target in targets if target.get("material")
+                    })
+                    material_text = ", ".join(material_names) or "원본 M_ 재료"
+                    source_spm = Path(blend_row["source_spm"])
+                    canonical_spm = Path(
+                        blend_row.get("canonical_spm") or (
+                            source_spm
+                            if source_spm.name.casefold().startswith("sk_")
+                            else source_spm.with_name("SK_" + source_spm.name)
+                        )
+                    )
+                    mirror_spm = Path(
+                        blend_row.get("mirror_spm") or (
+                            canonical_spm.with_name(canonical_spm.name[3:])
+                            if canonical_spm.name.casefold().startswith("sk_")
+                            else source_spm
+                        )
+                    )
+                    self.tree.insert(
+                        cluster_iid, "end", iid=blend_iid,
+                        text=f"◆ {Path(blend_row['blend']).name}",
+                        values=(
+                            relation_label,
+                            "—",
+                            f"폴더 SK {total_count}개 일괄 · {material_text}",
+                            status_text,
+                            "—",
+                        ),
+                        open=False, tags=(tag,),
+                    )
+                    self.item_meta[blend_iid] = {
+                        "kind": "cluster_relation",
+                        "folder": folder,
+                        "file": Path(blend_row["blend"]).name,
+                        "blend": Path(blend_row["blend"]),
+                        "source_spm": source_spm,
+                        "canonical_spm": canonical_spm,
+                        "mirror_spm": mirror_spm,
+                        "role": "cluster_relation",
+                        "folder_relation": relation,
+                        "relation_on": (
+                            True if relation == "on"
+                            else False if relation == "off"
+                            else None
+                        ),
+                        "target_spms": [
+                            Path(target["target_spm"]) for target in targets
+                        ],
+                        "on_target_spms": [
+                            Path(target["target_spm"]) for target in targets
+                            if target.get("relation_on")
+                        ],
+                        "target_count": total_count,
+                        "on_count": on_count,
+                        "all_synced": all_synced,
+                        "refresh_required_count": refresh_required_count,
+                        "refresh_reasons": refresh_reasons,
+                        "material": material_text,
+                    }
         try:
             save_analysis_cache(self.signature_cache, self.analysis_cache)
         except OSError:
@@ -846,6 +1023,13 @@ class App:
     def selected_items(self):
         return [self.item_meta[iid] for iid in self.tree.selection()
                 if iid in self.item_meta and self.item_meta[iid].get("kind") == "spm"]
+
+    def selected_cluster_relations(self):
+        return [
+            self.item_meta[iid] for iid in self.tree.selection()
+            if iid in self.item_meta
+            and self.item_meta[iid].get("kind") == "cluster_relation"
+        ]
 
     def copy_selected_paths(self, _event=None):
         count = copy_selected_row_paths(
@@ -861,6 +1045,41 @@ class App:
         return "break"
 
     def update_details(self, _event=None):
+        cluster_relations = self.selected_cluster_relations()
+        if cluster_relations:
+            if len(cluster_relations) > 1:
+                self.details_var.set(f"Cluster 관계 {len(cluster_relations)}개 선택됨")
+            else:
+                relation = cluster_relations[0]
+                reason_labels = {
+                    "canonical_source_missing": "canonical SPM 없음",
+                    "canonical_source_changed": "canonical SPM 변경",
+                    "recorded_source_conflict": "적용 영수증의 원본 해시 충돌",
+                    "physical_capture_manifest_missing": (
+                        "Blender physical-capture 영수증 없음"
+                    ),
+                    "physical_capture_changed": "Blender 촬영/plan 변경",
+                }
+                refresh_text = ", ".join(
+                    reason_labels.get(reason, reason)
+                    for reason in relation.get("refresh_reasons") or []
+                )
+                self.details_var.set("\n".join([
+                    f"{relation['blend'].name} · 폴더 관계 "
+                    f"{str(relation.get('folder_relation') or 'unknown').upper()}",
+                    f"정규화 blend: {relation['blend']}",
+                    f"canonical Cluster SPM: {relation['canonical_spm']}",
+                    f"legacy mirror (읽기 전용): {relation['mirror_spm']}",
+                    f"대상: 폴더 직하 SK_*.spm {relation.get('target_count', 0)}개 전체",
+                    f"현재 적용: {relation.get('on_count', 0)}/{relation.get('target_count', 0)}",
+                    (
+                        f"갱신 필요: {relation.get('refresh_required_count', 0)}개"
+                        + (f" · {refresh_text}" if refresh_text else "")
+                    ),
+                    f"교체 대상 재료: {relation.get('material') or '적용 후 manifest에서 확정'}",
+                ]))
+            self.show_delta_details(None)
+            return
         items = self.selected_items()
         if not items:
             self.details_var.set("행을 선택하면 관계와 Base 매핑을 보여 줍니다.")
@@ -930,6 +1149,10 @@ class App:
         self.delta_box.configure(state="disabled")
 
     def on_double_click(self, _event=None):
+        relations = self.selected_cluster_relations()
+        if len(relations) == 1:
+            self.set_selected_cluster_relation(not relations[0]["relation_on"])
+            return
         item = self.selected_items()
         if len(item) == 1 and item[0].get("role") == "follower":
             self.edit_selected_base_map()
@@ -1145,6 +1368,159 @@ class App:
             engine.save_manifest(folder, manifest)
         self.refresh()
 
+    def refresh_selected_cluster_relation(self):
+        self.set_selected_cluster_relation(True, refresh_only=True)
+
+    def set_selected_cluster_relation(self, enabled, *, refresh_only=False):
+        rows = self.selected_cluster_relations()
+        if not rows:
+            messagebox.showinfo(
+                "Cluster 관계",
+                "Cluster 아래의 정규화 SK_*.blend 행을 선택하세요.",
+                parent=self.root,
+            )
+            return
+        blend_keys = {
+            os.path.normcase(str(Path(row["blend"]).absolute())).casefold()
+            for row in rows
+        }
+        if len(blend_keys) != 1:
+            messagebox.showinfo(
+                "Cluster 관계",
+                "한 번에는 같은 Cluster blend의 관계만 처리하세요.",
+                parent=self.root,
+            )
+            return
+        if refresh_only:
+            no_targets = [
+                row for row in rows if not row.get("on_target_spms")
+            ]
+            if no_targets:
+                messagebox.showinfo(
+                    "Cluster 갱신",
+                    "현재 ON으로 연결된 대상이 없습니다. 먼저 관계를 ON으로 설정하세요.",
+                    parent=self.root,
+                )
+                return
+        changes = [
+            row for row in rows
+            if (
+                row.get("folder_relation") != ("on" if enabled else "off")
+                or (enabled and not row.get("all_synced"))
+            )
+        ]
+        if not changes:
+            self.status_var.set(
+                (
+                    "선택 Cluster는 이미 최신입니다."
+                    if refresh_only
+                    else f"선택 관계는 이미 {'ON' if enabled else 'OFF'}입니다."
+                )
+            )
+            return
+        blend = Path(changes[0]["blend"])
+        target_count = (
+            len(changes[0].get("on_target_spms") or [])
+            if refresh_only
+            else int(changes[0].get("target_count") or 0)
+        )
+        action = (
+            "갱신 · 현재 Blender 결과 재적용"
+            if refresh_only
+            else "ON · 메시 동기화" if enabled
+            else "OFF · 원본 메시 복원"
+        )
+        target_label = (
+            f"현재 ON으로 연결된 SK_*.spm {target_count}개"
+            if refresh_only
+            else f"부모 식생 폴더의 SK_*.spm {target_count}개 전체"
+        )
+        message = (
+            f"Cluster blend: {blend.name}\n관계: {action}\n"
+            f"대상: {target_label}\n\n"
+            + (
+                (
+                    "SK Batch가 만든 현재 정규화 3D mesh/plan/texture를 다시 적용해 "
+                    "대상 SPM의 Generator 연결을 갱신합니다. canonical Cluster SPM과 "
+                    "3D mesh 자체는 수정하지 않습니다."
+                    if refresh_only else
+                    "Atlas 애드온을 Blender 5.1 배경 실행으로 호출해 대상 SPM의 기존 "
+                    "M_ 재료 mesh를 정규화 mesh로 교체합니다."
+                )
+                if enabled else
+                "Atlas manifest의 백업 스냅샷으로 이 blend가 관리한 mesh와 Generator "
+                "슬롯만 원래 상태로 복원합니다."
+            )
+        )
+        title = "Cluster 갱신" if refresh_only else "Cluster 관계 적용"
+        if not messagebox.askyesno(title, message, parent=self.root):
+            return
+
+        def apply(report):
+            stage = (
+                "Cluster 갱신"
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'}"
+            )
+            report(f"{stage} 준비", 10)
+            if refresh_only:
+                result = run_cluster_relation_transaction(
+                    blend,
+                    changes[0].get("on_target_spms") or [],
+                    enabled=True,
+                    blender_exe=Path(
+                        self.config.get("blender_exe") or DEFAULT_BLENDER
+                    ),
+                )
+            else:
+                result = run_cluster_folder_relation_transaction(
+                    blend,
+                    enabled=enabled,
+                    blender_exe=Path(
+                        self.config.get("blender_exe") or DEFAULT_BLENDER
+                    ),
+                )
+            report("Cluster SPM 메시/Generator 검증 완료", 95)
+            return result
+
+        def done(result):
+            self.refresh()
+            self.status_var.set(
+                (
+                    f"Cluster 갱신 완료 · 폴더 SK {target_count}개"
+                    if refresh_only
+                    else
+                    f"Cluster 관계 {'ON' if enabled else 'OFF'} 완료 · "
+                    f"폴더 SK {target_count}개"
+                )
+            )
+            messagebox.showinfo(
+                "Cluster 갱신 완료" if refresh_only else "Cluster 관계 완료",
+                f"{blend.name}\n"
+                + (
+                    "현재 Blender 결과 재적용"
+                    if refresh_only else f"관계 {'ON' if enabled else 'OFF'}"
+                )
+                + " · "
+                + (
+                    f"ON 대상 SK {target_count}개\n"
+                    if refresh_only
+                    else f"폴더 SK {target_count}개 전체\n"
+                )
+                + f"모드: {result.get('mode')}",
+                parent=self.root,
+            )
+
+        self._start_job(
+            (
+                "Cluster 갱신 적용 중..."
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'} 적용 중..."
+            ),
+            apply,
+            done,
+        )
+
     def edit_selected_base_map(self):
         items = self.selected_items()
         if len(items) != 1 or items[0].get("role") != "follower":
@@ -1224,7 +1600,14 @@ class App:
         self.job_stage = label
         self.progress_bar.configure(value=1)
         self.progress_text_var.set(f"{label} · 00:00")
-        for button in (self.preview_button, self.apply_button, self.apply_all_button):
+        buttons = [
+            getattr(self, name, None) for name in (
+                "preview_button", "apply_button", "apply_all_button",
+                "cluster_on_button", "cluster_refresh_button",
+                "cluster_off_button",
+            )
+        ]
+        for button in (button for button in buttons if button is not None):
             button.configure(state="disabled")
 
         def report(stage, percent):
@@ -1264,7 +1647,14 @@ class App:
             return
 
         _kind, ok, payload, on_success = completed
-        for button in (self.preview_button, self.apply_button, self.apply_all_button):
+        buttons = [
+            getattr(self, name, None) for name in (
+                "preview_button", "apply_button", "apply_all_button",
+                "cluster_on_button", "cluster_refresh_button",
+                "cluster_off_button",
+            )
+        ]
+        for button in (button for button in buttons if button is not None):
             button.configure(state="normal")
         if ok:
             self.progress_bar.configure(value=100)

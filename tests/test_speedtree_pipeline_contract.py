@@ -233,6 +233,10 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
         )
 
     def test_all_backup_namespaces_are_not_live_spms(self):
+        self.assertIn(
+            "_atlas_cluster_normalization_backups",
+            BACKUP_DIRECTORY_NAMES,
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             live = write_spm(root / "SK_live.spm")

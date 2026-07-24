@@ -10,6 +10,11 @@ from .spm_generator_sync import (
     scan_tree_folders,
     suggest_base_map,
 )
+from cluster_blend_sync import (
+    discover_cluster_blend_relations,
+    run_cluster_folder_relation_transaction,
+    run_cluster_relation_transaction,
+)
 
 __all__ = [
     "CATEGORY_COLORS",
@@ -20,4 +25,7 @@ __all__ = [
     "promote_master",
     "scan_tree_folders",
     "suggest_base_map",
+    "discover_cluster_blend_relations",
+    "run_cluster_folder_relation_transaction",
+    "run_cluster_relation_transaction",
 ]

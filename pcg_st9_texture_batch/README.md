@@ -11,19 +11,24 @@ PCG_ST9_Texture_Batch.bat
 
 ## 화면 구성
 
-- **표**: 나무 폴더 하나 = 한 행. 컬럼 순서 = 작업 순서.
+- **표**: 나무 폴더는 공유 작업 그룹이고, 바로 아래에 실제 또는 생성 예정
+  `SK_*.spm`이 각각 체크 가능한 행으로 모두 보인다. 컬럼 순서 = 작업 순서.
 - **행 클릭** → 아래 상세 패널에 "이 폴더는 뭐가 되어 있고, 다음에 어느 프로그램에서
   뭘 하면 되는지"가 문장으로 나온다. 파일 저장이나 다른 창 열기 없음.
 - **로그**: 실행/건너뜀 내역과 이유.
+- 폴더 체크는 자식 SPM 전체를, SPM 체크는 해당 모델 하나만 선택한다. ①은 체크된
+  SPM만 정확히 처리하고, ②·③은 선택된 SPM이 속한 폴더의 공유 작업을 한 번만 처리한다.
 
 ## 단계 (표의 컬럼)
 
 | 컬럼 | 뜻 | 누가 하나 |
 |---|---|---|
-| ① 기존 SK + 머티리얼 이름 | 일반 식생 원본을 `SK_이름.spm`으로 복사 + 머티리얼 `M_` 이름 및 공용 이름 정리 | **[① 실행] 버튼이 자동 처리** |
-| ①-C Cluster M_만 | 선택한 Cluster 원본 SPM의 파일명과 TGA basename은 유지하고 머티리얼 `M_`만 정리 | **[①-C 실행] 버튼이 자동 처리** |
+| ① SK + 머티리얼 이름 | 일반 식생과 Cluster output을 canonical `SK_*.spm`으로 정규화한 뒤 머티리얼 `M_` 이름 및 공용 이름을 정리 | **[① 실행] 버튼이 자동 처리** |
 | ② 잎 메시 (Blender) | 아틀라스 리프 제너레이터로 오파시티 없는 잎 지오메트리 생성 | **[② 실행] 버튼이 자동 처리** (헤드리스 Blender) — 직접 할 값도 상세 패널에 나온다 |
 | ③ 텍스처 (Substance) | 표시된 SpeedTree Generator가 사용하는 고유 연결 텍스처 세트마다 `T_` 6장 추출 | **[③ 실행] 버튼이 자동 처리** (sbsrender) — SBS 그래프와 SPM 연결도 `T_`로 관리 |
+| ④ Blend ↔ SPM 확인 | 실제 `.blend` 파일별 대상 목록과 현재 SPM Generator 연결 상태 감사 | **JSON 공동 관리** — 기본 SPM 행은 폴더 바로 아래에 항상 보이고, blend 행을 펼치면 해당 연결 문맥의 SPM과 상태가 나온다. 선택 blend에 SPM을 추가하거나 선택 SPM을 목록에서 제거할 수 있다 |
+
+④의 대상 목록은 각 blend 옆 `<blend stem>.atlas_leaf_targets.json`을 기준으로 집계한다. 이 파일은 Blender `atlas_leaf_mesh_builder` 애드온과 공유된다. `선택 SPM 제거` 또는 Atlas 자식 행의 `Delete`는 실제 `.spm` 파일을 삭제하지 않고 먼저 `_spm_backups` 백업을 만든 뒤 원래 Generator 슬롯을 복원하고 해당 blend scope의 Material_v8/Mesh 자산만 SPM 내부에서 제거한다. 구형 manifest에 원래 슬롯 값이 없으면 해당 owned 슬롯을 `Material=-1`, `Mesh=-10`으로 해제한다. 검증이 끝난 뒤에만 JSON에서 빠진다. JSON이 아직 없는 기존 blend만 감사 결과를 임시 fallback으로 사용한다. 목록에 있으나 현재 경로에 없는 SPM은 `파일 없음`으로 유지해 잘못된 경로나 이동된 파일을 확인할 수 있게 한다.
 
 SK SPM 리페어 `.blend`의 상태 확인과 교체는 `..\sk_batch\SK_Batch.bat`가 단독으로 담당한다.
 이 보드는 해당 상태를 판정하거나 작업 완료 여부에 포함하지 않는다.
@@ -33,6 +38,15 @@ SK SPM 리페어 `.blend`의 상태 확인과 교체는 `..\sk_batch\SK_Batch.ba
 - 체크된 행 중 ①이 필요한 항목에만 적용된다.
 - 수정 전 원본은 각 폴더의 `_spm_backups\` 에 백업이 남는다.
 - 실행 전 확인창에 "SK 몇 개 생성, 이름 몇 개 변경"이 정확히 표시된다.
+- Cluster의 최초 무접두사 상태는 해당 SPM을 canonical `SK_*.spm` output으로 한 번
+  정규화한다. 이후 `M_` 정리, SpeedTree export, Blender와 Unreal 입력은 canonical SK만
+  기준으로 하며 canonical 내용을 예전 무접두사 파일로 다시 게시하지 않는다.
+- Cluster 안의 모든 named Material_v8는 일반 `M_` 규칙으로 정리한다. 실제 export 참여
+  재료가 canonical `M_*` 이름을 유지하며, 같은 이름으로 겹치는 비출력 legacy 재료는
+  `_old`, `_old_02` 순으로 결정적으로 보존한다. 같은 canonical 이름을 요구하는 재료가
+  둘 다 export 참여 상태이면 자동 추측하지 않고 차단한다.
+- canonical 생성 뒤 남은 무접두사 파일은 레거시 입력 증거로만 보존한다. 그 파일이
+  바뀌어도 canonical output으로 역복사하거나 현재 output 판정을 바꾸지 않는다.
 - 문제가 있는 항목은 자동으로 건너뛰고 로그에 이유를 적는다:
   - **중복 매칭**: 같은 PCG 메시가 여러 폴더에 매칭됨 → 어느 폴더가 진짜인지 먼저 확인
   - **원본 못 찾음**: 폴더에서 해당 메시의 원본 SPM을 못 찾음 → 파일 이름 확인
@@ -62,7 +76,10 @@ SK SPM 리페어 `.blend`의 상태 확인과 교체는 `..\sk_batch\SK_Batch.ba
 클러스터 없이 원본 잎 아틀라스를 직접 쓰는 SPM도 같은 방식으로 찾는다.
 동일한 절대경로의 알베도+알파 쌍을 여러 Cluster SPM이 재사용하면 blend/메시는
 한 번만 만들고, 그 Cluster 결과를 사용하던 **최종 SK SPM 목록**만 합친다.
-Cluster SPM은 원본 아틀라스 추적 근거일 뿐이며 대상 개수와 파일 수정에서 제외한다.
+Cluster SPM은 ② 원본 아틀라스 추적 근거일 뿐이며 ②의 대상 개수와 파일 수정에서는 제외한다.
+Cluster SPM pair의 최초 canonical `SK_` 생성과 머티리얼 정리는 ①에서만 수행한다.
+무접두사 SPM은 TGA·카메라 원본으로 남으며 canonical 내용을 그 파일에 다시
+게시하지 않는다.
 최종 SPM의 옛 Cluster Generator도 같은 원칙이다. 공용 Legacy Cluster 계약의
 receipt에 기록된 Generator GUID는 숨김/표시 여부와 무관하게 과거 출처로만 보존한다.
 receipt가 없는 현재 Generator만 실제 export 참여 여부를 보고 ② 작업 대상으로 센다.
@@ -77,17 +94,33 @@ receipt가 없는 현재 Generator만 실제 export 참여 여부를 보고 ② 
 ## Cluster → Assembly dependency와 handoff
 
 기존 감사와 같은 행 안에서 Tree/Bush/Weed의 실제 `Cluster` 폴더와 그 직하의
-모든 non-SK SPM을 파일별 독립 행으로 표시한다. `branch_*`/`leaf_*`뿐 아니라
-`cluster_*` 같은 기존 이름도 숨기지 않는다. 각 자식 행은 정확한 원본 SPM 경로를
-복사하지만 PCG ①의 SK SPM 생성 대상은 아니다. Cluster 원본 SPM은 이름을 바꾸거나
-이동하지 않는다. 필요한 `M_` 정리는 별도 ①-C에서 같은 원본에 백업 후 적용하며,
-SK Batch ②가 이 원본을 읽어 `SK_<원본명>.blend`만 만든다.
+SPM pair를 파일별 독립 행으로 표시한다. `branch_*`/`leaf_*`뿐 아니라
+`cluster_*` 같은 기존 이름도 숨기지 않는다. 각 행에는 canonical `SK_*.spm` output,
+레거시 무접두사 입력과 이름 정규화 상태가 함께 표시된다. 별도 Cluster 버튼은 없으며
+일반 ① 선택에 포함된다. 무접두사 파일만 있으면 canonical `SK_` output으로 한 번
+정규화한다. 이후 SK Batch, SpeedTree 렌더·FBX·STMAT·보고서와 Unreal Push는 모두
+canonical `SK_` stem을 사용한다.
 
-GUI의 `Cluster 출력 TGA 연결 N장`은 해당 Cluster SPM이 최종 렌더 결과로 연결한
-TGA 경로 수다. 실제 파일이 없으면 `누락 M장`을 따로 표시한다. 잎 메시 ②가
+SpeedTree Cluster Normalizer가 만든 `Cluster/SK_<원본>.blend`도 같은 Cluster 하위에
+표시한다. 해당 blend는 부모 식생 폴더 전체에 대해 관계 하나만 가지며, Base나 SK별
+ON/OFF 행 없이 `ON`/`OFF`로 표시한다. `ON`은 폴더 직하 모든 `SK_*.spm`, `OFF`는
+전체 해제다. 일부만 연결된 기존 상태는 `PARTIAL`로 감사한다. blend 옆
+`.atlas_leaf_targets.json`을 SPM Generator Sync와 공유하며 PCG 보드는 이 관계와
+실제 Generator 연결 완료 여부를 읽기 전용으로
+보여 준다. 관계 변경, 기존 `M_*` embedded mesh 제거, 정규화 mesh 삽입 및 OFF 복원은
+SPM Generator Sync가 Atlas Leaf Mesh Builder를 호출하여 수행한다.
+
+legacy 항목의 `Cluster 출력 TGA 연결 N장`은 해당 Cluster SPM이 최종 렌더 결과로
+연결한 TGA 경로 수다. `PHYSICAL_DIRECT_CAPTURE` 항목은 Color/Opacity를 포함한
+같은 Blender 촬영 영수증과 해상도를 확인해 `Blender 촬영 1024² · 완료`처럼
+표시하며, 호환용 기본 맵까지 합친 8장 수를 완료 의미로 노출하지 않는다.
+실제 파일이 없으면 `누락 M장`을 따로 표시한다. 잎 메시 ②가
 추적하는 내부 원본 알베도/알파나 머티리얼 슬롯 수와는 다른 값이다. 같은 자산
-아래의 `Blender` 행은 표 데이터가 아니라 식생 폴더 경로를 복사하기 위한 보조
-행이며, 파일이나 폴더를 새로 만들지 않는다.
+아래에는 추상적인 `Blender` 보조 행 대신 감사에서 확인된 실제 `.blend` 파일명이
+별도 관리 행으로 표시된다. 파일 행은 기본적으로 접혀 있으며 펼치면 해당 blend가
+적용되는 최종 SPM과 Generator 연결 완료/점검/미확인 상태를 확인할 수 있다. blend
+행은 실제 `.blend` 경로를, 자식 SPM 행은 해당 SPM 경로를 복사한다. 이 관계 표시는
+①~③ 작업 단계와 별개의 관리 정보이며 파일이나 폴더를 새로 만들지 않는다.
 
 Assembly 역할은 이 전체 inventory와 분리한다. export FBX에서 material–mesh
 완전쌍이 확인된 `branch`/`leaf`만 Assembly 후보가 되고, 일반 `cluster_*` 행은

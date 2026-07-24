@@ -332,6 +332,66 @@ def test_runtime_pending_checkpoint_finishes_without_reimport(tmp_path, monkeypa
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
 
 
+def test_headless_runtime_validation_is_deferred_without_starting_probe(monkeypatch):
+    runner = load_runner(monkeypatch)
+    monkeypatch.setenv("SK_BATCH_MANIFEST_PATH", "headless-manifest.json")
+    monkeypatch.setattr(
+        runner,
+        "_begin_instanced_dynamic_wind_runtime",
+        lambda _path: (_ for _ in ()).throw(AssertionError("probe started")),
+    )
+    assembly = {
+        "status": "ready_for_runtime",
+        "build": {"assembly": "/Game/Meshes/Tree/Assembly"},
+    }
+
+    status = runner._prepare_assembly_runtime_validation(assembly)
+
+    assert status == "imported_ok"
+    assert assembly["status"] == "ok"
+    assert assembly["runtime"]["status"] == "headless_deferred"
+    assert assembly["runtime"]["render_frame_validation_performed"] is False
+
+
+def test_headless_restart_recovers_pending_without_reimport(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest(
+        tmp_path,
+        [item("elm", "elm-v1")],
+    )
+    import_calls = []
+
+    def ingest(current):
+        import_calls.append(current["queue_id"])
+        return {
+            "status": "runtime_pending",
+            "cluster_assembly": {
+                "status": "runtime_pending",
+                "runtime": {
+                    "success": True,
+                    "status": "pending",
+                    "probe_token": "probe-from-previous-commandlet",
+                },
+            },
+        }
+
+    monkeypatch.delenv("SK_BATCH_MANIFEST_PATH", raising=False)
+    monkeypatch.setattr(runner, "ingest_item", ingest)
+    first = runner.run_manifest(manifest)
+    assert first["status"] == "runtime_pending"
+
+    monkeypatch.setenv("SK_BATCH_MANIFEST_PATH", str(manifest))
+    recovered = runner.run_manifest(manifest, checkpoint, report)
+
+    state = recovered["items"]["elm"]
+    assert recovered["status"] == "complete"
+    assert state["status"] == "imported_ok"
+    assert state["cluster_assembly"]["status"] == "ok"
+    assert state["cluster_assembly"]["runtime"]["status"] == "headless_deferred"
+    assert state["cluster_assembly"]["runtime"]["recovered_from_pending"] is True
+    assert import_calls == ["elm"]
+
+
 def test_runtime_pending_checkpoint_cancel_is_terminal(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     manifest, checkpoint, report = write_manifest(
@@ -885,3 +945,70 @@ class UnrealIngestSaveTests(unittest.TestCase):
             self.fail("material validation failure must propagate")
 
         self.assertEqual(events, ["save", "validate"])
+
+
+class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
+    def test_missing_imported_slot_names_are_normalized_before_reimport(self):
+        runner = load_runner()
+        calls = []
+
+        class FakeMaterial:
+            def get_path_name(self):
+                return "/Game/MI/MI_Bark.MI_Bark"
+
+        class FakeSlot:
+            def get_editor_property(self, name):
+                return {
+                    "imported_material_slot_name": "None",
+                    "material_slot_name": "M_Bark",
+                    "material_interface": FakeMaterial(),
+                }[name]
+
+        class FakeMesh:
+            def get_editor_property(self, name):
+                self.assert_materials = name
+                return [FakeSlot()]
+
+        mesh = FakeMesh()
+        runner.unreal.SkeletalMesh = FakeMesh
+        runner.unreal.Name = lambda value: value
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: mesh
+        )
+
+        def normalize(*args):
+            calls.append(args)
+            return json.dumps({"desired_is_set": True, "changed": True})
+
+        runner.unreal.CodexMaterialToolsLibrary = types.SimpleNamespace(
+            normalize_skeletal_mesh_material_slot=normalize
+        )
+
+        result = runner._normalize_existing_skeletal_mesh_imported_slot_names(
+            "/Game/Trees/SK_Branch"
+        )
+
+        self.assertEqual(result["status"], "normalized")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "/Game/Trees/SK_Branch",
+                    0,
+                    "None",
+                    "M_Bark",
+                    "/Game/MI/MI_Bark.MI_Bark",
+                    True,
+                )
+            ],
+        )
+
+    def test_missing_asset_is_a_fresh_import(self):
+        runner = load_runner()
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: None
+        )
+        result = runner._normalize_existing_skeletal_mesh_imported_slot_names(
+            "/Game/Trees/SK_New"
+        )
+        self.assertEqual(result["status"], "fresh")

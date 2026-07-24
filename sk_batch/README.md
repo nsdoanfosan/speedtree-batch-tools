@@ -27,13 +27,13 @@ timestamp 변경, SpeedTree 실행, 상태 캐시 저장을 하지 않으므로 
 목록 표에는 ①~③ 상태를 짧게 줄여 표시한다. 행을 선택하면 표 아래 `선택 항목
 상세`에서 전체 경로와 줄이지 않은 상태 문구를 볼 수 있으며, `Ctrl+C`로 선택한
 SPM 경로를 복사할 수 있다.
-실제 `Cluster` 폴더가 있으면 Tree/Bush/Weed 구분 없이 그 하위 non-SK 원본 SPM을
-폴더 계층으로 표시한다. `branch_elm_01.spm` 같은 원본은 그대로 Blender 입력으로
-쓰며 `SK_branch_elm_01.spm` 중간 파일을 만들지 않는다. 이 행의 ① 본 보정은 원본
-보호를 위해 성공적으로 생략하고, ②는 sibling `SK_branch_elm_01.blend`를 만든다.
-FBX/STMAT/판용 TGA identity는 원본 stem `branch_elm_01`을 유지한다. SK Batch 자체가
-Blender 파일 생성 도구이므로 PCG 화면과 같은 `Blender` 경로 복사 전용 행은
-추가하지 않는다.
+실제 `Cluster` 폴더의 production output도 일반 식생과 같은
+`SK_branch_elm_01.spm` 규격을 사용한다. 예전 무접두사
+`branch_elm_01.spm`만 남은 경우에는 첫 ①/② 실행 때 내용을 검증한 뒤 canonical
+`SK_` 이름으로 한 번 정규화한다. 이후 표·SpeedTree FBX/STMAT·Blend·보고서·Unreal
+identity는 모두 canonical `SK_` stem만 사용하며, canonical 내용을 다시 무접두사
+파일로 게시하지 않는다. 남아 있는 무접두사 파일은 레거시 입력 증거일 뿐 현재
+output으로 판정하지 않는다.
 SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 실제
 `Leaf Mesh`/`Frond` Generator의 Material과 Mesh가 같은 새 Atlas 자산에 연결됐는지도
 검사한다. 숨김·삭제·컬링 상태이거나 실제 생성 Node가 0개인 Generator는 export 대상이
@@ -202,7 +202,9 @@ headless transport의 Blender export도 기본 2개씩 처리하며 Unreal impor
 
 ### raw Cluster Blender 결과와 원본 검토 상태
 
-- `Cluster\branch_elm_01.spm` 같은 non-SK 원본은 읽기 전용 입력이다. SPM/TGA/FBX/JSON stem은 그대로 두고 Blender 파일만 `SK_branch_elm_01.blend`로 만든다.
+- `Cluster\branch_elm_01.spm` 같은 무접두사 레거시 입력은 한 번
+  `SK_branch_elm_01.spm`으로 정규화한다. 이후 SPM/FBX/STMAT/JSON/Blend는 모두
+  `SK_branch_elm_01` stem을 사용한다.
 - 원본에 선언된 텍스처 경로 또는 실제 FBX material slot이 완전하지 않아도, 검증된 raw Cluster 보존 계약이면 ② Blender 생성은 완료할 수 있다. 이때 보고서는 `handoff_preflight.status=source_review`, `source_review_required=true`, `unreal_push_ready=false`를 기록한다.
 - GUI 행은 이 상태를 `Blend 완료 · 원본 검토 필요 · Unreal Push 차단`으로 표시한다. Blend 열기와 경로 복사는 허용하지만 ③ Unreal Push 준비 목록에서는 제외한다.
 - `source_review`는 최신 receipt가 없거나 Blender Repair가 실패했다는 뜻이 아니다. 현재 원본의 결손을 그대로 보존했다는 뜻이며, 원본 SPM/TGA를 자동 수정하거나 이름을 바꾸지 않는다.

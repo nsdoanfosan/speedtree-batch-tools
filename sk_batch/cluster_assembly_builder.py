@@ -23,19 +23,244 @@ import json
 import math
 import os
 import statistics
+import subprocess
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from nanite_assembly_materials import (
+    NaniteAssemblyMaterialError,
+    normalize_unreal_nanite_assembly_materials,
+)
+
 
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
-ROLE_ORDER = ("branch", "leaf")
-
-
+ROLE_ORDER = ("branch", "leaf", "leaf_side")
 class ClusterAssemblyBuildError(RuntimeError):
     """Raised when a content or hierarchy invariant is not proven."""
+
+
+def _coalesce_normalized_external_parts(parts):
+    """Collapse topology buckets that resolve to one normalized SK asset.
+
+    SpeedTree may emit the same mesh slot with several clipped topology
+    signatures.  Those signatures need separate correspondence fits, but they
+    are instances of one authored normalized skeletal asset and therefore must
+    become one native Nanite Assembly part.
+    """
+    grouped = {}
+    passthrough = []
+    for source_part in parts or []:
+        part = deepcopy(source_part)
+        external = part.get("external_source") or {}
+        if external.get("kind") != "send_to_unreal_normalized_skeletal_part":
+            passthrough.append(part)
+            continue
+        role = str(part.get("role") or "").casefold()
+        asset_name = str(part.get("asset_name") or "")
+        relative_folder = str(
+            external.get("unreal_relative_folder") or ""
+        ).replace("\\", "/").strip("/")
+        if role not in ROLE_ORDER or not asset_name or not relative_folder:
+            raise ClusterAssemblyBuildError(
+                "normalized external part cannot be logically grouped"
+            )
+        key = (role, relative_folder.casefold(), asset_name.casefold())
+        incoming_bindings = list(part.get("bindings") or [])
+        accumulator = grouped.get(key)
+        if accumulator is None:
+            accumulator = part
+            accumulator["source_topology_signatures"] = []
+            accumulator["bindings"] = []
+            grouped[key] = accumulator
+        elif (
+            str(accumulator.get("role_identity") or "")
+            != str(part.get("role_identity") or "")
+            or str(
+                (accumulator.get("external_source") or {}).get(
+                    "pivot_contract"
+                )
+                or ""
+            )
+            != str(external.get("pivot_contract") or "")
+        ):
+            raise ClusterAssemblyBuildError(
+                "one normalized SK asset has inconsistent Assembly contracts: "
+                + asset_name
+            )
+        signature = str(part.get("topology_signature") or "")
+        if (
+            signature
+            and signature
+            not in accumulator["source_topology_signatures"]
+        ):
+            accumulator["source_topology_signatures"].append(signature)
+        accumulator["bindings"].extend(incoming_bindings)
+
+    collapsed = []
+    for (role, relative_folder, asset_name), part in grouped.items():
+        external = part["external_source"]
+        ordinals = sorted({
+            int(value)
+            for value in (
+                list(external.get("card_ordinals") or [])
+                + [int(external.get("ordinal") or 0)]
+            )
+            if int(value) > 0
+        })
+        logical_subpart = int(part.get("logical_subpart_index") or 0)
+        if logical_subpart <= 0 and len(ordinals) == 1:
+            logical_subpart = ordinals[0]
+        part["logical_group_index"] = ROLE_ORDER.index(role)
+        part["logical_subpart_index"] = logical_subpart
+        part["topology_signature"] = "normalized_external_asset"
+        part["prototype_id"] = (
+            f"{role}_normalized_{logical_subpart:02d}_"
+            + hashlib.sha1(
+                f"{relative_folder}/{asset_name}".encode("utf-8")
+            ).hexdigest()[:16]
+        )
+        external["card_ordinals"] = ordinals
+        if len(ordinals) != 1:
+            external["ordinal"] = 0
+        for instance_index, binding in enumerate(part["bindings"]):
+            binding["instance"] = instance_index
+        fit_rows = part["bindings"]
+        if fit_rows:
+            part["fit_summary"] = {
+                "fit_mode": "uniform_similarity_3d_normalized_asset",
+                "trs_relative_rms_median": statistics.median(
+                    row["transform"]["trs_relative_rms"] for row in fit_rows
+                ),
+                "trs_relative_rms_max": max(
+                    row["transform"]["trs_relative_rms"] for row in fit_rows
+                ),
+                "affine_relative_rms_median": statistics.median(
+                    row["transform"]["affine_relative_rms"] for row in fit_rows
+                ),
+                "affine_relative_rms_max": max(
+                    row["transform"]["affine_relative_rms"] for row in fit_rows
+                ),
+            }
+        collapsed.append(part)
+
+    collapsed.extend(passthrough)
+    collapsed.sort(
+        key=lambda part: (
+            int(
+                part.get(
+                    "logical_group_index",
+                    ROLE_ORDER.index(str(part.get("role") or "").casefold()),
+                )
+            ),
+            int(
+                part.get("logical_subpart_index")
+                or (part.get("external_source") or {}).get("ordinal")
+                or 0
+            ),
+            str(part.get("asset_name") or "").casefold(),
+        )
+    )
+    return collapsed
+
+
+def _public_base_name(full_stem):
+    return f"{full_stem}_NA_Base"
+
+
+def _public_part_name(full_stem, role, role_index):
+    """Return a tree-specific Assembly prototype name.
+
+    ``SK_branch_elm_01`` and ``SK_leaf_elm_01`` are authoritative raw 3D
+    cluster/data exports.  Reusing those names for the tiny repeated Assembly
+    prototypes lets a later raw-cluster import silently replace a 14/15-vertex
+    prototype with the complete cluster mesh.  Keep the Assembly FBX and
+    Unreal asset names in a separate, tree-specific namespace instead.
+    """
+    stem = str(full_stem or "").strip()
+    normalized_role = str(role or "").strip().casefold()
+    if not stem:
+        raise ClusterAssemblyBuildError("Assembly Full asset stem is missing")
+    if normalized_role not in ROLE_ORDER:
+        raise ClusterAssemblyBuildError(
+            f"Assembly part role is invalid: {normalized_role!r}"
+        )
+    return f"{stem}_NA_{normalized_role.title()}_{int(role_index):02d}"
+
+
+def _validate_public_export_names(manifest):
+    """Keep topology hashes internal and prove every public FBX/asset name."""
+    full_stem = str((manifest or {}).get("full_asset_stem") or "")
+    if not full_stem:
+        raise ClusterAssemblyBuildError("Assembly Full asset stem is missing")
+    base = (manifest or {}).get("base") or {}
+    expected_base = _public_base_name(full_stem)
+    if (
+        str(base.get("asset_name") or "") != expected_base
+        or str(base.get("export_stem") or "") != expected_base
+    ):
+        raise ClusterAssemblyBuildError(
+            f"Assembly base public name contract changed: expected {expected_base}"
+        )
+    base_path = str((base.get("fbx") or {}).get("path") or "")
+    if Path(base_path).stem != expected_base:
+        raise ClusterAssemblyBuildError(
+            "Assembly base FBX does not use its public export stem"
+        )
+
+    role_counts = Counter()
+    seen_public_names = {expected_base.casefold(): False}
+    for part in (manifest or {}).get("parts") or []:
+        role = str(part.get("role") or "").casefold()
+        role_counts[role] += 1
+        external = part.get("external_source") or {}
+        if external:
+            expected_part = str(part.get("asset_name") or "")
+            if (
+                not expected_part
+                or str(part.get("export_stem") or "") != expected_part
+                or external.get("kind")
+                != "send_to_unreal_normalized_skeletal_part"
+            ):
+                raise ClusterAssemblyBuildError(
+                    "normalized external Assembly part name/source contract is invalid: "
+                    f"role={role!r}, asset_name={expected_part!r}, "
+                    f"export_stem={str(part.get('export_stem') or '')!r}, "
+                    f"external_kind={str(external.get('kind') or '')!r}"
+                )
+        else:
+            expected_part = _public_part_name(
+                full_stem,
+                role,
+                role_counts[role],
+            )
+            if (
+                str(part.get("asset_name") or "") != expected_part
+                or str(part.get("export_stem") or "") != expected_part
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"Assembly part public name contract changed: expected {expected_part}"
+                )
+            part_path = str((part.get("fbx") or {}).get("path") or "")
+            if Path(part_path).stem != expected_part:
+                raise ClusterAssemblyBuildError(
+                    "Assembly part FBX does not use its public export stem"
+                )
+        folded = expected_part.casefold()
+        if folded in seen_public_names:
+            if not external or not seen_public_names[folded]:
+                raise ClusterAssemblyBuildError(
+                    f"duplicate Assembly public asset name: {expected_part}"
+                )
+        else:
+            seen_public_names[folded] = bool(external)
+    return {
+        "full_asset_stem": full_stem,
+        "base": expected_base,
+        "parts": role_counts,
+    }
 
 
 def _canonical_json(value):
@@ -94,11 +319,841 @@ def validate_file_fingerprint(record, label):
     return actual
 
 
+_PHYSICAL_CAPTURE_KIND = "speedtree_cluster_physical_capture_fit"
+_PHYSICAL_CAPTURE_WORKFLOW = "PHYSICAL_DIRECT_CAPTURE"
+_DIRECT_CAPTURE_UV_SOURCE = "same_blender_physical_capture_projection"
+_UNIT_PROBE_KIND = "speedtree_fbx_spm_unit_probe"
+_NORMALIZED_PIVOT_CONTRACT = "normalized_attachment_origin_0_0_0"
+_RECEIPT_SCAN_SKIP_KEYS = {
+    "bindings",
+    "bone_influences",
+    "component_polygon_indices",
+    "fit_matrix_world",
+    "final_skeleton",
+    "maps",
+    "plan_hull",
+    "result_uvs",
+    "source_objects",
+}
+
+
+def _production_receipts(value, role=None):
+    """Yield compact production receipts without walking binding-heavy payloads."""
+    if isinstance(value, list):
+        for row in value:
+            yield from _production_receipts(row, role)
+        return
+    if not isinstance(value, dict):
+        return
+
+    local_role = str(value.get("role") or role or "").casefold() or None
+    kind = str(value.get("kind") or "")
+    if kind == _PHYSICAL_CAPTURE_KIND:
+        yield "capture", local_role, value
+        return
+    if kind == _UNIT_PROBE_KIND:
+        yield "unit_probe", local_role, value
+        return
+    if (
+        value.get("workflow_mode") == _PHYSICAL_CAPTURE_WORKFLOW
+        and isinstance(value.get("physical_capture_contract"), dict)
+        and isinstance(value.get("prototypes"), list)
+        and isinstance(value.get("variants"), list)
+    ):
+        yield "normalized", local_role, value
+
+    for key, child in value.items():
+        if key in _RECEIPT_SCAN_SKIP_KEYS:
+            continue
+        child_role = key.casefold() if key.casefold() in ROLE_ORDER else local_role
+        if isinstance(child, (dict, list)):
+            yield from _production_receipts(child, child_role)
+
+
+def _deduplicated_receipts(manifest):
+    result = {"capture": [], "unit_probe": [], "normalized": []}
+    seen = set()
+    for receipt_type, role, payload in _production_receipts(manifest):
+        key = (receipt_type, role, _canonical_json(payload))
+        if key in seen:
+            continue
+        seen.add(key)
+        result[receipt_type].append((role, payload))
+    return result
+
+
+def _checked_normalized_bounds(value, label):
+    if not isinstance(value, dict):
+        raise ClusterAssemblyBuildError(f"{label} normalized bounds are missing")
+    size = value.get("size")
+    if not isinstance(size, (list, tuple)) or len(size) != 3:
+        raise ClusterAssemblyBuildError(
+            f"{label} normalized bounds size is invalid"
+        )
+    try:
+        checked_size = [float(component) for component in size]
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            f"{label} normalized bounds size is not numeric"
+        ) from exc
+    if any(
+        not math.isfinite(component) or component < 0.0
+        for component in checked_size
+    ) or max(checked_size) <= 0.0:
+        raise ClusterAssemblyBuildError(
+            f"{label} normalized bounds size is not finite and non-negative"
+        )
+    result = deepcopy(value)
+    result["size"] = checked_size
+    return result
+
+
+def _expected_normalized_bounds_for_variant(
+    normalized_contract,
+    variant,
+    asset_name,
+    ordinal,
+):
+    """Resolve one prototype's authored meter-space bounds from build metadata."""
+    asset_key = str(asset_name or "").casefold()
+    try:
+        ordinal_key = int(ordinal)
+    except (TypeError, ValueError):
+        ordinal_key = 0
+    candidates = []
+    direct = (variant or {}).get("expected_normalized_bounds")
+    if direct is None:
+        direct = (variant or {}).get("normalized_bounds")
+    if direct is not None:
+        candidates.append(
+            (
+                2,
+                _checked_normalized_bounds(
+                    direct,
+                    f"normalized variant {asset_name}",
+                ),
+            )
+        )
+
+    identity_keys = (
+        "skeletal_asset_name",
+        "skeletal_asset",
+        "prototype_asset",
+        "asset_name",
+    )
+    ordinal_keys = ("ordinal", "card_index", "index", "prototype_index")
+
+    def walk(value):
+        if isinstance(value, list):
+            for child in value:
+                walk(child)
+            return
+        if not isinstance(value, dict):
+            return
+        bounds = value.get("expected_normalized_bounds")
+        if bounds is None:
+            bounds = value.get("normalized_bounds")
+        if bounds is not None:
+            identities = {
+                str(value.get(key) or "").casefold()
+                for key in identity_keys
+                if value.get(key)
+            }
+            ordinals = set()
+            for key in ordinal_keys:
+                if value.get(key) is None:
+                    continue
+                try:
+                    ordinals.add(int(value[key]))
+                except (TypeError, ValueError):
+                    pass
+            identity_matches = bool(asset_key and asset_key in identities)
+            ordinal_matches = bool(ordinal_key and ordinal_key in ordinals)
+            if identity_matches or (not identities and ordinal_matches):
+                is_card_variant = bool(
+                    value.get("card_index")
+                    or value.get("plan")
+                    or value.get("plan_name")
+                )
+                candidates.append(
+                    (
+                        1 if is_card_variant else 2,
+                        _checked_normalized_bounds(
+                            bounds,
+                            f"normalized build metadata {asset_name}",
+                        ),
+                    )
+                )
+        for key, child in value.items():
+            if key in _RECEIPT_SCAN_SKIP_KEYS or key in {
+                "expected_normalized_bounds",
+                "normalized_bounds",
+            }:
+                continue
+            if isinstance(child, (dict, list)):
+                walk(child)
+
+    walk(normalized_contract or {})
+    highest_priority = max(
+        (priority for priority, _candidate in candidates),
+        default=0,
+    )
+    unique = {
+        _canonical_json(candidate): candidate
+        for priority, candidate in candidates
+        if priority == highest_priority
+    }
+    if len(unique) > 1:
+        raise ClusterAssemblyBuildError(
+            "normalized prototype has conflicting expected bounds metadata: "
+            + str(asset_name)
+        )
+    return next(iter(unique.values())) if unique else None
+
+
+def _receipt_normalized_bounds_by_asset(manifest):
+    result = {}
+    for role, receipt in _deduplicated_receipts(manifest or {})["normalized"]:
+        for prototype in receipt.get("prototypes") or []:
+            if not isinstance(prototype, dict):
+                continue
+            asset_name = str(
+                prototype.get("skeletal_asset")
+                or prototype.get("skeletal_asset_name")
+                or prototype.get("prototype_asset")
+                or ""
+            )
+            if not asset_name:
+                continue
+            bounds = _checked_normalized_bounds(
+                prototype.get("normalized_bounds"),
+                f"{role or 'normalized'} receipt prototype {asset_name}",
+            )
+            key = asset_name.casefold()
+            existing = result.get(key)
+            if existing is not None and _canonical_json(existing) != _canonical_json(
+                bounds
+            ):
+                raise ClusterAssemblyBuildError(
+                    "normalized receipts disagree on prototype bounds: "
+                    + asset_name
+                )
+            result[key] = bounds
+    return result
+
+
+def _positive_number(value, label):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(f"{label} must be numeric") from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise ClusterAssemblyBuildError(f"{label} must be finite and positive")
+    return result
+
+
+def _validate_capture_receipt(contract, role):
+    if (
+        contract.get("kind") != _PHYSICAL_CAPTURE_KIND
+        or int(contract.get("version") or 0) != 1
+        or contract.get("workflow_mode") != _PHYSICAL_CAPTURE_WORKFLOW
+        or contract.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture contract kind/workflow is invalid"
+        )
+    recorded_hash = str(contract.get("contract_sha256") or "")
+    hash_payload = {
+        key: value for key, value in contract.items()
+        if key != "contract_sha256"
+    }
+    actual_hash = _sha256_bytes(_canonical_json(hash_payload).encode("utf-8"))
+    if not recorded_hash or recorded_hash != actual_hash:
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture contract hash is missing or stale"
+        )
+
+    frame = contract.get("frame") or {}
+    if (
+        frame.get("policy") != "physical_target_uniform_whole_source_fit"
+        or frame.get("workflow_mode") != _PHYSICAL_CAPTURE_WORKFLOW
+        or frame.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
+        or str(frame.get("unit_system") or "") != "METRIC"
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture frame policy is invalid"
+        )
+    scale_length = _positive_number(
+        frame.get("scale_length"), f"{role} capture scale_length"
+    )
+    _positive_number(
+        frame.get("fit_scale"), f"{role} capture fit scale"
+    )
+    width = _positive_number(frame.get("width"), f"{role} capture width")
+    height = _positive_number(frame.get("height"), f"{role} capture height")
+    content_width = _positive_number(
+        frame.get("content_width"), f"{role} capture content width"
+    )
+    content_height = _positive_number(
+        frame.get("content_height"), f"{role} capture content height"
+    )
+    target_meters = frame.get("target_meters") or []
+    target_units = frame.get("target_blender_units") or []
+    if len(target_meters) != 2 or len(target_units) != 2:
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture target evidence is incomplete"
+        )
+    targets_m = [
+        _positive_number(value, f"{role} physical target meters")
+        for value in target_meters
+    ]
+    targets_bu = [
+        _positive_number(value, f"{role} physical target Blender Units")
+        for value in target_units
+    ]
+    target_tolerance = 1.0e-6
+    if any(abs(value - 0.1) > target_tolerance for value in targets_m):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture target is not the declared 0.1m contract"
+        )
+    unit_tolerance = max(max(targets_bu) * 1.0e-6, 1.0e-9)
+    if (
+        abs(width - height) > unit_tolerance
+        or max(abs(value - width) for value in targets_bu) > unit_tolerance
+        or max(
+            abs(targets_bu[index] * scale_length - targets_m[index])
+            for index in range(2)
+        )
+        > target_tolerance
+        or content_width > width + unit_tolerance
+        or content_height > height + unit_tolerance
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture exceeds its declared 0.1m frame"
+        )
+    center = frame.get("center")
+    if (
+        not isinstance(center, (list, tuple))
+        or len(center) != 3
+        or any(not math.isfinite(float(value)) for value in center)
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture center is invalid"
+        )
+    plane = str(frame.get("plane") or "").upper()
+    rotation = float(frame.get("rotation_degrees", math.nan))
+    expected_rotation = 90.0 if role == "leaf_side" else 0.0
+    if (
+        plane not in {"XY", "XZ", "YZ"}
+        or not math.isfinite(rotation)
+        or abs(rotation - expected_rotation) > 1.0e-6
+        or (role == "leaf_side" and plane == "XY")
+        or (role != "leaf_side" and plane != "XY")
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{role} physical capture plane/rotation is invalid"
+        )
+    return {
+        "contract_sha256": recorded_hash,
+        "target_meters": targets_m,
+        "target_blender_units": targets_bu,
+        "scale_length": scale_length,
+        "plane": plane,
+        "rotation_degrees": rotation,
+    }
+
+
+def _validate_unit_probe_receipt(contract):
+    if (
+        contract.get("kind") != _UNIT_PROBE_KIND
+        or int(contract.get("version") or 0) != 1
+        or str(contract.get("status") or "").casefold() != "verified"
+    ):
+        raise ClusterAssemblyBuildError(
+            "common FBX/SpeedTree unit probe is not verified"
+        )
+    target_meters = _positive_number(
+        contract.get("physical_target_meters"),
+        "unit probe physical target meters",
+    )
+    if abs(target_meters - 0.1) > 1.0e-6:
+        raise ClusterAssemblyBuildError(
+            "unit probe does not use the declared 0.1m capture target"
+        )
+    blender_units = contract.get("blender_units") or {}
+    if str(blender_units.get("system") or "").upper() != "METRIC":
+        raise ClusterAssemblyBuildError(
+            "unit probe does not prove Blender METRIC units"
+        )
+    scale_length = _positive_number(
+        blender_units.get("scale_length"), "unit probe scale_length"
+    )
+    target_bu = _positive_number(
+        blender_units.get("target_blender_units"),
+        "unit probe target Blender Units",
+    )
+    if abs(target_bu * scale_length - target_meters) > 1.0e-6:
+        raise ClusterAssemblyBuildError(
+            "unit probe target disagrees with Blender scale_length"
+        )
+
+    selected = contract.get("selected") or {}
+    geometry_scale = _positive_number(
+        selected.get("mesh_geometry_scale"), "FBX geometry scale"
+    )
+    asset_scale = _positive_number(
+        selected.get("mesh_asset_scale"), "SpeedTree Mesh asset scale"
+    )
+    generator_scale = _positive_number(
+        selected.get("generator_scale", 1.0), "SpeedTree generator scale"
+    )
+    identity_tolerance = 1.0e-9
+    non_identity = [
+        name
+        for name, value in (
+            ("FBX_GEOMETRY", geometry_scale),
+            ("SPM_MESH_ASSET", asset_scale),
+        )
+        if abs(value - 1.0) > identity_tolerance
+    ]
+    if abs(generator_scale - 1.0) > identity_tolerance:
+        raise ClusterAssemblyBuildError(
+            "unit probe contains a forbidden generator scale patch"
+        )
+    if len(non_identity) > 1:
+        raise ClusterAssemblyBuildError(
+            "unit conversion is duplicated across FBX geometry and SPM Mesh Scale"
+        )
+    expected_location = non_identity[0] if non_identity else "IDENTITY"
+    if str(selected.get("scale_location") or "").upper() != expected_location:
+        raise ClusterAssemblyBuildError(
+            "unit probe scale location disagrees with its numeric scales"
+        )
+    effective_scale = _positive_number(
+        selected.get("effective_scale"), "effective downstream unit scale"
+    )
+    if abs(effective_scale - geometry_scale * asset_scale) > 1.0e-9:
+        raise ClusterAssemblyBuildError(
+            "unit probe effective scale is internally inconsistent"
+        )
+    generator_types = {
+        str(row.get("generator_type") or "")
+        for row in contract.get("generator_results") or []
+        if isinstance(row, dict)
+        and str(row.get("status") or "").casefold() == "verified"
+        and bool(row.get("same_unit_contract"))
+    }
+    missing_types = {"Frond", "Leaf Mesh"} - generator_types
+    if missing_types:
+        raise ClusterAssemblyBuildError(
+            "unit probe did not verify one common contract for: "
+            + ", ".join(sorted(missing_types))
+        )
+    return {
+        "physical_target_meters": target_meters,
+        "scale_length": scale_length,
+        "target_blender_units": target_bu,
+        "mesh_geometry_scale": geometry_scale,
+        "mesh_asset_scale": asset_scale,
+        "generator_scale": generator_scale,
+        "scale_location": expected_location,
+        "effective_scale": effective_scale,
+    }
+
+
+def _part_ordinal(part):
+    external = part.get("external_source") or {}
+    try:
+        return int(
+            part.get("logical_subpart_index")
+            or external.get("ordinal")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _validate_common_scale_metadata(manifest, parts, unit_probe):
+    forbidden_root_keys = (
+        "role_scale_overrides",
+        "role_specific_scale_patches",
+        "generator_scale_overrides",
+        "scale_patches",
+    )
+    for key in forbidden_root_keys:
+        if (manifest or {}).get(key):
+            raise ClusterAssemblyBuildError(
+                f"role-specific scale patch is forbidden: {key}"
+            )
+
+    explicit_patch_keys = (
+        "role_multiplier",
+        "role_scale",
+        "role_scale_multiplier",
+        "scale_override",
+        "scale_patch",
+    )
+    generator_patch_keys = (
+        "frond_shape_width_scale",
+        "frond_shape_height_scale",
+        "leaf_size_scale",
+        "generator_size_scale",
+    )
+    common_aliases = {
+        "mesh_geometry_scale": (
+            "mesh_geometry_scale",
+            "geometry_scale",
+        ),
+        "mesh_asset_scale": (
+            "mesh_asset_scale",
+            "asset_scale",
+        ),
+        "generator_scale": ("generator_scale",),
+    }
+    collected = {key: [] for key in common_aliases}
+    for part in parts:
+        external = part.get("external_source") or {}
+        for container in (part, external):
+            for key in explicit_patch_keys:
+                if key in container and container.get(key) not in (
+                    None, False, 1, 1.0, {}, [],
+                ):
+                    raise ClusterAssemblyBuildError(
+                        f"role-specific scale patch is forbidden: {key}"
+                    )
+            for key in generator_patch_keys:
+                if key in container:
+                    value = _positive_number(
+                        container.get(key), f"generator size patch {key}"
+                    )
+                    if abs(value - 1.0) > 1.0e-9:
+                        raise ClusterAssemblyBuildError(
+                            f"automatic generator size patch is forbidden: {key}"
+                        )
+            for canonical, aliases in common_aliases.items():
+                values = [
+                    container.get(alias) for alias in aliases
+                    if alias in container
+                ]
+                if values:
+                    collected[canonical].append(
+                        _positive_number(
+                            values[0], f"{canonical} on {part.get('asset_name')}"
+                        )
+                    )
+    for key, values in collected.items():
+        if not values:
+            continue
+        expected = float(unit_probe[key])
+        if len(values) != len(parts) or any(
+            abs(value - expected) > 1.0e-9 for value in values
+        ):
+            raise ClusterAssemblyBuildError(
+                f"{key} is not one common role-independent unit contract"
+            )
+
+
+def validate_normalized_prototype_unit_contract(manifest):
+    """Fail closed for the physical normalized production Assembly contract.
+
+    Legacy camera-UV/component manifests remain supported until a normalized
+    physical-capture or unit-probe receipt is present.  Once any such receipt
+    is present, the complete production evidence set is mandatory.
+    """
+    receipts = _deduplicated_receipts(manifest or {})
+    if not any(receipts.values()):
+        return {"status": "legacy_contract_not_present"}
+
+    parts = list((manifest or {}).get("parts") or [])
+    variants = list((manifest or {}).get("registered_variants") or [])
+    if not parts or not variants:
+        raise ClusterAssemblyBuildError(
+            "physical normalized production manifest has no native prototypes/variants"
+        )
+    unit_probe_receipts = {
+        _canonical_json(payload): payload
+        for _role, payload in receipts["unit_probe"]
+    }
+    if len(unit_probe_receipts) != 1:
+        raise ClusterAssemblyBuildError(
+            "physical normalized production requires one common unit-probe contract"
+        )
+    unit_probe = _validate_unit_probe_receipt(
+        next(iter(unit_probe_receipts.values()))
+    )
+
+    prototype_rows = {}
+    prototype_ids = set()
+    asset_names = set()
+    role_ordinals = defaultdict(list)
+    for part in parts:
+        role = str(part.get("role") or "").casefold()
+        ordinal = _part_ordinal(part)
+        prototype_id = str(part.get("prototype_id") or "")
+        asset_name = str(part.get("asset_name") or "")
+        external = part.get("external_source") or {}
+        key = (role, ordinal)
+        if (
+            role not in ROLE_ORDER
+            or ordinal <= 0
+            or not prototype_id
+            or not asset_name
+            or external.get("kind")
+            != "send_to_unreal_normalized_skeletal_part"
+            or str(external.get("pivot_contract") or "")
+            != _NORMALIZED_PIVOT_CONTRACT
+            or key in prototype_rows
+            or prototype_id in prototype_ids
+            or asset_name.casefold() in asset_names
+        ):
+            raise ClusterAssemblyBuildError(
+                "native normalized prototype specification is invalid or duplicated"
+            )
+        bindings = list(part.get("bindings") or [])
+        if not bindings:
+            raise ClusterAssemblyBuildError(
+                f"normalized prototype is never instanced: {asset_name}"
+            )
+        for binding in bindings:
+            transform = binding.get("transform") or {}
+            fit_mode = str(transform.get("fit_mode") or "")
+            scale = transform.get("scale")
+            if (
+                not fit_mode.startswith("uniform_similarity_3d")
+                or not isinstance(scale, (list, tuple))
+                or len(scale) != 3
+                or max(float(value) for value in scale)
+                - min(float(value) for value in scale)
+                > 1.0e-7
+            ):
+                raise ClusterAssemblyBuildError(
+                    "normalized prototype instances require uniform-similarity transforms"
+                )
+        prototype_rows[key] = part
+        prototype_ids.add(prototype_id)
+        asset_names.add(asset_name.casefold())
+        role_ordinals[role].append(ordinal)
+
+    for role, ordinals in role_ordinals.items():
+        checked = sorted(ordinals)
+        if checked != list(range(1, len(checked) + 1)):
+            raise ClusterAssemblyBuildError(
+                f"{role} native prototype ordinals are not consecutive from input"
+            )
+
+    variant_rows = {}
+    for variant in variants:
+        role = str(variant.get("role") or "").casefold()
+        try:
+            ordinal = int(variant.get("ordinal") or 0)
+        except (TypeError, ValueError):
+            ordinal = 0
+        key = (role, ordinal)
+        if role not in ROLE_ORDER or ordinal <= 0 or key in variant_rows:
+            raise ClusterAssemblyBuildError(
+                "registered normalized variant is invalid or duplicated"
+            )
+        if variant.get("instanced") is not True:
+            raise ClusterAssemblyBuildError(
+                f"registered normalized variant is never instanced: {key}"
+            )
+        if str(variant.get("pivot_contract") or "") != _NORMALIZED_PIVOT_CONTRACT:
+            raise ClusterAssemblyBuildError(
+                f"registered normalized variant pivot contract is invalid: {key}"
+            )
+        variant_rows[key] = variant
+    if set(variant_rows) != set(prototype_rows):
+        raise ClusterAssemblyBuildError(
+            "unique registered variants do not exactly match native prototype specs"
+        )
+    for key, part in prototype_rows.items():
+        if (
+            str(variant_rows[key].get("skeletal_asset_name") or "")
+            != str(part.get("asset_name") or "")
+        ):
+            raise ClusterAssemblyBuildError(
+                "registered variant asset does not match its native prototype spec"
+            )
+
+    normalized_by_role = defaultdict(list)
+    for role, receipt in receipts["normalized"]:
+        if role in role_ordinals:
+            normalized_by_role[role].append(receipt)
+    capture_by_role = defaultdict(list)
+    for role, receipt in receipts["capture"]:
+        if role in role_ordinals:
+            capture_by_role[role].append(receipt)
+    if set(normalized_by_role) != set(role_ordinals):
+        raise ClusterAssemblyBuildError(
+            "every normalized prototype role requires a production normalization receipt"
+        )
+    if set(capture_by_role) != set(role_ordinals):
+        raise ClusterAssemblyBuildError(
+            "every normalized prototype role requires a direct-capture receipt"
+        )
+
+    capture_reports = {}
+    receipt_variant_rows = {}
+    for role in role_ordinals:
+        normalized_receipts = {
+            _canonical_json(value): value
+            for value in normalized_by_role[role]
+        }
+        capture_receipts = {
+            _canonical_json(value): value
+            for value in capture_by_role[role]
+        }
+        if len(normalized_receipts) != 1 or len(capture_receipts) != 1:
+            raise ClusterAssemblyBuildError(
+                f"{role} has ambiguous production normalization/capture receipts"
+            )
+        normalized = next(iter(normalized_receipts.values()))
+        capture = next(iter(capture_receipts.values()))
+        capture_report = _validate_capture_receipt(capture, role)
+        capture_reports[role] = capture_report
+        if (
+            normalized.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
+            or normalized.get("size_policy")
+            != "uniform_whole_source_physical_target_meters"
+            or normalized.get("plan_uv_policy")
+            != "direct_physical_capture_projection"
+            or normalized.get("generator_size_policy")
+            != "preserve_user_authored_leaf_and_frond_dimensions"
+            or str(normalized.get("physical_capture_contract_sha256") or "")
+            != capture_report["contract_sha256"]
+        ):
+            raise ClusterAssemblyBuildError(
+                f"{role} normalization receipt is not the physical direct-capture contract"
+            )
+
+        expected_assets = {
+            str(part.get("asset_name") or "")
+            for (part_role, _ordinal), part in prototype_rows.items()
+            if part_role == role
+        }
+        receipt_prototypes = normalized.get("prototypes") or []
+        receipt_assets = {
+            str(row.get("skeletal_asset") or "")
+            for row in receipt_prototypes
+            if isinstance(row, dict)
+        }
+        pivot_rows = capture.get("attachment_pivots") or []
+        pivot_assets = {
+            str(row.get("prototype_asset") or "")
+            for row in pivot_rows
+            if isinstance(row, dict)
+        }
+        if (
+            len(receipt_prototypes) != len(expected_assets)
+            or receipt_assets != expected_assets
+            or len(pivot_rows) != len(expected_assets)
+            or pivot_assets != expected_assets
+        ):
+            raise ClusterAssemblyBuildError(
+                f"{role} normalized prototype receipts do not match native prototype specs"
+            )
+        for pivot in pivot_rows:
+            local = pivot.get("normalized_local")
+            if (
+                not isinstance(local, (list, tuple))
+                or len(local) != 3
+                or max(abs(float(value)) for value in local) > 1.0e-8
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"{role} attachment pivot is not baked to (0,0,0)"
+                )
+        target_units = capture_report["target_blender_units"]
+        bounds_tolerance = max(max(target_units) * 1.0e-6, 1.0e-9)
+        for prototype in receipt_prototypes:
+            size = (prototype.get("normalized_bounds") or {}).get("size")
+            if (
+                not isinstance(size, (list, tuple))
+                or len(size) != 3
+                or any(
+                    not math.isfinite(float(value)) or float(value) < 0.0
+                    for value in size
+                )
+                or float(size[0]) > target_units[0] + bounds_tolerance
+                or float(size[1]) > target_units[1] + bounds_tolerance
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"{role} prototype physical bounds exceed the declared 0.1m capture contract"
+                )
+
+        for receipt_variant in normalized.get("variants") or []:
+            try:
+                ordinal = int(
+                    receipt_variant.get("card_index")
+                    or receipt_variant.get("index")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                ordinal = 0
+            key = (role, ordinal)
+            transfer = receipt_variant.get("plan_uv_transfer") or {}
+            if (
+                key in receipt_variant_rows
+                or receipt_variant.get("object_transforms_identity") is not True
+                or receipt_variant.get("plan_covers_projection") is not True
+                or transfer.get("policy")
+                != "direct_physical_capture_projection"
+                or transfer.get("direct_uv_source")
+                != _DIRECT_CAPTURE_UV_SOURCE
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"{role} normalized variant direct-capture evidence is invalid"
+                )
+            receipt_variant_rows[key] = receipt_variant
+    if set(receipt_variant_rows) != set(variant_rows):
+        raise ClusterAssemblyBuildError(
+            "normalization receipt variants do not exactly match registered variants"
+        )
+    for key, registered in variant_rows.items():
+        receipt_variant = receipt_variant_rows[key]
+        if (
+            str(receipt_variant.get("skeletal_asset") or "")
+            != str(registered.get("skeletal_asset_name") or "")
+            or str(receipt_variant.get("plan") or "")
+            != str(registered.get("card_name") or "")
+        ):
+            raise ClusterAssemblyBuildError(
+                "registered variant identity differs from normalization receipt"
+            )
+
+    if any(
+        abs(report["target_meters"][0] - unit_probe["physical_target_meters"])
+        > 1.0e-6
+        or abs(report["scale_length"] - unit_probe["scale_length"]) > 1.0e-9
+        for report in capture_reports.values()
+    ):
+        raise ClusterAssemblyBuildError(
+            "capture receipts and downstream unit probe use different unit contracts"
+        )
+    _validate_common_scale_metadata(manifest, parts, unit_probe)
+    return {
+        "status": "verified",
+        "native_prototype_count": len(prototype_rows),
+        "registered_variant_count": len(variant_rows),
+        "roles": {
+            role: len(ordinals)
+            for role, ordinals in sorted(role_ordinals.items())
+        },
+        "physical_target_meters": unit_probe["physical_target_meters"],
+        "downstream_unit_scale": unit_probe["effective_scale"],
+        "scale_location": unit_probe["scale_location"],
+        "role_specific_scale_patch": False,
+        "instance_fit": "uniform_similarity_3d",
+    }
+
+
 def validate_manifest_artifacts(manifest):
     """Revalidate every Blender/FBX/wind artifact at each consumer boundary."""
     if (manifest or {}).get("status") != "ready":
         raise ClusterAssemblyBuildError("Assembly manifest is not ready")
+    normalized_contract = validate_normalized_prototype_unit_contract(manifest)
+    _validate_public_export_names(manifest)
     checked = {
+        "normalized_prototype_unit_contract": normalized_contract,
         "full_fbx": validate_file_fingerprint(
             manifest.get("full_fbx"), "Full SK FBX"
         ),
@@ -111,15 +1166,34 @@ def validate_manifest_artifacts(manifest):
         ),
         "parts": {},
     }
+    source_blend = manifest.get("assembly_source_blend")
+    if source_blend is not None:
+        checked["assembly_source_blend"] = validate_file_fingerprint(
+            source_blend,
+            "Assembly Blender source",
+        )
     for part in manifest.get("parts") or []:
         prototype_id = str(part.get("prototype_id") or "")
         if not prototype_id or prototype_id in checked["parts"]:
             raise ClusterAssemblyBuildError(
                 f"invalid or duplicate Assembly prototype id: {prototype_id}"
             )
-        checked["parts"][prototype_id] = validate_file_fingerprint(
-            part.get("fbx"), f"Assembly part FBX {prototype_id}"
-        )
+        external = part.get("external_source") or {}
+        if external:
+            checked["parts"][prototype_id] = {
+                "source_blend": validate_file_fingerprint(
+                    external.get("source_blend"),
+                    f"Send to Unreal source blend {prototype_id}",
+                ),
+                "plan_fbx": validate_file_fingerprint(
+                    external.get("plan_fbx"),
+                    f"normalized plan FBX {prototype_id}",
+                ),
+            }
+        else:
+            checked["parts"][prototype_id] = validate_file_fingerprint(
+                part.get("fbx"), f"Assembly part FBX {prototype_id}"
+            )
     return checked
 
 
@@ -172,6 +1246,42 @@ def content_build_decision(handoff):
         if not row.get("assignments"):
             raise ClusterAssemblyBuildError(
                 f"{role} has no actual FBX polygon assignment evidence"
+            )
+        normalized = row.get("normalized_variants")
+        variants = list((normalized or {}).get("variants") or [])
+        try:
+            ordinals = [int(value.get("ordinal") or 0) for value in variants]
+        except (AttributeError, TypeError, ValueError):
+            ordinals = []
+        composite_ready = True
+        for variant in variants:
+            mode = str(variant.get("source_partition_mode") or "")
+            composite_parts = variant.get("composite_parts") or []
+            if mode == "COMPOSITE_PER_DEFORM_ROOT":
+                try:
+                    subpart_ordinals = [
+                        int(part.get("subpart_index") or 0)
+                        for part in composite_parts
+                    ]
+                except (AttributeError, TypeError, ValueError):
+                    subpart_ordinals = []
+                composite_ready = composite_ready and (
+                    bool(composite_parts)
+                    and subpart_ordinals
+                    == list(range(1, len(composite_parts) + 1))
+                )
+            elif composite_parts:
+                composite_ready = False
+        if (
+            not isinstance(normalized, dict)
+            or normalized.get("status") != "ready"
+            or not variants
+            or ordinals != list(range(1, len(variants) + 1))
+            or not composite_ready
+        ):
+            raise ClusterAssemblyBuildError(
+                f"{role} requires ready external normalized variants; "
+                "component-derived Assembly parts are forbidden"
             )
     return "build"
 
@@ -631,6 +1741,173 @@ def fit_trs_transform(source_points, target_points):
     }
 
 
+def fit_uniform_similarity_transform(source_points, target_points):
+    """Fit a stable 3D rigid rotation plus uniform scale for planar cards.
+
+    A full affine/TRS decomposition is underdetermined when every source point
+    lies on a plane.  Normalized SpeedTree plans are intentionally planar, so
+    use orthogonal Procrustes/Kabsch fitting and one uniform scale.  This keeps
+    the normalized attachment origin meaningful instead of inventing enormous
+    scale on the plane normal.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
+        raise ClusterAssemblyBuildError(
+            "NumPy is required for Assembly similarity fitting"
+        ) from exc
+    source = np.asarray(source_points, dtype=np.float64)
+    target = np.asarray(target_points, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ClusterAssemblyBuildError(
+            "similarity fit point arrays must both be Nx3"
+        )
+    if source.shape[0] < 3:
+        raise ClusterAssemblyBuildError(
+            "similarity fit needs at least three vertices"
+        )
+    source_center = np.mean(source, axis=0)
+    target_center = np.mean(target, axis=0)
+    source_centered = source - source_center
+    target_centered = target - target_center
+    source_energy = float(np.sum(source_centered * source_centered))
+    if source_energy <= 1.0e-18:
+        raise ClusterAssemblyBuildError(
+            "similarity fit source points have no spatial extent"
+        )
+    left, singular, right = np.linalg.svd(
+        source_centered.T @ target_centered
+    )
+    correction = np.ones(3, dtype=np.float64)
+    if np.linalg.det(left @ right) < 0.0:
+        correction[-1] = -1.0
+    rotation_rows = left @ np.diag(correction) @ right
+    scale_value = float(np.sum(singular * correction) / source_energy)
+    if not np.isfinite(scale_value) or abs(scale_value) <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            "similarity fit produced an invalid uniform scale"
+        )
+    linear = scale_value * rotation_rows
+    translation = target_center - source_center @ linear
+    prediction = source @ linear + translation
+    diagonal = max(
+        float(np.linalg.norm(np.max(target, axis=0) - np.min(target, axis=0))),
+        1.0e-9,
+    )
+    rms = float(
+        np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1)))
+    )
+    quaternion = _rotation_matrix_to_quaternion(rotation_rows.T.tolist())
+    return {
+        "translation": [float(value) for value in translation],
+        "rotation_xyzw": quaternion,
+        "scale": [scale_value, scale_value, scale_value],
+        "affine_relative_rms": rms / diagonal,
+        "trs_relative_rms": rms / diagonal,
+        "shear_relative_norm": 0.0,
+        "fit_mode": "uniform_similarity_3d",
+    }
+
+
+def compose_similarity_with_relative_matrix(transform, relative_matrix):
+    """Compose a fitted card transform with one normalized composite subpart.
+
+    ``relative_matrix`` is the Blender column-vector transform from the
+    subpart's normalized local space into the shared card/attachment space.
+    The fitted card transform is a positive uniform similarity, so the result
+    remains a positive uniform similarity suitable for a native Assembly
+    binding.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
+        raise ClusterAssemblyBuildError(
+            "NumPy is required for composite Assembly transforms"
+        ) from exc
+    translation = np.asarray(transform.get("translation"), dtype=np.float64)
+    rotation = np.asarray(transform.get("rotation_xyzw"), dtype=np.float64)
+    scale = np.asarray(transform.get("scale"), dtype=np.float64)
+    relative = np.asarray(relative_matrix, dtype=np.float64)
+    if (
+        translation.shape != (3,)
+        or rotation.shape != (4,)
+        or scale.shape != (3,)
+        or relative.shape != (4, 4)
+        or not np.all(np.isfinite(relative))
+    ):
+        raise ClusterAssemblyBuildError(
+            "composite Assembly transform contract is malformed"
+        )
+    if (
+        np.min(scale) <= 0.0
+        or float(np.max(scale) - np.min(scale)) > max(float(np.max(scale)), 1.0) * 1.0e-6
+    ):
+        raise ClusterAssemblyBuildError(
+            "composite Assembly card fit is not a positive uniform similarity"
+        )
+    x, y, z, w = [float(value) for value in rotation]
+    quaternion_length = math.sqrt(x * x + y * y + z * z + w * w)
+    if quaternion_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            "composite Assembly card fit has an invalid rotation"
+        )
+    x, y, z, w = [value / quaternion_length for value in (x, y, z, w)]
+    rotation_matrix = np.asarray([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
+    card_matrix = np.eye(4, dtype=np.float64)
+    card_matrix[:3, :3] = rotation_matrix * float(scale[0])
+    card_matrix[:3, 3] = translation
+    if (
+        np.max(np.abs(relative[3, :] - np.asarray([0.0, 0.0, 0.0, 1.0]))) > 1.0e-6
+        or float(np.linalg.det(relative[:3, :3])) <= 0.0
+    ):
+        raise ClusterAssemblyBuildError(
+            "composite subpart relative matrix is mirrored or non-affine"
+        )
+    relative_scales = np.linalg.norm(relative[:3, :3], axis=0)
+    if (
+        np.min(relative_scales) <= 1.0e-12
+        or float(np.max(relative_scales) - np.min(relative_scales)) > 1.0e-6
+    ):
+        raise ClusterAssemblyBuildError(
+            "composite subpart relative matrix is not rigid/uniform"
+        )
+    relative_rotation = relative[:3, :3] / relative_scales
+    if np.max(np.abs(relative_rotation.T @ relative_rotation - np.eye(3))) > 1.0e-6:
+        raise ClusterAssemblyBuildError(
+            "composite subpart relative matrix contains shear"
+        )
+    composed = card_matrix @ relative
+    composed_scales = np.linalg.norm(composed[:3, :3], axis=0)
+    if (
+        np.min(composed_scales) <= 1.0e-12
+        or float(np.max(composed_scales) - np.min(composed_scales)) > max(float(np.max(composed_scales)), 1.0) * 1.0e-6
+    ):
+        raise ClusterAssemblyBuildError(
+            "composed composite subpart transform is not uniform"
+        )
+    composed_rotation = composed[:3, :3] / composed_scales
+    if float(np.linalg.det(composed_rotation)) <= 0.0:
+        raise ClusterAssemblyBuildError(
+            "composed composite subpart transform is mirrored"
+        )
+    quaternion = _rotation_matrix_to_quaternion(composed_rotation.tolist())
+    result = deepcopy(transform)
+    result.update({
+        "translation": [float(value) for value in composed[:3, 3]],
+        "rotation_xyzw": quaternion,
+        "scale": [float(value) for value in composed_scales],
+        "fit_mode": "uniform_similarity_3d_composite_subpart",
+        "composite_relative_matrix": [
+            [float(value) for value in row] for row in relative
+        ],
+    })
+    return result
+
+
 def _rotation_matrix_to_quaternion(matrix):
     m = matrix
     trace = m[0][0] + m[1][1] + m[2][2]
@@ -664,6 +1941,8 @@ def _rotation_matrix_to_quaternion(matrix):
 
 def _component_groups(mesh, polygon_indices):
     polygon_indices = sorted(set(int(value) for value in polygon_indices))
+    if not polygon_indices:
+        return []
     parent = {index: index for index in polygon_indices}
 
     def find(value):
@@ -678,12 +1957,51 @@ def _component_groups(mesh, polygon_indices):
         if left != right:
             parent[right] = left
 
-    owners = {}
+    used_vertices = {
+        int(vertex)
+        for polygon_index in polygon_indices
+        for vertex in mesh.polygons[polygon_index].vertices
+    }
+    coordinates = {
+        index: tuple(float(mesh.vertices[index].co[axis]) for axis in range(3))
+        for index in used_vertices
+    }
+    spans = [
+        max(value[axis] for value in coordinates.values())
+        - min(value[axis] for value in coordinates.values())
+        for axis in range(3)
+    ]
+    # Relative to the current role extent, not a species-specific world size.
+    # This reconnects seam-split FBX/BWR vertices whose skinning differs only
+    # by float noise while remaining far below authored card edge lengths.
+    weld_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    weld_tolerance_sq = weld_tolerance * weld_tolerance
+    exact_owners = {}
+    spatial_owners = defaultdict(list)
     for polygon_index in polygon_indices:
         polygon = mesh.polygons[polygon_index]
         for vertex in polygon.vertices:
-            previous = owners.setdefault(int(vertex), polygon_index)
+            vertex = int(vertex)
+            previous = exact_owners.setdefault(vertex, polygon_index)
             union(polygon_index, previous)
+            if previous != polygon_index:
+                continue
+            coordinate = coordinates[vertex]
+            cell = tuple(
+                int(math.floor(value / weld_tolerance))
+                for value in coordinate
+            )
+            for x in range(cell[0] - 1, cell[0] + 2):
+                for y in range(cell[1] - 1, cell[1] + 2):
+                    for z in range(cell[2] - 1, cell[2] + 2):
+                        for other, owner in spatial_owners.get((x, y, z), ()):
+                            distance_sq = sum(
+                                (coordinate[axis] - other[axis]) ** 2
+                                for axis in range(3)
+                            )
+                            if distance_sq <= weld_tolerance_sq:
+                                union(polygon_index, owner)
+            spatial_owners[cell].append((coordinate, polygon_index))
     groups = defaultdict(lambda: {"vertices": set(), "polygons": []})
     for polygon_index in polygon_indices:
         root = find(polygon_index)
@@ -720,8 +2038,14 @@ def _component_signature(mesh, component):
                     )
                 )
             )
+    uv_vertices = set()
+    if uv_layer is not None:
+        for polygon_index in component["polygons"]:
+            for loop_index in mesh.polygons[polygon_index].loop_indices:
+                uv = uv_layer.data[loop_index].uv
+                uv_vertices.add((round(float(uv.x), 6), round(float(uv.y), 6)))
     value = {
-        "vertices": len(component["vertices"]),
+        "vertices": len(uv_vertices) if uv_layer is not None else len(component["vertices"]),
         "polygons": len(component["polygons"]),
         "polygon_sizes": sorted(polygon_sizes),
         "uv_faces": sorted(uv_faces),
@@ -729,13 +2053,74 @@ def _component_signature(mesh, component):
     return hashlib.sha1(_canonical_json(value).encode("utf-8")).hexdigest()[:16]
 
 
+def _component_uv_face_counter(mesh, component):
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        return None
+    faces = []
+    for polygon_index in component["polygons"]:
+        polygon = mesh.polygons[polygon_index]
+        faces.append(tuple(sorted(
+            (
+                round(float(uv_layer.data[loop].uv.x), 6),
+                round(float(uv_layer.data[loop].uv.y), 6),
+            )
+            for loop in polygon.loop_indices
+        )))
+    return Counter(faces)
+
+
+def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
+    signature = _component_signature(target_mesh, target_component)
+    exact = prototypes.get(signature)
+    if exact is not None:
+        return exact
+    target_faces = _component_uv_face_counter(target_mesh, target_component)
+    if target_faces is None:
+        return None
+    candidates = []
+    for prototype in prototypes.values():
+        source_faces = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
+        )
+        if source_faces is None or target_faces - source_faces:
+            continue
+        missing_faces = sum((source_faces - target_faces).values())
+        allowed_missing = max(1, int(math.ceil(sum(source_faces.values()) * 0.1)))
+        if missing_faces <= allowed_missing:
+            candidates.append((missing_faces, prototype))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: row[0])
+    best_missing = candidates[0][0]
+    best = [row[1] for row in candidates if row[0] == best_missing]
+    if len(best) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized plan UV-subset match is ambiguous for component: "
+            + signature
+        )
+    return best[0]
+
+
 def _vertex_descriptors(obj, component):
     mesh = obj.data
     uv_layer = mesh.uv_layers.active
     degree = Counter()
     component_edges = set()
+    representative = {}
     for polygon_index in component["polygons"]:
-        vertices = [int(value) for value in mesh.polygons[polygon_index].vertices]
+        polygon = mesh.polygons[polygon_index]
+        if uv_layer is not None:
+            vertices = [
+                (
+                    round(float(uv_layer.data[loop].uv.x), 6),
+                    round(float(uv_layer.data[loop].uv.y), 6),
+                )
+                for loop in polygon.loop_indices
+            ]
+        else:
+            vertices = [int(value) for value in polygon.vertices]
         for index, left in enumerate(vertices):
             right = vertices[(index + 1) % len(vertices)]
             component_edges.add(tuple(sorted((left, right))))
@@ -758,17 +2143,26 @@ def _vertex_descriptors(obj, component):
             )
         for loop_index in polygon.loop_indices:
             loop = mesh.loops[loop_index]
+            if uv_layer is not None:
+                loop_uv = uv_layer.data[loop_index].uv
+                logical_vertex = (
+                    round(float(loop_uv.x), 6),
+                    round(float(loop_uv.y), 6),
+                )
+            else:
+                logical_vertex = int(loop.vertex_index)
+            representative.setdefault(logical_vertex, int(loop.vertex_index))
             uv = (0.0, 0.0)
             if uv_layer is not None:
                 value = uv_layer.data[loop_index].uv
                 uv = (round(float(value.x), 6), round(float(value.y), 6))
-            records[int(loop.vertex_index)].append((uv, face_uv))
+            records[logical_vertex].append((uv, face_uv))
     return sorted(
         (
-            (degree[index], tuple(sorted(records[index]))),
-            index,
+            (degree[logical_vertex], tuple(sorted(records[logical_vertex]))),
+            representative[logical_vertex],
         )
-        for index in component["vertices"]
+        for logical_vertex in representative
     )
 
 
@@ -780,6 +2174,111 @@ def _ordered_correspondence(obj, template, target):
             "part prototype UV/topology descriptors do not match an instance"
         )
     return [row[1] for row in source], [row[1] for row in destination]
+
+
+def _ordered_cross_object_correspondence(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+):
+    source_uv = source_obj.data.uv_layers.active
+    target_uv = target_obj.data.uv_layers.active
+    if source_uv is not None and target_uv is not None:
+        def representatives(obj, component, uv_layer):
+            values = {}
+            for polygon_index in component["polygons"]:
+                polygon = obj.data.polygons[polygon_index]
+                for loop_index in polygon.loop_indices:
+                    uv = uv_layer.data[loop_index].uv
+                    key = (round(float(uv.x), 6), round(float(uv.y), 6))
+                    values.setdefault(
+                        key,
+                        int(obj.data.loops[loop_index].vertex_index),
+                    )
+            return values
+
+        source_by_uv = representatives(source_obj, source_component, source_uv)
+        target_by_uv = representatives(target_obj, target_component, target_uv)
+        common = sorted(set(source_by_uv) & set(target_by_uv))
+        if len(common) < 3 or len(common) != len(target_by_uv):
+            raise ClusterAssemblyBuildError(
+                "normalized plan UV correspondence does not cover the target instance"
+            )
+        return (
+            [source_by_uv[key] for key in common],
+            [target_by_uv[key] for key in common],
+        )
+    source = _vertex_descriptors(source_obj, source_component)
+    destination = _vertex_descriptors(target_obj, target_component)
+    if [row[0] for row in source] != [row[0] for row in destination]:
+        raise ClusterAssemblyBuildError(
+            "normalized plan UV/topology descriptors do not match an instance"
+        )
+    return [row[1] for row in source], [row[1] for row in destination]
+
+
+def _import_normalized_plan_prototypes(bpy, contract):
+    if (contract or {}).get("status") != "ready":
+        raise ClusterAssemblyBuildError(
+            "normalized plan variant contract is not ready"
+        )
+    prototypes = {}
+    created = []
+    for variant in contract.get("variants") or []:
+        plan_name = str(variant.get("plan_name") or "")
+        plan_fbx = validate_file_fingerprint(
+            variant.get("plan_fbx"),
+            f"normalized plan FBX {plan_name or '<unnamed>'}",
+        )["path"]
+        before = {obj.as_pointer() for obj in bpy.data.objects}
+        result = bpy.ops.import_scene.fbx(filepath=str(Path(plan_fbx).resolve()))
+        if "FINISHED" not in result:
+            raise ClusterAssemblyBuildError(
+                f"normalized plan FBX import failed: {plan_fbx}: {result}"
+            )
+        imported = [
+            obj for obj in bpy.data.objects
+            if obj.as_pointer() not in before
+        ]
+        created.extend(imported)
+        meshes = [
+            obj for obj in imported
+            if obj.type == "MESH" and len(obj.data.polygons)
+        ]
+        if len(meshes) != 1:
+            raise ClusterAssemblyBuildError(
+                "normalized plan FBX must contain exactly one mesh: "
+                + str(plan_fbx)
+            )
+        source_obj = meshes[0]
+        components = _component_groups(
+            source_obj.data,
+            [polygon.index for polygon in source_obj.data.polygons],
+        )
+        if len(components) != 1:
+            raise ClusterAssemblyBuildError(
+                "normalized plan FBX must contain one connected component: "
+                + plan_name
+            )
+        component = components[0]
+        signature = _component_signature(source_obj.data, component)
+        if signature in prototypes:
+            raise ClusterAssemblyBuildError(
+                "normalized plan variants have duplicate UV/topology signatures: "
+                + signature
+            )
+        prototypes[signature] = {
+            "variant": deepcopy(variant),
+            "object": source_obj,
+            "component": component,
+            "signature": signature,
+        }
+    if not prototypes:
+        raise ClusterAssemblyBuildError(
+            "normalized plan variant contract contains no variants"
+        )
+    return prototypes, created
 
 
 def _world_points(obj, vertex_indices):
@@ -897,6 +2396,17 @@ def _copy_base_without_role_polygons(bpy, source_obj, polygon_indices, name):
     duplicate.data.name = name + "_Mesh"
     bpy.context.scene.collection.objects.link(duplicate)
     mesh = duplicate.data
+    source_scale = [float(value) for value in source_obj.matrix_world.to_scale()]
+    if any(abs(value - 1.0) > 1.0e-5 for value in source_scale):
+        raise ClusterAssemblyBuildError(
+            "final BWR mesh must have applied scale before Assembly generation: "
+            f"{source_obj.name} scale={source_scale}"
+        )
+    # Keep the exact meter-space object/bone encoding used by the Full SK FBX.
+    # Blender's FBX exporter carries the scene-unit conversion as FBX metadata;
+    # baking another 100x into BASE coordinates changes Unreal's implicit
+    # armature root scale and therefore the mesh-local reference pose hash.
+    duplicate.matrix_world = source_obj.matrix_world.copy()
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.faces.ensure_lookup_table()
@@ -924,6 +2434,78 @@ def _copy_base_without_role_polygons(bpy, source_obj, polygon_indices, name):
         polygon.material_index = slot_remap[old_index]
     mesh.update()
     return duplicate
+
+
+def _copy_normalized_base_armature(bpy, source_armature, name):
+    """Copy the final Full-SK armature without changing its bind pose."""
+
+    duplicate = source_armature.copy()
+    duplicate.data = source_armature.data.copy()
+    duplicate.name = name
+    duplicate.data.name = name + "_Skeleton"
+    bpy.context.scene.collection.objects.link(duplicate)
+    source_scale = [
+        float(value) for value in source_armature.matrix_world.to_scale()
+    ]
+    if any(abs(value - 1.0) > 1.0e-5 for value in source_scale):
+        raise ClusterAssemblyBuildError(
+            "final BWR armature must have applied scale before Assembly generation: "
+            f"{source_armature.name} scale={source_scale}"
+        )
+    duplicate.matrix_world = source_armature.matrix_world.copy()
+    return duplicate
+
+
+def _replicate_full_export_parent_chain(
+    bpy,
+    source_obj,
+    source_armature,
+    target_obj,
+    target_armature,
+):
+    """Copy the Full Send2UE hierarchy between Armature and mesh.
+
+    BWR's normal Export collection can contain one or more transform empties
+    between the final Armature and mesh.  Blender's FBX exporter uses that
+    hierarchy when encoding the implicit armature-object root.  Parenting a
+    generated BASE mesh directly to the copied Armature preserves its visible
+    world transform but changes the imported root scale (observed 1 -> 100).
+    Reproduce the source chain and local transforms instead of applying a
+    tree-specific scale correction.
+    """
+    source_chain = []
+    current = source_obj.parent
+    while current is not None and current != source_armature:
+        source_chain.append(current)
+        current = current.parent
+    if current != source_armature:
+        raise ClusterAssemblyBuildError(
+            "final BWR mesh is not parented through the final armature"
+        )
+
+    target_parent = target_armature
+    created = []
+    for index, source_parent in enumerate(reversed(source_chain), start=1):
+        if source_parent.type != "EMPTY":
+            raise ClusterAssemblyBuildError(
+                "unsupported Full export parent between armature and mesh: "
+                f"{source_parent.name} ({source_parent.type})"
+            )
+        duplicate = source_parent.copy()
+        duplicate.name = f"{target_obj.name}_ExportParent_{index:02d}"
+        bpy.context.scene.collection.objects.link(duplicate)
+        duplicate.parent = target_parent
+        duplicate.matrix_parent_inverse = (
+            source_parent.matrix_parent_inverse.copy()
+        )
+        duplicate.matrix_basis = source_parent.matrix_basis.copy()
+        target_parent = duplicate
+        created.append(duplicate)
+
+    target_obj.parent = target_parent
+    target_obj.matrix_parent_inverse = source_obj.matrix_parent_inverse.copy()
+    target_obj.matrix_basis = source_obj.matrix_basis.copy()
+    return created
 
 
 def _strip_fbx_scene_textures(scene_data, get_fbx_uuid_from_key):
@@ -996,8 +2578,8 @@ def _textureless_fbx_scene_data(bpy):
         export_fbx_bin.fbx_data_from_scene = original
 
 
-def _validate_textureless_fbx(bpy, path):
-    """Fail closed if an Assembly FBX contains any Texture or Video object."""
+def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
+    """Fail closed on texture records or a second raw-FBX object scale."""
     if not hasattr(bpy, "app"):
         return {
             "status": "not_available_in_mock",
@@ -1015,19 +2597,80 @@ def _validate_textureless_fbx(bpy, path):
     objects = next((item for item in root.elems if item.id == b"Objects"), None)
     texture_records = 0
     video_records = 0
+    model_scales = []
     if objects is not None:
         texture_records = sum(item.id == b"Texture" for item in objects.elems)
         video_records = sum(item.id == b"Video" for item in objects.elems)
+        for item in objects.elems:
+            if item.id != b"Model" or len(item.props) < 3:
+                continue
+            if item.props[2] not in {b"Mesh", b"Null"}:
+                continue
+            properties = next(
+                (child for child in item.elems if child.id == b"Properties70"),
+                None,
+            )
+            scale = [1.0, 1.0, 1.0]
+            if properties is not None:
+                scaling = next(
+                    (
+                        child
+                        for child in properties.elems
+                        if child.id == b"P"
+                        and child.props
+                        and child.props[0] == b"Lcl Scaling"
+                    ),
+                    None,
+                )
+                if scaling is not None and len(scaling.props) >= 3:
+                    scale = [float(value) for value in scaling.props[-3:]]
+            raw_name = item.props[1]
+            name = (
+                raw_name.decode("utf-8", errors="replace")
+                if isinstance(raw_name, bytes)
+                else str(raw_name)
+            ).split("\x00", 1)[0]
+            model_scales.append({
+                "name": name,
+                "type": str(item.props[2]),
+                "is_null": item.props[2] == b"Null",
+                "scale": scale,
+            })
     if texture_records or video_records:
         raise ClusterAssemblyBuildError(
             "Assembly FBX contains texture records that can collide on Unreal "
             f"reimport: textures={texture_records}, videos={video_records}, path={path}"
+        )
+    units = bpy.context.scene.unit_settings
+    expected_model_scale = (
+        100.0 * float(units.scale_length)
+        if str(units.system) == "METRIC"
+        else 100.0
+    )
+    unexpected_model_scales = []
+    for row in model_scales:
+        row_expected_scale = 1.0 if row["is_null"] else expected_model_scale
+        row["expected_scale"] = row_expected_scale
+        if any(
+            abs(value - row_expected_scale)
+            > 1.0e-5 * max(row_expected_scale, 1.0)
+            for value in row["scale"]
+        ):
+            unexpected_model_scales.append(row)
+    if unexpected_model_scales:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX model scale does not match its Full SK/part root "
+            f"contract: {unexpected_model_scales}, path={path}"
         )
     return {
         "status": "textureless",
         "fbx_version": version,
         "texture_records": texture_records,
         "video_records": video_records,
+        "model_scales": model_scales,
+        "expected_model_scale": expected_model_scale,
+        "full_skeleton_root": bool(full_skeleton_root),
+        "all_model_scales_match_contract": True,
         "material_source": "material_pipeline_json_sidecar",
     }
 
@@ -1067,7 +2710,7 @@ def _weighted_bones_for_base(obj, skeleton_snapshot, skeleton_by_name=None):
     )
 
 
-def _export_selected_fbx(bpy, path, objects):
+def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.object.mode_set(mode="OBJECT") if bpy.context.object and bpy.context.object.mode != "OBJECT" else None
@@ -1079,8 +2722,32 @@ def _export_selected_fbx(bpy, path, objects):
         obj.hide_set(False)
         obj.select_set(True)
     bpy.context.view_layer.objects.active = objects[0]
+    armatures = [obj for obj in objects if getattr(obj, "type", "") == "ARMATURE"]
+    meshes = [obj for obj in objects if getattr(obj, "type", "") == "MESH"]
+    if len(armatures) != 1 or not meshes:
+        raise ClusterAssemblyBuildError(
+            "generated Assembly FBX requires one armature and at least one mesh"
+        )
+    for obj in armatures + meshes:
+        scale = [float(value) for value in obj.matrix_world.to_scale()]
+        if any(abs(value - 1.0) > 1.0e-5 for value in scale):
+            raise ClusterAssemblyBuildError(
+                f"generated Assembly object transform is not applied: "
+                f"{obj.name} scale={scale}"
+            )
+    units = bpy.context.scene.unit_settings
+    if (
+        str(units.system) != "METRIC"
+        or abs(float(units.scale_length) - 1.0) > 1.0e-9
+    ):
+        raise ClusterAssemblyBuildError(
+            "generated Assembly coordinates must preserve the Full SK meter "
+            "scene-unit contract"
+        )
     try:
-        with _textureless_fbx_scene_data(bpy):
+        if not hasattr(bpy, "app"):
+            # Lightweight unit-test mocks exercise the stock operator call
+            # contract without importing Blender add-ons.
             result = bpy.ops.export_scene.fbx(
                 filepath=str(path),
                 use_selection=True,
@@ -1099,16 +2766,161 @@ def _export_selected_fbx(bpy, path, objects):
                 armature_nodetype="NULL",
                 bake_anim=False,
                 path_mode="AUTO",
+                apply_unit_scale=True,
+                apply_scale_options="FBX_SCALE_NONE",
+                global_scale=1.0,
+                axis_forward="Y",
+                axis_up="Z",
+                bake_space_transform=False,
             )
-        if "FINISHED" not in result:
-            raise ClusterAssemblyBuildError(f"FBX export failed: {result}")
+            if "FINISHED" not in result:
+                raise ClusterAssemblyBuildError(f"FBX export failed: {result}")
+        else:
+            # Use the same scale/bind-pose exporter as the real Send to Unreal
+            # Full mesh.  Its armature correction is part of PARK's existing
+            # handoff contract; the stock Blender exporter writes a 100x
+            # armature-object root even when all visible world transforms are
+            # identical.
+            import addon_utils
+
+            _default, loaded = addon_utils.check("send2ue")
+            if not loaded:
+                addon_utils.enable(
+                    "send2ue",
+                    default_set=False,
+                    persistent=False,
+                )
+            from send2ue.core.io import fbx_b4 as send2ue_fbx
+
+            bpy.context.scene.send2ue.export_object_name_as_root = True
+            bpy.context.scene.send2ue.export_custom_root_name = ""
+            bpy.context.scene.send2ue.use_object_origin = False
+            textureless_flag = (
+                "send2ue_material_pipeline_textureless_fbx_export"
+            )
+            previous_flag = bpy.app.driver_namespace.get(textureless_flag)
+            bpy.app.driver_namespace[textureless_flag] = True
+            try:
+                send2ue_fbx.export(
+                    filepath=str(path),
+                    use_selection=True,
+                    object_types={"ARMATURE", "MESH", "EMPTY"},
+                    use_mesh_modifiers=False,
+                    use_mesh_modifiers_render=True,
+                    mesh_smooth_type="FACE",
+                    use_mesh_edges=False,
+                    use_subsurf=False,
+                    use_tspace=False,
+                    use_custom_props=False,
+                    add_leaf_bones=False,
+                    primary_bone_axis="Y",
+                    secondary_bone_axis="X",
+                    use_armature_deform_only=False,
+                    armature_nodetype="NULL",
+                    bake_anim=False,
+                    bake_anim_use_all_bones=True,
+                    bake_anim_use_nla_strips=True,
+                    bake_anim_use_all_actions=False,
+                    bake_anim_force_startend_keying=True,
+                    bake_anim_step=1.0,
+                    bake_anim_simplify_factor=0.0,
+                    path_mode="AUTO",
+                    use_metadata=True,
+                    apply_unit_scale=True,
+                    apply_scale_options="FBX_SCALE_NONE",
+                    global_scale=1.0,
+                    axis_forward="Y",
+                    axis_up="Z",
+                    bake_space_transform=False,
+                )
+            finally:
+                if previous_flag is None:
+                    bpy.app.driver_namespace.pop(textureless_flag, None)
+                else:
+                    bpy.app.driver_namespace[textureless_flag] = previous_flag
     finally:
         for obj, hidden, hide_viewport in previous:
             obj.hide_viewport = hide_viewport
             obj.hide_set(hidden)
     if not path.is_file():
         raise ClusterAssemblyBuildError(f"FBX export produced no file: {path}")
-    return _validate_textureless_fbx(bpy, path)
+    return _validate_textureless_fbx(
+        bpy,
+        path,
+        full_skeleton_root=full_skeleton_root,
+    )
+
+
+def _write_assembly_source_blend(bpy, path, objects, contract):
+    """Write a standalone Full-SK-space Assembly authoring source.
+
+    The raw ``SK_branch``/``SK_leaf`` cluster scenes are intentionally not
+    included.  The saved scene contains only the generated base and repeated
+    prototypes plus an embedded JSON contract, so opening or re-exporting it
+    cannot overwrite the authoritative raw cluster assets by accident.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    library_path = target.with_name(target.stem + "__library.blend")
+    collection = bpy.data.collections.new(target.stem + "_Objects")
+    text = bpy.data.texts.new(target.stem + "_Contract.json")
+    text.write(json.dumps(contract, ensure_ascii=False, indent=2))
+    try:
+        for obj in objects:
+            collection.objects.link(obj)
+        bpy.data.libraries.write(
+            str(library_path),
+            {collection, text},
+            path_remap="RELATIVE_ALL",
+            fake_user=True,
+            compress=True,
+        )
+        bootstrap = "\n".join(
+            [
+                "import bpy, sys",
+                "library, target, collection_name, text_name = sys.argv[sys.argv.index('--') + 1:]",
+                "for obj in list(bpy.data.objects): bpy.data.objects.remove(obj, do_unlink=True)",
+                "with bpy.data.libraries.load(library, link=False) as (source, destination):",
+                "    destination.collections = [collection_name]",
+                "    destination.texts = [text_name]",
+                "collection = bpy.data.collections[collection_name]",
+                "bpy.context.scene.collection.children.link(collection)",
+                "bpy.context.scene.unit_settings.system = 'METRIC'",
+                "bpy.context.scene.unit_settings.scale_length = 1.0",
+                "bpy.context.scene.name = collection_name.rsplit('_Objects', 1)[0]",
+                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False)",
+            ]
+        )
+        completed = subprocess.run(
+            [
+                bpy.app.binary_path,
+                "--factory-startup",
+                "--background",
+                "--python-expr",
+                "exec(" + repr(bootstrap) + ")",
+                "--",
+                str(library_path),
+                str(target),
+                collection.name,
+                text.name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 or not target.is_file():
+            raise ClusterAssemblyBuildError(
+                "standalone Assembly Blender source creation failed: "
+                + (completed.stderr or completed.stdout or "unknown error")[-4000:]
+            )
+    finally:
+        if collection.name in bpy.data.collections:
+            bpy.data.collections.remove(collection, do_unlink=True)
+        if text.name in bpy.data.texts:
+            bpy.data.texts.remove(text, do_unlink=True)
+        if library_path.is_file():
+            library_path.unlink()
+    return file_fingerprint(target)
 
 
 def _role_material_polygons(merged_mesh, role_inputs):
@@ -1136,6 +2948,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
             "role_identity": row.get("role_identity"),
             "material_slots": sorted(slots),
             "polygon_indices": polygons,
+            "normalized_variants": deepcopy(row.get("normalized_variants")),
         }
     return result
 
@@ -1177,8 +2990,11 @@ def build_blender_assembly_inputs(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     stem = Path(str((handoff.get("spm") or {}).get("path") or full_fbx_path)).stem
-    base_fbx = output / f"BASE_{stem}.fbx"
+    base_asset_name = _public_base_name(stem)
+    base_export_stem = base_asset_name
+    base_fbx = output / f"{base_export_stem}.fbx"
     manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
+    assembly_source_blend = output / f"{stem}_NaniteAssemblySource.blend"
     excluded_polygons = sorted(
         {index for row in roles.values() for index in row["polygon_indices"]}
     )
@@ -1186,24 +3002,61 @@ def build_blender_assembly_inputs(
     parts = []
     all_bindings = []
     base_obj = None
+    base_armature = None
+    scene_units = bpy.context.scene.unit_settings
+    source_unit_system = str(scene_units.system)
+    source_scale_length = float(scene_units.scale_length)
+    source_centimeters_per_blender_unit = (
+        100.0 * source_scale_length if source_unit_system != "NONE" else 100.0
+    )
+    if source_unit_system != "METRIC" or abs(source_scale_length - 1.0) > 1.0e-9:
+        raise ClusterAssemblyBuildError(
+            "Assembly generation requires the final Full SK meter-space scene "
+            f"contract, got system={source_unit_system} scale={source_scale_length}"
+        )
     try:
         base_obj = _copy_base_without_role_polygons(
             bpy,
             final_merged_mesh,
             excluded_polygons,
-            f"BASE_{stem}",
+            base_export_stem,
         )
-        created_objects.append(base_obj)
+        base_armature = _copy_normalized_base_armature(
+            bpy,
+            final_armature,
+            base_export_stem + "_Armature",
+        )
+        created_objects.extend([base_obj, base_armature])
+        base_export_parents = _replicate_full_export_parent_chain(
+            bpy,
+            final_merged_mesh,
+            final_armature,
+            base_obj,
+            base_armature,
+        )
+        created_objects.extend(base_export_parents)
+        for modifier in base_obj.modifiers:
+            if modifier.type == "ARMATURE":
+                modifier.object = base_armature
         base_weighted_bones = _weighted_bones_for_base(
             base_obj,
             snapshot,
             skeleton_by_name,
         )
-        base_fbx_texture_contract = _export_selected_fbx(
-            bpy,
-            base_fbx,
-            [final_armature, base_obj],
-        )
+        source_armature_name = final_armature.name
+        normalized_armature_name = base_armature.name
+        final_armature.name = source_armature_name + "__FullSource"
+        base_armature.name = source_armature_name
+        try:
+            base_fbx_texture_contract = _export_selected_fbx(
+                bpy,
+                base_fbx,
+                [base_armature, base_obj],
+                full_skeleton_root=True,
+            )
+        finally:
+            base_armature.name = normalized_armature_name
+            final_armature.name = source_armature_name
         for role in ROLE_ORDER:
             role_row = roles.get(role)
             if role_row is None:
@@ -1215,81 +3068,300 @@ def build_blender_assembly_inputs(
             by_signature = defaultdict(list)
             for component in components:
                 by_signature[_component_signature(final_merged_mesh.data, component)].append(component)
-            for signature, instances in sorted(by_signature.items()):
-                template = instances[0]
-                prototype_id = f"{role}_{signature}"
-                part_obj, part_armature, center = _copy_component_as_rigid_part(
-                    bpy,
-                    final_merged_mesh,
-                    template,
-                    "PART_" + prototype_id,
+            normalized_contract = role_row.get("normalized_variants")
+            if normalized_contract:
+                validate_file_fingerprint(
+                    normalized_contract.get("manifest"),
+                    f"Atlas normalized variant manifest for {role}",
                 )
-                created_objects.extend([part_obj, part_armature])
-                part_fbx = output / f"PART_{prototype_id}.fbx"
-                part_fbx_texture_contract = _export_selected_fbx(
-                    bpy,
-                    part_fbx,
-                    [part_armature, part_obj],
+                validate_file_fingerprint(
+                    normalized_contract.get("source_blend"),
+                    f"Send to Unreal normalized source blend for {role}",
                 )
-                bindings = []
-                for instance_index, component in enumerate(instances):
-                    source_indices, target_indices = _ordered_correspondence(
-                        final_merged_mesh,
-                        template,
-                        component,
+                prototypes, imported_objects = _import_normalized_plan_prototypes(
+                    bpy,
+                    normalized_contract,
+                )
+                created_objects.extend(imported_objects)
+                composite_accumulators = {}
+                for signature, instances in sorted(by_signature.items()):
+                    prototype = _normalized_prototype_for_component(
+                        prototypes,
+                        final_merged_mesh.data,
+                        instances[0],
                     )
-                    source_world = _world_points(final_merged_mesh, source_indices)
-                    source_centered = [
-                        [point[axis] - center[axis] for axis in range(3)]
-                        for point in source_world
-                    ]
-                    target_world = _world_points(final_merged_mesh, target_indices)
-                    transform = fit_trs_transform(source_centered, target_world)
-                    influences = _component_influences(final_merged_mesh, component)
-                    binding = {
-                        "instance": instance_index,
-                        "component_polygon_indices": component["polygons"],
-                        "transform": transform,
-                        "bone_influences": influences,
+                    if prototype is None:
+                        raise ClusterAssemblyBuildError(
+                            f"{role} plan instance has no normalized variant: "
+                            + signature
+                        )
+                    variant = prototype["variant"]
+                    source_obj = prototype["object"]
+                    source_component = prototype["component"]
+                    ordinal = int(variant.get("ordinal") or 0)
+                    part_asset_name = str(
+                        variant.get("skeletal_asset_name") or ""
+                    )
+                    if ordinal <= 0 or not part_asset_name:
+                        raise ClusterAssemblyBuildError(
+                            "normalized variant has no ordinal/skeletal asset name"
+                        )
+                    prototype_id = (
+                        f"{role}_normalized_{ordinal:02d}_{signature}"
+                    )
+                    bindings = []
+                    for instance_index, component in enumerate(instances):
+                        source_indices, target_indices = (
+                            _ordered_cross_object_correspondence(
+                                source_obj,
+                                source_component,
+                                final_merged_mesh,
+                                component,
+                            )
+                        )
+                        source_world = _world_points(
+                            source_obj,
+                            source_indices,
+                        )
+                        target_world = _world_points(
+                            final_merged_mesh,
+                            target_indices,
+                        )
+                        transform = fit_uniform_similarity_transform(
+                            source_world,
+                            target_world,
+                        )
+                        influences = _component_influences(
+                            final_merged_mesh,
+                            component,
+                        )
+                        binding = {
+                            "instance": instance_index,
+                            "component_polygon_indices": component["polygons"],
+                            "transform": transform,
+                            "bone_influences": influences,
+                        }
+                        hierarchy = validate_binding_hierarchy(
+                            binding,
+                            snapshot,
+                            skeleton_by_name=skeleton_by_name,
+                        )
+                        binding["anchor_bone"] = hierarchy["anchor_bone"]
+                        bindings.append(binding)
+                    composite_parts = list(variant.get("composite_parts") or [])
+                    if composite_parts:
+                        if str(variant.get("source_partition_mode") or "") != "COMPOSITE_PER_DEFORM_ROOT":
+                            raise ClusterAssemblyBuildError(
+                                "normalized composite parts require COMPOSITE_PER_DEFORM_ROOT"
+                            )
+                        for expected_subpart, subpart in enumerate(composite_parts, 1):
+                            subpart_index = int(subpart.get("subpart_index") or 0)
+                            subpart_asset = str(
+                                subpart.get("skeletal_asset_name") or ""
+                            )
+                            if (
+                                subpart_index != expected_subpart
+                                or not subpart_asset.casefold().startswith("sk_")
+                            ):
+                                raise ClusterAssemblyBuildError(
+                                    "normalized composite subparts are not consecutive SK assets"
+                                )
+                            expected_normalized_bounds = (
+                                _expected_normalized_bounds_for_variant(
+                                    normalized_contract,
+                                    subpart,
+                                    subpart_asset,
+                                    subpart_index,
+                                )
+                            )
+                            key = (subpart_index, subpart_asset)
+                            accumulator = composite_accumulators.get(key)
+                            if accumulator is None:
+                                external_source = {
+                                    "kind": "send_to_unreal_normalized_skeletal_part",
+                                    "unreal_relative_folder": str(
+                                        variant.get("unreal_relative_folder") or "Cluster"
+                                    ),
+                                    "source_blend": deepcopy(
+                                        normalized_contract["source_blend"]
+                                    ),
+                                    "plan_fbx": deepcopy(variant["plan_fbx"]),
+                                    "plan_name": str(variant.get("plan_name") or ""),
+                                    "ordinal": ordinal,
+                                    "card_ordinals": [],
+                                    "source_prototype_index": subpart_index,
+                                    "source_partition_mode": "COMPOSITE_PER_DEFORM_ROOT",
+                                    "source_bone": str(subpart.get("source_bone") or ""),
+                                    "endpoint_bone": str(subpart.get("endpoint_bone") or ""),
+                                    "pivot_contract": str(
+                                        subpart.get("pivot_contract")
+                                        or variant.get("pivot_contract")
+                                        or ""
+                                    ),
+                                }
+                                if expected_normalized_bounds is not None:
+                                    external_source["expected_normalized_bounds"] = (
+                                        expected_normalized_bounds
+                                    )
+                                    external_source[
+                                        "expected_normalized_bounds_source"
+                                    ] = "normalized_variant_build_metadata"
+                                accumulator = {
+                                    "prototype_id": (
+                                        f"{role}_composite_{subpart_index:02d}_"
+                                        + hashlib.sha1(subpart_asset.encode("utf-8")).hexdigest()[:16]
+                                    ),
+                                    "asset_name": subpart_asset,
+                                    "export_stem": subpart_asset,
+                                    "role": role,
+                                    "role_identity": role_row["role_identity"],
+                                    "topology_signature": "composite_subpart",
+                                    "logical_group_index": ROLE_ORDER.index(role),
+                                    "logical_subpart_index": subpart_index,
+                                    "external_source": external_source,
+                                    "template": {
+                                        "vertex_count": 0,
+                                        "polygon_count": 0,
+                                        "center": [0.0, 0.0, 0.0],
+                                    },
+                                    "bindings": [],
+                                    "fit_summary": {
+                                        "fit_mode": "uniform_similarity_3d_composite_subpart",
+                                    },
+                                }
+                                composite_accumulators[key] = accumulator
+                            else:
+                                recorded_bounds = (
+                                    accumulator["external_source"].get(
+                                        "expected_normalized_bounds"
+                                    )
+                                )
+                                if (
+                                    expected_normalized_bounds is not None
+                                    and recorded_bounds is not None
+                                    and _canonical_json(expected_normalized_bounds)
+                                    != _canonical_json(recorded_bounds)
+                                ):
+                                    raise ClusterAssemblyBuildError(
+                                        "normalized composite prototype bounds "
+                                        "changed across card variants: "
+                                        + subpart_asset
+                                    )
+                            card_ordinals = accumulator["external_source"]["card_ordinals"]
+                            if ordinal not in card_ordinals:
+                                card_ordinals.append(ordinal)
+                            for base_binding in bindings:
+                                composite_binding = deepcopy(base_binding)
+                                composite_binding["instance"] = len(
+                                    accumulator["bindings"]
+                                )
+                                composite_binding["card_ordinal"] = ordinal
+                                composite_binding["composite_subpart_index"] = subpart_index
+                                composite_binding["transform"] = (
+                                    compose_similarity_with_relative_matrix(
+                                        base_binding["transform"],
+                                        subpart.get("subpart_to_card_matrix"),
+                                    )
+                                )
+                                accumulator["bindings"].append(composite_binding)
+                                all_bindings.append(composite_binding)
+                        continue
+                    all_bindings.extend(bindings)
+                    external_source = {
+                        "kind": "send_to_unreal_normalized_skeletal_part",
+                        "unreal_relative_folder": str(
+                            variant.get("unreal_relative_folder") or "Cluster"
+                        ),
+                        "source_blend": deepcopy(
+                            normalized_contract["source_blend"]
+                        ),
+                        "plan_fbx": deepcopy(variant["plan_fbx"]),
+                        "plan_name": str(variant.get("plan_name") or ""),
+                        "ordinal": ordinal,
+                        "source_prototype_index": (
+                            int(variant["source_prototype_index"])
+                            if variant.get("source_prototype_index")
+                            else None
+                        ),
+                        "source_partition_mode": str(
+                            variant.get("source_partition_mode") or ""
+                        ),
+                        "pivot_contract": str(
+                            variant.get("pivot_contract") or ""
+                        ),
                     }
-                    hierarchy = validate_binding_hierarchy(
-                        binding,
-                        snapshot,
-                        skeleton_by_name=skeleton_by_name,
+                    expected_normalized_bounds = (
+                        _expected_normalized_bounds_for_variant(
+                            normalized_contract,
+                            variant,
+                            part_asset_name,
+                            ordinal,
+                        )
                     )
-                    binding["anchor_bone"] = hierarchy["anchor_bone"]
-                    bindings.append(binding)
-                    all_bindings.append(binding)
-                parts.append(
-                    {
+                    if expected_normalized_bounds is not None:
+                        external_source["expected_normalized_bounds"] = (
+                            expected_normalized_bounds
+                        )
+                        external_source[
+                            "expected_normalized_bounds_source"
+                        ] = "normalized_variant_build_metadata"
+                    parts.append({
                         "prototype_id": prototype_id,
+                        "asset_name": part_asset_name,
+                        "export_stem": part_asset_name,
                         "role": role,
                         "role_identity": role_row["role_identity"],
                         "topology_signature": signature,
-                        "fbx": file_fingerprint(part_fbx),
-                        "fbx_texture_contract": part_fbx_texture_contract,
+                        "external_source": external_source,
                         "template": {
-                            "vertex_count": len(template["vertices"]),
-                            "polygon_count": len(template["polygons"]),
-                            "center": center,
+                            "vertex_count": len(source_component["vertices"]),
+                            "polygon_count": len(source_component["polygons"]),
+                            "center": [0.0, 0.0, 0.0],
                         },
                         "bindings": bindings,
                         "fit_summary": {
+                            "fit_mode": "uniform_similarity_3d",
                             "trs_relative_rms_median": statistics.median(
-                                row["transform"]["trs_relative_rms"] for row in bindings
+                                row["transform"]["trs_relative_rms"]
+                                for row in bindings
                             ),
                             "trs_relative_rms_max": max(
-                                row["transform"]["trs_relative_rms"] for row in bindings
+                                row["transform"]["trs_relative_rms"]
+                                for row in bindings
                             ),
                             "affine_relative_rms_median": statistics.median(
-                                row["transform"]["affine_relative_rms"] for row in bindings
+                                row["transform"]["affine_relative_rms"]
+                                for row in bindings
                             ),
                             "affine_relative_rms_max": max(
-                                row["transform"]["affine_relative_rms"] for row in bindings
+                                row["transform"]["affine_relative_rms"]
+                                for row in bindings
                             ),
                         },
-                    }
-                )
+                    })
+                for key in sorted(composite_accumulators):
+                    accumulator = composite_accumulators[key]
+                    fit_rows = accumulator["bindings"]
+                    accumulator["fit_summary"].update({
+                        "trs_relative_rms_median": statistics.median(
+                            row["transform"]["trs_relative_rms"] for row in fit_rows
+                        ),
+                        "trs_relative_rms_max": max(
+                            row["transform"]["trs_relative_rms"] for row in fit_rows
+                        ),
+                        "affine_relative_rms_median": statistics.median(
+                            row["transform"]["affine_relative_rms"] for row in fit_rows
+                        ),
+                        "affine_relative_rms_max": max(
+                            row["transform"]["affine_relative_rms"] for row in fit_rows
+                        ),
+                    })
+                    parts.append(accumulator)
+                continue
+            raise ClusterAssemblyBuildError(
+                f"{role} has no external normalized variants; "
+                "component-derived tiny-part fallback is disabled"
+            )
         wind_validation = validate_wind_json_against_skeleton(
             wind_json_path,
             snapshot,
@@ -1307,14 +3379,60 @@ def build_blender_assembly_inputs(
                 "Assembly base weights are absent from the final wind hierarchy: "
                 + ", ".join(missing_base_wind_bones[:20])
             )
+        parts = _coalesce_normalized_external_parts(parts)
+        registered_variants = []
+        used_variant_keys = set()
+        for part in parts:
+            external = part.get("external_source") or {}
+            if not external:
+                continue
+            ordinals = list(external.get("card_ordinals") or [])
+            if not ordinals:
+                ordinals = [int(external.get("ordinal") or 0)]
+            used_variant_keys.update(
+                (str(part.get("role") or "").casefold(), int(ordinal))
+                for ordinal in ordinals
+                if int(ordinal) > 0
+            )
+        for role, role_row in sorted(roles.items()):
+            normalized = role_row.get("normalized_variants") or {}
+            for variant in normalized.get("variants") or []:
+                ordinal = int(variant.get("ordinal") or 0)
+                registered_variants.append({
+                    "role": role,
+                    "ordinal": ordinal,
+                    "card_name": str(variant.get("plan_name") or ""),
+                    "skeletal_asset_name": str(
+                        variant.get("skeletal_asset_name") or ""
+                    ),
+                    "source_prototype_index": (
+                        int(variant["source_prototype_index"])
+                        if variant.get("source_prototype_index")
+                        else None
+                    ),
+                    "source_partition_mode": str(
+                        variant.get("source_partition_mode") or ""
+                    ),
+                    "composite_parts": deepcopy(
+                        variant.get("composite_parts") or []
+                    ),
+                    "target_mesh_id": int(variant.get("target_mesh_id") or 0),
+                    "pivot_contract": str(
+                        variant.get("pivot_contract") or ""
+                    ),
+                    "instanced": (role.casefold(), ordinal) in used_variant_keys,
+                })
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "kind": MANIFEST_KIND,
             "status": "ready",
             "content_decision": "build",
             "full_skeletal_mesh_preserved": True,
+            "full_asset_stem": stem,
             "full_fbx": full_fingerprint_before,
             "base": {
+                "asset_name": base_asset_name,
+                "export_stem": base_export_stem,
                 "fbx": file_fingerprint(base_fbx),
                 "fbx_texture_contract": base_fbx_texture_contract,
                 "excluded_role_polygon_count": len(excluded_polygons),
@@ -1324,17 +3442,35 @@ def build_blender_assembly_inputs(
                 "all_weighted_bones_in_final_wind": True,
             },
             "parts": parts,
+            "registered_variants": registered_variants,
             "final_skeleton": snapshot,
             "wind_contract": wind_validation,
             "coordinate_contract": {
                 "source": "Blender world, Z-up, right-handed",
                 "target": "Unreal local, Z-up, left-handed, centimeters",
-                "centimeters_per_blender_unit": (
-                    100.0 * float(bpy.context.scene.unit_settings.scale_length)
-                ),
+                "centimeters_per_blender_unit": source_centimeters_per_blender_unit,
+                "source_unit_system": source_unit_system,
+                "source_scale_length": source_scale_length,
+                "generated_fbx_unit_scale_factor": 100.0,
                 "translation_axis_map": ["x", "-y", "z"],
                 "rotation_quaternion_axis_map": ["-x", "y", "-z", "w"],
                 "transform_space": "Local",
+            },
+            "role_contract": {
+                "role_material_identities": [
+                    str(row.get("role_identity") or "")
+                    for _role, row in sorted(roles.items())
+                ],
+                "registered_card_variants": [
+                    row["card_name"] for row in registered_variants
+                ],
+                "registered_skeletal_variants": [
+                    row["skeletal_asset_name"] for row in registered_variants
+                ],
+                "assembly_prototypes": [
+                    part["asset_name"] for part in parts
+                ],
+                "raw_cluster_assets_are_not_assembly_prototypes": True,
             },
             "handoff_evidence": {
                 "actual_fbx": handoff.get("actual_fbx"),
@@ -1343,6 +3479,13 @@ def build_blender_assembly_inputs(
                 "roles": roles,
             },
         }
+        _validate_public_export_names(manifest)
+        manifest["assembly_source_blend"] = _write_assembly_source_blend(
+            bpy,
+            assembly_source_blend,
+            created_objects,
+            manifest,
+        )
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1362,6 +3505,8 @@ def build_blender_assembly_inputs(
                 )
                 if data.name in collection:
                     collection.remove(data)
+        scene_units.system = source_unit_system
+        scene_units.scale_length = source_scale_length
     full_fingerprint_after = file_fingerprint(full_fbx_path)
     if full_fingerprint_after != full_fingerprint_before:
         raise ClusterAssemblyBuildError("existing Full SK FBX changed during Assembly build")
@@ -1371,6 +3516,7 @@ def build_blender_assembly_inputs(
 def validate_unreal_asset_contract(manifest, asset_contract):
     if (manifest or {}).get("status") != "ready":
         raise ClusterAssemblyBuildError("Assembly manifest is not ready")
+    public_names = _validate_public_export_names(manifest)
     required = ("full_skeletal_mesh", "base_skeletal_mesh", "assembly")
     for key in required:
         value = str((asset_contract or {}).get(key) or "")
@@ -1391,11 +3537,139 @@ def validate_unreal_asset_contract(manifest, asset_contract):
         )
     if any(not str(path).startswith("/Game/") for path in part_paths.values()):
         raise ClusterAssemblyBuildError("invalid Unreal part asset path")
+    if Path(asset_contract["full_skeletal_mesh"]).name != public_names[
+        "full_asset_stem"
+    ]:
+        raise ClusterAssemblyBuildError(
+            "Full Skeletal Mesh path violates the Assembly public-name contract"
+        )
+    expected_base = str((manifest.get("base") or {}).get("asset_name") or "")
+    if Path(asset_contract["base_skeletal_mesh"]).name != expected_base:
+        raise ClusterAssemblyBuildError(
+            "base Skeletal Mesh path violates the Assembly public-name contract"
+        )
+    expected_parts = {
+        str(part.get("prototype_id") or ""): str(part.get("asset_name") or "")
+        for part in manifest.get("parts") or []
+    }
+    for prototype_id, path in part_paths.items():
+        if Path(path).name != expected_parts.get(prototype_id):
+            raise ClusterAssemblyBuildError(
+                "part Skeletal Mesh path violates the Assembly public-name contract: "
+                + str(prototype_id)
+            )
+    expected_assembly = public_names["full_asset_stem"] + "_NaniteAssembly"
+    if Path(asset_contract["assembly"]).name != expected_assembly:
+        raise ClusterAssemblyBuildError(
+            "Nanite Assembly path violates the public-name contract"
+        )
     return {
         "full_skeletal_mesh": asset_contract["full_skeletal_mesh"],
         "base_skeletal_mesh": asset_contract["base_skeletal_mesh"],
         "parts": dict(part_paths),
         "assembly": asset_contract["assembly"],
+    }
+
+
+def _build_unreal_assembly_provenance_payload(manifest, paths):
+    """Describe production context without duplicating native Assembly data."""
+    manifest_fingerprint = (manifest or {}).get("manifest") or {}
+    native_groups = {}
+    for part in (manifest or {}).get("parts") or []:
+        prototype_id = str(part.get("prototype_id") or "")
+        native_path = str((paths.get("parts") or {}).get(prototype_id) or "")
+        if not native_path:
+            raise ClusterAssemblyBuildError(
+                "provenance part has no resolved native asset path: " + prototype_id
+            )
+        group = native_groups.setdefault(native_path, [])
+        group.append(part)
+    native_parts = []
+    for part_index, (_native_path, grouped_parts) in enumerate(native_groups.items()):
+        roles = {str(part.get("role") or "") for part in grouped_parts}
+        asset_names = {str(part.get("asset_name") or "") for part in grouped_parts}
+        pivot_contracts = {
+            str((part.get("external_source") or {}).get("pivot_contract") or "")
+            for part in grouped_parts
+        }
+        if len(roles) != 1 or len(asset_names) != 1 or len(pivot_contracts) != 1:
+            raise ClusterAssemblyBuildError(
+                "one native Assembly part has inconsistent production provenance"
+            )
+        prototype_ids = [str(part.get("prototype_id") or "") for part in grouped_parts]
+        card_names = sorted({
+            str((part.get("external_source") or {}).get("plan_name") or "")
+            for part in grouped_parts
+            if (part.get("external_source") or {}).get("plan_name")
+        })
+        ordinals = {
+            int((part.get("external_source") or {}).get("ordinal") or 0)
+            for part in grouped_parts
+        }
+        logical_group_indices = {
+            int(part.get("logical_group_index", ROLE_ORDER.index(next(iter(roles)))))
+            for part in grouped_parts
+        }
+        logical_subpart_indices = {
+            int(part.get("logical_subpart_index") or 0)
+            for part in grouped_parts
+        }
+        card_ordinals = sorted({
+            int(value)
+            for part in grouped_parts
+            for value in (
+                (part.get("external_source") or {}).get("card_ordinals")
+                or [int((part.get("external_source") or {}).get("ordinal") or 0)]
+            )
+            if int(value) > 0
+        })
+        if len(logical_group_indices) != 1 or len(logical_subpart_indices) != 1:
+            raise ClusterAssemblyBuildError(
+                "one native Assembly part has inconsistent logical hierarchy"
+            )
+        logical_subpart_index = next(iter(logical_subpart_indices))
+        native_parts.append({
+            "part_index": part_index,
+            "group_index": next(iter(logical_group_indices)),
+            "subpart_ordinal": (
+                logical_subpart_index
+                if logical_subpart_index > 0
+                else (next(iter(ordinals)) if len(ordinals) == 1 else 0)
+            ),
+            "role": next(iter(roles)),
+            "prototype_id": (
+                prototype_ids[0]
+                if len(prototype_ids) == 1
+                else "+".join(prototype_ids)
+            ),
+            "asset_name": next(iter(asset_names)),
+            "card_name": ", ".join(card_names),
+            "ordinal": next(iter(ordinals)) if len(ordinals) == 1 else 0,
+            "card_ordinals": card_ordinals,
+            "expected_instance_count": sum(
+                len(part.get("bindings") or []) for part in grouped_parts
+            ),
+            "pivot_contract": next(iter(pivot_contracts)),
+            "external_normalized_part": all(
+                bool(part.get("external_source")) for part in grouped_parts
+            ),
+        })
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "builder_version": f"{MANIFEST_KIND}:{SCHEMA_VERSION}",
+        "full_source": paths["full_skeletal_mesh"],
+        "base_source": paths["base_skeletal_mesh"],
+        "manifest_path": str(
+            manifest_fingerprint.get("path")
+            or (manifest or {}).get("manifest_path")
+            or ""
+        ),
+        "manifest_sha256": str(manifest_fingerprint.get("sha256") or ""),
+        "build_status": "Valid",
+        "registered_variants": deepcopy(
+            (manifest or {}).get("registered_variants") or []
+        ),
+        "parts": native_parts,
     }
 
 
@@ -1630,6 +3904,84 @@ def scope_material_pipeline_to_codex_tests(
     }
 
 
+def scope_material_pipeline_for_destination(
+    manifest_assets,
+    unreal_folder,
+    output_dir,
+):
+    """Isolate Codex tests while leaving production material intent untouched."""
+    folder = str(unreal_folder or "").rstrip("/")
+    if folder.casefold().startswith("/game/codex/tests/"):
+        return scope_material_pipeline_to_codex_tests(
+            manifest_assets,
+            folder,
+            output_dir,
+        )
+    return {
+        "status": "production_preserved",
+        "unreal_folder": folder,
+        "production_materials_preserved": True,
+        "assets": [
+            {
+                "asset_path": (asset.get("asset_data") or {}).get("asset_path"),
+                "material_sidecar": (
+                    asset.get("asset_data") or {}
+                ).get("_material_pipeline_json_path"),
+            }
+            for asset in manifest_assets or []
+        ],
+    }
+
+
+def _apply_generated_fbx_import_contract(manifest_asset):
+    """Override only settings that differ for generated Blender FBXs.
+
+    The Full SK template may deliberately disable scene conversion for its own
+    export.  BASE/part files are emitted directly by Blender and retain Blender
+    FBX axis metadata, so Unreal must consume that metadata.  Applying a mesh
+    rotation would also rotate the Skeleton/bind space and is forbidden here.
+    """
+    property_data = (manifest_asset or {}).get("property_data")
+    if not isinstance(property_data, dict):
+        raise ClusterAssemblyBuildError(
+            "Assembly generated import requires Full SK property_data"
+        )
+    try:
+        settings = property_data["unreal"]["import_method"]["fbx"][
+            "skeletal_mesh_import_data"
+        ]
+    except (KeyError, TypeError) as exc:
+        raise ClusterAssemblyBuildError(
+            "Assembly generated import requires skeletal FBX import settings"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise ClusterAssemblyBuildError(
+            "Assembly skeletal FBX import settings are invalid"
+        )
+
+    overrides = {
+        # Generated FBX geometry and bones are already baked to centimeters
+        # with object transforms normalized to 1, so consume them with the
+        # same no-extra-conversion policy as the Full SK.
+        "convert_scene": False,
+        "convert_scene_unit": False,
+        "force_front_x_axis": False,
+        "import_rotation": [0.0, 0.0, 0.0],
+    }
+    for name, value in overrides.items():
+        setting = settings.setdefault(name, {})
+        if not isinstance(setting, dict):
+            raise ClusterAssemblyBuildError(
+                f"Assembly skeletal FBX setting is invalid: {name}"
+            )
+        setting["value"] = value
+    return {
+        "source": "generated Blender FBX axis metadata",
+        "mesh_rotation_applied": False,
+        **overrides,
+    }
+
+
 def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unreal_folder):
     """Derive generated imports from the existing Send2UE Full-mesh contract."""
     if (manifest or {}).get("status") == "pass_through":
@@ -1637,6 +3989,7 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
     if (manifest or {}).get("status") != "ready":
         raise ClusterAssemblyBuildError("Assembly input manifest is not ready")
     validate_manifest_artifacts(manifest)
+    public_names = _validate_public_export_names(manifest)
     if not isinstance(full_manifest_asset, dict):
         raise ClusterAssemblyBuildError("Send2UE Full-mesh manifest asset is missing")
     template_data = full_manifest_asset.get("asset_data") or {}
@@ -1645,26 +3998,53 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
     source_asset_path = str(full_asset_path or template_data.get("asset_path") or "")
     if not source_asset_path.startswith("/Game/"):
         raise ClusterAssemblyBuildError("invalid Full Skeletal Mesh asset path")
-    folder = str(unreal_folder or "").rstrip("/") + "/Assembly"
+    if Path(source_asset_path).name != public_names["full_asset_stem"]:
+        raise ClusterAssemblyBuildError(
+            "Assembly Full asset path does not match the Blender public-name contract"
+        )
+    tree_folder = str(unreal_folder or "").rstrip("/")
+    assembly_folder = tree_folder + "/Assembly"
     generated_output_dir = Path(
         ((manifest.get("base") or {}).get("fbx") or {}).get("path")
     ).parent
 
-    def generated_asset(file_path, asset_path, asset_id, use_full_skeleton):
+    def generated_asset(
+        file_path,
+        asset_path,
+        asset_id,
+        asset_name,
+        export_stem,
+        use_full_skeleton,
+        prototype_id,
+    ):
         source = Path(file_path)
         if not source.is_file():
             raise ClusterAssemblyBuildError(f"generated Assembly FBX is missing: {source}")
+        if source.stem != export_stem:
+            raise ClusterAssemblyBuildError(
+                "generated Assembly FBX filename does not match export_stem"
+            )
+        if Path(asset_path).name != asset_name:
+            raise ClusterAssemblyBuildError(
+                "generated Assembly Unreal path does not match asset_name"
+            )
         row = deepcopy(full_manifest_asset)
         data = row.setdefault("asset_data", {})
         data["file_path"] = str(source.resolve())
-        data["asset_folder"] = folder + "/"
+        data["asset_folder"] = asset_path.rsplit("/", 1)[0] + "/"
         data["asset_path"] = asset_path
-        data["_mesh_object_name"] = source.stem
-        data["empty_object_name"] = source.stem
+        data["_mesh_object_name"] = export_stem
+        data["empty_object_name"] = export_stem
         data["skeleton_asset_path"] = "__FULL_FINAL_SKELETON__" if use_full_skeleton else ""
+        data["_cluster_assembly_asset_name"] = asset_name
+        data["_cluster_assembly_export_stem"] = export_stem
+        data["_cluster_assembly_prototype_id"] = prototype_id
+        data["_generated_fbx_axis_contract"] = _apply_generated_fbx_import_contract(
+            row
+        )
         sidecar = _generated_material_sidecar(
             template_data,
-            source.stem,
+            asset_name,
             generated_output_dir,
         )
         data["_material_pipeline_json_path"] = sidecar["generated"]["path"]
@@ -1688,39 +4068,97 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
                     commands[index] = rewritten
         return row
 
-    base_fbx = ((manifest.get("base") or {}).get("fbx") or {}).get("path")
-    base_path = folder + "/" + Path(str(base_fbx)).stem
-    assets = [generated_asset(base_fbx, base_path, "cluster_assembly_base", True)]
+    base_contract = manifest.get("base") or {}
+    base_fbx = (base_contract.get("fbx") or {}).get("path")
+    base_name = str(base_contract.get("asset_name") or "")
+    base_export_stem = str(base_contract.get("export_stem") or "")
+    base_path = assembly_folder + "/" + base_name
+    assets = [generated_asset(
+        base_fbx,
+        base_path,
+        "cluster_assembly_base",
+        base_name,
+        base_export_stem,
+        True,
+        "base",
+    )]
     part_paths = {}
+    external_assets = []
     for part in manifest.get("parts") or []:
         prototype_id = str(part.get("prototype_id") or "")
-        part_fbx = (part.get("fbx") or {}).get("path")
-        if not prototype_id or not part_fbx:
+        if not prototype_id:
             raise ClusterAssemblyBuildError("Assembly part manifest is incomplete")
-        part_path = folder + "/" + Path(str(part_fbx)).stem
+        part_name = str(part.get("asset_name") or "")
+        part_export_stem = str(part.get("export_stem") or "")
         if prototype_id in part_paths:
             raise ClusterAssemblyBuildError(
                 f"duplicate Assembly prototype id: {prototype_id}"
             )
+        external = part.get("external_source") or {}
+        if external:
+            relative_folder = str(
+                external.get("unreal_relative_folder") or ""
+            ).strip().replace("\\", "/").strip("/")
+            segments = relative_folder.split("/") if relative_folder else []
+            if (
+                external.get("kind")
+                != "send_to_unreal_normalized_skeletal_part"
+                or not relative_folder
+                or any(segment in {"", ".", ".."} for segment in segments)
+            ):
+                raise ClusterAssemblyBuildError(
+                    "normalized external Assembly part has an invalid Unreal folder"
+                )
+            part_path = tree_folder + "/" + relative_folder + "/" + part_name
+            part_paths[prototype_id] = part_path
+            external_asset = {
+                "prototype_id": prototype_id,
+                "asset_path": part_path,
+                "asset_name": part_name,
+                "source_kind": external["kind"],
+                "plan_name": str(external.get("plan_name") or ""),
+                "ordinal": int(external.get("ordinal") or 0),
+                "pivot_contract": str(external.get("pivot_contract") or ""),
+            }
+            if external.get("expected_normalized_bounds") is not None:
+                external_asset["expected_normalized_bounds"] = deepcopy(
+                    external["expected_normalized_bounds"]
+                )
+            external_assets.append(external_asset)
+            continue
+
+        part_fbx = (part.get("fbx") or {}).get("path")
+        if not part_fbx:
+            raise ClusterAssemblyBuildError("Assembly generated part FBX is missing")
+        part_path = assembly_folder + "/" + part_name
         part_paths[prototype_id] = part_path
         assets.append(
             generated_asset(
                 part_fbx,
                 part_path,
                 "cluster_assembly_part_" + prototype_id,
+                part_name,
+                part_export_stem,
                 False,
+                prototype_id,
             )
         )
     asset_contract = {
         "full_skeletal_mesh": source_asset_path,
         "base_skeletal_mesh": base_path,
         "parts": part_paths,
-        "assembly": folder + "/" + Path(source_asset_path).name + "_NaniteAssembly",
+        "assembly": (
+            assembly_folder
+            + "/"
+            + Path(source_asset_path).name
+            + "_NaniteAssembly"
+        ),
     }
     validate_unreal_asset_contract(manifest, asset_contract)
     return {
         "status": "ready",
         "assets": assets,
+        "external_assets": external_assets,
         "asset_contract": asset_contract,
     }
 
@@ -1781,6 +4219,312 @@ def _dynamic_wind_user_data(unreal, mesh):
     ]
 
 
+def _bounds_size(record, label):
+    if not isinstance(record, dict):
+        raise ClusterAssemblyBuildError(f"{label} bounds are missing")
+    size = record.get("size")
+    if size is None and record.get("extent") is not None:
+        size = [2.0 * float(value) for value in record["extent"]]
+    if not isinstance(size, (list, tuple)) or len(size) != 3:
+        raise ClusterAssemblyBuildError(f"{label} bounds size is invalid")
+    checked = [float(value) for value in size]
+    if any(not math.isfinite(value) or value <= 0.0 for value in checked):
+        raise ClusterAssemblyBuildError(f"{label} bounds size is not positive")
+    return checked
+
+
+def validate_unreal_bounds_contract(
+    full_bounds,
+    base_bounds,
+    assembly_bounds=None,
+    assembly_relative_tolerance=0.15,
+    base_absolute_scale_ratio_limit=10.0,
+    allow_normalized_prototype_dominance=False,
+):
+    """Reject unit/axis errors and incomplete final Assemblies.
+
+    A normalized external prototype can legitimately dominate the Full SK
+    bounds while the generator's user-authored Size/Frond dimensions are still
+    awaiting art-direction adjustment.  In that production contract the base
+    contains only the non-replaced tree geometry, so Full/base size is not a
+    unit probe.  The completed native Assembly remains required to reconstruct
+    the Full SK within tolerance.
+    """
+    full_size = _bounds_size(full_bounds, "Full SK")
+    base_size = _bounds_size(base_bounds, "Assembly base")
+
+    axis_scale_ratios = [
+        full_size[index] / base_size[index] for index in range(3)
+    ]
+    absolute_scale_ratio = math.exp(
+        sum(math.log(value) for value in axis_scale_ratios) / 3.0
+    )
+    ratio_limit = _positive_number(
+        base_absolute_scale_ratio_limit,
+        "Full/base absolute scale ratio limit",
+    )
+    base_scale_outside_limit = (
+        absolute_scale_ratio > ratio_limit
+        or absolute_scale_ratio < 1.0 / ratio_limit
+    )
+    if base_scale_outside_limit and not allow_normalized_prototype_dominance:
+        raise ClusterAssemblyBuildError(
+            "Assembly generated import has an absolute unit scale mismatch "
+            "relative to the Full SK: "
+            f"full_size={full_size} base_size={base_size} "
+            f"axis_scale_ratios={axis_scale_ratios} "
+            f"geometric_scale_ratio={absolute_scale_ratio}"
+        )
+
+    full_normalized = [value / sum(full_size) for value in full_size]
+    base_normalized = [value / sum(base_size) for value in base_size]
+    direct_error = sum(
+        abs(full_normalized[index] - base_normalized[index])
+        for index in range(3)
+    )
+    yz_swapped_error = (
+        abs(full_normalized[0] - base_normalized[0])
+        + abs(full_normalized[1] - base_normalized[2])
+        + abs(full_normalized[2] - base_normalized[1])
+    )
+    if (
+        not base_scale_outside_limit
+        and yz_swapped_error + 0.05 < direct_error
+    ):
+        raise ClusterAssemblyBuildError(
+            "Assembly generated import is Y/Z-swapped relative to the Full SK: "
+            f"full_size={full_size} base_size={base_size}"
+        )
+
+    result = {
+        "status": "base_axis_ok",
+        "full": full_bounds,
+        "base": base_bounds,
+        "base_direct_shape_error": direct_error,
+        "base_yz_swapped_shape_error": yz_swapped_error,
+        "base_axis_scale_ratios": axis_scale_ratios,
+        "base_absolute_scale_ratio": absolute_scale_ratio,
+        "base_absolute_scale_ratio_limit": ratio_limit,
+        "base_scale_outside_limit": base_scale_outside_limit,
+        "normalized_prototype_dominance_allowed": bool(
+            allow_normalized_prototype_dominance
+        ),
+        "assembly_relative_tolerance": float(assembly_relative_tolerance),
+    }
+    if assembly_bounds is None:
+        if base_scale_outside_limit:
+            result["status"] = (
+                "normalized_prototype_dominance_pending_final_validation"
+            )
+        return result
+
+    assembly_size = _bounds_size(assembly_bounds, "Nanite Assembly")
+    relative_errors = [
+        abs(assembly_size[index] - full_size[index]) / full_size[index]
+        for index in range(3)
+    ]
+    if max(relative_errors) > float(assembly_relative_tolerance):
+        raise ClusterAssemblyBuildError(
+            "Nanite Assembly bounds do not reconstruct the Full SK: "
+            f"full_size={full_size} assembly_size={assembly_size} "
+            f"relative_errors={relative_errors}"
+        )
+    full_origin = full_bounds.get("origin")
+    assembly_origin = assembly_bounds.get("origin")
+    origin_relative_errors = None
+    if (
+        isinstance(full_origin, (list, tuple))
+        and len(full_origin) == 3
+        and isinstance(assembly_origin, (list, tuple))
+        and len(assembly_origin) == 3
+    ):
+        origin_relative_errors = [
+            abs(float(assembly_origin[index]) - float(full_origin[index]))
+            / full_size[index]
+            for index in range(3)
+        ]
+        if max(origin_relative_errors) > float(assembly_relative_tolerance):
+            raise ClusterAssemblyBuildError(
+                "Nanite Assembly bounds center does not match the Full SK: "
+                f"full_origin={list(full_origin)} "
+                f"assembly_origin={list(assembly_origin)}"
+            )
+    result.update(
+        {
+            "status": "complete",
+            "assembly": assembly_bounds,
+            "assembly_size_relative_errors": relative_errors,
+            "assembly_origin_relative_errors": origin_relative_errors,
+        }
+    )
+    return result
+
+
+def _unreal_mesh_bounds_record(mesh):
+    bounds = mesh.get_bounds()
+    origin = [
+        float(bounds.origin.x),
+        float(bounds.origin.y),
+        float(bounds.origin.z),
+    ]
+    extent = [
+        float(bounds.box_extent.x),
+        float(bounds.box_extent.y),
+        float(bounds.box_extent.z),
+    ]
+    return {
+        "origin": origin,
+        "extent": extent,
+        "size": [2.0 * value for value in extent],
+        "minimum": [origin[index] - extent[index] for index in range(3)],
+        "maximum": [origin[index] + extent[index] for index in range(3)],
+    }
+
+
+def validate_unreal_normalized_prototype_bounds(
+    manifest,
+    part_assets,
+    relative_tolerance=0.08,
+    absolute_tolerance_cm=0.1,
+):
+    """Reject stale or wrong-unit external prototypes before Assembly build."""
+    production_contract = validate_normalized_prototype_unit_contract(manifest)
+    receipt_bounds = _receipt_normalized_bounds_by_asset(manifest)
+    parts = [
+        part
+        for part in (manifest or {}).get("parts") or []
+        if (part.get("external_source") or {}).get("kind")
+        == "send_to_unreal_normalized_skeletal_part"
+    ]
+    if not parts:
+        return {"status": "not_applicable", "parts": []}
+
+    expected_rows = []
+    missing = []
+    for part in parts:
+        external = part.get("external_source") or {}
+        asset_name = str(part.get("asset_name") or "")
+        explicit = external.get("expected_normalized_bounds")
+        receipt = receipt_bounds.get(asset_name.casefold())
+        if explicit is not None:
+            explicit = _checked_normalized_bounds(
+                explicit,
+                f"Assembly manifest prototype {asset_name}",
+            )
+        if (
+            explicit is not None
+            and receipt is not None
+            and _canonical_json(explicit) != _canonical_json(receipt)
+        ):
+            raise ClusterAssemblyBuildError(
+                "Assembly manifest and production receipt disagree on normalized "
+                f"prototype bounds: {asset_name}"
+            )
+        expected = explicit or receipt
+        if expected is None:
+            missing.append(asset_name)
+        else:
+            expected_rows.append((part, expected))
+
+    physical_production = production_contract.get("status") == "verified"
+    if missing and physical_production:
+        raise ClusterAssemblyBuildError(
+            "physical normalized Assembly manifest is missing expected prototype "
+            "bounds for: "
+            + ", ".join(missing)
+            + "; regenerate the BWR Assembly manifest from the current Blender "
+            "physical-direct-capture build metadata"
+        )
+    if not expected_rows:
+        return {
+            "status": "legacy_contract_not_present",
+            "parts": [],
+        }
+
+    coordinate_contract = (manifest or {}).get("coordinate_contract") or {}
+    centimeters_per_blender_unit = _positive_number(
+        coordinate_contract.get("centimeters_per_blender_unit"),
+        "Assembly prototype centimeters_per_blender_unit",
+    )
+    relative_tolerance = _positive_number(
+        relative_tolerance,
+        "normalized prototype relative bounds tolerance",
+    )
+    absolute_tolerance_cm = _positive_number(
+        absolute_tolerance_cm,
+        "normalized prototype absolute bounds tolerance",
+    )
+    checked = []
+    for part, expected in expected_rows:
+        prototype_id = str(part.get("prototype_id") or "")
+        asset_name = str(part.get("asset_name") or "")
+        mesh = (part_assets or {}).get(prototype_id)
+        if mesh is None:
+            raise ClusterAssemblyBuildError(
+                "loaded Unreal prototype is missing for bounds preflight: "
+                + prototype_id
+            )
+        actual_bounds = _unreal_mesh_bounds_record(mesh)
+        actual_size_cm = [
+            float(value) for value in actual_bounds.get("size") or []
+        ]
+        if (
+            len(actual_size_cm) != 3
+            or any(
+                not math.isfinite(value) or value < 0.0
+                for value in actual_size_cm
+            )
+            or max(actual_size_cm) <= 0.0
+        ):
+            raise ClusterAssemblyBuildError(
+                "loaded normalized prototype bounds are invalid: "
+                + asset_name
+            )
+        expected_size_cm = [
+            component * centimeters_per_blender_unit
+            for component in expected["size"]
+        ]
+        absolute_errors_cm = [
+            abs(actual_size_cm[index] - expected_size_cm[index])
+            for index in range(3)
+        ]
+        allowed_errors_cm = [
+            max(
+                absolute_tolerance_cm,
+                expected_size_cm[index] * relative_tolerance,
+            )
+            for index in range(3)
+        ]
+        if any(
+            absolute_errors_cm[index] > allowed_errors_cm[index]
+            for index in range(3)
+        ):
+            raise ClusterAssemblyBuildError(
+                "stale or wrong-unit normalized Unreal prototype "
+                f"{asset_name}: expected Blender physical-capture bounds "
+                f"{[round(value, 6) for value in expected_size_cm]} cm, loaded "
+                f"{[round(value, 6) for value in actual_size_cm]} cm. Re-send "
+                "the current normalized source blend through the regular Blender "
+                "Send to Unreal profile before building the Nanite Assembly; do "
+                "not compensate with generator Leaf Size or Frond Width/Height."
+            )
+        checked.append({
+            "prototype_id": prototype_id,
+            "asset_name": asset_name,
+            "expected_size_cm": expected_size_cm,
+            "actual_size_cm": actual_size_cm,
+            "absolute_errors_cm": absolute_errors_cm,
+            "allowed_errors_cm": allowed_errors_cm,
+        })
+    return {
+        "status": "verified",
+        "physical_production_contract": physical_production,
+        "centimeters_per_blender_unit": centimeters_per_blender_unit,
+        "prototype_count": len(checked),
+        "parts": checked,
+    }
+
+
 def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -1801,6 +4545,32 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     part_assets = {
         key: load_skeletal(value) for key, value in paths["parts"].items()
     }
+    prototype_bounds_preflight = validate_unreal_normalized_prototype_bounds(
+        manifest,
+        part_assets,
+    )
+    full_bounds = _unreal_mesh_bounds_record(full)
+    base_bounds = _unreal_mesh_bounds_record(base)
+    parts = list(manifest.get("parts") or [])
+    normalized_external_parts = [
+        part
+        for part in parts
+        if part.get("topology_signature") == "normalized_external_asset"
+        and (part.get("external_source") or {}).get("kind")
+        == "send_to_unreal_normalized_skeletal_part"
+        and (part.get("fit_summary") or {}).get("fit_mode")
+        == "uniform_similarity_3d_normalized_asset"
+    ]
+    allow_normalized_prototype_dominance = bool(parts) and (
+        len(normalized_external_parts) == len(parts)
+    )
+    validate_unreal_bounds_contract(
+        full_bounds,
+        base_bounds,
+        allow_normalized_prototype_dominance=(
+            allow_normalized_prototype_dominance
+        ),
+    )
     expected_bones = [
         row["name"] for row in manifest["final_skeleton"]["bones"]
     ]
@@ -1968,6 +4738,17 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         raise ClusterAssemblyBuildError(
             "finished Assembly does not use the Full SK final Skeleton"
         )
+    try:
+        material_normalization = normalize_unreal_nanite_assembly_materials(
+            unreal,
+            assembly,
+            apply=True,
+            allow_dirty=True,
+        )
+    except NaniteAssemblyMaterialError as exc:
+        raise ClusterAssemblyBuildError(
+            "finished Assembly material table/remaps are not canonical: " + str(exc)
+        ) from exc
     if not hasattr(unreal, "CodexDynamicWindImportLibrary"):
         raise ClusterAssemblyBuildError("CodexDynamicWindImportLibrary is unavailable")
     pose_sync_result = (
@@ -1986,6 +4767,12 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
             "Assembly reference pose could not be synchronized to the Full SK "
             "final Skeleton: "
             + str(reference_pose_sync.get("error") or reference_pose_sync)
+        )
+    if reference_pose_sync.get("changed"):
+        raise ClusterAssemblyBuildError(
+            "Assembly reference pose required a destructive post-build change; "
+            "generated BASE/part FBX units do not match the Full SK Skeleton: "
+            + str(reference_pose_sync)
         )
     result = unreal.CodexDynamicWindImportLibrary.import_dynamic_wind_json_to_skeletal_mesh(
         assembly,
@@ -2025,6 +4812,41 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         raise ClusterAssemblyBuildError(
             "finished Assembly has no regenerated DynamicWindSkeletalData"
         )
+    bounds_completion = validate_unreal_bounds_contract(
+        full_bounds,
+        base_bounds,
+        _unreal_mesh_bounds_record(assembly),
+        allow_normalized_prototype_dominance=(
+            allow_normalized_prototype_dominance
+        ),
+    )
+    if not hasattr(unreal, "NaniteAssemblyInspectorLibrary"):
+        raise ClusterAssemblyBuildError(
+            "NaniteAssemblyInspectorLibrary is unavailable"
+        )
+    provenance_payload = _build_unreal_assembly_provenance_payload(
+        manifest,
+        paths,
+    )
+    provenance_result = (
+        unreal.NaniteAssemblyInspectorLibrary
+        .set_skeletal_mesh_assembly_provenance_from_json(
+            assembly,
+            json.dumps(provenance_payload, ensure_ascii=False),
+        )
+    )
+    try:
+        provenance = json.loads(str(provenance_result))
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "Assembly provenance writer returned invalid JSON: "
+            f"{provenance_result!r}"
+        ) from exc
+    if not provenance.get("success"):
+        raise ClusterAssemblyBuildError(
+            "Assembly provenance could not be attached: "
+            + str(provenance.get("error") or provenance)
+        )
     unreal.EditorAssetLibrary.save_loaded_asset(assembly, only_if_is_dirty=False)
     return {
         "status": "ok",
@@ -2039,8 +4861,12 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "base_weighted_bone_count": len(base_weighted_bones),
         "base_weights_in_final_wind": True,
         "reference_pose_sync": reference_pose_sync,
+        "prototype_bounds_preflight": prototype_bounds_preflight,
+        "bounds_completion": bounds_completion,
+        "material_normalization": material_normalization,
         "wind_json_sha256": (wind_validation.get("wind_json") or {}).get("sha256"),
         "dynamic_wind": wind_import,
+        "provenance": provenance,
     }
 
 
@@ -2055,14 +4881,19 @@ __all__ = [
     "content_build_decision",
     "file_fingerprint",
     "fit_trs_transform",
+    "fit_uniform_similarity_transform",
     "lowest_common_ancestor",
     "make_skeleton_snapshot",
     "normalize_role_identity",
+    "scope_material_pipeline_for_destination",
     "scope_material_pipeline_to_codex_tests",
     "snapshot_blender_armature",
     "validate_binding_hierarchy",
     "validate_file_fingerprint",
     "validate_manifest_artifacts",
+    "validate_normalized_prototype_unit_contract",
     "validate_unreal_asset_contract",
+    "validate_unreal_bounds_contract",
+    "validate_unreal_normalized_prototype_bounds",
     "validate_wind_json_against_skeleton",
 ]

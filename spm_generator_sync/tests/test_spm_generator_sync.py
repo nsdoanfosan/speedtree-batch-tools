@@ -268,6 +268,30 @@ def with_assets(text, assets):
 
 
 class GeneratorSyncTests(unittest.TestCase):
+    def test_scan_nests_cluster_normalized_blends_under_owner_not_as_spm_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            owner = root / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            write_spm(owner / "SK_Tree_elm_01.spm", make_master())
+            write_spm(cluster / "branch_elm_01.spm", make_target())
+            write_spm(cluster / "SK_branch_elm_01.spm", make_target())
+            (cluster / "SK_branch_elm_01.blend").touch()
+
+            board = sync.scan_tree_folders(root, sk_only=True)
+
+            self.assertEqual([Path(row["folder"]) for row in board], [owner])
+            self.assertEqual(board[0]["spms"], ["SK_Tree_elm_01.spm"])
+            self.assertEqual(
+                board[0]["cluster_blends"][0]["blend"],
+                str((cluster / "SK_branch_elm_01.blend").absolute()),
+            )
+            self.assertEqual(
+                board[0]["cluster_blends"][0]["folder_relation"],
+                "off",
+            )
+
     def test_cloned_and_previously_wrong_leaf_material_ids_are_remapped_by_asset_name(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -831,6 +855,46 @@ class GeneratorSyncTests(unittest.TestCase):
             errors = document.integrity_errors()
             self.assertTrue(any("Link target GUID 없음" in item for item in errors))
 
+    def test_multi_property_containers_stay_with_the_follower(self):
+        # The indexed slot properties are protected, so the container that
+        # counts them must be too - otherwise the follower claims the master's
+        # slot count and SpeedTree draws "Material: None / Mesh: Any" slots.
+        for container in ("Leaves:Type", "Material:Frond", "Cap:Material"):
+            self.assertTrue(sync.is_protected_property(container), container)
+            self.assertTrue(sync.is_protected_property(f"{container}:1:Material"))
+            self.assertTrue(sync.is_protected_property(f"{container}:1:Mesh"))
+
+    def test_sync_keeps_follower_leaf_slot_count(self):
+        def leaf_generator(child_count, slots):
+            generator = ET.Element("Generator", {"Type": "Leaf Mesh"})
+            properties = ET.SubElement(generator, "Properties")
+            parent = ET.SubElement(properties, "Property")
+            ET.SubElement(parent, "Name").text = "Leaves:Type"
+            ET.SubElement(parent, "MultiPropertyChildren").text = str(child_count)
+            ET.SubElement(parent, "Value").text = "0"
+            for index, material in enumerate(slots):
+                for suffix, value in (("Material", material), ("Mesh", "-10")):
+                    prop = ET.SubElement(properties, "Property")
+                    ET.SubElement(prop, "Name").text = f"Leaves:Type:{index}:{suffix}"
+                    ET.SubElement(prop, "Value").text = value
+            unprotected = ET.SubElement(properties, "Property")
+            ET.SubElement(unprotected, "Name").text = "Generation:Style"
+            ET.SubElement(unprotected, "Value").text = str(child_count)
+            return generator
+
+        master = leaf_generator(3, ["7", "7", "7"])
+        follower = leaf_generator(1, ["8"])
+        changes, names = sync.sync_generator_properties(master, follower)
+
+        parent = next(
+            item for item in follower.find("Properties")
+            if item.findtext("Name") == "Leaves:Type"
+        )
+        self.assertEqual(parent.findtext("MultiPropertyChildren"), "1")
+        self.assertNotIn("Leaves:Type", names)
+        self.assertIn("Generation:Style", names)
+        self.assertEqual(changes, 1)
+
     def test_speedtree_base_filter_search_syntax(self):
         self.assertTrue(sync.is_protected_property(sync.GENERATION_PASS_PROPERTY))
         self.assertFalse(sync.is_protected_property("Generation:Shared:Pass override"))
@@ -1045,6 +1109,46 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertIsNone(follower["last_sync"])
             backups = list((folder / sync.BACKUP_SUBDIR).glob("generator_sync_*"))
             self.assertEqual(len(backups), 1)
+
+    def test_transaction_aborts_when_another_tool_rewrites_an_spm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {"Leaf": "leaf", "Branch": "branch", "End": "end"}
+            sync.assign_follower(
+                manifest, master.name, target.name,
+                {"Leaf 2": "Leaf", "BranchBig": "Branch",
+                 "BranchSmall": None, "End 2": "End"},
+                confirmed=True,
+            )
+            sync.save_manifest(folder, manifest)
+
+            concurrent = make_target().replace("<Name>Leaf 2</Name>", "<Name>Leaf 9</Name>", 1)
+
+            def preflight(*_args, **_kwargs):
+                # Stand in for a Cluster relationship ON finishing while the
+                # SpeedTree preflight is still running.
+                write_spm(target, concurrent)
+
+            with mock.patch.object(sync, "verify_temporary_patches", side_effect=preflight):
+                with self.assertRaises(sync.SyncError) as caught:
+                    sync.apply_group_transaction(
+                        folder, master.name, verify_speedtree=True,
+                        speedtree_exe=Path("speedtree.exe"),
+                        xml_ini=Path("options.ini"),
+                    )
+            self.assertIn(target.name, str(caught.exception))
+            self.assertEqual(
+                sync.read_spm_text(target)[0], concurrent,
+                "the concurrent write must survive",
+            )
+            self.assertFalse((folder / sync.BACKUP_SUBDIR).exists())
 
     def test_successful_transaction_updates_manifest_and_keeps_backup(self):
         with tempfile.TemporaryDirectory() as temp:

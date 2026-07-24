@@ -45,10 +45,17 @@ if str(REPO_DIR) not in sys.path:
 
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
+from cluster_blend_sync import discover_cluster_blend_relations
 
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
-SKIP_DIRS = {BACKUP_SUBDIR, "_skbatch_backup", "_pcgtex_backups"}
+SKIP_DIRS = {
+    BACKUP_SUBDIR,
+    "_skbatch_backup",
+    "_pcgtex_backups",
+    "_codex_backups",
+    "_atlas_cluster_normalization_backups",
+}
 BACKUP_NAME_RE = re.compile(
     r"(^~|\.sbk$|backup|codex_backup|skbatch_backup|pcgtex_backup)",
     re.IGNORECASE,
@@ -133,6 +140,31 @@ def read_spm_prefix(path: Path) -> str:
         # omit the Links section entirely.
         return joined
     raise SyncError(f"SPM에서 Links 섹션을 찾지 못했습니다: {path}")
+
+
+def _spm_fingerprint(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _assert_spm_unchanged(fingerprints: dict[Path, str]) -> None:
+    """Refuse to overwrite SPMs another tool rewrote while this run computed.
+
+    Patches are built from the bytes read at plan time and the SpeedTree
+    preflight between then and the write can run for minutes, so a Cluster
+    relationship ON/OFF or a second sync finishing in that window would
+    otherwise be silently reverted by this transaction's stale text.
+    """
+    drifted = [
+        path for path, digest in fingerprints.items()
+        if not path.is_file() or _spm_fingerprint(path) != digest
+    ]
+    if drifted:
+        raise SyncError(
+            "동기화를 계산하는 동안 다른 작업이 같은 SPM을 수정했습니다. "
+            "원본을 덮어쓰지 않고 중단합니다: "
+            + ", ".join(path.name for path in drifted)
+            + "\nCluster 관계 ON/OFF 등 다른 도구가 끝난 뒤 다시 실행하세요."
+        )
 
 
 def write_spm_text(path: Path, text: str, compressed: bool) -> None:
@@ -386,10 +418,25 @@ def _format_color(value: float) -> str:
     return format(value, ".10g")
 
 
+# A multi-property container holds its slot count in <MultiPropertyChildren>,
+# while the indexed ``:N:Material`` / ``:Mesh`` / ``:Weight`` slot properties it
+# counts are protected below so the follower keeps its own assets.  Copying the
+# container on its own therefore makes the follower claim the master's slot
+# count with nothing behind it, and SpeedTree draws the surplus slots as
+# "Material: None / Mesh: Any" (a smaller count instead hides authored slots).
+PROTECTED_MULTI_PROPERTY_CONTAINERS = (
+    "leaves:type",
+    "material:frond",
+    "cap:material",
+)
+
+
 def is_protected_property(name: str) -> bool:
     """Properties kept from the follower to preserve identity and assets."""
     lowered = str(name or "").strip().lower()
     if lowered == "generation:shared:pass":
+        return True
+    if lowered in PROTECTED_MULTI_PROPERTY_CONTAINERS:
         return True
     protected_prefixes = (
         "random seeds:",
@@ -2278,7 +2325,11 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
         raise SyncError(f"나무 루트 폴더가 없습니다: {root}")
     folders: list[dict] = []
     for current, dirs, files in os.walk(root):
-        dirs[:] = [name for name in dirs if name.lower() not in {item.lower() for item in SKIP_DIRS}]
+        dirs[:] = [
+            name for name in dirs
+            if name.lower() not in {item.lower() for item in SKIP_DIRS}
+            and name.casefold() != "cluster"
+        ]
         folder = Path(current)
         spms = sorted(
             [
@@ -2289,7 +2340,11 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
             ],
             key=lambda item: item.name.casefold(),
         )
-        if not spms:
+        cluster_blends = json.loads(json.dumps(
+            discover_cluster_blend_relations(folder),
+            default=str,
+        ))
+        if not spms and not cluster_blends:
             continue
         manifest = load_manifest(folder)
         relations = relation_index(manifest)
@@ -2303,6 +2358,7 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
             "manifest": manifest,
             "relations": relations,
             "master_candidates": candidates,
+            "cluster_blends": cluster_blends,
         })
     return folders
 
@@ -2596,6 +2652,14 @@ def apply_group_transaction(
             raise SyncError(f"{name} Base 매핑 확인 필요: " + ", ".join(plan.mapping_required))
         plans.append(plan)
 
+    # Every patch below is built from the bytes just read, so remember them and
+    # re-check right before the write.
+    plan_fingerprints = {
+        path: _spm_fingerprint(path)
+        for path in dict.fromkeys([master_path, *(folder / name for name in selected)])
+        if path.is_file()
+    }
+
     if progress_callback is not None:
         progress_callback("크기 위험과 XML 무결성 확인 중", 38)
 
@@ -2669,7 +2733,9 @@ def apply_group_transaction(
         )
 
     if progress_callback is not None:
-        progress_callback("사전검사 완료 · 백업 준비 중", 76)
+        progress_callback("사전검사 완료 · 동시 수정 확인 중", 76)
+
+    _assert_spm_unchanged(plan_fingerprints)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_dir = folder / BACKUP_SUBDIR / f"generator_sync_{stamp}"

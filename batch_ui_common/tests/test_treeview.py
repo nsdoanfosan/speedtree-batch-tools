@@ -109,18 +109,27 @@ class FakeTree:
 
 
 class ClipboardTests(unittest.TestCase):
-    def test_clipboard_text_is_raw_absolute_and_case_insensitive_deduplicated(self):
+    def test_clipboard_text_is_everything_or_query_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as temporary:
             first = Path(temporary) / "Tree_01.spm"
             duplicate = Path(temporary) / "TREE_01.SPM"
             second = Path(temporary) / "Tree 02.spm"
 
             text = clipboard_text([first, "", None, duplicate, second])
-            values = text.splitlines()
 
-            self.assertEqual(values, [str(first.resolve()), str(second.resolve())])
-            self.assertTrue(all(Path(value).is_absolute() for value in values))
-            self.assertNotIn('"', text)
+            self.assertEqual(
+                text,
+                f'"{first.resolve()}"|"{second.resolve()}"',
+            )
+
+    def test_single_path_stays_raw_and_absolute(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "Tree 01.spm"
+
+            text = clipboard_text(path)
+
+            self.assertEqual(text, str(path.resolve()))
+            self.assertTrue(Path(text).is_absolute())
 
     def test_copy_paths_to_clipboard_returns_count_and_leaves_clipboard_on_empty(self):
         root = FakeRoot()

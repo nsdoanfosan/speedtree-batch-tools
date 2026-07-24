@@ -47,6 +47,7 @@ from speedtree_pipeline_contract import (  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spm", required=True)
+    parser.add_argument("--canonical-spm", default="")
     parser.add_argument("--speedtree-exe", required=True)
     parser.add_argument("--fbx-ini", required=True)
     parser.add_argument("--speedtree-cli", required=True)
@@ -341,22 +342,25 @@ def attach_pipeline_contract(report, spm_path):
 
 def main():
     args = parse_args()
+    speedtree_spm = Path(args.spm).resolve()
+    canonical_spm = Path(getattr(args, "canonical_spm", "") or args.spm).resolve()
     report = {
         "status": "failed",
         "stage": "speedtree_material_preflight",
-        "spm": args.spm,
+        "spm": str(canonical_spm),
+        "speedtree_spm": str(speedtree_spm),
         "contract_kind": PREFLIGHT_CONTRACT_KIND,
         "schema_version": PREFLIGHT_SCHEMA_VERSION,
     }
     try:
         # Invalid Tree User data is a real authoring error.  Material labels
         # such as Green/Yellow/Dead never substitute for this model-wide key.
-        report["instance_profile"] = read_tree_instance_profile(args.spm)
+        report["instance_profile"] = read_tree_instance_profile(speedtree_spm)
         speedtree_cli = load_speedtree_cli(args.speedtree_cli)
-        leaf_contract = inspect_spm_leaf_contract(args.spm)
+        leaf_contract = inspect_spm_leaf_contract(speedtree_spm)
         leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
         report["leaf_reference_contract"] = leaf_contract
-        mesh_files = inspect_spm_mesh_file_references(args.spm)
+        mesh_files = inspect_spm_mesh_file_references(speedtree_spm)
         report["mesh_file_reference_contract"] = mesh_files
         missing_mesh_files = list(mesh_files.get("missing") or [])
         if not leaf_ok:
@@ -380,10 +384,10 @@ def main():
         else:
             report["speedtree_export"] = run_export(args, speedtree_cli)
             material = inspect_speedtree_material_export(
-                args.spm, leaf_contract
+                speedtree_spm, leaf_contract
             )
-            all_material = inspect_all_speedtree_material_export(args.spm)
-            textures = inspect_speedtree_texture_sources(args.spm)
+            all_material = inspect_all_speedtree_material_export(speedtree_spm)
+            textures = inspect_speedtree_texture_sources(speedtree_spm)
             texture_readiness = resolve_texture_bindings(textures.get("stmat"))
             report["material_export_contract"] = material
             report["all_export_material_contract"] = all_material
@@ -469,7 +473,7 @@ def main():
         report["error"] = str(exc)
         report["traceback"] = traceback.format_exc()
     try:
-        attach_pipeline_contract(report, args.spm)
+        attach_pipeline_contract(report, speedtree_spm)
     except Exception as exc:
         report["status"] = "failed"
         report["pipeline_contract_error"] = str(exc)

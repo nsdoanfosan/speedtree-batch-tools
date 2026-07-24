@@ -20,7 +20,7 @@ from pcg_cluster_bark_normalization import (
 from pcg_texture_audit import (
     active_material_ids,
     extract_material_image_refs,
-    prepare_cluster_m_prefix,
+    prepare_sk,
     read_maybe_gzip_text,
 )
 
@@ -487,7 +487,10 @@ class BarkNormalizationTests(unittest.TestCase):
             m_only = m_only_cluster / production.name
             target = target_cluster / production.name
             shutil.copy2(production, m_only)
-            prepare_cluster_m_prefix(m_only, dry_run=False)
+            prepared = prepare_sk(
+                m_only_cluster, [m_only.stem], dry_run=False
+            )["targets"][0]
+            self.assertEqual(prepared["status"], "prepared")
             shutil.copy2(m_only, target)
             isolated[str(m_only)] = str(target)
             bark = next(

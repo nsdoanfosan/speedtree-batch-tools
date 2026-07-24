@@ -83,12 +83,10 @@ def _path_values(paths: Iterable[PathValue] | PathValue | None) -> Iterable[Any]
     return paths
 
 
-def clipboard_text(paths: Iterable[PathValue] | PathValue | None) -> str:
-    """Return unquoted absolute paths, one per line, ready for Everything.
-
-    Blank values are ignored and duplicates are removed case-insensitively,
-    matching Windows path semantics while preserving the first spelling.
-    """
+def _normalized_paths(
+    paths: Iterable[PathValue] | PathValue | None,
+) -> list[str]:
+    """Return unique absolute paths using Windows-style comparisons."""
 
     values: list[str] = []
     seen: set[str] = set()
@@ -111,19 +109,40 @@ def clipboard_text(paths: Iterable[PathValue] | PathValue | None) -> str:
             continue
         seen.add(key)
         values.append(value)
-    return "\n".join(values)
+    return values
+
+
+def _everything_query(values: list[str]) -> str:
+    """Format normalized paths as one query accepted by Everything."""
+
+    if len(values) <= 1:
+        return values[0] if values else ""
+    return "|".join(f'"{value}"' for value in values)
+
+
+def clipboard_text(paths: Iterable[PathValue] | PathValue | None) -> str:
+    """Return absolute paths as a query ready to paste into Everything.
+
+    Blank values are ignored and duplicates are removed case-insensitively,
+    matching Windows path semantics while preserving the first spelling. A
+    single path stays raw for compatibility; multiple paths are quoted and
+    joined with Everything's OR operator so every file appears in the result.
+    """
+
+    return _everything_query(_normalized_paths(paths))
 
 
 def copy_paths_to_clipboard(root: Any, paths: Iterable[PathValue] | PathValue | None) -> int:
     """Copy paths through a tkinter-compatible root and return the path count."""
 
-    text = clipboard_text(paths)
+    values = _normalized_paths(paths)
+    text = _everything_query(values)
     if not text:
         return 0
     root.clipboard_clear()
     root.clipboard_append(text)
     root.update_idletasks()
-    return len(text.splitlines())
+    return len(values)
 
 
 def selected_row_paths(

@@ -39,7 +39,7 @@ from spm_leaf_handoff_contract import (
 )
 from speedtree_pipeline_contract import validate_preflight_report
 from cluster_assembly_handoff_contract import (
-    assembly_source_fbx_from_contract,
+    assembly_source_fbx_resolution,
     build_assembly_handoff,
     build_blender_fbx_inventory,
     file_fingerprint,
@@ -48,6 +48,7 @@ from cluster_assembly_handoff_contract import (
     role_identities_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
+from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -69,6 +70,7 @@ def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
     parser.add_argument("--spm", required=True)
+    parser.add_argument("--speedtree-spm", default="")
     parser.add_argument("--blend", required=True)
     parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
     parser.add_argument("--material-contract", default="")
@@ -136,6 +138,20 @@ def remove_unused_empty_material_slots(obj):
     return removed
 
 
+def export_collection_contract_issues():
+    """Return Send2UE units that would become unintended standalone assets."""
+    export_collection = bpy.data.collections.get("Export")
+    if export_collection is None:
+        return ["missing_export_collection"]
+    return [
+        f"orphan_owned_export_empty:{obj.name}"
+        for obj in export_collection.objects
+        if obj.type == "EMPTY"
+        and not obj.children
+        and bool(obj.get("codex_source_fbx", ""))
+    ]
+
+
 def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
     """Import the exact FBX in-memory and reconcile it before BWR can save.
 
@@ -197,11 +213,52 @@ def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
 
 def main():
     args = parse_args()
-    report = {"spm": args.spm, "blend": args.blend, "wind": args.wind, "status": "failed"}
-    source_review_allowed = is_cluster_source_spm(args.spm)
-    report["source_review_policy"] = (
-        "cluster_source_read_only" if source_review_allowed else "strict"
+    canonical_spm = Path(args.spm).resolve()
+    speedtree_spm = Path(args.speedtree_spm or args.spm).resolve()
+    report = {
+        "spm": str(canonical_spm),
+        "speedtree_spm": str(speedtree_spm),
+        "blend": args.blend,
+        "wind": args.wind,
+        "status": "failed",
+    }
+    raw_cluster_source = is_cluster_source_spm(speedtree_spm)
+    explicit_cluster_pair = bool(args.speedtree_spm and raw_cluster_source)
+    legacy_state = inspect_legacy_cluster_state(speedtree_spm)
+    legacy_cluster_origin = bool(
+        legacy_state.get("receipt_valid")
+        and legacy_state.get("classified_generator_guids")
     )
+    source_review_allowed = (
+        (raw_cluster_source and not explicit_cluster_pair)
+        or legacy_cluster_origin
+    )
+    if explicit_cluster_pair:
+        source_review_policy = "cluster_pair_strict"
+    elif raw_cluster_source:
+        source_review_policy = "cluster_source_read_only"
+    elif legacy_cluster_origin:
+        source_review_policy = "legacy_cluster_receipt"
+    else:
+        source_review_policy = "strict"
+    report["source_review_policy"] = source_review_policy
+    report["legacy_cluster_lineage"] = {
+        "status": "recognized" if legacy_cluster_origin else "not_applicable",
+        "receipt": legacy_state.get("receipt", ""),
+        "receipt_valid": bool(legacy_state.get("receipt_valid")),
+        "generator_count": len(
+            legacy_state.get("classified_generator_guids") or []
+        ),
+        "generator_guids": legacy_state.get("classified_generator_guids") or [],
+        "marker_drift_guids": legacy_state.get("marker_drift_guids") or [],
+        "marker_drift_non_blocking": True,
+        "errors": legacy_state.get("errors") or [],
+    }
+    if report["legacy_cluster_lineage"]["marker_drift_guids"]:
+        report.setdefault("warnings", []).append(
+            "Legacy Cluster foreground marker drift is recorded but does not "
+            "block Blender Repair; the permanent GUID receipt remains authoritative."
+        )
     try:
         material_preflight = None
         if args.material_contract:
@@ -210,7 +267,7 @@ def main():
             # path for its existing texture-binding loader.
             material_preflight = validate_preflight_report(
                 args.material_contract,
-                args.spm,
+                speedtree_spm,
                 require_ok=True,
             )
             report["speedtree_pipeline_contract"] = material_preflight[
@@ -235,7 +292,7 @@ def main():
         # one-bone fallback inside the add-on.
         from speedtree_bone_weight_repair.core import require_spm_sk_ready
 
-        require_spm_sk_ready(os.path.abspath(args.spm))
+        require_spm_sk_ready(str(speedtree_spm))
 
         blend_path = os.path.abspath(args.blend)
         blend_exists = os.path.exists(blend_path)
@@ -245,13 +302,18 @@ def main():
             bpy.ops.wm.read_homefile(use_empty=True)
 
         cluster_assembly_handoff = None
-        cluster_receipt_path = resolve_cluster_receipt_path(
-            args.spm,
+        cluster_assembly_source_resolution = None
+        cluster_receipt_path, cluster_receipt_resolution = resolve_cluster_receipt_path(
+            speedtree_spm,
             args.material_contract or None,
+            include_resolution=True,
+        )
+        report["cluster_assembly_receipt_resolution"] = (
+            cluster_receipt_resolution
         )
         cluster_assembly_contract = (
             cluster_assembly_contract_from_material_contract(
-                cluster_receipt_path, args.spm
+                cluster_receipt_path, speedtree_spm
             )
             if cluster_receipt_path
             else None
@@ -260,14 +322,26 @@ def main():
             report["cluster_assembly_receipt"] = file_fingerprint(
                 cluster_receipt_path
             )
-            source_fbx_path = assembly_source_fbx_from_contract(
+            cluster_assembly_source_resolution = assembly_source_fbx_resolution(
                 cluster_assembly_contract,
-                args.spm,
+                speedtree_spm,
+            )
+            report["cluster_assembly_source_resolution"] = (
+                cluster_assembly_source_resolution
+            )
+            source_fbx_value = cluster_assembly_source_resolution.get(
+                "source_fbx"
+            )
+            source_fbx_path = (
+                Path(source_fbx_value)
+                if cluster_assembly_source_resolution.get("status") == "ready"
+                and source_fbx_value
+                else None
             )
             if source_fbx_path is not None:
                 cluster_assembly_handoff = inspect_cluster_assembly_fbx(
                     cluster_receipt_path,
-                    args.spm,
+                    speedtree_spm,
                     source_fbx_path,
                 )
                 report["cluster_assembly_handoff"] = cluster_assembly_handoff
@@ -281,9 +355,17 @@ def main():
                         "PCG Cluster Assembly handoff blocked before Blender Repair: "
                         + (reasons or "unknown contract error")
                     )
+            elif cluster_assembly_source_resolution.get("status") == (
+                "legacy_pass_through"
+            ):
+                report.setdefault("warnings", []).append(
+                    "Cluster Assembly source FBX is recorded as pending export "
+                    "and is absent on disk; Full SK repair continues with legacy "
+                    "pass-through."
+                )
 
         settings = bpy.context.scene.speedtree_bwr_settings
-        settings.spm_path = os.path.abspath(args.spm)
+        settings.spm_path = str(speedtree_spm)
         settings.texture_contract_path = (
             os.path.abspath(args.material_contract)
             if args.material_contract
@@ -315,11 +397,42 @@ def main():
             Path(blend_path).parent.mkdir(parents=True, exist_ok=True)
             bpy.ops.wm.save_as_mainfile(filepath=blend_path)
 
-        result = bpy.ops.speedtree_bwr.export_from_speedtree()
-        if "FINISHED" not in result:
-            raise RuntimeError(f"export_from_speedtree returned {result}")
+        # The add-on UI operator uses one name_stem for both the SpeedTree
+        # export and the repaired Blender output.  Cluster pairs deliberately
+        # have two identities, so perform those two existing core stages with
+        # explicit stems instead of deriving one by removing ``SK_``.
+        from speedtree_bone_weight_repair import core as bwr_core
 
-        stem = Path(args.spm).stem
+        export_settings = settings.as_dict()
+        speedtree_export = bwr_core.run_speedtree_cli_export(
+            str(speedtree_spm),
+            speedtree_exe_path=export_settings["speedtree_exe_path"],
+            export_options_path=export_settings["speedtree_export_options_path"],
+            fbx_export_options_path=export_settings[
+                "speedtree_fbx_export_options_path"
+            ],
+            xml_export_options_path=export_settings[
+                "speedtree_xml_export_options_path"
+            ],
+            output_root=export_settings["speedtree_output_root"],
+            name_stem=speedtree_spm.stem,
+            export_fbx=export_settings["speedtree_export_fbx"],
+            export_xml=export_settings["speedtree_export_xml"],
+        )
+        fbx_export = speedtree_export["exports"].get("fbx", {})
+        xml_export = speedtree_export["exports"].get("xml", {})
+        if not fbx_export.get("exists"):
+            raise RuntimeError("SpeedTree export produced no FBX to import")
+        settings.source_fbx_path = fbx_export["path"]
+        if xml_export.get("exists"):
+            settings.xml_path = xml_export["path"]
+        settings.name_stem = canonical_spm.stem
+        result = bwr_core.run_import_and_repair(settings.as_dict())
+        report["speedtree_export"] = speedtree_export
+        export_collection_issues = export_collection_contract_issues()
+        report["export_collection_issues"] = export_collection_issues
+
+        stem = canonical_spm.stem
         blend_dir = str(Path(blend_path).parent)
         json_dir = os.path.join(blend_dir, "JSON")
         report.update(
@@ -347,9 +460,9 @@ def main():
             "status": "blocked",
             "issues": ["missing_pipeline_report"],
         }
-        leaf_reference_contract = inspect_spm_leaf_contract(args.spm)
+        leaf_reference_contract = inspect_spm_leaf_contract(speedtree_spm)
         material_export_contract = inspect_speedtree_material_export(
-            args.spm, leaf_reference_contract
+            speedtree_spm, leaf_reference_contract
         )
         report["leaf_reference_contract"] = leaf_reference_contract
         report["material_export_contract"] = material_export_contract
@@ -361,6 +474,19 @@ def main():
         }
         if pipeline_path.is_file():
             pipeline_data = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            pipeline_data["source_review_policy"] = source_review_policy
+            pipeline_data["legacy_cluster_lineage"] = report[
+                "legacy_cluster_lineage"
+            ]
+            pipeline_data["cluster_assembly_receipt_resolution"] = (
+                cluster_receipt_resolution
+            )
+            pipeline_data["cluster_assembly_source_resolution"] = (
+                cluster_assembly_source_resolution
+            )
+            pipeline_data["export_collection_issues"] = (
+                export_collection_issues
+            )
             if cluster_assembly_handoff is not None:
                 pipeline_data["cluster_assembly_handoff"] = (
                     cluster_assembly_handoff
@@ -440,7 +566,8 @@ def main():
             or material_export_blocked
         )
         structural_handoff_blocked = bool(
-            missing_outputs
+            export_collection_issues
+            or missing_outputs
             or vertex_color_contract.get("status") == "blocked"
             or vertex_payload_contract.get("status") == "blocked"
             or leaf_reference_blocked
@@ -457,6 +584,7 @@ def main():
             handoff_status = "ok"
         preflight = {
             "status": handoff_status,
+            "export_collection_issues": export_collection_issues,
             "empty_material_slots": empty_material_slots,
             "missing_textures": texture_normalization.get("missing", []),
             "missing_outputs": missing_outputs,
@@ -506,6 +634,11 @@ def main():
             write_report(pipeline_path, pipeline_data)
         if preflight["status"] == "blocked":
             reasons = []
+            if export_collection_issues:
+                reasons.append(
+                    "Send2UE Export 구조 오류: "
+                    + ", ".join(export_collection_issues)
+                )
             if texture_normalization.get("missing"):
                 reasons.append(f"텍스처 세트 {len(texture_normalization['missing'])}개 미준비")
             if empty_material_slots:

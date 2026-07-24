@@ -27,6 +27,11 @@ from speedtree_pipeline_contract import (
     shared_contract_api,
 )
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from cluster_spm_pair_contract import (
+    bootstrap_cluster_authoring,
+    inspect_cluster_spm_pair,
+    resolve_cluster_spm_pair,
+)
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -659,15 +664,107 @@ def _material_rename_plan_for_names(names, exclude=None):
 
 
 def cluster_material_rename_plan(spm, exclude=None):
-    """Normalize every Generator-referenced Cluster material.
+    """Normalize all Cluster materials without stealing active export names.
 
-    Some source leaf SPMs export materials even when their authored visibility
-    chain cannot be reconstructed by the audit.  Cluster ①-C therefore uses
-    the broader Generator-reference set.  The later FBX/STMAT receipt remains
-    the content-driven check for which material/mesh pairs actually exported.
+    Every named Material_v8 follows the normal M_ rule.  When a detached
+    legacy material canonicalizes onto an export-participating material, the
+    active material keeps the canonical name and the legacy one receives the
+    deterministic ``_old``, ``_old_02`` ... suffix.  Two active materials that
+    demand the same canonical name are unsafe and are reported separately.
     """
-    return _material_rename_plan_for_names(
-        active_material_names(spm), exclude=exclude)
+    return _cluster_material_rename_analysis(spm, exclude=exclude)["renames"]
+
+
+def _cluster_material_rename_analysis(spm, exclude=None):
+    rows = extract_material_image_refs(spm)
+    excluded = {str(name).casefold() for name in (exclude or [])}
+    active = {
+        str(name).casefold() for name in active_material_names(spm) if name
+    }
+    records = []
+    by_current = {}
+    for index, row in enumerate(rows):
+        name = str(row.get("material_name") or "").strip()
+        if not name:
+            continue
+        record = {
+            "index": index,
+            "material_id": str(row.get("material_id") or ""),
+            "name": name,
+            "active": name.casefold() in active,
+            "excluded": name.casefold() in excluded,
+        }
+        record["canonical"] = (
+            name if record["excluded"] else canonical_material_name(name)
+        )
+        records.append(record)
+        by_current.setdefault(name.casefold(), []).append(record)
+
+    conflicts = []
+    for same_name in by_current.values():
+        if len(same_name) > 1:
+            conflicts.append({
+                "type": "duplicate_existing_name",
+                "target": same_name[0]["name"],
+                "material_ids": [row["material_id"] for row in same_name],
+                "active_sources": [
+                    row["name"] for row in same_name if row["active"]
+                ],
+            })
+
+    groups = {}
+    for record in records:
+        groups.setdefault(record["canonical"].casefold(), []).append(record)
+
+    # Reserve every authored name, including names from other canonical groups.
+    # This makes suffix allocation stable even when an old suffix already
+    # exists elsewhere in the file.
+    reserved = set(by_current)
+    assigned = set()
+    renames = []
+
+    def legacy_name(base):
+        candidate = f"{base}_old"
+        suffix = 2
+        while candidate.casefold() in reserved or candidate.casefold() in assigned:
+            candidate = f"{base}_old_{suffix:02d}"
+            suffix += 1
+        assigned.add(candidate.casefold())
+        return candidate
+
+    for group in groups.values():
+        base = group[0]["canonical"]
+        active_group = [row for row in group if row["active"]]
+        if len(active_group) > 1:
+            conflicts.append({
+                "type": "active_canonical_collision",
+                "target": base,
+                "material_ids": [row["material_id"] for row in active_group],
+                "active_sources": [row["name"] for row in active_group],
+            })
+            continue
+        if active_group:
+            winner = active_group[0]
+        else:
+            winner = next(
+                (row for row in group
+                 if row["name"].casefold() == base.casefold()),
+                group[0],
+            )
+        assigned.add(base.casefold())
+        for record in group:
+            destination = base if record is winner else legacy_name(base)
+            if destination != record["name"]:
+                renames.append([record["name"], destination])
+
+    return {"renames": renames, "conflicts": conflicts}
+
+
+def _cluster_material_rename_conflicts(spm, renames=None, exclude=None):
+    """Return only fail-closed Cluster naming conflicts."""
+    return _cluster_material_rename_analysis(
+        spm, exclude=exclude
+    )["conflicts"]
 
 
 def root_spms(folder):
@@ -1826,7 +1923,18 @@ def cluster_material_usage(target_spms, clusters):
     material references. They are lineage evidence even when graph-visible,
     not current mesh-build targets, and must never reopen a finished atlas.
     """
-    by_stem = {cluster.stem.lower(): cluster for cluster in clusters}
+    # The production dependency is the canonical SK output.  Accept both its
+    # stem and the old unprefixed render stem while resolving existing texture
+    # references so legacy data can be normalized without becoming the live
+    # output identity again.
+    by_stem = {}
+    for cluster in clusters:
+        pair = resolve_cluster_spm_pair(cluster)
+        canonical = Path(pair["canonical_spm"])
+        mirror = Path(pair["mirror_spm"])
+        dependency = canonical if canonical.is_file() else mirror
+        by_stem[mirror.stem.lower()] = (dependency, mirror)
+        by_stem[canonical.stem.lower()] = (dependency, canonical)
     found = {}
     for spm in target_spms:
         referenced_ids = active_material_ids(spm)
@@ -1861,11 +1969,12 @@ def cluster_material_usage(target_spms, clusters):
             if _refs_are_only_managed_outputs(refs) and original_refs.get(canonical):
                 refs = original_refs[canonical]
             matched = {
-                by_stem[Path(ref).stem.lower()]
+                str(by_stem[Path(ref).stem.lower()][0]).casefold():
+                    by_stem[Path(ref).stem.lower()]
                 for ref in refs
                 if Path(ref).stem.lower() in by_stem
             }
-            for cluster in matched:
+            for cluster, output_mirror in matched.values():
                 key = str(cluster).lower()
                 usage = found.setdefault(key, {
                     "spms": [], "material_names": [], "source_refs": [],
@@ -1904,10 +2013,10 @@ def cluster_material_usage(target_spms, clusters):
                     if text.lower() not in {value.lower() for value in usage["source_refs"]}:
                         usage["source_refs"].append(text)
                     stem = Path(ref).stem.lower()
-                    if stem == cluster.stem.lower():
+                    if stem == output_mirror.stem.lower():
                         if text.lower() not in {value.lower() for value in usage["source_albedo"]}:
                             usage["source_albedo"].append(text)
-                    elif stem.startswith(cluster.stem.lower() + "_") and any(
+                    elif stem.startswith(output_mirror.stem.lower() + "_") and any(
                             word in stem for word in ALPHA_WORDS):
                         if text.lower() not in {value.lower() for value in usage["source_alpha"]}:
                             usage["source_alpha"].append(text)
@@ -1920,6 +2029,26 @@ def referenced_cluster_spms(target_spms, clusters):
     for key, usage in cluster_material_usage(target_spms, clusters).items():
         found[key] = sorted(usage["spms"])
     return found
+
+
+def cluster_dependency_spms(target_spms):
+    """Return final targets plus their authoritative non-SK source SPMs."""
+    dependencies = []
+    assembly_sources = []
+    for target_spm in target_spms or ():
+        target_spm = Path(target_spm)
+        if target_spm not in dependencies:
+            dependencies.append(target_spm)
+        assembly_source_spm = target_spm
+        if target_spm.name.lower().startswith("sk_"):
+            source_spm = target_spm.with_name(target_spm.name[3:])
+            if source_spm.is_file():
+                assembly_source_spm = source_spm
+                if source_spm not in dependencies:
+                    dependencies.append(source_spm)
+        if assembly_source_spm not in assembly_sources:
+            assembly_sources.append(assembly_source_spm)
+    return dependencies, assembly_sources
 
 
 LEAF_ATLAS_LINEAGE_SCHEMA_VERSION = 2
@@ -2424,41 +2553,138 @@ def m_prefix_plan(spm, exclude=None):
     return material_rename_plan(spm, exclude=exclude)
 
 
-def prepare_cluster_m_prefix(spm, dry_run=False, exclude_materials=None):
-    """Apply only M_ material normalization to one exact Cluster source.
+def _cluster_pair_summary(pair):
+    return {
+        "pair_status": pair.get("status"),
+        "pair_action": pair.get("action"),
+        "pair_generation": pair.get("generation"),
+        "canonical_spm": str(pair.get("canonical_spm") or ""),
+        "mirror_spm": str(pair.get("mirror_spm") or ""),
+        "output_spm": str(pair.get("canonical_spm") or ""),
+        "legacy_output_spm": str(pair.get("mirror_spm") or ""),
+        "pair_receipt": str(pair.get("receipt_path") or ""),
+        "pair_conflicts": list(pair.get("conflicts") or []),
+        "can_bootstrap": bool(pair.get("can_bootstrap")),
+        "can_publish": bool(pair.get("can_publish")),
+    }
 
-    Cluster sources keep their authored filename so SpeedTree card-render TGA
-    basenames remain stable.  This path never creates an ``SK_*.spm`` copy;
-    the corresponding SK name belongs only to the Blender output.
-    """
-    source = Path(spm)
-    if source.parent.name.casefold() != "cluster":
-        raise RuntimeError(f"not an exact Cluster source SPM: {source}")
-    if source.name.casefold().startswith("sk_") or source.suffix.casefold() != ".spm":
-        raise RuntimeError(f"Cluster M_ target must be a non-SK .spm: {source}")
-    if not source.is_file() or is_backup_path(source):
-        raise RuntimeError(f"Cluster source SPM is unavailable: {source}")
+
+def _cluster_prepare_one(folder, mesh_name, dry_run=False,
+                         exclude_materials=None):
+    """Normalize one Cluster output to its canonical SK name and patch it."""
+    folder = Path(folder)
+    existing = find_sk_spm_for_mesh(folder, mesh_name)
+    mirror = find_source_spm_for_mesh(folder, mesh_name)
+    candidate = existing or mirror or folder / f"SK_{mesh_name}.spm"
+    pair = inspect_cluster_spm_pair(candidate)
+    summary = _cluster_pair_summary(pair)
+    canonical = Path(pair["canonical_spm"])
+    mirror = Path(pair["mirror_spm"])
+    plan_source = canonical if canonical.is_file() else mirror
+
+    if pair.get("conflicts") and not canonical.is_file():
+        return {
+            "mesh_name": mesh_name,
+            "status": "blocked",
+            "reason": pair.get("action") or pair.get("status"),
+            "sk_spm": str(canonical),
+            "source_spm": str(mirror),
+            "would_create": None,
+            "would_publish": False,
+            "patch": {"dry_run": dry_run, "renames": []},
+            **summary,
+        }
+    if not plan_source.is_file():
+        return {
+            "mesh_name": mesh_name,
+            "status": "skipped",
+            "reason": "no Cluster canonical or raw mirror SPM",
+            "sk_spm": str(canonical),
+            "source_spm": str(mirror),
+            "would_create": None,
+            "would_publish": False,
+            "patch": {"dry_run": dry_run, "renames": []},
+            **summary,
+        }
+
     renames = cluster_material_rename_plan(
-        source, exclude=exclude_materials)
+        plan_source, exclude=exclude_materials)
+    material_name_conflicts = _cluster_material_rename_conflicts(
+        plan_source, renames=renames, exclude=exclude_materials
+    )
+    if material_name_conflicts:
+        return {
+            "mesh_name": mesh_name,
+            "status": "blocked",
+            "reason": "Cluster material rename would create duplicate names",
+            "sk_spm": str(canonical),
+            "source_spm": str(mirror),
+            "would_create": None,
+            "would_publish": False,
+            "material_name_conflicts": material_name_conflicts,
+            "patch": {"dry_run": dry_run, "renames": renames},
+            **summary,
+        }
+    would_create = str(canonical) if pair.get("can_bootstrap") else None
+    would_normalize_name = bool(pair.get("can_bootstrap"))
+    would_publish = False
     if dry_run:
         return {
-            "spm": str(source),
-            "status": "dry-run" if renames else "up_to_date",
-            "changed": False,
-            "renames": renames,
-            "blend_output": str(
-                source.with_name(f"SK_{source.stem}.blend")
-            ),
+            "mesh_name": mesh_name,
+            "status": "dry-run" if would_create or renames else "up_to_date",
+            "sk_spm": str(canonical),
+            "source_spm": str(mirror),
+            "would_create": would_create,
+            "would_publish": would_publish,
+            "would_normalize_output_name": would_normalize_name,
+            "patch": {"dry_run": True, "renames": renames},
+            **summary,
         }
+
+    bootstrap = None
+    if pair.get("can_bootstrap"):
+        bootstrap = bootstrap_cluster_authoring(mirror, dry_run=False)
+    elif not canonical.is_file():
+        return {
+            "mesh_name": mesh_name,
+            "status": "skipped",
+            "reason": pair.get("action") or "Cluster canonical SPM unavailable",
+            "sk_spm": str(canonical),
+            "source_spm": str(mirror),
+            "would_create": None,
+            "would_publish": False,
+            "patch": {"changed": False, "renames": []},
+            **summary,
+        }
+
     patch = patch_m_prefix(
-        source,
+        canonical,
         exclude=exclude_materials,
         cluster_active_scope=True,
     )
+    after = inspect_cluster_spm_pair(canonical)
+    changed = bool(
+        (bootstrap and bootstrap.get("status") == "applied")
+        or patch.get("changed")
+    )
     return {
-        **patch,
-        "status": "prepared" if patch.get("changed") else "up_to_date",
-        "blend_output": str(source.with_name(f"SK_{source.stem}.blend")),
+        "mesh_name": mesh_name,
+        "status": "prepared" if changed else "up_to_date",
+        "sk_spm": str(canonical),
+        "source_spm": str(mirror),
+        "would_create": None,
+        "would_publish": False,
+        "would_normalize_output_name": False,
+        "created": str(canonical) if bootstrap else None,
+        "patch": patch,
+        "bootstrap": bootstrap,
+        "mirror_publish": None,
+        "legacy_cluster_marker": {
+            "status": "not_applicable_cluster_pair",
+            "changed": False,
+            "generator_count": 0,
+        },
+        **_cluster_pair_summary(after),
     }
 
 
@@ -2501,7 +2727,15 @@ def target_spm_status(folder, mesh_name):
         m for m in materials
         if m and not m.startswith("M_")
     ]
-    renames_needed = material_rename_plan(target) if target else []
+    planner = (
+        cluster_material_rename_plan
+        if folder.name.casefold() == "cluster" else material_rename_plan
+    )
+    renames_needed = planner(target) if target else []
+    material_name_conflicts = (
+        _cluster_material_rename_conflicts(target, renames=renames_needed)
+        if target and folder.name.casefold() == "cluster" else []
+    )
     status = "ready"
     actions = []
     if not source and not sk:
@@ -2513,15 +2747,40 @@ def target_spm_status(folder, mesh_name):
     elif renames_needed or missing_m:
         status = "needs_m_prefix"
         actions.append("머티리얼 이름 M_/공용 이름 정리 필요")
-    return {
+    result = {
         "mesh_name": mesh_name,
         "source_spm": str(source) if source else None,
         "sk_spm": str(sk) if sk else None,
         "materials_missing_m_prefix": missing_m,
         "material_renames_needed": renames_needed,
+        "material_name_conflicts": material_name_conflicts,
         "status": status,
         "actions": actions,
     }
+    if folder.name.casefold() == "cluster" and (sk or source):
+        pair = inspect_cluster_spm_pair(sk or source)
+        result.update(_cluster_pair_summary(pair))
+        result["source_spm"] = str(pair["mirror_spm"])
+        result["sk_spm"] = (
+            str(pair["canonical_spm"])
+            if Path(pair["canonical_spm"]).is_file() else None
+        )
+        if pair.get("conflicts"):
+            result["status"] = "pair_conflict"
+            result["actions"] = [pair.get("action") or pair.get("status")]
+        elif material_name_conflicts:
+            result["status"] = "material_name_conflict"
+            result["actions"] = [
+                "Cluster material M_ rename would create duplicate names"
+            ]
+        elif pair.get("can_bootstrap"):
+            result["status"] = "needs_sk"
+            result["actions"] = [
+                pair.get("action") or "Cluster output name normalization required"
+            ]
+        elif renames_needed or missing_m:
+            result["status"] = "needs_m_prefix"
+    return result
 
 
 def _mark_new_sk_or_rollback(target):
@@ -2545,10 +2804,24 @@ def _mark_new_sk_or_rollback(target):
 def prepare_sk(folder, target_mesh_names=None, dry_run=False, exclude_materials=None):
     folder = Path(folder)
     if folder.name.casefold() == "cluster":
-        raise RuntimeError(
-            "Cluster source SPM names are fixed; use "
-            "prepare_cluster_m_prefix() instead of creating SK_*.spm"
-        )
+        mesh_names = list(target_mesh_names or [])
+        if not mesh_names:
+            mesh_names = sorted({
+                Path(resolve_cluster_spm_pair(path)["mirror_spm"]).stem
+                for path in cluster_spms(folder.parent)
+            })
+        return {
+            "folder": str(folder),
+            "targets": [
+                _cluster_prepare_one(
+                    folder,
+                    mesh_name,
+                    dry_run=dry_run,
+                    exclude_materials=exclude_materials,
+                )
+                for mesh_name in sorted(set(mesh_names))
+            ],
+        }
     if target_mesh_names:
         results = []
         for mesh_name in sorted(set(target_mesh_names)):
@@ -2990,12 +3263,79 @@ def cluster_spms(folder):
     cluster_dir = Path(folder) / "Cluster"
     if not cluster_dir.exists():
         return []
+    pairs = {}
+    for path in sorted(cluster_dir.glob("*.spm")):
+        if not path.is_file() or is_backup_path(path):
+            continue
+        pair = resolve_cluster_spm_pair(path)
+        pairs.setdefault(pair["pair_id"], pair)
     return sorted(
-        p for p in cluster_dir.glob("*.spm")
-        if p.is_file()
-        and not p.name.lower().startswith("sk_")
-        and not is_backup_path(p)
+        (
+            Path(pair["canonical_spm"])
+            if Path(pair["canonical_spm"]).is_file()
+            else Path(pair["mirror_spm"])
+            for pair in pairs.values()
+        ),
+        key=lambda path: str(path).casefold(),
     )
+
+
+def physical_cluster_capture_status(canonical_spm):
+    """Read the authoritative Blender physical-capture receipt for one pair."""
+    canonical = Path(canonical_spm)
+    stem = canonical.stem
+    if stem.casefold().startswith("sk_"):
+        stem = stem[3:]
+    manifest = canonical.with_name(f"{stem}_auto_capture_manifest.json")
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE"
+        or payload.get("direct_uv_source")
+        != "same_blender_physical_capture_projection"
+    ):
+        return {}
+    map_rows = [
+        row for row in payload.get("maps") or []
+        if isinstance(row, dict)
+    ]
+    roles = {
+        str(row.get("role") or "").casefold(): row
+        for row in map_rows
+        if row.get("role")
+    }
+    missing_core = []
+    for label in ("Color", "Opacity"):
+        row = roles.get(label.casefold())
+        path = Path(str((row or {}).get("path") or ""))
+        if not row or not path.is_file():
+            missing_core.append(label)
+    resolution = payload.get("resolution")
+    if not isinstance(resolution, (list, tuple)) or len(resolution) != 2:
+        resolution = (
+            (payload.get("physical_capture_contract") or {}).get(
+                "capture_resolution"
+            )
+        )
+    return {
+        "normalization_workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "direct_uv_source": payload.get("direct_uv_source"),
+        "physical_capture_manifest": str(manifest),
+        "physical_capture_contract_sha256": str(
+            payload.get("physical_capture_contract_sha256")
+            or (payload.get("physical_capture_contract") or {}).get(
+                "contract_sha256"
+            )
+            or ""
+        ),
+        "physical_capture_resolution": list(resolution or ()),
+        "physical_capture_map_count": len(map_rows),
+        "physical_capture_core_complete": not missing_core,
+        "physical_capture_core_missing": missing_core,
+    }
 
 
 def cluster_source_inventory(clusters, cluster_usage=None,
@@ -3017,19 +3357,42 @@ def cluster_source_inventory(clusters, cluster_usage=None,
     for source in sorted(
             (Path(path) for path in clusters or []),
             key=lambda path: str(path).lower()):
-        key = str(source).lower()
-        usage = usage_by_path.get(key) or {}
-        assembly = assembly_by_path.get(key) or {}
+        pair = inspect_cluster_spm_pair(source)
+        canonical = Path(pair["canonical_spm"])
+        mirror = Path(pair["mirror_spm"])
+        usage = (
+            usage_by_path.get(str(source).lower())
+            or usage_by_path.get(str(canonical).lower())
+            or usage_by_path.get(str(mirror).lower())
+            or {}
+        )
+        assembly = (
+            assembly_by_path.get(str(source).lower())
+            or assembly_by_path.get(str(canonical).lower())
+            or assembly_by_path.get(str(mirror).lower())
+            or {}
+        )
         connected_refs = list(
             usage.get("connected_refs")
             if usage.get("connected_refs") is not None
             else usage.get("source_refs") or []
         )
         missing_refs = list(usage.get("missing_source_refs") or [])
+        physical_capture = physical_cluster_capture_status(canonical)
         rows.append({
             "kind": "cluster_spm",
-            "name": source.stem,
-            "source_spm": str(source),
+            "name": canonical.stem,
+            "source_spm": str(canonical),
+            "authoring_spm": str(canonical),
+            "output_spm": str(canonical),
+            "mirror_spm": str(mirror),
+            "legacy_output_spm": str(mirror),
+            "pair_status": pair.get("status"),
+            "pair_action": pair.get("action"),
+            "pair_generation": pair.get("generation"),
+            "pair_conflicts": list(pair.get("conflicts") or []),
+            "target_status": target_spm_status(
+                canonical.parent, canonical.stem.removeprefix("SK_")),
             "referenced": bool(usage),
             "referenced_by_spms": list(usage.get("spms") or []),
             "target_material_names": list(
@@ -3045,7 +3408,33 @@ def cluster_source_inventory(clusters, cluster_usage=None,
             ),
             "assembly_role": assembly.get("role"),
             "assembly_decision": assembly.get("decision"),
+            **physical_capture,
         })
+    return rows
+
+
+def cluster_connection_rows(folder, target_spms=None, clusters=None,
+                            connected_only=False, assembly_contract=None,
+                            cluster_usage=None):
+    """Return Cluster rows using the PCG board's exact TGA-link semantics."""
+    folder = Path(folder)
+    clusters = list(cluster_spms(folder) if clusters is None else clusters)
+    if target_spms is None:
+        target_spms = (
+            preferred_sk_spms(folder)
+            or loose_sk_spms(folder)
+            or source_spms(folder)
+        )
+    if cluster_usage is None:
+        dependency_spms, _assembly_sources = cluster_dependency_spms(target_spms)
+        cluster_usage = cluster_material_usage(dependency_spms, clusters)
+    rows = cluster_source_inventory(
+        clusters,
+        cluster_usage=cluster_usage,
+        assembly_contract=assembly_contract,
+    )
+    if connected_only:
+        rows = [row for row in rows if row.get("cluster_output_textures")]
     return rows
 
 
@@ -3759,19 +4148,9 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         from .pcg_cluster_assembly_contract import (
             build_cluster_assembly_contract,
         )
-    assembly_dependency_spms = list(target_spms)
-    assembly_source_spms = []
-    for target_spm in target_spms:
-        target_spm = Path(target_spm)
-        assembly_source_spm = target_spm
-        if target_spm.name.lower().startswith("sk_"):
-            source_spm = target_spm.with_name(target_spm.name[3:])
-            if source_spm.is_file():
-                assembly_source_spm = source_spm
-                if source_spm not in assembly_dependency_spms:
-                    assembly_dependency_spms.append(source_spm)
-        if assembly_source_spm not in assembly_source_spms:
-            assembly_source_spms.append(assembly_source_spm)
+    assembly_dependency_spms, assembly_source_spms = cluster_dependency_spms(
+        target_spms
+    )
     assembly_cluster_usage = cluster_material_usage(
         assembly_dependency_spms, clusters)
     cluster_assembly = build_cluster_assembly_contract(
@@ -3781,8 +4160,10 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         cluster_usage=assembly_cluster_usage,
         assembly_source_spms=assembly_source_spms,
     )
-    cluster_sources = cluster_source_inventory(
-        clusters,
+    cluster_sources = cluster_connection_rows(
+        folder,
+        target_spms=target_spms,
+        clusters=clusters,
         cluster_usage=assembly_cluster_usage,
         assembly_contract=cluster_assembly,
     )
@@ -4059,6 +4440,30 @@ def normalize_local_asset_stem(stem):
     return low
 
 
+def local_target_mesh_names(folder):
+    """Return every production SPM identity represented by one folder.
+
+    Existing strict ``SK_*.spm`` files use the same inclusion rule as
+    SK Batch. Source-only SPMs are also included when they use the folder
+    name directly or a numbered production variant, so the PCG board can
+    create every missing SK sibling instead of silently choosing the first
+    source file. Scratch suffixes such as ``_baked``/``_back`` are therefore
+    not promoted into new SK files merely because they share the folder.
+    """
+
+    folder = Path(folder)
+    folder_token = normalize_local_asset_stem(folder.name)
+    names = {
+        normalize_local_asset_stem(path.stem)
+        for path in preferred_sk_spms(folder)
+    }
+    for path in source_spms(folder):
+        token = normalize_local_asset_stem(path.stem)
+        if token == folder_token or re.search(r"_\d+$", token):
+            names.add(token)
+    return sorted(name for name in names if name)
+
+
 def folder_match_tokens(folder):
     folder = Path(folder)
     tokens = {normalize_local_asset_stem(folder.name)}
@@ -4261,7 +4666,8 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             folder, cfg, include_refs=include_refs,
             target_mesh_names=folder_target_mesh_names(
                 folder, report_target_mesh_names)
-                if report_target_mesh_names else None,
+                if report_target_mesh_names
+                else local_target_mesh_names(folder),
         )
         for folder in folders
     ]
@@ -4276,11 +4682,14 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
         folder_matches = folder_target_mesh_names(item["folder"], target_mesh_names)
         if folder_matches is True:
             folder_matches = []
+        workflow_mesh_names = (
+            folder_matches or local_target_mesh_names(item["folder"])
+        )
         matched_target_names.update(folder_matches)
         for name in folder_matches:
             target_folder_matches.setdefault(name, []).append(item["name"])
         item["pcg_target_mesh_names"] = folder_matches
-        item["target_mesh_names"] = folder_matches
+        item["target_mesh_names"] = workflow_mesh_names
         item["pcg_mesh_names"] = [
             name for name in folder_matches
             if target_source_map.get(name, {}).get("pcg")
@@ -4306,7 +4715,7 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
         ]
         item["target_spm_statuses"] = [
             target_spm_status(item["folder"], name)
-            for name in folder_matches
+            for name in workflow_mesh_names
         ]
         target_statuses = {entry["status"] for entry in item["target_spm_statuses"]}
         target_actions = [

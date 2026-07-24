@@ -37,6 +37,7 @@ GitHub/
 - SpeedTree Modeler 10.1
 - PCG 텍스처 작업용 Adobe Substance 3D Designer
 - 아틀라스 생성 작업용 `atlas_leaf_mesh_builder` Blender 애드온
+- Atlas blend별 `<blend stem>.atlas_leaf_targets.json` 대상 목록은 PCG 탭과 Blender 애드온이 공동 관리
 - Unreal 전송 작업용 Send to Unreal 및 프로젝트 측 동적 바람 임포트 기능
 
 개인 PC 경로가 들어가는 설정 JSON, 실행 상태, 로그, 생성 리포트는 로컬에는 유지되지만 Git에는 포함되지 않습니다.

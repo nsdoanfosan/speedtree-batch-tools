@@ -10,6 +10,8 @@ from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 from unittest import mock
 
+from speedtree_pipeline_contract import build_preflight_envelope
+
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
 
@@ -130,6 +132,46 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("공통 SpeedTree 계약 정보 없음", reason)
             self.assertIn("Repair 필요", app._blend_status_text(spm))
 
+    def test_cluster_contract_uses_canonical_sk_output_and_stmat(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            legacy = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_empty_spm(legacy)
+            canonical.write_bytes(legacy.read_bytes())
+            stmat = cluster / "fbx" / "SK_branch_elm_01.stmat"
+            stmat.parent.mkdir()
+            stmat.write_text("<SpeedTreeMaterials />", encoding="utf-8")
+            report = cluster / "reports" / (
+                "SK_branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": build_preflight_envelope(
+                        canonical,
+                        outcome="ok",
+                        texture_readiness={"status": "not_applicable"},
+                    ),
+                    "texture_normalization": {
+                        "status": "ok",
+                        "missing": [],
+                        "materials": [],
+                    },
+                    "handoff_preflight": {"status": "ok"},
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(gui.speedtree_output_spm_for(canonical), canonical)
+            self.assertEqual(
+                app._texture_normalization_ready(canonical),
+                (True, "텍스처 정규화 완료"),
+            )
+
     def test_content_receipt_keeps_touch_only_spm_current(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -206,6 +248,103 @@ class BlendLiveStatusTests(unittest.TestCase):
                 ready, _reason = app._texture_normalization_ready(spm)
 
             self.assertFalse(ready)
+
+    def test_repair_code_newer_than_saved_outputs_forces_blender_rerun(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_runtime_stale.spm"
+            blend = spm.with_suffix(".blend")
+            report = root / "reports" / (
+                "SK_tree_runtime_stale_speedtree_repair_pipeline_report_codex.json"
+            )
+            addon_dir = root / "speedtree_bone_weight_repair"
+            fbx_ini = (
+                addon_dir / "presets" / "speedtree_10_1" / "Options_MA_Fbx.ini"
+            )
+            core = addon_dir / "core.py"
+            report.parent.mkdir()
+            fbx_ini.parent.mkdir(parents=True)
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            report.write_text("{}", encoding="utf-8")
+            fbx_ini.write_text("", encoding="utf-8")
+            core.write_text("# newer repair runtime", encoding="utf-8")
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(blend, 2_000_000_000)
+            self.set_time(report, 2_000_000_000)
+            self.set_time(core, 3_000_000_000)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
+
+            ready, reason = app._handoff_ready(spm)
+
+            self.assertFalse(ready)
+            self.assertIn("Blender Repair 코드가 저장 결과보다 최신임", reason)
+            self.assertIn("core.py", reason)
+
+    def _runtime_stale_fixture(self, root):
+        """A completed Repair result whose .blend predates the installed code."""
+        spm = root / "SK_tree_runtime_stale.spm"
+        blend = spm.with_suffix(".blend")
+        report = root / "reports" / (
+            "SK_tree_runtime_stale_speedtree_repair_pipeline_report_codex.json"
+        )
+        addon_dir = root / "speedtree_bone_weight_repair"
+        fbx_ini = addon_dir / "presets" / "speedtree_10_1" / "Options_MA_Fbx.ini"
+        core = addon_dir / "core.py"
+        report.parent.mkdir(exist_ok=True)
+        fbx_ini.parent.mkdir(parents=True)
+        write_empty_spm(spm)
+        blend.write_bytes(b"blend")
+        report.write_text("{}", encoding="utf-8")
+        fbx_ini.write_text("", encoding="utf-8")
+        core.write_text("# newer repair runtime", encoding="utf-8")
+        self.set_time(spm, 1_000_000_000)
+        self.set_time(blend, 2_000_000_000)
+        self.set_time(report, 2_000_000_000)
+        self.set_time(core, 3_000_000_000)
+        return spm, core, fbx_ini
+
+    def test_runtime_receipt_clears_the_rerun_demand_without_a_new_blend(self):
+        # A Repair with nothing to change saves no .blend, so timestamps alone
+        # would keep asking for a rerun that can never satisfy them.
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, _core, fbx_ini = self._runtime_stale_fixture(root)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
+            app.log = mock.Mock()
+
+            self.assertFalse(app._handoff_ready(spm)[0])
+
+            app._write_repair_runtime_receipt(spm)
+
+            self.assertTrue(app._repair_runtime_receipt_path(spm).is_file())
+            fresh, reason = app._repair_runtime_fresh(spm)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
+
+    def test_runtime_receipt_goes_stale_when_addon_code_changes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, core, fbx_ini = self._runtime_stale_fixture(root)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app.log = mock.Mock()
+            app._write_repair_runtime_receipt(spm)
+            self.assertTrue(app._repair_runtime_fresh(spm)[0])
+
+            core.write_text("# edited again", encoding="utf-8")
+
+            fresh, reason = app._repair_runtime_fresh(spm)
+            self.assertFalse(fresh)
+            self.assertIn("Blender Repair 코드가 저장 결과보다 최신임", reason)
+            self.assertIn("core.py", reason)
 
     def test_live_status_explains_unconnected_managed_atlas(self):
         gui = load_gui_module()
@@ -620,6 +759,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             app._blend_status_text = mock.Mock(return_value="최신 ✓")
             item = {"manual_bones_locked": False, "wind_override": "auto"}
+            app.state[str(spm)] = {
+                "push_status": "건너뜀: Blender 갱신 필요",
+                "push_status_kind": "preflight_skip",
+                "push_status_error": {"kind": "preflight_skip"},
+            }
 
             with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
                 "spm_audit.sk_readiness", return_value={"ready": True}
@@ -636,6 +780,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             contract_path = commands[1][commands[1].index("--material-contract") + 1]
             first_report = commands[0][commands[0].index("--report") + 1]
             self.assertEqual(contract_path, first_report)
+            self.assertEqual(app.state[str(spm)]["push_status"], "준비됨 ✓")
+            self.assertEqual(app.state[str(spm)]["push_status_kind"], "ready")
+            self.assertNotIn("push_status_error", app.state[str(spm)])
 
     def test_blender_job_accepts_source_review_and_leaves_push_blocked(self):
         gui = load_gui_module()

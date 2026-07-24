@@ -122,6 +122,27 @@ def _material_blocks(text, authored_name=None, material_id=None):
     return rows
 
 
+def _receipt_material_blocks(text, row):
+    """Resolve a receipt bark slot by durable ID, then exact authored name.
+
+    Export-name normalization intentionally treats ``Bark_x`` and ``M_Bark_x``
+    as the same external identity.  Inside one SPM those can coexist while the
+    detached legacy slot is retained as ``*_old``.  Selecting by normalized
+    name would therefore mutate the wrong slot or report a false ambiguity.
+    """
+    material_id = str((row or {}).get("material_id") or "").strip()
+    if material_id:
+        return _material_blocks(text, material_id=material_id)
+    authored_name = str((row or {}).get("material_name") or "").strip()
+    if not authored_name:
+        return []
+    return [
+        (match, block)
+        for match, block in _material_blocks(text)
+        if _material_name(block).casefold() == authored_name.casefold()
+    ]
+
+
 def _resolve_ref(spm, value):
     value = str(value or "").strip().replace("\\", os.sep).replace("/", os.sep)
     path = Path(value)
@@ -361,7 +382,7 @@ def build_isolated_bark_normalization_plan(
                 f"isolated SPM is not an exact source copy: {isolated_spm}")
 
         before = read_maybe_gzip_text(isolated_spm)
-        target_blocks = _material_blocks(before, row.get("material_name"))
+        target_blocks = _receipt_material_blocks(before, row)
         if len(target_blocks) != 1:
             raise BarkNormalizationError(
                 f"Cluster bark material is ambiguous in {isolated_spm}: "

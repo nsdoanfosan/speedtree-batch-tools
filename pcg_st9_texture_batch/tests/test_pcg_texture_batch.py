@@ -1,6 +1,7 @@
 import gzip
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -19,6 +20,7 @@ sys.path.insert(0, str(TOOL_DIR))
 import sbs_auto
 import pcg_texture_audit
 import migrate_current_sk_textures
+from pcg_texture_common import is_backup_path
 from export_texture_plan import build_texture_plan_from_report, extract_material_image_refs
 from pcg_texture_audit import (
     assign_leaf_atlas_bases,
@@ -46,6 +48,118 @@ from spm_texture_normalize import (
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_physical_cluster_capture_receipt_tracks_color_opacity_and_resolution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cluster = Path(temp) / "Cluster"
+            cluster.mkdir()
+            canonical = cluster / "SK_branch_test_01.spm"
+            canonical.touch()
+            color = cluster / "branch_test_01.tga"
+            opacity = cluster / "branch_test_01_Opacity.tga"
+            color.touch()
+            opacity.touch()
+            manifest = cluster / "branch_test_01_auto_capture_manifest.json"
+            manifest.write_text(json.dumps({
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "direct_uv_source": (
+                    "same_blender_physical_capture_projection"
+                ),
+                "resolution": [1024, 1024],
+                "physical_capture_contract_sha256": "capture-hash",
+                "maps": [
+                    {"role": "Color", "path": str(color)},
+                    {"role": "Opacity", "path": str(opacity)},
+                ],
+            }), encoding="utf-8")
+
+            status = pcg_texture_audit.physical_cluster_capture_status(
+                canonical
+            )
+
+            self.assertTrue(status["physical_capture_core_complete"])
+            self.assertEqual(
+                status["normalization_workflow_mode"],
+                "PHYSICAL_DIRECT_CAPTURE",
+            )
+            self.assertEqual(
+                status["physical_capture_resolution"],
+                [1024, 1024],
+            )
+
+    def test_root_level_repair_and_probe_spms_are_not_pipeline_sources(self):
+        self.assertTrue(is_backup_path("SK_Tree_elm_01.pre_xml_root_fix_20260724.spm"))
+        self.assertTrue(is_backup_path("SK_Tree_elm_01_frond_probe.spm"))
+        self.assertFalse(is_backup_path("SK_Tree_elm_01.spm"))
+
+    def test_local_folder_targets_include_every_numbered_spm_variant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Tree_elm"
+            folder.mkdir()
+            for name in (
+                "Tree_elm.spm",
+                "Tree_elm_01.spm",
+                "Tree_elm_02.spm",
+                "Tree_elm_02_baked.spm",
+                "Tree_elm_03_back.spm",
+                "Tree_UlmusDavidiana_01.spm",
+                "SK_Tree_elm_01.spm",
+                "SK)Tree_elm_02.spm",
+            ):
+                (folder / name).write_bytes(b"SPM")
+
+            names = pcg_texture_audit.local_target_mesh_names(folder)
+
+        self.assertEqual(names, [
+            "tree_elm",
+            "tree_elm_01",
+            "tree_elm_02",
+            "tree_ulmusdavidiana_01",
+        ])
+
+    def test_default_report_audits_all_local_spm_targets(self):
+        folder = Path(r"D:\Trees\Tree_elm")
+        local_names = ["tree_elm_01", "tree_elm_02", "tree_elm_03"]
+        audit_item = {
+            "folder": str(folder),
+            "name": "Tree_elm",
+            "status": "ready",
+            "actions": [],
+        }
+
+        with mock.patch.object(
+                pcg_texture_audit, "ensure_blend_source_index"), \
+                mock.patch.object(
+                    pcg_texture_audit, "candidate_folders",
+                    return_value=[folder]), \
+                mock.patch.object(
+                    pcg_texture_audit, "local_target_mesh_names",
+                    return_value=local_names), \
+                mock.patch.object(
+                    pcg_texture_audit, "audit_folder",
+                    return_value=audit_item) as audit, \
+                mock.patch.object(
+                    pcg_texture_audit, "attach_global_m_graphs"), \
+                mock.patch.object(
+                    pcg_texture_audit, "resolve_shared_atlas_entries"), \
+                mock.patch.object(
+                    pcg_texture_audit, "target_spm_status",
+                    side_effect=lambda _folder, name: {
+                        "mesh_name": name,
+                        "status": "ready",
+                        "actions": [],
+                    }):
+            report = pcg_texture_audit.make_report(
+                {"pcg_focus_data_assets": [], "pcg_positive_weight_only": True},
+                pcg_targets=None,
+            )
+
+        self.assertEqual(
+            audit.call_args.kwargs["target_mesh_names"], local_names)
+        self.assertEqual(
+            [row["mesh_name"] for row in report["items"][0]["target_spm_statuses"]],
+            local_names,
+        )
+
     def test_pcg_and_level_provenance_stay_separate(self):
         targets = {
             "meshes": [
@@ -2069,7 +2183,8 @@ class GuiLabelTests(unittest.TestCase):
         source = (TOOL_DIR / "pcg_texture_gui.pyw").read_text(encoding="utf-8")
         self.assertFalse(hasattr(self.gui.App, "step4_text"))
         self.assertNotIn("④ SK Blend", source)
-        self.assertNotIn('"step4"', source)
+        self.assertIn("④ Blend ↔ SPM 확인", source)
+        self.assertIn("blender_connection_overview", source)
 
     def test_step3_uses_exact_target_status_not_folder_sibling_variants(self):
         selected = r"D:\Trees\ladyfern\SK_weed_ladyfern_01.spm"
@@ -2312,6 +2427,22 @@ class GuiLabelTests(unittest.TestCase):
                 mock.call(state="disabled"), mock.call(state="normal"),
             ])
 
+    def test_busy_click_selects_copyable_row_without_toggling_check(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app._busy = True
+        app.tree = mock.Mock()
+        app.tree.identify_row.return_value = "row"
+        app.row_copy_paths = {"row": [Path("SK_tree_test.spm")]}
+        app.checked_rows = mock.Mock()
+        event = type("Event", (), {"x": 10, "y": 20})()
+
+        self.assertEqual(app._on_click(event), "break")
+
+        app.tree.selection_set.assert_called_once_with("row")
+        app.tree.focus.assert_called_once_with("row")
+        app.tree.focus_set.assert_called_once_with()
+        app.checked_rows.click.assert_not_called()
+
     def test_target_refresh_rejects_duplicate_and_times_out(self):
         class FakeRoot:
             def __init__(self):
@@ -2500,6 +2631,34 @@ class GuiLabelTests(unittest.TestCase):
         normal, generic = self.gui.split_generic(["m_leaf_test"])
         self.assertEqual(normal, [])
         self.assertEqual(generic, [])
+
+    def test_current_cluster_pair_is_rendered_as_complete(self):
+        self.assertEqual(
+            self.gui.cluster_pair_step1_text({
+                "pair_status": "current",
+                "pair_action": "none",
+                "pair_conflicts": [],
+                "target_status": {"status": "ready"},
+            }),
+            "완료 ✓",
+        )
+
+    def test_physical_cluster_capture_hides_legacy_eight_map_count(self):
+        physical = {
+            "normalization_workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "physical_capture_resolution": [1024, 1024],
+            "physical_capture_core_missing": [],
+        }
+        paths = [f"map_{index}.tga" for index in range(8)]
+
+        self.assertEqual(
+            self.gui.cluster_texture_status_text(physical, paths, []),
+            "Blender 촬영 1024² · 완료 ✓",
+        )
+        self.assertEqual(
+            self.gui.cluster_texture_status_text({}, paths, []),
+            "Cluster 출력 TGA 연결 8장",
+        )
 
     def test_step2_label_distinguishes_complete_and_partial(self):
         complete = {"leaf_mesh_sources": [
@@ -2768,6 +2927,119 @@ class GuiLabelTests(unittest.TestCase):
             {"a": True, "b": False, "c": False},
         )
 
+    def test_first_spm_click_after_select_all_keeps_only_exact_spm(self):
+        class FakeTree:
+            def __init__(self):
+                self.labels = {}
+
+            @staticmethod
+            def identify_region(_x, _y):
+                return "tree"
+
+            @staticmethod
+            def identify_row(y):
+                return y
+
+            def item(self, iid, **values):
+                self.labels[iid] = values.get("text")
+
+            def selection_set(self, _iid):
+                pass
+
+            def focus(self, _iid):
+                pass
+
+            def focus_set(self):
+                pass
+
+        app = self.gui.App.__new__(self.gui.App)
+        app.tree = FakeTree()
+        app.items = {
+            "folder_a": {"item": {"name": "a"}, "checked": True},
+            "folder_b": {"item": {"name": "b"}, "checked": True},
+        }
+        app.target_items = {
+            "a1": {
+                "folder_iid": "folder_a", "display_name": "SK_a1.spm",
+                "checked": True,
+            },
+            "a2": {
+                "folder_iid": "folder_a", "display_name": "SK_a2.spm",
+                "checked": True,
+            },
+            "b1": {
+                "folder_iid": "folder_b", "display_name": "SK_b1.spm",
+                "checked": True,
+            },
+        }
+        app.checked_rows = self.gui.CheckedRowController(
+            app.items, app._redraw_checked_row)
+        app.target_checked_rows = self.gui.CheckedRowController(
+            app.target_items, app._redraw_target_checked_row)
+        app.checked_rows.sync_after_reload()
+        app.target_checked_rows.sync_after_reload()
+        event = type("Event", (), {"x": 0, "y": "a2"})()
+
+        app._on_click(event)
+
+        self.assertEqual(
+            {name: row["checked"] for name, row in app.target_items.items()},
+            {"a1": False, "a2": True, "b1": False},
+        )
+        self.assertTrue(app.items["folder_a"]["checked"])
+        self.assertFalse(app.items["folder_b"]["checked"])
+
+    def test_folder_click_selects_all_spms_in_only_that_folder(self):
+        class FakeTree:
+            def __init__(self):
+                self.labels = {}
+
+            @staticmethod
+            def identify_region(_x, _y):
+                return "tree"
+
+            @staticmethod
+            def identify_row(y):
+                return y
+
+            def item(self, iid, **values):
+                self.labels[iid] = values.get("text")
+
+        app = self.gui.App.__new__(self.gui.App)
+        app.tree = FakeTree()
+        app.items = {
+            "folder_a": {"item": {"name": "a"}, "checked": True},
+            "folder_b": {"item": {"name": "b"}, "checked": True},
+        }
+        app.target_items = {
+            "a1": {
+                "folder_iid": "folder_a", "display_name": "SK_a1.spm",
+                "checked": True,
+            },
+            "a2": {
+                "folder_iid": "folder_a", "display_name": "SK_a2.spm",
+                "checked": True,
+            },
+            "b1": {
+                "folder_iid": "folder_b", "display_name": "SK_b1.spm",
+                "checked": True,
+            },
+        }
+        app.checked_rows = self.gui.CheckedRowController(
+            app.items, app._redraw_checked_row)
+        app.target_checked_rows = self.gui.CheckedRowController(
+            app.target_items, app._redraw_target_checked_row)
+        app.checked_rows.sync_after_reload()
+        app.target_checked_rows.sync_after_reload()
+        event = type("Event", (), {"x": 0, "y": "folder_a"})()
+
+        app._on_click(event)
+
+        self.assertEqual(
+            {name: row["checked"] for name, row in app.target_items.items()},
+            {"a1": True, "a2": True, "b1": False},
+        )
+
     def test_folder_row_exposes_concrete_spm_paths_for_copy(self):
         item = {
             "target_spm_statuses": [
@@ -2811,6 +3083,119 @@ class GuiLabelTests(unittest.TestCase):
             self.gui.App.step2_text(None, complete),
             "현재 잎 매쉬 1세트 · 연결 완료 ✓",
         )
+
+    def test_current_inventory_overrides_stale_blend_target_connection(self):
+        blend = r"D:\Trees\atlas\M_leaf_test_atlas_01.blend"
+        spm = r"D:\Trees\tree_test\SK_tree_test.spm"
+        item = {
+            "leaf_mesh_sources": [{
+                "atlas_blends": [blend],
+                "targets": [{
+                    "spm": spm,
+                    "generator_connection_complete": False,
+                }],
+            }],
+            "leaf_atlas_inventory": [{
+                "atlas_blends": [blend],
+                "export_participating": True,
+                "targets": [{
+                    "spm": spm,
+                    "generator_connection_complete": True,
+                }],
+            }],
+        }
+
+        rows = self.gui.blender_connection_rows(item)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]["spms"]), 1)
+        self.assertTrue(rows[0]["spms"][0]["connected"])
+        self.assertEqual(
+            self.gui.blender_connection_summary(rows[0]),
+            "연결 SPM 1개 · 연결 완료 ✓",
+        )
+
+    def test_populate_inserts_collapsed_real_blend_with_spm_children(self):
+        class FakeTree:
+            def __init__(self):
+                self.insertions = []
+
+            def get_children(self):
+                return ()
+
+            def delete(self, _iid):
+                raise AssertionError("empty fake tree must not delete rows")
+
+            def insert(self, parent, index, **kwargs):
+                self.insertions.append((parent, index, kwargs))
+                return kwargs.get("iid")
+
+        blend = Path(r"D:\Trees\atlas\M_leaf_test_atlas_01.blend")
+        spm = Path(r"D:\Trees\tree_test\SK_tree_test.spm")
+        item = {
+            "folder": r"D:\Trees\tree_test",
+            "name": "tree_test",
+            "actions": [],
+            "target_spm_statuses": [{
+                "mesh_name": "tree_test",
+                "source_spm": r"D:\Trees\tree_test\tree_test.spm",
+                "sk_spm": str(spm),
+                "status": "ready",
+            }],
+            "leaf_mesh_sources": [{
+                "atlas_blends": [str(blend)],
+                "targets": [{
+                    "spm": str(spm),
+                    "generator_connection_complete": True,
+                }],
+            }],
+        }
+        app = self.gui.App.__new__(self.gui.App)
+        app.report = {"items": [item]}
+        app.items = {}
+        app.row_copy_paths = {}
+        app.tree = FakeTree()
+        app.checked_rows = self.gui.CheckedRowController(
+            app.items, lambda _iid, _entry: None
+        )
+        app._annotate_unreal_sync = lambda _item: None
+        app._target_row_tag = lambda _item: ""
+        app._target_source_text = lambda _item: ""
+        app.step1_text = lambda _item: ""
+        app.step2_text = lambda _item: ""
+        app.step3_text = lambda _item: ""
+        app._update_step3_button = lambda: None
+
+        app.populate()
+
+        by_iid = {
+            kwargs["iid"]: (parent, kwargs)
+            for parent, _index, kwargs in app.tree.insertions
+        }
+        blend_iid = item["folder"] + "::blend::0"
+        spm_iid = blend_iid + "::spm::0"
+        target_iid = item["folder"] + "::target::0"
+        self.assertEqual(by_iid[target_iid][0], item["folder"])
+        self.assertEqual(by_iid[target_iid][1]["text"], f"☑ {spm.name}")
+        self.assertEqual(app.target_items[target_iid]["mesh"], "tree_test")
+        self.assertEqual(app.row_copy_paths[target_iid], [spm])
+        self.assertEqual(by_iid[blend_iid][1]["text"], f"◆ {blend.name}")
+        self.assertFalse(by_iid[blend_iid][1]["open"])
+        self.assertEqual(
+            by_iid[item["folder"]][1]["values"][4],
+            "blend 1개 · 연결 완료 ✓",
+        )
+        self.assertEqual(
+            by_iid[blend_iid][1]["values"][4],
+            "연결 SPM 1개 · 연결 완료 ✓",
+        )
+        self.assertEqual(by_iid[spm_iid][0], blend_iid)
+        self.assertEqual(by_iid[spm_iid][1]["text"], f"↳ {spm.name}")
+        self.assertNotIn(
+            "Blender", [kwargs["text"] for _, _, kwargs in app.tree.insertions]
+        )
+        self.assertEqual(app.row_copy_paths[blend_iid], [blend])
+        self.assertEqual(app.row_copy_paths[spm_iid], [spm])
 
     def test_step2_explicit_complete_targets_override_stale_source_aggregate(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2901,6 +3286,42 @@ class GuiLabelTests(unittest.TestCase):
             rows = app._build_prepare_rows()
 
         self.assertEqual(rows, [])
+
+    def test_prepare_rows_use_only_checked_exact_spm_targets(self):
+        item = {
+            "folder": r"D:\Trees\tree_elm",
+            "name": "tree_elm",
+            "duplicate_target_mesh_names": [],
+        }
+        first_status = {"mesh_name": "tree_elm_01", "status": "needs_sk"}
+        second_status = {"mesh_name": "tree_elm_02", "status": "needs_sk"}
+        app = self.gui.App.__new__(self.gui.App)
+        app.items = {item["folder"]: {"checked": True, "item": item}}
+        app.target_items = {
+            "first": {
+                "checked": False,
+                "item": item,
+                "target_status": first_status,
+            },
+            "second": {
+                "checked": True,
+                "item": item,
+                "target_status": second_status,
+            },
+        }
+        preview = {"targets": [{
+            "status": "dry-run",
+            "would_create": r"D:\Trees\tree_elm\SK_Tree_elm_02.spm",
+            "patch": {"dry_run": True, "renames": []},
+        }]}
+
+        with mock.patch.object(
+                self.gui, "prepare_sk", return_value=preview) as prepare:
+            rows = app._build_prepare_rows()
+
+        self.assertEqual([row["mesh"] for row in rows], ["tree_elm_02"])
+        prepare.assert_called_once_with(
+            item["folder"], ["tree_elm_02"], dry_run=True)
 
     def test_step2_reuses_existing_blend_and_passes_exact_target_mapping(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -55,22 +55,15 @@ def _atlas_family_key(value):
 def _replacement_source_slot(slot, managed_family_keys):
     """Whether a visible source slot is part of the authored leaf-atlas job.
 
-    Leaf Mesh is unambiguous. Frond also carries ordinary branch cards, so it
-    is a replacement target only when its material is leaf/cluster-like or a
-    managed atlas material of the same family exists in the SPM.
+    A tree can contain several independent card families at once.  The mere
+    presence of one managed Atlas material must not turn every other Leaf Mesh
+    or Frond family into a replacement target.  Require the source slot and
+    managed output to share the same normalized family identity.
     """
     generator_type = _normalized_generator_type(slot.get("generator_type"))
-    if generator_type == "leafmesh":
-        return True
-    material_name = str(slot.get("material_name") or "")
-    family = _atlas_family_key(material_name)
-    tokens = set(re.split(r"[^a-z0-9]+", material_name.casefold()))
     return bool(
-        generator_type == "frond"
-        and (
-            {"leaf", "cluster"} & tokens
-            or family in managed_family_keys
-        )
+        generator_type in SEMANTIC_GENERATOR_TYPES
+        and _atlas_family_key(slot.get("material_name")) in managed_family_keys
     )
 
 

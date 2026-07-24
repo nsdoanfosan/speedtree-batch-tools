@@ -140,8 +140,8 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             write_spm(
                 spm,
                 [
-                    (2, "M_cluster_source", [2], False),
-                    (8, "M_cluster_atlas_01", [18], True),
+                    (2, "M_cluster_tree_01", [2], False),
+                    (8, "M_cluster_tree_01_atlas", [18], True),
                 ],
                 [(2, 2)],
             )
@@ -152,6 +152,24 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             self.assertTrue(contract["replacement_needed"])
             self.assertEqual(contract["source_slot_count"], 1)
             self.assertEqual(contract["managed_slot_count"], 0)
+
+    def test_unrelated_managed_family_does_not_replace_existing_leaf_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "SK_tree_multiple_card_families.spm"
+            write_spm(
+                spm,
+                [
+                    (2, "M_leaf_tree_01", [2], False),
+                    (8, "M_branch_tree_01_atlas", [18], True),
+                ],
+                [(2, 2)],
+            )
+
+            contract = inspect_spm_leaf_contract(spm)
+
+            self.assertEqual(contract["status"], "source_only")
+            self.assertFalse(contract["replacement_needed"])
+            self.assertEqual(contract["replacement_source_slot_count"], 0)
 
     def test_managed_assets_without_semantic_slots_require_connection(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import json
 import tempfile
@@ -8,6 +9,36 @@ from pathlib import Path
 
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
+
+
+def write_material_spm(path, materials, mesh_ids=()):
+    material_xml = []
+    for material_id, name, refs, owned_mesh_ids in materials:
+        texture_xml = "".join(
+            f"<TexFilename>{value}</TexFilename>" for value in refs
+        )
+        cutout_xml = "".join(
+            f'<CutoutMesh ID="{value}"/>' for value in owned_mesh_ids
+        )
+        material_xml.append(
+            f'<Material_v8 ID="{material_id}" Name="{name}">'
+            f"{texture_xml}"
+            f'<SupplementalCutoutMeshIDs Count="{len(owned_mesh_ids)}">'
+            f"{cutout_xml}</SupplementalCutoutMeshIDs>"
+            "</Material_v8>"
+        )
+    mesh_xml = "".join(
+        f'<Mesh ID="{value}" Name="mesh-{value}"/>' for value in mesh_ids
+    )
+    payload = (
+        "<SpeedTree><Materials>" + "".join(material_xml)
+        + "</Materials><Meshes>" + mesh_xml
+        + "</Meshes></SpeedTree>"
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wb") as handle:
+        handle.write(payload)
+    return path
 
 
 def load_gui_module():
@@ -75,7 +106,7 @@ class FakeTree:
 
 
 class SkBatchUiConvenienceTests(unittest.TestCase):
-    def test_cluster_sources_are_read_only_inputs_with_sk_named_blend_outputs(self):
+    def test_cluster_raw_inputs_are_retained_as_canonical_bootstrap_rows(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -83,23 +114,43 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             cluster.mkdir(parents=True)
             source = cluster / "cluster_Silky_Dogwood_01.spm"
             source.write_bytes(b"source")
-            legacy_sk = cluster / "SK_cluster_Silky_Dogwood_01.spm"
-            legacy_sk.write_bytes(b"legacy-work-spm")
+            unused = cluster / "cluster_Silky_Dogwood_02.spm"
+            unused.write_bytes(b"unused")
             speedtree_temp = cluster / "~cluster_Silky_Dogwood_01.spm"
             speedtree_temp.write_bytes(b"temporary")
             full_sk = root / "bush_Silky_Dogwood" / "SK_bush_Silky_Dogwood_01.spm"
-            full_sk.write_bytes(b"full")
+            write_material_spm(
+                full_sk,
+                [(
+                    "material-1",
+                    "M_cluster_Silky_Dogwood_01",
+                    ["Cluster/cluster_Silky_Dogwood_01.tga"],
+                    ("mesh-1",),
+                )],
+                mesh_ids=("mesh-1",),
+            )
 
             rows = gui.scan_cluster_spm_sources(root)
 
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["source_spm"], source)
+            row = next(
+                item for item in rows
+                if item["legacy_output_spm"] == source
+            )
+            self.assertEqual(
+                row["source_spm"], cluster / "SK_cluster_Silky_Dogwood_01.spm"
+            )
+            self.assertEqual(row["authoring_spm"], row["source_spm"])
+            self.assertEqual(row["output_spm"], row["source_spm"])
+            self.assertEqual(row["pair_status"], "normalization_ready")
+            self.assertIn("connected_output_textures", row)
+            self.assertNotIn(unused, [item["output_spm"] for item in rows])
             self.assertNotIn(
                 speedtree_temp,
                 [row["source_spm"] for row in rows],
             )
             self.assertEqual(
-                rows[0]["blend_path"],
+                row["blend_path"],
                 cluster / "SK_cluster_Silky_Dogwood_01.blend",
             )
             self.assertEqual(
@@ -113,6 +164,66 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             self.assertEqual(
                 gui.blend_path_for(full_sk),
                 full_sk.with_suffix(".blend"),
+            )
+
+    def test_cluster_scan_uses_authoritative_source_and_prunes_pipeline_backup(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = root / "Tree_elm"
+            cluster = owner / "Cluster"
+            branch = cluster / "branch_elm_01.spm"
+            branch.parent.mkdir(parents=True)
+            branch.write_bytes(b"cluster-source")
+            write_material_spm(
+                owner / "SK_Tree_elm_01.spm",
+                [(
+                    "material-1",
+                    "M_branch_elm_01",
+                    ["texture/T_branch_elm_01_color.tga"],
+                    ("mesh-1",),
+                )],
+                mesh_ids=("mesh-1",),
+            )
+            write_material_spm(
+                owner / "Tree_elm_01.spm",
+                [(
+                    "material-1",
+                    "branch_elm_01",
+                    ["Cluster/branch_elm_01.tga"],
+                    ("mesh-1",),
+                )],
+                mesh_ids=("mesh-1",),
+            )
+
+            backup_owner = (
+                root / "_atlas_cluster_normalization_backups" / "final"
+                / "files" / "Tree_elm"
+            )
+            backup_cluster = backup_owner / "Cluster"
+            backup_branch = backup_cluster / "branch_elm_01.spm"
+            backup_branch.parent.mkdir(parents=True)
+            backup_branch.write_bytes(b"backup-cluster-source")
+            write_material_spm(
+                backup_owner / "Tree_elm_01.spm",
+                [(
+                    "material-1",
+                    "branch_elm_01",
+                    ["Cluster/branch_elm_01.tga"],
+                    ("mesh-1",),
+                )],
+                mesh_ids=("mesh-1",),
+            )
+
+            rows = gui.scan_cluster_spm_sources(root)
+
+            self.assertEqual(
+                [row["source_spm"] for row in rows],
+                [cluster / "SK_branch_elm_01.spm"],
+            )
+            self.assertNotIn(
+                backup_branch,
+                [row["source_spm"] for row in rows],
             )
 
     def test_cluster_folder_chain_and_owner_wind_cover_tree_bush_and_weed(self):
@@ -132,18 +243,22 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                     [root / owner, root / owner / "Cluster"],
                 )
 
-    def test_cluster_row_shows_sk_blend_but_never_an_sk_spm(self):
+    def test_cluster_row_shows_only_canonical_output_name(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         iid = "cluster-source"
         app.items = {
             iid: {
-                "spm": Path("Tree_elm/Cluster/branch_elm_01.spm"),
+                "spm": Path("Tree_elm/Cluster/SK_branch_elm_01.spm"),
                 "cluster_source_spm": Path(
                     "Tree_elm/Cluster/branch_elm_01.spm"
                 ),
-                "display_name": "branch_elm_01.spm",
-                "source_read_only": True,
+                "output_spm": Path("Tree_elm/Cluster/SK_branch_elm_01.spm"),
+                "legacy_output_spm": Path(
+                    "Tree_elm/Cluster/branch_elm_01.spm"
+                ),
+                "display_name": "SK_branch_elm_01.spm",
+                "source_read_only": False,
                 "checked": True,
                 "manual_bones_locked": False,
             }
@@ -151,10 +266,35 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
 
         label = app._item_label(iid)
 
-        self.assertIn("branch_elm_01.spm", label)
-        self.assertIn("Blend → SK_branch_elm_01.blend", label)
-        self.assertNotIn("SK_branch_elm_01.spm", label)
-        self.assertFalse(gui.should_calibrate_spm(app.items[iid]))
+        self.assertIn("SK_branch_elm_01.spm", label)
+        self.assertNotIn("branch_elm_01.spm →", label)
+        self.assertNotIn("Atlas output", label)
+        self.assertTrue(gui.should_calibrate_spm(app.items[iid]))
+
+    def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            raw = cluster / "branch_elm_01.spm"
+            canonical = cluster / "SK_branch_elm_01.spm"
+            raw.write_bytes(b"generation-1")
+
+            bootstrap = gui.prepare_cluster_spm_pair_for_job(raw)
+            self.assertEqual(
+                bootstrap["operation"],
+                "normalize_legacy_output_to_canonical",
+            )
+            self.assertEqual(canonical.read_bytes(), b"generation-1")
+
+            canonical.write_bytes(b"generation-2")
+            current = gui.prepare_cluster_spm_pair_for_job(canonical)
+            self.assertEqual(current["operation"], "none")
+            self.assertEqual(raw.read_bytes(), b"generation-1")
+
+            raw.write_bytes(b"independent-atlas-edit")
+            gui.prepare_cluster_spm_pair_for_job(canonical)
+            self.assertEqual(canonical.read_bytes(), b"generation-2")
 
     def test_folder_click_clears_stale_actionable_checks(self):
         gui = load_gui_module()
@@ -344,6 +484,44 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             self.assertEqual(app.copy_selected_paths(), "break")
             self.assertEqual(app.root.clipboard, str(spms[1].resolve()))
             self.assertIn("1개", app.progress_var.value)
+
+
+    def test_running_click_selects_and_copies_without_toggling_check(self):
+        gui = load_gui_module()
+
+        class RunningWorker:
+            @staticmethod
+            def is_alive():
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "SK_tree_running.spm"
+            app = gui.App.__new__(gui.App)
+            app.root = FakeRoot()
+            app.tree = FakeTree()
+            app.worker = RunningWorker()
+            app.cell_editor = None
+            app.progress_var = FakeVar()
+            app.items = {
+                str(spm): {
+                    "spm": spm,
+                    "checked": True,
+                    "manual_bones_locked": False,
+                }
+            }
+            app.row_copy_paths = {str(spm): [spm]}
+            app.checked_rows = gui.CheckedRowController(
+                app.items, app._redraw_checked_row
+            )
+            app.checked_rows.sync_after_reload()
+            event = type("Event", (), {"x": 0, "y": str(spm)})()
+
+            self.assertEqual(app._on_click(event), "break")
+
+            self.assertTrue(app.items[str(spm)]["checked"])
+            self.assertEqual(app.tree.selection(), (str(spm),))
+            self.assertEqual(app.copy_selected_paths(), "break")
+            self.assertEqual(app.root.clipboard, str(spm.resolve()))
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ if JOBS_DIR not in sys.path:
 SK_BATCH_DIR = str(Path(__file__).resolve().parent.parent)
 if SK_BATCH_DIR not in sys.path:
     sys.path.insert(0, SK_BATCH_DIR)
+REPO_DIR = str(Path(SK_BATCH_DIR).parent)
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
 
 from vertex_color_contract import (
     inspect_object_vertex_colors,
@@ -47,9 +50,13 @@ from vertex_color_contract import (
 from cluster_assembly_builder import (
     build_unreal_ingest_plan,
     file_fingerprint as cluster_file_fingerprint,
-    scope_material_pipeline_to_codex_tests,
+    scope_material_pipeline_for_destination,
     validate_file_fingerprint,
     validate_manifest_artifacts,
+)
+from cluster_spm_pair_contract import (
+    ClusterSpmPairPathError,
+    resolve_cluster_spm_pair,
 )
 
 
@@ -398,10 +405,18 @@ def main():
 
         report["stage"] = "texture_validation"
         spm_path = Path(args.spm).resolve()
-        source_fbx = spm_path.parent / "fbx" / f"{spm_path.stem}.fbx"
+        try:
+            speedtree_spm = resolve_cluster_spm_pair(spm_path)["canonical_spm"]
+        except ClusterSpmPairPathError:
+            speedtree_spm = spm_path
+        source_fbx = (
+            speedtree_spm.parent / "fbx" / f"{speedtree_spm.stem}.fbx"
+        )
+        report["canonical_spm"] = str(spm_path)
+        report["speedtree_spm"] = str(speedtree_spm)
         texture_contract = load_speedtree_texture_readiness_contract(
             args.material_contract,
-            spm_path=str(spm_path),
+            spm_path=str(speedtree_spm),
             source_fbx_path=str(source_fbx),
         )
         if not texture_contract.get("strict_speedtree_pipeline_contract"):
@@ -415,31 +430,43 @@ def main():
                 texture_contract.get("strict_speedtree_pipeline_contract")
             ),
         }
+        export_collection = bpy.data.collections.get("Export")
+        export_objects = list(export_collection.all_objects) if export_collection else []
         material_consolidation = consolidate_speedtree_group_materials(
-            bpy.context.scene.objects,
+            export_objects,
             texture_contract=texture_contract,
         )
         report["material_consolidation"] = material_consolidation
         texture_normalization = normalize_speedtree_material_textures(
-            bpy.context.scene.objects,
+            export_objects,
             texture_contract=texture_contract,
         )
         report["texture_normalization"] = texture_normalization
-        export_collection = bpy.data.collections.get("Export")
         export_meshes = [
             obj for obj in (export_collection.all_objects if export_collection else [])
             if obj.type == "MESH" and obj.data
+        ]
+        orphan_owned_export_empties = [
+            obj.name
+            for obj in (export_collection.objects if export_collection else [])
+            if obj.type == "EMPTY"
+            and not obj.children
+            and bool(obj.get("codex_source_fbx", ""))
         ]
         export_collection_issues = []
         if export_collection is None:
             export_collection_issues.append("missing_export_collection")
         elif not export_meshes:
             export_collection_issues.append("export_collection_has_no_meshes")
+        export_collection_issues.extend(
+            f"orphan_owned_export_empty:{name}"
+            for name in orphan_owned_export_empties
+        )
         removed_empty_slots = remove_unused_empty_material_slots(
-            bpy.context.scene.objects
+            export_objects
         )
         report["removed_unused_empty_material_slots"] = removed_empty_slots
-        empty_material_slots = export_material_slot_issues(bpy.context.scene.objects)
+        empty_material_slots = export_material_slot_issues(export_objects)
         vertex_payload_contracts = [
             pack_speedtree_vertex_payload(obj, mirror_to_nanite_uv=True)
             for obj in export_meshes
@@ -600,6 +627,11 @@ def main():
             rpc_timeout = 0
 
         scene_props = bpy.context.scene.send2ue
+        folder_before_sync = scene_props.unreal_mesh_folder_path
+        # A saved template or an earlier output layout can leave this value on
+        # the FBX staging folder.  Re-derive it from the actual .blend location
+        # immediately before Send2UE builds the manifest.
+        utilities.sync_unreal_mesh_folder_path()
         if hasattr(scene_props, "skip_animation_export"):
             scene_props.skip_animation_export = True
 
@@ -607,6 +639,8 @@ def main():
         folder = scene_props.unreal_mesh_folder_path
         report["unit_name"] = unit_name
         report["unreal_folder"] = folder
+        report["unreal_folder_before_sync"] = folder_before_sync
+        report["unreal_folder_synced"] = folder != folder_before_sync
         report["transport"] = args.transport
 
         export_root = Path(args.export_root).resolve()
@@ -639,7 +673,7 @@ def main():
         cluster_assembly = None
         material_asset_scope = None
         if cluster_manifest is not None:
-            material_asset_scope = scope_material_pipeline_to_codex_tests(
+            material_asset_scope = scope_material_pipeline_for_destination(
                 manifest_assets,
                 folder,
                 export_root,
@@ -814,6 +848,11 @@ def main():
             runner_path = str(Path(args.unreal_ingest).resolve())
             runner_load_lines = [
                 "import importlib.util, sys",
+                # Unreal keeps embedded-Python modules alive across RPC jobs.
+                # Purge the Assembly contract module before loading the runner
+                # so a newly normalized public path/name cannot be validated by
+                # stale code from an earlier Push in the same Editor session.
+                "sys.modules.pop('cluster_assembly_builder', None)",
                 f"_runner_path = {runner_path!r}",
                 "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
                 "if _spec is None or _spec.loader is None:",

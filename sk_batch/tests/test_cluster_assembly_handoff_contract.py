@@ -15,6 +15,7 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
 
 from cluster_assembly_handoff_contract import (  # noqa: E402
     assembly_source_fbx_from_contract,
+    assembly_source_fbx_resolution,
     build_assembly_handoff,
     build_blender_fbx_inventory,
     classify_inventory_role,
@@ -75,7 +76,14 @@ def role_object(source_fbx, *, material="M_branch_elm_01", used=True, name="Tree
 
 
 def write_receipt(
-    path, spm, fbx, roles, *, fingerprint=None, assembly_spm=None
+    path,
+    spm,
+    fbx,
+    roles,
+    *,
+    fingerprint=None,
+    assembly_spm=None,
+    normalized_by_role=None,
 ):
     fingerprint = dict(fingerprint or file_fingerprint(fbx))
     assembly_spm = Path(assembly_spm or spm)
@@ -86,6 +94,9 @@ def write_receipt(
             "name": identity,
             "decision": decision,
             "spm": str(spm),
+            "normalized_variants": (
+                (normalized_by_role or {}).get(role)
+            ),
             "targets": [{
                 "spm": str(assembly_spm),
                 "export_bundle": {"fbx": fingerprint},
@@ -162,6 +173,11 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             normalize_export_name("Material::M_branch_elm_01_Mat"),
             "branch_elm_01",
         )
+
+    def test_leaf_side_is_an_independent_role(self):
+        from cluster_assembly_handoff_contract import dependency_role
+
+        self.assertEqual(dependency_role("SK_leaf_elm_side_01"), "leaf_side")
 
     def test_actual_polygon_assignment_is_complete_and_componentized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +279,39 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
         )
 
+    def test_pending_missing_assembly_fbx_is_recorded_legacy_pass_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            full_spm = root / "SK_Tree_elm_02.spm"
+            source_spm = root / "Tree_elm_02.spm"
+            missing_fbx = root / "fbx" / "Tree_elm_02.fbx"
+            receipt = root / "pcg_receipt.json"
+            full_spm.write_bytes(b"full")
+            source_spm.write_bytes(b"source")
+            write_receipt(
+                receipt,
+                full_spm,
+                missing_fbx,
+                [
+                    ("branch", "branch_elm_01", "pending_export"),
+                    ("leaf", "leaf_elm_01", "pending_export"),
+                ],
+                assembly_spm=source_spm,
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            contract = payload["items"][0]["cluster_assembly"]
+
+            resolution = assembly_source_fbx_resolution(contract, full_spm)
+
+            self.assertEqual(resolution["status"], "legacy_pass_through")
+            self.assertEqual(
+                resolution["reason"], "assembly_source_fbx_pending_export"
+            )
+            self.assertEqual(Path(resolution["source_fbx"]), missing_fbx)
+            self.assertIsNone(
+                assembly_source_fbx_from_contract(contract, full_spm)
+            )
+
     def test_declared_but_unused_material_is_blocked_partial(self):
         with tempfile.TemporaryDirectory() as tmp:
             fbx = Path(tmp) / "tree.fbx"
@@ -322,6 +371,19 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                     ("branch", "branch_elm_01", "pending_export"),
                     ("leaf", "leaf_elm_01", "pass_through"),
                 ],
+                normalized_by_role={
+                    "branch": {
+                        "status": "ready",
+                        "material": "M_branch_elm_01",
+                        "variants": [{
+                            "ordinal": 1,
+                            "plan_name": "branch_elm_01_01",
+                            "skeletal_asset_name": "SK_branch_elm_01_01",
+                            "source_prototype_index": 1,
+                            "source_partition_mode": "PER_DEFORM_ROOT",
+                        }],
+                    }
+                },
             )
             inventory = build_blender_fbx_inventory(
                 [role_object(fbx)],
@@ -336,8 +398,48 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 [row["role"] for row in handoff["assembly"]["part_builder_inputs"]],
                 ["branch"],
             )
+            self.assertEqual(
+                handoff["assembly"]["part_builder_inputs"][0]["role_identity"],
+                "M_branch_elm_01",
+            )
+            self.assertEqual(
+                handoff["assembly"]["part_builder_inputs"][0][
+                    "normalized_variants"
+                ]["variants"][0]["source_prototype_index"],
+                1,
+            )
+            self.assertEqual(
+                handoff["assembly"]["part_builder_inputs"][0][
+                    "normalized_variants"
+                ]["variants"][0]["skeletal_asset_name"],
+                "SK_branch_elm_01_01",
+            )
             self.assertFalse(
                 handoff["skeleton_wind_contract"]["production_310_bone_hard_gate"]
+            )
+
+    def test_actionable_role_without_normalized_variants_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+            self.assertEqual(handoff["status"], "blocked")
+            self.assertIn(
+                "normalized_variants_required",
+                [row.get("reason") for row in handoff["issues"]],
             )
 
     def test_receipt_pass_through_disagreeing_with_real_pair_is_blocked(self):

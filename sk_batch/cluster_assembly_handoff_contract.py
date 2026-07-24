@@ -16,13 +16,17 @@ import hashlib
 import json
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 
 
 SCHEMA_VERSION = 1
 CONTRACT_KIND = "pcg_cluster_blender_assembly_handoff"
-ROLE_ORDER = ("branch", "leaf")
-ROLE_PREFIX_RE = re.compile(r"^(branch|leaf)(?:_|$)", re.IGNORECASE)
+ROLE_ORDER = ("branch", "leaf", "leaf_side")
+ROLE_PREFIX_RE = re.compile(
+    r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|leaf)(?:_|$)",
+    re.IGNORECASE,
+)
 
 
 def normalize_export_name(value):
@@ -35,12 +39,17 @@ def normalize_export_name(value):
         name = name[:-4]
     if name.casefold().startswith("m_"):
         name = name[2:]
+    if name.casefold().startswith("sk_"):
+        name = name[3:]
     return name.strip().casefold()
 
 
 def dependency_role(value):
     match = ROLE_PREFIX_RE.match(normalize_export_name(value))
-    return match.group(1).casefold() if match else None
+    if not match:
+        return None
+    token = match.group(1).casefold()
+    return "leaf_side" if token.startswith("leaf") and token != "leaf" else token
 
 
 def _normalized_path(value):
@@ -345,7 +354,12 @@ def load_cluster_contract(receipt_path, spm_path):
     return payload, select_cluster_contract(payload, spm_path)
 
 
-def resolve_cluster_receipt_path(spm_path, embedded_contract_path=None):
+def resolve_cluster_receipt_path(
+    spm_path,
+    embedded_contract_path=None,
+    *,
+    include_resolution=False,
+):
     """Resolve the additive PCG receipt without adding a new batch argument.
 
     PCG persists the Cluster contract independently from the existing SK
@@ -354,25 +368,57 @@ def resolve_cluster_receipt_path(spm_path, embedded_contract_path=None):
     A stale or ambiguous persisted receipt is intentionally not swallowed.
     """
     from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+        cluster_assembly_receipt_resolution,
         locate_cluster_assembly_receipt,
     )
 
     try:
+        if include_resolution:
+            resolution = cluster_assembly_receipt_resolution(spm_path)
+            return Path(resolution["selected_receipt"]).resolve(), resolution
         return Path(locate_cluster_assembly_receipt(spm_path)).resolve()
     except FileNotFoundError:
         pass
 
     if not embedded_contract_path:
+        if include_resolution:
+            return None, {
+                "policy": "no_cluster_assembly_receipt",
+                "requested_spm": str(spm_path),
+                "selected_receipt": None,
+            }
         return None
     embedded = Path(embedded_contract_path)
     if not embedded.is_file():
+        if include_resolution:
+            return None, {
+                "policy": "no_cluster_assembly_receipt",
+                "requested_spm": str(spm_path),
+                "selected_receipt": None,
+            }
         return None
     try:
         payload = json.loads(embedded.read_text(encoding="utf-8"))
         select_cluster_contract(payload, spm_path)
     except (OSError, json.JSONDecodeError, ValueError):
+        if include_resolution:
+            return None, {
+                "policy": "no_cluster_assembly_receipt",
+                "requested_spm": str(spm_path),
+                "selected_receipt": None,
+            }
         return None
-    return embedded.resolve()
+    resolved = embedded.resolve()
+    if include_resolution:
+        return resolved, {
+            "policy": "embedded_material_contract_fallback",
+            "requested_spm": str(spm_path),
+            "selected_receipt": str(resolved),
+            "current_candidates": [{"path": str(resolved)}],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
+        }
+    return resolved
 
 
 def _role_receipt_rows(contract):
@@ -396,11 +442,55 @@ def _contract_species(contract):
 
 
 def _role_identity(role, receipt_row, contract=None):
+    normalized = (receipt_row or {}).get("normalized_variants") or {}
+    material_identity = str(normalized.get("material") or "").strip()
+    if material_identity:
+        return material_identity
     identity = str((receipt_row or {}).get("name") or "")
     if dependency_role(identity) == role:
         return identity
     species = _contract_species(contract or {}) or "asset"
+    if role == "leaf_side":
+        return f"leaf_{species}_side_01"
     return f"{role}_{species}_01"
+
+
+def _normalized_variants_ready(value):
+    if not isinstance(value, dict) or value.get("status") != "ready":
+        return False
+    variants = list(value.get("variants") or [])
+    if not variants:
+        return False
+    try:
+        ordinals = [int(row.get("ordinal") or 0) for row in variants]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if ordinals != list(range(1, len(variants) + 1)):
+        return False
+    for variant in variants:
+        mode = str(variant.get("source_partition_mode") or "")
+        composite_parts = variant.get("composite_parts") or []
+        if mode == "COMPOSITE_PER_DEFORM_ROOT":
+            if not isinstance(composite_parts, list) or not composite_parts:
+                return False
+            try:
+                subparts = [
+                    int(row.get("subpart_index") or 0)
+                    for row in composite_parts
+                ]
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if subparts != list(range(1, len(composite_parts) + 1)):
+                return False
+            if any(
+                not str(row.get("skeletal_asset_name") or "")
+                .casefold().startswith("sk_")
+                for row in composite_parts
+            ):
+                return False
+        elif composite_parts:
+            return False
+    return True
 
 
 def role_identities_from_contract(contract):
@@ -451,31 +541,90 @@ def _authoritative_spm_for_requested(contract, spm_path):
     return Path(spm_path)
 
 
-def assembly_source_fbx_from_contract(contract, full_spm_path):
-    """Return the one authoritative Assembly-source FBX named by the receipt.
+def assembly_source_fbx_resolution(contract, full_spm_path):
+    """Resolve the Assembly FBX or an explicit legacy pass-through decision.
 
     The Full SK SPM identifies the batch item, but its derived ``SK_*.fbx`` is
     not the role-pair evidence.  PCG records the general-tree source target in
     every role row; branch and leaf must agree on that exact FBX.
+
+    A persisted ``pending_export`` target whose receipt and disk both say the
+    source FBX does not exist is incomplete optional Assembly evidence, not a
+    broken Full SK input.  Preserve the Full SK repair and report that legacy
+    pass-through instead of asking Blender to import a known-missing file.
     """
     paths = {}
     role_rows = _role_receipt_rows(contract)
     if not role_rows:
-        return None
+        return {
+            "status": "not_applicable",
+            "reason": "no_cluster_assembly_roles",
+            "source_fbx": None,
+            "roles": [],
+        }
     authoritative_spm = _authoritative_spm_for_requested(
         contract, full_spm_path
     )
-    for receipt_row in role_rows.values():
+    targets = []
+    for role, receipt_row in role_rows.items():
         target = _target_for_spm(receipt_row, authoritative_spm)
         expected = ((target or {}).get("export_bundle") or {}).get("fbx") or {}
         path = expected.get("path")
+        target_gate = (target or {}).get("fbx_material_mesh_pair") or {}
+        decision = str(
+            target_gate.get("decision")
+            or (target or {}).get("decision")
+            or receipt_row.get("decision")
+            or ""
+        )
+        actual_exists = bool(path and Path(path).is_file())
+        targets.append({
+            "role": role,
+            "decision": decision,
+            "expected_fbx": expected,
+            "actual_exists": actual_exists,
+        })
         if path:
             paths[_normalized_path(path)] = str(path)
+
+    pending_missing = [
+        row for row in targets
+        if row["decision"] == "pending_export"
+        and row["expected_fbx"].get("exists") is False
+        and not row["actual_exists"]
+    ]
+    if targets and len(pending_missing) == len(targets):
+        pending_paths = sorted({
+            str(row["expected_fbx"].get("path") or "")
+            for row in pending_missing
+            if row["expected_fbx"].get("path")
+        })
+        return {
+            "status": "legacy_pass_through",
+            "reason": "assembly_source_fbx_pending_export",
+            "source_fbx": pending_paths[0] if len(pending_paths) == 1 else None,
+            "roles": targets,
+        }
     if not paths:
         raise ValueError("PCG receipt contains no Assembly source FBX")
     if len(paths) != 1:
         raise ValueError("PCG branch/leaf receipts disagree on Assembly source FBX")
-    return Path(next(iter(paths.values())))
+    source_fbx = Path(next(iter(paths.values())))
+    return {
+        "status": "ready",
+        "reason": "hash_validated_cluster_assembly_source",
+        "source_fbx": str(source_fbx),
+        "roles": targets,
+    }
+
+
+def assembly_source_fbx_from_contract(contract, full_spm_path):
+    """Return the ready Assembly FBX, or None for a recorded pass-through."""
+    resolution = assembly_source_fbx_resolution(contract, full_spm_path)
+    source_fbx = resolution.get("source_fbx")
+    if resolution.get("status") != "ready" or not source_fbx:
+        return None
+    return Path(source_fbx)
 
 
 def _compare_artifact(expected, actual, *, allow_pending=False):
@@ -570,7 +719,20 @@ def _dependency_artifact_validation(contract, spm_path):
         or []
     )
     for dependency in dependencies:
-        expected_rows.append(("cluster_spm", dependency.get("spm_fingerprint") or {}))
+        pair_rows = [
+            ("cluster_authoring_spm", dependency.get("authoring_spm_fingerprint")),
+            ("cluster_output_spm", dependency.get("output_spm_fingerprint")),
+        ]
+        if any(expected for _artifact, expected in pair_rows):
+            expected_rows.extend(
+                (artifact, expected)
+                for artifact, expected in pair_rows
+                if isinstance(expected, dict) and expected.get("exists")
+            )
+        else:
+            expected_rows.append(
+                ("cluster_spm", dependency.get("spm_fingerprint") or {})
+            )
         for texture in dependency.get("texture_dependencies") or []:
             expected_rows.append(("cluster_texture", texture))
 
@@ -642,7 +804,19 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 str(receipt_row.get("decision") or "") if receipt_row else "absent"
             ),
             "reconciliation": evidence,
+            "normalized_variants": (
+                deepcopy(receipt_row.get("normalized_variants"))
+                if receipt_row and receipt_row.get("normalized_variants")
+                else None
+            ),
         }
+        if decision == "normalize_part" and not _normalized_variants_ready(
+            row.get("normalized_variants")
+        ):
+            row["decision"] = "blocked"
+            row["reconciliation"] = "normalized_variants_required"
+            decision = "blocked"
+            evidence = "normalized_variants_required"
         roles.append(row)
         if decision == "blocked":
             issues.append({
@@ -708,6 +882,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                     "role": row["role"],
                     "role_identity": row["role_identity"],
                     "assignments": row["assignments"],
+                    "normalized_variants": row.get("normalized_variants"),
                 }
                 for row in normalize_roles
             ],

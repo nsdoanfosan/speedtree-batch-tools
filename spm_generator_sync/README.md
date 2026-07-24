@@ -125,6 +125,39 @@ Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==`
 - 수종 관계: 각 나무 폴더의 `spm_generator_sync.json`
 - PC별 경로와 마지막 루트: `spm_generator_sync_config.json` (Git 제외)
 
+## Cluster Normalizer 관계 ON/OFF
+
+식생 폴더 직하의 `Cluster` 폴더는 일반 MASTER/FOLLOWER 계보로 취급하지 않고,
+부모 식생 행 아래에 별도 하위 항목으로 표시한다.
+
+- `Cluster/SK_branch_elm_01.spm` 같은 `SK_` SPM이 canonical 3D 원본이다.
+  무접두사 SPM은 legacy pair 증거일 뿐이며 production 촬영 입력으로 사용하지 않는다.
+- Color/Opacity, capture frame, plan 외곽과 UV는 같은 Blender
+  `PHYSICAL_DIRECT_CAPTURE`에서 만들며 SpeedTree camera UV는 참조하지 않는다.
+- 같은 stem의 정규화 결과는 `Cluster/SK_branch_elm_01.blend` 하나다. 별도
+  무접두사 blend를 만들지 않는다.
+- 각 정규화 blend에는 Base 매핑이나 SK별 자식 행 없이 폴더 단위 관계 한 개만
+  `ON`/`OFF`로 표시한다. 기존 데이터가 일부 SK에만 연결되어 있으면 `PARTIAL`로
+  감사되며 다음 ON/OFF 적용으로 한 상태로 정규화한다.
+- 관계 `ON`은 blend 옆 `<blend stem>.atlas_leaf_targets.json`에 기록된다.
+  적용 시 부모 식생 폴더 직하의 모든 `SK_*.spm`을 한 번에 등록하고 Blender 5.1에서
+  Atlas Leaf Mesh Builder를 호출하여 기존 `M_*` Material_v8의 embedded mesh를
+  제거한 뒤 Cluster Normalizer가 만든 plan mesh로 교체한다. Material 이름과 ID는
+  그대로 채택한다. sibling SPM을 새로 ON에 포함할 때는 같은 이름의 기존 source
+  Material을 각 SPM의 로컬 ID로 adoption 매핑하여 교체한다. 동일 blend의 기존
+  adoption 영수증은 재사용하지만 다른 Atlas scope 소유 재료는 계속 차단한다.
+- `Cluster/SK_*.spm`의 SHA-256 또는 Blender physical-capture contract가 마지막
+  대상 scope manifest와 달라지면 `Cluster 원본 변경 · 갱신 필요`로 표시한다.
+  3D mesh 재생성은 SK Batch가 담당하고, 이 도구의 `Cluster 갱신`은 현재
+  normalized blend/plan/texture를 현재 ON으로 연결된 부모 `SK_*.spm`에 다시
+  적용한다. `PARTIAL` 상태에서도 OFF 대상을 새로 연결하지 않고 기존 ON 대상만
+  갱신한다.
+- 관계 `OFF`는 그 blend가 관리한 Generator 슬롯·Material/Mesh만 manifest의 원본
+  스냅샷으로 폴더의 모든 SK에서 복원하고 JSON 목록에서 모두 해제한다. 실제 SPM
+  파일은 삭제하지 않는다.
+- PCG ST9 Texture 보드는 같은 JSON을 읽어 관계를 표시하지만, 실제 ON/OFF 적용은
+  이 도구가 단독으로 담당한다.
+
 ## SK Batch 연동 준비
 
 엔진은 패키지 진입점을 제공하므로, 안정화 후 기존 SK Batch의 `0. Generator Sync` 단계에서
