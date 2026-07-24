@@ -67,7 +67,9 @@ from sk_common import (
     scan_sk_spms,
     set_manual_bones_marker,
     push_source_snapshot,
+    prepare_cluster_spm_pair_for_job,
     summarize_job_failure,
+    speedtree_output_spm_for,
     terminate_process_tree,
     wind_preset_for_spm,
 )
@@ -91,6 +93,7 @@ WIND_OPTIONS = (
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
+REPAIR_RUNTIME_RECEIPT_VERSION = 1
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 
 
@@ -99,16 +102,12 @@ def is_cluster_source_spm(spm):
     return (
         path.suffix.casefold() == ".spm"
         and path.parent.name.casefold() == "cluster"
-        and not path.name.casefold().startswith("sk_")
     )
 
 
 def should_calibrate_spm(item):
-    """Cluster authoring SPMs are Blender inputs, never calibration targets."""
-    return not (
-        item.get("source_read_only")
-        or is_cluster_source_spm(item.get("spm", ""))
-    )
+    """Canonical Cluster authoring SPMs use the ordinary calibration phase."""
+    return not item.get("source_read_only")
 
 
 def sk_batch_folder_chain(root, spm):
@@ -748,7 +747,15 @@ class App:
     def _collect_scan_result(cls, root, snapshot_caches):
         spms = scan_sk_spms(root)
         cluster_sources = scan_cluster_spm_sources(root)
-        all_spms = spms + [row["source_spm"] for row in cluster_sources]
+        all_spms = list(spms)
+        snapshot_aliases = {}
+        for row in cluster_sources:
+            canonical = row["authoring_spm"]
+            snapshot_source = (
+                canonical if canonical.is_file() else row["output_spm"]
+            )
+            all_spms.append(snapshot_source)
+            snapshot_aliases[str(snapshot_source)] = str(canonical)
         snapshots = {}
         errors = []
         cache_hits = 0
@@ -756,15 +763,16 @@ class App:
             tasks = [
                 (spm, snapshot_caches.get(str(spm))) for spm in all_spms
             ]
-            with ThreadPoolExecutor(max_workers=min(8, len(spms))) as pool:
+            with ThreadPoolExecutor(max_workers=min(8, len(all_spms))) as pool:
                 for iid, snapshot, error, cache_hit in pool.map(
                     cls._snapshot_spm, tasks
                 ):
+                    result_iid = snapshot_aliases.get(iid, iid)
                     if snapshot:
-                        snapshots[iid] = snapshot
+                        snapshots[result_iid] = snapshot
                         cache_hits += int(cache_hit)
                     elif error:
-                        errors.append((iid, error))
+                        errors.append((result_iid, error))
         return {
             "spms": spms,
             "cluster_sources": cluster_sources,
@@ -913,11 +921,11 @@ class App:
             self._table_full_values.clear()
         cluster_sources = prepared.get("cluster_sources") or []
         cluster_by_source = {
-            _normalized_path(row["source_spm"]): row
+            _normalized_path(row["authoring_spm"]): row
             for row in cluster_sources
         }
         spms = list(prepared["spms"]) + [
-            row["source_spm"] for row in cluster_sources
+            row["authoring_spm"] for row in cluster_sources
         ]
         snapshots = prepared["snapshots"]
 
@@ -957,7 +965,7 @@ class App:
         for spm in spms:
             iid = str(spm)
             cluster_source = cluster_by_source.get(_normalized_path(spm))
-            source_read_only = cluster_source is not None
+            source_read_only = False
             entry = self.state.setdefault(iid, {})
             # The file system is the source of truth.  A saved "완료" label may
             # have become stale after the SPM was edited since the last run.
@@ -965,10 +973,9 @@ class App:
             if snapshots.get(iid):
                 entry["spm_snapshot_cache"] = snapshots[iid]
                 calibration_cache = entry.get("calibration_cache")
-                if not source_read_only:
-                    self._migrate_restored_marker_calibration_cache(
-                        spm, calibration_cache, snapshots[iid]
-                    )
+                self._migrate_restored_marker_calibration_cache(
+                    spm, calibration_cache, snapshots[iid]
+                )
                 if (
                     isinstance(calibration_cache, dict)
                     and calibration_cache.get("settings_signature")
@@ -992,10 +999,7 @@ class App:
             if wind_override not in {value for _label, value in WIND_OPTIONS}:
                 wind_override = "auto"
                 entry["wind_override"] = "auto"
-            manual_bones_locked = (
-                False if source_read_only
-                else is_manual_bones_locked(spm, entry)
-            )
+            manual_bones_locked = is_manual_bones_locked(spm, entry)
             if manual_bones_locked:
                 entry["manual_bones_locked"] = True
                 self.state[iid] = entry
@@ -1009,9 +1013,20 @@ class App:
                 "spm": spm,
                 "display_name": (
                     cluster_source["display_name"]
-                    if source_read_only else spm.name
+                    if cluster_source else spm.name
                 ),
-                "cluster_source_spm": spm if source_read_only else None,
+                "cluster_source_spm": (
+                    cluster_source["output_spm"] if cluster_source else None
+                ),
+                "authoring_spm": (
+                    cluster_source["authoring_spm"] if cluster_source else spm
+                ),
+                "output_spm": (
+                    cluster_source["output_spm"] if cluster_source else spm
+                ),
+                "cluster_pair_status": (
+                    cluster_source["pair_status"] if cluster_source else None
+                ),
                 "source_read_only": source_read_only,
                 "blend_path": blend_path_for(spm),
                 "checked": True,
@@ -1023,18 +1038,18 @@ class App:
                 "live_status_signature": None,
             }
             spm_status = (
-                "건너뜀 · Cluster source read-only"
-                if source_read_only
+                f"Output 규격 · {cluster_source['pair_status']}"
+                if cluster_source
                 else manual_bone_status_text(spm)
                 if manual_bones_locked
                 else entry.get("spm_status", "-")
             )
             blend_status = entry.get("blend_status", "-")
             push_status = self._current_push_status_text(iid, spm)
-            owner = spm.parent.parent if source_read_only else spm.parent
+            owner = spm.parent.parent if cluster_source else spm.parent
             owner_iid = ensure_folder_row(owner)
             parent_iid = owner_iid
-            if source_read_only:
+            if cluster_source:
                 parent_iid = ensure_folder_row(spm.parent, owner_iid)
             self.tree.insert(
                 parent_iid, "end", iid=iid,
@@ -1106,12 +1121,13 @@ class App:
     def _live_status_signature(spm, texture_paths=()):
         """Cheap cross-tool change detector for PCG -> SK handoff files."""
         spm = Path(spm)
+        speedtree_spm = speedtree_output_spm_for(spm)
         blend = blend_path_for(spm)
         report = (
             spm.parent / "reports" /
             f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
         )
-        stmat = speedtree_stmat_path(spm)
+        stmat = speedtree_stmat_path(speedtree_spm)
 
         def stat_key(path):
             try:
@@ -1125,7 +1141,8 @@ class App:
             for path in texture_paths
         )
         return (
-            stat_key(spm), stat_key(blend), stat_key(report), stat_key(stmat),
+            stat_key(spm), stat_key(speedtree_spm), stat_key(blend),
+            stat_key(report), stat_key(stmat),
             texture_stats,
         )
 
@@ -1213,11 +1230,6 @@ class App:
         mark = CHECK_ON if item["checked"] else CHECK_OFF
         lock = "🔒 " if item.get("manual_bones_locked", False) else ""
         name = item.get("display_name") or item["spm"].name
-        if item.get("source_read_only"):
-            return (
-                f"{mark} {name} · Blend → {blend_path_for(item['spm']).name} "
-                "· source read-only"
-            )
         return f"{mark} {lock}{name}"
 
     def _redraw_checked_row(self, iid, _item):
@@ -1275,6 +1287,13 @@ class App:
 
     def _on_click(self, event):
         if self.worker and self.worker.is_alive():
+            # Freeze checked execution targets and dropdown values, but keep
+            # read-only row selection available for details and path copying.
+            iid = self.tree.identify_row(event.y)
+            if iid in self.row_copy_paths:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.focus_set()
             return "break"
         self._close_cell_editor()
         region = self.tree.identify_region(event.x, event.y)
@@ -1860,19 +1879,162 @@ class App:
             envelope = report.get("speedtree_pipeline_contract")
             if not isinstance(envelope, dict):
                 return False
-            validate_preflight_envelope(envelope, spm, require_ok=True)
+            validate_preflight_envelope(
+                envelope, speedtree_output_spm_for(spm), require_ok=True
+            )
             return True
         except (OSError, ValueError, RuntimeError):
             return False
 
+    def _repair_runtime_addon_dir(self):
+        """Installed BWR addon folder, derived identically for read and write."""
+        cfg = getattr(self, "cfg", {}) or {}
+        fbx_ini_value = cfg.get("fbx_ini", "")
+        if not fbx_ini_value:
+            return None
+        try:
+            return Path(fbx_ini_value).resolve().parents[2]
+        except (IndexError, OSError):
+            return None
+
+    @staticmethod
+    def _repair_runtime_code_state(addon_dir):
+        """Content hash per addon module, so a checkout cannot fake staleness."""
+        modules = sorted(Path(addon_dir).glob("*.py"))
+        if not modules:
+            return None
+        return {
+            module.name: hashlib.sha256(module.read_bytes()).hexdigest()
+            for module in modules
+        }
+
+    @staticmethod
+    def _repair_runtime_receipt_path(spm):
+        return (
+            Path(spm).parent / "reports" /
+            f"{Path(spm).stem}_repair_runtime_codex.json"
+        )
+
+    def _write_repair_runtime_receipt(self, spm):
+        """Record which BWR code produced this completed Repair result.
+
+        A run that finds nothing to change legitimately saves no .blend, so the
+        blend timestamp cannot stand in for code freshness: it pins the check
+        forever and keeps demanding a rerun that can never satisfy it.  The
+        receipt states what the run actually verified instead.
+        """
+        addon_dir = self._repair_runtime_addon_dir()
+        if addon_dir is None:
+            return
+        try:
+            state = self._repair_runtime_code_state(addon_dir)
+        except OSError as exc:
+            self.log(f"  [② 경고] Repair 런타임 지문 계산 실패: {spm.name}: {exc}")
+            return
+        if not state:
+            return
+        path = self._repair_runtime_receipt_path(spm)
+        payload = {
+            "kind": "sk_repair_runtime",
+            "version": REPAIR_RUNTIME_RECEIPT_VERSION,
+            "addon_dir": str(addon_dir),
+            "code": state,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(
+                path,
+                json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+        except OSError as exc:
+            self.log(f"  [② 경고] Repair 런타임 기록 실패: {spm.name}: {exc}")
+
+    def _repair_runtime_fresh(self, spm):
+        """Require the saved Repair result to come from the installed BWR code.
+
+        The SPM/content receipt alone cannot detect a pipeline-only fix.  In
+        that case an old report may still say ``handoff_preflight: ok`` even
+        though the saved .blend predates the cleanup code that now defines the
+        Export contract.
+
+        The runtime receipt written by a completed ② run is authoritative.
+        Results produced before receipts existed fall back to comparing output
+        timestamps, which is why a receipt-less result whose Repair changed
+        nothing has to be rerun once to record one.
+        """
+        blend = blend_path_for(spm)
+        report_path = (
+            Path(spm).parent / "reports" /
+            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+        )
+        if not blend.is_file() or not report_path.is_file():
+            # Missing/stale source outputs are explained by the ordinary
+            # handoff checks; runtime freshness applies only to a completed
+            # Repair result that would otherwise be skipped as current.
+            return True, ""
+        addon_dir = self._repair_runtime_addon_dir()
+        if addon_dir is None:
+            return True, ""
+        try:
+            current = self._repair_runtime_code_state(addon_dir)
+        except OSError as exc:
+            return False, f"Blender Repair 런타임 확인 실패: {exc}"
+        if not current:
+            return True, ""
+
+        receipt_path = self._repair_runtime_receipt_path(spm)
+        saved = None
+        if receipt_path.is_file():
+            try:
+                candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict) and isinstance(candidate.get("code"), dict):
+                saved = candidate["code"]
+        if saved is not None:
+            if saved == current:
+                return True, ""
+            changed = sorted(
+                name for name in set(saved) | set(current)
+                if saved.get(name) != current.get(name)
+            )
+            return False, (
+                "Blender Repair 코드가 저장 결과보다 최신임 → "
+                "② Blender Repair 다시 실행 (" + ", ".join(changed) + ")"
+            )
+
+        try:
+            output_time = min(
+                blend.stat().st_mtime_ns,
+                report_path.stat().st_mtime_ns,
+            )
+            newer = [
+                path.name
+                for path in sorted(addon_dir.glob("*.py"))
+                if path.stat().st_mtime_ns > output_time
+            ]
+        except OSError as exc:
+            return False, f"Blender Repair 런타임 확인 실패: {exc}"
+        if newer:
+            return False, (
+                "Blender Repair 코드가 저장 결과보다 최신임 → "
+                "② Blender Repair 다시 실행 (" + ", ".join(newer) + ")"
+            )
+        return True, ""
+
     def _handoff_ready(self, spm):
         """핸드오프 산출물(push에 필요한 것들)이 준비됐는지 → (ok, 설명)."""
-        leaf_ok, leaf_reason = self._leaf_reference_ready(spm)
+        leaf_ok, leaf_reason = self._leaf_reference_ready(
+            speedtree_output_spm_for(spm)
+        )
         if not leaf_ok:
             return False, leaf_reason
         blend = blend_path_for(spm)
         if not blend.exists():
             return False, "생성 필요 — blend 없음 → ② Blender Repair"
+        runtime_fresh, runtime_reason = self._repair_runtime_fresh(spm)
+        if not runtime_fresh:
+            return False, runtime_reason
         receipt_current = self._repair_contract_current(spm)
         if blend.stat().st_mtime < spm.stat().st_mtime and not receipt_current:
             return False, "Blender 갱신 필요 — SPM이 더 최근에 수정됨 → ② Blender Repair"
@@ -1898,9 +2060,10 @@ class App:
 
     @staticmethod
     def _material_export_ready(spm, content_receipt_current=False):
-        contract = inspect_spm_leaf_contract(spm)
-        exported = inspect_speedtree_material_export(spm, contract)
-        all_exported = inspect_all_speedtree_material_export(spm)
+        speedtree_spm = speedtree_output_spm_for(spm)
+        contract = inspect_spm_leaf_contract(speedtree_spm)
+        exported = inspect_speedtree_material_export(speedtree_spm, contract)
+        all_exported = inspect_all_speedtree_material_export(speedtree_spm)
         if all_exported.get("status") not in {"ok", "not_applicable"}:
             exported = all_exported
         status = exported.get("status")
@@ -2060,6 +2223,14 @@ class App:
         if not leaf_ok:
             return leaf_reason
         blend = blend_path_for(spm)
+        try:
+            if not blend.is_file():
+                return "생성 필요 — blend 없음 · ② Blender Repair 실행"
+        except OSError as exc:
+            return f"확인 실패 — {exc}"
+        runtime_fresh, runtime_reason = self._repair_runtime_fresh(spm)
+        if not runtime_fresh:
+            return runtime_reason
         receipt_current = self._repair_contract_current(spm)
         if receipt_current:
             report_path = (
@@ -2074,8 +2245,6 @@ class App:
                     == "source_review":
                 return "Blend 완료 · 원본 검토 필요 · Unreal Push 차단"
         try:
-            if not blend.is_file():
-                return "생성 필요 — blend 없음 · ② Blender Repair 실행"
             if (
                 blend.stat().st_mtime_ns < Path(spm).stat().st_mtime_ns
                 and not receipt_current
@@ -2107,13 +2276,38 @@ class App:
         return text
 
     def _job_check(self, iid, spm):
-        from spm_audit import audit_spm, sk_readiness
+        from spm_audit import audit_spm, inspect_interrupted_calibration, sk_readiness
+
+        interrupted = inspect_interrupted_calibration(spm)
+        if interrupted["status"] not in {"clean", "interrupted_but_intact"}:
+            # ① restores automatically on its next run; say so instead of
+            # reporting bone numbers read out of a half-rewritten source.
+            recoverable = (
+                "① 실행 시 자동 복원"
+                if interrupted.get("backup_available")
+                else "백업 없음 · 수동 확인 필요"
+            )
+            text = f"⚠ 중단된 캘리브레이션 흔적 · {recoverable}"
+            self.ui_queue.put(("cell", (iid, "spm_status", text)))
+            self.log(
+                f"  [① 중단 흔적] {Path(spm).name}: {interrupted['marker']} "
+                f"({recoverable})"
+            )
+            self._record_live_blend_status(iid, spm, persist=False)
+            return
 
         entry = self.state.get(iid, {})
-        if not should_calibrate_spm(self.items[iid]):
-            text = "건너뜀 · Cluster source read-only · Blender 입력 전용"
+        pair_status = self.items[iid].get("cluster_pair_status")
+        if pair_status == "bootstrap_ready":
+            text = "Cluster canonical 생성 예정 · 첫 작업에서 안전 bootstrap"
             self.ui_queue.put(("cell", (iid, "spm_status", text)))
             self._record_live_blend_status(iid, spm, persist=False)
+            return
+        if pair_status and pair_status not in {
+            "current", "publish_ready", "mirror_missing"
+        }:
+            text = f"오류: Cluster pair {pair_status}"
+            self.ui_queue.put(("cell", (iid, "spm_status", text)))
             return
         manual_bones_locked = self.items[iid].get("manual_bones_locked", False)
         summary = entry.get("spm_summary", "")
@@ -2168,7 +2362,21 @@ class App:
             return "SpeedTree 본 없음 → rigid 1본 폴백"
         return rep.get("status", "?")
 
+    def _prepare_pair_for_job(self, spm):
+        try:
+            result = prepare_cluster_spm_pair_for_job(spm)
+        except Exception as exc:
+            raise BatchItemError(str(exc), kind="data_error") from exc
+        if result.get("status") == "applied":
+            self.log(
+                f"Cluster output 이름 정규화: "
+                f"{Path(result['mirror_spm']).name} → "
+                f"{Path(result['canonical_spm']).name}"
+            )
+        return Path(result.get("canonical_spm") or spm)
+
     def _job_spm(self, iid, spm):
+        spm = self._prepare_pair_for_job(spm)
         entry = self.state.setdefault(iid, {})
         item = self.items[iid]
         if not should_calibrate_spm(item):
@@ -2290,11 +2498,13 @@ class App:
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
 
+        spm = self._prepare_pair_for_job(spm)
+        speedtree_spm = speedtree_output_spm_for(spm)
         blend = blend_path_for(spm)
-        leaf_ok, leaf_reason = self._leaf_reference_ready(spm)
+        leaf_ok, leaf_reason = self._leaf_reference_ready(speedtree_spm)
         if not leaf_ok:
             status = self._record_live_blend_status(iid, spm)
-            contract = inspect_spm_leaf_contract(spm)
+            contract = inspect_spm_leaf_contract(speedtree_spm)
             self.log(f"  [② 조기 차단] {spm.name}: {leaf_reason}")
             raise BatchItemError(
                 leaf_reason,
@@ -2345,7 +2555,8 @@ class App:
         material_cmd = [
             sys.executable,
             str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
-            "--spm", str(spm),
+            "--spm", str(speedtree_spm),
+            "--canonical-spm", str(spm),
             "--speedtree-exe", str(self.cfg["speedtree_exe"]),
             "--fbx-ini", str(fbx_ini),
             "--speedtree-cli", str(speedtree_cli),
@@ -2392,7 +2603,9 @@ class App:
         cmd = [
             self.cfg["blender_exe"], "--factory-startup", "-b",
             "--python", str(TOOL_DIR / "jobs" / "bwr_headless_job.py"), "--",
-            "--spm", str(spm), "--blend", str(blend),
+            "--spm", str(spm),
+            "--speedtree-spm", str(speedtree_spm),
+            "--blend", str(blend),
             "--wind", wind,
             "--material-contract", str(material_report),
             "--report", str(job_report),
@@ -2429,6 +2642,10 @@ class App:
                 log_file=log_file,
                 report_file=job_report,
             )
+        # Written before the handoff check reads it: this run verified the saved
+        # outputs against the code now installed, whether or not it had to
+        # rewrite the .blend.
+        self._write_repair_runtime_receipt(spm)
         handoff_ok, handoff_reason = self._handoff_ready(spm)
         blend_status = self._blend_status_text(spm)
         self.ui_queue.put(("cell", (iid, "blend_status", blend_status)))
@@ -2459,6 +2676,14 @@ class App:
                 f"② 완료 · source review 필요 · Unreal Push 차단: "
                 f"{spm.name} ({handoff_reason})"
             )
+        else:
+            push_status = "준비됨 ✓"
+            self.ui_queue.put(("cell", (iid, "push_status", push_status)))
+            with self.state_lock:
+                entry["push_status"] = push_status
+                entry["push_status_kind"] = "ready"
+                entry.pop("push_status_error", None)
+                save_state(self.state)
         for warning in result.get("warnings", []):
             self.log(f"  [② 경고] {spm.name}: {warning}")
         self.log(f"repair 완료: {blend.name}")
@@ -2574,6 +2799,8 @@ class App:
         return [
             TOOL_DIR / "jobs" / "send2ue_push_job.py",
             TOOL_DIR / "jobs" / "vertex_color_contract.py",
+            TOOL_DIR / "cluster_assembly_builder.py",
+            TOOL_DIR / "cluster_assembly_handoff_contract.py",
             TOOL_DIR / "unreal_ingest.py",
             send2ue_dir / "core" / "export.py",
             send2ue_dir / "core" / "ingest.py",
@@ -2611,7 +2838,9 @@ class App:
                 "SpeedTree Repair handoff preflight is not ready; "
                 "run Blender Repair again"
             )
-        validate_preflight_envelope(envelope, spm, require_ok=True)
+        validate_preflight_envelope(
+            envelope, speedtree_output_spm_for(spm), require_ok=True
+        )
         source_fingerprint = str(envelope.get("source_fingerprint") or "")
         suffix = source_fingerprint[:16] or hashlib.sha256(
             _normalized_path(spm).encode("utf-8")
@@ -2634,6 +2863,9 @@ class App:
         entry = self.state.get(iid, {})
         saved = str(entry.get("push_status") or "")
         kind = str(entry.get("push_status_kind") or "")
+        if kind == "preflight_skip":
+            ready, reason = self._handoff_ready(spm)
+            return "준비됨 ✓" if ready else f"건너뜀: {reason}"
         success_like = kind == "imported_ok" or saved.startswith("완료")
         export_like = kind == "exported_pending_unreal" or saved.startswith(
             "export 완료"
@@ -2707,6 +2939,7 @@ class App:
         return item
 
     def _export_manifest_item(self, iid, spm, batch_stamp):
+        spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
         cached = self._cached_manifest_item(iid, source_fingerprint)
@@ -3168,6 +3401,7 @@ class App:
         return complete and not failed_items
 
     def _job_push(self, iid, spm):
+        spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
         if not getattr(self, "force_rerun", False):

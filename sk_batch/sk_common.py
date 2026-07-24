@@ -17,7 +17,17 @@ REPO_ROOT = TOOL_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from speedtree_pipeline_contract import BACKUP_DIRECTORY_NAMES, is_live_spm
+from speedtree_pipeline_contract import (
+    BACKUP_DIRECTORY_NAMES,
+    is_live_spm,
+    production_spm_folders,
+)
+from cluster_spm_pair_contract import (
+    ClusterSpmPairPathError,
+    bootstrap_cluster_authoring,
+    inspect_cluster_spm_pair,
+    resolve_cluster_spm_pair,
+)
 
 
 def _default_addon_dir():
@@ -707,45 +717,70 @@ def set_manual_bones_marker(spm_path, locked):
 
 
 def scan_sk_spms(root):
-    """All live SK_*.spm while pruning backup trees before descending."""
+    """Non-Cluster SK inputs; Cluster canonical rows come from pair inventory.
+
+    Only ``<owner>/SK_x.spm`` is a shipping identity.  Timestamped safety
+    copies, capture staging and verify candidates all reuse the same SK_ name
+    deeper in the tree, so a recursive walk drowned the real rows; the location
+    contract keeps the list to what can actually be pushed.
+    """
     out = []
-    skip_dirs = set(BACKUP_DIRECTORY_NAMES)
-    root = Path(root)
-    if not root.exists():
-        return out
-    for current, dirs, files in os.walk(root, topdown=True):
-        dirs[:] = [name for name in dirs if name.casefold() not in skip_dirs]
-        for name in files:
+    for folder in production_spm_folders(root):
+        if folder.name.casefold() == "cluster":
+            continue
+        try:
+            names = sorted(path.name for path in folder.iterdir() if path.is_file())
+        except OSError:
+            continue
+        for name in names:
             if not name.lower().startswith("sk_") or not name.lower().endswith(".spm"):
                 continue
-            candidate = Path(current) / name
-            if (
-                candidate.parent.name.casefold() == "cluster"
-                or BACKUP_RE.search(name)
-                or not is_live_spm(candidate)
-            ):
+            candidate = folder / name
+            if BACKUP_RE.search(name) or not is_live_spm(candidate):
                 continue
             out.append(candidate)
     return sorted(out)
 
 
+def _connected_cluster_rows(owner_folder, clusters):
+    """Return PCG's exact final-SPM-to-Cluster texture connections."""
+    from pcg_st9_texture_batch.pcg_texture_audit import cluster_connection_rows
+
+    return cluster_connection_rows(
+        owner_folder,
+        clusters=clusters,
+        connected_only=True,
+    )
+
+
+def _path_key(value):
+    return os.path.normcase(os.path.abspath(str(value))).casefold()
+
+
 def scan_cluster_spm_sources(root):
-    """Inventory exact read-only Cluster inputs and SK-named Blend outputs."""
-    rows = []
-    skip_dirs = set(BACKUP_DIRECTORY_NAMES)
+    """Connected Cluster outputs, normalized to one canonical SK row.
+
+    A legacy unprefixed file remains a discoverable normalization input only
+    while its canonical ``SK_`` output is missing.  Once canonical exists, all
+    downstream identities use it and never publish back to the legacy name.
+    """
+    inventory = {}
     root = Path(root)
     if not root.exists():
-        return rows
-    for current, dirs, files in os.walk(root, topdown=True):
-        dirs[:] = [name for name in dirs if name.casefold() not in skip_dirs]
-        cluster_folder = Path(current)
+        return inventory
+    for cluster_folder in production_spm_folders(root):
         if cluster_folder.name.casefold() != "cluster":
             continue
-        for name in files:
+        try:
+            names = sorted(
+                path.name for path in cluster_folder.iterdir() if path.is_file()
+            )
+        except OSError:
+            continue
+        for name in names:
             lowered = name.casefold()
             if (
                 not lowered.endswith(".spm")
-                or lowered.startswith("sk_")
                 or lowered.startswith("~")
                 or BACKUP_RE.search(name)
             ):
@@ -753,16 +788,101 @@ def scan_cluster_spm_sources(root):
             source = cluster_folder / name
             if not is_live_spm(source):
                 continue
-            rows.append({
-                "kind": "cluster_spm",
-                "source_spm": source,
-                "blend_path": source.with_name(f"SK_{source.stem}.blend"),
-                "cluster_folder": cluster_folder,
-                "owner_folder": cluster_folder.parent,
-                "display_name": source.name,
-                "legacy_sk_spm": source.with_name(f"SK_{source.name}"),
-            })
-    return sorted(rows, key=lambda row: str(row["source_spm"]).casefold())
+            try:
+                pair = resolve_cluster_spm_pair(source)
+            except ClusterSpmPairPathError:
+                continue
+            inventory.setdefault(pair["pair_id"], pair)
+
+    rows = []
+    by_owner = {}
+    for pair in inventory.values():
+        preview = inspect_cluster_spm_pair(pair["canonical_spm"])
+        row = {
+            "kind": "cluster_spm_output",
+            "source_spm": pair["canonical_spm"],
+            "authoring_spm": pair["canonical_spm"],
+            "output_spm": pair["canonical_spm"],
+            "legacy_output_spm": pair["mirror_spm"],
+            "blend_path": pair["canonical_spm"].with_suffix(".blend"),
+            "cluster_folder": pair["canonical_spm"].parent,
+            "owner_folder": pair["canonical_spm"].parent.parent,
+            "display_name": pair["canonical_spm"].name,
+            "pair_status": preview["status"],
+            "pair_action": preview["action"],
+            "pair_generation": preview["generation"],
+            "pair_conflicts": tuple(preview["conflicts"]),
+            "can_bootstrap": bool(preview["can_bootstrap"]),
+            "can_publish": bool(preview["can_publish"]),
+            "pair_receipt": pair["receipt_path"],
+            # Compatibility alias for state written by the former raw-row UI.
+            "legacy_sk_spm": pair["canonical_spm"],
+        }
+        by_owner.setdefault(row["owner_folder"], []).append(row)
+    for owner_folder, owner_rows in by_owner.items():
+        sources = [
+            row["output_spm"]
+            if row["output_spm"].is_file()
+            else row["legacy_output_spm"]
+            for row in owner_rows
+        ]
+        connection_by_source = {
+            _path_key(row.get("source_spm") or row.get("authoring_spm")): row
+            for row in _connected_cluster_rows(owner_folder, sources)
+        }
+        for row in owner_rows:
+            connection = connection_by_source.get(
+                _path_key(row["output_spm"])
+            ) or connection_by_source.get(
+                _path_key(row["legacy_output_spm"])
+            ) or {}
+            connected = tuple(connection.get("cluster_output_textures") or ())
+            if not connected and not row["authoring_spm"].is_file():
+                continue
+            row["connected_output_textures"] = connected
+            row["missing_output_textures"] = tuple(
+                connection.get("missing_cluster_output_textures") or ()
+            )
+            row["referenced_by_spms"] = tuple(
+                connection.get("referenced_by_spms") or ()
+            )
+            rows.append(row)
+    return sorted(rows, key=lambda row: str(row["authoring_spm"]).casefold())
+
+
+def speedtree_output_spm_for(spm_path):
+    """Return the canonical SK output identity for one SK Batch row."""
+    candidate = Path(spm_path)
+    try:
+        return resolve_cluster_spm_pair(candidate)["canonical_spm"]
+    except ClusterSpmPairPathError:
+        return candidate
+
+
+def prepare_cluster_spm_pair_for_job(spm_path):
+    """Normalize a legacy Cluster output name before an SK job starts."""
+    candidate = Path(spm_path)
+    try:
+        preview = inspect_cluster_spm_pair(candidate)
+    except ClusterSpmPairPathError:
+        return {"status": "not_applicable", "canonical_spm": candidate,
+                "mirror_spm": candidate, "operation": "none"}
+    if preview["can_bootstrap"]:
+        return bootstrap_cluster_authoring(preview["mirror_spm"])
+    if Path(preview["canonical_spm"]).is_file():
+        return {
+            "status": "up_to_date",
+            "operation": "none",
+            "generation": preview["generation"],
+            "canonical_spm": preview["canonical_spm"],
+            "mirror_spm": preview["mirror_spm"],
+            "output_spm": preview["canonical_spm"],
+            "receipt_path": preview["receipt_path"],
+        }
+    raise RuntimeError(
+        f"Cluster SPM output name cannot be normalized ({preview['status']}): "
+        + "; ".join(preview["conflicts"])
+    )
 
 
 # Wind preset from the file name (checklist item 4). Dead vegetation must not
@@ -788,17 +908,12 @@ def wind_preset_for_spm(spm_path):
 
 
 def blend_path_for(spm_path):
-    """Return the established Blend output without changing source identity.
-
-    Full SK inputs keep the same stem.  A non-SK Cluster source stays in place
-    and writes only its Blender output with the SK_ prefix.
-    """
+    """Return the canonical Blend identity for ordinary or Cluster inputs."""
     spm = Path(spm_path)
-    if (
-        spm.parent.name.casefold() == "cluster"
-        and not spm.name.casefold().startswith("sk_")
-    ):
-        return spm.with_name(f"SK_{spm.stem}.blend")
+    try:
+        spm = resolve_cluster_spm_pair(spm)["canonical_spm"]
+    except ClusterSpmPairPathError:
+        pass
     return spm.with_suffix(".blend")
 
 

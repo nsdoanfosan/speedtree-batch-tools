@@ -61,6 +61,8 @@ FIRST_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>")
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
 
 BACKUP_SUBDIR = "_spm_backups"
+CALIBRATION_MARKER_SUFFIX = ".skbatch_calibration_in_progress.json"
+CALIBRATION_MARKER_VERSION = 1
 PROBE_CACHE_VERSION = 1
 PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
 BONE_VALUE_RE = re.compile(
@@ -503,15 +505,40 @@ def read_spm(path):
 
 
 def write_spm(path, text):
+    """Replace one SPM atomically with byte-stable output.
+
+    Two properties matter downstream:
+      * ``mtime=0`` keeps the gzip header out of the payload, so identical
+        logical content always hashes identically.  Otherwise a no-op ① rewrite
+        changes the file's content fingerprint and needlessly invalidates the
+        calibration cache, the .blend freshness receipt and the Push manifest.
+      * ``os.replace`` means a crash or kill during a write can never leave a
+        truncated SPM; the previous file survives untouched.
+    """
     candidate = Path(path)
     compressed = (
         spm_container_format(candidate) == "gzip" if candidate.is_file() else True
     )
-    if compressed:
-        with gzip.open(candidate, "wb") as handle:
-            handle.write(text.encode("utf-8"))
-    else:
-        candidate.write_text(text, encoding="utf-8")
+    payload = text.encode("utf-8")
+    temporary = candidate.with_name(f".{candidate.name}.{os.getpid()}.skbatch.tmp")
+    try:
+        if compressed:
+            with temporary.open("wb") as raw:
+                with gzip.GzipFile(
+                    filename=candidate.name, mode="wb", fileobj=raw, mtime=0
+                ) as handle:
+                    handle.write(payload)
+                raw.flush()
+                os.fsync(raw.fileno())
+        else:
+            with temporary.open("wb") as raw:
+                raw.write(payload)
+                raw.flush()
+                os.fsync(raw.fileno())
+        os.replace(temporary, candidate)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def probe_cache_path(spm_path):
@@ -1303,6 +1330,185 @@ def backup_spm(path):
     return str(backup)
 
 
+def _terminate_speedtree_tree(process):
+    """Kill a timed-out Modeler and every descendant it launched."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def run_speedtree_export(cmd, cwd, timeout):
+    """Run one Modeler export, waiting on the process handle, not on pipe EOF.
+
+    SpeedTree is a GUI executable even under ``-export``: descendants can keep
+    an inherited stdout/stderr pipe open after the Modeler process itself has
+    exited.  ``subprocess.run(capture_output=True)`` then blocks on EOF until
+    the timeout fires and a finished 16s export is reported as a 120s failure.
+    Regular temporary files remove that failure mode; this mirrors the add-on's
+    ``speedtree_cli._run_process`` contract.
+    """
+    popen_kwargs = {"cwd": str(cwd), "stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = 0x08000000 | getattr(  # CREATE_NO_WINDOW
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    def _read(handle):
+        handle.flush()
+        handle.seek(0)
+        return handle.read().decode("utf-8", errors="replace")
+
+    with tempfile.TemporaryFile(mode="w+b") as out_file, tempfile.TemporaryFile(
+        mode="w+b"
+    ) as err_file:
+        process = subprocess.Popen(
+            cmd, stdout=out_file, stderr=err_file, **popen_kwargs
+        )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_speedtree_tree(process)
+            raise
+        return returncode, _read(out_file), _read(err_file)
+
+
+def calibration_marker_path(spm_path):
+    """Crash marker beside the backups, outside the scanned working list."""
+    spm = Path(spm_path)
+    return spm.parent / BACKUP_SUBDIR / f"{spm.stem}{CALIBRATION_MARKER_SUFFIX}"
+
+
+def write_calibration_marker(spm_path, backup, source_sha256):
+    """Record that the SPM is mid-rewrite before the first destructive write.
+
+    Calibration edits the source SPM in place (Absolute/1 probe, then Relative
+    rounds) and restores it afterwards.  Every *exception* path restores, but a
+    hard kill has none: Stop and the watchdog timeout both use
+    ``taskkill /T /F``, so a killed run can leave the SPM in its probe state.
+    This marker makes that state detectable and repairable on the next scan
+    instead of silently shipping probe bones into ② and ③.
+    """
+    marker = calibration_marker_path(spm_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CALIBRATION_MARKER_VERSION,
+        "spm": str(Path(spm_path)),
+        "backup": str(backup) if backup else "",
+        "source_sha256": source_sha256,
+        "pid": os.getpid(),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "note": (
+            "Calibration was interrupted before it could restore this SPM. "
+            "Restore the recorded backup before trusting its bone settings."
+        ),
+    }
+    marker.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return marker
+
+
+def clear_calibration_marker(spm_path):
+    marker = calibration_marker_path(spm_path)
+    try:
+        marker.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _sha256_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def inspect_interrupted_calibration(spm_path):
+    """Report whether a previous ① run was killed while rewriting this SPM."""
+    marker = calibration_marker_path(spm_path)
+    if not marker.is_file():
+        return {"status": "clean", "marker": str(marker)}
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "unreadable_marker",
+            "marker": str(marker),
+            "error": str(exc),
+        }
+    backup = Path(payload.get("backup") or "")
+    result = {
+        "status": "interrupted",
+        "marker": str(marker),
+        "spm": payload.get("spm", str(spm_path)),
+        "backup": str(backup) if payload.get("backup") else "",
+        "started_at": payload.get("started_at", ""),
+        "source_sha256": payload.get("source_sha256", ""),
+        "backup_available": bool(payload.get("backup")) and backup.is_file(),
+    }
+    try:
+        result["spm_matches_source"] = (
+            _sha256_bytes(Path(spm_path).read_bytes())
+            == str(payload.get("source_sha256") or "")
+        )
+    except OSError:
+        result["spm_matches_source"] = False
+    if result["spm_matches_source"]:
+        # The kill landed between two writes that happen to reproduce the
+        # source bytes, so nothing was actually lost.
+        result["status"] = "interrupted_but_intact"
+    return result
+
+
+def recover_interrupted_calibration(spm_path):
+    """Restore a killed calibration's source SPM from its recorded backup."""
+    state = inspect_interrupted_calibration(spm_path)
+    if state["status"] == "clean":
+        return {**state, "recovered": False}
+    if state["status"] == "interrupted_but_intact":
+        clear_calibration_marker(spm_path)
+        return {**state, "recovered": False, "cleared": True}
+    if state["status"] == "unreadable_marker" or not state.get("backup_available"):
+        return {**state, "recovered": False}
+    backup = Path(state["backup"])
+    if state.get("source_sha256") and _sha256_bytes(
+        backup.read_bytes()
+    ) != state["source_sha256"]:
+        return {
+            **state,
+            "recovered": False,
+            "error": "recorded backup does not match the interrupted source hash",
+        }
+    shutil.copy2(backup, spm_path)
+    clear_calibration_marker(spm_path)
+    return {**state, "recovered": True, "cleared": True}
+
+
 def export_verify_xml(spm_path, cfg, out_path):
     cmd = [
         cfg["speedtree_exe"],
@@ -1314,19 +1520,14 @@ def export_verify_xml(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(Path(spm_path).parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        returncode, stdout, stderr = run_speedtree_export(
+            cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
         raise SpeedTreeExportTimeout("XML", timeout) from exc
-    if result.returncode != 0 or not Path(out_path).exists():
-        detail = (result.stderr or result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree XML verify export failed ({result.returncode}): {detail}")
+    if returncode != 0 or not Path(out_path).exists():
+        detail = (stderr or stdout or "").strip()[-500:]
+        raise RuntimeError(f"SpeedTree XML verify export failed ({returncode}): {detail}")
     return out_path
 
 
@@ -1341,20 +1542,15 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(Path(spm_path).parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000,
+        returncode, stdout, stderr = run_speedtree_export(
+            cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
         raise SpeedTreeExportTimeout("FBX", timeout) from exc
     path = Path(out_path)
-    if result.returncode != 0 or not path.exists():
-        detail = (result.stderr or result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree FBX verify export failed ({result.returncode}): {detail}")
+    if returncode != 0 or not path.exists():
+        detail = (stderr or stdout or "").strip()[-500:]
+        raise RuntimeError(f"SpeedTree FBX verify export failed ({returncode}): {detail}")
     # SpeedTree writes binary FBX. A real mesh contains the FBX property name
     # "Vertices" in clear text; armature-only/container-only exports do not.
     return b"Vertices" in path.read_bytes()
@@ -1879,6 +2075,14 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
 def process_spm(spm_path, cfg, log=print, dry_run=False):
     """Material prefix + bone calibration with backup/restore. Returns report."""
     spm_path = Path(spm_path)
+    # A previous run killed mid-rewrite left probe bones in the source. Repair
+    # that before reading it as authoritative input.
+    recovery = recover_interrupted_calibration(spm_path)
+    if recovery.get("recovered"):
+        log(
+            "  [복구] 중단된 캘리브레이션 감지 — 백업에서 원본 SPM 복원: "
+            f"{recovery.get('backup', '')}"
+        )
     source_bytes = spm_path.read_bytes()
     source_stat = spm_path.stat()
     source_text = gzip.decompress(source_bytes).decode("utf-8")
@@ -1893,6 +2097,13 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         "skipped": [],
         "warnings": [],
     }
+    if recovery["status"] != "clean":
+        report["interrupted_calibration_recovery"] = recovery
+        if not recovery.get("recovered") and not recovery.get("cleared"):
+            report["warnings"].append(
+                "이전 캘리브레이션이 중단된 흔적이 있으나 백업으로 복원하지 못했습니다: "
+                + str(recovery.get("error") or recovery.get("status"))
+            )
 
     audit = audit_spm(spm_path, text=source_text, analyze_bone_graph=True)
     readiness = sk_readiness(audit)
@@ -1931,6 +2142,11 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
     if cfg.get("backup_spm", True):
         backup = backup_spm(spm_path)
         report["backup"] = backup
+    # Written before the first in-place write so a hard kill anywhere below is
+    # recoverable; every return path below clears it in the finally block.
+    report["calibration_marker"] = str(
+        write_calibration_marker(spm_path, backup, _sha256_bytes(source_bytes))
+    )
 
     try:
         generators, rounds, total, meta, warnings, skipped, changed = calibrate_bones(
@@ -2024,6 +2240,10 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
             report["warnings"].append("calibration failed; SPM restored from backup")
         report["status"] = "failed"
         raise
+    finally:
+        # Every path above has already restored the source, so the marker must
+        # not outlive this call and trigger a bogus recovery on the next run.
+        clear_calibration_marker(spm_path)
     return report
 
 

@@ -1,3 +1,37 @@
 @echo off
+setlocal
 rem PCG ST9 texture batch GUI launcher (no console window)
-start "" pythonw "%~dp0pcg_texture_gui.pyw"
+set "GUARD=%~dp0..\launch_guard.pyw"
+set "LAUNCHER=%~dp0pcg_texture_gui.pyw"
+
+where.exe pythonw >nul 2>&1
+if errorlevel 1 goto python_missing
+if not exist "%GUARD%" goto guard_missing
+if not exist "%LAUNCHER%" goto launcher_missing
+pythonw -c "import tkinter" >nul 2>&1
+if errorlevel 1 goto tkinter_missing
+
+rem launch_guard.pyw reports any startup failure; `start` cannot.
+start "" /D "%~dp0" pythonw "%GUARD%" "%LAUNCHER%"
+exit /b 0
+
+:python_missing
+echo [ERROR] pythonw was not found in PATH.
+goto show_error
+
+:guard_missing
+echo [ERROR] Missing launch guard: "%GUARD%"
+goto show_error
+
+:launcher_missing
+echo [ERROR] Missing launcher: "%LAUNCHER%"
+goto show_error
+
+:tkinter_missing
+echo [ERROR] The pythonw found in PATH cannot import tkinter.
+pythonw -c "import sys; print(sys.executable)"
+
+:show_error
+echo.
+pause
+exit /b 1

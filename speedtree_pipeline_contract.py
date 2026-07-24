@@ -25,7 +25,12 @@ PREFLIGHT_CONTRACT_KIND = "speedtree_material_preflight"
 PREFLIGHT_SCHEMA_VERSION = 1
 TREE_USER_DATA_PROPERTY = "SpeedTree SDK:User data"
 BACKUP_DIRECTORY_NAMES = frozenset(
-    {"_spm_backups", "_skbatch_backup", "_pcgtex_backups"}
+    {
+        "_spm_backups",
+        "_skbatch_backup",
+        "_pcgtex_backups",
+        "_atlas_cluster_normalization_backups",
+    }
 )
 BACKUP_FILENAME_RE = re.compile(
     r"\.(?:codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE
@@ -60,6 +65,52 @@ def is_live_spm(path, require_file=True):
     if any(part.casefold() in BACKUP_DIRECTORY_NAMES for part in candidate.parts):
         return False
     return candidate.is_file() if require_file else True
+
+
+def production_spm_folders(root):
+    """Yield the only folders that can hold a production SPM identity.
+
+    A vegetation root holds ``<owner>/x.spm`` and ``<owner>/Cluster/x.spm`` and
+    nothing else.  Every other SPM under the root is a work artifact: capture
+    staging, verify candidates, timestamped safety copies, per-experiment
+    output trees.  A recursive walk surfaces all of those in the batch list and
+    buries the ~20 files that actually ship, so scanning is location-driven
+    instead of blacklist-driven.  PCG ST9 Texture and SPM Generator Sync
+    already scan this way, which is why their lists stay readable.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return
+    # A root pointed straight at one vegetation folder is still valid input.
+    yield root
+    cluster = root / "Cluster"
+    if cluster.is_dir():
+        yield cluster
+    try:
+        owners = sorted(
+            (path for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError:
+        return
+    for owner in owners:
+        if owner.name.casefold() in BACKUP_DIRECTORY_NAMES:
+            continue
+        if owner.name.casefold() == "cluster":
+            continue  # already yielded above
+        yield owner
+        owner_cluster = owner / "Cluster"
+        if owner_cluster.is_dir():
+            yield owner_cluster
+
+
+def is_production_spm_location(path, root):
+    """True when *path* sits in a folder that can hold a shipping SPM."""
+    parent_key = canonical_path_key(Path(path).parent)
+    return any(
+        canonical_path_key(folder) == parent_key
+        for folder in production_spm_folders(root)
+    )
 
 
 def _candidate_contract_paths():
@@ -596,7 +647,9 @@ __all__ = [
     "dynamic_wind_path",
     "inspect_tree_instance_profile",
     "is_live_spm",
+    "is_production_spm_location",
     "naming_shadow_issue",
+    "production_spm_folders",
     "open_spm_binary",
     "pipeline_contract_path",
     "read_spm_text",

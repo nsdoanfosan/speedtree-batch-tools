@@ -1,3 +1,4 @@
+import os
 import sys
 import subprocess
 import tempfile
@@ -129,8 +130,8 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             "spm_verify_timeout": 120,
         }
         with mock.patch.object(
-            spm_audit.subprocess,
-            "run",
+            spm_audit,
+            "run_speedtree_export",
             side_effect=subprocess.TimeoutExpired("SpeedTree", 120),
         ):
             with self.assertRaises(spm_audit.SpeedTreeExportTimeout) as caught:
@@ -138,6 +139,73 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.stage, "XML")
         self.assertEqual(caught.exception.timeout_seconds, 120.0)
+
+    def test_speedtree_export_never_waits_on_an_inherited_pipe(self):
+        """A Modeler descendant can hold a pipe open after the exe exits.
+
+        Waiting on EOF there turns a finished export into a full-timeout
+        failure, so the run helper must hand the child regular files and wait
+        on the process handle only.
+        """
+        captured = {}
+
+        class FakeProcess:
+            pid = 4321
+
+            def wait(self, timeout=None):
+                captured["timeout"] = timeout
+                return 0
+
+        def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
+            captured["cmd"] = cmd
+            captured["stdout"] = stdout
+            captured["stderr"] = stderr
+            captured["kwargs"] = kwargs
+            stdout.write(b"exported\n")
+            return FakeProcess()
+
+        with mock.patch.object(spm_audit.subprocess, "Popen", side_effect=fake_popen):
+            returncode, stdout, stderr = spm_audit.run_speedtree_export(
+                ["SpeedTree.exe", "model.spm"], ".", 120
+            )
+
+        self.assertEqual((returncode, stdout, stderr), (0, "exported\n", ""))
+        self.assertEqual(captured["timeout"], 120)
+        self.assertIsNot(captured["stdout"], subprocess.PIPE)
+        self.assertIsNot(captured["stderr"], subprocess.PIPE)
+        # Real file objects expose fileno(); a pipe placeholder is a plain int.
+        self.assertTrue(callable(getattr(captured["stdout"], "fileno", None)))
+        self.assertTrue(callable(getattr(captured["stderr"], "fileno", None)))
+        self.assertIs(captured["kwargs"].get("stdin"), subprocess.DEVNULL)
+
+    def test_speedtree_export_timeout_kills_the_whole_process_tree(self):
+        killed = {}
+
+        class HangingProcess:
+            pid = 9876
+
+            def wait(self, timeout=None):
+                if "terminated" not in killed:
+                    raise subprocess.TimeoutExpired("SpeedTree", timeout)
+                return 1
+
+        def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
+            return HangingProcess()
+
+        def fake_run(cmd, **kwargs):
+            killed["terminated"] = list(cmd)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(spm_audit.subprocess, "Popen", side_effect=fake_popen):
+            with mock.patch.object(spm_audit.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    spm_audit.run_speedtree_export(
+                        ["SpeedTree.exe", "model.spm"], ".", 5
+                    )
+
+        if os.name == "nt":
+            self.assertIn("/T", killed.get("terminated", []))
+            self.assertIn("9876", killed.get("terminated", []))
 
     def test_guid_graph_tree_uses_root_and_first_branch_base_stage(self):
         graph = spm_audit.analyze_branch_bone_graph(
