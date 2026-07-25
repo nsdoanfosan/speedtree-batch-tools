@@ -83,15 +83,6 @@ def write_report(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def is_cluster_source_spm(path):
-    candidate = Path(path)
-    return (
-        candidate.suffix.casefold() == ".spm"
-        and candidate.parent.name.casefold() == "cluster"
-        and not candidate.name.casefold().startswith("sk_")
-    )
-
-
 def material_slot_issues(obj):
     if obj is None:
         return [{"object": "<missing export mesh>", "slot": None, "used_faces": 0}]
@@ -222,25 +213,21 @@ def main():
         "wind": args.wind,
         "status": "failed",
     }
-    raw_cluster_source = is_cluster_source_spm(speedtree_spm)
-    explicit_cluster_pair = bool(args.speedtree_spm and raw_cluster_source)
+    # Cluster rows reach this job already normalized to their canonical SK_
+    # name, so --spm and --speedtree-spm always name the same file.  The two
+    # former "is this a raw, unprefixed Cluster source?" policies could
+    # therefore never be selected; the pair policy resolved to the same gate as
+    # strict anyway, so only their labels were ever observable.  Legacy receipt
+    # lineage stays the one thing that relaxes the source gate.
     legacy_state = inspect_legacy_cluster_state(speedtree_spm)
     legacy_cluster_origin = bool(
         legacy_state.get("receipt_valid")
         and legacy_state.get("classified_generator_guids")
     )
-    source_review_allowed = (
-        (raw_cluster_source and not explicit_cluster_pair)
-        or legacy_cluster_origin
+    source_review_allowed = legacy_cluster_origin
+    source_review_policy = (
+        "legacy_cluster_receipt" if legacy_cluster_origin else "strict"
     )
-    if explicit_cluster_pair:
-        source_review_policy = "cluster_pair_strict"
-    elif raw_cluster_source:
-        source_review_policy = "cluster_source_read_only"
-    elif legacy_cluster_origin:
-        source_review_policy = "legacy_cluster_receipt"
-    else:
-        source_review_policy = "strict"
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
         "status": "recognized" if legacy_cluster_origin else "not_applicable",

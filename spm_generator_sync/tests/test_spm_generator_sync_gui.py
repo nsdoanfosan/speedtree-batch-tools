@@ -21,6 +21,34 @@ GUI = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(GUI)
 
 
+class ClipboardRecorder:
+    """Stand-in for the Tk root that records the clipboard handoff.
+
+    ``copy_paths_to_clipboard`` only needs these three calls, so this keeps the
+    assertion on what the app produced instead of on the shared OS clipboard.
+    """
+
+    def __init__(self):
+        self.appends = []
+        self.clear_count = 0
+        self.cleared_before_append = False
+
+    def clipboard_clear(self):
+        self.clear_count += 1
+        if not self.appends:
+            self.cleared_before_append = True
+
+    def clipboard_append(self, value):
+        self.appends.append(value)
+
+    def update_idletasks(self):
+        pass
+
+    @property
+    def text(self):
+        return "".join(self.appends)
+
+
 class GeneratorSyncGuiCacheTests(unittest.TestCase):
     def test_gui_uses_full_sibling_engine_module(self):
         self.assertEqual(
@@ -38,7 +66,11 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         root.withdraw()
         try:
             app = GUI.App.__new__(GUI.App)
-            app.root = root
+            # The Windows clipboard is a shared OS resource whose ownership any
+            # process can take between the append and a read-back, so asserting
+            # through clipboard_get() is inherently racy.  Record what the app
+            # hands to Tk instead; delivering it is Tk's job, not ours.
+            app.root = ClipboardRecorder()
             app.status_var = tk.StringVar(root, value="")
             app.tree = ttk.Treeview(root)
             iid = app.tree.insert("", "end", text="tree_04.spm")
@@ -52,13 +84,12 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             app.tree.selection_set(iid)
 
             result = app.copy_selected_paths()
-            # Commit the clipboard selection claim before reading it back;
-            # without this the read is timing-dependent under a full test run.
-            root.update()
+
             expected = str(
                 Path(r"D:\Trees\black_locust\tree_04.spm").resolve()
             )
-            self.assertEqual(root.clipboard_get(), expected)
+            self.assertEqual(app.root.text, expected)
+            self.assertTrue(app.root.cleared_before_append)
             self.assertEqual(result, "break")
             self.assertIn("1", app.status_var.get())
         finally:
