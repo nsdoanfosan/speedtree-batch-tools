@@ -269,7 +269,29 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertIn("SK_branch_elm_01.spm", label)
         self.assertNotIn("branch_elm_01.spm →", label)
         self.assertNotIn("Atlas output", label)
-        self.assertTrue(gui.should_calibrate_spm(app.items[iid]))
+        # Carrying the canonical SK_ name does not turn a Cluster authoring
+        # source into a calibration target.
+        self.assertFalse(gui.should_calibrate_spm(app.items[iid]))
+
+    def test_cluster_authoring_spm_is_never_a_calibration_target(self):
+        # Calibration writes Physics:Bones into the SPM; on a Cluster source
+        # that invalidates the normalized blend's recorded bone contract, and
+        # an interrupted run leaves injected bones behind.
+        gui = load_gui_module()
+        for name in ("SK_branch_elm_01.spm", "branch_elm_01.spm"):
+            item = {
+                "spm": Path("Tree_elm/Cluster") / name,
+                "source_read_only": False,
+                "manual_bones_locked": False,
+            }
+            self.assertFalse(gui.should_calibrate_spm(item), name)
+
+        tree_item = {
+            "spm": Path("Tree_elm/SK_Tree_elm_01.spm"),
+            "source_read_only": False,
+            "manual_bones_locked": False,
+        }
+        self.assertTrue(gui.should_calibrate_spm(tree_item))
 
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()

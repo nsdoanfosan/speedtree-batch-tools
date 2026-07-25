@@ -106,8 +106,19 @@ def is_cluster_source_spm(spm):
 
 
 def should_calibrate_spm(item):
-    """Canonical Cluster authoring SPMs use the ordinary calibration phase."""
-    return not item.get("source_read_only")
+    """Cluster authoring SPMs are Blender inputs, never calibration targets.
+
+    A Cluster SPM's bone graph is read, not authored: the normalized blend
+    records its representative bone, XML bone id and source SPM hash, and the
+    deform-cluster partitioning is derived from them.  Calibration writes
+    Physics:Bones into the file, which invalidates that contract - and if it is
+    interrupted the Cluster source is left carrying injected bones.  Renaming a
+    Cluster row to its canonical SK_ name does not make it a tree.
+    """
+    return not (
+        item.get("source_read_only")
+        or is_cluster_source_spm(item.get("spm", ""))
+    )
 
 
 def sk_batch_folder_chain(root, spm):
