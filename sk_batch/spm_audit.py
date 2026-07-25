@@ -1167,6 +1167,292 @@ def apply_branch_values(text, indices, style, bones):
     return "".join(out)
 
 
+def apply_branch_hidden_values(text, indices, hidden):
+    """Set the direct Hidden flag on Branch generators by document index."""
+    index_set = set(indices)
+    value = "true" if hidden else "false"
+    out = []
+    pos = 0
+    branch_i = -1
+    for match in GEN_RE.finditer(text):
+        block = match.group(0)
+        type_match = GEN_TYPE_RE.match(block)
+        if type_match and type_match.group(1) == "Branch":
+            branch_i += 1
+            if branch_i in index_set:
+                hidden_match = re.search(
+                    r"(<Hidden>)[^<]*(</Hidden>)",
+                    block,
+                )
+                if hidden_match:
+                    block = (
+                        block[: hidden_match.start()]
+                        + hidden_match.group(1)
+                        + value
+                        + hidden_match.group(2)
+                        + block[hidden_match.end() :]
+                    )
+                elif "<Properties>" in block:
+                    block = block.replace(
+                        "<Properties>",
+                        f"<Hidden>{value}</Hidden><Properties>",
+                        1,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Branch generator has no Hidden or Properties field "
+                        f"at index {branch_i}"
+                    )
+        out.append(text[pos : match.start()])
+        out.append(block)
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def is_cluster_normalization_spm(spm_path):
+    """Return whether an SPM is a Cluster prototype source.
+
+    Cluster prototype SPMs have a different skeleton contract from whole-tree
+    assets.  Their authored hierarchy may contain hundreds of visible terminal
+    spines, but Blender normalization needs one SpeedTree root bone per
+    top-level Cluster piece, not one bone on every terminal spine.
+    """
+    path = Path(spm_path)
+    return (
+        path.parent.name.casefold() == "cluster"
+        or path.stem.casefold().startswith("sk_cluster_")
+    )
+
+
+def _cluster_branch_has_render_geometry(properties):
+    """Return whether a Branch generator contributes renderable geometry."""
+    skin_type = _number(properties.get("Skin:Type"))
+    skin_visibility = _number(properties.get("Skin:Visibility"))
+    segment_mesh = str(
+        properties.get("Segments:Features:Mesh:Enabled") or ""
+    ).strip().casefold() in {"1", "true", "yes"}
+    has_visible_skin = (
+        skin_type is not None
+        and skin_type != 3.0
+        and (skin_visibility is None or skin_visibility > 0.0)
+    )
+    return bool(has_visible_skin or segment_mesh)
+
+
+def plan_cluster_root_bones(text):
+    """Select the first renderable Branch node below each Tree root.
+
+    Hidden Branch nodes and visible ``Skin:Type=3`` Branches are authoring
+    scaffolds.  The latter are commonly long Trunk spines used only as Cluster
+    placement pivots; they have no mesh and must never become exported bones.
+    Traversing through both kinds and stopping at the first Branch that
+    contributes real skin/segment-mesh geometry reproduces the structural roots
+    seen in the known-good elm and elm-side Cluster exports:
+
+    * Tree -> hidden Trunk -> visible Trunk 3
+    * Tree -> hidden Trunk -> hidden Trunk 4 -> visible Big 4
+    * Tree -> meshless pivot Trunk -> visible Branch 5
+
+    Every selected generator is authored as Absolute/1.  Every other Branch
+    generator is authored as Absolute/0, so terminal leaf/needle spines cannot
+    inflate the exported skeleton.
+    """
+    root = ET.fromstring(text)
+    branch_generators = []
+    generator_by_guid = {}
+    duplicate_generator_guids = set()
+    for generator in root.findall(".//Generator"):
+        if generator.attrib.get("Type") != "Branch":
+            continue
+        guid = generator.findtext("GUID")
+        info = {
+            "index": len(branch_generators),
+            "guid": guid,
+            "name": generator.findtext("Name") or "?",
+            "hidden": (generator.findtext("Hidden") or "").strip().lower()
+            in {"1", "true", "yes"},
+            "properties": _direct_properties(generator),
+        }
+        info["has_render_geometry"] = _cluster_branch_has_render_geometry(
+            info["properties"]
+        )
+        branch_generators.append(info)
+        if guid:
+            if guid in generator_by_guid:
+                duplicate_generator_guids.add(guid)
+            generator_by_guid[guid] = info
+
+    nodes = []
+    node_by_guid = {}
+    children_by_parent = {}
+    duplicate_node_guids = set()
+    for node in root.findall(".//Node"):
+        record = {
+            "guid": node.findtext("GUID"),
+            "type": node.attrib.get("Type", "?"),
+            "generator_guid": node.findtext("GeneratorGUID"),
+            "parent_guid": node.findtext("ParentGUID"),
+        }
+        nodes.append(record)
+        if record["guid"]:
+            if record["guid"] in node_by_guid:
+                duplicate_node_guids.add(record["guid"])
+            node_by_guid[record["guid"]] = record
+        children_by_parent.setdefault(record["parent_guid"], []).append(record)
+
+    errors = []
+    if duplicate_generator_guids:
+        errors.append(
+            "duplicate Branch Generator GUIDs prevent Cluster root selection: "
+            + ", ".join(sorted(duplicate_generator_guids))
+        )
+    if duplicate_node_guids:
+        errors.append(
+            "duplicate Node GUIDs prevent Cluster root selection: "
+            + ", ".join(sorted(duplicate_node_guids))
+        )
+
+    selected_nodes = []
+    meshless_pivot_nodes = []
+    visited = set()
+
+    def walk_children(parent_guid):
+        if parent_guid in visited:
+            errors.append(
+                f"Node hierarchy cycle encountered below {parent_guid or '<root>'}"
+            )
+            return
+        visited.add(parent_guid)
+        try:
+            for child in children_by_parent.get(parent_guid, ()):
+                if child["type"] != "Branch":
+                    # Zone/Base-style containers may sit between the Tree and
+                    # the first authored Branch.  They are transparent here.
+                    walk_children(child["guid"])
+                    continue
+                generator = generator_by_guid.get(child["generator_guid"])
+                if generator is None:
+                    errors.append(
+                        "Cluster root Branch node references an unknown generator: "
+                        f"{child['generator_guid'] or '<missing>'}"
+                    )
+                    continue
+                if not generator["has_render_geometry"]:
+                    meshless_pivot_nodes.append(
+                        {
+                            "node_guid": child["guid"],
+                            "generator_guid": generator["guid"],
+                            "generator_index": generator["index"],
+                            "generator_name": generator["name"],
+                            "was_hidden": generator["hidden"],
+                        }
+                    )
+                    walk_children(child["guid"])
+                elif generator["hidden"]:
+                    walk_children(child["guid"])
+                else:
+                    selected_nodes.append(
+                        {
+                            "node_guid": child["guid"],
+                            "generator_guid": generator["guid"],
+                            "generator_index": generator["index"],
+                            "generator_name": generator["name"],
+                        }
+                    )
+        finally:
+            visited.remove(parent_guid)
+
+    tree_nodes = [node for node in nodes if node["type"] == "Tree"]
+    for tree_node in tree_nodes:
+        walk_children(tree_node["guid"])
+
+    selected_indices = sorted(
+        {item["generator_index"] for item in selected_nodes}
+    )
+    meshless_pivot_indices = sorted(
+        {item["generator_index"] for item in meshless_pivot_nodes}
+    )
+    for index in selected_indices:
+        properties = branch_generators[index]["properties"]
+        if (
+            "Physics:Bone style" not in properties
+            or "Physics:Bones" not in properties
+        ):
+            errors.append(
+                "Cluster structural root generator has no bone properties: "
+                + branch_generators[index]["name"]
+            )
+    if not tree_nodes:
+        errors.append("Cluster SPM has no Tree node")
+    if not selected_nodes:
+        errors.append(
+            "Cluster SPM has no renderable structural Branch below its Tree root"
+        )
+
+    root_name_counts = {}
+    for item in selected_nodes:
+        name = item["generator_name"]
+        root_name_counts[name] = root_name_counts.get(name, 0) + 1
+
+    return {
+        "mode": "cluster_first_renderable_root_absolute_1",
+        "branch_generator_count": len(branch_generators),
+        "selected_generator_indices": selected_indices,
+        "selected_generators": [
+            {
+                "index": branch_generators[index]["index"],
+                "guid": branch_generators[index]["guid"],
+                "name": branch_generators[index]["name"],
+            }
+            for index in selected_indices
+        ],
+        "selected_nodes": selected_nodes,
+        "meshless_pivot_generator_indices": meshless_pivot_indices,
+        "meshless_pivot_generators": [
+            {
+                "index": branch_generators[index]["index"],
+                "guid": branch_generators[index]["guid"],
+                "name": branch_generators[index]["name"],
+                "was_hidden": branch_generators[index]["hidden"],
+            }
+            for index in meshless_pivot_indices
+        ],
+        "meshless_pivot_nodes": meshless_pivot_nodes,
+        "expected_root_bone_count": len(selected_nodes),
+        "expected_root_generator_counts": root_name_counts,
+        "disabled_generator_count": (
+            len(branch_generators) - len(selected_indices)
+        ),
+        "errors": errors,
+        "ready": not errors,
+    }
+
+
+def apply_cluster_root_bone_plan(text, plan):
+    """Author one Absolute bone on Cluster roots and zero everywhere else."""
+    if not plan.get("ready"):
+        raise RuntimeError(
+            "Cluster root bone plan is invalid: "
+            + "; ".join(plan.get("errors") or ["unknown error"])
+        )
+    branch_count = int(plan["branch_generator_count"])
+    patched = apply_branch_values(
+        text, range(branch_count), 0.0, 0.0
+    )
+    patched = apply_branch_values(
+        patched,
+        plan["selected_generator_indices"],
+        0.0,
+        1.0,
+    )
+    return apply_branch_hidden_values(
+        patched,
+        plan.get("meshless_pivot_generator_indices") or (),
+        True,
+    )
+
+
 def apply_prioritized_branch_values(
     text, relative_indices, relative_value, disabled_base_indices=()
 ):
@@ -1581,6 +1867,125 @@ def bone_lengths_from_xml(xml_path):
     return lengths
 
 
+def cluster_root_bones_from_xml(xml_path):
+    """Return the exact structural-root bone inventory from a Raw XML export."""
+    root = ET.parse(xml_path).getroot()
+    bones = root.findall(".//Bone")
+    root_bones = []
+    non_root_bones = []
+    for bone in bones:
+        record = {
+            "id": bone.get("ID"),
+            "parent_id": bone.get("ParentID", "-1"),
+            "generator": bone.get("Generator") or "?",
+        }
+        if record["parent_id"] in {"", "-1"}:
+            root_bones.append(record)
+        else:
+            non_root_bones.append(record)
+    counts = {}
+    for bone in root_bones:
+        name = bone["generator"]
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        "bone_count": len(bones),
+        "root_bone_count": len(root_bones),
+        "non_root_bone_count": len(non_root_bones),
+        "root_generator_counts": counts,
+        "root_bones": root_bones,
+        "non_root_bones": non_root_bones,
+    }
+
+
+def calibrate_cluster_root_bones(
+    spm_path,
+    cfg,
+    *,
+    original_text,
+    log=print,
+):
+    """Write and verify the Cluster one-root-per-piece SpeedTree contract."""
+    plan = plan_cluster_root_bones(original_text)
+    if not plan["ready"]:
+        raise RuntimeError(
+            "Cluster root bone planning failed: "
+            + "; ".join(plan["errors"])
+        )
+
+    patched_text = apply_cluster_root_bone_plan(original_text, plan)
+    write_spm(spm_path, patched_text)
+    with tempfile.TemporaryDirectory(prefix="skbatch_cluster_root_") as tmp:
+        xml_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.xml"
+        fbx_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.fbx"
+        log(
+            "  [Cluster bones] SpeedTree structural-root XML verification: "
+            f"{plan['expected_root_bone_count']} roots"
+        )
+        export_verify_xml(spm_path, cfg, xml_out)
+        inventory = cluster_root_bones_from_xml(xml_out)
+        if inventory["bone_count"] != plan["expected_root_bone_count"]:
+            raise RuntimeError(
+                "Cluster structural-root bone count mismatch: "
+                f"expected {plan['expected_root_bone_count']}, "
+                f"exported {inventory['bone_count']}"
+            )
+        if inventory["non_root_bone_count"]:
+            raise RuntimeError(
+                "Cluster structural-root export still contains descendant bones: "
+                f"{inventory['non_root_bone_count']}"
+            )
+        if (
+            inventory["root_generator_counts"]
+            != plan["expected_root_generator_counts"]
+        ):
+            raise RuntimeError(
+                "Cluster structural-root generator mismatch: "
+                f"expected {plan['expected_root_generator_counts']}, "
+                f"exported {inventory['root_generator_counts']}"
+            )
+        log("  [Cluster bones] SpeedTree FBX geometry verification")
+        if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+            raise RuntimeError(
+                "Cluster structural-root bone compaction produced an FBX "
+                "without mesh geometry"
+            )
+
+    generator_counts = dict(
+        sorted(
+            inventory["root_generator_counts"].items(),
+            key=lambda item: item[0].casefold(),
+        )
+    )
+    meta = {
+        **plan,
+        "actual_root_bone_count": inventory["root_bone_count"],
+        "actual_root_generator_counts": inventory["root_generator_counts"],
+        "verified_xml": True,
+        "verified_fbx_geometry": True,
+    }
+    rounds = [
+        {
+            "phase": "cluster structural roots absolute/1",
+            "total_bones": inventory["bone_count"],
+            "root_bones": inventory["root_bone_count"],
+            "disabled_generator_count": plan["disabled_generator_count"],
+            "hidden_meshless_pivot_generator_count": len(
+                plan["meshless_pivot_generator_indices"]
+            ),
+        }
+    ]
+    changed = patched_text != original_text
+    return (
+        generator_counts,
+        rounds,
+        inventory["bone_count"],
+        meta,
+        [],
+        [],
+        changed,
+    )
+
+
 def estimate_relative_value_from_probe(
     lengths,
     target_total,
@@ -1672,6 +2077,16 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     max_rounds = int(cfg.get("max_calibration_rounds", 4))
 
     original_text = source_text if source_text is not None else read_spm(spm_path)
+    if (
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    ):
+        return calibrate_cluster_root_bones(
+            spm_path,
+            cfg,
+            original_text=original_text,
+            log=log,
+        )
     audit = source_audit if source_audit is not None else audit_spm(
         spm_path, text=original_text, analyze_bone_graph=True
     )
@@ -2133,6 +2548,13 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
         report["bone_graph"] = audit.get("bone_graph")
+        if (
+            cfg.get("cluster_root_only_bones", True)
+            and is_cluster_normalization_spm(spm_path)
+        ):
+            report["cluster_root_bone_plan"] = plan_cluster_root_bones(
+                source_text
+            )
         if apply_tree_red:
             _planned_text, vertex_report = apply_leaf_parent_red_gradient(source_text)
             report["vertex_colors"] = vertex_report

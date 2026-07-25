@@ -18,6 +18,7 @@ from spm_leaf_handoff_contract import (  # noqa: E402
     inspect_speedtree_material_export,
     inspect_speedtree_texture_sources,
     inspect_spm_leaf_contract,
+    leaf_contract_user_message,
 )
 
 
@@ -171,7 +172,7 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             self.assertFalse(contract["replacement_needed"])
             self.assertEqual(contract["replacement_source_slot_count"], 0)
 
-    def test_managed_assets_without_semantic_slots_require_connection(self):
+    def test_unused_managed_assets_without_semantic_slots_are_nonblocking(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm = Path(temporary) / "SK_weed_test_02.spm"
             write_spm(
@@ -181,8 +182,16 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
 
             contract = inspect_spm_leaf_contract(spm)
 
-            self.assertEqual(contract["status"], "replacement_needed")
+            self.assertEqual(contract["status"], "no_leaf_slots")
             self.assertEqual(contract["semantic_slot_count"], 0)
+            self.assertFalse(contract["replacement_needed"])
+            self.assertEqual(
+                leaf_contract_user_message(contract),
+                (
+                    True,
+                    "Atlas 연결 검사 비적용 — 현재 내보내는 Atlas 대상 잎 슬롯 없음",
+                ),
+            )
 
     def test_mesh_must_be_owned_by_the_same_material(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -188,6 +188,103 @@ def _asset_package_path(asset):
         return ""
 
 
+def _manifest_asset_paths(item):
+    paths = []
+    seen = set()
+    for manifest_asset in item.get("assets") or []:
+        asset_data = manifest_asset.get("asset_data") or {}
+        if asset_data.get("skip"):
+            continue
+        path = str(asset_data.get("asset_path") or "").split(".", 1)[0]
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _verify_manifest_assets_exist(item):
+    """Validate a local import receipt against the active Unreal project."""
+    paths = _manifest_asset_paths(item)
+    missing = [
+        path
+        for path in paths
+        if not unreal.EditorAssetLibrary.does_asset_exist(path)
+    ]
+    return {
+        "status": (
+            "current"
+            if paths and not missing
+            else "missing"
+            if missing
+            else "no_assets"
+        ),
+        "complete": bool(paths) and not missing,
+        "asset_paths": paths,
+        "missing_asset_paths": missing,
+    }
+
+
+def _manifest_items_dependency_order(items):
+    """Return a stable topological order from explicit queue dependencies."""
+    items = list(items)
+    by_id = {}
+    order = []
+    for item in items:
+        queue_id = str(item["queue_id"])
+        if queue_id in by_id:
+            raise RuntimeError(f"duplicate manifest queue_id: {queue_id}")
+        by_id[queue_id] = item
+        order.append(queue_id)
+
+    remaining = list(order)
+    result = []
+    completed = set()
+    while remaining:
+        progressed = False
+        for queue_id in list(remaining):
+            dependencies = {
+                str(value)
+                for value in (
+                    by_id[queue_id].get("depends_on_queue_ids") or []
+                )
+                if str(value) in by_id
+            }
+            if not dependencies.issubset(completed):
+                continue
+            result.append(by_id[queue_id])
+            completed.add(queue_id)
+            remaining.remove(queue_id)
+            progressed = True
+        if not progressed:
+            raise RuntimeError(
+                "manifest dependency cycle: " + ", ".join(remaining)
+            )
+    return result
+
+
+def _dependency_block_message(item, checkpoint):
+    missing = []
+    failed = []
+    states = checkpoint.get("items") or {}
+    for value in item.get("depends_on_queue_ids") or []:
+        dependency = str(value)
+        state = states.get(dependency)
+        if state is None:
+            missing.append(dependency)
+            continue
+        status = str(state.get("status") or "not_run")
+        if status != "imported_ok":
+            failed.append(f"{dependency} ({status})")
+    details = []
+    if missing:
+        details.append("missing provider: " + ", ".join(missing))
+    if failed:
+        details.append("provider did not complete: " + ", ".join(failed))
+    if not details:
+        return ""
+    return "required Cluster Push dependency unavailable; " + "; ".join(details)
+
+
 def _nanite_shape_preservation_voxelize():
     for enum_name in ("NaniteShapePreservation", "ENaniteShapePreservation"):
         enum_type = getattr(unreal, enum_name, None)
@@ -581,9 +678,18 @@ def _clear_placeholder_skeleton_before_import(item):
 
 
 def _apply_dynamic_wind(item):
+    policy = item.get("wind_policy") or {}
     wind_json = item.get("wind_json")
     if not wind_json:
-        return {"status": "skipped", "reason": "manifest has no wind JSON"}
+        if policy.get("requires_json"):
+            raise RuntimeError(
+                "manifest requires final-skeleton dynamic wind JSON but has no path"
+            )
+        return {
+            "status": "skipped",
+            "reason": policy.get("reason") or "manifest has no wind JSON",
+            "policy": policy,
+        }
     if not Path(wind_json).is_file():
         raise RuntimeError(f"dynamic wind JSON missing: {wind_json}")
     mesh_path = item.get("mesh_path")
@@ -1157,7 +1263,9 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     report_path = str(Path(report_path or manifest["report_path"]).resolve())
     checkpoint = _load_json(checkpoint_path, default=None) or _initial_checkpoint(manifest)
     max_retries = int(manifest.get("max_item_crash_retries", 2))
-    manifest_items = manifest.get("items") or []
+    manifest_items = _manifest_items_dependency_order(
+        manifest.get("items") or []
+    )
     _recover_interrupted_item(checkpoint, manifest_items, max_retries)
     _atomic_write_json(checkpoint_path, checkpoint)
 
@@ -1188,6 +1296,28 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
                 item_report["checkpoint"] = checkpoint_path
                 _atomic_write_json(previous["report"], item_report)
             continue
+        dependency_message = _dependency_block_message(item, checkpoint)
+        if dependency_message:
+            state = {
+                "status": "not_run",
+                "fingerprint": fingerprint,
+                "crash_count": int(previous.get("crash_count", 0)),
+                "message": dependency_message,
+                "completed_at": _now(),
+                "updated_at": _now(),
+                "manifest": manifest_path,
+                "report": item.get("report_path"),
+            }
+            checkpoint["items"][queue_id] = state
+            checkpoint["current_item"] = None
+            checkpoint["updated_at"] = _now()
+            _atomic_write_json(checkpoint_path, checkpoint)
+            if item.get("report_path"):
+                item_report = dict(state)
+                item_report["queue_id"] = queue_id
+                item_report["checkpoint"] = checkpoint_path
+                _atomic_write_json(item["report_path"], item_report)
+            continue
         if (
             previous.get("fingerprint") == fingerprint
             and previous.get("status") in TERMINAL_STATES
@@ -1211,7 +1341,18 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
 
         result = None
         try:
-            result = ingest_item(item)
+            asset_cache = None
+            if item.get("verify_existing_assets"):
+                asset_cache = _verify_manifest_assets_exist(item)
+            if asset_cache and asset_cache["complete"]:
+                result = {
+                    "status": "imported_ok",
+                    "asset_cache": asset_cache,
+                }
+            else:
+                result = ingest_item(item)
+                if asset_cache is not None:
+                    result["asset_cache_preflight"] = asset_cache
             state.update(result)
             state["status"] = result.get("status", "imported_ok")
             if state["status"] == "imported_ok":

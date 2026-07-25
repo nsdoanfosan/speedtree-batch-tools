@@ -177,6 +177,22 @@ def make_target_without_end():
     return ET.tostring(root, encoding="unicode")
 
 
+def make_target_without_knot():
+    root = ET.fromstring(make_target())
+    generators = root.find("Generators")
+    links = root.find("Links")
+    for generator in list(generators or []):
+        if generator.findtext("GUID") == "target-knot":
+            generators.remove(generator)
+    for link in list(links or []):
+        if (
+            link.findtext("SourceGUID") == "target-knot"
+            or link.findtext("TargetGUID") == "target-knot"
+        ):
+            links.remove(link)
+    return ET.tostring(root, encoding="unicode")
+
+
 def make_empty_target_without_links():
     return spm_xml(
         [generator_xml("empty-tree", "Tree", "Tree", 0)],
@@ -480,6 +496,37 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertTrue(seen)
             self.assertFalse(seen[0].exists())
 
+    def test_auto_copy_verification_uses_the_same_normalized_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            originals = {
+                master: master.read_bytes(),
+                target: target.read_bytes(),
+            }
+
+            with mock.patch.object(sync, "verify_speedtree_export") as verify:
+                plans = sync.verify_auto_copies(
+                    folder,
+                    master.name,
+                    [target.name],
+                    Path("SpeedTree.exe"),
+                    Path("Options.ini"),
+                )
+
+            self.assertEqual(len(plans), 1)
+            self.assertGreaterEqual(plans[0].master_sync_nodes, 1)
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(master.read_bytes(), originals[master])
+            self.assertEqual(target.read_bytes(), originals[target])
+            self.assertFalse(any(
+                path.name.startswith("__spm_sync_verify_")
+                for path in folder.iterdir()
+            ))
+
     def test_scan_only_suggests_master_candidate(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp) / "tree"
@@ -627,7 +674,7 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(len(renames), 2)
             self.assertEqual(sync.standardize_base_ref_names(document), [])
 
-    def test_sync_preserves_identity_assets_and_target_only_nodes(self):
+    def test_sync_reports_master_normalization_and_preserves_local_identity(self):
         with tempfile.TemporaryDirectory() as temp:
             master = Path(temp) / "master.spm"
             target = Path(temp) / "target.spm"
@@ -639,20 +686,27 @@ class GeneratorSyncTests(unittest.TestCase):
                 "BranchSmall": None,
                 "End 2": "End",
             }
+            delta = sync.compare_base_structure(
+                sync.SPMDocument.from_path(master, full=True),
+                sync.SPMDocument.from_path(target, full=True),
+                mapping,
+                include_details=True,
+            )
+            self.assertGreaterEqual(delta["master_sync"], 1)
+            self.assertTrue(any(
+                detail["name"] == "Knot unique"
+                for detail in delta["master_sync_details"]
+            ))
+
             plan = sync.build_sync_plan(master, target, mapping)
             self.assertTrue(plan.changed)
             self.assertGreaterEqual(plan.added_nodes, 1)
-            self.assertGreaterEqual(plan.target_only_nodes, 1)
+            self.assertEqual(plan.master_sync_nodes, 0)
             self.assertFalse(plan.mapping_required)
             self.assertTrue(any(
                 detail["name"] == "Leaf 2"
                 for result in plan.base_results
                 for detail in result.added_node_details
-            ))
-            self.assertTrue(any(
-                detail["name"] == "Knot unique"
-                for result in plan.base_results
-                for detail in result.target_only_details
             ))
             self.assertEqual(
                 plan.renamed_bases,
@@ -677,9 +731,9 @@ class GeneratorSyncTests(unittest.TestCase):
                 self.assertEqual(generator.findtext("Extra/m_vecBackgroundIconColor_g"), "1")
             unique_knot = patched.by_guid["target-knot"]
             self.assertEqual(unique_knot.findtext("Extra/m_bSetForegroundIconColor"), "true")
-            self.assertEqual(unique_knot.findtext("Extra/m_vecForegroundIconColor_r"), "1")
-            self.assertLess(
-                float(unique_knot.findtext("Extra/m_vecBackgroundIconColor_g")), 0.5
+            self.assertEqual(unique_knot.findtext("Extra/m_vecForegroundIconColor_r"), "0")
+            self.assertGreaterEqual(
+                float(unique_knot.findtext("Extra/m_vecBackgroundIconColor_g")), 0.9
             )
             # Existing target identity is unchanged and one missing Leaf Mesh was added.
             self.assertIn("target-leaf-base", patched.by_guid)
@@ -688,6 +742,101 @@ class GeneratorSyncTests(unittest.TestCase):
                 if item.attrib.get("Type") == "Leaf Mesh"
             ]
             self.assertEqual(len(leaf_meshes), 2)
+
+    def test_group_sync_merges_follower_structure_into_master_then_all_followers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            first = folder / "tree_02.spm"
+            second = folder / "tree_03.spm"
+            write_spm(master, make_master())
+            write_spm(first, make_target())
+            write_spm(second, make_target_without_knot())
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            sync.assign_follower(
+                manifest, master.name, first.name, mapping, confirmed=True
+            )
+            sync.assign_follower(
+                manifest, master.name, second.name, mapping, confirmed=True
+            )
+            sync.save_manifest(folder, manifest)
+
+            original_from_path = sync.SPMDocument.from_path
+            with mock.patch.object(
+                sync.SPMDocument,
+                "from_path",
+                side_effect=original_from_path,
+            ) as from_path:
+                result = sync.apply_group_transaction(
+                    folder,
+                    master.name,
+                    [first.name, second.name],
+                    verify_speedtree=False,
+                    verify_callback=lambda _path: None,
+                )
+            full_reads = [
+                Path(call.args[0]).name
+                for call in from_path.call_args_list
+                if call.kwargs.get("full", True)
+            ]
+            self.assertEqual(full_reads.count(first.name), 1)
+            self.assertEqual(full_reads.count(second.name), 1)
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(
+                result["plans"][0].master_sync_nodes,
+                1,
+            )
+            self.assertEqual(
+                result["plans"][1].master_sync_nodes,
+                0,
+            )
+            master_doc = sync.SPMDocument.from_path(master, full=True)
+            first_doc = sync.SPMDocument.from_path(first, full=True)
+            second_doc = sync.SPMDocument.from_path(second, full=True)
+            self.assertEqual(
+                len([
+                    item for item in master_doc.generators
+                    if master_doc.generator_name(item) == "Knot unique"
+                ]),
+                1,
+            )
+            self.assertIn("target-knot", first_doc.by_guid)
+            self.assertEqual(
+                len([
+                    item for item in second_doc.generators
+                    if second_doc.generator_name(item) == "Knot unique"
+                ]),
+                1,
+            )
+            for follower_doc in (first_doc, second_doc):
+                delta = sync.compare_base_structure(
+                    master_doc, follower_doc, mapping, include_details=True
+                )
+                self.assertEqual(delta["missing"], 0)
+                self.assertEqual(delta["master_sync"], 0)
+
+            again = sync.apply_group_transaction(
+                folder,
+                master.name,
+                [first.name, second.name],
+                verify_speedtree=False,
+                verify_callback=lambda _path: None,
+            )
+            self.assertEqual(again["status"], "up_to_date")
 
     def test_same_role_bases_receive_distinct_stable_brightness(self):
         big = sync.base_role_color("branch", "BranchBig")

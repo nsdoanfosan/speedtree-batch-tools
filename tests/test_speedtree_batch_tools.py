@@ -63,6 +63,104 @@ class IntegratedLauncherTests(unittest.TestCase):
             "PARK.SpeedTree.BatchTools",
         )
 
+    def test_activity_snapshot_reads_each_embedded_worker_model(self):
+        class FakeVar:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class FakeThread:
+            def __init__(self, alive):
+                self.alive = alive
+
+            def is_alive(self):
+                return self.alive
+
+        sk = type("App", (), {})()
+        sk.worker = FakeThread(True)
+        sk.progress_var = FakeVar("Blender Repair 1/6 · 실행 중 2개")
+        self.assertEqual(
+            self.launcher.app_activity_snapshot(sk),
+            (True, "Blender Repair 1/6 · 실행 중 2개"),
+        )
+
+        sync = type("App", (), {})()
+        sync.worker = FakeThread(True)
+        sync.progress_text_var = FakeVar("자식 2/5 저장 중 · 00:14")
+        self.assertEqual(
+            self.launcher.app_activity_snapshot(sync),
+            (True, "자식 2/5 저장 중 · 00:14"),
+        )
+
+        pcg = type("App", (), {})()
+        pcg._busy = True
+        pcg.status_var = FakeVar("③ Unreal 동기화 중...")
+        self.assertEqual(
+            self.launcher.app_activity_snapshot(pcg),
+            (True, "③ Unreal 동기화 중..."),
+        )
+
+    def test_activity_snapshot_treats_scan_as_visible_work(self):
+        class FinishedThread:
+            def is_alive(self):
+                return False
+
+        class RunningThread:
+            def is_alive(self):
+                return True
+
+        class FakeVar:
+            def get(self):
+                return "SK SPM 스캔 중…"
+
+        app = type("App", (), {})()
+        app.worker = FinishedThread()
+        app.scan_worker = RunningThread()
+        app.progress_var = FakeVar()
+        self.assertEqual(
+            self.launcher.app_activity_snapshot(app),
+            (True, "SK SPM 스캔 중…"),
+        )
+
+    def test_activity_snapshot_is_idle_without_busy_workers(self):
+        app = type("App", (), {})()
+        app._busy = False
+        app.status_var = type("Var", (), {"get": lambda self: "대기"})()
+        self.assertEqual(
+            self.launcher.app_activity_snapshot(app),
+            (False, "대기"),
+        )
+
+    def test_completion_detail_replaces_stale_running_status(self):
+        class FakeVar:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        finished = type("App", (), {})()
+        finished.progress_var = FakeVar("스캔 완료 · SPM 145개")
+        self.assertEqual(
+            self.launcher.activity_completion_detail(
+                finished,
+                "SK SPM 스캔 중…",
+            ),
+            "스캔 완료 · SPM 145개",
+        )
+
+        idle = type("App", (), {})()
+        idle.progress_var = FakeVar("대기")
+        self.assertEqual(
+            self.launcher.activity_completion_detail(
+                idle,
+                "Blender Repair 6/6 · 실행 중 0개",
+            ),
+            "Blender Repair 6/6 · 완료",
+        )
+
     def test_find_matches_tree_text_and_columns_case_insensitively(self):
         class FakeTree:
             children = {"": ("folder",), "folder": ("file",), "file": ()}

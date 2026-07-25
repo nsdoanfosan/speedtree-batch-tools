@@ -12,6 +12,7 @@ is a clean idempotent update (the operator wipes its previous build).
 import argparse
 import json
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -37,7 +38,7 @@ from spm_leaf_handoff_contract import (
     inspect_spm_leaf_contract,
     leaf_contract_user_message,
 )
-from speedtree_pipeline_contract import validate_preflight_report
+from speedtree_pipeline_contract import source_identity, validate_preflight_report
 from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -48,6 +49,7 @@ from cluster_assembly_handoff_contract import (
     role_identities_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
+from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 
 
@@ -129,18 +131,60 @@ def remove_unused_empty_material_slots(obj):
     return removed
 
 
-def export_collection_contract_issues():
+def export_collection_contract_issues(cluster_source_stem=""):
     """Return Send2UE units that would become unintended standalone assets."""
     export_collection = bpy.data.collections.get("Export")
     if export_collection is None:
         return ["missing_export_collection"]
-    return [
+    issues = [
         f"orphan_owned_export_empty:{obj.name}"
         for obj in export_collection.objects
         if obj.type == "EMPTY"
         and not obj.children
         and bool(obj.get("codex_source_fbx", ""))
     ]
+    if not cluster_source_stem:
+        return issues
+
+    pivots = [
+        obj
+        for obj in export_collection.objects
+        if obj.type == "EMPTY"
+        and obj.children
+        and bool(obj.get("speedtree_cluster_generated"))
+        and obj.get("speedtree_cluster_asset_role") == "send2ue_pivot"
+    ]
+    unintended = [
+        obj.name
+        for obj in export_collection.objects
+        if obj.type == "EMPTY"
+        and obj.children
+        and obj not in pivots
+    ]
+    issues.extend(
+        f"cluster_unsuffixed_export_unit:{name}"
+        for name in sorted(unintended)
+    )
+
+    pattern = re.compile(
+        rf"^{re.escape(cluster_source_stem)}_(\d{{2}})$",
+        re.IGNORECASE,
+    )
+    ordinals = []
+    for pivot in pivots:
+        match = pattern.fullmatch(pivot.name)
+        if match is None:
+            issues.append(f"cluster_invalid_export_pivot:{pivot.name}")
+        else:
+            ordinals.append(int(match.group(1)))
+    if not pivots:
+        issues.append("cluster_missing_normalized_export_pivot")
+    elif sorted(ordinals) != list(range(1, len(pivots) + 1)):
+        issues.append(
+            "cluster_nonconsecutive_export_pivots:"
+            + ",".join(str(value) for value in sorted(ordinals))
+        )
+    return issues
 
 
 def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
@@ -371,6 +415,15 @@ def main():
             settings.wind_preset = args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
+        is_cluster_source = is_cluster_normalization_spm(canonical_spm)
+        report["cluster_source_skin_contract"] = {
+            "requested": is_cluster_source,
+            "policy": (
+                "canonicalize_xml_render_root_axes_preserve_authored_skin_or_bind_unskinned_single_axis"
+                if is_cluster_source
+                else "not_applicable"
+            ),
+        }
         # The additive Assembly stage fingerprints the existing Full SK FBX;
         # keep the established BWR Full export enabled instead of synthesizing
         # a second, differently-configured Full mesh inside the builder.
@@ -414,9 +467,13 @@ def main():
         if xml_export.get("exists"):
             settings.xml_path = xml_export["path"]
         settings.name_stem = canonical_spm.stem
-        result = bwr_core.run_import_and_repair(settings.as_dict())
+        repair_settings = settings.as_dict()
+        repair_settings["cluster_source_skin_contract"] = is_cluster_source
+        result = bwr_core.run_import_and_repair(repair_settings)
         report["speedtree_export"] = speedtree_export
-        export_collection_issues = export_collection_contract_issues()
+        export_collection_issues = export_collection_contract_issues(
+            canonical_spm.stem if is_cluster_source else ""
+        )
         report["export_collection_issues"] = export_collection_issues
 
         stem = canonical_spm.stem
@@ -615,6 +672,9 @@ def main():
             )
             report["cluster_assembly_manifest"] = assembly_manifest
         if pipeline_data is not None:
+            pipeline_data["speedtree_live_source_identity"] = {
+                "spm": source_identity(canonical_spm),
+            }
             pipeline_data["handoff_preflight"] = preflight
             if assembly_manifest is not None:
                 pipeline_data["cluster_assembly_manifest"] = assembly_manifest

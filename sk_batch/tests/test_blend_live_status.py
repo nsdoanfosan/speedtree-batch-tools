@@ -346,6 +346,70 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("Blender Repair 코드가 저장 결과보다 최신임", reason)
             self.assertIn("core.py", reason)
 
+    def test_cluster_assembly_input_change_invalidates_root_repair(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        from cluster_assembly_builder import (
+            ClusterAssemblyBuildError,
+            MANIFEST_KIND,
+            file_fingerprint,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_Tree_elm_01.spm"
+            report = root / "reports" / (
+                "SK_Tree_elm_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            manifest_path = root / "assembly" / "manifest.json"
+            report.parent.mkdir()
+            manifest_path.parent.mkdir()
+            write_empty_spm(spm)
+            manifest_path.write_text(
+                json.dumps({"kind": MANIFEST_KIND}),
+                encoding="utf-8",
+            )
+            report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {
+                        "manifest": file_fingerprint(manifest_path),
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "cluster_assembly_builder.validate_manifest_artifacts",
+                side_effect=ClusterAssemblyBuildError(
+                    "source blend branch_normalized_01 changed"
+                ),
+            ):
+                ready, reason = app._cluster_assembly_inputs_current(spm)
+
+        self.assertFalse(ready)
+        self.assertIn("Cluster Assembly input changed", reason)
+        self.assertIn("branch_normalized_01", reason)
+
+    def test_handoff_readiness_checks_cluster_assembly_inputs(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "SK_Tree_elm_01.spm"
+            blend = spm.with_suffix(".blend")
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+            app._repair_runtime_fresh = mock.Mock(return_value=(True, ""))
+            app._repair_contract_current = mock.Mock(return_value=True)
+            app._cluster_assembly_inputs_current = mock.Mock(
+                return_value=(False, "Cluster Assembly input changed")
+            )
+
+            ready, reason = app._handoff_ready(spm)
+
+        self.assertFalse(ready)
+        self.assertEqual(reason, "Cluster Assembly input changed")
+
     def test_live_status_explains_unconnected_managed_atlas(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -783,6 +847,49 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(app.state[str(spm)]["push_status"], "준비됨 ✓")
             self.assertEqual(app.state[str(spm)]["push_status_kind"], "ready")
             self.assertNotIn("push_status_error", app.state[str(spm)])
+
+    def test_stale_cluster_receipt_is_refreshed_and_revalidated(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            selected = Path(temporary) / "receipt.json"
+            current = {"selected_receipt": str(selected)}
+            app._run_limited = mock.Mock(
+                return_value=(0, Path(temporary) / "refresh.log")
+            )
+
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[
+                    gui.ClusterAssemblyReceiptStaleError("stale"),
+                    current,
+                ],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm, "20260725_120000"
+                )
+
+            self.assertEqual(resolution, current)
+            command = app._run_limited.call_args.args[0]
+            self.assertTrue(
+                str(command[1]).endswith("pcg_texture_audit.py")
+            )
+            self.assertEqual(
+                command[command.index("--target") + 1], str(spm.parent)
+            )
+            self.assertEqual(app._run_limited.call_args.args[2], 321)
+            self.assertTrue(any(
+                "갱신 완료" in call.args[0]
+                for call in app.log.call_args_list
+            ))
 
     def test_blender_job_accepts_source_review_and_leaves_push_blocked(self):
         gui = load_gui_module()

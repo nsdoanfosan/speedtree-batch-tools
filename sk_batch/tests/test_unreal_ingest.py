@@ -123,6 +123,38 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
             report["result"]["skeleton_contract"], "final_skeleton_v2"
         )
 
+    def test_normalized_cluster_prototype_skips_source_rig_wind(self):
+        runner = load_runner()
+        report = runner._apply_dynamic_wind(
+            {
+                "wind_json": None,
+                "wind_policy": {
+                    "mode": "deferred_to_final_assembly",
+                    "requires_json": False,
+                    "reason": "apply after final Assembly rebinding",
+                },
+            }
+        )
+
+        self.assertEqual(report["status"], "skipped")
+        self.assertEqual(
+            report["policy"]["mode"],
+            "deferred_to_final_assembly",
+        )
+
+    def test_required_wind_contract_without_path_stops_ingest(self):
+        runner = load_runner()
+        with self.assertRaisesRegex(RuntimeError, "requires final-skeleton"):
+            runner._apply_dynamic_wind(
+                {
+                    "wind_json": None,
+                    "wind_policy": {
+                        "mode": "final_skeleton",
+                        "requires_json": True,
+                    },
+                }
+            )
+
     def test_failed_name_index_contract_stops_ingest(self):
         runner = self._runner_with_result(
             json.dumps(
@@ -286,6 +318,129 @@ def test_data_error_is_item_local_and_queue_continues(tmp_path, monkeypatch):
     assert result["items"]["bad"]["status"] == "data_error"
     assert result["items"]["good"]["status"] == "imported_ok"
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    root = item("tree", "tree-v1")
+    root["depends_on_queue_ids"] = ["cluster"]
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path,
+        [root, item("cluster", "cluster-v1")],
+    )
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: calls.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert calls == ["cluster", "tree"]
+    assert result["items"]["tree"]["status"] == "imported_ok"
+
+
+def test_failed_cluster_marks_dependent_tree_not_run(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    root = item("tree", "tree-v1")
+    root["depends_on_queue_ids"] = ["cluster"]
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path,
+        [root, item("cluster", "cluster-v1"), item("other", "other-v1")],
+    )
+    calls = []
+
+    def ingest(current):
+        calls.append(current["queue_id"])
+        if current["queue_id"] == "cluster":
+            raise RuntimeError("cluster failed")
+        return {"status": "imported_ok"}
+
+    monkeypatch.setattr(runner, "ingest_item", ingest)
+    result = runner.run_manifest(manifest)
+
+    assert "tree" not in calls
+    assert "other" in calls
+    assert result["items"]["cluster"]["status"] == "data_error"
+    assert result["items"]["tree"]["status"] == "not_run"
+    assert "required Cluster Push dependency" in result["items"]["tree"]["message"]
+
+
+def test_cached_cluster_is_verified_in_unreal_before_import(
+    tmp_path, monkeypatch
+):
+    runner = load_runner(monkeypatch)
+    provider = item("cluster", "cluster-v1")
+    provider.update(
+        {
+            "verify_existing_assets": True,
+            "assets": [
+                {
+                    "asset_data": {
+                        "asset_path": "/Game/Tree/Cluster/SK_cluster_01"
+                    }
+                }
+            ],
+        }
+    )
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path, [provider]
+    )
+    runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+        does_asset_exist=lambda _path: True
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: (_ for _ in ()).throw(
+            AssertionError("current cached asset must not be reimported")
+        ),
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["cluster"]["status"] == "imported_ok"
+    assert result["items"]["cluster"]["asset_cache"]["status"] == "current"
+
+
+def test_missing_cached_cluster_asset_is_reimported(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    provider = item("cluster", "cluster-v1")
+    provider.update(
+        {
+            "verify_existing_assets": True,
+            "assets": [
+                {
+                    "asset_data": {
+                        "asset_path": "/Game/Tree/Cluster/SK_cluster_01"
+                    }
+                }
+            ],
+        }
+    )
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path, [provider]
+    )
+    runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+        does_asset_exist=lambda _path: False
+    )
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: calls.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert calls == ["cluster"]
+    assert (
+        result["items"]["cluster"]["asset_cache_preflight"]["status"]
+        == "missing"
+    )
 
 
 def test_runtime_pending_checkpoint_finishes_without_reimport(tmp_path, monkeypatch):

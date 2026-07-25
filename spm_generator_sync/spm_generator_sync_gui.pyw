@@ -56,13 +56,17 @@ engine = _load_sibling_engine()
 
 CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
 )
 DEFAULT_BLENDER = Path(
     r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+)
+DEFAULT_CLUSTER_UNIT_PROBE = Path(
+    r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
+    r"\speedtree_unit_probe_10cm_user_scale_0_1_verified.json"
 )
 
 
@@ -92,6 +96,8 @@ def load_config() -> dict:
         "speedtree_exe": str(DEFAULT_SPEEDTREE),
         "xml_ini": find_default_xml_ini(),
         "blender_exe": str(DEFAULT_BLENDER),
+        "cluster_unit_probe": str(DEFAULT_CLUSTER_UNIT_PROBE),
+        "cluster_capture_resolution": 1024,
         "verify_speedtree": True,
         "sk_only": True,
     }
@@ -397,7 +403,10 @@ class PreviewWindow(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         ttk.Label(
             frame,
-            text="읽기 전용 미리보기입니다. 자식 전용 구조는 삭제되지 않습니다.",
+            text=(
+                "읽기 전용 미리보기입니다. 자식의 추가 구조는 마스터에 합쳐진 뒤 "
+                "선택 자식 전체에 정규화됩니다."
+            ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 6))
         box = tk.Text(frame, wrap="word", font=("Consolas", 10))
@@ -528,13 +537,13 @@ class App:
         self.tree.heading("#0", text="나무 폴더 / SPM")
         self.tree.heading("role", text="관계")
         self.tree.heading("bases", text="따라가는 Base")
-        self.tree.heading("structure", text="Base 구조")
+        self.tree.heading("structure", text="정규화 구조")
         self.tree.heading("status", text="동기화 상태")
         self.tree.heading("last", text="마지막 적용")
         self.tree.column("#0", width=430, minwidth=280)
         self.tree.column("role", width=145, anchor="center")
         self.tree.column("bases", width=330)
-        self.tree.column("structure", width=180)
+        self.tree.column("structure", width=240)
         self.tree.column("status", width=160, anchor="center")
         self.tree.column("last", width=155, anchor="center")
         yscroll = ttk.Scrollbar(board_frame, orient="vertical", command=self.tree.yview)
@@ -551,13 +560,7 @@ class App:
         )
         self.tree.tag_configure("follower", background="#f4f9ff")
         self.tree.tag_configure(
-            "follower_unique", background="#f7e5dd", foreground="#6f2818"
-        )
-        self.tree.tag_configure(
-            "follower_missing", background="#fff2cc", foreground="#745000"
-        )
-        self.tree.tag_configure(
-            "follower_delta", background="#f2dfcf", foreground="#612d12"
+            "follower_master_sync", background="#e8ddf5", foreground="#4b2c63"
         )
         self.tree.tag_configure(
             "follower_risk", background="#ffd6d6", foreground="#8b0000",
@@ -592,9 +595,11 @@ class App:
         details.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Label(
             details,
-            text=("추가 예정 = 마스터에만 있는 구조입니다. 아직 동기화하지 않았거나 마스터를 나중에 "
-                  "수정했을 때 생기며 다음 동기화에서 자식에 추가됩니다. · "
-                  "자식 전용 = 자식에만 있는 변형 구조이며 자동 삭제하지 않고 보존합니다."),
+            text=(
+                "마스터와 동기화 = 마스터와 현재 SPM의 Generator 구조 차이를 통합합니다. "
+                "현재 SPM에서 발견된 구조는 마스터에 합치고, 정규화된 마스터 구조를 "
+                "현재 SPM에 반영합니다."
+            ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 4))
         self.details_var = tk.StringVar(value="행을 선택하면 관계와 Base 매핑을 보여 줍니다.")
@@ -605,13 +610,16 @@ class App:
         )
         self.delta_box.pack(fill="x", pady=(5, 0))
         self.delta_box.tag_configure("missing", foreground="#9a5b00", font=("Segoe UI", 9, "bold"))
-        self.delta_box.tag_configure("unique", foreground="#7d2417", font=("Segoe UI", 9, "bold"))
+        self.delta_box.tag_configure("master_sync", foreground="#4b2c63", font=("Segoe UI", 9, "bold"))
         self.delta_box.tag_configure("muted", foreground="#777")
         self.delta_box.configure(state="disabled")
 
         Tooltip(
             self.preview_button,
-            "SPM을 수정하지 않고 공통 노드·속성 변경·추가 예정·자식 전용 구조·색상 변경을 계산합니다.",
+            (
+                "SPM을 수정하지 않고 마스터와 현재 SPM 사이의 Generator 구조·"
+                "속성·색상 동기화를 계산합니다."
+            ),
         )
         Tooltip(
             self.apply_button,
@@ -649,7 +657,7 @@ class App:
         document = engine.SPMDocument.from_path(path, full=False)
         return self._cache_store(self.document_cache, key, document, limit=24)
 
-    def cached_master_signature(self, path: Path, categories: dict, document=None):
+    def cached_master_signature(self, path: Path, categories: dict):
         key = json.dumps(
             [self._path_cache_key(path), categories],
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -657,13 +665,12 @@ class App:
         if key in self.signature_cache:
             self.signature_cache.move_to_end(key)
             return self.signature_cache[key]
-        document = document or self.cached_document(path)
+        document = self.cached_document(path)
         signature = engine.base_sync_signature(document, categories)
         return self._cache_store(self.signature_cache, key, signature, limit=64)
 
     def cached_follower_analysis(
         self, source_path: Path, target_path: Path, mapping: dict,
-        source_document=None, target_document=None,
     ):
         key = json.dumps(
             [self._path_cache_key(source_path), self._path_cache_key(target_path), mapping],
@@ -672,8 +679,8 @@ class App:
         if key in self.analysis_cache:
             self.analysis_cache.move_to_end(key)
             return self.analysis_cache[key]
-        source_document = source_document or self.cached_document(source_path)
-        target_document = target_document or self.cached_document(target_path)
+        source_document = self.cached_document(source_path)
+        target_document = self.cached_document(target_path)
         delta = engine.compare_base_structure(
             source_document, target_document, mapping, include_details=True
         )
@@ -725,11 +732,11 @@ class App:
                     self.update_details()
                     break
 
-    def master_status(self, folder: Path, group: dict, document=None) -> tuple[str, str]:
+    def master_status(self, folder: Path, group: dict) -> tuple[str, str]:
         categories = group.get("base_categories") or {}
         try:
             master_path = folder / group["master"]
-            signature = self.cached_master_signature(master_path, categories, document=document)
+            signature = self.cached_master_signature(master_path, categories)
         except Exception as exc:
             return "검사 실패", str(exc)
         followers = group.get("followers", [])
@@ -789,8 +796,8 @@ class App:
                         for target, source in mapping.items()
                     ]
                     delta = {
-                        "missing": 0, "target_only": 0, "missing_bases": 0,
-                        "missing_details": [], "target_only_details": [],
+                        "missing": 0, "master_sync": 0, "missing_bases": 0,
+                        "missing_details": [], "master_sync_details": [],
                     }
                     risk = {}
                     if not follower.get("base_map_confirmed"):
@@ -803,15 +810,11 @@ class App:
                             )
                             if delta.get("mapping_errors"):
                                 structure = "매핑 오류"
-                            elif delta["missing"] or delta["target_only"]:
-                                parts = []
-                                if delta.get("missing_bases"):
-                                    parts.append(f"Base 추가 {delta['missing_bases']}")
-                                if delta["missing"]:
-                                    parts.append(f"추가 예정 {delta['missing']}")
-                                if delta["target_only"]:
-                                    parts.append(f"자식 전용 {delta['target_only']}")
-                                structure = " · ".join(parts)
+                            elif delta["missing"] or delta["master_sync"]:
+                                structure = (
+                                    "마스터와 동기화 "
+                                    f"{delta['missing'] + delta['master_sync']}"
+                                )
                             else:
                                 structure = "동일"
                             risk = delta.get("scale_risk") or {}
@@ -827,6 +830,8 @@ class App:
                         follower_status = "매핑 필요"
                     elif follower.get("last_sync") and last_hash != signature:
                         follower_status = "마스터 변경"
+                    elif follower.get("last_sync") and delta.get("master_sync"):
+                        follower_status = "정규화 필요"
                     elif follower.get("last_sync") and follower.get("last_target_hash") != current_target_hash:
                         follower_status = "차이 있음"
                     elif follower.get("last_sync"):
@@ -839,9 +844,8 @@ class App:
                                 follower_status, follower.get("last_sync") or "—"),
                         tags=(
                             "follower_risk" if risk.get("level") == "blocked"
-                            else "follower_delta" if delta.get("missing") and delta.get("target_only")
-                            else "follower_missing" if delta.get("missing")
-                            else "follower_unique" if delta.get("target_only")
+                            else "follower_master_sync"
+                            if delta.get("missing") or delta.get("master_sync")
                             else "follower",
                         )
                     )
@@ -850,9 +854,7 @@ class App:
                         "role": "follower", "group": group, "follower": follower,
                         "master": master,
                         "missing_details": delta.get("missing_details") or [],
-                        "target_only_details": delta.get("target_only_details") or [],
-                        "missing_count": delta.get("missing", 0),
-                        "target_only_count": delta.get("target_only", 0),
+                        "master_sync_details": delta.get("master_sync_details") or [],
                         "scale_risk": delta.get("scale_risk") or {},
                     }
             independent = set(manifest.get("independent", []))
@@ -1116,12 +1118,16 @@ class App:
         self.delta_box.configure(state="normal")
         self.delta_box.delete("1.0", "end")
         if not item or item.get("role") != "follower":
-            self.delta_box.insert("end", "자식 행을 선택하면 추가 예정·자식 전용 Generator 상세가 표시됩니다.", "muted")
+            self.delta_box.insert(
+                "end",
+                "SPM 행을 선택하면 마스터와 동기화될 Generator 상세가 표시됩니다.",
+                "muted",
+            )
             self.delta_box.configure(state="disabled")
             return
         missing = item.get("missing_details") or []
-        unique = item.get("target_only_details") or []
-        if not missing and not unique:
+        master_sync = item.get("master_sync_details") or []
+        if not missing and not master_sync:
             self.delta_box.insert("end", "구조 차이 없음 — 마스터와 자식의 관리 대상 구조가 같습니다.", "muted")
             self.delta_box.configure(state="disabled")
             return
@@ -1143,9 +1149,17 @@ class App:
                 )
 
         if missing:
-            insert_group("추가 예정 — 동기화 시 자식에 추가될 구조", missing, "missing")
-        if unique:
-            insert_group("자식 전용 — 자식에만 있어 보존되는 구조", unique, "unique")
+            insert_group(
+                "마스터 → 현재 SPM — 마스터 기준으로 반영될 구조",
+                missing,
+                "missing",
+            )
+        if master_sync:
+            insert_group(
+                "현재 SPM → 마스터 — 마스터에 통합될 구조",
+                master_sync,
+                "master_sync",
+            )
         self.delta_box.configure(state="disabled")
 
     def on_double_click(self, _event=None):
@@ -1440,12 +1454,13 @@ class App:
             f"대상: {target_label}\n\n"
             + (
                 (
-                    "SK Batch가 만든 현재 정규화 3D mesh/plan/texture를 다시 적용해 "
-                    "대상 SPM의 Generator 연결을 갱신합니다. canonical Cluster SPM과 "
-                    "3D mesh 자체는 수정하지 않습니다."
+                    "canonical Cluster SPM 변경을 검사하고, 필요하면 SK Batch blend에서 "
+                    "정규화 3D prototype/plan/texture와 Atlas 설정을 자동 재생성한 뒤 "
+                    "현재 ON 대상 SPM의 Generator 연결을 갱신합니다."
                     if refresh_only else
-                    "Atlas 애드온을 Blender 5.1 배경 실행으로 호출해 대상 SPM의 기존 "
-                    "M_ 재료 mesh를 정규화 mesh로 교체합니다."
+                    "Blender 5.1 백그라운드에서 Cluster Normalizer와 Atlas를 연속 실행해 "
+                    "정규화 prototype/plan을 준비하고 대상 SPM의 기존 M_ 재료 mesh를 "
+                    "교체합니다."
                 )
                 if enabled else
                 "Atlas manifest의 백업 스냅샷으로 이 blend가 관리한 mesh와 Generator "
@@ -1471,6 +1486,13 @@ class App:
                     blender_exe=Path(
                         self.config.get("blender_exe") or DEFAULT_BLENDER
                     ),
+                    unit_probe_path=Path(
+                        self.config.get("cluster_unit_probe")
+                        or DEFAULT_CLUSTER_UNIT_PROBE
+                    ),
+                    capture_resolution=int(
+                        self.config.get("cluster_capture_resolution") or 1024
+                    ),
                 )
             else:
                 result = run_cluster_folder_relation_transaction(
@@ -1478,6 +1500,13 @@ class App:
                     enabled=enabled,
                     blender_exe=Path(
                         self.config.get("blender_exe") or DEFAULT_BLENDER
+                    ),
+                    unit_probe_path=Path(
+                        self.config.get("cluster_unit_probe")
+                        or DEFAULT_CLUSTER_UNIT_PROBE
+                    ),
+                    capture_resolution=int(
+                        self.config.get("cluster_capture_resolution") or 1024
                     ),
                 )
             report("Cluster SPM 메시/Generator 검증 완료", 95)
@@ -1674,32 +1703,14 @@ class App:
         def build(report):
             folder = followers[0]["folder"]
             master = followers[0]["master"]
-            report("마스터 구조 분석 중", 8)
-            manifest = engine.load_manifest(folder)
-            group = engine.find_group(manifest, master)
-            source, _text, color_updates, master_ref_renames, color_warnings = engine.standardize_master_document(
-                folder / master, group.get("base_categories") or {}
+            prepared = engine.build_group_sync_plans(
+                folder,
+                master,
+                [item["file"] for item in followers],
+                progress_callback=report,
             )
-            plans = []
-            for index, item in enumerate(followers, start=1):
-                report(
-                    f"미리보기 계산 중 · {item['file']} ({index}/{len(followers)})",
-                    15 + round(75 * (index - 1) / max(1, len(followers))),
-                )
-                follower = next(row for row in group["followers"] if row.get("file") == item["file"])
-                if not follower.get("base_map_confirmed"):
-                    raise engine.SyncError(f"Base 매핑을 먼저 확인하세요: {item['file']}")
-                plan = engine.build_sync_plan(
-                    folder / master, folder / item["file"],
-                    follower.get("base_map") or {}, group.get("base_categories") or {},
-                    master_document=source,
-                )
-                plan.master_color_updates = color_updates
-                plan.master_reference_renames = master_ref_renames
-                plan.warnings.extend(color_warnings)
-                plans.append(plan)
             report("미리보기 결과 정리 중", 95)
-            return plans
+            return prepared["plans"]
 
         def show(plans):
             lines = []
@@ -1756,7 +1767,9 @@ class App:
         message = (
             f"마스터: {master}\n자식: {', '.join(names)}\n\n"
             "적용 전 마스터와 모든 자식이 하나의 백업 폴더에 저장됩니다.\n"
-            "자식 전용 구조, GUID, Random Seed, 재질과 Node/Freehand Edit는 유지됩니다."
+            "자식에서 발견한 추가 Generator 구조는 마스터에 합쳐지고 선택 자식 전체에 "
+            "정규화됩니다. GUID, Random Seed, 재질과 Node/Freehand Edit는 각 SPM의 "
+            "로컬 값을 유지합니다."
         )
         if verify:
             message += (

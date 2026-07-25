@@ -14,7 +14,16 @@ import spm_audit
 from spm_audit import bone_lengths_from_xml, estimate_relative_value_from_probe
 
 
-def graph_generator(guid, name, generator_type, mode=0, style=0):
+def graph_generator(
+    guid,
+    name,
+    generator_type,
+    mode=0,
+    style=0,
+    hidden=False,
+    skin_type=0,
+    segment_mesh=False,
+):
     bone_properties = ""
     if generator_type == "Branch":
         bone_properties = """
@@ -22,10 +31,13 @@ def graph_generator(guid, name, generator_type, mode=0, style=0):
       <Property><Name>Physics:Bones</Name><Value>0</Value></Property>"""
     return f"""
   <Generator Type="{generator_type}">
-    <Name>{name}</Name><GUID>{guid}</GUID><Hidden>false</Hidden>
+    <Name>{name}</Name><GUID>{guid}</GUID><Hidden>{str(hidden).lower()}</Hidden>
     <Properties>
       <Property><Name>Generation:Mode</Name><Value>{mode}</Value></Property>
       <Property><Name>Generation:Style</Name><Value>{style}</Value></Property>
+      <Property><Name>Skin:Type</Name><Value>{skin_type}</Value></Property>
+      <Property><Name>Skin:Visibility</Name><Value>1</Value></Property>
+      <Property><Name>Segments:Features:Mesh:Enabled</Name><Value>{str(segment_mesh).lower()}</Value></Property>
       {bone_properties}
     </Properties>
   </Generator>"""
@@ -85,7 +97,179 @@ def probe_xml(generator_counts):
     return "<SpeedTreeRaw><Bones>" + "".join(bones) + "</Bones></SpeedTreeRaw>"
 
 
+def cluster_graph_xml():
+    generators = [
+        graph_generator("tree-gen", "Tree", "Tree"),
+        graph_generator(
+            "hidden-root-a",
+            "Visible Meshless Pivot A",
+            "Branch",
+            hidden=False,
+            skin_type=3,
+        ),
+        graph_generator("structural-a", "Structural A", "Branch"),
+        graph_generator("twig-a", "Twig A", "Branch"),
+        graph_generator("needle-a", "Needle A", "Branch"),
+        graph_generator(
+            "hidden-root-b",
+            "Hidden Root B",
+            "Branch",
+            hidden=True,
+            skin_type=3,
+        ),
+        graph_generator(
+            "hidden-middle-b",
+            "Hidden Middle B",
+            "Branch",
+            hidden=True,
+            skin_type=3,
+        ),
+        graph_generator("structural-b", "Structural B", "Branch"),
+        graph_generator("needle-b", "Needle B", "Branch"),
+    ]
+    nodes = [
+        graph_node("tree-node", "Tree", "tree-gen", ""),
+        graph_node(
+            "hidden-root-a-node",
+            "Branch",
+            "hidden-root-a",
+            "tree-node",
+        ),
+        graph_node(
+            "structural-a-node",
+            "Branch",
+            "structural-a",
+            "hidden-root-a-node",
+        ),
+        graph_node("twig-a-node", "Branch", "twig-a", "structural-a-node"),
+        graph_node("needle-a-1", "Branch", "needle-a", "twig-a-node"),
+        graph_node("needle-a-2", "Branch", "needle-a", "twig-a-node"),
+        graph_node(
+            "hidden-root-b-node",
+            "Branch",
+            "hidden-root-b",
+            "tree-node",
+        ),
+        graph_node(
+            "hidden-middle-b-node",
+            "Branch",
+            "hidden-middle-b",
+            "hidden-root-b-node",
+        ),
+        graph_node(
+            "structural-b-node",
+            "Branch",
+            "structural-b",
+            "hidden-middle-b-node",
+        ),
+        graph_node(
+            "needle-b-node",
+            "Branch",
+            "needle-b",
+            "structural-b-node",
+        ),
+    ]
+    return "<SpeedTree>" + "".join(generators + nodes) + "</SpeedTree>"
+
+
+def cluster_export_xml(generator_names):
+    bones = []
+    for bone_id, generator in enumerate(generator_names):
+        bones.append(
+            f'<Bone ID="{bone_id}" ParentID="-1" Generator="{generator}" '
+            'StartX="0" StartY="0" StartZ="0" '
+            'EndX="0" EndY="0" EndZ="30.48" />'
+        )
+    return "<SpeedTreeRaw><Bones>" + "".join(bones) + "</Bones></SpeedTreeRaw>"
+
+
 class SpmCalibrationEstimateTests(unittest.TestCase):
+    def test_cluster_plan_keeps_only_first_renderable_structural_roots(self):
+        plan = spm_audit.plan_cluster_root_bones(cluster_graph_xml())
+
+        self.assertTrue(plan["ready"])
+        self.assertEqual(
+            {item["name"] for item in plan["selected_generators"]},
+            {"Structural A", "Structural B"},
+        )
+        self.assertEqual(plan["expected_root_bone_count"], 2)
+        self.assertEqual(plan["disabled_generator_count"], 6)
+
+        patched = spm_audit.apply_cluster_root_bone_plan(
+            cluster_graph_xml(), plan
+        )
+        audit = spm_audit.audit_spm("unused.spm", text=patched)
+        enabled = {
+            item["name"]
+            for item in audit["generators"]
+            if item["style"] == 0.0 and item["bones"] == 1.0
+        }
+        disabled = {
+            item["name"]
+            for item in audit["generators"]
+            if item["style"] == 0.0 and item["bones"] == 0.0
+        }
+        self.assertEqual(enabled, {"Structural A", "Structural B"})
+        self.assertIn("Needle A", disabled)
+        self.assertIn("Needle B", disabled)
+        self.assertIn("Twig A", disabled)
+        self.assertIn("Visible Meshless Pivot A", disabled)
+        pivot = next(
+            item
+            for item in audit["generators"]
+            if item["name"] == "Visible Meshless Pivot A"
+        )
+        self.assertTrue(pivot["hidden"])
+
+    def test_cluster_calibration_writes_and_verifies_root_only_spm(self):
+        source_xml = cluster_graph_xml()
+        cfg = {
+            "cluster_root_only_bones": True,
+            "rename_materials": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster_dir = Path(tmp) / "cluster"
+            cluster_dir.mkdir()
+            spm_path = cluster_dir / "SK_leaf_example_01.spm"
+            spm_audit.write_spm(spm_path, source_xml)
+
+            def fake_xml_export(_spm_path, _cfg, out_path):
+                Path(out_path).write_text(
+                    cluster_export_xml(["Structural A", "Structural B"]),
+                    encoding="utf-8",
+                )
+                return out_path
+
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=fake_xml_export,
+            ):
+                with mock.patch.object(
+                    spm_audit,
+                    "export_verify_fbx_geometry",
+                    return_value=True,
+                ):
+                    report = spm_audit.process_spm(
+                        spm_path, cfg, log=lambda _message: None
+                    )
+
+            self.assertEqual(report["status"], "calibrated")
+            self.assertEqual(report["total_bones"], 2)
+            self.assertEqual(
+                report["calibration"]["mode"],
+                "cluster_first_renderable_root_absolute_1",
+            )
+            final_audit = spm_audit.audit_spm(spm_path)
+            enabled = {
+                item["name"]
+                for item in final_audit["generators"]
+                if item["bones"] == 1.0
+            }
+            self.assertEqual(enabled, {"Structural A", "Structural B"})
+
     def test_speedtree_timeout_becomes_manual_required_and_restores_source(self):
         source_xml = mixed_base_graph_xml()
         cfg = {

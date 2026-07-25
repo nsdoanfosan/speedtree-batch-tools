@@ -84,6 +84,14 @@ class SourceReviewPolicyTests(unittest.TestCase):
             "speedtree_spm = Path(args.speedtree_spm or args.spm)", source
         )
 
+    def test_bwr_receipt_records_the_live_canonical_spm_identity(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'pipeline_data["speedtree_live_source_identity"]',
+            source,
+        )
+        self.assertIn('"spm": source_identity(canonical_spm)', source)
+
 
 if __name__ == "__main__":
     unittest.main()

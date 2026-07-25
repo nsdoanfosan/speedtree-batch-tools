@@ -74,6 +74,11 @@ DEFAULT_CONFIG = {
     "value_floor": 0.02,
     "max_calibration_rounds": 4,
     "probe_cache_enabled": True,
+    # Cluster prototype SPMs use exactly one Absolute bone on the first
+    # renderable structural Branch below each Tree root. Meshless placement
+    # Trunks and terminal needle/leaf spines stay at Absolute/0 and never reach
+    # Blender as long pivot bones or hundreds of Start/End pairs.
+    "cluster_root_only_bones": True,
     # Stop after the first bad Relative/FBX verification. Restore the source
     # and mark it for manual handling instead of paying for more ~16s launches.
     "fast_skip_problem_spm": True,
@@ -93,6 +98,7 @@ DEFAULT_CONFIG = {
     "spm_verify_timeout": 120,
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
+    "cluster_receipt_refresh_timeout": 600,
     "push_job_timeout": 1800,
     # Avoid wedging Unreal's synchronous RPC queue with assets that are faster
     # to handle manually than to import through the unattended handoff.
@@ -417,6 +423,7 @@ def _calibration_settings_signature(cfg, include_hashed_stat=False):
         "value_floor",
         "max_calibration_rounds",
         "probe_cache_enabled",
+        "cluster_root_only_bones",
         "fast_skip_problem_spm",
         "spm_verify_timeout",
         "rename_materials",

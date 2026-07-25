@@ -269,14 +269,13 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertIn("SK_branch_elm_01.spm", label)
         self.assertNotIn("branch_elm_01.spm →", label)
         self.assertNotIn("Atlas output", label)
-        # Carrying the canonical SK_ name does not turn a Cluster authoring
-        # source into a calibration target.
-        self.assertFalse(gui.should_calibrate_spm(app.items[iid]))
+        # Cluster rows use the dedicated one-root-per-piece stage-① policy.
+        self.assertTrue(gui.should_calibrate_spm(app.items[iid]))
 
-    def test_cluster_authoring_spm_is_never_a_calibration_target(self):
-        # Calibration writes Physics:Bones into the SPM; on a Cluster source
-        # that invalidates the normalized blend's recorded bone contract, and
-        # an interrupted run leaves injected bones behind.
+    def test_cluster_authoring_spm_uses_dedicated_root_only_calibration(self):
+        # Canonical and legacy Cluster row names both route through stage ①;
+        # spm_audit selects the first renderable structural roots and writes
+        # Absolute/1 instead of using the normal tree density solver.
         gui = load_gui_module()
         for name in ("SK_branch_elm_01.spm", "branch_elm_01.spm"):
             item = {
@@ -284,7 +283,14 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 "source_read_only": False,
                 "manual_bones_locked": False,
             }
-            self.assertFalse(gui.should_calibrate_spm(item), name)
+            self.assertTrue(gui.should_calibrate_spm(item), name)
+
+        read_only_item = {
+            "spm": Path("Tree_elm/Cluster/SK_branch_elm_01.spm"),
+            "source_read_only": True,
+            "manual_bones_locked": False,
+        }
+        self.assertFalse(gui.should_calibrate_spm(read_only_item))
 
         tree_item = {
             "spm": Path("Tree_elm/SK_Tree_elm_01.spm"),

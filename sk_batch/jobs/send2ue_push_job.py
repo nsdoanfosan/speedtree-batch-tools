@@ -58,6 +58,11 @@ from cluster_spm_pair_contract import (
     ClusterSpmPairPathError,
     resolve_cluster_spm_pair,
 )
+from dynamic_wind_handoff_policy import (
+    CLUSTER_ASSET_ROLE_KEY,
+    CLUSTER_GENERATED_FLAG,
+    resolve_dynamic_wind_policy,
+)
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
@@ -289,7 +294,7 @@ def target_material_compile_failures(log_path, offset, material_names):
 
 
 def find_export_unit_name():
-    """The Empty under the Export collection names the FBX -> the UE asset."""
+    """The first prepared Empty under Export names the primary UE asset."""
     coll = bpy.data.collections.get("Export")
     if not coll:
         return None
@@ -297,6 +302,27 @@ def find_export_unit_name():
         if obj.type == "EMPTY" and obj.children:
             return obj.name
     return None
+
+
+def export_object_wind_facts():
+    """Describe only the facts needed to select the DynamicWind handoff."""
+    collection = bpy.data.collections.get("Export")
+    if collection is None:
+        return []
+    facts = []
+    for obj in collection.all_objects:
+        row = {
+            "name": obj.name,
+            "type": obj.type,
+            "cluster_generated": bool(obj.get(CLUSTER_GENERATED_FLAG, False)),
+            "asset_role": obj.get(CLUSTER_ASSET_ROLE_KEY),
+        }
+        if obj.type == "ARMATURE" and obj.data is not None:
+            row["bone_names"] = [bone.name for bone in obj.data.bones]
+        elif obj.type == "MESH":
+            row["vertex_groups"] = [group.name for group in obj.vertex_groups]
+        facts.append(row)
+    return facts
 
 
 def unreal_editor_running():
@@ -635,7 +661,7 @@ def main():
         if hasattr(scene_props, "skip_animation_export"):
             scene_props.skip_animation_export = True
 
-        unit_name = find_export_unit_name() or Path(blend_path).stem
+        unit_name = find_export_unit_name() or spm_path.stem
         folder = scene_props.unreal_mesh_folder_path
         report["unit_name"] = unit_name
         report["unreal_folder"] = folder
@@ -652,11 +678,15 @@ def main():
 
         blend_dir = Path(blend_path).parent
         mesh_path = folder.rstrip("/") + "/" + unit_name
+        # BWR writes the final-skeleton wind contract from the selected SPM
+        # identity. Never derive it from a mutable Blender object name.
+        wind_source_stem = spm_path.stem
         wind_json = (
             blend_dir
             / "JSON"
-            / f"{unit_name}_dynamic_wind_import_from_megaplant_groups.json"
+            / f"{wind_source_stem}_dynamic_wind_import_from_megaplant_groups.json"
         )
+        report["wind_source_stem"] = wind_source_stem
 
         report["stage"] = "send2ue_export"
         result = bpy.ops.wm.send2ue("EXEC_DEFAULT")
@@ -701,6 +731,19 @@ def main():
                 "ingest_plan": cluster_plan,
             }
 
+        cluster_assembly_status = (
+            cluster_assembly["ingest_plan"].get("status")
+            if cluster_assembly is not None
+            else None
+        )
+        wind_policy = resolve_dynamic_wind_policy(
+            export_object_wind_facts(),
+            explicit_skip=args.skip_wind,
+            cluster_assembly_status=cluster_assembly_status,
+        )
+        wind_json_enabled = bool(wind_policy["requires_json"])
+        report["wind_policy"] = wind_policy
+
         exported_files = manifest_asset_files(manifest_assets)
         if cluster_assembly is not None:
             for generated in (cluster_assembly["ingest_plan"].get("assets") or []):
@@ -710,10 +753,22 @@ def main():
         json_dir = blend_dir / "JSON"
         handoff_paths = []
         if json_dir.is_dir():
+            handoff_stems = {
+                unit_name.casefold(),
+                wind_source_stem.casefold(),
+                speedtree_spm.stem.casefold(),
+            }
             handoff_paths = [
                 path
                 for path in sorted(json_dir.glob("*.json"))
-                if unit_name.casefold() in path.stem.casefold()
+                if any(
+                    stem in path.stem.casefold()
+                    for stem in handoff_stems
+                )
+                and (
+                    wind_json_enabled
+                    or path.resolve() != wind_json.resolve()
+                )
             ]
         for path in command_json_files(manifest_assets):
             if path not in handoff_paths:
@@ -721,9 +776,14 @@ def main():
         handoff_files = [file_fingerprint(path) for path in handoff_paths]
         wind_file = (
             None
-            if args.skip_wind or not wind_json.is_file()
+            if not wind_json_enabled or not wind_json.is_file()
             else file_fingerprint(wind_json)
         )
+        if wind_json_enabled and wind_file is None:
+            raise RuntimeError(
+                "required final-skeleton dynamic wind JSON missing: "
+                + str(wind_json)
+            )
         if cluster_assembly is not None and cluster_assembly["ingest_plan"].get("status") == "ready":
             expected_wind = (
                 cluster_assembly["manifest"].get("wind_contract") or {}
@@ -747,6 +807,12 @@ def main():
             file_fingerprint(args.unreal_ingest),
             file_fingerprint(args.send2ue_unreal_py),
         ]
+        wind_policy_module = (
+            Path(__file__).resolve().parents[1]
+            / "dynamic_wind_handoff_policy.py"
+        )
+        if wind_policy_module.is_file():
+            code_files.append(file_fingerprint(wind_policy_module))
         cluster_builder = Path(__file__).resolve().parents[1] / "cluster_assembly_builder.py"
         if cluster_builder.is_file():
             code_files.append(file_fingerprint(cluster_builder))
@@ -770,6 +836,7 @@ def main():
             "exported_files": exported_files,
             "handoff_files": handoff_files,
             "wind_file": wind_file,
+            "wind_policy": wind_policy,
             "code_files": code_files,
             "cluster_assembly": cluster_assembly,
             "material_asset_scope": material_asset_scope,
@@ -786,7 +853,7 @@ def main():
             "queue_id": queue_id,
             "fingerprint": fingerprint,
             "send2ue_unreal_py": str(Path(args.send2ue_unreal_py).resolve()),
-            "wind_json": None if args.skip_wind else str(wind_json),
+            "wind_json": str(wind_json) if wind_json_enabled else None,
             "checkout_asset_paths": [
                 mesh_path,
                 mesh_path + "_Skeleton",

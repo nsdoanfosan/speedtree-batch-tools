@@ -98,6 +98,152 @@ class PushQueueFlowTests(unittest.TestCase):
     def targets(*names):
         return [{"spm": Path(name), "checked": True} for name in names]
 
+    def test_blender_repair_waits_for_cluster_sources_before_root_assets(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"blender_parallel_jobs": 2}
+        completed_clusters = set()
+        downstream_snapshots = []
+        lock = threading.Lock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "Tree_elm"
+            cluster = root / "Cluster"
+            cluster_targets = [
+                cluster / "SK_branch_elm_01.spm",
+                cluster / "SK_leaf_elm_01.spm",
+            ]
+            root_targets = [
+                root / "SK_Tree_elm_01.spm",
+                root / "SK_Tree_elm_02.spm",
+            ]
+            targets = [
+                {"spm": root_targets[0], "checked": True},
+                {"spm": cluster_targets[0], "checked": True},
+                {"spm": root_targets[1], "checked": True},
+                {"spm": cluster_targets[1], "checked": True},
+            ]
+
+            def fake_blender(_iid, spm, _item):
+                with lock:
+                    if gui.is_cluster_source_spm(spm):
+                        completed_clusters.add(spm)
+                    else:
+                        downstream_snapshots.append(set(completed_clusters))
+
+            app._job_blender = mock.Mock(side_effect=fake_blender)
+            with mock.patch.object(gui, "LOG_DIR", Path(temp_dir) / "logs"), \
+                    mock.patch.object(gui, "save_state"):
+                result = app._run_batch(
+                    "blender", targets, emit_done=False
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(len(downstream_snapshots), len(root_targets))
+        self.assertTrue(
+            all(
+                snapshot == set(cluster_targets)
+                for snapshot in downstream_snapshots
+            )
+        )
+
+    def test_failed_cluster_repair_blocks_only_its_dependent_roots(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"blender_parallel_jobs": 1}
+        calls = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_root = Path(temp_dir) / "Tree_elm"
+            second_root = Path(temp_dir) / "Tree_maple"
+            failed_cluster = (
+                first_root / "Cluster" / "SK_branch_elm_01.spm"
+            )
+            blocked_root = first_root / "SK_Tree_elm_01.spm"
+            independent_root = second_root / "SK_Tree_maple_01.spm"
+            targets = [
+                {"spm": failed_cluster, "checked": True},
+                {"spm": blocked_root, "checked": True},
+                {"spm": independent_root, "checked": True},
+            ]
+
+            def fake_blender(_iid, spm, _item):
+                calls.append(spm)
+                if spm == failed_cluster:
+                    raise RuntimeError("cluster repair failed")
+
+            app._job_blender = mock.Mock(side_effect=fake_blender)
+            with mock.patch.object(
+                gui, "LOG_DIR", Path(temp_dir) / "logs"
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_batch(
+                    "blender", targets, emit_done=False
+                )
+
+        self.assertTrue(result)
+        self.assertIn(failed_cluster, calls)
+        self.assertNotIn(blocked_root, calls)
+        self.assertIn(independent_root, calls)
+        self.assertIn(str(blocked_root), app._phase_failed_items)
+        self.assertEqual(
+            app.state[str(blocked_root)]["blend_status_kind"],
+            "dependency_blocked",
+        )
+        self.assertIn(
+            failed_cluster.name,
+            app.state[str(blocked_root)]["blend_status"],
+        )
+
+    def test_blender_repair_blocks_an_interactively_open_target(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = True
+        app._prepare_pair_for_job = mock.Mock(side_effect=lambda spm: spm)
+        app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+        app._handoff_ready = mock.Mock(return_value=(False, "stale"))
+        spm = Path("D:/asset/SK_branch_test_01.spm")
+        blend = spm.with_suffix(".blend")
+
+        with mock.patch.object(
+            gui, "speedtree_output_spm_for", return_value=spm
+        ), mock.patch.object(
+            gui, "blend_path_for", return_value=blend
+        ), mock.patch.object(
+            gui,
+            "blender_open_file_window_titles",
+            return_value=[f"* SK_branch_test_01 [{blend}] - Blender 5.1"],
+        ):
+            with self.assertRaises(gui.BatchItemError) as raised:
+                app._job_blender(
+                    str(spm), spm, {"spm": spm, "checked": True}
+                )
+
+        self.assertEqual(raised.exception.kind, "manual_required")
+        self.assertIn("대화형 Blender", str(raised.exception))
+
+    def test_push_preflight_blocks_unsaved_interactive_blender_changes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "headless"
+        app._unreal_running = mock.Mock(return_value=False)
+        app._handoff_ready = mock.Mock(return_value=(True, "ready"))
+        spm = Path("D:/asset/SK_branch_test_01.spm")
+        target = {"spm": spm, "checked": True}
+
+        with mock.patch.object(
+            gui,
+            "blender_open_file_window_titles",
+            return_value=["* SK_branch_test_01 [...] - Blender 5.1"],
+        ), mock.patch.object(gui, "save_state"):
+            ready, fatal = app._push_preflight([target])
+
+        self.assertEqual(ready, [])
+        self.assertIsNone(fatal)
+        app._handoff_ready.assert_not_called()
+        self.assertEqual(
+            app.state[str(spm)]["push_status_kind"], "manual_required"
+        )
+
     def test_push_contract_wrapper_requires_and_preserves_current_envelope(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
@@ -159,8 +305,17 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("name_stem=speedtree_spm.stem", bwr_source)
         self.assertIn("settings.name_stem = canonical_spm.stem", bwr_source)
         self.assertNotIn("canonical_spm.name[3:]", bwr_source)
-        self.assertIn("export_collection_contract_issues()", bwr_source)
+        self.assertIn('report["cluster_source_skin_contract"]', bwr_source)
+        self.assertIn(
+            'repair_settings["cluster_source_skin_contract"] = is_cluster_source',
+            bwr_source,
+        )
+        self.assertNotIn("cluster_single_bone_rigid_binding", bwr_source)
+        self.assertNotIn("rigid_existing_single_bone", bwr_source)
+        self.assertIn("export_collection_contract_issues(", bwr_source)
         self.assertIn("orphan_owned_export_empty:", bwr_source)
+        self.assertIn("cluster_unsuffixed_export_unit:", bwr_source)
+        self.assertIn("cluster_missing_normalized_export_pivot", bwr_source)
 
         push_source = (
             SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -172,6 +327,25 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertLess(sync_call, folder_read)
         self.assertIn("orphan_owned_export_empty:", push_source)
+        self.assertIn("wind_source_stem = spm_path.stem", push_source)
+        self.assertIn(
+            'f"{wind_source_stem}_dynamic_wind_import_from_megaplant_groups.json"',
+            push_source,
+        )
+        self.assertNotIn(
+            'f"{unit_name}_dynamic_wind_import_from_megaplant_groups.json"',
+            push_source,
+        )
+        self.assertIn("resolve_dynamic_wind_policy(", push_source)
+        self.assertIn(
+            "unit_name = find_export_unit_name() or spm_path.stem",
+            push_source,
+        )
+        self.assertNotIn("find_export_unit_name(spm_path.stem)", push_source)
+        self.assertIn(
+            '"wind_json": str(wind_json) if wind_json_enabled else None',
+            push_source,
+        )
         push_tree = ast.parse(push_source)
         calls = [node for node in ast.walk(push_tree) if isinstance(node, ast.Call)]
 
@@ -223,6 +397,57 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(app.state["SK_bad.spm"]["push_status_kind"], "data_error")
         self.assertEqual(
             app.state["SK_manual.spm"]["push_status_kind"], "manual_required"
+        )
+
+    def test_rpc_push_blocks_only_roots_whose_auto_cluster_failed(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        cluster = Path("Tree_elm") / "Cluster" / "SK_any_cluster.spm"
+        blocked_root = Path("Tree_elm") / "SK_Tree_elm.spm"
+        independent_root = Path("Tree_maple") / "SK_Tree_maple.spm"
+        cluster_item = {"spm": cluster, "checked": False}
+        blocked_item = {"spm": blocked_root, "checked": True}
+        independent_item = {"spm": independent_root, "checked": True}
+        expanded = [cluster_item, blocked_item, independent_item]
+        app.items = {
+            str(item["spm"]): item for item in expanded
+        }
+        attempted = []
+
+        def fake_push(_iid, spm):
+            attempted.append(spm)
+            if spm == cluster:
+                raise gui.BatchItemError(
+                    "cluster import failed", kind="data_error"
+                )
+
+        with mock.patch.object(
+            gui,
+            "expand_push_targets",
+            return_value=(
+                expanded,
+                {
+                    str(blocked_root): (str(cluster),),
+                    str(independent_root): (),
+                },
+                {str(cluster)},
+            ),
+        ), mock.patch.object(
+            app, "_push_preflight", return_value=(expanded, None)
+        ), mock.patch.object(
+            app, "_job_push", side_effect=fake_push
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch(
+                "push",
+                [blocked_item, independent_item],
+                emit_done=False,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(attempted, [cluster, independent_root])
+        self.assertEqual(
+            app.state[str(blocked_root)]["push_status_kind"],
+            "dependency_blocked",
         )
 
     def test_full_pipeline_does_not_forward_failed_items_to_later_phases(self):
@@ -555,6 +780,114 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             app.state["SK_second.spm"]["push_status_kind"], "imported_ok"
+        )
+
+    def test_headless_verifies_cached_cluster_before_dependent_tree(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app._phase_failed_items = set()
+        cluster = Path("Tree_elm") / "Cluster" / "SK_cluster_any.spm"
+        root = Path("Tree_elm") / "SK_Tree_elm.spm"
+        app._active_push_dependency_map = {
+            str(root): (str(cluster),)
+        }
+        app.cfg = {
+            "blender_parallel_jobs": 1,
+            "unreal_editor_cmd": "UnrealEditor-Cmd.exe",
+            "unreal_project": "MyProject2.uproject",
+            "headless_item_crash_retries": 2,
+            "headless_batch_max_restarts": 0,
+            "headless_job_timeout": 100,
+        }
+        targets = [
+            {"spm": cluster, "checked": False},
+            {"spm": root, "checked": True},
+        ]
+        exported = [
+            {
+                "queue_id": str(cluster),
+                "fingerprint": "cluster-v1",
+                "report_path": "cluster-report.json",
+                "assets": [
+                    {
+                        "asset_data": {
+                            "asset_path": "/Game/Tree/Cluster/SK_cluster_any_01"
+                        }
+                    }
+                ],
+            },
+            {
+                "queue_id": str(root),
+                "fingerprint": "root-v1",
+                "report_path": "root-report.json",
+                "assets": [],
+            },
+        ]
+        app.state[str(cluster)] = {
+            "push_import_fingerprint": "cluster-v1"
+        }
+        captured = {}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def fake_commandlet(_cmd, log_name, _timeout, **kwargs):
+                manifest_path = Path(
+                    kwargs["env"]["SK_BATCH_MANIFEST_PATH"]
+                )
+                checkpoint_path = Path(
+                    kwargs["env"]["SK_BATCH_CHECKPOINT_PATH"]
+                )
+                report_path = Path(kwargs["env"]["SK_BATCH_REPORT_PATH"])
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                captured["items"] = manifest["items"]
+                states = {
+                    item["queue_id"]: {
+                        "status": "imported_ok",
+                        "fingerprint": item["fingerprint"],
+                    }
+                    for item in manifest["items"]
+                }
+                checkpoint_path.write_text(
+                    json.dumps(
+                        {
+                            "complete": True,
+                            "current_item": None,
+                            "items": states,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                report_path.write_text(
+                    json.dumps({"status": "complete", "items": states}),
+                    encoding="utf-8",
+                )
+                kwargs["progress_callback"](1.0, "done")
+                return 0, temp_root / log_name
+
+            with mock.patch.object(
+                gui, "LOG_DIR", temp_root
+            ), mock.patch.object(
+                app, "_export_manifest_item", side_effect=exported
+            ), mock.patch.object(
+                app, "_run_limited", side_effect=fake_commandlet
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_headless_push_batch(
+                    targets, emit_done=False
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            [item["queue_id"] for item in captured["items"]],
+            [str(cluster), str(root)],
+        )
+        self.assertTrue(captured["items"][0]["verify_existing_assets"])
+        self.assertEqual(
+            captured["items"][1]["depends_on_queue_ids"],
+            [str(cluster)],
         )
 
 

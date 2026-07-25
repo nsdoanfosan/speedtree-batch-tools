@@ -43,6 +43,17 @@ SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 �
 오래 걸리는 단계를 돌리기 전에 항상 먼저 눌러보는 용도.
 
 **① SPM 본 세팅 (파일별 편차 있음, 기본 4개 동시 실행)** — SPM만 수정:
+- **Cluster 구조 루트 본 정규화**: `Cluster` 폴더의 SPM도 ①을 건너뛰지 않는다.
+  각 Tree 루트 아래 첫 번째 실제 렌더 메시를 찾고 그 구조 루트만 `Absolute/1`,
+  나머지 Branch는 `Absolute/0`으로 만든다. 메시가 없는 배치용 pivot Branch는
+  숨김 처리한다. 한 SPM에 사용 조각이 여러 개면 구조 루트와 축도 여러 개다.
+  XML에서 각 사용 Cluster 조각마다 루트 본이 정확히 하나이고 descendant 본이
+  없는지, FBX에 실제 메시 지오메트리가 남는지까지 검증한 뒤 저장한다.
+  Blender Repair는 FBX의 짧은 `_End` marker를 축 본으로 쓰지 않는다. Raw XML의
+  렌더 구조 루트 `Start→End`를 `Bone_N_Start` 본 하나로 재구성하고, 여러 조각은
+  서로 parent가 없는 독립 축으로 유지한다. 일반 트리용 Base reparent는 Cluster에
+  적용하지 않는다.
+  실패·중단 시 일반 캘리브레이션과 같은 백업/marker 복구를 적용한다.
 - **본 캘리브레이션 (총 본 수 예산 방식)**: SpeedTree의 Relative 본 스타일은
   spline 길이에 비례해 본을 넣으므로, 값이 낮으면 짧은 잔가지는 자동으로
   0본이 된다(원하는 동작). 문제는 "가지당 평균 N본"을 목표로 잡으면 가지가
@@ -122,6 +133,12 @@ SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 �
 BWR `SpeedTree → Import → Repair` 실행, wind 프리셋은 파일명 기반 자동
 (tree/bush/weed·grass, deadleaves·deadbranches=무바람), SPM 옆에 같은 이름
 `.blend` + wind JSON 저장. **이미 SPM보다 최신인 blend는 건너뛴다**
+Cluster FBX에 양수 skin weight가 있으면 ①의 구조 루트 수에 대응하는 다중
+`*_Start` deform root와 `*_End` 축 끝점을 그대로 보존해 Cluster Normalizer의
+연결 컴포넌트 분할에 넘긴다. 단일 구조 루트 FBX가 armature와 축 본은 내보내지만
+skin deformer를 완전히 생략한 경우에만, 실제 imported deform bone 하나를 보존하고
+사용 메시 전체를 그 본에 weight 1.0으로 rigid 바인딩한다. 완전 무스킨 상태에서
+본 수가 하나가 아니면 정상 다축 리그를 평탄화하지 않고 즉시 실패한다.
 ("완료된 항목도 다시 실행"으로 강제 가능). 재실행 = 갱신. 배치 Blender는
 `--factory-startup`으로 시작하고 BWR만 명시적으로 켜므로 사용자용 애드온의 시작
 오류와 등록 비용을 가져오지 않는다. SpeedTree가 만든 `.stmat`의 실제 Material
@@ -136,6 +153,9 @@ receipt의 최초 Generator GUID를 읽어 담당한다. 현재 재질 경로나
 계보는 유지되며, Generator Sync는 receipt 소유 GUID의 전경색을 덮어쓰지 않는다.
 표시색만 있고 receipt가 없는 경우는 과거 문제 표시와 구분할 수 없으므로 자동
 분류하지 않는다. 이후 재질 사전검사는 이 색을 변경하거나 원복하지 않는다.
+Cluster Assembly 영수증이 현재 산출물 해시보다 오래된 경우에는 PCG 폴더 감사를
+한 번 자동 재실행하고, 새 영수증이 실제 현재 해시로 검증된 뒤에만 Blender를
+시작한다. 오래된 영수증을 무시하거나 완화해서 통과시키지는 않는다.
 
 **③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
 새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,
@@ -143,7 +163,18 @@ blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비
 이유를 표에 남기고 건너뛰고, 준비된 것만 헤드리스 send2ue로 push한다
 (임포트 시 머티리얼 파이프라인이 wind JSON 연결까지 자동 수행 + 디스크 저장).
 headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
-안전하게 순차 실행한다.
+안전하게 순차 실행한다. Blender 오브젝트 이름에 충돌 방지 숫자가 붙더라도 wind
+JSON은 오브젝트명이 아니라 선택한 SPM의 정규 이름으로 연결한다.
+Cluster Assembly가 있는 Tree만 선택해도 BWR manifest의 실제
+`parts[].external_source.source_blend`를 따라 필요한 Cluster SPM을 자동 포함한다.
+이때 이름이나 개수를 추측하지 않으며, Cluster source/export fingerprint가 최신이면
+기존 export cache를 사용한다. Unreal import에서는 그 Cluster 자산이 현재 프로젝트에
+실제로 존재하는지 확인하고, 모두 있으면 재임포트 없이 통과하며 누락된 경우에만
+캐시된 export를 먼저 임포트한다. Cluster가 실패하면 그 Cluster를 요구하는 Tree만
+`not_run`으로 남기고 독립 항목은 계속 처리한다.
+단, 정규화된 Cluster 프로토타입이 생성 태그와 단일 `part_root` 계약을 만족하면
+그 원본 리그용 JSON은 적용하지 않고 최종 Assembly 스켈레톤 재바인딩 단계까지
+DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSON은 계속 필수다.
 
 ②/③ 실패 시 표와 저장 상태에는 `Unreal 연결 실패`, `메시를 찾지 못함`,
 `add-on 로드 실패`, `FBX 메시 지오메트리 없음`, `시간 초과`처럼 짧은 원인을

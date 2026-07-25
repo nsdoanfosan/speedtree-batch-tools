@@ -233,7 +233,11 @@ class ClusterBlendSyncTests(unittest.TestCase):
             ) as run:
                 with self.assertRaises(ClusterBlendSyncError):
                     run_cluster_relation_transaction(
-                        blend, [target], enabled=True, blender_exe=blender
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
                     )
 
             command = run.call_args.args[0]
@@ -270,7 +274,11 @@ class ClusterBlendSyncTests(unittest.TestCase):
             ):
                 with self.assertRaises(ClusterBlendSyncError) as caught:
                     run_cluster_relation_transaction(
-                        blend, [selected], enabled=True, blender_exe=blender
+                        blend,
+                        [selected],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
                     )
 
             self.assertEqual(already_on.read_bytes(), b"clean-01")
@@ -280,6 +288,76 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 registry_before,
             )
             self.assertIn("Rolled back SPM(s)", str(caught.exception))
+
+    def test_on_failure_restores_capture_manifest_and_maps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            reports = cluster / "reports"
+            xml_dir = cluster / "xml"
+            reports.mkdir(parents=True)
+            xml_dir.mkdir()
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.write_bytes(b"blend")
+            source = cluster / "SK_branch_elm_01.spm"
+            source.write_bytes(b"source")
+            (xml_dir / "SK_branch_elm_01.xml").write_bytes(b"xml")
+            target = owner / "SK_Tree_elm_01.spm"
+            target.write_bytes(b"target")
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            manifest = cluster / "branch_elm_01_auto_capture_manifest.json"
+            color = cluster / "branch_elm_01.tga"
+            manifest.write_bytes(b"good-manifest")
+            color.write_bytes(b"good-color")
+            receipt = (
+                reports
+                / "SK_branch_elm_01_cluster_normalization_sync_receipt.json"
+            )
+            receipt.write_bytes(b"good-receipt")
+
+            recipe = {
+                "kind": "speedtree_cluster_sync_normalization_recipe",
+                "normalization_required": True,
+                "blend": str(blend),
+                "receipt_path": str(receipt),
+                "capture_output_dir": str(cluster),
+                "capture_prefix": "branch_elm_01",
+            }
+
+            def half_write(*_args, **_kwargs):
+                manifest.write_bytes(b"bad-manifest")
+                color.write_bytes(b"bad-color")
+                blend.write_bytes(b"bad-blend")
+                receipt.write_bytes(b"bad-receipt")
+                (cluster / "branch_elm_01_AO.tga").write_bytes(b"new-partial")
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="expected failure",
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.resolve_normalization_recipe",
+                return_value=recipe,
+            ), mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=half_write,
+            ):
+                with self.assertRaises(ClusterBlendSyncError):
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        unit_probe_path=Path(temporary) / "unit.json",
+                    )
+
+            self.assertEqual(manifest.read_bytes(), b"good-manifest")
+            self.assertEqual(color.read_bytes(), b"good-color")
+            self.assertEqual(blend.read_bytes(), b"blend")
+            self.assertEqual(receipt.read_bytes(), b"good-receipt")
+            self.assertFalse((cluster / "branch_elm_01_AO.tga").exists())
 
     def test_on_timeout_restores_spms_and_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -302,7 +380,11 @@ class ClusterBlendSyncTests(unittest.TestCase):
             ):
                 with self.assertRaises(ClusterBlendSyncError):
                     run_cluster_relation_transaction(
-                        blend, [target], enabled=True, blender_exe=blender
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
                     )
 
             self.assertEqual(target.read_bytes(), b"clean")

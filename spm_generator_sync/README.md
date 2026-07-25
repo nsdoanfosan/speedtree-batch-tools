@@ -20,7 +20,8 @@ weed_black_locast
   - 예: `Ref_Leaf_3_001`, `Ref_BranchBig_2_001`
   - 영문·숫자·밑줄만 사용하고 전체 Generator 이름과 충돌하면 다음 번호 사용
   - BaseRef의 계층 순서에 따라 같은 Base 안에서 번호 부여
-- 마스터에만 있는 `추가 예정` Generator 구조
+- 마스터와 현재 SPM 사이에 차이가 있는 Generator 구조
+- 자식에서 발견한 추가 Generator 구조를 마스터에 먼저 합친 뒤 선택 자식 전체에 다시 배포
 - 자식에 대응 Base 자체가 없으면 해당 Base와 하위 구조를 자식 `Tree` 아래에 새로 연결
 - 새 Generator의 Material/Mesh 참조는 마스터의 숫자 ID를 그대로 복사하지 않고, 에셋 이름을
   기준으로 자식 SPM의 로컬 ID로 변환
@@ -33,7 +34,6 @@ weed_black_locast
   - End: 빨간색
 - 같은 Base를 사용하는 BaseRef에도 같은 색 적용
 - `BranchBig`/`BranchSmall`처럼 같은 계열의 서로 다른 Base는 같은 색조 안에서 밝기를 다르게 표시
-- 자식 전용 Generator는 더 짙은 배경과 밝은 전경 아이콘으로 표시
 
 기본적으로 다음 항목은 자식의 값을 보존합니다.
 
@@ -43,7 +43,6 @@ weed_black_locast
 - BaseRef의 배치/Generation 설정
 - 기존 자식 Generator의 `Generation > Pass`
 - Node/Freehand Edit (`Nodes` XML은 수정하지 않음)
-- 자식에만 있는 `자식 전용` Generator 구조
 
 `Pass`는 자식별 Reference/Base 계산 순서에 속하므로 마스터 값으로 덮어쓰지 않습니다. 동기화 후에는
 SpeedTree 규칙에 따라 일반 계층의 `Parent pass <= Child pass`와
@@ -56,11 +55,11 @@ Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==`
 테이블에서 다시 찾아 안전하게 교정합니다. 이름이 같은 에셋도 없으면 마스터의 에셋 정의를 복사하며,
 미리보기 상세에는 `에셋 복사` 항목으로 머티리얼과 메시 이름 및 새 ID를 표시합니다.
 
-마스터와 자식의 같은 부모 아래에서 Generator Type별 순서를 기준으로 공통 노드를 대응시킵니다.
-마스터에 더 많은 노드가 있으면 `추가 예정`으로 표시하고 다음 동기화에서 자식에 추가합니다.
-이는 아직 동기화하지 않았거나 마스터를 나중에 수정했을 때 생깁니다. 자식에 더 많은 노드가
-있으면 `자식 전용`으로 표시하고 삭제하지 않습니다. 표에는 개수를 간단히 표시하고, 자식 행을
-선택하면 Base·Generator 이름·타입·경로를 모두 확인할 수 있습니다.
+마스터와 현재 SPM의 같은 부모 아래에서 Generator Type별 순서를 기준으로 공통 노드를 대응시킵니다.
+구조 차이는 방향과 관계없이 표에서 `마스터와 동기화`로 표시합니다. 적용 시 현재 SPM에서 발견된
+추가 구조를 메모리의 마스터에 먼저 합치고, 정규화된 마스터 구조를 선택 SPM 전체에 반영합니다.
+BaseRef 배치만 파일별 데이터로 남겨 이 구조 병합에서 제외합니다. 행을 선택하면 상세에서
+`마스터 → 현재 SPM`과 `현재 SPM → 마스터` 방향 및 Base·Generator 이름·타입·경로를 확인할 수 있습니다.
 
 ## 사용 순서
 
@@ -81,7 +80,7 @@ Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==`
    - 구조가 다른 두 Branch를 별도로 관리하려면 마스터도 `BranchBig`, `BranchSmall`처럼 Base를 분리하거나 하나를 `독립 Base`로 둡니다.
    - 동기화하지 않을 Base는 `독립 Base`로 둡니다.
 4. 마스터의 `Base 색 분류`를 확인합니다.
-5. `변경 미리보기`로 공통/추가 예정/자식 전용/색상 변경을 확인합니다.
+5. `변경 미리보기`로 마스터와 동기화될 구조·속성·색상 변경을 확인합니다.
 6. 선택 자식 또는 마스터의 모든 자식을 동기화합니다.
    - 하단 진행 표시줄에서 현재 파일과 `패치 계산 → XML 검사 → SpeedTree 사전검사 → 백업 → 저장`
      단계를 확인할 수 있습니다.
@@ -115,6 +114,8 @@ Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==`
 
 ## 성능
 
+- 동기화 실행은 각 대상 SPM을 한 번만 압축 해제·XML 파싱하고, 같은 메모리 문서를
+  마스터 구조 통합과 최종 반영 계획에 재사용합니다.
 - 폴더 보드는 SPM 수정 시간과 크기를 키로 Generator/Link 분석·구조 비교·동기화 해시를 캐시합니다.
 - 결과는 PC 로컬 `spm_generator_sync_cache.json`에 저장되어 파일이 바뀌지 않으면 반복 새로고침뿐
   아니라 프로그램을 닫았다 다시 열어도 기존 분석을 즉시 재사용합니다.
@@ -140,18 +141,25 @@ Base를 대상으로 보고, `|`, `&`, `!`, `()`, `*`, `?`, 따옴표, `=`, `==`
   `ON`/`OFF`로 표시한다. 기존 데이터가 일부 SK에만 연결되어 있으면 `PARTIAL`로
   감사되며 다음 ON/OFF 적용으로 한 상태로 정규화한다.
 - 관계 `ON`은 blend 옆 `<blend stem>.atlas_leaf_targets.json`에 기록된다.
-  적용 시 부모 식생 폴더 직하의 모든 `SK_*.spm`을 한 번에 등록하고 Blender 5.1에서
-  Atlas Leaf Mesh Builder를 호출하여 기존 `M_*` Material_v8의 embedded mesh를
-  제거한 뒤 Cluster Normalizer가 만든 plan mesh로 교체한다. Material 이름과 ID는
-  그대로 채택한다. sibling SPM을 새로 ON에 포함할 때는 같은 이름의 기존 source
-  Material을 각 SPM의 로컬 ID로 adoption 매핑하여 교체한다. 동일 blend의 기존
-  adoption 영수증은 재사용하지만 다른 Atlas scope 소유 재료는 계속 차단한다.
+  적용 시 부모 식생 폴더 직하의 모든 `SK_*.spm`을 한 번에 등록한다. 현재 SK Batch
+  BWR 보고서와 canonical Cluster SPM 해시를 먼저 확인하고, Blender 5.1에서
+  `PHYSICAL_DIRECT_CAPTURE` 8맵 촬영 → 연결 성분별 `part_root` Prototype →
+  Plan Mesh → Atlas handoff를 자동 실행한다. Blender에서 Cluster Normalizer를
+  따로 누를 필요가 없다.
+- Cluster Sync는 대상 SPM의 Generator/Branch 구조를 자동 복원·교체·숨김하지
+  않는다. 현재 존재하는 Frond/Leaf 슬롯만 Atlas 연결 근거로 사용하며 구조 교체는
+  사용자가 별도로 확인한 경우에만 수행한다.
+- Atlas Leaf Mesh Builder는 출력 이름과 같은 `M_*` Material_v8이 있으면 기존
+  embedded mesh를 자동 생성한 plan mesh로 갱신한다. 출력 재질이 없으면 같은 역할
+  이름의 새 Material/Mesh 자산만 생성하고 Generator 슬롯은 변경하지 않는다.
+  기존 출력 재질이 실제 Frond/Leaf 슬롯에 연결된 경우에만 source Material ID를
+  각 SPM에서 다시 해석하며, 다른 Atlas scope 소유 재료는 계속 차단한다.
 - `Cluster/SK_*.spm`의 SHA-256 또는 Blender physical-capture contract가 마지막
   대상 scope manifest와 달라지면 `Cluster 원본 변경 · 갱신 필요`로 표시한다.
-  3D mesh 재생성은 SK Batch가 담당하고, 이 도구의 `Cluster 갱신`은 현재
-  normalized blend/plan/texture를 현재 ON으로 연결된 부모 `SK_*.spm`에 다시
-  적용한다. `PARTIAL` 상태에서도 OFF 대상을 새로 연결하지 않고 기존 ON 대상만
-  갱신한다.
+  원본 SPM이 바뀌면 SK Batch가 최신 BWR blend를 먼저 만들고, 이 도구의
+  `Cluster 갱신`이 정규화/Plan/Atlas 단계를 다시 실행하여 현재 ON으로 연결된 부모
+  `SK_*.spm`에 적용한다. `PARTIAL` 상태에서도 OFF 대상을 새로 연결하지 않고 기존
+  ON 대상만 갱신한다.
 - 관계 `OFF`는 그 blend가 관리한 Generator 슬롯·Material/Mesh만 manifest의 원본
   스냅샷으로 폴더의 모든 SK에서 복원하고 JSON 목록에서 모두 해제한다. 실제 SPM
   파일은 삭제하지 않는다.

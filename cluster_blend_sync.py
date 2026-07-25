@@ -31,6 +31,10 @@ from cluster_spm_pair_contract import (
     ClusterSpmPairPathError,
     resolve_cluster_spm_pair,
 )
+from cluster_normalization_sync import (
+    ClusterNormalizationSyncError,
+    resolve_normalization_recipe,
+)
 
 
 BACKUP_NAME_TOKENS = (
@@ -188,6 +192,71 @@ def _restore_spm_files(snapshots):
             if rescue is not None:
                 detail += f" (snapshot kept at {rescue})"
             failed.append(detail)
+    return restored, failed
+
+
+def _normalization_artifact_paths(recipe):
+    """Files the Blender normalization stage may overwrite before Sync commits."""
+    if not recipe or not recipe.get("normalization_required"):
+        return []
+    output_dir = Path(recipe["capture_output_dir"]).expanduser().absolute()
+    prefix = str(recipe["capture_prefix"])
+    suffixes = (
+        "",
+        "_Opacity",
+        "_Normal",
+        "_Gloss",
+        "_Subsurface",
+        "_SubsurfaceAmount",
+        "_AO",
+        "_Height",
+    )
+    paths = (
+        [output_dir / f"{prefix}{suffix}.tga" for suffix in suffixes]
+        + [output_dir / f"{prefix}_auto_capture_manifest.json"]
+    )
+    # Normalizer saves both the rebuilt blend and its current-content receipt
+    # before Atlas starts writing owner SPMs.  They belong to the same outer
+    # relationship transaction as the capture maps.
+    paths.extend(
+        [
+            Path(recipe["blend"]).expanduser().absolute(),
+            Path(recipe["receipt_path"]).expanduser().absolute(),
+        ]
+    )
+    return paths
+
+
+def _snapshot_normalization_artifacts(recipe, directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    snapshots = []
+    for index, path in enumerate(_normalization_artifact_paths(recipe)):
+        path = Path(path)
+        copy = None
+        if path.is_file():
+            copy = directory / f"{index:02d}_{path.name}"
+            shutil.copy2(path, copy)
+        snapshots.append((path, copy))
+    return snapshots
+
+
+def _restore_normalization_artifacts(snapshots):
+    restored = []
+    failed = []
+    for path, copy in snapshots:
+        try:
+            if copy is None:
+                if path.exists():
+                    path.unlink()
+                    restored.append(str(path))
+                continue
+            if path.is_file() and path.read_bytes() == copy.read_bytes():
+                continue
+            shutil.copy2(copy, path)
+            restored.append(str(path))
+        except OSError as exc:
+            failed.append(f"{path}: {exc}")
     return restored, failed
 
 
@@ -555,9 +624,12 @@ def run_cluster_relation_transaction(
     *,
     enabled,
     blender_exe,
+    unit_probe_path=None,
+    capture_resolution=1024,
+    auto_normalize=True,
     timeout=1800,
 ):
-    """Apply ON through Atlas build, or OFF through reversible Atlas removal.
+    """Apply ON through automatic Normalizer + Atlas, or reversible OFF.
 
     The Atlas addon writes each SPM as it walks the target list, so a failure on
     one target used to leave the earlier ones carrying generated meshes and
@@ -582,6 +654,18 @@ def run_cluster_relation_transaction(
     blender = Path(blender_exe).expanduser().absolute()
     if not blender.is_file():
         raise ClusterBlendSyncError(f"Blender executable does not exist: {blender}")
+    normalization_recipe = None
+    if enabled and auto_normalize:
+        try:
+            normalization_recipe = resolve_normalization_recipe(
+                blend,
+                targets,
+                canonical_spm=blend.with_suffix(".spm"),
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+            )
+        except ClusterNormalizationSyncError as exc:
+            raise ClusterBlendSyncError(str(exc)) from exc
 
     job = Path(__file__).resolve().parent / "spm_generator_sync" / "jobs" / "cluster_relation_job.py"
     if not job.is_file():
@@ -591,6 +675,18 @@ def run_cluster_relation_transaction(
 
     with tempfile.TemporaryDirectory(prefix="cluster_relation_") as temporary:
         report_path = Path(temporary) / "report.json"
+        recipe_path = None
+        if normalization_recipe is not None:
+            recipe_path = Path(temporary) / "normalization_recipe.json"
+            recipe_path.write_text(
+                json.dumps(
+                    normalization_recipe,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         if enabled:
             for target in targets:
@@ -604,15 +700,33 @@ def run_cluster_relation_transaction(
         snapshots = _snapshot_spm_files(
             at_risk.values(), Path(temporary) / "spm_snapshots"
         )
+        normalization_snapshots = _snapshot_normalization_artifacts(
+            normalization_recipe,
+            Path(temporary) / "normalization_artifacts",
+        )
 
         def rollback():
             restored, failed = _restore_spm_files(snapshots)
+            capture_restored, capture_failed = (
+                _restore_normalization_artifacts(normalization_snapshots)
+            )
             if enabled:
                 if registry_before is None:
                     registry_path.unlink(missing_ok=True)
                 else:
                     registry_path.write_bytes(registry_before)
-            return _rollback_detail(restored, failed)
+            detail = _rollback_detail(restored, failed)
+            if capture_restored:
+                detail += (
+                    "\nRestored Cluster capture artifact(s): "
+                    + ", ".join(capture_restored)
+                )
+            if capture_failed:
+                detail += (
+                    "\nCOULD NOT restore Cluster capture artifact(s): "
+                    + "; ".join(capture_failed)
+                )
+            return detail
 
         command = [str(blender), "--factory-startup"]
         if enabled:
@@ -627,6 +741,8 @@ def run_cluster_relation_transaction(
         ])
         for target in targets:
             command.extend(["--target", str(target)])
+        if recipe_path is not None:
+            command.extend(["--normalization-recipe", str(recipe_path)])
         try:
             result = subprocess.run(
                 command,
@@ -655,6 +771,9 @@ def run_cluster_folder_relation_transaction(
     *,
     enabled,
     blender_exe,
+    unit_probe_path=None,
+    capture_resolution=1024,
+    auto_normalize=True,
     timeout=1800,
 ):
     """Normalize one Cluster blend relationship across every owner SK SPM."""
@@ -699,6 +818,9 @@ def run_cluster_folder_relation_transaction(
         selected,
         enabled=enabled,
         blender_exe=blender_exe,
+        unit_probe_path=unit_probe_path,
+        capture_resolution=capture_resolution,
+        auto_normalize=auto_normalize,
         timeout=timeout,
     )
     result["folder_target_count"] = len(owner_targets)

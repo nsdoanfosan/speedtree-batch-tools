@@ -27,6 +27,9 @@ ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
 ICON_PNG = REPO_DIR / "assets" / "speedtree_batch_tools_icon_512.png"
 ICON_ICO = REPO_DIR / "assets" / "speedtree_batch_tools.ico"
 APP_USER_MODEL_ID = "PARK.SpeedTree.BatchTools"
+BASE_WINDOW_TITLE = "SpeedTree Batch Tools — 통합 데이터 관리"
+ACTIVITY_POLL_MS = 250
+COMPLETION_BANNER_MS = 4000
 
 
 def record_error(label, exc) -> bool:
@@ -127,6 +130,82 @@ TOOLS = (
         REPO_DIR / "pcg_st9_texture_batch" / "PCG_ST9_Texture_Batch.bat",
     ),
 )
+
+
+def _string_var_value(app, *names):
+    """Read the first useful Tk status variable exposed by an embedded app."""
+
+    for name in names:
+        variable = getattr(app, name, None)
+        getter = getattr(variable, "get", None)
+        if not callable(getter):
+            continue
+        try:
+            value = str(getter()).strip()
+        except (AttributeError, RuntimeError, tk.TclError):
+            continue
+        if value:
+            return value
+    return ""
+
+
+def app_activity_snapshot(app):
+    """Return ``(is_busy, detail)`` for any of the three embedded tools.
+
+    Each tool keeps its own worker model.  The integrated launcher deliberately
+    observes their public-ish state instead of changing those job pipelines.
+    """
+
+    if app is None:
+        return False, ""
+
+    busy = bool(getattr(app, "_busy", False))
+    for name in ("worker", "scan_worker"):
+        worker = getattr(app, name, None)
+        is_alive = getattr(worker, "is_alive", None)
+        if callable(is_alive):
+            try:
+                busy = busy or bool(is_alive())
+            except RuntimeError:
+                pass
+
+    detail = _string_var_value(
+        app,
+        "progress_text_var",
+        "progress_var",
+        "status_var",
+    )
+    return busy, detail
+
+
+def activity_completion_detail(app, previous=""):
+    """Prefer a finished app status and never leave a stale “running” label."""
+
+    current = _string_var_value(
+        app,
+        "progress_text_var",
+        "progress_var",
+        "status_var",
+    )
+    in_progress_markers = (
+        "실행 중",
+        "스캔 중",
+        "검사 중",
+        "처리 중",
+        "저장 중",
+        "동기화 중",
+        "불러오는 중",
+        "재검사 중",
+    )
+    if current not in {"", "대기", "준비됨"} and not any(
+        marker in current for marker in in_progress_markers
+    ):
+        return current
+
+    previous = str(previous or "").replace("실행 중 0개", "완료").strip()
+    if previous and not any(marker in previous for marker in in_progress_markers):
+        return previous
+    return "작업이 정상적으로 끝났습니다."
 
 
 class ToolTab(ttk.Frame):
@@ -387,12 +466,15 @@ class IntegratedApp:
         self.load_states = ["pending"] * len(TOOLS)
         self.status_var = tk.StringVar(value="통합 도구 준비 중...")
         self.find_dialog = None
+        self._busy_indices = set()
+        self._last_activity_detail = ""
+        self._completion_after_id = None
 
-        root.title("SpeedTree Batch Tools — 통합 데이터 관리")
+        root.title(BASE_WINDOW_TITLE)
         root.geometry("1500x920")
         root.minsize(1120, 700)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
 
         style = ttk.Style(root)
         style.configure(
@@ -400,9 +482,65 @@ class IntegratedApp:
             padding=(18, 8),
             font=("Segoe UI", 10, "bold"),
         )
+        style.configure(
+            "Activity.Horizontal.TProgressbar",
+            troughcolor="#0d47a1",
+            background="#90caf9",
+            bordercolor="#0d47a1",
+            lightcolor="#90caf9",
+            darkcolor="#90caf9",
+            thickness=11,
+        )
+        style.configure(
+            "Success.Horizontal.TProgressbar",
+            troughcolor="#1b5e20",
+            background="#a5d6a7",
+            bordercolor="#1b5e20",
+            lightcolor="#a5d6a7",
+            darkcolor="#a5d6a7",
+            thickness=11,
+        )
+
+        self.activity_frame = tk.Frame(
+            root,
+            background="#0b57d0",
+            padx=14,
+            pady=8,
+        )
+        self.activity_frame.grid(row=0, column=0, sticky="ew")
+        self.activity_frame.columnconfigure(1, weight=1)
+        self.activity_heading_var = tk.StringVar(value="작업 실행 중")
+        self.activity_detail_var = tk.StringVar()
+        self.activity_heading = tk.Label(
+            self.activity_frame,
+            textvariable=self.activity_heading_var,
+            background="#0b57d0",
+            foreground="white",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+        )
+        self.activity_heading.grid(row=0, column=0, sticky="w")
+        self.activity_detail = tk.Label(
+            self.activity_frame,
+            textvariable=self.activity_detail_var,
+            background="#0b57d0",
+            foreground="#e8f0fe",
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.activity_detail.grid(row=0, column=1, sticky="ew", padx=(18, 12))
+        self.activity_progress = ttk.Progressbar(
+            self.activity_frame,
+            mode="indeterminate",
+            maximum=100,
+            length=250,
+            style="Activity.Horizontal.TProgressbar",
+        )
+        self.activity_progress.grid(row=0, column=2, sticky="e")
+        self.activity_frame.grid_remove()
 
         self.notebook = ttk.Notebook(root)
-        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.notebook.grid(row=1, column=0, sticky="nsew")
         self.tabs = []
         for index, spec in enumerate(TOOLS, start=1):
             tab = ToolTab(self.notebook)
@@ -411,7 +549,7 @@ class IntegratedApp:
             self._show_placeholder(index - 1)
 
         footer = ttk.Frame(root, padding=(8, 5))
-        footer.grid(row=1, column=0, sticky="ew")
+        footer.grid(row=2, column=0, sticky="ew")
         ttk.Label(
             footer,
             textvariable=self.status_var,
@@ -438,6 +576,7 @@ class IntegratedApp:
         root.bind("<Delete>", self.delete_selected_files)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._schedule_load(0)
+        self.root.after(ACTIVITY_POLL_MS, self._poll_activity)
 
     def current_app(self):
         selected = self.notebook.select()
@@ -582,6 +721,125 @@ class IntegratedApp:
 
         self.load_states[index] = "loaded"
         self.status_var.set(f"{spec.label} 준비됨")
+
+    def _set_activity_colors(self, background, foreground):
+        self.activity_frame.configure(background=background)
+        self.activity_heading.configure(
+            background=background,
+            foreground=foreground,
+        )
+        self.activity_detail.configure(
+            background=background,
+            foreground=foreground,
+        )
+
+    def _set_tab_activity_markers(self, busy_indices):
+        for index, spec in enumerate(TOOLS, start=1):
+            marker = "● " if index - 1 in busy_indices else ""
+            self.notebook.tab(
+                self.tabs[index - 1],
+                text=f"{marker}{index}  {spec.label}",
+            )
+
+    def _show_running_activity(self, snapshots):
+        activity_was_running = bool(self._busy_indices)
+        if self._completion_after_id is not None:
+            try:
+                self.root.after_cancel(self._completion_after_id)
+            except tk.TclError:
+                pass
+            self._completion_after_id = None
+
+        busy_indices = {index for index, _detail in snapshots}
+        labels = [TOOLS[index].label for index, _detail in snapshots]
+        details = [
+            f"{TOOLS[index].label}: {detail or '처리 중...'}"
+            for index, detail in snapshots
+        ]
+        if len(labels) == 1:
+            heading = f"● {labels[0]} 작업 실행 중"
+            detail = snapshots[0][1] or "처리 중..."
+            title = f"● 실행 중 · {labels[0]} — SpeedTree Batch Tools"
+        else:
+            heading = f"● {len(labels)}개 작업 실행 중"
+            detail = "   |   ".join(details)
+            title = f"● 실행 중 ({len(labels)}) — SpeedTree Batch Tools"
+
+        if detail not in {"대기", "준비됨"}:
+            self._last_activity_detail = detail
+        self._set_activity_colors("#0b57d0", "white")
+        self.activity_heading_var.set(heading)
+        self.activity_detail_var.set(detail)
+        if not activity_was_running:
+            self.activity_progress.stop()
+            self.activity_progress.configure(
+                mode="indeterminate",
+                value=0,
+                style="Activity.Horizontal.TProgressbar",
+            )
+            self.activity_progress.start(12)
+        self.activity_frame.grid()
+        self._set_tab_activity_markers(busy_indices)
+        self.root.title(title)
+        self._busy_indices = busy_indices
+
+    def _show_activity_complete(self, completed_indices):
+        labels = [TOOLS[index].label for index in sorted(completed_indices)]
+        label = labels[0] if len(labels) == 1 else f"{len(labels)}개 작업"
+        details = [
+            activity_completion_detail(
+                self.apps.get(index),
+                self._last_activity_detail if len(completed_indices) == 1 else "",
+            )
+            for index in sorted(completed_indices)
+        ]
+        detail = "   |   ".join(
+            f"{TOOLS[index].label}: {text}"
+            for index, text in zip(sorted(completed_indices), details)
+        )
+        if len(details) == 1:
+            detail = details[0]
+        self.activity_progress.stop()
+        self.activity_progress.configure(
+            mode="determinate",
+            value=100,
+            style="Success.Horizontal.TProgressbar",
+        )
+        self._set_activity_colors("#2e7d32", "white")
+        self.activity_heading_var.set(f"✓ {label} 완료")
+        self.activity_detail_var.set(detail)
+        self.activity_frame.grid()
+        self._set_tab_activity_markers(set())
+        self.root.title(f"✓ 완료 · {label} — SpeedTree Batch Tools")
+        self._busy_indices = set()
+        self._completion_after_id = self.root.after(
+            COMPLETION_BANNER_MS,
+            self._hide_activity,
+        )
+
+    def _hide_activity(self):
+        self._completion_after_id = None
+        self.activity_progress.stop()
+        self.activity_frame.grid_remove()
+        self._set_tab_activity_markers(set())
+        self.root.title(BASE_WINDOW_TITLE)
+        self._last_activity_detail = ""
+
+    def _poll_activity(self):
+        snapshots = []
+        for index, app in self.apps.items():
+            busy, detail = app_activity_snapshot(app)
+            if busy:
+                snapshots.append((index, detail))
+
+        if snapshots:
+            self._show_running_activity(snapshots)
+        elif self._busy_indices:
+            self._show_activity_complete(self._busy_indices)
+        try:
+            self.root.after(ACTIVITY_POLL_MS, self._poll_activity)
+        except tk.TclError:
+            pass
 
     def _show_load_error(self, index, exc):
         self._clear_tab(index)

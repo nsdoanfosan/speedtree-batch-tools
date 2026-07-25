@@ -7,11 +7,13 @@ The tool treats each vegetation folder as a small family graph:
       - follower_b.spm
     independent.spm
 
-Only generator settings and additive Base-subtree structure are synchronized.
-Target identity and variation data (GUIDs, names, random seeds, materials,
-BaseRef placement, node/freehand edits, and target-only generators) remain in
-the follower.  The Generators/Links XML sections are patched without rewriting
-the usually very large Nodes section.
+Generator settings and additive Base-subtree structure are normalized across
+the family.  A follower-only Generator subtree is first merged into the master,
+then the normalized master structure is distributed to the selected followers
+in the same transaction.  Per-file identity and variation data (GUIDs, names,
+random seeds, materials, BaseRef placement, and node/freehand edits) remain
+local.  The Generators/Links XML sections are patched without rewriting the
+usually very large Nodes section.
 """
 
 from __future__ import annotations
@@ -459,14 +461,24 @@ class BaseSyncResult:
     matched_nodes: int = 0
     property_updates: int = 0
     added_nodes: int = 0
-    target_only_nodes: int = 0
     color_updates: int = 0
     asset_reference_updates: int = 0
     copied_assets: list[dict[str, str]] = field(default_factory=list)
     created_base: bool = False
     added_node_details: list[dict[str, str]] = field(default_factory=list)
-    target_only_details: list[dict[str, str]] = field(default_factory=list)
     changed_properties: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MasterSyncResult:
+    source_file: str
+    source_base: str
+    master_base: str
+    category: str
+    synced_nodes: int = 0
+    synced_node_details: list[dict[str, str]] = field(default_factory=list)
+    copied_assets: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -475,6 +487,7 @@ class SyncPlan:
     master: str
     target: str
     base_results: list[BaseSyncResult] = field(default_factory=list)
+    master_sync_results: list[MasterSyncResult] = field(default_factory=list)
     master_color_updates: int = 0
     target_color_updates: int = 0
     mapping_required: list[str] = field(default_factory=list)
@@ -500,8 +513,8 @@ class SyncPlan:
         return sum(item.added_nodes for item in self.base_results)
 
     @property
-    def target_only_nodes(self) -> int:
-        return sum(item.target_only_nodes for item in self.base_results)
+    def master_sync_nodes(self) -> int:
+        return sum(item.synced_nodes for item in self.master_sync_results)
 
     def summary_lines(self) -> list[str]:
         lines = [
@@ -521,6 +534,24 @@ class SyncPlan:
             if level != "safe":
                 lines.append("  거리 기반 생성 노드와 폴리곤이 크게 늘어날 수 있습니다.")
             lines.append("")
+        for item in self.master_sync_results:
+            lines.append(
+                f"마스터 구조 동기화: {item.master_base} ← "
+                f"{Path(item.source_file).name}:{item.source_base} · "
+                f"{item.synced_nodes}개"
+            )
+            lines.extend(
+                f"  ↑ 마스터 추가: {detail['path']} ({detail['type']})"
+                for detail in item.synced_node_details
+            )
+            lines.extend(
+                f"  + 마스터 에셋 복사: {asset['kind']} · "
+                f"{asset['name']} (ID {asset['id']})"
+                for asset in item.copied_assets
+            )
+            lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
+        if self.master_sync_results:
+            lines.append("")
         for item in self.base_results:
             relation = (
                 f"[새 Base] {item.target_base} ← {item.source_base}"
@@ -530,7 +561,7 @@ class SyncPlan:
             lines.append(
                 f"{relation} [{item.category}] · "
                 f"공통 {item.matched_nodes}, 속성 {item.property_updates}, "
-                f"추가 예정 {item.added_nodes}, 자식 전용 {item.target_only_nodes}, "
+                f"마스터→SPM {item.added_nodes}, "
                 f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}, "
                 f"에셋 복사 {len(item.copied_assets)}"
             )
@@ -541,11 +572,7 @@ class SyncPlan:
             lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
             for detail in item.added_node_details:
                 lines.append(
-                    f"  + 추가 예정: {detail['path']} ({detail['type']})"
-                )
-            for detail in item.target_only_details:
-                lines.append(
-                    f"  ◆ 자식 전용: {detail['path']} ({detail['type']})"
+                    f"  ↓ 마스터 → SPM: {detail['path']} ({detail['type']})"
                 )
         if self.mapping_required:
             lines.append("매핑 확인 필요: " + ", ".join(self.mapping_required))
@@ -1055,15 +1082,9 @@ def base_role_color(category: str, base_name: str) -> tuple[float, float, float,
     return _scale_color(color, factor)
 
 
-def unique_role_color(category: str, base_name: str):
-    color = base_role_color(category, base_name)
-    return _scale_color(color, 0.42) if color is not None else None
-
-
 def set_icon_palette(
     generator: ET.Element,
     background: tuple[float, float, float, float] | None,
-    unique: bool = False,
     preserve_foreground: bool = False,
 ) -> bool:
     if background is None:
@@ -1084,9 +1105,9 @@ def set_icon_palette(
     if not preserve_foreground:
         expected.update({
             "m_bSetForegroundIconColor": "true",
-            "m_vecForegroundIconColor_r": "1" if unique else "0",
-            "m_vecForegroundIconColor_g": "1" if unique else "0",
-            "m_vecForegroundIconColor_b": "1" if unique else "0",
+            "m_vecForegroundIconColor_r": "0",
+            "m_vecForegroundIconColor_g": "0",
+            "m_vecForegroundIconColor_b": "0",
             "m_vecForegroundIconColor_a": "1",
         })
     changed = False
@@ -1135,18 +1156,16 @@ def _restore_icon_foreground(
 
 def set_icon_background(generator: ET.Element, category: str) -> bool:
     """Compatibility wrapper for callers that only know the role."""
-    return set_icon_palette(generator, CATEGORY_COLORS.get(category), unique=False)
+    return set_icon_palette(generator, CATEGORY_COLORS.get(category))
 
 
 def standardize_base_colors(
     document: SPMDocument,
     categories: dict[str, str | None],
-    unique_guids: set[str] | None = None,
     preserve_foreground_guids: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     updates = 0
     warnings: list[str] = []
-    unique_guids = unique_guids or set()
     preserve_foreground_guids = preserve_foreground_guids or set()
     processed: set[str] = set()
     for base in document.base_nodes():
@@ -1157,14 +1176,11 @@ def standardize_base_colors(
             warnings.append(f"색 분류가 없는 Base: {name}")
             continue
         regular_color = base_role_color(category, name)
-        unique_color = unique_role_color(category, name)
         member_guids = [document.generator_guid(base), *document.descendants(document.generator_guid(base))]
         for guid in member_guids:
             node = document.by_guid.get(guid)
-            is_unique = guid in unique_guids
-            color = unique_color if is_unique else regular_color
             if node is not None and set_icon_palette(
-                    node, color, unique=is_unique,
+                    node, regular_color,
                     preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
@@ -1172,10 +1188,8 @@ def standardize_base_colors(
             guid = document.generator_guid(ref)
             if guid in processed:
                 continue
-            is_unique = guid in unique_guids
-            color = unique_color if is_unique else regular_color
             if set_icon_palette(
-                    ref, color, unique=is_unique,
+                    ref, regular_color,
                     preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
@@ -1353,7 +1367,8 @@ def clone_subtree(
     source = source_document.by_guid[source_guid]
     if source_document.generator_type(source) == "BaseRef":
         result.warnings.append(
-            f"마스터 전용 BaseRef는 자동 추가하지 않음: {source_document.generator_name(source)}"
+            f"BaseRef는 파일별 배치이므로 자동 추가하지 않음: "
+            f"{source_document.generator_name(source)}"
         )
         return None
     clone = copy.deepcopy(source)
@@ -1539,12 +1554,109 @@ def sync_subtree(
                 salt,
                 result,
             )
-        for target_child in target_children[paired:]:
-            details = _collect_subtree_details(
-                target_document, target_child, result.target_base
+def _merge_structure_into_master(
+    master_document: SPMDocument,
+    follower_document: SPMDocument,
+    master_guid: str,
+    follower_guid: str,
+    category: str,
+    salt: str,
+    result: BaseSyncResult,
+) -> None:
+    """Add follower-only non-BaseRef subtrees to the in-memory master."""
+
+    master_groups = _children_by_type(master_document, master_guid)
+    follower_groups = _children_by_type(follower_document, follower_guid)
+    for generator_type in sorted(set(master_groups) | set(follower_groups)):
+        master_children = master_groups.get(generator_type, [])
+        follower_children = follower_groups.get(generator_type, [])
+        paired = min(len(master_children), len(follower_children))
+        for index in range(paired):
+            _merge_structure_into_master(
+                master_document,
+                follower_document,
+                master_children[index],
+                follower_children[index],
+                category,
+                salt,
+                result,
             )
-            result.target_only_details.extend(details)
-            result.target_only_nodes += len(details)
+        for follower_child in follower_children[paired:]:
+            try:
+                parent_level = int(
+                    _child_text(master_document.by_guid[master_guid], "Level", "0")
+                )
+            except ValueError:
+                parent_level = 0
+            clone_subtree(
+                follower_document,
+                master_document,
+                follower_child,
+                follower_guid,
+                master_guid,
+                parent_level,
+                category,
+                salt,
+                result,
+            )
+
+
+def synchronize_follower_structure_to_master(
+    master_document: SPMDocument,
+    follower: SPMDocument,
+    base_map: dict[str, str | None],
+    base_categories: dict[str, str | None] | None = None,
+) -> list[MasterSyncResult]:
+    """Merge one follower's extra governed structure into the master.
+
+    Common-node properties remain master-authored.  Only structural suffixes
+    that the master lacks are cloned.  BaseRef subtrees stay file-local.
+    """
+
+    follower_path = follower.path
+    categories = source_base_categories(master_document, base_categories)
+    output: list[MasterSyncResult] = []
+    for follower_name, master_name in base_map.items():
+        if master_name in (None, "", "__independent__"):
+            continue
+        master_base = master_document.resolve_base(master_name)
+        follower_base = follower.resolve_base(follower_name)
+        if master_base is None or follower_base is None:
+            continue
+        resolved_master_name = master_document.generator_name(master_base)
+        category = categories.get(resolved_master_name)
+        if category not in CATEGORY_COLORS:
+            continue
+        resolved_follower_name = follower.generator_name(follower_base)
+        temporary = BaseSyncResult(
+            source_base=resolved_follower_name,
+            target_base=resolved_master_name,
+            category=category,
+        )
+        _merge_structure_into_master(
+            master_document,
+            follower,
+            master_document.generator_guid(master_base),
+            follower.generator_guid(follower_base),
+            category,
+            f"{follower_path}|master|{resolved_master_name}",
+            temporary,
+        )
+        if temporary.added_nodes:
+            output.append(MasterSyncResult(
+                source_file=str(follower_path),
+                source_base=resolved_follower_name,
+                master_base=resolved_master_name,
+                category=category,
+                synced_nodes=temporary.added_nodes,
+                synced_node_details=temporary.added_node_details,
+                copied_assets=temporary.copied_assets,
+                warnings=temporary.warnings,
+            ))
+            # Re-sort the newly extended branch before another mapped Base or
+            # follower compares Type-order positions against it.
+            master_document.reindex()
+    return output
 
 
 def _set_base_ref_filter(generator: ET.Element, value: str) -> bool:
@@ -1772,11 +1884,17 @@ def build_sync_plan(
     base_map: dict[str, str | None],
     base_categories: dict[str, str | None] | None = None,
     master_document: SPMDocument | None = None,
+    target_document: SPMDocument | None = None,
 ) -> SyncPlan:
     master_path = Path(master_path)
     target_path = Path(target_path)
     source = master_document or SPMDocument.from_path(master_path, full=True)
-    target = SPMDocument.from_path(target_path, full=True)
+    target = target_document or SPMDocument.from_path(target_path, full=True)
+    if target.path.absolute() != target_path.absolute():
+        raise SyncError(
+            f"대상 문서 경로가 동기화 요청과 다릅니다: "
+            f"{target.path} != {target_path}"
+        )
     original_target_text = target.text
     legacy_cluster_guids = set(
         inspect_legacy_cluster_state(target_path)[
@@ -1885,13 +2003,8 @@ def build_sync_plan(
     plan.pass_adjustments = repair_generation_passes(target)
     plan.reference_renames = standardize_base_ref_names(target)
     target_color_categories: dict[str, str | None] = {}
-    unique_guids: set[str] = set()
     for item in plan.base_results:
         target_color_categories[item.target_base] = item.category
-        unique_guids.update(
-            detail["guid"] for detail in item.target_only_details
-            if detail.get("guid")
-        )
     # sync_subtree applies the role palette while copying settings. Restore
     # the exact receipt-owned foreground observed at transaction start before
     # the final background-only palette pass. Drifted/user-edited foregrounds
@@ -1903,7 +2016,6 @@ def build_sync_plan(
     target_color_updates, color_warnings = standardize_base_colors(
         target,
         target_color_categories,
-        unique_guids=unique_guids,
         preserve_foreground_guids=legacy_cluster_guids,
     )
     plan.target_color_updates = target_color_updates
@@ -1976,12 +2088,12 @@ def base_sync_signature(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _common_target_payload(
-    source_document: SPMDocument,
+def _managed_target_payload(
     target_document: SPMDocument,
-    source_guid: str,
     target_guid: str,
 ) -> dict[str, object]:
+    """Hash all master-governed follower structure, including new extras."""
+
     target = target_document.by_guid[target_guid]
     properties = []
     target_properties = target.find("Properties")
@@ -1990,19 +2102,12 @@ def _common_target_payload(
             if not is_protected_property(_property_name(prop)):
                 properties.append(_normalized_xml(prop))
     children = []
-    source_groups = _children_by_type(source_document, source_guid)
     target_groups = _children_by_type(target_document, target_guid)
-    for generator_type in sorted(source_groups):
-        source_children = source_groups[generator_type]
-        target_children = target_groups.get(generator_type, [])
-        for index, source_child in enumerate(source_children):
-            if index < len(target_children):
-                children.append(_common_target_payload(
-                    source_document, target_document,
-                    source_child, target_children[index],
-                ))
-            else:
-                children.append({"type": generator_type, "missing": True})
+    for generator_type in sorted(target_groups):
+        if generator_type == "BaseRef":
+            continue
+        for child_guid in target_groups[generator_type]:
+            children.append(_managed_target_payload(target_document, child_guid))
     return {
         "type": target_document.generator_type(target),
         "properties": properties,
@@ -2017,8 +2122,9 @@ def target_sync_signature(
 ) -> str:
     """Hash only the follower data governed by the master.
 
-    Target-only generators are intentionally excluded. Protected identity and
-    asset properties are excluded for the same reason.
+    Extra governed structure is included so a new follower subtree immediately
+    reports a pending master normalization.  Protected identity, asset, and
+    BaseRef placement data remain excluded.
     """
     payload = []
     for target_name, source_name in sorted(base_map.items(), key=lambda item: item[0].casefold()):
@@ -2032,10 +2138,8 @@ def target_sync_signature(
         payload.append({
             "target": canonical_base_name(target_name),
             "source": canonical_base_name(source_name),
-            "tree": _common_target_payload(
-                source_document, target_document,
-                source_document.generator_guid(source_base),
-                target_document.generator_guid(target_base),
+            "tree": _managed_target_payload(
+                target_document, target_document.generator_guid(target_base)
             ),
         })
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2050,11 +2154,11 @@ def _structure_delta(
     source_base_name: str = "",
     target_base_name: str = "",
     missing_details: list[dict[str, str]] | None = None,
-    target_only_details: list[dict[str, str]] | None = None,
+    master_sync_details: list[dict[str, str]] | None = None,
 ) -> tuple[int, int, int]:
     common = 1
     missing = 0
-    target_only = 0
+    master_sync = 0
     source_groups = _children_by_type(source_document, source_guid)
     target_groups = _children_by_type(target_document, target_guid)
     for generator_type in sorted(set(source_groups) | set(target_groups)):
@@ -2062,15 +2166,15 @@ def _structure_delta(
         target_children = target_groups.get(generator_type, [])
         paired = min(len(source_children), len(target_children))
         for index in range(paired):
-            child_common, child_missing, child_only = _structure_delta(
+            child_common, child_missing, child_master_sync = _structure_delta(
                 source_document, target_document,
                 source_children[index], target_children[index],
                 source_base_name, target_base_name,
-                missing_details, target_only_details,
+                missing_details, master_sync_details,
             )
             common += child_common
             missing += child_missing
-            target_only += child_only
+            master_sync += child_master_sync
         for source_child in source_children[paired:]:
             details = _collect_subtree_details(
                 source_document,
@@ -2083,12 +2187,15 @@ def _structure_delta(
                 missing_details.extend(details)
         for target_child in target_children[paired:]:
             details = _collect_subtree_details(
-                target_document, target_child, target_base_name
+                target_document,
+                target_child,
+                target_base_name,
+                exclude_source_baseref=True,
             )
-            target_only += len(details)
-            if target_only_details is not None:
-                target_only_details.extend(details)
-    return common, missing, target_only
+            master_sync += len(details)
+            if master_sync_details is not None:
+                master_sync_details.extend(details)
+    return common, missing, master_sync
 
 
 def compare_base_structure(
@@ -2098,12 +2205,12 @@ def compare_base_structure(
     include_details: bool = False,
 ) -> dict[str, object]:
     totals = {
-        "common": 0, "missing": 0, "target_only": 0,
+        "common": 0, "missing": 0, "master_sync": 0,
         "mapping_errors": 0, "missing_bases": 0,
     }
     if include_details:
         totals["missing_details"] = []
-        totals["target_only_details"] = []
+        totals["master_sync_details"] = []
     used_source: set[str] = set()
     for target_name, source_name in base_map.items():
         if source_name in (None, "", "__independent__"):
@@ -2114,18 +2221,18 @@ def compare_base_structure(
             totals["mapping_errors"] += 1
             continue
         used_source.add(source_document.generator_name(source_base))
-        common, missing, target_only = _structure_delta(
+        common, missing, master_sync = _structure_delta(
             source_document, target_document,
             source_document.generator_guid(source_base),
             target_document.generator_guid(target_base),
             source_document.generator_name(source_base),
             target_document.generator_name(target_base),
             totals.get("missing_details") if include_details else None,
-            totals.get("target_only_details") if include_details else None,
+            totals.get("master_sync_details") if include_details else None,
         )
         totals["common"] += common
         totals["missing"] += missing
-        totals["target_only"] += target_only
+        totals["master_sync"] += master_sync
     for source_base in source_document.base_nodes():
         source_name = source_document.generator_name(source_base)
         if source_name not in used_source:
@@ -2532,6 +2639,95 @@ def apply_pass_repair_transaction(
     }
 
 
+def build_normalized_sync_plans(
+    master_path: Path,
+    target_specs: list[tuple[Path, dict[str, str | None]]],
+    categories: dict[str, str | None],
+    progress_callback=None,
+) -> dict[str, object]:
+    """Read each target once, normalize the master, then build every patch."""
+
+    master_path = Path(master_path)
+    if not target_specs:
+        raise SyncError("동기화할 SPM이 없습니다")
+    (
+        master_doc,
+        _standardized_master_text,
+        master_color_updates,
+        master_ref_renames,
+        master_warnings,
+    ) = standardize_master_document(master_path, categories)
+
+    loaded_targets: list[
+        tuple[Path, dict[str, str | None], SPMDocument, list[MasterSyncResult]]
+    ] = []
+    total = len(target_specs)
+    for index, (target_path, mapping) in enumerate(target_specs, start=1):
+        target_path = Path(target_path)
+        if progress_callback is not None:
+            progress_callback(
+                f"마스터 구조 통합 중 · {target_path.name} ({index}/{total})",
+                5 + round(15 * (index - 1) / max(1, total)),
+            )
+        target_doc = SPMDocument.from_path(target_path, full=True)
+        master_sync = synchronize_follower_structure_to_master(
+            master_doc,
+            target_doc,
+            mapping,
+            categories,
+        )
+        loaded_targets.append((target_path, mapping, target_doc, master_sync))
+
+    repair_generation_passes(master_doc)
+    master_doc.reindex()
+    master_doc.validate()
+    master_text = master_doc.render()
+    master_doc.validate(master_text)
+    master_doc = SPMDocument(
+        master_path,
+        master_text,
+        master_doc.compressed,
+        full=True,
+    )
+    master_hash = base_sync_signature(master_doc, categories)
+
+    plans: list[SyncPlan] = []
+    for index, (target_path, mapping, target_doc, master_sync) in enumerate(
+        loaded_targets,
+        start=1,
+    ):
+        if progress_callback is not None:
+            progress_callback(
+                f"SPM 동기화 패치 계산 중 · {target_path.name} ({index}/{total})",
+                20 + round(15 * (index - 1) / max(1, total)),
+            )
+        plan = build_sync_plan(
+            master_path,
+            target_path,
+            mapping,
+            categories,
+            master_document=master_doc,
+            target_document=target_doc,
+        )
+        plan.master_sync_results = master_sync
+        plan.master_color_updates = master_color_updates
+        plan.master_reference_renames = master_ref_renames
+        plan.warnings.extend(master_warnings)
+        if plan.mapping_required:
+            raise SyncError(
+                f"{target_path.name} Base 매핑 확인 필요: "
+                + ", ".join(plan.mapping_required)
+            )
+        plans.append(plan)
+
+    return {
+        "master_document": master_doc,
+        "master_text": master_text,
+        "master_hash": master_hash,
+        "plans": plans,
+    }
+
+
 def verify_auto_copies(
     folder: Path,
     master_name: str,
@@ -2548,37 +2744,35 @@ def verify_auto_copies(
     master_path = folder / master_name
     source_prefix = SPMDocument.from_path(master_path, full=False)
     categories = source_base_categories(source_prefix)
-    master_doc, master_text, color_updates, master_ref_renames, color_warnings = standardize_master_document(
-        master_path, categories
+    target_specs = []
+    for target_name in target_names:
+        target_path = folder / target_name
+        target_prefix = SPMDocument.from_path(target_path, full=False)
+        target_specs.append((
+            target_path,
+            suggest_base_map(source_prefix, target_prefix, categories),
+        ))
+    prepared = build_normalized_sync_plans(
+        master_path,
+        target_specs,
+        categories,
     )
+    master_doc = prepared["master_document"]
+    master_text = prepared["master_text"]
+    plans = prepared["plans"]
     token = uuid.uuid4().hex[:10]
     temporary_paths: list[Path] = []
-    plans: list[SyncPlan] = []
     try:
         temp_master = folder / f"__spm_sync_verify_{token}_{master_name}"
         write_spm_text(temp_master, master_text, master_doc.compressed)
         temporary_paths.append(temp_master)
         verify_speedtree_export(temp_master, speedtree_exe, xml_ini)
-        for target_name in target_names:
-            target_path = folder / target_name
-            target_prefix = SPMDocument.from_path(target_path, full=False)
-            mapping = suggest_base_map(source_prefix, target_prefix, categories)
-            plan = build_sync_plan(
-                master_path, target_path, mapping, categories,
-                master_document=master_doc,
-            )
-            plan.master_color_updates = color_updates
-            plan.master_reference_renames = master_ref_renames
-            plan.warnings.extend(color_warnings)
-            if plan.mapping_required:
-                raise SyncError(
-                    f"{target_name} 자동 매핑 확인 필요: " + ", ".join(plan.mapping_required)
-                )
-            temp_target = folder / f"__spm_sync_verify_{token}_{target_name}"
+        for plan in plans:
+            target_path = Path(plan.target)
+            temp_target = folder / f"__spm_sync_verify_{token}_{target_path.name}"
             write_spm_text(temp_target, plan.patched_text, plan.compressed)
             temporary_paths.append(temp_target)
             verify_speedtree_export(temp_target, speedtree_exe, xml_ini)
-            plans.append(plan)
         return plans
     finally:
         for path in temporary_paths:
@@ -2594,17 +2788,14 @@ def verify_auto_copies(
                     pass
 
 
-def apply_group_transaction(
+def build_group_sync_plans(
     folder: Path,
     master_name: str,
     follower_names: list[str] | None = None,
-    verify_speedtree: bool = True,
-    speedtree_exe: Path | None = None,
-    xml_ini: Path | None = None,
-    verify_callback=None,
     progress_callback=None,
-) -> dict:
-    """Preflight, backup, write, verify, and rollback a whole master group."""
+) -> dict[str, object]:
+    """Build one normalized master plus all selected follower patches in memory."""
+
     folder = Path(folder)
     if progress_callback is not None:
         progress_callback("설정과 마스터 읽는 중", 2)
@@ -2622,35 +2813,63 @@ def apply_group_transaction(
     if not master_path.is_file():
         raise SyncError(f"마스터 SPM이 없습니다: {master_path}")
     categories = group.get("base_categories") or {}
-    master_doc, master_text, master_color_updates, master_ref_renames, master_warnings = standardize_master_document(
-        master_path, categories
-    )
-    master_hash = base_sync_signature(master_doc, categories)
-
-    plans: list[SyncPlan] = []
-    for index, name in enumerate(selected, start=1):
-        if progress_callback is not None:
-            percent = 5 + round(30 * (index - 1) / max(1, len(selected)))
-            progress_callback(f"패치 계산 중 · {name} ({index}/{len(selected)})", percent)
+    target_specs = []
+    for name in selected:
         entry = configured[name]
         if not entry.get("base_map_confirmed"):
             raise SyncError(f"Base 매핑을 먼저 확인해야 합니다: {name}")
         target_path = folder / name
         if not target_path.is_file():
             raise SyncError(f"자식 SPM이 없습니다: {target_path}")
-        plan = build_sync_plan(
-            master_path,
+        target_specs.append((
             target_path,
             entry.get("base_map") or {},
-            categories,
-            master_document=master_doc,
-        )
-        plan.master_color_updates = master_color_updates
-        plan.master_reference_renames = master_ref_renames
-        plan.warnings.extend(master_warnings)
-        if plan.mapping_required:
-            raise SyncError(f"{name} Base 매핑 확인 필요: " + ", ".join(plan.mapping_required))
-        plans.append(plan)
+        ))
+    normalized = build_normalized_sync_plans(
+        master_path,
+        target_specs,
+        categories,
+        progress_callback=progress_callback,
+    )
+
+    return {
+        "folder": folder,
+        "manifest": manifest,
+        "group": group,
+        "configured": configured,
+        "selected": selected,
+        "master_path": master_path,
+        "categories": categories,
+        **normalized,
+    }
+
+
+def apply_group_transaction(
+    folder: Path,
+    master_name: str,
+    follower_names: list[str] | None = None,
+    verify_speedtree: bool = True,
+    speedtree_exe: Path | None = None,
+    xml_ini: Path | None = None,
+    verify_callback=None,
+    progress_callback=None,
+) -> dict:
+    """Preflight, backup, write, verify, and rollback a whole master group."""
+    prepared = build_group_sync_plans(
+        folder,
+        master_name,
+        follower_names,
+        progress_callback=progress_callback,
+    )
+    folder = prepared["folder"]
+    manifest = prepared["manifest"]
+    configured = prepared["configured"]
+    selected = prepared["selected"]
+    master_path = prepared["master_path"]
+    master_doc = prepared["master_document"]
+    master_text = prepared["master_text"]
+    master_hash = prepared["master_hash"]
+    plans = prepared["plans"]
 
     # Every patch below is built from the bytes just read, so remember them and
     # re-check right before the write.
@@ -2904,21 +3123,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "preview":
-        folder = Path(args.folder)
-        manifest = load_manifest(folder)
-        group = find_group(manifest, args.master)
-        follower = next(
-            (item for item in group.get("followers", []) if item.get("file") == args.target),
-            None,
+        prepared = build_group_sync_plans(
+            Path(args.folder),
+            args.master,
+            [args.target],
         )
-        if follower is None:
-            raise SyncError(f"자식 설정이 없습니다: {args.target}")
-        plan = build_sync_plan(
-            folder / args.master,
-            folder / args.target,
-            follower.get("base_map") or {},
-            group.get("base_categories") or {},
-        )
+        plan = prepared["plans"][0]
         print(json.dumps(plan_to_json(plan), ensure_ascii=False, indent=2))
         return 0
     if args.command == "preview-auto":
@@ -2926,22 +3136,27 @@ def main(argv: list[str] | None = None) -> int:
         master_path = folder / args.master
         source_prefix = SPMDocument.from_path(master_path, full=False)
         categories = source_base_categories(source_prefix)
-        source_full, _master_text, color_updates, master_ref_renames, color_warnings = standardize_master_document(
-            master_path, categories
-        )
-        output = []
+        target_specs = []
         for target_name in args.target:
             target_path = folder / target_name
             target_prefix = SPMDocument.from_path(target_path, full=False)
             mapping = suggest_base_map(source_prefix, target_prefix, categories)
-            plan = build_sync_plan(
-                master_path, target_path, mapping, categories,
-                master_document=source_full,
+            target_specs.append((target_path, mapping))
+        prepared = build_normalized_sync_plans(
+            master_path,
+            target_specs,
+            categories,
+        )
+        output = [
+            {
+                "base_map_suggestion": mapping,
+                "plan": plan_to_json(plan),
+            }
+            for (_target_path, mapping), plan in zip(
+                target_specs,
+                prepared["plans"],
             )
-            plan.master_color_updates = color_updates
-            plan.master_reference_renames = master_ref_renames
-            plan.warnings.extend(color_warnings)
-            output.append({"base_map_suggestion": mapping, "plan": plan_to_json(plan)})
+        ]
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     if args.command == "apply":

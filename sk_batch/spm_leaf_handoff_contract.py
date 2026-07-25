@@ -92,6 +92,25 @@ def _replacement_counts(slots, managed_materials):
     return source, connected
 
 
+def _atlas_replacement_required(
+    managed_materials,
+    blocking_issues,
+    replacement_source_slot_count,
+):
+    """Require Atlas handoff only when an exported source slot proves intent.
+
+    A managed Atlas material can remain in an SPM as an unused asset definition.
+    Its marker alone is not evidence that this model exports Atlas leaf cards.
+    In particular, zero semantic slots must stay nonblocking: there is no
+    generator connection for the artist or the batch to repair.
+    """
+    return bool(
+        managed_materials
+        and not blocking_issues
+        and replacement_source_slot_count > 0
+    )
+
+
 def _managed_ownership_provenance(managed_materials):
     """Expose that the fast status path has marker evidence, not repair proof."""
     names = [str(item.get("name") or "") for item in managed_materials]
@@ -371,13 +390,10 @@ def _inspect_spm_cached(path_text, _size, _mtime_ns):
         and not slot["valid"]
     )
 
-    replacement_needed = bool(
-        managed_materials
-        and not blocking_issues
-        and (
-            replacement_source_slot_count > 0
-            or not slots
-        )
+    replacement_needed = _atlas_replacement_required(
+        managed_materials,
+        blocking_issues,
+        replacement_source_slot_count,
     )
     if blocking_issues:
         status = "invalid_references"
@@ -556,13 +572,10 @@ def _inspect_spm_fast_cached(path_text, _size, _mtime_ns):
         1 for slot in slots if slot.get("material_id") and slot["material_id"] > 0
         and not slot["valid"]
     )
-    replacement_needed = bool(
-        managed_materials
-        and not blocking_issues
-        and (
-            replacement_source_slot_count > 0
-            or not slots
-        )
+    replacement_needed = _atlas_replacement_required(
+        managed_materials,
+        blocking_issues,
+        replacement_source_slot_count,
     )
     if blocking_issues:
         status = "invalid_references"
@@ -664,6 +677,8 @@ def leaf_contract_user_message(contract):
                 "새 Atlas 재질은 만들어졌지만 현재 내보내는 잎 노드에 연결되지 않음"
             )
         return False, f"Atlas 연결 확인 필요 — {detail} → 연결 후 ② Blender Repair"
+    if status == "no_leaf_slots":
+        return True, "Atlas 연결 검사 비적용 — 현재 내보내는 Atlas 대상 잎 슬롯 없음"
     return True, "현재 내보내는 잎 재질 연결 정상"
 
 

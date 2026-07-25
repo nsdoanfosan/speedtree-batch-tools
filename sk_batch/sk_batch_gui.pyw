@@ -14,6 +14,7 @@
 모든 무거운 작업은 낮은 우선순위 + CPU 코어 제한이 걸린 백그라운드 프로세스로
 실행된다 (자식 SpeedTree CLI에 상속. 헤드리스 Blender는 GPU를 쓰지 않음).
 """
+import ctypes
 import hashlib
 import json
 import os
@@ -82,6 +83,14 @@ from spm_leaf_handoff_contract import (
     speedtree_stmat_path,
 )
 from speedtree_pipeline_contract import validate_preflight_envelope
+from push_dependency_schedule import (
+    PushDependencyError,
+    expand_push_targets,
+)
+from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+    ClusterAssemblyReceiptStaleError,
+    cluster_assembly_receipt_resolution,
+)
 
 WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
@@ -95,6 +104,7 @@ CHECK_ON = "☑"
 CHECK_OFF = "☐"
 REPAIR_RUNTIME_RECEIPT_VERSION = 1
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
+CLUSTER_RECEIPT_REFRESH_LOCK = threading.Lock()
 
 
 def is_cluster_source_spm(spm):
@@ -105,20 +115,81 @@ def is_cluster_source_spm(spm):
     )
 
 
-def should_calibrate_spm(item):
-    """Cluster authoring SPMs are Blender inputs, never calibration targets.
+def blender_repair_asset_folder(spm):
+    """Return the asset root whose Repair receipts depend on this SPM."""
+    path = Path(spm)
+    return path.parent.parent if is_cluster_source_spm(path) else path.parent
 
-    A Cluster SPM's bone graph is read, not authored: the normalized blend
-    records its representative bone, XML bone id and source SPM hash, and the
-    deform-cluster partitioning is derived from them.  Calibration writes
-    Physics:Bones into the file, which invalidates that contract - and if it is
-    interrupted the Cluster source is left carrying injected bones.  Renaming a
-    Cluster row to its canonical SK_ name does not make it a tree.
+
+def normalized_folder_key(path):
+    try:
+        return os.path.normcase(str(Path(path).resolve())).casefold()
+    except (OSError, ValueError):
+        return os.path.normcase(str(Path(path).absolute())).casefold()
+
+
+def blender_open_file_window_titles(blend_path):
+    """Return interactive Blender windows that currently hold this blend."""
+    if os.name != "nt":
+        return []
+    try:
+        expected = str(Path(blend_path).resolve()).casefold()
+    except (OSError, ValueError):
+        return []
+    titles = []
+    try:
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+        )
+
+        @callback_type
+        def collect(window, _extra):
+            length = user32.GetWindowTextLengthW(window)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(window, buffer, len(buffer))
+            title = buffer.value
+            folded = title.casefold()
+            if "blender" in folded and expected in folded:
+                titles.append(title)
+            return True
+
+        user32.EnumWindows(collect, 0)
+    except (AttributeError, OSError):
+        return []
+    return titles
+
+
+def blender_repair_schedule_waves(targets):
+    """Run authored Cluster sources before root assets that fingerprint them."""
+    cluster_sources = []
+    downstream = []
+    for item in targets:
+        target = (
+            item.get("spm")
+            if isinstance(item, dict)
+            else getattr(item, "spm", None)
+        )
+        if is_cluster_source_spm(target):
+            cluster_sources.append(item)
+        else:
+            downstream.append(item)
+    return [
+        wave for wave in (cluster_sources, downstream) if wave
+    ]
+
+
+def should_calibrate_spm(item):
+    """Return whether stage ① may normalize this row's SPM bone contract.
+
+    Cluster rows are calibration targets too, but ``spm_audit`` routes them to
+    the dedicated first-renderable-root Absolute/1 policy instead of the normal
+    whole-tree density solver.  Its backup/marker recovery is the same as every
+    other stage-① write, so an interrupted run restores the source safely.
     """
-    return not (
-        item.get("source_read_only")
-        or is_cluster_source_spm(item.get("spm", ""))
-    )
+    return not item.get("source_read_only")
 
 
 def sk_batch_folder_chain(root, spm):
@@ -1631,10 +1702,60 @@ class App:
         self._phase_abort_reason = None
         self._phase_failed_items = set()
         requested_targets = list(targets)
+        self._active_push_dependency_map = {}
+        self._active_push_auto_added_ids = set()
         preflight_skipped = set()
         if phase == "spm":
             targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
+            try:
+                (
+                    targets,
+                    self._active_push_dependency_map,
+                    self._active_push_auto_added_ids,
+                ) = expand_push_targets(
+                    targets,
+                    getattr(self, "items", None)
+                    or {str(item["spm"]): item for item in targets},
+                )
+            except (
+                PushDependencyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                reason = compact_error_message(exc)
+                requested_ids = {
+                    str(item["spm"]) for item in requested_targets
+                }
+                self._phase_failed_items.update(requested_ids)
+                self._phase_abort_reason = reason
+                for item in requested_targets:
+                    self._record_phase_status(
+                        str(item["spm"]),
+                        "push_status",
+                        self._failure_status_text(reason, "data_error"),
+                        "data_error",
+                        reason,
+                        persist=False,
+                    )
+                self.log(f"Unreal Push dependency scheduling failed — {reason}")
+                if emit_done:
+                    self.ui_queue.put(
+                        ("progress", f"Unreal Push 중단 — {reason}")
+                    )
+                    self.ui_queue.put(("done", None))
+                return False
+            requested_targets = list(targets)
+            if self._active_push_auto_added_ids:
+                names = sorted(
+                    Path(iid).name
+                    for iid in self._active_push_auto_added_ids
+                )
+                self.log(
+                    "Tree Push dependency: Cluster "
+                    f"{len(names)}개 자동 포함 — {', '.join(names)}"
+                )
             requested_ids = {str(item["spm"]) for item in requested_targets}
             targets, preflight_abort = self._push_preflight(targets)
             ready_ids = {str(item["spm"]) for item in targets}
@@ -1676,6 +1797,7 @@ class App:
         phase_abort = threading.Event()
         attempted = set()
         failed_items = set(preflight_skipped)
+        dependency_failures = {}
 
         def run_one(item):
             if self.stop_flag.is_set():
@@ -1691,6 +1813,34 @@ class App:
                 ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
             )
             try:
+                if phase == "push":
+                    dependencies = self._active_push_dependency_map.get(
+                        iid, ()
+                    )
+                    blocked = [
+                        dependency
+                        for dependency in dependencies
+                        if dependency in failed_items
+                    ]
+                    if blocked:
+                        raise BatchItemError(
+                            "required Cluster Push did not complete: "
+                            + ", ".join(
+                                sorted(Path(value).name for value in blocked)
+                            ),
+                            kind="dependency_blocked",
+                        )
+                if phase == "blender" and not is_cluster_source_spm(spm):
+                    blocked_sources = dependency_failures.get(
+                        normalized_folder_key(blender_repair_asset_folder(spm))
+                    )
+                    if blocked_sources:
+                        raise BatchItemError(
+                            "Cluster source Repair failed, so downstream "
+                            "Repair was not run: "
+                            + ", ".join(sorted(blocked_sources)),
+                            kind="dependency_blocked",
+                        )
                 if phase == "check":
                     self._job_check(iid, spm)
                 elif phase == "spm":
@@ -1747,8 +1897,11 @@ class App:
                     ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
                 )
 
-        # Independent SPM and Blender jobs can overlap. RPC Push stays serial;
-        # headless Push parallelizes only its Blender export stage below.
+        # Independent jobs overlap inside a wave. Blender keeps a barrier
+        # between Cluster sources and root assemblies so saved input hashes
+        # cannot change after a downstream Repair receipt is written.
+        # RPC Push stays serial; headless Push parallelizes only its Blender
+        # export stage below.
         if phase == "spm":
             workers = self.cfg.get("spm_parallel_jobs", 1)
         elif phase == "check":
@@ -1758,15 +1911,46 @@ class App:
         else:
             workers = 1
         workers = max(1, min(int(workers), total))
-        if workers > 1:
-            self.log(f"{title}: {workers}개 동시 실행")
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                pool.map(run_one, targets)
-        else:
-            for item in targets:
-                if self.stop_flag.is_set() or phase_abort.is_set():
-                    break
-                run_one(item)
+        waves = (
+            blender_repair_schedule_waves(targets)
+            if phase == "blender"
+            else [targets]
+        )
+        if phase == "blender" and len(waves) > 1:
+            self.log(
+                "Blender Repair 의존성: Cluster 소스를 먼저 완료한 뒤 "
+                "루트/Assembly Repair를 시작합니다."
+            )
+        for wave_index, wave in enumerate(waves):
+            if self.stop_flag.is_set() or phase_abort.is_set():
+                break
+            wave_workers = max(1, min(workers, len(wave)))
+            if wave_workers > 1:
+                self.log(
+                    f"{title}: {wave_workers}개 동시 실행 "
+                    f"(wave {wave_index + 1}/{len(waves)})"
+                )
+                with ThreadPoolExecutor(max_workers=wave_workers) as pool:
+                    list(pool.map(run_one, wave))
+            else:
+                for item in wave:
+                    if self.stop_flag.is_set() or phase_abort.is_set():
+                        break
+                    run_one(item)
+            if phase == "blender":
+                for item in wave:
+                    spm = item["spm"]
+                    iid = str(spm)
+                    if (
+                        iid in failed_items
+                        and is_cluster_source_spm(spm)
+                    ):
+                        key = normalized_folder_key(
+                            blender_repair_asset_folder(spm)
+                        )
+                        dependency_failures.setdefault(key, []).append(
+                            Path(spm).name
+                        )
 
         if phase_abort.is_set():
             deferred_reason = f"Unreal/RPC 중단으로 미실행 — {self._phase_abort_reason}"
@@ -1896,6 +2080,50 @@ class App:
             return True
         except (OSError, ValueError, RuntimeError):
             return False
+
+    @staticmethod
+    def _cluster_assembly_inputs_current(spm):
+        """Validate every external Cluster artifact captured by BWR."""
+        from cluster_assembly_builder import (
+            MANIFEST_KIND,
+            validate_file_fingerprint,
+            validate_manifest_artifacts,
+        )
+
+        report_path = (
+            Path(spm).parent / "reports" /
+            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+        )
+        try:
+            pipeline = json.loads(report_path.read_text(encoding="utf-8"))
+            embedded = pipeline.get("cluster_assembly_manifest")
+            if not isinstance(embedded, dict):
+                return True, ""
+            if embedded.get("status") == "pass_through":
+                return True, ""
+            manifest_record = embedded.get("manifest") or {}
+            manifest_path = Path(str(manifest_record.get("path") or ""))
+            if not manifest_path.is_file():
+                raise RuntimeError(
+                    "BWR Cluster Assembly manifest file is missing: "
+                    + str(manifest_path)
+                )
+            validate_file_fingerprint(
+                manifest_record, "BWR Cluster Assembly manifest"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["manifest"] = manifest_record
+            if manifest.get("kind") != MANIFEST_KIND:
+                raise RuntimeError(
+                    "unsupported BWR Cluster Assembly manifest kind"
+                )
+            validate_manifest_artifacts(manifest)
+            return True, ""
+        except (OSError, ValueError, RuntimeError) as exc:
+            return False, (
+                "Cluster Assembly input changed after Repair → "
+                "② Blender Repair 다시 실행: " + compact_error_message(exc)
+            )
 
     def _repair_runtime_addon_dir(self):
         """Installed BWR addon folder, derived identically for read and write."""
@@ -2047,6 +2275,11 @@ class App:
         if not runtime_fresh:
             return False, runtime_reason
         receipt_current = self._repair_contract_current(spm)
+        assembly_current, assembly_reason = (
+            self._cluster_assembly_inputs_current(spm)
+        )
+        if not assembly_current:
+            return False, assembly_reason
         if blend.stat().st_mtime < spm.stat().st_mtime and not receipt_current:
             return False, "Blender 갱신 필요 — SPM이 더 최근에 수정됨 → ② Blender Repair"
         material_ok, material_reason = self._material_export_ready(
@@ -2391,12 +2624,12 @@ class App:
         entry = self.state.setdefault(iid, {})
         item = self.items[iid]
         if not should_calibrate_spm(item):
-            summary = "건너뜀 · Cluster 원본 SPM 유지 · SK_*.spm 미생성"
+            summary = "건너뜀 · 읽기 전용 SPM"
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
                 save_state(self.state)
-            self.log(f"SPM 본 보정 건너뜀 (Cluster source read-only): {spm.name}")
+            self.log(f"SPM 본 보정 건너뜀 (source read-only): {spm.name}")
             return
         if item.get("manual_bones_locked", False):
             summary = f"{manual_bone_status_text(spm)} · ① 전체 건너뜀"
@@ -2506,6 +2739,70 @@ class App:
         else:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
+    def _refresh_stale_cluster_receipt(self, spm, stamp):
+        """Regenerate a stale PCG receipt before paying to launch Blender.
+
+        The receipt remains a strict hash gate.  This only reruns the existing
+        read-only PCG folder audit against the current artifacts and then
+        requires a newly hash-current receipt; it never accepts stale hashes.
+        """
+        spm = Path(spm).resolve()
+        with CLUSTER_RECEIPT_REFRESH_LOCK:
+            try:
+                return cluster_assembly_receipt_resolution(spm)
+            except FileNotFoundError:
+                # Ordinary non-Cluster vegetation has no Assembly receipt.
+                return None
+            except ClusterAssemblyReceiptStaleError:
+                self.log(
+                    f"Cluster Assembly 영수증 갱신: {spm.name} "
+                    f"(현재 산출물 해시 재감사)"
+                )
+
+            audit_report = LOG_DIR / (
+                f"{spm.stem}_cluster_receipt_refresh_{stamp}.json"
+            )
+            audit_script = (
+                REPO_DIR
+                / "pcg_st9_texture_batch"
+                / "pcg_texture_audit.py"
+            )
+            timeout = int(self.cfg.get("cluster_receipt_refresh_timeout", 600))
+            code, log_file = self._run_limited(
+                [
+                    sys.executable,
+                    str(audit_script),
+                    "--target", str(spm.parent),
+                    "--json", str(audit_report),
+                ],
+                f"{spm.stem}_cluster_receipt_refresh_{stamp}.log",
+                timeout,
+                affinity=False,
+            )
+            if code != 0:
+                raise BatchItemError(
+                    "Cluster Assembly 영수증 자동 갱신 실패: "
+                    f"{spm.name} (exit {code})",
+                    kind="data_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
+            try:
+                resolution = cluster_assembly_receipt_resolution(spm)
+            except (FileNotFoundError, ClusterAssemblyReceiptStaleError) as exc:
+                raise BatchItemError(
+                    "Cluster Assembly 영수증 자동 갱신 후에도 현재 해시를 "
+                    f"확인하지 못함: {spm.name}: {exc}",
+                    kind="data_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                ) from exc
+            self.log(
+                "Cluster Assembly 영수증 갱신 완료: "
+                f"{Path(resolution['selected_receipt']).name}"
+            )
+            return resolution
+
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
 
@@ -2532,6 +2829,19 @@ class App:
             self._record_live_blend_status(iid, spm)
             self.log(f"건너뜀 (blend 최신): {spm.name}")
             return
+        open_windows = blender_open_file_window_titles(blend)
+        if open_windows:
+            raise BatchItemError(
+                "Repair 대상 .blend가 대화형 Blender에 열려 있습니다. "
+                "저장하거나 닫은 뒤 다시 실행하세요: " + blend.name,
+                kind="manual_required",
+                report={
+                    "status": "blocked",
+                    "stage": "interactive_blender_guard",
+                    "blend": str(blend),
+                    "open_windows": open_windows,
+                },
+            )
         if should_calibrate_spm(item):
             readiness = sk_readiness(
                 audit_spm(
@@ -2596,6 +2906,7 @@ class App:
                 log_file=material_log,
                 report_file=material_report,
             )
+        self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
         self.log(f"재질 사전검사 통과: {spm.name}")
         self.log(f"Blender repair 시작: {spm.name} (수분 소요될 수 있음)")
         self.ui_queue.put(("cell", (iid, "blend_status", "Blender repair 중...")))
@@ -2741,6 +3052,28 @@ class App:
         ready = []
         for item in targets:
             spm = item["spm"]
+            dirty_windows = [
+                title
+                for title in blender_open_file_window_titles(
+                    blend_path_for(spm)
+                )
+                if title.lstrip().startswith("*")
+            ]
+            if dirty_windows:
+                why = (
+                    "Blender에 저장되지 않은 변경이 있어 저장본 Export를 "
+                    "차단함 — 저장하거나 닫은 뒤 다시 실행"
+                )
+                self._record_phase_status(
+                    str(spm),
+                    "push_status",
+                    f"건너뜀: {why}",
+                    "manual_required",
+                    why,
+                    persist=False,
+                )
+                self.log(f"[준비 제외] {spm.name}: {why}")
+                continue
             ok, why = self._handoff_ready(spm)
             if ok:
                 ready.append(item)
@@ -2810,8 +3143,10 @@ class App:
         return [
             TOOL_DIR / "jobs" / "send2ue_push_job.py",
             TOOL_DIR / "jobs" / "vertex_color_contract.py",
+            TOOL_DIR / "dynamic_wind_handoff_policy.py",
             TOOL_DIR / "cluster_assembly_builder.py",
             TOOL_DIR / "cluster_assembly_handoff_contract.py",
+            TOOL_DIR / "push_dependency_schedule.py",
             TOOL_DIR / "unreal_ingest.py",
             send2ue_dir / "core" / "export.py",
             send2ue_dir / "core" / "ingest.py",
@@ -3167,6 +3502,14 @@ class App:
     def _run_headless_push_batch(self, targets, emit_done=True):
         batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         total = len(targets)
+        dependency_map = dict(
+            getattr(self, "_active_push_dependency_map", {}) or {}
+        )
+        required_dependency_ids = {
+            dependency
+            for dependencies in dependency_map.values()
+            for dependency in dependencies
+        }
         self.ui_queue.put(("batch_progress", (0, total)))
         exported_by_index = {}
         failed_items = set(getattr(self, "_phase_failed_items", set()))
@@ -3236,11 +3579,22 @@ class App:
         pending = []
         for item in exported:
             iid = str(item["queue_id"])
+            item["depends_on_queue_ids"] = list(
+                dependency_map.get(iid, ())
+            )
             entry = self.state.setdefault(iid, {})
-            if (
+            import_cache_matches = (
                 not self.force_rerun
                 and entry.get("push_import_fingerprint") == item["fingerprint"]
-            ):
+            )
+            if import_cache_matches and iid in required_dependency_ids:
+                # The export cache is still valid, but a Tree in this batch
+                # needs the provider to exist in this Unreal project.  Unreal
+                # verifies the asset paths and imports only when any are absent.
+                item["verify_existing_assets"] = True
+                pending.append(item)
+                continue
+            if import_cache_matches:
                 self._set_push_state(iid, "imported_ok", "완료 (import cache)")
                 continue
             pending.append(item)

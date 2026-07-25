@@ -242,6 +242,86 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_follower_extra_structure_is_shown_as_master_normalization(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            folder = Path(r"D:\Trees\Tree_elm")
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.root_var = tk.StringVar(root, value=str(folder))
+            app.tree = ttk.Treeview(
+                root,
+                columns=("role", "bases", "structure", "status", "last"),
+            )
+            app.item_meta = {}
+            app.signature_cache = OrderedDict()
+            app.analysis_cache = OrderedDict()
+            app.board = [{
+                "folder": str(folder),
+                "spms": ["SK_Tree_elm_01.spm", "SK_Tree_elm_02.spm"],
+                "manifest": {
+                    "version": 1,
+                    "groups": [{
+                        "master": "SK_Tree_elm_01.spm",
+                        "base_categories": {"Leaf": "leaf"},
+                        "followers": [{
+                            "file": "SK_Tree_elm_02.spm",
+                            "base_map": {"Leaf 2": "Leaf"},
+                            "base_map_confirmed": True,
+                            "last_sync": "2026-07-25T10:00:00",
+                            "last_master_hash": "master-hash",
+                            "last_target_hash": "old-target-hash",
+                        }],
+                    }],
+                    "independent": [],
+                },
+                "master_candidates": [],
+                "cluster_blends": [],
+            }]
+            app.master_status = mock.Mock(
+                return_value=("최신", "master-hash")
+            )
+            app.cached_follower_analysis = mock.Mock(return_value=(
+                {
+                    "common": 2,
+                    "missing": 0,
+                    "master_sync": 1,
+                    "missing_bases": 0,
+                    "missing_details": [],
+                    "master_sync_details": [{
+                        "base": "Leaf 2",
+                        "name": "Knot unique",
+                        "type": "Knot",
+                        "path": "Branch > Knot unique",
+                    }],
+                    "scale_risk": {},
+                },
+                "new-target-hash",
+            ))
+
+            with mock.patch.object(GUI, "save_analysis_cache"):
+                app.render_board()
+
+            follower_iid = next(
+                iid for iid, row in app.item_meta.items()
+                if row.get("role") == "follower"
+            )
+            self.assertEqual(
+                app.tree.set(follower_iid, "structure"),
+                "마스터와 동기화 1",
+            )
+            self.assertEqual(
+                app.tree.set(follower_iid, "status"),
+                "정규화 필요",
+            )
+            self.assertIn(
+                "follower_master_sync",
+                app.tree.item(follower_iid, "tags"),
+            )
+        finally:
+            root.destroy()
+
     def test_cluster_refresh_reapplies_only_current_on_targets(self):
         owner = Path(r"D:\Trees\Tree_elm")
         blend = owner / "Cluster" / "SK_branch_elm_01.blend"
@@ -283,6 +363,8 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             [current],
             enabled=True,
             blender_exe=Path(r"C:\Blender\blender.exe"),
+            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+            capture_resolution=1024,
         )
         normalize.assert_not_called()
 
@@ -340,7 +422,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             cache_path = Path(temp) / "cache.json"
             signatures = OrderedDict([("master-key", "master-hash")])
             analyses = OrderedDict([
-                ("pair-key", ({"missing": 2, "target_only": 1}, "target-hash")),
+                ("pair-key", ({"missing": 2, "master_sync": 1}, "target-hash")),
             ])
             with mock.patch.object(GUI, "CACHE_PATH", cache_path):
                 GUI.save_analysis_cache(signatures, analyses)
