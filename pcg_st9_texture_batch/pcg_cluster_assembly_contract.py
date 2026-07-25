@@ -1094,11 +1094,15 @@ def _atlas_normalized_variants(
             payload,
             group,
         )
+        # One Cluster blend legitimately delivers the same plan set to several
+        # tree SPMs, and each target assigns its own local Material/Mesh IDs.
+        # Those per-target values must stay out of the identity: including them
+        # made every additional ON relationship look like a conflicting
+        # receipt, so a fully consistent folder failed while a half-applied one
+        # passed.  Identity is what the Cluster produced, not where it landed.
         identity = json.dumps(
             {
-                "spm": str(manifest_spm),
                 "material": normalize_export_name(contract["material"]),
-                "material_id": contract["material_id"],
                 "source_blend": contract["source_blend"].get("sha256"),
                 "variants": [
                     {
@@ -1111,7 +1115,6 @@ def _atlas_normalized_variants(
                         "source_partition_mode": row[
                             "source_partition_mode"
                         ],
-                        "target_mesh_id": row["target_mesh_id"],
                         "plan_fbx": row["plan_fbx"].get("sha256"),
                     }
                     for row in contract["variants"]
@@ -1120,9 +1123,9 @@ def _atlas_normalized_variants(
             sort_keys=True,
             separators=(",", ":"),
         )
-        candidates.append((identity, contract))
+        candidates.append((str(manifest_path), identity, contract))
     distinct = {}
-    for identity, contract in candidates:
+    for _manifest, identity, contract in sorted(candidates):
         distinct.setdefault(identity, contract)
     if len(distinct) > 1:
         raise ClusterAssemblyReceiptError(

@@ -686,6 +686,112 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     audit=audit_module,
                 )
 
+    def test_same_delivery_to_several_targets_is_one_role_contract(self):
+        # A Cluster blend that is ON for more than one tree SPM writes one
+        # scope manifest per target, each with that target's local Material and
+        # Mesh IDs.  Those are per-target bookkeeping, not competing receipts.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            blend = folder / "SK_branch_elm_01.blend"
+            plan_fbx = folder / "branch_elm_01_01.fbx"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            plan_fbx.write_bytes(b"plan")
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+
+            targets = []
+            for index, (material_id, mesh_id) in enumerate(
+                ((2, 10), (8, 21), (4, 33)), start=1
+            ):
+                target = folder / f"SK_Tree_elm_0{index}.spm"
+                write_spm(
+                    target,
+                    [(str(material_id), "branch_elm_01", [], (str(mesh_id),))],
+                    mesh_ids=(str(mesh_id),),
+                )
+                targets.append(target)
+                (scope_dir / f"scope_branch__{target.stem}.json").write_text(
+                    json.dumps({
+                        "spm": str(target),
+                        "blend_file": str(blend),
+                        "material_groups": [{
+                            "material": "branch_elm_01",
+                            "material_id": material_id,
+                            "mesh_ids": [mesh_id],
+                            "meshes": [{
+                                "source_object": "branch_elm_01_01",
+                                "source_ordinal": 1,
+                                "fbx": str(plan_fbx),
+                                "skeletal_asset_name": "SK_branch_elm_01_01",
+                                "source_prototype_index": 1,
+                                "source_partition_mode": "WHOLE_MESH",
+                            }],
+                        }],
+                    }),
+                    encoding="utf-8",
+                )
+
+            contract = _atlas_normalized_variants(
+                folder, "branch_elm_01", targets, audit=audit_module,
+            )
+
+            self.assertEqual(contract["material"], "branch_elm_01")
+            self.assertEqual(
+                [row["plan_name"] for row in contract["variants"]],
+                ["branch_elm_01_01"],
+            )
+
+    def test_diverging_plan_delivery_still_reports_multiple_receipts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            blend = folder / "SK_branch_elm_01.blend"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+
+            targets = []
+            for index, plan in enumerate(
+                ("branch_elm_01_01", "branch_elm_01_09"), start=1
+            ):
+                target = folder / f"SK_Tree_elm_0{index}.spm"
+                write_spm(
+                    target,
+                    [("2", "branch_elm_01", [], ("10",))],
+                    mesh_ids=("10",),
+                )
+                targets.append(target)
+                plan_fbx = folder / f"{plan}.fbx"
+                plan_fbx.write_bytes(plan.encode("utf-8"))
+                (scope_dir / f"scope_branch__{target.stem}.json").write_text(
+                    json.dumps({
+                        "spm": str(target),
+                        "blend_file": str(blend),
+                        "material_groups": [{
+                            "material": "branch_elm_01",
+                            "material_id": 2,
+                            "mesh_ids": [10],
+                            "meshes": [{
+                                "source_object": plan,
+                                "source_ordinal": 1,
+                                "fbx": str(plan_fbx),
+                                "skeletal_asset_name": f"SK_{plan}",
+                                "source_prototype_index": 1,
+                                "source_partition_mode": "WHOLE_MESH",
+                            }],
+                        }],
+                    }),
+                    encoding="utf-8",
+                )
+
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptError, "multiple current receipts"
+            ):
+                _atlas_normalized_variants(
+                    folder, "branch_elm_01", targets, audit=audit_module,
+                )
+
     def test_composite_side_contract_preserves_all_deform_subparts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir) / "Tree_elm"

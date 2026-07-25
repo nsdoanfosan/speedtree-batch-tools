@@ -116,6 +116,32 @@ class TargetCollectionTests(unittest.TestCase):
             "tree_ulmusdavidiana_01",
         ])
 
+    def test_bare_target_name_resolves_against_tree_root(self):
+        # An unresolved relative --target silently audited nothing: no SPM was
+        # found, the folder reported needs_sk, and no Cluster Assembly receipt
+        # was written - which then blocked Blender Repair with a stale receipt.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            folder = root / "Tree_elm"
+            folder.mkdir()
+            cfg = {"tree_root": str(root)}
+
+            self.assertEqual(
+                pcg_texture_audit.candidate_folders(cfg, ["Tree_elm"]),
+                [folder],
+            )
+            self.assertEqual(
+                pcg_texture_audit.candidate_folders(cfg, [str(folder)]),
+                [folder],
+            )
+
+    def test_unknown_target_is_reported_instead_of_auditing_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg = {"tree_root": temporary}
+            with self.assertRaises(ValueError) as caught:
+                pcg_texture_audit.candidate_folders(cfg, ["Tree_missing"])
+            self.assertIn("Tree_missing", str(caught.exception))
+
     def test_default_report_audits_all_local_spm_targets(self):
         folder = Path(r"D:\Trees\Tree_elm")
         local_names = ["tree_elm_01", "tree_elm_02", "tree_elm_03"]

@@ -4488,9 +4488,25 @@ def folder_target_mesh_names(folder, target_mesh_names):
 
 
 def candidate_folders(cfg, targets=None, pcg_targets=None):
-    if targets:
-        return [Path(t) for t in targets]
     root = Path(cfg["tree_root"])
+    if targets:
+        # A bare folder name is the documented --target form, but an unresolved
+        # relative path silently audits nothing: no SPM is found, the folder
+        # reports needs_sk, and no Cluster Assembly receipt is written.
+        resolved = []
+        for value in targets:
+            path = Path(value)
+            if not path.is_dir() and not path.is_absolute():
+                candidate = root / value
+                if candidate.is_dir():
+                    path = candidate
+            if not path.is_dir():
+                raise ValueError(
+                    f"감사할 폴더를 찾지 못했습니다: {value} "
+                    f"(tree_root={root})"
+                )
+            resolved.append(path)
+        return resolved
     folders = []
     target_mesh_names = target_mesh_names_from_pcg_targets(pcg_targets)
     if not root.exists():
