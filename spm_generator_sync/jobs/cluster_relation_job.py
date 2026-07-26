@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import traceback
@@ -44,6 +45,105 @@ def sha256_file(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def cluster_export_contract_issues(cluster_source_stem):
+    export_collection = bpy.data.collections.get("Export")
+    if export_collection is None:
+        return ["missing_export_collection"]
+    issues = [
+        f"orphan_owned_export_empty:{obj.name}"
+        for obj in export_collection.objects
+        if obj.type == "EMPTY"
+        and not obj.children
+        and bool(obj.get("codex_source_fbx", ""))
+    ]
+    pivots = [
+        obj
+        for obj in export_collection.objects
+        if obj.type == "EMPTY"
+        and obj.children
+        and bool(obj.get("speedtree_cluster_generated"))
+        and obj.get("speedtree_cluster_asset_role") == "send2ue_pivot"
+    ]
+    issues.extend(
+        f"cluster_unsuffixed_export_unit:{obj.name}"
+        for obj in export_collection.objects
+        if obj.type == "EMPTY" and obj.children and obj not in pivots
+    )
+    pattern = re.compile(
+        rf"^{re.escape(cluster_source_stem)}_(\d{{2}})$",
+        re.IGNORECASE,
+    )
+    ordinals = []
+    for pivot in pivots:
+        match = pattern.fullmatch(pivot.name)
+        if match is None:
+            issues.append(f"cluster_invalid_export_pivot:{pivot.name}")
+        else:
+            ordinals.append(int(match.group(1)))
+    if not pivots:
+        issues.append("cluster_missing_normalized_export_pivot")
+    elif sorted(ordinals) != list(range(1, len(pivots) + 1)):
+        issues.append(
+            "cluster_nonconsecutive_export_pivots:"
+            + ",".join(str(value) for value in sorted(ordinals))
+        )
+    return issues
+
+
+def finalize_cluster_source_pipeline(recipe):
+    if not recipe:
+        return {"status": "not_applicable"}
+    blend = Path(recipe["blend"]).expanduser().absolute()
+    issues = cluster_export_contract_issues(blend.stem)
+    if issues:
+        raise RuntimeError(
+            "Cluster Normalizer final Export contract failed: "
+            + ", ".join(issues)
+        )
+    report_path = (
+        blend.parent
+        / "reports"
+        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    handoff = payload.get("handoff_preflight") or {}
+    if handoff.get("status") == "cluster_export_pending":
+        source_build = payload.get("cluster_source_build_contract") or {}
+        final_status = source_build.get(
+            "post_normalization_handoff_status", "ok"
+        )
+        if final_status not in {"ok", "source_review"}:
+            raise RuntimeError(
+                "Cluster source-build post-normalization handoff status is "
+                f"invalid: {final_status}"
+            )
+        handoff["status"] = final_status
+        handoff["export_collection_issues"] = []
+        handoff["source_review_required"] = (
+            final_status == "source_review"
+        )
+        handoff["unreal_push_ready"] = final_status == "ok"
+        payload["handoff_preflight"] = handoff
+        payload["export_collection_issues"] = []
+        payload["source_review_required"] = (
+            final_status == "source_review"
+        )
+        payload["unreal_push_ready"] = final_status == "ok"
+        source_build["status"] = "normalized"
+        source_build["deferred_export_issues"] = []
+        source_build["final_export_required"] = False
+        payload["cluster_source_build_contract"] = source_build
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return {
+        "status": "ok",
+        "pipeline_report": str(report_path),
+        "export_collection_issues": [],
+    }
 
 
 def load_normalization_recipe(path, blend, requested):
@@ -471,6 +571,9 @@ def sync_targets(blend, requested, normalization_recipe=None):
     unresolved = [str(path) for path in requested if key(path) not in completed]
     if unresolved:
         raise RuntimeError("Atlas build returned no result for: " + ", ".join(unresolved))
+    cluster_source_pipeline = finalize_cluster_source_pipeline(
+        normalization_recipe
+    )
     return {
         "mode": "sync",
         "blend": str(blend),
@@ -479,6 +582,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "cluster_export_configuration": export_configuration,
         "recipe_source_material_mapping_update": recipe_mapping_update,
         "source_material_mapping_update": mapping_update,
+        "cluster_source_pipeline": cluster_source_pipeline,
         "results": results,
     }
 

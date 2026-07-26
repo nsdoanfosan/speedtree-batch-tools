@@ -244,6 +244,58 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertEqual(command[1:3], ["--factory-startup", "--background"])
             self.assertFalse(blend.with_suffix(".atlas_leaf_targets.json").exists())
 
+    def test_successful_sync_commits_shared_repair_runtime_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.touch()
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            runtime_receipt = (
+                cluster / "reports"
+                / "SK_branch_elm_01_repair_runtime_codex.json"
+            )
+
+            def complete(command, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.write_text(
+                    json.dumps({"status": "ok"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=complete,
+            ), mock.patch(
+                "sk_batch.repair_runtime_contract."
+                "write_repair_runtime_receipt",
+                return_value=runtime_receipt,
+            ) as write_receipt:
+                result = run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=blender,
+                    auto_normalize=False,
+                    repair_runtime_config={"fbx_ini": "configured.ini"},
+                )
+
+            write_receipt.assert_called_once_with(
+                blend.with_suffix(".spm"),
+                {"fbx_ini": "configured.ini"},
+            )
+            self.assertEqual(
+                result["repair_runtime_receipt"],
+                str(runtime_receipt),
+            )
+
     def test_on_failure_restores_every_spm_the_job_half_wrote(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
@@ -315,6 +367,12 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 / "SK_branch_elm_01_cluster_normalization_sync_receipt.json"
             )
             receipt.write_bytes(b"good-receipt")
+            pipeline_report = (
+                reports
+                / "SK_branch_elm_01_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            pipeline_report.write_bytes(b"good-pipeline")
             import_manifest = owner / "speedtree_import_manifest.json"
             readme = owner / "README_SPEEDTREE_IMPORT.md"
             import_manifest.write_bytes(b"good-import-manifest")
@@ -355,6 +413,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 color.write_bytes(b"bad-color")
                 blend.write_bytes(b"bad-blend")
                 receipt.write_bytes(b"bad-receipt")
+                pipeline_report.write_bytes(b"bad-pipeline")
                 (cluster / "branch_elm_01_AO.tga").write_bytes(b"new-partial")
                 import_manifest.write_bytes(b"bad-import-manifest")
                 readme.write_bytes(b"bad-readme")
@@ -400,6 +459,10 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertEqual(color.read_bytes(), b"good-color")
             self.assertEqual(blend.read_bytes(), b"blend")
             self.assertEqual(receipt.read_bytes(), b"good-receipt")
+            self.assertEqual(
+                pipeline_report.read_bytes(),
+                b"good-pipeline",
+            )
             self.assertFalse((cluster / "branch_elm_01_AO.tga").exists())
             self.assertEqual(
                 import_manifest.read_bytes(),
@@ -474,11 +537,18 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 return_value={"status": "ok", "mode": "sync"},
             ) as apply:
                 run_cluster_folder_relation_transaction(
-                    blend, enabled=True, blender_exe=blender
+                    blend,
+                    enabled=True,
+                    blender_exe=blender,
+                    repair_runtime_config={"fbx_ini": "configured.ini"},
                 )
             self.assertEqual(
                 apply.call_args.args[1],
                 [first.absolute(), second.absolute()],
+            )
+            self.assertEqual(
+                apply.call_args.kwargs["repair_runtime_config"],
+                {"fbx_ini": "configured.ini"},
             )
 
             save_target_registry(blend, [first])

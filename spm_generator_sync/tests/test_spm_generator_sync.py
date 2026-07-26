@@ -69,6 +69,15 @@ def write_spm(path, text):
     path.write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
 
 
+def rename_generators(text, names_by_guid):
+    root = ET.fromstring(text)
+    for generator in root.findall("./Generators/Generator"):
+        name = names_by_guid.get(generator.findtext("GUID"))
+        if name is not None:
+            generator.find("Name").text = name
+    return ET.tostring(root, encoding="unicode")
+
+
 def make_master():
     generators = [
         generator_xml("tree", "Tree", "Tree", 0),
@@ -661,6 +670,67 @@ class GeneratorSyncTests(unittest.TestCase):
 
             plan = sync.build_sync_plan(master, target, mapping)
             self.assertFalse(plan.mapping_required)
+
+    def test_custom_base_names_sync_without_optional_color_classification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            master = Path(temp) / "master.spm"
+            target = Path(temp) / "target.spm"
+            write_spm(master, rename_generators(make_master(), {
+                "leaf-base": "Frond Base 3",
+                "branch-base": "Cluster Base 3",
+                "end-base": "extend",
+            }))
+            target_text = rename_generators(make_target(), {
+                "target-leaf-base": "Frond Base 4",
+                "target-branch-big": "Cluster Base 4",
+                "target-end": "extend 2",
+            }).replace(
+                property_xml("Settings:Base filter", "Leaf 2"),
+                property_xml("Settings:Base filter", "Frond Base 4"),
+            )
+            write_spm(target, target_text)
+
+            self.assertIsNone(sync.classify_base_name("Frond Base 3"))
+            self.assertIsNone(sync.classify_base_name("Cluster Base 3"))
+            self.assertIsNone(sync.classify_base_name("extend"))
+            plan = sync.build_sync_plan(master, target, {
+                "Frond Base 4": "Frond Base 3",
+                "Cluster Base 4": "Cluster Base 3",
+                "BranchSmall": None,
+                "extend 2": "extend",
+            })
+
+            self.assertFalse(plan.mapping_required)
+            self.assertEqual(
+                {item.source_base for item in plan.base_results},
+                {"Frond Base 3", "Cluster Base 3", "extend"},
+            )
+            self.assertTrue(all(
+                item.category is None for item in plan.base_results
+            ))
+
+    def test_custom_unmapped_master_bases_are_still_additive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            master = Path(temp) / "master.spm"
+            target = Path(temp) / "target.spm"
+            write_spm(master, rename_generators(make_master(), {
+                "leaf-base": "Frond Base 3",
+                "branch-base": "Cluster Base 3",
+                "end-base": "extend",
+            }))
+            write_spm(target, make_empty_target_without_links())
+
+            plan = sync.build_sync_plan(master, target, {})
+
+            self.assertFalse(plan.mapping_required)
+            self.assertEqual(
+                plan.added_base_mappings,
+                {
+                    "Frond Base 3": "Frond Base 3",
+                    "Cluster Base 3": "Cluster Base 3",
+                    "extend": "extend",
+                },
+            )
 
     def test_base_ref_names_are_base_scoped_unique_export_safe_and_stable(self):
         with tempfile.TemporaryDirectory() as temp:

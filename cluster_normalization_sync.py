@@ -20,6 +20,17 @@ class ClusterNormalizationSyncError(RuntimeError):
     """Actionable automatic-normalization preflight failure."""
 
 
+class ClusterSourceBuildRequiredError(ClusterNormalizationSyncError):
+    """The canonical Cluster blend/report must be rebuilt from its SPM."""
+
+    def __init__(self, message, *, blend, canonical_spm, report_path, reason):
+        super().__init__(message)
+        self.blend = Path(blend).expanduser().absolute()
+        self.canonical_spm = Path(canonical_spm).expanduser().absolute()
+        self.report_path = Path(report_path).expanduser().absolute()
+        self.reason = str(reason)
+
+
 def _sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -233,6 +244,7 @@ def _validate_unit_probe(path):
 
 def _bwr_report(blend, canonical_spm):
     blend = Path(blend).expanduser().absolute()
+    canonical_spm = Path(canonical_spm).expanduser().absolute()
     report_path = (
         blend.parent
         / "reports"
@@ -240,10 +252,36 @@ def _bwr_report(blend, canonical_spm):
     )
     report = _read_json(report_path)
     if not report or str(report.get("status") or "").casefold() != "done":
-        raise ClusterNormalizationSyncError(
-            "Current SK Batch BWR completion report is missing: "
-            f"{report_path}"
+        reason = "missing_or_incomplete_report"
+        raise ClusterSourceBuildRequiredError(
+            "Current Cluster source-build completion report is missing: "
+            f"{report_path}",
+            blend=blend,
+            canonical_spm=canonical_spm,
+            report_path=report_path,
+            reason=reason,
         )
+    handoff_status = str(
+        (report.get("handoff_preflight") or {}).get("status") or ""
+    ).casefold()
+    if handoff_status == "cluster_export_pending":
+        source_build = report.get("cluster_source_build_contract") or {}
+        if (
+            source_build.get("status") != "ready"
+            or source_build.get("mode")
+            != "raw_source_for_cluster_normalizer"
+            or not source_build.get("final_export_required")
+            or not source_build.get("deferred_export_issues")
+        ):
+            reason = "cluster_source_build_contract_invalid"
+            raise ClusterSourceBuildRequiredError(
+                "Cluster source-build report deferred Export without a valid "
+                f"Normalizer handoff contract: {report_path}",
+                blend=blend,
+                canonical_spm=canonical_spm,
+                report_path=report_path,
+                reason=reason,
+            )
     identity = (report.get("speedtree_live_source_identity") or {}).get("spm") or {}
     reported_path = Path(
         str(identity.get("canonical_path") or canonical_spm)
@@ -253,14 +291,24 @@ def _bwr_report(blend, canonical_spm):
         reported_path != Path(canonical_spm).expanduser().absolute()
         or str(identity.get("sha256") or "").casefold() != current_hash.casefold()
     ):
-        raise ClusterNormalizationSyncError(
-            "SK Batch blend/report is stale for the current Cluster SPM. "
-            f"Run Blender Repair first: {canonical_spm}"
+        reason = "source_identity_stale"
+        raise ClusterSourceBuildRequiredError(
+            "Cluster blend/report is stale for the current Cluster SPM. "
+            f"Rebuild the Cluster source blend first: {canonical_spm}",
+            blend=blend,
+            canonical_spm=canonical_spm,
+            report_path=report_path,
+            reason=reason,
         )
     merged_name = str((report.get("paths") or {}).get("merged_name") or "").strip()
     if not merged_name:
-        raise ClusterNormalizationSyncError(
-            f"SK Batch report has no merged source object: {report_path}"
+        reason = "merged_source_missing"
+        raise ClusterSourceBuildRequiredError(
+            f"Cluster source-build report has no merged render object: {report_path}",
+            blend=blend,
+            canonical_spm=canonical_spm,
+            report_path=report_path,
+            reason=reason,
         )
     return report_path, report, current_hash, merged_name
 
@@ -371,8 +419,6 @@ def resolve_normalization_recipe(
     blend = Path(blend).expanduser().absolute()
     canonical = Path(canonical_spm or blend.with_suffix(".spm")).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]
-    if not blend.is_file():
-        raise ClusterNormalizationSyncError(f"Cluster blend is missing: {blend}")
     if not canonical.is_file():
         raise ClusterNormalizationSyncError(
             f"Canonical Cluster SPM is missing: {canonical}"
@@ -388,13 +434,30 @@ def resolve_normalization_recipe(
             + ", ".join(missing)
         )
     unit_probe = _validate_unit_probe(unit_probe_path)
+    report_path = (
+        blend.parent
+        / "reports"
+        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+    if not blend.is_file():
+        raise ClusterSourceBuildRequiredError(
+            f"Canonical Cluster source blend is missing: {blend}",
+            blend=blend,
+            canonical_spm=canonical,
+            report_path=report_path,
+            reason="blend_missing",
+        )
     report_path, _report, source_hash, merged_name = _bwr_report(
         blend, canonical
     )
     source_xml = blend.parent / "xml" / f"{blend.stem}.xml"
     if not source_xml.is_file():
-        raise ClusterNormalizationSyncError(
-            f"SK Batch source XML is missing: {source_xml}"
+        raise ClusterSourceBuildRequiredError(
+            f"Cluster source XML is missing: {source_xml}",
+            blend=blend,
+            canonical_spm=canonical,
+            report_path=report_path,
+            reason="source_xml_missing",
         )
     role = _role_contract(blend)
     target_material_bindings = [
@@ -478,6 +541,7 @@ def resolve_normalization_recipe(
 
 __all__ = [
     "ClusterNormalizationSyncError",
+    "ClusterSourceBuildRequiredError",
     "normalization_receipt_path",
     "resolve_normalization_recipe",
 ]

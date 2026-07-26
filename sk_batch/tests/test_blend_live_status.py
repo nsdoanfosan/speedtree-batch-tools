@@ -1019,9 +1019,9 @@ class BlendLiveStatusTests(unittest.TestCase):
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            cluster = root / "Tree_elm" / "Cluster"
-            cluster.mkdir(parents=True)
-            spm = cluster / "branch_elm_01.spm"
+            owner = root / "Tree_elm"
+            owner.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
             write_empty_spm(spm)
             app.force_rerun = True
             app.cfg = {
@@ -1085,6 +1085,129 @@ class BlendLiveStatusTests(unittest.TestCase):
                 for call in app.log.call_args_list
             ))
 
+    def test_cluster_blender_job_builds_raw_then_runs_normalizer_transaction(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = root / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_branch_elm_01.spm"
+            target = owner / "SK_Tree_elm_01.spm"
+            source_target = owner / "Tree_elm_01.spm"
+            write_empty_spm(spm)
+            write_empty_spm(target)
+            write_empty_spm(source_target)
+            blend = spm.with_suffix(".blend")
+            blend.write_bytes(b"old-normalized-blend")
+            pipeline_report = cluster / "reports" / (
+                "SK_branch_elm_01_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            pipeline_report.parent.mkdir()
+            pipeline_report.write_text(
+                json.dumps({"handoff_preflight": {"status": "ok"}}),
+                encoding="utf-8",
+            )
+            app.force_rerun = True
+            app.cfg = {
+                "speedtree_exe": "SpeedTree.exe",
+                "fbx_ini": str(
+                    root / "speedtree_bone_weight_repair"
+                    / "presets" / "speedtree_10_1"
+                    / "Options_MA_Fbx.ini"
+                ),
+                "blender_exe": str(root / "blender.exe"),
+                "blender_parallel_jobs": 1,
+                "blender_job_timeout": 3600,
+                "speedtree_material_preflight_timeout": 900,
+                "cluster_unit_probe": str(root / "unit.json"),
+                "cluster_capture_resolution": 1024,
+            }
+            speedtree_cli = (
+                Path(app.cfg["fbx_ini"]).resolve().parents[2]
+                / "speedtree_cli.py"
+            )
+            speedtree_cli.parent.mkdir(parents=True, exist_ok=True)
+            speedtree_cli.write_text("# test", encoding="utf-8")
+            commands = []
+
+            def fake_run(cmd, log_name, _timeout, **_kwargs):
+                del _kwargs
+                commands.append([str(value) for value in cmd])
+                report = Path(cmd[cmd.index("--report") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                if any(
+                    str(value).endswith("speedtree_material_preflight.py")
+                    for value in cmd
+                ):
+                    payload = {"status": "ok"}
+                else:
+                    payload = {
+                        "status": "ok",
+                        "cluster_source_build_contract": {
+                            "status": "ready",
+                        },
+                        "handoff_preflight": {
+                            "status": "cluster_export_pending",
+                        },
+                    }
+                report.write_text(json.dumps(payload), encoding="utf-8")
+                return 0, root / log_name
+
+            def fake_relation(*_args, **_kwargs):
+                pipeline_report.write_text(
+                    json.dumps({
+                        "handoff_preflight": {"status": "ok"},
+                        "source_review_required": False,
+                    }),
+                    encoding="utf-8",
+                )
+                return {"status": "ok"}
+
+            app._run_limited = fake_run
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+            app._handoff_ready = mock.Mock(
+                side_effect=[(False, "stale"), (True, "ready")]
+            )
+            app._blend_status_text = mock.Mock(return_value="latest")
+            app._write_repair_runtime_receipt = mock.Mock()
+            item = {
+                "spm": spm,
+                "manual_bones_locked": False,
+                "wind_override": "auto",
+                # Dependency provenance contains both the editable source and
+                # the final output.  Only the final SK output is a relationship
+                # mutation target.
+                "referenced_by_spms": (source_target, spm, target, target),
+            }
+
+            with mock.patch(
+                "spm_audit.audit_spm", return_value={}
+            ), mock.patch(
+                "spm_audit.sk_readiness", return_value={"ready": True}
+            ), mock.patch(
+                "cluster_blend_sync.run_cluster_relation_transaction",
+                side_effect=fake_relation,
+            ) as relation, mock.patch.object(gui, "save_state"):
+                app._job_blender(str(spm), spm, item)
+
+            bwr_command = next(
+                command
+                for command in commands
+                if any(
+                    value.endswith("bwr_headless_job.py")
+                    for value in command
+                )
+            )
+            self.assertIn("--cluster-source-build-only", bwr_command)
+            relation.assert_called_once()
+            self.assertEqual(
+                relation.call_args.args[1],
+                [target.absolute()],
+            )
+
     def test_failed_blender_job_restores_previous_pipeline_report(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -1131,7 +1254,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     '{"status":"done"}', encoding="utf-8"
                 )
                 report.write_text(
-                    '{"status":"failed","error":"Blender crashed"}',
+                    '{"status":"blocked","error":"preflight blocked"}',
                     encoding="utf-8",
                 )
                 return 1, root / log_name

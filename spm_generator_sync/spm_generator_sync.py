@@ -371,7 +371,8 @@ def classify_base_name(name: str) -> str | None:
     token = canonical_base_name(name)
     if "leaf" in token or "leaves" in token:
         return "leaf"
-    if "end" in token or "tip" in token:
+    words = set(filter(None, re.split(r"[^a-z0-9]+", token)))
+    if words & {"end", "tip"}:
         return "end"
     if "branch" in token or "bough" in token or "twig" in token:
         return "branch"
@@ -459,7 +460,7 @@ def is_protected_property(name: str) -> bool:
 class BaseSyncResult:
     source_base: str
     target_base: str
-    category: str
+    category: str | None
     matched_nodes: int = 0
     property_updates: int = 0
     added_nodes: int = 0
@@ -1163,7 +1164,7 @@ def _restore_icon_foreground(
         child.text = value
 
 
-def set_icon_background(generator: ET.Element, category: str) -> bool:
+def set_icon_background(generator: ET.Element, category: str | None) -> bool:
     """Compatibility wrapper for callers that only know the role."""
     return set_icon_palette(generator, CATEGORY_COLORS.get(category))
 
@@ -1368,7 +1369,7 @@ def clone_subtree(
     source_parent_guid: str,
     target_parent_guid: str,
     target_parent_level: int,
-    category: str,
+    category: str | None,
     salt: str,
     result: BaseSyncResult,
     detail_path: str = "",
@@ -1553,7 +1554,7 @@ def sync_subtree(
     target_document: SPMDocument,
     source_guid: str,
     target_guid: str,
-    category: str,
+    category: str | None,
     salt: str,
     result: BaseSyncResult,
 ) -> None:
@@ -1884,9 +1885,9 @@ def build_sync_plan(
             continue
         resolved_source_name = source.generator_name(source_base)
         category = categories.get(resolved_source_name)
-        if category not in CATEGORY_COLORS:
-            plan.mapping_required.append(f"색 분류 없음: {resolved_source_name}")
-            continue
+        # Base mapping is the structural contract.  A role category only
+        # standardizes editor icon colors; unknown/custom Base names must still
+        # synchronize and keep their existing/source palette.
         used_source.add(resolved_source_name)
         result = BaseSyncResult(
             source_base=resolved_source_name,
@@ -1911,9 +1912,8 @@ def build_sync_plan(
         if source_name in used_source:
             continue
         category = categories.get(source_name)
-        if category not in CATEGORY_COLORS:
-            plan.mapping_required.append(f"색 분류 없음: {source_name}")
-            continue
+        # New master Bases are additive even when their names do not encode one
+        # of the optional leaf/branch/end color roles.
         existing_name = [
             base for base in target.base_nodes()
             if canonical_base_name(target.generator_name(base)) == canonical_base_name(source_name)

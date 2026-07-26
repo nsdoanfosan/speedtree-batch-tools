@@ -4,6 +4,7 @@ Pure Python (no bpy). Used by the GUI and by spm_audit; the Blender-side job
 scripts under jobs/ are self-contained on purpose (they run inside Blender).
 """
 import configparser
+import ctypes
 import hashlib
 import ipaddress
 import json
@@ -101,6 +102,11 @@ DEFAULT_CONFIG = {
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
     "cluster_receipt_refresh_timeout": 600,
+    "cluster_unit_probe": (
+        r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
+        r"\speedtree_unit_probe_10cm_user_scale_0_1_verified.json"
+    ),
+    "cluster_capture_resolution": 1024,
     "push_job_timeout": 1800,
     # Avoid wedging Unreal's synchronous RPC queue with assets that are faster
     # to handle manually than to import through the unattended handoff.
@@ -994,6 +1000,40 @@ def blend_path_for(spm_path):
     except ClusterSpmPairPathError:
         pass
     return spm.with_suffix(".blend")
+
+
+def blender_open_file_window_titles(blend_path):
+    """Return interactive Blender windows that currently hold this blend."""
+    if os.name != "nt":
+        return []
+    try:
+        expected = str(Path(blend_path).resolve()).casefold()
+    except (OSError, ValueError):
+        return []
+    titles = []
+    try:
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+        )
+
+        @callback_type
+        def collect(window, _extra):
+            length = user32.GetWindowTextLengthW(window)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(window, buffer, length + 1)
+            title = buffer.value
+            lowered = title.casefold()
+            if "blender" in lowered and expected in lowered:
+                titles.append(title)
+            return True
+
+        user32.EnumWindows(collect, 0)
+    except (AttributeError, OSError):
+        return []
+    return titles
 
 
 def set_process_affinity(pid, cores):

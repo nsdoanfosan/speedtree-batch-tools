@@ -270,6 +270,55 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             }
             self.assertEqual(enabled, {"Structural A", "Structural B"})
 
+    def test_cluster_calibration_reaches_root_normalizer_when_generic_gate_is_off(self):
+        source_xml = cluster_graph_xml()
+        cfg = {
+            "cluster_root_only_bones": True,
+            "rename_materials": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": False,
+        }
+        generic_not_ready = {
+            "ready": False,
+            "mode": "all_bones_disabled",
+            "error": "all visible Branch bone generators are disabled",
+            "disabled_generators": [],
+            "bone_graph": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster_dir = Path(tmp) / "Cluster"
+            cluster_dir.mkdir()
+            spm_path = cluster_dir / "SK_branch_example_01.spm"
+            spm_audit.write_spm(spm_path, source_xml)
+
+            def fake_xml_export(_spm_path, _cfg, out_path):
+                Path(out_path).write_text(
+                    cluster_export_xml(["Structural A", "Structural B"]),
+                    encoding="utf-8",
+                )
+                return out_path
+
+            with mock.patch.object(
+                spm_audit, "sk_readiness", return_value=generic_not_ready
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=fake_xml_export,
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                return_value=True,
+            ):
+                report = spm_audit.process_spm(
+                    spm_path, cfg, log=lambda _message: None
+                )
+
+        self.assertEqual(report["status"], "calibrated")
+        self.assertEqual(
+            report["calibration"]["mode"],
+            "cluster_first_renderable_root_absolute_1",
+        )
+
     def test_speedtree_timeout_becomes_manual_required_and_restores_source(self):
         source_xml = mixed_base_graph_xml()
         cfg = {

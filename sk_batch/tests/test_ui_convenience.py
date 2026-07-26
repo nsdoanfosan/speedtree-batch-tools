@@ -1,7 +1,9 @@
 import gzip
 import hashlib
 import json
+import os
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -106,6 +108,100 @@ class FakeTree:
 
 
 class SkBatchUiConvenienceTests(unittest.TestCase):
+    def test_blender_repair_adds_and_blocks_only_exact_cluster_dependencies(self):
+        gui = load_gui_module()
+        owner = Path(r"D:\Trees\Birch")
+        root_01 = owner / "SK_tree_birch_01.spm"
+        root_02 = owner / "SK_tree_birch_02.spm"
+        cluster_a = owner / "Cluster" / "SK_branch_birch_01.spm"
+        cluster_b = owner / "Cluster" / "SK_leaf_birch_02.spm"
+        root_items = [
+            {"spm": root_01},
+            {"spm": root_02},
+        ]
+        all_items = root_items + [
+            {
+                "spm": cluster_a,
+                "referenced_by_spms": (root_01,),
+            },
+            {
+                "spm": cluster_b,
+                "referenced_by_spms": (),
+            },
+        ]
+
+        ordered, dependencies, auto_added = (
+            gui.expand_blender_repair_targets(root_items, all_items)
+        )
+
+        self.assertEqual(
+            [item["spm"] for item in ordered],
+            [cluster_a, root_01, root_02],
+        )
+        self.assertEqual(dependencies[str(root_01)], (str(cluster_a),))
+        self.assertEqual(dependencies[str(root_02)], ())
+        self.assertEqual(auto_added, {str(cluster_a)})
+
+    def test_recent_24_hours_checks_only_recent_authoritative_spms(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recent = root / "SK_tree_recent.spm"
+            old = root / "SK_tree_old.spm"
+            missing = root / "SK_tree_missing.spm"
+            mirror = root / "cluster_tree_old.spm"
+            for path in (recent, old, mirror):
+                path.write_bytes(path.name.encode("utf-8"))
+
+            now_ns = time.time_ns()
+            hour_ns = 60 * 60 * 1_000_000_000
+            os.utime(recent, ns=(now_ns - 23 * hour_ns,) * 2)
+            os.utime(old, ns=(now_ns - 25 * hour_ns,) * 2)
+            # A recent mirror must not select an old authoritative Cluster SPM.
+            os.utime(mirror, ns=(now_ns - hour_ns,) * 2)
+
+            app = gui.App.__new__(gui.App)
+            app.root = FakeRoot()
+            app.tree = FakeTree()
+            app.worker = None
+            app.progress_var = FakeVar()
+            messages = []
+            app.log = messages.append
+            app.items = {
+                str(recent): {
+                    "spm": recent,
+                    "authoring_spm": recent,
+                    "checked": False,
+                    "manual_bones_locked": False,
+                },
+                str(old): {
+                    "spm": old,
+                    "authoring_spm": old,
+                    "output_spm": mirror,
+                    "checked": True,
+                    "manual_bones_locked": False,
+                },
+                str(missing): {
+                    "spm": missing,
+                    "authoring_spm": missing,
+                    "checked": True,
+                    "manual_bones_locked": False,
+                },
+            }
+            app.checked_rows = gui.CheckedRowController(
+                app.items, app._redraw_checked_row
+            )
+            app.checked_rows.sync_after_reload()
+
+            app._set_recent_modified(hours=24, now_ns=now_ns)
+
+            self.assertTrue(app.items[str(recent)]["checked"])
+            self.assertFalse(app.items[str(old)]["checked"])
+            self.assertFalse(app.items[str(missing)]["checked"])
+            self.assertFalse(app.checked_rows.armed)
+            self.assertIn("1개 체크", app.progress_var.value)
+            self.assertIn("작업은 실행하지 않음", messages[-1])
+
     def test_cluster_raw_inputs_are_retained_as_canonical_bootstrap_rows(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:
@@ -514,42 +610,50 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             self.assertIn("1개", app.progress_var.value)
 
 
-    def test_running_click_selects_and_copies_without_toggling_check(self):
+    def test_running_queue_allows_selecting_the_next_execution_target(self):
         gui = load_gui_module()
 
-        class RunningWorker:
-            @staticmethod
-            def is_alive():
-                return True
-
         with tempfile.TemporaryDirectory() as temporary:
-            spm = Path(temporary) / "SK_tree_running.spm"
+            first = Path(temporary) / "SK_tree_running_a.spm"
+            second = Path(temporary) / "SK_tree_running_b.spm"
             app = gui.App.__new__(gui.App)
             app.root = FakeRoot()
             app.tree = FakeTree()
-            app.worker = RunningWorker()
+            app.worker = object()
+            app.active_batch_job = {"id": 1}
             app.cell_editor = None
             app.progress_var = FakeVar()
             app.items = {
-                str(spm): {
-                    "spm": spm,
-                    "checked": True,
+                str(path): {
+                    "spm": path,
+                    "checked": path == first,
                     "manual_bones_locked": False,
                 }
+                for path in (first, second)
             }
-            app.row_copy_paths = {str(spm): [spm]}
+            app.row_copy_paths = {
+                str(first): [first],
+                str(second): [second],
+            }
             app.checked_rows = gui.CheckedRowController(
                 app.items, app._redraw_checked_row
             )
             app.checked_rows.sync_after_reload()
-            event = type("Event", (), {"x": 0, "y": str(spm)})()
+            clear_current = type(
+                "Event", (), {"x": 0, "y": str(first)}
+            )()
+            select_next = type(
+                "Event", (), {"x": 0, "y": str(second)}
+            )()
 
-            self.assertEqual(app._on_click(event), "break")
+            self.assertEqual(app._on_click(clear_current), "break")
+            self.assertEqual(app._on_click(select_next), "break")
 
-            self.assertTrue(app.items[str(spm)]["checked"])
-            self.assertEqual(app.tree.selection(), (str(spm),))
+            self.assertFalse(app.items[str(first)]["checked"])
+            self.assertTrue(app.items[str(second)]["checked"])
+            self.assertEqual(app.tree.selection(), (str(second),))
             self.assertEqual(app.copy_selected_paths(), "break")
-            self.assertEqual(app.root.clipboard, str(spm.resolve()))
+            self.assertEqual(app.root.clipboard, str(second.resolve()))
 
 
 if __name__ == "__main__":

@@ -19,12 +19,14 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import xml.etree.ElementTree as ET
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +108,8 @@ CHECK_OFF = "☐"
 REPAIR_RUNTIME_RECEIPT_VERSION = 2
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 CLUSTER_RECEIPT_REFRESH_LOCK = threading.Lock()
+CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
+CLUSTER_RELATION_LOCKS = {}
 
 
 def is_cluster_source_spm(spm):
@@ -116,17 +120,42 @@ def is_cluster_source_spm(spm):
     )
 
 
-def blender_repair_asset_folder(spm):
-    """Return the asset root whose Repair receipts depend on this SPM."""
-    path = Path(spm)
-    return path.parent.parent if is_cluster_source_spm(path) else path.parent
-
-
 def normalized_folder_key(path):
     try:
         return os.path.normcase(str(Path(path).resolve())).casefold()
     except (OSError, ValueError):
         return os.path.normcase(str(Path(path).absolute())).casefold()
+
+
+def cluster_relation_output_targets(cluster_spm, referenced_by_spms):
+    """Keep final owner-folder SK outputs separate from source provenance."""
+    cluster_spm = Path(cluster_spm).expanduser().absolute()
+    owner = cluster_spm.parent.parent
+    owner_key = normalized_folder_key(owner)
+    targets = []
+    seen = set()
+    for value in referenced_by_spms or ():
+        target = Path(value).expanduser().absolute()
+        if (
+            normalized_folder_key(target.parent) != owner_key
+            or target.suffix.casefold() != ".spm"
+            or not target.name.casefold().startswith("sk_")
+        ):
+            continue
+        key = normalized_folder_key(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
+
+
+def cluster_relation_owner_lock(spm):
+    owner_key = normalized_folder_key(Path(spm).parent.parent)
+    with CLUSTER_RELATION_LOCKS_GUARD:
+        return CLUSTER_RELATION_LOCKS.setdefault(
+            owner_key, threading.Lock()
+        )
 
 
 def send2ue_rpc_cli_args(unreal_project):
@@ -195,6 +224,76 @@ def blender_repair_schedule_waves(targets):
     return [
         wave for wave in (cluster_sources, downstream) if wave
     ]
+
+
+def expand_blender_repair_targets(selected_targets, all_items):
+    """Add only Cluster rows referenced by the selected downstream SPMs.
+
+    ``referenced_by_spms`` is produced from the final SPM's actual Cluster
+    texture connections. It is the authority here: folder membership and
+    branch/leaf naming are not dependency contracts.
+    """
+    selected_targets = list(selected_targets)
+    values = all_items.values() if isinstance(all_items, dict) else all_items
+    inventory = [
+        item for item in values
+        if isinstance(item, dict) and item.get("spm")
+    ]
+    selected_downstream_by_path = {}
+    dependencies_by_root = {}
+    for item in selected_targets:
+        spm = item.get("spm")
+        if not spm or is_cluster_source_spm(spm):
+            continue
+        iid = str(spm)
+        dependencies_by_root.setdefault(iid, [])
+        for field in ("spm", "authoring_spm", "output_spm"):
+            value = item.get(field)
+            if value:
+                selected_downstream_by_path[
+                    normalized_folder_key(value)
+                ] = iid
+
+    dependency_items = []
+    auto_added_ids = set()
+    selected_ids = {str(item["spm"]) for item in selected_targets}
+    for item in inventory:
+        cluster_spm = item["spm"]
+        if not is_cluster_source_spm(cluster_spm):
+            continue
+        matched_roots = {
+            selected_downstream_by_path.get(normalized_folder_key(reference))
+            for reference in item.get("referenced_by_spms") or ()
+            if reference
+        }
+        matched_roots.discard(None)
+        if not matched_roots:
+            continue
+        dependency_iid = str(cluster_spm)
+        dependency_items.append(item)
+        if dependency_iid not in selected_ids:
+            auto_added_ids.add(dependency_iid)
+        for root_iid in matched_roots:
+            dependencies_by_root.setdefault(root_iid, []).append(
+                dependency_iid
+            )
+
+    ordered = []
+    seen = set()
+    for item in dependency_items + selected_targets:
+        iid = str(item["spm"])
+        if iid in seen:
+            continue
+        seen.add(iid)
+        ordered.append(item)
+    return (
+        ordered,
+        {
+            root: tuple(dict.fromkeys(dependencies))
+            for root, dependencies in dependencies_by_root.items()
+        },
+        auto_added_ids,
+    )
 
 
 def should_calibrate_spm(item):
@@ -432,6 +531,10 @@ class App:
         self.checked_rows = CheckedRowController(self.items, self._redraw_checked_row)
         self.ui_queue = queue.Queue()
         self.worker = None
+        self.pending_batch_jobs = deque()
+        self.active_batch_job = None
+        self.batch_job_sequence = 0
+        self.batch_job_failures = []
         self.cell_editor = None
         self.stop_flag = threading.Event()
         self.active_procs = set()          # all running child procs (serial or parallel)
@@ -458,7 +561,10 @@ class App:
         top.pack(fill="x")
         ttk.Label(top, text="루트:").pack(side="left")
         self.root_var = tk.StringVar(value=self.cfg["root"])
-        ttk.Entry(top, textvariable=self.root_var, width=66).pack(side="left", padx=4)
+        self.root_entry = ttk.Entry(
+            top, textvariable=self.root_var, width=66
+        )
+        self.root_entry.pack(side="left", padx=4)
         self.btn_pick_root = ttk.Button(top, text="...", width=3, command=self._pick_root)
         self.btn_pick_root.pack(side="left")
         self.btn_scan = ttk.Button(top, text="스캔", command=self.scan)
@@ -467,6 +573,20 @@ class App:
         self.btn_select_all.pack(side="left")
         self.btn_clear_all = ttk.Button(top, text="전체 해제", command=lambda: self._set_all(False))
         self.btn_clear_all.pack(side="left", padx=4)
+        self.btn_recent_24h = ttk.Button(
+            top,
+            text="최근 24시간",
+            command=self._check_recent_24h,
+        )
+        self.btn_recent_24h.pack(side="left")
+        Tooltip(
+            self.btn_recent_24h,
+            (
+                "현재 시각 기준으로 권위 SPM 파일이 최근 24시간 안에 수정된 "
+                "행만 체크합니다.\n"
+                "체크 상태만 바꾸며 작업은 실행하지 않습니다."
+            ),
+        )
         ttk.Button(
             top, text="선택 SPM 경로 복사", command=self.copy_selected_paths
         ).pack(side="left", padx=(4, 0))
@@ -621,7 +741,8 @@ class App:
         self.btn_blender = ttk.Button(actions, text="② Blender Repair (느림)",
                                       command=lambda: self.start_batch("blender"))
         self.btn_blender.pack(side="left", padx=6)
-        Tooltip(self.btn_blender, ("헤드리스 Blender로 SpeedTree 익스포트→임포트→본/웨이트 수리를 돌리고 "
+        Tooltip(self.btn_blender, ("① SPM 본 세팅을 먼저 실행한 뒤 ② Blender Repair를 실행합니다.\n"
+                                   "헤드리스 Blender로 SpeedTree 익스포트→임포트→본/웨이트 수리를 돌리고 "
                                    "SPM 옆에 같은 이름의 .blend와 wind JSON을 저장합니다.\n"
                                    "완료 전에 T_ 6종 또는 보존 Cluster 텍스처, 빈 머티리얼 슬롯까지 검사합니다.\n"
                                    "파일당 수분~수십분. 이미 최신인 blend는 건너뜁니다("
@@ -629,7 +750,9 @@ class App:
         self.btn_push = ttk.Button(actions, text="③ Unreal Push",
                                    command=lambda: self.start_batch("push"))
         self.btn_push.pack(side="left", padx=6)
-        Tooltip(self.btn_push, ("push 전에 준비 검사를 먼저 전부 통과시킵니다:\n"
+        Tooltip(self.btn_push, ("① SPM 본 세팅→② Blender Repair를 먼저 실행한 뒤 "
+                                "③ Unreal Push를 실행합니다.\n"
+                                "push 전에 준비 검사를 먼저 전부 통과시킵니다:\n"
                                 "· .blend 존재 + SPM보다 최신인지\n"
                                 "· 텍스처 세트와 Repair 사전검사(빈 머티리얼 슬롯 포함)\n"
                                 "· wind JSON(핸드오프 산출물) 존재\n"
@@ -802,12 +925,18 @@ class App:
                     if iid in self.items:
                         self._set_table_cell(iid, column, value)
                 elif kind == "progress":
-                    self.progress_var.set(payload)
+                    pending = len(getattr(self, "pending_batch_jobs", ()))
+                    suffix = f" · 대기 {pending}개" if pending else ""
+                    self.progress_var.set(f"{payload}{suffix}")
                 elif kind == "batch_progress":
                     done, total = payload
                     percent = (done / total * 100.0) if total else 0.0
                     self.batch_progress.configure(value=percent)
-                    self.batch_progress_var.set(f"{done}/{total} ({percent:.0f}%)")
+                    pending = len(getattr(self, "pending_batch_jobs", ()))
+                    suffix = f" · 대기 {pending}개" if pending else ""
+                    self.batch_progress_var.set(
+                        f"{done}/{total} ({percent:.0f}%){suffix}"
+                    )
                 elif kind == "scan_done":
                     generation, result, error = payload
                     if error is not None:
@@ -818,13 +947,13 @@ class App:
                     else:
                         self.scan(prepared=result, generation=generation)
                 elif kind == "done":
-                    for btn in (
-                        self.btn_check, self.btn_spm, self.btn_blender, self.btn_push,
-                        self.btn_all,
-                        self.btn_pick_root, self.btn_scan, self.btn_select_all, self.btn_clear_all,
-                    ):
-                        btn.configure(state="normal")
-                    self.btn_stop.configure(state="disabled")
+                    # Compatibility for direct worker/test calls. Queued jobs
+                    # finish through batch_job_done so the next request starts
+                    # only after the previous worker has returned.
+                    if getattr(self, "active_batch_job", None) is None:
+                        self._set_batch_queue_controls(False)
+                elif kind == "batch_job_done":
+                    self._finish_batch_job(payload)
         except queue.Empty:
             pass
         self.root.after(150, self._drain_ui_queue)
@@ -953,10 +1082,14 @@ class App:
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push", "btn_all",
             "btn_pick_root", "btn_scan", "btn_select_all", "btn_clear_all",
+            "btn_recent_24h",
         ):
             button = getattr(self, name, None)
             if button is not None:
                 button.configure(state=state)
+        root_entry = getattr(self, "root_entry", None)
+        if root_entry is not None:
+            root_entry.configure(state=state)
 
     def scan(self, prepared=None, generation=None):
         if prepared is None:
@@ -1124,6 +1257,10 @@ class App:
                 ),
                 "cluster_pair_status": (
                     cluster_source["pair_status"] if cluster_source else None
+                ),
+                "referenced_by_spms": (
+                    cluster_source.get("referenced_by_spms", ())
+                    if cluster_source else ()
                 ),
                 "source_read_only": source_read_only,
                 "blend_path": blend_path_for(spm),
@@ -1384,15 +1521,6 @@ class App:
         self.root.after_idle(post_dropdown)
 
     def _on_click(self, event):
-        if self.worker and self.worker.is_alive():
-            # Freeze checked execution targets and dropdown values, but keep
-            # read-only row selection available for details and path copying.
-            iid = self.tree.identify_row(event.y)
-            if iid in self.row_copy_paths:
-                self.tree.selection_set(iid)
-                self.tree.focus(iid)
-                self.tree.focus_set()
-            return "break"
         self._close_cell_editor()
         region = self.tree.identify_region(event.x, event.y)
         iid = self.tree.identify_row(event.y)
@@ -1415,6 +1543,14 @@ class App:
             return "break"
         if region != "cell":
             return
+        if getattr(self, "active_batch_job", None) is not None:
+            # Checked targets may change for a future queued request. Per-row
+            # modes can write marker/state data, so freeze only those edits
+            # until the current worker has completely returned.
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.focus_set()
+            return "break"
         column = self.tree.identify_column(event.x)
         if column == "#1":
             current = self.items[iid].get("bone_mode", "auto")
@@ -1442,9 +1578,35 @@ class App:
             return "break"
 
     def _set_all(self, checked):
-        if self.worker and self.worker.is_alive():
-            return
         self.checked_rows.set_all(checked)
+
+    def _set_recent_modified(self, hours=24, now_ns=None):
+        """Check only rows whose authoritative SPM changed within ``hours``."""
+        now_ns = time.time_ns() if now_ns is None else int(now_ns)
+        cutoff_ns = now_ns - int(float(hours) * 60 * 60 * 1_000_000_000)
+        checked_count = 0
+        for iid, item in self.items.items():
+            # A Cluster row is intentionally one-way: only its normalized
+            # authoring SPM is authoritative.  Mirror/report/blend timestamps
+            # must not select the row or feed changes back into its owner.
+            spm = Path(item.get("authoring_spm") or item["spm"])
+            try:
+                checked = spm.is_file() and spm.stat().st_mtime_ns >= cutoff_ns
+            except OSError:
+                checked = False
+            item["checked"] = bool(checked)
+            checked_count += int(checked)
+            self._redraw_checked_row(iid, item)
+        self.checked_rows.armed = False
+        message = (
+            f"최근 {hours:g}시간 수정 SPM {checked_count}개 체크 "
+            f"(총 {len(self.items)}개)"
+        )
+        self.progress_var.set(message)
+        self.log(f"[선택] {message} · 작업은 실행하지 않음")
+
+    def _check_recent_24h(self):
+        self._set_recent_modified(hours=24)
 
     def copy_selected_paths(self, _event=None):
         if not hasattr(self, "row_copy_paths"):
@@ -1567,95 +1729,340 @@ class App:
         # resolved, which avoids a single slow tree becoming the final tail.
         return (2, -duration, item["spm"].name.lower())
 
-    def start_batch(self, phase):
-        self._close_cell_editor()
-        targets = [item for item in self.items.values() if item["checked"]]
-        if not targets:
-            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
-            return
-        self.cfg = self._collect_cfg()
-        self.spm_calibration_signature = calibration_settings_signature(self.cfg)
-        self.legacy_spm_calibration_signature = (
-            legacy_calibration_settings_signature(self.cfg)
-        )
-        if phase != "check":
-            save_config(self.cfg)
-        self.active_push_transport = self.cfg.get("push_transport", "rpc")
-        # snapshot tk vars on the main thread; the worker must not touch them
-        self.force_rerun = bool(self.force_var.get())
-        self.stop_flag.clear()
-        self.batch_progress.configure(value=0)
-        self.batch_progress_var.set(f"0/{len(targets)} (0%)")
-        for btn in (
-            self.btn_check, self.btn_spm, self.btn_blender, self.btn_push,
-            self.btn_all,
-            self.btn_pick_root, self.btn_scan, self.btn_select_all, self.btn_clear_all,
-        ):
-            btn.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.worker = threading.Thread(target=self._run_batch, args=(phase, targets), daemon=True)
-        self.worker.start()
+    @staticmethod
+    def _snapshot_batch_item(item):
+        snapshot = dict(item)
+        for key, value in tuple(snapshot.items()):
+            if isinstance(value, dict):
+                snapshot[key] = dict(value)
+            elif isinstance(value, list):
+                snapshot[key] = list(value)
+            elif isinstance(value, set):
+                snapshot[key] = set(value)
+            elif isinstance(value, tuple):
+                snapshot[key] = tuple(value)
+        return snapshot
 
-    def start_full_pipeline(self):
-        self._close_cell_editor()
-        targets = list(self.items.values())
-        if not targets:
-            messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
+    def _ensure_batch_queue_state(self):
+        if not hasattr(self, "pending_batch_jobs"):
+            self.pending_batch_jobs = deque()
+        if not hasattr(self, "active_batch_job"):
+            self.active_batch_job = None
+        if not hasattr(self, "batch_job_sequence"):
+            self.batch_job_sequence = 0
+        if not hasattr(self, "batch_job_failures"):
+            self.batch_job_failures = []
+
+    def _snapshot_batch_request(self, target_iids):
+        inventory = {
+            iid: self._snapshot_batch_item(item)
+            for iid, item in self.items.items()
+        }
+        targets = [
+            inventory[iid] for iid in target_iids if iid in inventory
+        ]
+        return inventory, targets
+
+    def _batch_job_inventory(self):
+        active = getattr(self, "_active_batch_inventory", None)
+        return (
+            active
+            if active is not None
+            else getattr(self, "items", {})
+        )
+
+    def _batch_job_item(self, iid):
+        active = getattr(self, "_active_batch_items", None)
+        if active is not None and iid in active:
+            return active[iid]
+        return getattr(self, "items", {})[iid]
+
+    def _set_batch_queue_controls(self, active):
+        # Action and selection controls stay enabled so another request can be
+        # captured and queued. Root replacement/rescan would invalidate the
+        # visible inventory, so only those controls are frozen.
+        for name in (
+            "btn_check", "btn_spm", "btn_blender", "btn_push", "btn_all",
+            "btn_select_all", "btn_clear_all", "btn_recent_24h",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state="normal")
+        for name in ("btn_pick_root", "btn_scan"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state="disabled" if active else "normal")
+        root_entry = getattr(self, "root_entry", None)
+        if root_entry is not None:
+            root_entry.configure(state="disabled" if active else "normal")
+        stop = getattr(self, "btn_stop", None)
+        if stop is not None:
+            stop.configure(state="normal" if active else "disabled")
+
+    def _enqueue_batch_job(self, job):
+        self._ensure_batch_queue_state()
+        if (
+            self.active_batch_job is None
+            and not self.pending_batch_jobs
+        ):
+            self.batch_job_failures = []
+        self.batch_job_sequence += 1
+        job = dict(job)
+        job["id"] = self.batch_job_sequence
+        self.pending_batch_jobs.append(job)
+        if self.active_batch_job is not None:
+            pending = len(self.pending_batch_jobs)
+            self.log(
+                f"[대기열 #{job['id']}] {job['label']} 등록 · "
+                f"앞 대기 {pending - 1}개"
+            )
+        self._set_batch_queue_controls(True)
+        self._start_next_batch_job()
+        return job["id"]
+
+    def _start_next_batch_job(self):
+        self._ensure_batch_queue_state()
+        if self.active_batch_job is not None or not self.pending_batch_jobs:
             return
-        self.cfg = self._collect_cfg()
-        self.spm_calibration_signature = calibration_settings_signature(self.cfg)
+        job = self.pending_batch_jobs.popleft()
+        self.active_batch_job = job
+        self.cfg = dict(job["cfg"])
+        self.spm_calibration_signature = calibration_settings_signature(
+            self.cfg
+        )
         self.legacy_spm_calibration_signature = (
             legacy_calibration_settings_signature(self.cfg)
         )
-        save_config(self.cfg)
-        self.active_push_transport = (
-            "headless"
-            if self.cfg.get("night_headless", True)
-            else self.cfg.get("push_transport", "rpc")
-        )
-        self.force_rerun = bool(self.force_var.get())
+        self.force_rerun = job["force_rerun"]
+        self.active_push_transport = job["push_transport"]
+        self._active_batch_inventory = job["inventory"]
+        self._active_batch_items = job["inventory"]
         self.stop_flag.clear()
         self.batch_progress.configure(value=0)
-        self.batch_progress_var.set(f"0/{len(targets)} (0%)")
-        for btn in (
-            self.btn_check, self.btn_spm, self.btn_blender, self.btn_push,
-            self.btn_all,
-            self.btn_pick_root, self.btn_scan, self.btn_select_all, self.btn_clear_all,
-        ):
-            btn.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.log(
-            f"🌙 목록 전체 자동 시작: {len(targets)}개 · "
-            "① SPM → ② Blender → ③ Unreal"
+        pending = len(self.pending_batch_jobs)
+        suffix = f" · 대기 {pending}개" if pending else ""
+        self.batch_progress_var.set(
+            f"0/{len(job['targets'])} (0%){suffix}"
         )
+        self._set_batch_queue_controls(True)
+        self.log(f"[대기열 #{job['id']}] 시작 · {job['label']}")
         self.worker = threading.Thread(
-            target=self._run_full_pipeline,
-            args=(targets,),
+            target=self._run_queued_batch_job,
+            args=(job,),
             daemon=True,
         )
         self.worker.start()
 
-    def _run_full_pipeline(self, targets):
-        phases = (
-            ("spm", "① SPM 본 세팅"),
-            ("blender", "② Blender Repair"),
-            ("push", "③ Unreal Push"),
+    def _run_queued_batch_job(self, job):
+        error = None
+        try:
+            if job["mode"] == "pipeline":
+                self._run_full_pipeline(
+                    job["targets"],
+                    terminal_phase=job["terminal_phase"],
+                    selected_scope=job["selected_scope"],
+                    emit_done=False,
+                )
+            else:
+                self._run_batch(
+                    job["phase"], job["targets"], emit_done=False
+                )
+        except Exception as exc:
+            error = compact_error_message(exc)
+            self.log(
+                f"[대기열 #{job['id']}] 예외 종료 · "
+                f"{job['label']}: {error}"
+            )
+        finally:
+            self.ui_queue.put((
+                "batch_job_done",
+                {"id": job["id"], "error": error},
+            ))
+
+    def _finish_batch_job(self, payload):
+        self._ensure_batch_queue_state()
+        job = self.active_batch_job
+        if job is None or payload.get("id") != job.get("id"):
+            return
+        error = payload.get("error")
+        if error:
+            self.batch_job_failures.append(
+                {"id": job["id"], "label": job["label"], "error": error}
+            )
+        self.log(
+            f"[대기열 #{job['id']}] "
+            + ("실패 기록 후 다음 작업 계속" if error else "완료")
+            + f" · {job['label']}"
         )
+        self.active_batch_job = None
+        self.worker = None
+        for key in (
+            "_active_batch_inventory",
+            "_active_batch_items",
+            "_active_blender_dependency_map",
+            "_pipeline_upstream_failed_items",
+            "_active_push_dependency_map",
+            "_active_push_auto_added_ids",
+        ):
+            self.__dict__.pop(key, None)
+        if self.pending_batch_jobs:
+            self._start_next_batch_job()
+            return
+        self._set_batch_queue_controls(False)
+        failure_count = len(self.batch_job_failures)
+        if failure_count:
+            self.progress_var.set(
+                f"대기열 완료 · 작업 예외 {failure_count}건 기록"
+            )
+        else:
+            self.progress_var.set("대기열 완료")
+
+    def start_batch(self, phase):
+        self._close_cell_editor()
+        target_iids = [
+            iid for iid, item in self.items.items() if item["checked"]
+        ]
+        if not target_iids:
+            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+            return
+        cfg = dict(self._collect_cfg())
+        if phase != "check":
+            save_config(cfg)
+        inventory, targets = self._snapshot_batch_request(target_iids)
+        phase_labels = {
+            "check": "검사",
+            "spm": "① SPM 본 세팅",
+            "blender": "② Blender Repair 연계 ①→②",
+            "push": "③ Unreal Push 연계 ①→②→③",
+        }
+        job = {
+            "label": f"{phase_labels[phase]} · 선택 {len(targets)}개",
+            "mode": (
+                "pipeline" if phase in {"blender", "push"} else "phase"
+            ),
+            "phase": phase,
+            "terminal_phase": phase,
+            "selected_scope": phase in {"blender", "push"},
+            "targets": targets,
+            "inventory": inventory,
+            "cfg": cfg,
+            "force_rerun": bool(self.force_var.get()),
+            "push_transport": cfg.get("push_transport", "rpc"),
+        }
+        self._enqueue_batch_job(job)
+
+    def start_full_pipeline(self):
+        self._close_cell_editor()
+        target_iids = list(self.items)
+        if not target_iids:
+            messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
+            return
+        cfg = dict(self._collect_cfg())
+        save_config(cfg)
+        inventory, targets = self._snapshot_batch_request(target_iids)
+        job = {
+            "label": f"목록 전체 자동 ①→②→③ · {len(targets)}개",
+            "mode": "pipeline",
+            "phase": "push",
+            "terminal_phase": "push",
+            "selected_scope": False,
+            "targets": targets,
+            "inventory": inventory,
+            "cfg": cfg,
+            "force_rerun": bool(self.force_var.get()),
+            "push_transport": (
+                "headless"
+                if cfg.get("night_headless", True)
+                else cfg.get("push_transport", "rpc")
+            ),
+        }
+        self._enqueue_batch_job(job)
+
+    def _run_full_pipeline(
+        self,
+        targets,
+        terminal_phase="push",
+        selected_scope=False,
+        emit_done=True,
+    ):
+        (
+            targets,
+            self._active_blender_dependency_map,
+            auto_added_cluster_ids,
+        ) = expand_blender_repair_targets(
+            targets,
+            self._batch_job_inventory()
+            or {str(item["spm"]): item for item in targets},
+        )
+        if auto_added_cluster_ids:
+            self.log(
+                "Tree Repair dependency: Cluster "
+                f"{len(auto_added_cluster_ids)}개 자동 포함 — "
+                + ", ".join(
+                    sorted(
+                        Path(iid).name for iid in auto_added_cluster_ids
+                    )
+                )
+            )
+        phase_labels = {
+            "spm": "① SPM 본 세팅",
+            "blender": "② Blender Repair",
+            "push": "③ Unreal Push",
+        }
+        cluster_targets = [
+            item for item in targets
+            if is_cluster_source_spm(item["spm"])
+        ]
+        downstream_targets = [
+            item for item in targets
+            if not is_cluster_source_spm(item["spm"])
+        ]
+        schedule = []
+        if cluster_targets:
+            schedule.append(
+                ("spm", cluster_targets, "Cluster ① SPM 본 세팅")
+            )
+            if terminal_phase in {"blender", "push"}:
+                schedule.append(
+                    (
+                        "blender",
+                        cluster_targets,
+                        "Cluster ② Blender/Normalizer",
+                    )
+                )
+        if downstream_targets:
+            schedule.append(
+                ("spm", downstream_targets, "Tree ① SPM 본 세팅")
+            )
+            if terminal_phase in {"blender", "push"}:
+                schedule.append(
+                    (
+                        "blender",
+                        downstream_targets,
+                        "Tree ② Blender Repair",
+                    )
+                )
+        if terminal_phase == "push":
+            schedule.append(("push", targets, phase_labels["push"]))
         pipeline_abort = None
-        eligible = list(targets)
         failed_items = set()
-        for phase, label in phases:
-            if self.stop_flag.is_set() or not eligible:
+        for phase, scheduled_targets, label in schedule:
+            if self.stop_flag.is_set():
                 break
+            eligible_stage = [
+                item for item in scheduled_targets
+                if str(item["spm"]) not in failed_items
+            ]
+            if not eligible_stage:
+                continue
+            self._pipeline_upstream_failed_items = set(failed_items)
             self.log(f"🌙 {label} 시작")
-            phase_ok = self._run_batch(phase, eligible, emit_done=False)
+            phase_ok = self._run_batch(
+                phase, eligible_stage, emit_done=False
+            )
             phase_failed = set(getattr(self, "_phase_failed_items", set()))
             if phase_failed:
                 failed_items.update(phase_failed)
-                eligible = [
-                    item for item in eligible
-                    if str(item["spm"]) not in phase_failed
-                ]
                 self.log(
                     f"🌙 {label}: 실패/준비 제외 {len(phase_failed)}개는 "
                     "다음 단계로 넘기지 않습니다."
@@ -1664,6 +2071,10 @@ class App:
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
                 break
+        eligible = [
+            item for item in targets
+            if str(item["spm"]) not in failed_items
+        ]
         if self.stop_flag.is_set():
             final_text = "중지됨"
         elif pipeline_abort:
@@ -1675,15 +2086,38 @@ class App:
             )
         else:
             final_text = "전체 자동 완료"
+        if selected_scope:
+            terminal_label = phase_labels[terminal_phase]
+            if self.stop_flag.is_set():
+                final_text = f"{terminal_label} 연계 실행 중지됨"
+            elif pipeline_abort:
+                final_text = f"{terminal_label} 연계 실행 중단 · {pipeline_abort}"
+            elif failed_items:
+                final_text = (
+                    f"{terminal_label} 연계 실행 종료 · 성공 {len(eligible)}개 · "
+                    f"실패/준비 제외 {len(failed_items)}개"
+                )
+            else:
+                final_text = f"{terminal_label} 연계 실행 완료"
         self.ui_queue.put(("progress", final_text))
-        self.ui_queue.put(("done", None))
+        if emit_done:
+            self.ui_queue.put(("done", None))
+        self.__dict__.pop("_active_blender_dependency_map", None)
+        self.__dict__.pop("_pipeline_upstream_failed_items", None)
         self.log(f"🌙 {final_text}")
 
     def stop_batch(self):
+        self._ensure_batch_queue_state()
+        pending = len(self.pending_batch_jobs)
+        self.pending_batch_jobs.clear()
         self.stop_flag.set()
         # Worker polling performs the tree kill. Keeping it in one place avoids
         # racing a direct parent-only kill that would orphan SpeedTree children.
-        self.log("중지 요청됨 — 실행 중인 작업과 SpeedTree 자식을 종료합니다.")
+        suffix = f" · 대기 작업 {pending}개 취소" if pending else ""
+        self.log(
+            "중지 요청됨 — 실행 중인 작업과 SpeedTree 자식을 종료합니다."
+            + suffix
+        )
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
@@ -1731,7 +2165,7 @@ class App:
                     self._active_push_auto_added_ids,
                 ) = expand_push_targets(
                     targets,
-                    getattr(self, "items", None)
+                    self._batch_job_inventory()
                     or {str(item["spm"]): item for item in targets},
                 )
             except (
@@ -1813,7 +2247,25 @@ class App:
         phase_abort = threading.Event()
         attempted = set()
         failed_items = set(preflight_skipped)
-        dependency_failures = {}
+        blender_dependency_map = (
+            getattr(self, "_active_blender_dependency_map", None)
+            if phase == "blender"
+            else None
+        )
+        if phase == "blender" and blender_dependency_map is None:
+            (
+                _expanded,
+                blender_dependency_map,
+                _auto_added,
+            ) = expand_blender_repair_targets(
+                targets,
+                self._batch_job_inventory()
+                or {str(item["spm"]): item for item in targets},
+            )
+        blender_dependency_map = blender_dependency_map or {}
+        upstream_failed_items = set(
+            getattr(self, "_pipeline_upstream_failed_items", set())
+        )
 
         def run_one(item):
             if self.stop_flag.is_set():
@@ -1847,14 +2299,24 @@ class App:
                             kind="dependency_blocked",
                         )
                 if phase == "blender" and not is_cluster_source_spm(spm):
-                    blocked_sources = dependency_failures.get(
-                        normalized_folder_key(blender_repair_asset_folder(spm))
-                    )
+                    blocked_sources = [
+                        dependency
+                        for dependency in blender_dependency_map.get(iid, ())
+                        if (
+                            dependency in failed_items
+                            or dependency in upstream_failed_items
+                        )
+                    ]
                     if blocked_sources:
                         raise BatchItemError(
                             "Cluster source Repair failed, so downstream "
                             "Repair was not run: "
-                            + ", ".join(sorted(blocked_sources)),
+                            + ", ".join(
+                                sorted(
+                                    Path(value).name
+                                    for value in blocked_sources
+                                )
+                            ),
                             kind="dependency_blocked",
                         )
                 if phase == "check":
@@ -1953,21 +2415,6 @@ class App:
                     if self.stop_flag.is_set() or phase_abort.is_set():
                         break
                     run_one(item)
-            if phase == "blender":
-                for item in wave:
-                    spm = item["spm"]
-                    iid = str(spm)
-                    if (
-                        iid in failed_items
-                        and is_cluster_source_spm(spm)
-                    ):
-                        key = normalized_folder_key(
-                            blender_repair_asset_folder(spm)
-                        )
-                        dependency_failures.setdefault(key, []).append(
-                            Path(spm).name
-                        )
-
         if phase_abort.is_set():
             deferred_reason = f"Unreal/RPC 중단으로 미실행 — {self._phase_abort_reason}"
             for item in targets:
@@ -2160,7 +2607,10 @@ class App:
         paths.extend([
             REPO_DIR / "speedtree_pipeline_contract.py",
             REPO_DIR / "cluster_spm_pair_contract.py",
+            REPO_DIR / "cluster_blend_sync.py",
             REPO_DIR / "cluster_normalization_sync.py",
+            REPO_DIR / "spm_generator_sync" / "jobs"
+            / "cluster_relation_job.py",
             REPO_DIR / "pcg_st9_texture_batch"
             / "pcg_cluster_assembly_contract.py",
             REPO_DIR / "pcg_st9_texture_batch" / "pcg_texture_audit.py",
@@ -2603,7 +3053,8 @@ class App:
             return
 
         entry = self.state.get(iid, {})
-        pair_status = self.items[iid].get("cluster_pair_status")
+        item = self._batch_job_item(iid)
+        pair_status = item.get("cluster_pair_status")
         if pair_status == "bootstrap_ready":
             text = "Cluster canonical 생성 예정 · 첫 작업에서 안전 bootstrap"
             self.ui_queue.put(("cell", (iid, "spm_status", text)))
@@ -2615,7 +3066,7 @@ class App:
             text = f"오류: Cluster pair {pair_status}"
             self.ui_queue.put(("cell", (iid, "spm_status", text)))
             return
-        manual_bones_locked = self.items[iid].get("manual_bones_locked", False)
+        manual_bones_locked = item.get("manual_bones_locked", False)
         summary = entry.get("spm_summary", "")
         if manual_bones_locked:
             text = manual_bone_status_text(spm)
@@ -2684,7 +3135,7 @@ class App:
     def _job_spm(self, iid, spm):
         spm = self._prepare_pair_for_job(spm)
         entry = self.state.setdefault(iid, {})
-        item = self.items[iid]
+        item = self._batch_job_item(iid)
         if not should_calibrate_spm(item):
             summary = "건너뜀 · 읽기 전용 SPM"
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
@@ -2894,6 +3345,7 @@ class App:
         from spm_audit import audit_spm, sk_readiness
 
         spm = self._prepare_pair_for_job(spm)
+        cluster_source = is_cluster_source_spm(spm)
         speedtree_spm = speedtree_output_spm_for(spm)
         blend = blend_path_for(spm)
         leaf_ok, leaf_reason = self._leaf_reference_ready(speedtree_spm)
@@ -3009,6 +3461,32 @@ class App:
             previous_pipeline_report = pipeline_report.read_bytes()
         except OSError:
             previous_pipeline_report = None
+        cluster_blend_backup = None
+        cluster_blend_existed = cluster_source and blend.is_file()
+        if cluster_blend_existed:
+            cluster_blend_backup = (
+                LOG_DIR / f"{spm.stem}_pre_repair_{stamp}.blend"
+            )
+            shutil.copy2(blend, cluster_blend_backup)
+
+        def restore_cluster_repair_outputs():
+            restored = []
+            if cluster_blend_backup and cluster_blend_backup.is_file():
+                shutil.copy2(cluster_blend_backup, blend)
+                restored.append(str(blend))
+            elif cluster_source and not cluster_blend_existed and blend.exists():
+                blend.unlink()
+                restored.append(str(blend))
+            if previous_pipeline_report is not None:
+                atomic_write_bytes(
+                    pipeline_report, previous_pipeline_report
+                )
+                restored.append(str(pipeline_report))
+            elif cluster_source and pipeline_report.exists():
+                pipeline_report.unlink()
+                restored.append(str(pipeline_report))
+            return restored
+
         cmd = [
             self.cfg["blender_exe"], "--factory-startup", "-b",
             "--python", str(TOOL_DIR / "jobs" / "bwr_headless_job.py"), "--",
@@ -3019,6 +3497,11 @@ class App:
             "--material-contract", str(material_report),
             "--report", str(job_report),
         ]
+        if cluster_source:
+            cmd.insert(
+                cmd.index("--material-contract"),
+                "--cluster-source-build-only",
+            )
         parallel = self.cfg.get("blender_parallel_jobs", 2) > 1
         code, log_file = self._run_limited(
             cmd,
@@ -3028,10 +3511,14 @@ class App:
         )
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
-            if (
-                previous_pipeline_report is not None
-                and result.get("status") not in {"ok", "blocked"}
-            ):
+            if cluster_source:
+                try:
+                    restore_cluster_repair_outputs()
+                except OSError as exc:
+                    self.log(
+                        f"  [Repair rollback warning] {spm.name}: {exc}"
+                    )
+            if previous_pipeline_report is not None:
                 try:
                     atomic_write_bytes(pipeline_report, previous_pipeline_report)
                     self.log(
@@ -3051,6 +3538,92 @@ class App:
                 log_file=log_file,
                 report_file=job_report,
             )
+        if cluster_source:
+            source_build = (
+                result.get("cluster_source_build_contract") or {}
+            )
+            if source_build.get("status") != "ready":
+                try:
+                    restore_cluster_repair_outputs()
+                except OSError:
+                    pass
+                raise BatchItemError(
+                    "Cluster raw source build did not produce a ready "
+                    "Normalizer contract",
+                    kind="data_error",
+                    report=result,
+                    log_file=log_file,
+                    report_file=job_report,
+                )
+            from cluster_blend_sync import (
+                owner_sk_spms,
+                run_cluster_relation_transaction,
+            )
+
+            relation_targets = cluster_relation_output_targets(
+                spm,
+                item.get("referenced_by_spms") or (),
+            )
+            if not relation_targets:
+                relation_targets = owner_sk_spms(spm.parent.parent)
+            if not relation_targets:
+                try:
+                    restore_cluster_repair_outputs()
+                except OSError:
+                    pass
+                raise BatchItemError(
+                    "Cluster normalization has no owner SK SPM target",
+                    kind="data_error",
+                    report=result,
+                    log_file=log_file,
+                    report_file=job_report,
+                )
+            try:
+                with cluster_relation_owner_lock(spm):
+                    relation_result = run_cluster_relation_transaction(
+                        blend,
+                        relation_targets,
+                        enabled=True,
+                        blender_exe=Path(self.cfg["blender_exe"]),
+                        unit_probe_path=Path(
+                            self.cfg["cluster_unit_probe"]
+                        ),
+                        capture_resolution=int(
+                            self.cfg.get(
+                                "cluster_capture_resolution", 1024
+                            )
+                        ),
+                        repair_runtime_config=self.cfg,
+                        timeout=int(
+                            self.cfg.get("blender_job_timeout", 3600)
+                        ),
+                    )
+                result["cluster_relation_sync"] = relation_result
+                final_pipeline = load_job_report(pipeline_report)
+                result["handoff_preflight"] = (
+                    final_pipeline.get("handoff_preflight") or {}
+                )
+                result["source_review_required"] = bool(
+                    final_pipeline.get("source_review_required")
+                )
+            except Exception as exc:
+                try:
+                    restored = restore_cluster_repair_outputs()
+                except OSError as restore_exc:
+                    restored = [f"rollback_failed:{restore_exc}"]
+                raise BatchItemError(
+                    "Cluster Normalizer/Atlas sync failed: "
+                    + str(exc)
+                    + (
+                        " | restored: " + ", ".join(restored)
+                        if restored
+                        else ""
+                    ),
+                    kind="data_error",
+                    report=result,
+                    log_file=log_file,
+                    report_file=job_report,
+                ) from exc
         # Written before the handoff check reads it: this run verified the saved
         # outputs against the code now installed, whether or not it had to
         # rewrite the .blend.
@@ -3067,6 +3640,13 @@ class App:
             == "source_review"
         )
         if not handoff_ok and not source_review:
+            if cluster_source:
+                try:
+                    restore_cluster_repair_outputs()
+                except OSError as exc:
+                    self.log(
+                        f"  [Repair rollback warning] {spm.name}: {exc}"
+                    )
             raise BatchItemError(
                 f"② 완료 후 사전검사 실패: {handoff_reason}",
                 kind="data_error",
@@ -3093,6 +3673,13 @@ class App:
                 entry["push_status_kind"] = "ready"
                 entry.pop("push_status_error", None)
                 save_state(self.state)
+        if cluster_blend_backup is not None:
+            try:
+                cluster_blend_backup.unlink(missing_ok=True)
+            except OSError as exc:
+                self.log(
+                    f"  [backup cleanup warning] {spm.name}: {exc}"
+                )
         for warning in result.get("warnings", []):
             self.log(f"  [② 경고] {spm.name}: {warning}")
         self.log(f"repair 완료: {blend.name}")
@@ -3448,7 +4035,9 @@ class App:
             getattr(self, "_active_push_dependency_map", {}) or {}
         ).get(iid):
             cmd.append("--dependency-orchestrated")
-        wind_override = self.items.get(iid, {}).get("wind_override", "auto")
+        wind_override = self._batch_job_item(iid).get(
+            "wind_override", "auto"
+        )
         resolved_wind = (
             wind_preset_for_spm(spm)
             if wind_override == "auto"
@@ -3909,7 +4498,9 @@ class App:
         ).get(iid):
             cmd.append("--dependency-orchestrated")
         cmd.extend(send2ue_rpc_cli_args(self.cfg.get("unreal_project")))
-        wind_override = self.items.get(iid, {}).get("wind_override", "auto")
+        wind_override = self._batch_job_item(iid).get(
+            "wind_override", "auto"
+        )
         resolved_wind = (
             wind_preset_for_spm(spm)
             if wind_override == "auto"

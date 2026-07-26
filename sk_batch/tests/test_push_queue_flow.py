@@ -155,14 +155,17 @@ class PushQueueFlowTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             first_root = Path(temp_dir) / "Tree_elm"
-            second_root = Path(temp_dir) / "Tree_maple"
             failed_cluster = (
                 first_root / "Cluster" / "SK_branch_elm_01.spm"
             )
             blocked_root = first_root / "SK_Tree_elm_01.spm"
-            independent_root = second_root / "SK_Tree_maple_01.spm"
+            independent_root = first_root / "SK_Tree_elm_02.spm"
             targets = [
-                {"spm": failed_cluster, "checked": True},
+                {
+                    "spm": failed_cluster,
+                    "checked": True,
+                    "referenced_by_spms": (blocked_root,),
+                },
                 {"spm": blocked_root, "checked": True},
                 {"spm": independent_root, "checked": True},
             ]
@@ -495,6 +498,55 @@ class PushQueueFlowTests(unittest.TestCase):
             if kind == "progress"
         ][-1]
         self.assertIn("실패/준비 제외 2개", final_progress)
+
+    def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        owner = Path(r"D:\Trees\Tree_elm")
+        cluster_spm = (
+            owner / "Cluster" / "SK_branch_elm_01.spm"
+        )
+        tree_spm = owner / "SK_Tree_elm_01.spm"
+        cluster_item = {
+            "spm": cluster_spm,
+            "checked": True,
+            "referenced_by_spms": (tree_spm,),
+        }
+        tree_item = {"spm": tree_spm, "checked": True}
+        app.items = {
+            str(cluster_spm): cluster_item,
+            str(tree_spm): tree_item,
+        }
+        calls = []
+
+        def fake_batch(phase, phase_targets, emit_done=False):
+            del emit_done
+            calls.append(
+                (
+                    phase,
+                    [item["spm"] for item in phase_targets],
+                )
+            )
+            app._phase_failed_items = set()
+            app._phase_abort_reason = None
+            return True
+
+        app._run_batch = mock.Mock(side_effect=fake_batch)
+        app._run_full_pipeline(
+            [tree_item, cluster_item],
+            terminal_phase="push",
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                ("spm", [cluster_spm]),
+                ("blender", [cluster_spm]),
+                ("spm", [tree_spm]),
+                ("blender", [tree_spm]),
+                ("push", [cluster_spm, tree_spm]),
+            ],
+        )
 
     def test_rpc_timeout_stops_safely_and_marks_remaining_items_not_run(self):
         gui = load_gui_module()

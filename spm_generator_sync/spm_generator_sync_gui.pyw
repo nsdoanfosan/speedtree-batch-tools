@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -27,6 +27,7 @@ from cluster_blend_sync import (
     run_cluster_folder_relation_transaction,
     run_cluster_relation_transaction,
 )
+from cluster_source_prepare import prepare_cluster_source_if_required
 
 
 def _load_sibling_engine():
@@ -429,6 +430,11 @@ class App:
         self.item_meta = {}
         self.job_queue = queue.Queue()
         self.worker = None
+        self.pending_jobs = deque()
+        self.active_job = None
+        self.job_sequence = 0
+        self.job_failures = []
+        self._job_has_followup = False
         self.job_started_at = None
         self.job_stage = "대기"
         self.drag_source_iids = ()
@@ -1476,6 +1482,15 @@ class App:
                 )
             )
             return
+        changes = [
+            {
+                **row,
+                "on_target_spms": list(row.get("on_target_spms") or ()),
+                "target_spms": list(row.get("target_spms") or ()),
+            }
+            for row in changes
+        ]
+        job_config = dict(self.config)
         blend = Path(changes[0]["blend"])
         cluster_count = len(changes)
         if refresh_only:
@@ -1542,26 +1557,45 @@ class App:
             if refresh_only:
                 results = []
                 for index, row in enumerate(changes, start=1):
+                    blend_path = Path(row["blend"])
+                    on_targets = row.get("on_target_spms") or []
+                    blender_path = Path(
+                        job_config.get("blender_exe") or DEFAULT_BLENDER
+                    )
+                    unit_probe_path = Path(
+                        job_config.get("cluster_unit_probe")
+                        or DEFAULT_CLUSTER_UNIT_PROBE
+                    )
+                    capture_resolution = int(
+                        job_config.get("cluster_capture_resolution") or 1024
+                    )
                     report(
                         f"Cluster 갱신 {index}/{cluster_count} · "
-                        f"{Path(row['blend']).name}",
+                        f"{blend_path.name}",
                         10 + int(80 * (index - 1) / cluster_count),
                     )
-                    results.append(run_cluster_relation_transaction(
-                        Path(row["blend"]),
-                        row.get("on_target_spms") or [],
+                    preparation = prepare_cluster_source_if_required(
+                        blend_path,
+                        on_targets,
+                        blender_exe=blender_path,
+                        unit_probe_path=unit_probe_path,
+                        capture_resolution=capture_resolution,
+                        progress_callback=lambda _stage, message, i=index: report(
+                            f"Cluster 갱신 {i}/{cluster_count} · {message}",
+                            10 + int(80 * (i - 0.5) / cluster_count),
+                        ),
+                    )
+                    relation_result = run_cluster_relation_transaction(
+                        blend_path,
+                        on_targets,
                         enabled=True,
-                        blender_exe=Path(
-                            self.config.get("blender_exe") or DEFAULT_BLENDER
-                        ),
-                        unit_probe_path=Path(
-                            self.config.get("cluster_unit_probe")
-                            or DEFAULT_CLUSTER_UNIT_PROBE
-                        ),
-                        capture_resolution=int(
-                            self.config.get("cluster_capture_resolution") or 1024
-                        ),
-                    ))
+                        blender_exe=blender_path,
+                        unit_probe_path=unit_probe_path,
+                        capture_resolution=capture_resolution,
+                        repair_runtime_config=job_config,
+                    )
+                    relation_result["source_preparation"] = preparation
+                    results.append(relation_result)
                 result = (
                     results[0]
                     if cluster_count == 1
@@ -1577,15 +1611,16 @@ class App:
                     blend,
                     enabled=enabled,
                     blender_exe=Path(
-                        self.config.get("blender_exe") or DEFAULT_BLENDER
+                        job_config.get("blender_exe") or DEFAULT_BLENDER
                     ),
                     unit_probe_path=Path(
-                        self.config.get("cluster_unit_probe")
+                        job_config.get("cluster_unit_probe")
                         or DEFAULT_CLUSTER_UNIT_PROBE
                     ),
                     capture_resolution=int(
-                        self.config.get("cluster_capture_resolution") or 1024
+                        job_config.get("cluster_capture_resolution") or 1024
                     ),
+                    repair_runtime_config=job_config,
                 )
             report("Cluster SPM 메시/Generator 검증 완료", 95)
             return result
@@ -1602,7 +1637,7 @@ class App:
                     f"폴더 SK {target_count}개"
                 )
             )
-            messagebox.showinfo(
+            self._show_job_info(
                 "Cluster 갱신 완료" if refresh_only else "Cluster 관계 완료",
                 f"{blend_label}\n"
                 + (
@@ -1616,7 +1651,6 @@ class App:
                     else f"폴더 SK {target_count}개 전체\n"
                 )
                 + f"모드: {result.get('mode')}",
-                parent=self.root,
             )
 
         self._start_job(
@@ -1627,6 +1661,11 @@ class App:
             ),
             apply,
             done,
+            queue_label=(
+                f"Cluster 갱신 · {blend_label}"
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'} · {blend_label}"
+            ),
         )
 
     def edit_selected_base_map(self):
@@ -1699,39 +1738,104 @@ class App:
             return []
         return followers
 
-    def _start_job(self, label, func, on_success):
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("작업 중", "현재 작업이 끝날 때까지 기다려 주세요.", parent=self.root)
+    def _ensure_job_queue_state(self):
+        """Initialize queue fields for normal startup and lightweight tests."""
+        if not hasattr(self, "pending_jobs"):
+            self.pending_jobs = deque()
+        if not hasattr(self, "active_job"):
+            self.active_job = None
+        if not hasattr(self, "job_sequence"):
+            self.job_sequence = 0
+        if not hasattr(self, "job_failures"):
+            self.job_failures = []
+        if not hasattr(self, "queue_run_total"):
+            self.queue_run_total = 0
+        if not hasattr(self, "queue_run_completed"):
+            self.queue_run_completed = 0
+        if not hasattr(self, "_job_has_followup"):
+            self._job_has_followup = False
+
+    def _show_job_info(self, title, message):
+        """Do not let a completion popup hold the next queued job."""
+        if getattr(self, "_job_has_followup", False):
+            self.status_var.set(f"{title} · 다음 대기 작업 시작")
             return
-        self.status_var.set(label)
-        self.job_started_at = time.monotonic()
-        self.job_stage = label
-        self.progress_bar.configure(value=1)
-        self.progress_text_var.set(f"{label} · 00:00")
-        buttons = [
-            getattr(self, name, None) for name in (
-                "preview_button", "apply_button", "apply_all_button",
-                "cluster_on_button", "cluster_refresh_button",
-                "cluster_off_button",
+        messagebox.showinfo(title, message, parent=self.root)
+
+    def _start_job(self, label, func, on_success, *, queue_label=None):
+        """Capture one job request and run all requests in FIFO order."""
+        self._ensure_job_queue_state()
+        if self.active_job is None and not self.pending_jobs:
+            self.job_failures = []
+            self.queue_run_total = 0
+            self.queue_run_completed = 0
+        self.job_sequence += 1
+        job = {
+            "id": self.job_sequence,
+            "label": str(label),
+            "queue_label": str(queue_label or label),
+            "func": func,
+            "on_success": on_success,
+        }
+        self.pending_jobs.append(job)
+        self.queue_run_total += 1
+        if self.active_job is None:
+            self._start_next_job()
+        else:
+            waiting = len(self.pending_jobs)
+            self.status_var.set(
+                f"대기열 추가 · {job['queue_label']} · 대기 {waiting}개"
             )
-        ]
-        for button in (button for button in buttons if button is not None):
-            button.configure(state="disabled")
+            self.progress_text_var.set(
+                f"{self.job_stage} · 대기열 {waiting}개"
+            )
+        return job["id"]
+
+    def _start_next_job(self):
+        self._ensure_job_queue_state()
+        if self.active_job is not None or not self.pending_jobs:
+            return
+        job = self.pending_jobs.popleft()
+        self.active_job = job
+        self.status_var.set(
+            f"{job['queue_label']} · 실행"
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
+        self.job_started_at = time.monotonic()
+        self.job_stage = job["label"]
+        self.progress_bar.configure(value=1)
+        self.progress_text_var.set(
+            f"{job['queue_label']} · 00:00"
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
 
         def report(stage, percent):
-            self.job_queue.put(("progress", str(stage), max(0, min(100, int(percent)))))
+            self.job_queue.put((
+                "progress",
+                job["id"],
+                str(stage),
+                max(0, min(100, int(percent))),
+            ))
 
         def run():
             try:
-                self.job_queue.put(("done", True, func(report), on_success))
+                payload = job["func"](report)
+                self.job_queue.put(("done", job["id"], True, payload))
             except Exception as exc:
-                self.job_queue.put(("done", False, exc, on_success))
+                self.job_queue.put(("done", job["id"], False, exc))
 
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
         self.root.after(100, self._poll_job)
 
     def _poll_job(self):
+        self._ensure_job_queue_state()
         completed = None
         while True:
             try:
@@ -1739,39 +1843,89 @@ class App:
             except queue.Empty:
                 break
             if event[0] == "progress":
-                _kind, stage, percent = event
+                _kind, job_id, stage, percent = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
                 self.job_stage = stage
                 self.progress_bar.configure(value=percent)
-                self.status_var.set(stage)
+                self.status_var.set(
+                    stage
+                    + (
+                        f" · 대기 {len(self.pending_jobs)}개"
+                        if self.pending_jobs else ""
+                    )
+                )
             elif event[0] == "done":
-                completed = event
+                _kind, job_id, _ok, _payload = event
+                if (
+                    self.active_job is not None
+                    and job_id == self.active_job["id"]
+                ):
+                    completed = event
 
         elapsed = max(0, int(time.monotonic() - (self.job_started_at or time.monotonic())))
         elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-        self.progress_text_var.set(f"{self.job_stage} · {elapsed_text}")
+        self.progress_text_var.set(
+            f"{self.job_stage} · {elapsed_text}"
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
         if completed is None:
             if self.worker and self.worker.is_alive():
                 self.root.after(100, self._poll_job)
             return
 
-        _kind, ok, payload, on_success = completed
-        buttons = [
-            getattr(self, name, None) for name in (
-                "preview_button", "apply_button", "apply_all_button",
-                "cluster_on_button", "cluster_refresh_button",
-                "cluster_off_button",
-            )
-        ]
-        for button in (button for button in buttons if button is not None):
-            button.configure(state="normal")
+        _kind, _job_id, ok, payload = completed
+        job = self.active_job
+        self.queue_run_completed += 1
+        has_followup = bool(self.pending_jobs)
+        self._job_has_followup = has_followup
         if ok:
             self.progress_bar.configure(value=100)
             self.progress_text_var.set(f"완료 · {elapsed_text}")
-            on_success(payload)
-        else:
-            self.status_var.set("실패")
-            self.progress_text_var.set(f"실패 · {self.job_stage} · {elapsed_text}")
-            messagebox.showerror("작업 실패", str(payload), parent=self.root)
+            try:
+                job["on_success"](payload)
+            except Exception as exc:
+                ok = False
+                payload = exc
+        if not ok:
+            self.job_failures.append((job["queue_label"], str(payload)))
+            self.status_var.set(
+                f"실패 · {job['queue_label']}"
+                + (" · 다음 대기 작업 시작" if has_followup else "")
+            )
+            self.progress_text_var.set(
+                f"실패 · {self.job_stage} · {elapsed_text}"
+            )
+            if not has_followup:
+                messagebox.showerror(
+                    "작업 실패", str(payload), parent=self.root
+                )
+        self._job_has_followup = False
+        self.active_job = None
+        self.worker = None
+        if self.pending_jobs:
+            self._start_next_job()
+            return
+        if self.queue_run_total > 1:
+            if self.job_failures:
+                self.status_var.set(
+                    f"대기열 완료 · {self.queue_run_completed}개 처리 · "
+                    f"실패 {len(self.job_failures)}개"
+                )
+            else:
+                self.status_var.set(
+                    f"대기열 완료 · {self.queue_run_completed}개"
+                )
+            self.progress_text_var.set(
+                f"대기열 완료 · {self.queue_run_completed}/"
+                f"{self.queue_run_total}"
+            )
 
     def preview_selected(self):
         followers = self.followers_from_selection()
@@ -1802,7 +1956,15 @@ class App:
             PreviewWindow(self.root, "SPM Generator Sync · 변경 미리보기", "\n".join(lines))
             self.status_var.set(f"미리보기 완료 · 자식 {len(plans)}개")
 
-        self._start_job("변경 계산 중...", build, show)
+        self._start_job(
+            "변경 계산 중...",
+            build,
+            show,
+            queue_label=(
+                f"변경 미리보기 · {followers[0]['master']} → "
+                f"자식 {len(followers)}개"
+            ),
+        )
 
     def _apply_followers(self, followers):
         if not followers:
@@ -1858,27 +2020,33 @@ class App:
             )
         if not messagebox.askyesno("동기화 적용", message, parent=self.root):
             return
+        speedtree_exe = Path(self.config["speedtree_exe"])
+        xml_ini = Path(self.config["xml_ini"])
 
         def apply(report):
             return engine.apply_group_transaction(
                 folder, master, names,
                 verify_speedtree=verify,
-                speedtree_exe=Path(self.config["speedtree_exe"]),
-                xml_ini=Path(self.config["xml_ini"]),
+                speedtree_exe=speedtree_exe,
+                xml_ini=xml_ini,
                 progress_callback=report,
             )
 
         def done(result):
             self.refresh()
             changed = "\n".join(Path(path).name for path in result["changed_files"]) or "변경 없음"
-            messagebox.showinfo(
+            self._show_job_info(
                 "동기화 완료",
                 f"상태: {result['status']}\n\n변경 파일:\n{changed}\n\n"
                 f"백업: {result.get('backup_dir') or '새 백업 없음'}",
-                parent=self.root,
             )
 
-        self._start_job("SPM 동기화 및 검증 중...", apply, done)
+        self._start_job(
+            "SPM 동기화 및 검증 중...",
+            apply,
+            done,
+            queue_label=f"SPM 동기화 · {master} → 자식 {len(names)}개",
+        )
 
     def apply_selected(self):
         self._apply_followers(self.followers_from_selection())

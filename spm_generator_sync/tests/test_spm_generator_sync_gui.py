@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import queue
 import tempfile
+import threading
 import time
 import unittest
 import tkinter as tk
@@ -387,7 +388,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             "all_synced": False,
         }]
 
-        def run_now(_label, work, done):
+        def run_now(_label, work, done, **_kwargs):
             done(work(lambda *_args: None))
 
         app._start_job = run_now
@@ -396,6 +397,10 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         ), mock.patch.object(
             GUI.messagebox, "showinfo"
         ), mock.patch.object(
+            GUI,
+            "prepare_cluster_source_if_required",
+            return_value={"status": "current"},
+        ) as prepare, mock.patch.object(
             GUI,
             "run_cluster_relation_transaction",
             return_value={"status": "ok", "mode": "sync"},
@@ -411,6 +416,15 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             blender_exe=Path(r"C:\Blender\blender.exe"),
             unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
             capture_resolution=1024,
+            repair_runtime_config=app.config,
+        )
+        prepare.assert_called_once_with(
+            blend,
+            [current],
+            blender_exe=Path(r"C:\Blender\blender.exe"),
+            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+            capture_resolution=1024,
+            progress_callback=mock.ANY,
         )
         normalize.assert_not_called()
 
@@ -453,7 +467,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             },
         ]
 
-        def run_now(_label, work, done):
+        def run_now(_label, work, done, **_kwargs):
             done(work(lambda *_args: None))
 
         app._start_job = run_now
@@ -461,6 +475,10 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             GUI.messagebox, "askyesno", return_value=True
         ), mock.patch.object(
             GUI.messagebox, "showinfo"
+        ), mock.patch.object(
+            GUI,
+            "prepare_cluster_source_if_required",
+            return_value={"status": "current"},
         ), mock.patch.object(
             GUI,
             "run_cluster_relation_transaction",
@@ -483,6 +501,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     blender_exe=Path(r"C:\Blender\blender.exe"),
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
+                    repair_runtime_config=app.config,
                 ),
                 mock.call(
                     leaf_blend,
@@ -491,6 +510,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     blender_exe=Path(r"C:\Blender\blender.exe"),
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
+                    repair_runtime_config=app.config,
                 ),
             ],
         )
@@ -577,6 +597,75 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertEqual(float(app.progress_bar.cget("value")), 100.0)
             self.assertTrue(app.progress_text_var.get().startswith("완료 · "))
             self.assertEqual(str(app.apply_button.cget("state")), "normal")
+        finally:
+            root.destroy()
+
+    def test_background_jobs_queue_fifo_and_continue_after_failure(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.preview_button = ttk.Button(root)
+            app.apply_button = ttk.Button(root)
+            app.apply_all_button = ttk.Button(root)
+            app.cluster_on_button = ttk.Button(root)
+            app.cluster_refresh_button = ttk.Button(root)
+            app.cluster_off_button = ttk.Button(root)
+            gate = threading.Event()
+            order = []
+            completed = []
+
+            def first(report):
+                order.append("a-start")
+                report("A 실행", 25)
+                gate.wait(2)
+                order.append("a-end")
+                return "A"
+
+            def second(_report):
+                order.append("b")
+                raise RuntimeError("expected B failure")
+
+            def third(_report):
+                order.append("c")
+                return "C"
+
+            with mock.patch.object(GUI.messagebox, "showerror") as showerror:
+                app._start_job("A", first, completed.append, queue_label="A")
+                app._start_job("B", second, completed.append, queue_label="B")
+                app._start_job("C", third, completed.append, queue_label="C")
+
+                self.assertEqual(len(app.pending_jobs), 2)
+                self.assertEqual(
+                    str(app.cluster_refresh_button.cget("state")),
+                    "normal",
+                )
+                gate.set()
+                deadline = time.monotonic() + 3
+                while (
+                    (
+                        app.active_job is not None
+                        or app.pending_jobs
+                        or app.worker is not None
+                    )
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(order, ["a-start", "a-end", "b", "c"])
+            self.assertEqual(completed, ["A", "C"])
+            self.assertEqual(len(app.job_failures), 1)
+            self.assertIn("대기열 완료", app.status_var.get())
+            showerror.assert_not_called()
         finally:
             root.destroy()
 

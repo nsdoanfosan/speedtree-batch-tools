@@ -1,3 +1,4 @@
+import queue
 import threading
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -30,8 +31,8 @@ class FakeVar:
 
 
 class FullPipelineScopeTests(unittest.TestCase):
-    def test_full_pipeline_ignores_checkmarks_and_queues_the_whole_list(self):
-        gui = load_gui_module()
+    @staticmethod
+    def make_start_app(gui):
         app = gui.App.__new__(gui.App)
         checked = {"spm": Path("SK_checked.spm"), "checked": True}
         unchecked = {"spm": Path("SK_unchecked.spm"), "checked": False}
@@ -45,6 +46,7 @@ class FullPipelineScopeTests(unittest.TestCase):
         app.stop_flag = threading.Event()
         app.batch_progress = mock.Mock()
         app.batch_progress_var = FakeVar()
+        app.progress_var = FakeVar()
         app.btn_check = mock.Mock()
         app.btn_spm = mock.Mock()
         app.btn_blender = mock.Mock()
@@ -52,10 +54,17 @@ class FullPipelineScopeTests(unittest.TestCase):
         app.btn_all = mock.Mock()
         app.btn_pick_root = mock.Mock()
         app.btn_scan = mock.Mock()
+        app.root_entry = mock.Mock()
         app.btn_select_all = mock.Mock()
         app.btn_clear_all = mock.Mock()
+        app.btn_recent_24h = mock.Mock()
         app.btn_stop = mock.Mock()
         app.log = mock.Mock()
+        return app, checked, unchecked
+
+    def test_full_pipeline_ignores_checkmarks_and_queues_the_whole_list(self):
+        gui = load_gui_module()
+        app, checked, unchecked = self.make_start_app(gui)
         worker = mock.Mock()
 
         with mock.patch.object(
@@ -68,10 +77,184 @@ class FullPipelineScopeTests(unittest.TestCase):
             app.start_full_pipeline()
 
         showinfo.assert_not_called()
-        queued_targets = thread.call_args.kwargs["args"][0]
-        self.assertEqual(queued_targets, [checked, unchecked])
+        queued_job = thread.call_args.kwargs["args"][0]
+        self.assertEqual(
+            [item["spm"] for item in queued_job["targets"]],
+            [checked["spm"], unchecked["spm"]],
+        )
+        self.assertIsNot(queued_job["targets"][0], checked)
+        self.assertEqual(queued_job["mode"], "pipeline")
+        self.assertEqual(queued_job["terminal_phase"], "push")
+        self.assertFalse(queued_job["selected_scope"])
+        self.assertEqual(queued_job["push_transport"], "headless")
         worker.start.assert_called_once_with()
         self.assertIn("2개", app.log.call_args.args[0])
+
+    def test_numbered_buttons_route_to_their_required_phase_chain(self):
+        gui = load_gui_module()
+        for phase, expected_mode, chained in (
+            ("spm", "phase", False),
+            ("blender", "pipeline", True),
+            ("push", "pipeline", True),
+        ):
+            with self.subTest(phase=phase):
+                app, checked, _unchecked = self.make_start_app(gui)
+                worker = mock.Mock()
+                with mock.patch.object(
+                    gui, "calibration_settings_signature", return_value="current"
+                ), mock.patch.object(
+                    gui,
+                    "legacy_calibration_settings_signature",
+                    return_value="legacy",
+                ), mock.patch.object(gui, "save_config"), mock.patch.object(
+                    gui.threading, "Thread", return_value=worker
+                ) as thread:
+                    app.start_batch(phase)
+
+                call = thread.call_args
+                self.assertIs(
+                    call.kwargs["target"].__func__,
+                    gui.App._run_queued_batch_job,
+                )
+                queued_job = call.kwargs["args"][0]
+                self.assertEqual(queued_job["mode"], expected_mode)
+                self.assertEqual(queued_job["phase"], phase)
+                self.assertEqual(
+                    queued_job["terminal_phase"], phase
+                )
+                self.assertEqual(
+                    queued_job["selected_scope"], chained
+                )
+                self.assertEqual(
+                    [item["spm"] for item in queued_job["targets"]],
+                    [checked["spm"]],
+                )
+                worker.start.assert_called_once_with()
+
+    def test_jobs_queue_fifo_with_click_time_snapshots_and_continue_after_error(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        paths = [
+            Path("SK_cluster_a.spm"),
+            Path("SK_cluster_b.spm"),
+            Path("SK_cluster_c.spm"),
+        ]
+        app.items = {
+            str(path): {
+                "spm": path,
+                "checked": index == 0,
+                "wind_override": "auto",
+            }
+            for index, path in enumerate(paths)
+        }
+        cfg_values = [
+            {"push_transport": "rpc", "night_headless": False, "tag": "A"},
+            {"push_transport": "rpc", "night_headless": False, "tag": "B"},
+            {"push_transport": "headless", "night_headless": False, "tag": "C"},
+        ]
+        app._collect_cfg = mock.Mock(side_effect=cfg_values)
+        workers = [mock.Mock(), mock.Mock(), mock.Mock()]
+
+        with mock.patch.object(
+            gui, "calibration_settings_signature", return_value="current"
+        ), mock.patch.object(
+            gui, "legacy_calibration_settings_signature", return_value="legacy"
+        ), mock.patch.object(gui, "save_config"), mock.patch.object(
+            gui.threading, "Thread", side_effect=workers
+        ) as thread:
+            app.start_batch("spm")
+            first = app.active_batch_job
+
+            app.items[str(paths[0])]["checked"] = False
+            app.items[str(paths[1])]["checked"] = True
+            app.start_batch("blender")
+
+            app.items[str(paths[1])]["checked"] = False
+            app.items[str(paths[2])]["checked"] = True
+            app.start_batch("push")
+
+            self.assertEqual(thread.call_count, 1)
+            self.assertEqual(
+                [item["spm"] for item in first["targets"]], [paths[0]]
+            )
+            self.assertEqual(first["cfg"]["tag"], "A")
+            self.assertEqual(
+                [
+                    [item["spm"] for item in job["targets"]]
+                    for job in app.pending_batch_jobs
+                ],
+                [[paths[1]], [paths[2]]],
+            )
+            self.assertEqual(
+                [job["cfg"]["tag"] for job in app.pending_batch_jobs],
+                ["B", "C"],
+            )
+            app.btn_spm.configure.assert_any_call(state="normal")
+            app.btn_select_all.configure.assert_any_call(state="normal")
+            app.btn_scan.configure.assert_any_call(state="disabled")
+            app.root_entry.configure.assert_any_call(state="disabled")
+
+            app._finish_batch_job({"id": first["id"], "error": "A failed"})
+            second = app.active_batch_job
+            self.assertEqual(thread.call_count, 2)
+            self.assertEqual(second["cfg"]["tag"], "B")
+
+            app._finish_batch_job({"id": second["id"], "error": None})
+            third = app.active_batch_job
+            self.assertEqual(thread.call_count, 3)
+            self.assertEqual(third["cfg"]["tag"], "C")
+
+            app._finish_batch_job({"id": third["id"], "error": None})
+
+        self.assertIsNone(app.active_batch_job)
+        self.assertFalse(app.pending_batch_jobs)
+        self.assertEqual(len(app.batch_job_failures), 1)
+        app.btn_scan.configure.assert_called_with(state="normal")
+        app.root_entry.configure.assert_called_with(state="normal")
+        app.btn_stop.configure.assert_called_with(state="disabled")
+
+    def test_stop_cancels_pending_jobs_but_leaves_current_job_to_stop_safely(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        app.pending_batch_jobs = gui.deque([
+            {"id": 2, "label": "B"},
+            {"id": 3, "label": "C"},
+        ])
+        app.active_batch_job = {"id": 1, "label": "A"}
+
+        app.stop_batch()
+
+        self.assertTrue(app.stop_flag.is_set())
+        self.assertFalse(app.pending_batch_jobs)
+        self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
+
+    def test_queued_worker_uses_one_terminal_event_and_suppresses_legacy_done(self):
+        gui = load_gui_module()
+        app, checked, _unchecked = self.make_start_app(gui)
+        app.ui_queue = queue.Queue()
+        app._run_full_pipeline = mock.Mock()
+        job = {
+            "id": 7,
+            "label": "② B",
+            "mode": "pipeline",
+            "terminal_phase": "blender",
+            "selected_scope": True,
+            "targets": [checked],
+        }
+
+        app._run_queued_batch_job(job)
+
+        app._run_full_pipeline.assert_called_once_with(
+            [checked],
+            terminal_phase="blender",
+            selected_scope=True,
+            emit_done=False,
+        )
+        self.assertEqual(
+            app.ui_queue.get_nowait(),
+            ("batch_job_done", {"id": 7, "error": None}),
+        )
+        self.assertTrue(app.ui_queue.empty())
 
     def test_full_pipeline_reports_an_empty_list_not_an_empty_selection(self):
         gui = load_gui_module()

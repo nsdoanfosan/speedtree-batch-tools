@@ -228,6 +228,14 @@ def _normalization_artifact_paths(recipe):
             [
                 Path(recipe["blend"]).expanduser().absolute(),
                 Path(recipe["receipt_path"]).expanduser().absolute(),
+                (
+                    Path(recipe["blend"]).expanduser().absolute().parent
+                    / "reports"
+                    / (
+                        Path(recipe["blend"]).stem
+                        + "_speedtree_repair_pipeline_report_codex.json"
+                    )
+                ),
             ]
         )
 
@@ -740,6 +748,7 @@ def run_cluster_relation_transaction(
     unit_probe_path=None,
     capture_resolution=1024,
     auto_normalize=True,
+    repair_runtime_config=None,
     timeout=1800,
 ):
     """Apply ON through automatic Normalizer + Atlas, or reversible OFF.
@@ -876,6 +885,24 @@ def run_cluster_relation_transaction(
                 f"Cluster relationship {'ON' if enabled else 'OFF'} apply failed: "
                 f"{detail}" + rollback()
             )
+        if enabled and repair_runtime_config:
+            try:
+                from sk_batch.repair_runtime_contract import (
+                    write_repair_runtime_receipt,
+                )
+
+                runtime_receipt = write_repair_runtime_receipt(
+                    blend.with_suffix(".spm"),
+                    repair_runtime_config,
+                )
+            except OSError as exc:
+                raise ClusterBlendSyncError(
+                    "Cluster Sync completed but could not commit the shared "
+                    f"Blender/Normalizer completion receipt: {exc}"
+                    + rollback()
+                ) from exc
+            if runtime_receipt is not None:
+                report["repair_runtime_receipt"] = str(runtime_receipt)
         return report
 
 
@@ -887,6 +914,7 @@ def run_cluster_folder_relation_transaction(
     unit_probe_path=None,
     capture_resolution=1024,
     auto_normalize=True,
+    repair_runtime_config=None,
     timeout=1800,
 ):
     """Normalize one Cluster blend relationship across every owner SK SPM."""
@@ -934,6 +962,7 @@ def run_cluster_folder_relation_transaction(
         unit_probe_path=unit_probe_path,
         capture_resolution=capture_resolution,
         auto_normalize=auto_normalize,
+        repair_runtime_config=repair_runtime_config,
         timeout=timeout,
     )
     result["folder_target_count"] = len(owner_targets)

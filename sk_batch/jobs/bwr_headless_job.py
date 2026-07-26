@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument("--blend", required=True)
     parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
     parser.add_argument("--material-contract", default="")
+    parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -396,6 +397,11 @@ def main():
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
         is_cluster_source = is_cluster_normalization_spm(canonical_spm)
+        if args.cluster_source_build_only and not is_cluster_source:
+            raise RuntimeError(
+                "--cluster-source-build-only is valid only for a canonical "
+                "Cluster SPM"
+            )
         report["cluster_source_skin_contract"] = {
             "requested": is_cluster_source,
             "policy": (
@@ -581,6 +587,14 @@ def main():
             canonical_spm.stem if is_cluster_source else ""
         )
         report["export_collection_issues"] = export_collection_issues
+        cluster_export_pending = bool(
+            args.cluster_source_build_only
+            and is_cluster_source
+            and export_collection_issues
+        )
+        blocking_export_collection_issues = (
+            [] if cluster_export_pending else export_collection_issues
+        )
 
         stem = canonical_spm.stem
         blend_dir = str(Path(blend_path).parent)
@@ -716,7 +730,7 @@ def main():
             or material_export_blocked
         )
         structural_handoff_blocked = bool(
-            export_collection_issues
+            blocking_export_collection_issues
             or missing_outputs
             or vertex_color_contract.get("status") == "blocked"
             or vertex_payload_contract.get("status") == "blocked"
@@ -728,6 +742,8 @@ def main():
         )
         if hard_handoff_blocked:
             handoff_status = "blocked"
+        elif cluster_export_pending:
+            handoff_status = "cluster_export_pending"
         elif reviewable_source_issues:
             handoff_status = "source_review"
         else:
@@ -749,6 +765,32 @@ def main():
             "source_review_required": handoff_status == "source_review",
             "unreal_push_ready": handoff_status == "ok",
         }
+        cluster_source_build_contract = {
+            "status": (
+                "ready"
+                if args.cluster_source_build_only and not hard_handoff_blocked
+                else "blocked"
+                if args.cluster_source_build_only
+                else "not_applicable"
+            ),
+            "mode": (
+                "raw_source_for_cluster_normalizer"
+                if args.cluster_source_build_only
+                else "final_handoff"
+            ),
+            "deferred_export_issues": (
+                list(export_collection_issues)
+                if cluster_export_pending
+                else []
+            ),
+            "final_export_required": cluster_export_pending,
+            "post_normalization_handoff_status": (
+                "source_review" if reviewable_source_issues else "ok"
+            ),
+        }
+        report["cluster_source_build_contract"] = (
+            cluster_source_build_contract
+        )
         report["handoff_preflight"] = preflight
         report["source_review_required"] = handoff_status == "source_review"
         report["unreal_push_ready"] = handoff_status == "ok"
@@ -782,15 +824,18 @@ def main():
                 "spm": source_identity(canonical_spm),
             }
             pipeline_data["handoff_preflight"] = preflight
+            pipeline_data["cluster_source_build_contract"] = (
+                cluster_source_build_contract
+            )
             if assembly_manifest is not None:
                 pipeline_data["cluster_assembly_manifest"] = assembly_manifest
             write_report(pipeline_path, pipeline_data)
         if preflight["status"] == "blocked":
             reasons = []
-            if export_collection_issues:
+            if blocking_export_collection_issues:
                 reasons.append(
                     "Send2UE Export 구조 오류: "
-                    + ", ".join(export_collection_issues)
+                    + ", ".join(blocking_export_collection_issues)
                 )
             if texture_normalization.get("missing"):
                 reasons.append(f"텍스처 세트 {len(texture_normalization['missing'])}개 미준비")

@@ -70,6 +70,35 @@ class ManualBonesTests(unittest.TestCase):
         self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
         self.assertIn(("progress", "전체 자동 완료"), queued)
 
+    def test_blender_button_chain_stops_after_spm_and_blender(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.stop_flag = threading.Event()
+        app.ui_queue = queue.Queue()
+        app.log = mock.Mock()
+        app._run_batch = mock.Mock()
+        targets = [{"spm": Path("SK_test.spm"), "checked": True}]
+
+        app._run_full_pipeline(
+            targets,
+            terminal_phase="blender",
+            selected_scope=True,
+        )
+
+        self.assertEqual(
+            app._run_batch.call_args_list,
+            [
+                mock.call("spm", targets, emit_done=False),
+                mock.call("blender", targets, emit_done=False),
+            ],
+        )
+        queued = list(app.ui_queue.queue)
+        self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
+        self.assertIn(
+            ("progress", "② Blender Repair 연계 실행 완료"),
+            queued,
+        )
+
     def test_manual_marker_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             spm = Path(tmp) / "SK_manual_test.spm"

@@ -38,6 +38,13 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
 
+    def test_final_export_is_verified_before_pending_handoff_is_promoted(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertIn("cluster_export_contract_issues(", source)
+        self.assertIn("finalize_cluster_source_pipeline(", source)
+        self.assertIn('handoff["status"] = final_status', source)
+        self.assertIn('"cluster_export_pending"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

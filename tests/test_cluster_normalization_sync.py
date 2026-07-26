@@ -6,6 +6,7 @@ from pathlib import Path
 
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
+    ClusterSourceBuildRequiredError,
     resolve_normalization_recipe,
 )
 
@@ -134,6 +135,64 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             self.assertEqual(recipe["source_material_id"], 6)
             self.assertTrue(recipe["adopt_source_material"])
             self.assertEqual(recipe["plan_collection"], "Atlas_Cluster_Cards")
+
+    def test_pending_cluster_export_is_accepted_only_with_ready_source_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            report_path = (
+                blend.parent
+                / "reports"
+                / (
+                    blend.stem
+                    + "_speedtree_repair_pipeline_report_codex.json"
+                )
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["handoff_preflight"] = {
+                "status": "cluster_export_pending",
+                "unreal_push_ready": False,
+            }
+            report["cluster_source_build_contract"] = {
+                "status": "ready",
+                "mode": "raw_source_for_cluster_normalizer",
+                "final_export_required": True,
+                "deferred_export_issues": ["missing_export_collection"],
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            self.assertTrue(recipe["normalization_required"])
+
+    def test_pending_cluster_export_without_ready_source_contract_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            report_path = (
+                blend.parent
+                / "reports"
+                / (
+                    blend.stem
+                    + "_speedtree_repair_pipeline_report_codex.json"
+                )
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["handoff_preflight"] = {
+                "status": "cluster_export_pending",
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            with self.assertRaises(ClusterSourceBuildRequiredError):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
 
     def test_existing_material_spelling_is_preserved_for_in_place_adoption(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -428,7 +487,10 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                     unit_probe_path=unit_probe,
                 )
 
-            self.assertIn("Run Blender Repair first", str(caught.exception))
+            self.assertIn(
+                "Rebuild the Cluster source blend first",
+                str(caught.exception),
+            )
 
 
 if __name__ == "__main__":

@@ -2523,6 +2523,10 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
     audit = audit_spm(spm_path, text=source_text, analyze_bone_graph=True)
     readiness = sk_readiness(audit)
     report["sk_readiness"] = readiness
+    cluster_root_mode = bool(
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    )
     renames, mat_skipped = plan_material_renames(audit)
     report["skipped"].extend(mat_skipped)
     apply_tree_red = bool(
@@ -2530,7 +2534,11 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         and classify_asset_kind(spm_path) == "tree"
     )
 
-    if not readiness["ready"]:
+    # A Cluster source is intentionally allowed to arrive with every authored
+    # Branch bone disabled.  That is the input state repaired by the dedicated
+    # first-renderable-root normalizer below; applying the generic Tree
+    # readiness gate here made the normalizer unreachable.
+    if not readiness["ready"] and not cluster_root_mode:
         report["status"] = "not-sk-ready"
         report["error"] = readiness["error"]
         report["calibration"] = {
@@ -2548,10 +2556,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
         report["bone_graph"] = audit.get("bone_graph")
-        if (
-            cfg.get("cluster_root_only_bones", True)
-            and is_cluster_normalization_spm(spm_path)
-        ):
+        if cluster_root_mode:
             report["cluster_root_bone_plan"] = plan_cluster_root_bones(
                 source_text
             )
