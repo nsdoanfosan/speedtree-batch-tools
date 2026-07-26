@@ -242,7 +242,49 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         finally:
             root.destroy()
 
-    def test_follower_extra_structure_is_shown_as_master_normalization(self):
+    def test_cluster_folder_selection_expands_to_unique_child_relations_for_refresh(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.tree = ttk.Treeview(root)
+            cluster_folder = app.tree.insert("", "end", text="Cluster")
+            first = app.tree.insert(cluster_folder, "end", text="branch")
+            second = app.tree.insert(cluster_folder, "end", text="leaf")
+            branch_blend = Path(r"D:\Trees\Tree_elm\Cluster\SK_branch_elm_01.blend")
+            leaf_blend = Path(r"D:\Trees\Tree_elm\Cluster\SK_leaf_elm_01.blend")
+            app.item_meta = {
+                cluster_folder: {
+                    "kind": "folder",
+                    "folder": branch_blend.parent,
+                    "role": "cluster_folder",
+                },
+                first: {
+                    "kind": "cluster_relation",
+                    "blend": branch_blend,
+                },
+                second: {
+                    "kind": "cluster_relation",
+                    "blend": leaf_blend,
+                },
+            }
+            app.tree.selection_set(cluster_folder, first)
+
+            self.assertEqual(
+                app.selected_cluster_relations(
+                    include_cluster_folders=True
+                ),
+                [app.item_meta[first], app.item_meta[second]],
+            )
+            self.assertEqual(
+                app.selected_cluster_relations(),
+                [app.item_meta[first]],
+            )
+        finally:
+            root.destroy()
+
+    def test_follower_extra_structure_is_shown_as_one_way_removal(self):
         root = tk.Tk()
         root.withdraw()
         try:
@@ -286,10 +328,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 {
                     "common": 2,
                     "missing": 0,
-                    "master_sync": 1,
+                    "master_sync": 0,
+                    "target_local": 0,
+                    "remove": 1,
                     "missing_bases": 0,
                     "missing_details": [],
-                    "master_sync_details": [{
+                    "master_sync_details": [],
+                    "target_local_details": [],
+                    "remove_details": [{
                         "base": "Leaf 2",
                         "name": "Knot unique",
                         "type": "Knot",
@@ -309,7 +355,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             )
             self.assertEqual(
                 app.tree.set(follower_iid, "structure"),
-                "마스터와 동기화 1",
+                "마스터→자식 반영 0 · 초과삭제 1",
             )
             self.assertEqual(
                 app.tree.set(follower_iid, "status"),
@@ -332,9 +378,9 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         app.config = {"blender_exe": r"C:\Blender\blender.exe"}
         app.status_var = mock.Mock()
         app.refresh = mock.Mock()
-        app.selected_cluster_relations = lambda: [{
+        app.selected_cluster_relations = lambda **_kwargs: [{
             "blend": blend,
-            "folder_relation": "partial",
+            "folder_relation": "on",
             "target_count": 2,
             "on_target_spms": [current],
             "target_spms": [current, unrelated],
@@ -367,6 +413,123 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             capture_resolution=1024,
         )
         normalize.assert_not_called()
+
+    def test_cluster_folder_refresh_updates_each_on_relation_and_skips_off(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        branch_blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        leaf_blend = owner / "Cluster" / "SK_leaf_elm_01.blend"
+        off_blend = owner / "Cluster" / "SK_leaf_elm_02.blend"
+        tree_01 = owner / "SK_Tree_elm_01.spm"
+        tree_02 = owner / "SK_Tree_elm_02.spm"
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app.selected_cluster_relations = lambda **_kwargs: [
+            {
+                "blend": branch_blend,
+                "folder_relation": "on",
+                "target_count": 2,
+                "on_target_spms": [tree_01, tree_02],
+                "all_synced": False,
+            },
+            {
+                "blend": leaf_blend,
+                "folder_relation": "on",
+                "target_count": 2,
+                "on_target_spms": [tree_01],
+                # The GUI snapshot may still say current after the source was
+                # saved externally. The transaction performs the authoritative
+                # receipt/hash check, so explicit refresh must still call it.
+                "all_synced": True,
+            },
+            {
+                "blend": off_blend,
+                "folder_relation": "off",
+                "target_count": 2,
+                "on_target_spms": [],
+                "all_synced": False,
+            },
+        ]
+
+        def run_now(_label, work, done):
+            done(work(lambda *_args: None))
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.messagebox, "showinfo"
+        ), mock.patch.object(
+            GUI,
+            "run_cluster_relation_transaction",
+            side_effect=[
+                {"status": "ok", "mode": "sync"},
+                {"status": "ok", "mode": "sync"},
+            ],
+        ) as refresh, mock.patch.object(
+            GUI, "run_cluster_folder_relation_transaction"
+        ) as normalize:
+            app.refresh_selected_cluster_relation()
+
+        self.assertEqual(
+            refresh.call_args_list,
+            [
+                mock.call(
+                    branch_blend,
+                    [tree_01, tree_02],
+                    enabled=True,
+                    blender_exe=Path(r"C:\Blender\blender.exe"),
+                    unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+                    capture_resolution=1024,
+                ),
+                mock.call(
+                    leaf_blend,
+                    [tree_01],
+                    enabled=True,
+                    blender_exe=Path(r"C:\Blender\blender.exe"),
+                    unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+                    capture_resolution=1024,
+                ),
+            ],
+        )
+        normalize.assert_not_called()
+        self.assertIn(
+            "Cluster 2개",
+            app.status_var.set.call_args.args[0],
+        )
+
+    def test_partial_cluster_relation_blocks_refresh_until_normalized(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        tree_01 = owner / "SK_Tree_elm_01.spm"
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.status_var = mock.Mock()
+        app.selected_cluster_relations = lambda **_kwargs: [{
+            "blend": blend,
+            "folder_relation": "partial",
+            "target_count": 2,
+            "on_target_spms": [tree_01],
+            "all_synced": False,
+        }]
+        app._start_job = mock.Mock()
+
+        with mock.patch.object(
+            GUI.messagebox, "showinfo"
+        ) as showinfo, mock.patch.object(
+            GUI, "run_cluster_relation_transaction"
+        ) as refresh:
+            app.refresh_selected_cluster_relation()
+
+        app._start_job.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(
+            showinfo.call_args.args[0],
+            "Cluster 관계 불일치",
+        )
 
     def test_clipboard_rows_are_deduplicated_and_folder_rows_are_supported(self):
         rows = [

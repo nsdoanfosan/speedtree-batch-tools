@@ -196,55 +196,148 @@ def _restore_spm_files(snapshots):
 
 
 def _normalization_artifact_paths(recipe):
-    """Files the Blender normalization stage may overwrite before Sync commits."""
-    if not recipe or not recipe.get("normalization_required"):
+    """Files the Blender/Atlas stages may overwrite before Sync commits."""
+    if not recipe:
         return []
-    output_dir = Path(recipe["capture_output_dir"]).expanduser().absolute()
-    prefix = str(recipe["capture_prefix"])
-    suffixes = (
-        "",
-        "_Opacity",
-        "_Normal",
-        "_Gloss",
-        "_Subsurface",
-        "_SubsurfaceAmount",
-        "_AO",
-        "_Height",
-    )
-    paths = (
-        [output_dir / f"{prefix}{suffix}.tga" for suffix in suffixes]
-        + [output_dir / f"{prefix}_auto_capture_manifest.json"]
-    )
-    # Normalizer saves both the rebuilt blend and its current-content receipt
-    # before Atlas starts writing owner SPMs.  They belong to the same outer
-    # relationship transaction as the capture maps.
+    paths = []
+    if recipe.get("normalization_required"):
+        output_dir = Path(
+            recipe["capture_output_dir"]
+        ).expanduser().absolute()
+        prefix = str(recipe["capture_prefix"])
+        suffixes = (
+            "",
+            "_Opacity",
+            "_Normal",
+            "_Gloss",
+            "_Subsurface",
+            "_SubsurfaceAmount",
+            "_AO",
+            "_Height",
+        )
+        paths.extend(
+            output_dir / f"{prefix}{suffix}.tga"
+            for suffix in suffixes
+        )
+        paths.append(
+            output_dir / f"{prefix}_auto_capture_manifest.json"
+        )
+        # Normalizer saves both the rebuilt blend and its current-content
+        # receipt before Atlas starts writing owner SPMs.
+        paths.extend(
+            [
+                Path(recipe["blend"]).expanduser().absolute(),
+                Path(recipe["receipt_path"]).expanduser().absolute(),
+            ]
+        )
+
+    first_target = Path(
+        recipe["first_target_spm"]
+    ).expanduser().absolute()
+    owner = first_target.parent
     paths.extend(
         [
-            Path(recipe["blend"]).expanduser().absolute(),
-            Path(recipe["receipt_path"]).expanduser().absolute(),
+            owner / "speedtree_import_manifest.json",
+            owner / "README_SPEEDTREE_IMPORT.md",
         ]
     )
-    return paths
+    target_receipts = owner / ".atlas_leaf_speedtree_targets"
+    paths.extend(
+        target_receipts / f"{Path(target).stem}.json"
+        for target in recipe.get("target_spms") or []
+    )
+
+    # Existing per-scope manifests are content-addressed by a UUID that lives
+    # inside the blend. Discover them semantically instead of guessing the ID.
+    blend_key = normalized_path_key(recipe["blend"])
+    scope_dir = owner / ".atlas_leaf_speedtree_scopes"
+    if scope_dir.is_dir():
+        for candidate in scope_dir.glob("*.json"):
+            payload = _read_json(candidate)
+            if (
+                isinstance(payload, dict)
+                and normalized_path_key(payload.get("blend_file") or "")
+                == blend_key
+            ):
+                paths.append(candidate)
+
+    # Atlas rewrites the external plan FBXs even when normalization itself is
+    # current. Existing files must therefore participate in every relationship
+    # transaction, not only a capture rebuild.
+    mesh_dir = owner / "meshes"
+    mesh_pattern = (
+        str(recipe.get("material_name") or "").casefold()
+        + "__*.fbx"
+    )
+    if mesh_dir.is_dir() and mesh_pattern != "__*.fbx":
+        paths.extend(mesh_dir.glob(mesh_pattern))
+
+    result = []
+    seen = set()
+    for path in paths:
+        path = Path(path).expanduser().absolute()
+        key = normalized_path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _normalization_artifact_globs(recipe):
+    if not recipe:
+        return []
+    owner = Path(
+        recipe["first_target_spm"]
+    ).expanduser().absolute().parent
+    material_name = str(recipe.get("material_name") or "").casefold()
+    globs = []
+    if material_name:
+        globs.append({
+            "directory": owner / "meshes",
+            "pattern": material_name + "__*.fbx",
+            "kind": "path",
+        })
+    globs.append({
+        "directory": owner / ".atlas_leaf_speedtree_scopes",
+        "pattern": "*.json",
+        "kind": "scope",
+        "blend": str(Path(recipe["blend"]).expanduser().absolute()),
+    })
+    return globs
 
 
 def _snapshot_normalization_artifacts(recipe, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    snapshots = []
+    file_snapshots = []
     for index, path in enumerate(_normalization_artifact_paths(recipe)):
         path = Path(path)
         copy = None
         if path.is_file():
             copy = directory / f"{index:02d}_{path.name}"
             shutil.copy2(path, copy)
-        snapshots.append((path, copy))
-    return snapshots
+        file_snapshots.append((path, copy))
+    glob_snapshots = []
+    for spec in _normalization_artifact_globs(recipe):
+        path = Path(spec["directory"])
+        before = {
+            normalized_path_key(candidate)
+            for candidate in (
+                path.glob(spec["pattern"]) if path.is_dir() else ()
+            )
+        }
+        glob_snapshots.append({**spec, "before": before})
+    return {
+        "files": file_snapshots,
+        "globs": glob_snapshots,
+    }
 
 
 def _restore_normalization_artifacts(snapshots):
     restored = []
     failed = []
-    for path, copy in snapshots:
+    for path, copy in (snapshots or {}).get("files") or []:
         try:
             if copy is None:
                 if path.exists():
@@ -257,6 +350,26 @@ def _restore_normalization_artifacts(snapshots):
             restored.append(str(path))
         except OSError as exc:
             failed.append(f"{path}: {exc}")
+    for spec in (snapshots or {}).get("globs") or []:
+        directory = Path(spec["directory"])
+        if not directory.is_dir():
+            continue
+        for path in directory.glob(spec["pattern"]):
+            if normalized_path_key(path) in spec["before"]:
+                continue
+            if spec.get("kind") == "scope":
+                payload = _read_json(path)
+                if (
+                    not isinstance(payload, dict)
+                    or normalized_path_key(payload.get("blend_file") or "")
+                    != normalized_path_key(spec.get("blend") or "")
+                ):
+                    continue
+            try:
+                path.unlink()
+                restored.append(str(path))
+            except OSError as exc:
+                failed.append(f"{path}: {exc}")
     return restored, failed
 
 
@@ -718,12 +831,12 @@ def run_cluster_relation_transaction(
             detail = _rollback_detail(restored, failed)
             if capture_restored:
                 detail += (
-                    "\nRestored Cluster capture artifact(s): "
+                    "\nRestored Cluster/Atlas transaction artifact(s): "
                     + ", ".join(capture_restored)
                 )
             if capture_failed:
                 detail += (
-                    "\nCOULD NOT restore Cluster capture artifact(s): "
+                    "\nCOULD NOT restore Cluster/Atlas transaction artifact(s): "
                     + "; ".join(capture_failed)
                 )
             return detail

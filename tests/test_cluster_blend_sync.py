@@ -315,6 +315,28 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 / "SK_branch_elm_01_cluster_normalization_sync_receipt.json"
             )
             receipt.write_bytes(b"good-receipt")
+            import_manifest = owner / "speedtree_import_manifest.json"
+            readme = owner / "README_SPEEDTREE_IMPORT.md"
+            import_manifest.write_bytes(b"good-import-manifest")
+            readme.write_bytes(b"good-readme")
+            target_receipts = owner / ".atlas_leaf_speedtree_targets"
+            target_receipts.mkdir()
+            target_receipt = target_receipts / "SK_Tree_elm_01.json"
+            target_receipt.write_bytes(b"good-target-receipt")
+            scopes = owner / ".atlas_leaf_speedtree_scopes"
+            scopes.mkdir()
+            scope = scopes / "scope-old.json"
+            scope.write_text(
+                json.dumps({"blend_file": str(blend), "state": "good"}),
+                encoding="utf-8",
+            )
+            meshes = owner / "meshes"
+            meshes.mkdir()
+            plan_fbx = (
+                meshes
+                / "m_branch_elm_01__01_branch_elm_01_01.fbx"
+            )
+            plan_fbx.write_bytes(b"good-plan")
 
             recipe = {
                 "kind": "speedtree_cluster_sync_normalization_recipe",
@@ -323,6 +345,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 "receipt_path": str(receipt),
                 "capture_output_dir": str(cluster),
                 "capture_prefix": "branch_elm_01",
+                "first_target_spm": str(target),
+                "target_spms": [str(target)],
+                "material_name": "M_branch_elm_01",
             }
 
             def half_write(*_args, **_kwargs):
@@ -331,6 +356,24 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 blend.write_bytes(b"bad-blend")
                 receipt.write_bytes(b"bad-receipt")
                 (cluster / "branch_elm_01_AO.tga").write_bytes(b"new-partial")
+                import_manifest.write_bytes(b"bad-import-manifest")
+                readme.write_bytes(b"bad-readme")
+                target_receipt.write_bytes(b"bad-target-receipt")
+                scope.write_text(
+                    json.dumps(
+                        {"blend_file": str(blend), "state": "bad"}
+                    ),
+                    encoding="utf-8",
+                )
+                (scopes / "scope-new.json").write_text(
+                    json.dumps({"blend_file": str(blend)}),
+                    encoding="utf-8",
+                )
+                plan_fbx.write_bytes(b"bad-plan")
+                (
+                    meshes
+                    / "m_branch_elm_01__02_branch_elm_01_02.fbx"
+                ).write_bytes(b"new-plan")
                 return SimpleNamespace(
                     returncode=1,
                     stdout="",
@@ -358,6 +401,27 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertEqual(blend.read_bytes(), b"blend")
             self.assertEqual(receipt.read_bytes(), b"good-receipt")
             self.assertFalse((cluster / "branch_elm_01_AO.tga").exists())
+            self.assertEqual(
+                import_manifest.read_bytes(),
+                b"good-import-manifest",
+            )
+            self.assertEqual(readme.read_bytes(), b"good-readme")
+            self.assertEqual(
+                target_receipt.read_bytes(),
+                b"good-target-receipt",
+            )
+            self.assertEqual(
+                json.loads(scope.read_text(encoding="utf-8"))["state"],
+                "good",
+            )
+            self.assertFalse((scopes / "scope-new.json").exists())
+            self.assertEqual(plan_fbx.read_bytes(), b"good-plan")
+            self.assertFalse(
+                (
+                    meshes
+                    / "m_branch_elm_01__02_branch_elm_01_02.fbx"
+                ).exists()
+            )
 
     def test_on_timeout_restores_spms_and_registry(self):
         with tempfile.TemporaryDirectory() as temporary:

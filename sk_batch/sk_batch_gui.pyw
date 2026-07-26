@@ -3444,6 +3444,10 @@ class App:
             "--max-push-bones",
             str(self.cfg.get("push_max_bones", 1_500)),
         ]
+        if (
+            getattr(self, "_active_push_dependency_map", {}) or {}
+        ).get(iid):
+            cmd.append("--dependency-orchestrated")
         wind_override = self.items.get(iid, {}).get("wind_override", "auto")
         resolved_wind = (
             wind_preset_for_spm(spm)
@@ -3900,6 +3904,10 @@ class App:
             "--rpc-timeout-min", str(self.cfg.get("push_rpc_timeout_min", 180)),
             "--rpc-timeout-max", str(self.cfg.get("push_rpc_timeout_max", 900)),
         ]
+        if (
+            getattr(self, "_active_push_dependency_map", {}) or {}
+        ).get(iid):
+            cmd.append("--dependency-orchestrated")
         cmd.extend(send2ue_rpc_cli_args(self.cfg.get("unreal_project")))
         wind_override = self.items.get(iid, {}).get("wind_override", "auto")
         resolved_wind = (

@@ -290,6 +290,7 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             self.assertIn("--spm", strings)
             self.assertIn("--material-contract", strings)
+            self.assertIn("--dependency-orchestrated", strings)
 
         blender_job_strings = {
             node.value
@@ -321,6 +322,22 @@ class PushQueueFlowTests(unittest.TestCase):
             SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
         ).read_text(encoding="utf-8")
         self.assertIn("resolve_cluster_spm_pair(spm_path)", push_source)
+        self.assertIn(
+            'parser.add_argument("--dependency-orchestrated", action="store_true")',
+            push_source,
+        )
+        self.assertIn(
+            "Tree Push with Cluster Assembly must run through the SK Batch",
+            push_source,
+        )
+        self.assertIn(
+            "cluster_manifest is not None",
+            push_source,
+        )
+        self.assertIn(
+            "not args.dependency_orchestrated",
+            push_source,
+        )
         sync_call = push_source.index("utilities.sync_unreal_mesh_folder_path()")
         folder_read = push_source.index(
             "folder = scene_props.unreal_mesh_folder_path", sync_call

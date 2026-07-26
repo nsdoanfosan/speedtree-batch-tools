@@ -7,13 +7,15 @@ The tool treats each vegetation folder as a small family graph:
       - follower_b.spm
     independent.spm
 
-Generator settings and additive Base-subtree structure are normalized across
-the family.  A follower-only Generator subtree is first merged into the master,
-then the normalized master structure is distributed to the selected followers
-in the same transaction.  Per-file identity and variation data (GUIDs, names,
-random seeds, materials, BaseRef placement, and node/freehand edits) remain
-local.  The Generators/Links XML sections are patched without rewriting the
-usually very large Nodes section.
+Generator settings and additive Base-subtree structure flow one way from the
+master to each selected follower.  The master is an immutable source during a
+follower sync: it is fingerprinted for concurrent-change detection, but it is
+never patched, backed up, verified, or restored by that transaction.
+Follower-only governed Generator subtrees are removed from that follower and
+are never promoted to the master or distributed to siblings.  Per-file
+identity and variation data (GUIDs, names, random seeds, materials, BaseRef
+placement, and node/freehand edits) remain local.  The Generators/Links XML
+sections are patched without rewriting the usually very large Nodes section.
 """
 
 from __future__ import annotations
@@ -461,11 +463,13 @@ class BaseSyncResult:
     matched_nodes: int = 0
     property_updates: int = 0
     added_nodes: int = 0
+    removed_nodes: int = 0
     color_updates: int = 0
     asset_reference_updates: int = 0
     copied_assets: list[dict[str, str]] = field(default_factory=list)
     created_base: bool = False
     added_node_details: list[dict[str, str]] = field(default_factory=list)
+    removed_node_details: list[dict[str, str]] = field(default_factory=list)
     changed_properties: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -562,12 +566,17 @@ class SyncPlan:
                 f"{relation} [{item.category}] · "
                 f"공통 {item.matched_nodes}, 속성 {item.property_updates}, "
                 f"마스터→SPM {item.added_nodes}, "
+                f"SPM 초과 삭제 {item.removed_nodes}, "
                 f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}, "
                 f"에셋 복사 {len(item.copied_assets)}"
             )
             lines.extend(
                 f"  + 에셋 복사: {asset['kind']} · {asset['name']} (ID {asset['id']})"
                 for asset in item.copied_assets
+            )
+            lines.extend(
+                f"  - 자식 Generator 삭제: {detail['path']} ({detail['type']})"
+                for detail in item.removed_node_details
             )
             lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
             for detail in item.added_node_details:
@@ -1470,6 +1479,50 @@ def _collect_subtree_details(
     return details
 
 
+def remove_generator_subtree(
+    document: SPMDocument,
+    guid: str,
+    result: BaseSyncResult,
+    path_prefix: str = "",
+) -> int:
+    """Remove one follower-only governed Generator subtree and its links."""
+
+    generator = document.by_guid.get(guid)
+    if generator is None:
+        return 0
+    if document.generator_type(generator) == "BaseRef":
+        result.warnings.append(
+            f"BaseRef는 파일별 배치이므로 자동 삭제하지 않음: "
+            f"{document.generator_name(generator)}"
+        )
+        return 0
+
+    details = _collect_subtree_details(
+        document,
+        guid,
+        result.target_base,
+        path_prefix,
+        exclude_source_baseref=True,
+    )
+    removed_guids = {guid, *document.descendants(guid)}
+    removed_count = 0
+    for item in list(document.generators_element.findall("Generator")):
+        item_guid = document.generator_guid(item)
+        if item_guid in removed_guids:
+            document.generators_element.remove(item)
+            removed_count += 1
+    for link in list(document.links_element.findall("Link")):
+        if (
+            _child_text(link, "SourceGUID") in removed_guids
+            or _child_text(link, "TargetGUID") in removed_guids
+        ):
+            document.links_element.remove(link)
+    document.reindex()
+    result.removed_nodes += removed_count
+    result.removed_node_details.extend(details)
+    return removed_count
+
+
 def _matching_target_parent(
     source_document: SPMDocument,
     target_document: SPMDocument,
@@ -1554,109 +1607,12 @@ def sync_subtree(
                 salt,
                 result,
             )
-def _merge_structure_into_master(
-    master_document: SPMDocument,
-    follower_document: SPMDocument,
-    master_guid: str,
-    follower_guid: str,
-    category: str,
-    salt: str,
-    result: BaseSyncResult,
-) -> None:
-    """Add follower-only non-BaseRef subtrees to the in-memory master."""
-
-    master_groups = _children_by_type(master_document, master_guid)
-    follower_groups = _children_by_type(follower_document, follower_guid)
-    for generator_type in sorted(set(master_groups) | set(follower_groups)):
-        master_children = master_groups.get(generator_type, [])
-        follower_children = follower_groups.get(generator_type, [])
-        paired = min(len(master_children), len(follower_children))
-        for index in range(paired):
-            _merge_structure_into_master(
-                master_document,
-                follower_document,
-                master_children[index],
-                follower_children[index],
-                category,
-                salt,
+        for target_child in target_children[paired:]:
+            remove_generator_subtree(
+                target_document,
+                target_child,
                 result,
             )
-        for follower_child in follower_children[paired:]:
-            try:
-                parent_level = int(
-                    _child_text(master_document.by_guid[master_guid], "Level", "0")
-                )
-            except ValueError:
-                parent_level = 0
-            clone_subtree(
-                follower_document,
-                master_document,
-                follower_child,
-                follower_guid,
-                master_guid,
-                parent_level,
-                category,
-                salt,
-                result,
-            )
-
-
-def synchronize_follower_structure_to_master(
-    master_document: SPMDocument,
-    follower: SPMDocument,
-    base_map: dict[str, str | None],
-    base_categories: dict[str, str | None] | None = None,
-) -> list[MasterSyncResult]:
-    """Merge one follower's extra governed structure into the master.
-
-    Common-node properties remain master-authored.  Only structural suffixes
-    that the master lacks are cloned.  BaseRef subtrees stay file-local.
-    """
-
-    follower_path = follower.path
-    categories = source_base_categories(master_document, base_categories)
-    output: list[MasterSyncResult] = []
-    for follower_name, master_name in base_map.items():
-        if master_name in (None, "", "__independent__"):
-            continue
-        master_base = master_document.resolve_base(master_name)
-        follower_base = follower.resolve_base(follower_name)
-        if master_base is None or follower_base is None:
-            continue
-        resolved_master_name = master_document.generator_name(master_base)
-        category = categories.get(resolved_master_name)
-        if category not in CATEGORY_COLORS:
-            continue
-        resolved_follower_name = follower.generator_name(follower_base)
-        temporary = BaseSyncResult(
-            source_base=resolved_follower_name,
-            target_base=resolved_master_name,
-            category=category,
-        )
-        _merge_structure_into_master(
-            master_document,
-            follower,
-            master_document.generator_guid(master_base),
-            follower.generator_guid(follower_base),
-            category,
-            f"{follower_path}|master|{resolved_master_name}",
-            temporary,
-        )
-        if temporary.added_nodes:
-            output.append(MasterSyncResult(
-                source_file=str(follower_path),
-                source_base=resolved_follower_name,
-                master_base=resolved_master_name,
-                category=category,
-                synced_nodes=temporary.added_nodes,
-                synced_node_details=temporary.added_node_details,
-                copied_assets=temporary.copied_assets,
-                warnings=temporary.warnings,
-            ))
-            # Re-sort the newly extended branch before another mapped Base or
-            # follower compares Type-order positions against it.
-            master_document.reindex()
-    return output
 
 
 def _set_base_ref_filter(generator: ET.Element, value: str) -> bool:
@@ -2154,11 +2110,11 @@ def _structure_delta(
     source_base_name: str = "",
     target_base_name: str = "",
     missing_details: list[dict[str, str]] | None = None,
-    master_sync_details: list[dict[str, str]] | None = None,
+    remove_details: list[dict[str, str]] | None = None,
 ) -> tuple[int, int, int]:
     common = 1
     missing = 0
-    master_sync = 0
+    remove = 0
     source_groups = _children_by_type(source_document, source_guid)
     target_groups = _children_by_type(target_document, target_guid)
     for generator_type in sorted(set(source_groups) | set(target_groups)):
@@ -2166,15 +2122,15 @@ def _structure_delta(
         target_children = target_groups.get(generator_type, [])
         paired = min(len(source_children), len(target_children))
         for index in range(paired):
-            child_common, child_missing, child_master_sync = _structure_delta(
+            child_common, child_missing, child_remove = _structure_delta(
                 source_document, target_document,
                 source_children[index], target_children[index],
                 source_base_name, target_base_name,
-                missing_details, master_sync_details,
+                missing_details, remove_details,
             )
             common += child_common
             missing += child_missing
-            master_sync += child_master_sync
+            remove += child_remove
         for source_child in source_children[paired:]:
             details = _collect_subtree_details(
                 source_document,
@@ -2192,10 +2148,10 @@ def _structure_delta(
                 target_base_name,
                 exclude_source_baseref=True,
             )
-            master_sync += len(details)
-            if master_sync_details is not None:
-                master_sync_details.extend(details)
-    return common, missing, master_sync
+            remove += len(details)
+            if remove_details is not None:
+                remove_details.extend(details)
+    return common, missing, remove
 
 
 def compare_base_structure(
@@ -2205,12 +2161,18 @@ def compare_base_structure(
     include_details: bool = False,
 ) -> dict[str, object]:
     totals = {
-        "common": 0, "missing": 0, "master_sync": 0,
+        "common": 0, "missing": 0,
+        # Backward-compatible fields.  Reverse synchronization is forbidden.
+        "master_sync": 0,
+        "target_local": 0,
+        "remove": 0,
         "mapping_errors": 0, "missing_bases": 0,
     }
     if include_details:
         totals["missing_details"] = []
         totals["master_sync_details"] = []
+        totals["target_local_details"] = []
+        totals["remove_details"] = []
     used_source: set[str] = set()
     for target_name, source_name in base_map.items():
         if source_name in (None, "", "__independent__"):
@@ -2221,18 +2183,18 @@ def compare_base_structure(
             totals["mapping_errors"] += 1
             continue
         used_source.add(source_document.generator_name(source_base))
-        common, missing, master_sync = _structure_delta(
+        common, missing, remove = _structure_delta(
             source_document, target_document,
             source_document.generator_guid(source_base),
             target_document.generator_guid(target_base),
             source_document.generator_name(source_base),
             target_document.generator_name(target_base),
             totals.get("missing_details") if include_details else None,
-            totals.get("master_sync_details") if include_details else None,
+            totals.get("remove_details") if include_details else None,
         )
         totals["common"] += common
         totals["missing"] += missing
-        totals["master_sync"] += master_sync
+        totals["remove"] += remove
     for source_base in source_document.base_nodes():
         source_name = source_document.generator_name(source_base)
         if source_name not in used_source:
@@ -2645,54 +2607,32 @@ def build_normalized_sync_plans(
     categories: dict[str, str | None],
     progress_callback=None,
 ) -> dict[str, object]:
-    """Read each target once, normalize the master, then build every patch."""
+    """Build independent follower patches from one immutable master snapshot."""
 
     master_path = Path(master_path)
     if not target_specs:
         raise SyncError("동기화할 SPM이 없습니다")
-    (
-        master_doc,
-        _standardized_master_text,
-        master_color_updates,
-        master_ref_renames,
-        master_warnings,
-    ) = standardize_master_document(master_path, categories)
+    master_doc = SPMDocument.from_path(master_path, full=True)
+    master_doc.validate()
+    master_text = master_doc.text
+    master_hash = base_sync_signature(master_doc, categories)
 
     loaded_targets: list[
-        tuple[Path, dict[str, str | None], SPMDocument, list[MasterSyncResult]]
+        tuple[Path, dict[str, str | None], SPMDocument]
     ] = []
     total = len(target_specs)
     for index, (target_path, mapping) in enumerate(target_specs, start=1):
         target_path = Path(target_path)
         if progress_callback is not None:
             progress_callback(
-                f"마스터 구조 통합 중 · {target_path.name} ({index}/{total})",
+                f"자식 SPM 읽는 중 · {target_path.name} ({index}/{total})",
                 5 + round(15 * (index - 1) / max(1, total)),
             )
         target_doc = SPMDocument.from_path(target_path, full=True)
-        master_sync = synchronize_follower_structure_to_master(
-            master_doc,
-            target_doc,
-            mapping,
-            categories,
-        )
-        loaded_targets.append((target_path, mapping, target_doc, master_sync))
-
-    repair_generation_passes(master_doc)
-    master_doc.reindex()
-    master_doc.validate()
-    master_text = master_doc.render()
-    master_doc.validate(master_text)
-    master_doc = SPMDocument(
-        master_path,
-        master_text,
-        master_doc.compressed,
-        full=True,
-    )
-    master_hash = base_sync_signature(master_doc, categories)
+        loaded_targets.append((target_path, mapping, target_doc))
 
     plans: list[SyncPlan] = []
-    for index, (target_path, mapping, target_doc, master_sync) in enumerate(
+    for index, (target_path, mapping, target_doc) in enumerate(
         loaded_targets,
         start=1,
     ):
@@ -2709,10 +2649,6 @@ def build_normalized_sync_plans(
             master_document=master_doc,
             target_document=target_doc,
         )
-        plan.master_sync_results = master_sync
-        plan.master_color_updates = master_color_updates
-        plan.master_reference_renames = master_ref_renames
-        plan.warnings.extend(master_warnings)
         if plan.mapping_required:
             raise SyncError(
                 f"{target_path.name} Base 매핑 확인 필요: "
@@ -2867,7 +2803,6 @@ def apply_group_transaction(
     selected = prepared["selected"]
     master_path = prepared["master_path"]
     master_doc = prepared["master_document"]
-    master_text = prepared["master_text"]
     master_hash = prepared["master_hash"]
     plans = prepared["plans"]
 
@@ -2897,9 +2832,6 @@ def apply_group_transaction(
         )
 
     patches: list[tuple[Path, str, bool]] = []
-    original_master_text, master_compressed = read_spm_text(master_path)
-    if master_text != original_master_text:
-        patches.append((master_path, master_text, master_compressed))
     for plan in plans:
         if plan.changed and plan.patched_text is not None:
             patches.append((Path(plan.target), plan.patched_text, plan.compressed))
@@ -2961,9 +2893,7 @@ def apply_group_transaction(
     backup_dir.mkdir(parents=True, exist_ok=False)
     backups: list[tuple[Path, Path]] = []
     try:
-        transaction_paths = list(dict.fromkeys(
-            [master_path, *(folder / name for name in selected)]
-        ))
+        transaction_paths = list(dict.fromkeys(folder / name for name in selected))
         for index, path in enumerate(transaction_paths, start=1):
             if progress_callback is not None:
                 progress_callback(
@@ -2976,6 +2906,9 @@ def apply_group_transaction(
         manifest_path = folder / MANIFEST_NAME
         if manifest_path.is_file():
             shutil.copy2(manifest_path, backup_dir / f"00_{MANIFEST_NAME}")
+        # The master remains read-only, but must still be the exact source
+        # snapshot used to calculate every follower patch.
+        _assert_spm_unchanged(plan_fingerprints)
         for index, (path, text, compressed) in enumerate(patches, start=1):
             if progress_callback is not None:
                 progress_callback(

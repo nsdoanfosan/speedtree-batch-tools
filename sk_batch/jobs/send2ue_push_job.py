@@ -120,6 +120,7 @@ def parse_args():
     parser.add_argument("--export-root")
     parser.add_argument("--queue-id")
     parser.add_argument("--source-fingerprint", default="")
+    parser.add_argument("--dependency-orchestrated", action="store_true")
     parser.add_argument("--item-import-report")
     parser.add_argument("--unreal-ingest")
     parser.add_argument("--send2ue-unreal-py")
@@ -498,6 +499,23 @@ def main():
 
         report["stage"] = "texture_validation"
         spm_path = Path(args.spm).resolve()
+        blend_dir = Path(blend_path).parent
+        cluster_manifest = load_cluster_assembly_manifest(
+            blend_dir,
+            spm_path,
+        )
+        report["dependency_orchestrated"] = bool(
+            args.dependency_orchestrated
+        )
+        if (
+            cluster_manifest is not None
+            and not args.dependency_orchestrated
+        ):
+            raise RuntimeError(
+                "Tree Push with Cluster Assembly must run through the SK Batch "
+                "dependency orchestrator; direct send2ue_push_job execution is "
+                "blocked so normalized Cluster sources cannot be skipped"
+            )
         try:
             speedtree_spm = resolve_cluster_spm_pair(spm_path)["canonical_spm"]
         except ClusterSpmPairPathError:
@@ -743,7 +761,6 @@ def main():
         scene_props.disk_animation_folder_path = str(export_root / "animations")
         scene_props.disk_groom_folder_path = str(export_root / "groom")
 
-        blend_dir = Path(blend_path).parent
         mesh_path = folder.rstrip("/") + "/" + unit_name
         # BWR writes the final-skeleton wind contract from the selected SPM
         # identity. Never derive it from a mutable Blender object name.
@@ -766,7 +783,6 @@ def main():
         if not manifest_assets:
             raise RuntimeError("Send2UE produced no manifest assets")
 
-        cluster_manifest = load_cluster_assembly_manifest(blend_dir, spm_path)
         cluster_assembly = None
         material_asset_scope = None
         if cluster_manifest is not None:

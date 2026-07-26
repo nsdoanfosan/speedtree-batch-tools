@@ -496,7 +496,7 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertTrue(seen)
             self.assertFalse(seen[0].exists())
 
-    def test_auto_copy_verification_uses_the_same_normalized_plan(self):
+    def test_auto_copy_verification_keeps_follower_extra_out_of_master_plan(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             master = folder / "tree_01.spm"
@@ -508,7 +508,19 @@ class GeneratorSyncTests(unittest.TestCase):
                 target: target.read_bytes(),
             }
 
-            with mock.patch.object(sync, "verify_speedtree_export") as verify:
+            verified_documents = {}
+
+            def capture_verified_document(path, *_args):
+                path = Path(path)
+                verified_documents[path.name] = sync.SPMDocument.from_path(
+                    path, full=True
+                )
+
+            with mock.patch.object(
+                sync,
+                "verify_speedtree_export",
+                side_effect=capture_verified_document,
+            ) as verify:
                 plans = sync.verify_auto_copies(
                     folder,
                     master.name,
@@ -518,8 +530,30 @@ class GeneratorSyncTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(plans), 1)
-            self.assertGreaterEqual(plans[0].master_sync_nodes, 1)
+            self.assertEqual(plans[0].master_sync_nodes, 0)
             self.assertEqual(verify.call_count, 2)
+            verified_master = next(
+                document
+                for name, document in verified_documents.items()
+                if name.endswith(master.name)
+            )
+            verified_target = next(
+                document
+                for name, document in verified_documents.items()
+                if name.endswith(target.name)
+            )
+            self.assertFalse(any(
+                verified_master.generator_name(item) == "Knot unique"
+                for item in verified_master.generators
+            ))
+            self.assertNotIn("target-knot", verified_target.by_guid)
+            self.assertEqual(
+                sum(
+                    result.removed_nodes
+                    for result in plans[0].base_results
+                ),
+                1,
+            )
             self.assertEqual(master.read_bytes(), originals[master])
             self.assertEqual(target.read_bytes(), originals[target])
             self.assertFalse(any(
@@ -674,12 +708,23 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(len(renames), 2)
             self.assertEqual(sync.standardize_base_ref_names(document), [])
 
-    def test_sync_reports_master_normalization_and_preserves_local_identity(self):
+    def test_sync_reports_and_removes_follower_only_managed_structure(self):
         with tempfile.TemporaryDirectory() as temp:
             master = Path(temp) / "master.spm"
             target = Path(temp) / "target.spm"
             write_spm(master, make_master())
-            write_spm(target, make_target())
+            target_text = make_target().replace(
+                property_xml("Generation:First", "0.95"),
+                property_xml("Generation:First", "0.95")
+                + property_xml("Generation:Pass", "4"),
+                1,
+            )
+            target_root = ET.fromstring(target_text)
+            for link in target_root.find("Links") or []:
+                if link.findtext("TargetGUID") == "target-ref":
+                    link.find("SourceGUID").text = "target-leaf-base"
+            target_text = ET.tostring(target_root, encoding="unicode")
+            write_spm(target, target_text)
             mapping = {
                 "Leaf 2": "Leaf",
                 "BranchBig": "Branch",
@@ -692,10 +737,14 @@ class GeneratorSyncTests(unittest.TestCase):
                 mapping,
                 include_details=True,
             )
-            self.assertGreaterEqual(delta["master_sync"], 1)
+            self.assertEqual(delta["master_sync"], 0)
+            self.assertEqual(delta["master_sync_details"], [])
+            self.assertEqual(delta["target_local"], 0)
+            self.assertEqual(delta["target_local_details"], [])
+            self.assertGreaterEqual(delta["remove"], 1)
             self.assertTrue(any(
                 detail["name"] == "Knot unique"
-                for detail in delta["master_sync_details"]
+                for detail in delta["remove_details"]
             ))
 
             plan = sync.build_sync_plan(master, target, mapping)
@@ -703,6 +752,15 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertGreaterEqual(plan.added_nodes, 1)
             self.assertEqual(plan.master_sync_nodes, 0)
             self.assertFalse(plan.mapping_required)
+            self.assertEqual(
+                sum(result.removed_nodes for result in plan.base_results),
+                1,
+            )
+            self.assertTrue(any(
+                detail["name"] == "Knot unique"
+                for result in plan.base_results
+                for detail in result.removed_node_details
+            ))
             self.assertTrue(any(
                 detail["name"] == "Leaf 2"
                 for result in plan.base_results
@@ -718,23 +776,39 @@ class GeneratorSyncTests(unittest.TestCase):
             patched.validate(plan.patched_text)
             branch = patched.by_guid["target-leaf-branch"]
             self.assertEqual(property_value(branch, "Generation:First"), "0.25")
+            self.assertEqual(property_value(branch, "Generation:Pass"), "4")
             self.assertEqual(property_value(branch, "Random Seeds:Generation"), "888")
             self.assertEqual(property_value(branch, "Materials:Branch:0:Material"), "TargetBark")
-            self.assertIn("target-knot", patched.by_guid)
+            self.assertNotIn("target-knot", patched.by_guid)
+            self.assertFalse(any(
+                link.findtext("SourceGUID") == "target-knot"
+                or link.findtext("TargetGUID") == "target-knot"
+                for link in patched.links
+            ))
+            self.assertTrue(all(
+                link.findtext("SourceGUID") in patched.by_guid
+                and link.findtext("TargetGUID") in patched.by_guid
+                for link in patched.links
+            ))
 
             leaf_base = patched.by_guid["target-leaf-base"]
             leaf_ref = patched.by_guid["target-ref"]
+            independent_base = patched.by_guid["target-branch-small"]
+            independent_child = patched.by_guid["target-branch-child-2"]
             self.assertEqual(patched.generator_name(leaf_base), "Leaf 2")
             self.assertEqual(patched.base_ref_filter(leaf_ref), "Leaf 2")
+            self.assertEqual(patched.parent["target-ref"], "target-leaf-base")
+            self.assertEqual(
+                patched.generator_name(independent_base),
+                "BranchSmall",
+            )
+            self.assertEqual(
+                patched.generator_name(independent_child),
+                "Branch 81",
+            )
             for generator in (leaf_base, branch, leaf_ref):
                 self.assertEqual(generator.findtext("Extra/m_bSetBackgroundIconColor"), "true")
                 self.assertEqual(generator.findtext("Extra/m_vecBackgroundIconColor_g"), "1")
-            unique_knot = patched.by_guid["target-knot"]
-            self.assertEqual(unique_knot.findtext("Extra/m_bSetForegroundIconColor"), "true")
-            self.assertEqual(unique_knot.findtext("Extra/m_vecForegroundIconColor_r"), "0")
-            self.assertGreaterEqual(
-                float(unique_knot.findtext("Extra/m_vecBackgroundIconColor_g")), 0.9
-            )
             # Existing target identity is unchanged and one missing Leaf Mesh was added.
             self.assertIn("target-leaf-base", patched.by_guid)
             leaf_meshes = [
@@ -743,7 +817,7 @@ class GeneratorSyncTests(unittest.TestCase):
             ]
             self.assertEqual(len(leaf_meshes), 2)
 
-    def test_group_sync_merges_follower_structure_into_master_then_all_followers(self):
+    def test_group_sync_removes_follower_extra_without_master_or_sibling_effects(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             master = folder / "tree_01.spm"
@@ -773,6 +847,7 @@ class GeneratorSyncTests(unittest.TestCase):
                 manifest, master.name, second.name, mapping, confirmed=True
             )
             sync.save_manifest(folder, manifest)
+            original_master_bytes = master.read_bytes()
 
             original_from_path = sync.SPMDocument.from_path
             with mock.patch.object(
@@ -798,12 +873,28 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(result["status"], "applied")
             self.assertEqual(
                 result["plans"][0].master_sync_nodes,
-                1,
+                0,
             )
             self.assertEqual(
                 result["plans"][1].master_sync_nodes,
                 0,
             )
+            self.assertEqual(
+                sum(
+                    item.removed_nodes
+                    for item in result["plans"][0].base_results
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    item.removed_nodes
+                    for item in result["plans"][1].base_results
+                ),
+                0,
+            )
+            self.assertEqual(master.read_bytes(), original_master_bytes)
+            self.assertNotIn(str(master), result["changed_files"])
             master_doc = sync.SPMDocument.from_path(master, full=True)
             first_doc = sync.SPMDocument.from_path(first, full=True)
             second_doc = sync.SPMDocument.from_path(second, full=True)
@@ -812,22 +903,38 @@ class GeneratorSyncTests(unittest.TestCase):
                     item for item in master_doc.generators
                     if master_doc.generator_name(item) == "Knot unique"
                 ]),
-                1,
+                0,
             )
-            self.assertIn("target-knot", first_doc.by_guid)
+            self.assertNotIn("target-knot", first_doc.by_guid)
+            self.assertFalse(any(
+                link.findtext("SourceGUID") == "target-knot"
+                or link.findtext("TargetGUID") == "target-knot"
+                for link in first_doc.links
+            ))
+            self.assertTrue(all(
+                link.findtext("SourceGUID") in first_doc.by_guid
+                and link.findtext("TargetGUID") in first_doc.by_guid
+                for link in first_doc.links
+            ))
             self.assertEqual(
                 len([
                     item for item in second_doc.generators
                     if second_doc.generator_name(item) == "Knot unique"
                 ]),
-                1,
+                0,
             )
-            for follower_doc in (first_doc, second_doc):
-                delta = sync.compare_base_structure(
-                    master_doc, follower_doc, mapping, include_details=True
-                )
-                self.assertEqual(delta["missing"], 0)
-                self.assertEqual(delta["master_sync"], 0)
+            first_delta = sync.compare_base_structure(
+                master_doc, first_doc, mapping, include_details=True
+            )
+            second_delta = sync.compare_base_structure(
+                master_doc, second_doc, mapping, include_details=True
+            )
+            self.assertEqual(first_delta["missing"], 0)
+            self.assertEqual(first_delta["master_sync"], 0)
+            self.assertEqual(first_delta["remove"], 0)
+            self.assertEqual(second_delta["missing"], 0)
+            self.assertEqual(second_delta["master_sync"], 0)
+            self.assertEqual(second_delta["remove"], 0)
 
             again = sync.apply_group_transaction(
                 folder,
@@ -1316,6 +1423,7 @@ class GeneratorSyncTests(unittest.TestCase):
             }
             sync.assign_follower(manifest, master.name, target.name, mapping, confirmed=True)
             sync.save_manifest(folder, manifest)
+            original_master_bytes = master.read_bytes()
             verified = []
             progress = []
             result = sync.apply_group_transaction(
@@ -1328,10 +1436,11 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertTrue(backup_dir.is_dir())
             backup_names = {path.name for path in backup_dir.iterdir()}
             self.assertIn(f"00_{sync.MANIFEST_NAME}", backup_names)
-            self.assertIn(f"01_{master.name}", backup_names)
-            self.assertIn(f"02_{target.name}", backup_names)
-            self.assertIn(master.name, verified)
-            self.assertIn(target.name, verified)
+            self.assertFalse(any(name.endswith(master.name) for name in backup_names))
+            self.assertTrue(any(name.endswith(target.name) for name in backup_names))
+            self.assertEqual(verified, [target.name])
+            self.assertEqual(result["changed_files"], [str(target)])
+            self.assertEqual(master.read_bytes(), original_master_bytes)
             self.assertEqual(progress[-1][1], 100)
             self.assertEqual(
                 [percent for _stage, percent in progress],

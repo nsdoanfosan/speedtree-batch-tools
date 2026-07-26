@@ -56,7 +56,7 @@ engine = _load_sibling_engine()
 
 CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
@@ -404,8 +404,8 @@ class PreviewWindow(tk.Toplevel):
         ttk.Label(
             frame,
             text=(
-                "읽기 전용 미리보기입니다. 자식의 추가 구조는 마스터에 합쳐진 뒤 "
-                "선택 자식 전체에 정규화됩니다."
+                "읽기 전용 미리보기입니다. 마스터 변경은 자식에게만 반영됩니다. "
+                "관리 Base의 자식 초과 Generator는 삭제되며 부모·형제에게 전파되지 않습니다."
             ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 6))
@@ -596,9 +596,9 @@ class App:
         ttk.Label(
             details,
             text=(
-                "마스터와 동기화 = 마스터와 현재 SPM의 Generator 구조 차이를 통합합니다. "
-                "현재 SPM에서 발견된 구조는 마스터에 합치고, 정규화된 마스터 구조를 "
-                "현재 SPM에 반영합니다."
+                "마스터 → 자식 단방향 동기화입니다. 마스터에만 있는 구조는 자식에 "
+                "반영하고, 관리 Base의 자식 초과 Generator는 삭제합니다. 자식에서 "
+                "부모·형제로 구조가 역전파되는 경로는 없습니다."
             ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 4))
@@ -611,6 +611,7 @@ class App:
         self.delta_box.pack(fill="x", pady=(5, 0))
         self.delta_box.tag_configure("missing", foreground="#9a5b00", font=("Segoe UI", 9, "bold"))
         self.delta_box.tag_configure("master_sync", foreground="#4b2c63", font=("Segoe UI", 9, "bold"))
+        self.delta_box.tag_configure("remove", foreground="#9b1c1c", font=("Segoe UI", 9, "bold"))
         self.delta_box.tag_configure("muted", foreground="#777")
         self.delta_box.configure(state="disabled")
 
@@ -797,7 +798,11 @@ class App:
                     ]
                     delta = {
                         "missing": 0, "master_sync": 0, "missing_bases": 0,
+                        "target_local": 0,
+                        "remove": 0,
                         "missing_details": [], "master_sync_details": [],
+                        "target_local_details": [],
+                        "remove_details": [],
                     }
                     risk = {}
                     if not follower.get("base_map_confirmed"):
@@ -810,10 +815,10 @@ class App:
                             )
                             if delta.get("mapping_errors"):
                                 structure = "매핑 오류"
-                            elif delta["missing"] or delta["master_sync"]:
+                            elif delta["missing"] or delta.get("remove"):
                                 structure = (
-                                    "마스터와 동기화 "
-                                    f"{delta['missing'] + delta['master_sync']}"
+                                    "마스터→자식 반영 "
+                                    f"{delta['missing']} · 초과삭제 {delta.get('remove', 0)}"
                                 )
                             else:
                                 structure = "동일"
@@ -830,7 +835,7 @@ class App:
                         follower_status = "매핑 필요"
                     elif follower.get("last_sync") and last_hash != signature:
                         follower_status = "마스터 변경"
-                    elif follower.get("last_sync") and delta.get("master_sync"):
+                    elif follower.get("last_sync") and delta.get("remove"):
                         follower_status = "정규화 필요"
                     elif follower.get("last_sync") and follower.get("last_target_hash") != current_target_hash:
                         follower_status = "차이 있음"
@@ -845,7 +850,7 @@ class App:
                         tags=(
                             "follower_risk" if risk.get("level") == "blocked"
                             else "follower_master_sync"
-                            if delta.get("missing") or delta.get("master_sync")
+                            if delta.get("missing") or delta.get("remove")
                             else "follower",
                         )
                     )
@@ -855,6 +860,8 @@ class App:
                         "master": master,
                         "missing_details": delta.get("missing_details") or [],
                         "master_sync_details": delta.get("master_sync_details") or [],
+                        "target_local_details": delta.get("target_local_details") or [],
+                        "remove_details": delta.get("remove_details") or [],
                         "scale_risk": delta.get("scale_risk") or {},
                     }
             independent = set(manifest.get("independent", []))
@@ -897,7 +904,9 @@ class App:
                     open=True, tags=("cluster_blend",),
                 )
                 self.item_meta[cluster_iid] = {
-                    "kind": "folder", "folder": cluster_path,
+                    "kind": "folder",
+                    "folder": cluster_path,
+                    "role": "cluster_folder",
                 }
                 for blend_index, blend_row in enumerate(cluster_blends):
                     blend_iid = f"{cluster_iid}::blend::{blend_index}"
@@ -1026,12 +1035,29 @@ class App:
         return [self.item_meta[iid] for iid in self.tree.selection()
                 if iid in self.item_meta and self.item_meta[iid].get("kind") == "spm"]
 
-    def selected_cluster_relations(self):
-        return [
-            self.item_meta[iid] for iid in self.tree.selection()
-            if iid in self.item_meta
-            and self.item_meta[iid].get("kind") == "cluster_relation"
-        ]
+    def selected_cluster_relations(self, *, include_cluster_folders=False):
+        relation_iids = []
+        for iid in self.tree.selection():
+            meta = self.item_meta.get(iid, {})
+            if meta.get("kind") == "cluster_relation":
+                relation_iids.append(iid)
+            elif include_cluster_folders and meta.get("role") == "cluster_folder":
+                relation_iids.extend(self.tree.get_children(iid))
+
+        rows = []
+        seen = set()
+        for iid in relation_iids:
+            row = self.item_meta.get(iid, {})
+            if row.get("kind") != "cluster_relation":
+                continue
+            key = os.path.normcase(
+                str(Path(row["blend"]).absolute())
+            ).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        return rows
 
     def copy_selected_paths(self, _event=None):
         count = copy_selected_row_paths(
@@ -1126,8 +1152,8 @@ class App:
             self.delta_box.configure(state="disabled")
             return
         missing = item.get("missing_details") or []
-        master_sync = item.get("master_sync_details") or []
-        if not missing and not master_sync:
+        remove = item.get("remove_details") or []
+        if not missing and not remove:
             self.delta_box.insert("end", "구조 차이 없음 — 마스터와 자식의 관리 대상 구조가 같습니다.", "muted")
             self.delta_box.configure(state="disabled")
             return
@@ -1154,11 +1180,11 @@ class App:
                 missing,
                 "missing",
             )
-        if master_sync:
+        if remove:
             insert_group(
-                "현재 SPM → 마스터 — 마스터에 통합될 구조",
-                master_sync,
-                "master_sync",
+                "현재 SPM에서 삭제 — 부모에 없는 초과 Generator",
+                remove,
+                "remove",
             )
         self.delta_box.configure(state="disabled")
 
@@ -1386,11 +1412,13 @@ class App:
         self.set_selected_cluster_relation(True, refresh_only=True)
 
     def set_selected_cluster_relation(self, enabled, *, refresh_only=False):
-        rows = self.selected_cluster_relations()
+        rows = self.selected_cluster_relations(
+            include_cluster_folders=refresh_only
+        )
         if not rows:
             messagebox.showinfo(
                 "Cluster 관계",
-                "Cluster 아래의 정규화 SK_*.blend 행을 선택하세요.",
+                "Cluster 폴더 또는 아래의 정규화 SK_*.blend 행을 선택하세요.",
                 parent=self.root,
             )
             return
@@ -1398,7 +1426,7 @@ class App:
             os.path.normcase(str(Path(row["blend"]).absolute())).casefold()
             for row in rows
         }
-        if len(blend_keys) != 1:
+        if not refresh_only and len(blend_keys) != 1:
             messagebox.showinfo(
                 "Cluster 관계",
                 "한 번에는 같은 Cluster blend의 관계만 처리하세요.",
@@ -1406,17 +1434,33 @@ class App:
             )
             return
         if refresh_only:
-            no_targets = [
-                row for row in rows if not row.get("on_target_spms")
+            partial_rows = [
+                row for row in rows
+                if row.get("folder_relation") == "partial"
             ]
-            if no_targets:
+            if partial_rows:
+                messagebox.showinfo(
+                    "Cluster 관계 불일치",
+                    "일부 트리에만 연결된 기존 Cluster 관계가 있습니다. "
+                    "해당 Cluster 관계를 ON 또는 OFF로 먼저 정규화하세요.",
+                    parent=self.root,
+                )
+                return
+            rows = [
+                row for row in rows
+                if (
+                    row.get("folder_relation") == "on"
+                    and row.get("on_target_spms")
+                )
+            ]
+            if not rows:
                 messagebox.showinfo(
                     "Cluster 갱신",
                     "현재 ON으로 연결된 대상이 없습니다. 먼저 관계를 ON으로 설정하세요.",
                     parent=self.root,
                 )
                 return
-        changes = [
+        changes = rows if refresh_only else [
             row for row in rows
             if (
                 row.get("folder_relation") != ("on" if enabled else "off")
@@ -1433,11 +1477,22 @@ class App:
             )
             return
         blend = Path(changes[0]["blend"])
-        target_count = (
-            len(changes[0].get("on_target_spms") or [])
-            if refresh_only
-            else int(changes[0].get("target_count") or 0)
-        )
+        cluster_count = len(changes)
+        if refresh_only:
+            target_binding_count = sum(
+                len(row.get("on_target_spms") or []) for row in changes
+            )
+            target_keys = {
+                os.path.normcase(str(Path(target).absolute())).casefold()
+                for row in changes
+                for target in (row.get("on_target_spms") or [])
+            }
+            target_count = len(target_keys)
+        else:
+            target_binding_count = int(
+                changes[0].get("target_count") or 0
+            )
+            target_count = target_binding_count
         action = (
             "갱신 · 현재 Blender 결과 재적용"
             if refresh_only
@@ -1445,12 +1500,18 @@ class App:
             else "OFF · 원본 메시 복원"
         )
         target_label = (
-            f"현재 ON으로 연결된 SK_*.spm {target_count}개"
+            f"현재 ON으로 연결된 SK_*.spm {target_count}개 · "
+            f"Cluster 연결 {target_binding_count}건"
             if refresh_only
             else f"부모 식생 폴더의 SK_*.spm {target_count}개 전체"
         )
+        blend_label = (
+            blend.name
+            if cluster_count == 1
+            else f"{cluster_count}개 (선택 Cluster 폴더 전체)"
+        )
         message = (
-            f"Cluster blend: {blend.name}\n관계: {action}\n"
+            f"Cluster blend: {blend_label}\n관계: {action}\n"
             f"대상: {target_label}\n\n"
             + (
                 (
@@ -1479,20 +1540,37 @@ class App:
             )
             report(f"{stage} 준비", 10)
             if refresh_only:
-                result = run_cluster_relation_transaction(
-                    blend,
-                    changes[0].get("on_target_spms") or [],
-                    enabled=True,
-                    blender_exe=Path(
-                        self.config.get("blender_exe") or DEFAULT_BLENDER
-                    ),
-                    unit_probe_path=Path(
-                        self.config.get("cluster_unit_probe")
-                        or DEFAULT_CLUSTER_UNIT_PROBE
-                    ),
-                    capture_resolution=int(
-                        self.config.get("cluster_capture_resolution") or 1024
-                    ),
+                results = []
+                for index, row in enumerate(changes, start=1):
+                    report(
+                        f"Cluster 갱신 {index}/{cluster_count} · "
+                        f"{Path(row['blend']).name}",
+                        10 + int(80 * (index - 1) / cluster_count),
+                    )
+                    results.append(run_cluster_relation_transaction(
+                        Path(row["blend"]),
+                        row.get("on_target_spms") or [],
+                        enabled=True,
+                        blender_exe=Path(
+                            self.config.get("blender_exe") or DEFAULT_BLENDER
+                        ),
+                        unit_probe_path=Path(
+                            self.config.get("cluster_unit_probe")
+                            or DEFAULT_CLUSTER_UNIT_PROBE
+                        ),
+                        capture_resolution=int(
+                            self.config.get("cluster_capture_resolution") or 1024
+                        ),
+                    ))
+                result = (
+                    results[0]
+                    if cluster_count == 1
+                    else {
+                        "status": "ok",
+                        "mode": "sync",
+                        "cluster_count": cluster_count,
+                        "results": results,
+                    }
                 )
             else:
                 result = run_cluster_folder_relation_transaction(
@@ -1516,7 +1594,8 @@ class App:
             self.refresh()
             self.status_var.set(
                 (
-                    f"Cluster 갱신 완료 · 폴더 SK {target_count}개"
+                    f"Cluster 갱신 완료 · Cluster {cluster_count}개 · "
+                    f"ON 대상 SK {target_count}개 · 연결 {target_binding_count}건"
                     if refresh_only
                     else
                     f"Cluster 관계 {'ON' if enabled else 'OFF'} 완료 · "
@@ -1525,7 +1604,7 @@ class App:
             )
             messagebox.showinfo(
                 "Cluster 갱신 완료" if refresh_only else "Cluster 관계 완료",
-                f"{blend.name}\n"
+                f"{blend_label}\n"
                 + (
                     "현재 Blender 결과 재적용"
                     if refresh_only else f"관계 {'ON' if enabled else 'OFF'}"
@@ -1766,10 +1845,11 @@ class App:
                 return
         message = (
             f"마스터: {master}\n자식: {', '.join(names)}\n\n"
-            "적용 전 마스터와 모든 자식이 하나의 백업 폴더에 저장됩니다.\n"
-            "자식에서 발견한 추가 Generator 구조는 마스터에 합쳐지고 선택 자식 전체에 "
-            "정규화됩니다. GUID, Random Seed, 재질과 Node/Freehand Edit는 각 SPM의 "
-            "로컬 값을 유지합니다."
+            "마스터는 읽기 전용 기준으로 사용하며 선택 자식만 백업·저장됩니다.\n"
+            "마스터에만 있는 Generator 구조는 자식에 반영됩니다. 자식에서 발견한 추가 "
+            "Generator 구조는 관리 Base에서 삭제되고 부모·형제에게 전파되지 않습니다. "
+            "Generation Pass는 자식 계산 순서에 맞게 재정규화합니다. GUID, Random Seed, "
+            "재질과 Node/Freehand Edit는 각 SPM의 로컬 값을 유지합니다."
         )
         if verify:
             message += (
