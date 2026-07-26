@@ -587,6 +587,8 @@ def _normalize_existing_skeletal_mesh_imported_slot_names(asset_path):
     path = str(asset_path or "").split(".", 1)[0]
     if not path:
         return {"status": "skipped", "reason": "no asset path", "changes": []}
+    if not unreal.EditorAssetLibrary.does_asset_exist(path):
+        return {"status": "fresh", "asset": path, "changes": []}
     mesh = unreal.EditorAssetLibrary.load_asset(path)
     if mesh is None:
         return {"status": "fresh", "asset": path, "changes": []}

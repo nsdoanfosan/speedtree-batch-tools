@@ -458,26 +458,86 @@ class PhysicalProductionContractTests(unittest.TestCase):
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
-    def test_role_ordinals_are_derived_from_input_and_must_be_consecutive(self):
+    def test_role_ordinals_preserve_content_driven_gaps(self):
         manifest = physical_production_manifest()
         branch_two = next(
             row for row in manifest["parts"]
             if row["role"] == "branch" and row["logical_subpart_index"] == 2
         )
+        branch_two["prototype_id"] = "branch_normalized_03"
+        branch_two["asset_name"] = "SK_branch_sample_01_03"
         branch_two["logical_subpart_index"] = 3
         branch_two["external_source"]["ordinal"] = 3
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "ordinals are not consecutive from input",
-        ):
-            validate_normalized_prototype_unit_contract(manifest)
+        branch_two_variant = next(
+            row for row in manifest["registered_variants"]
+            if row["role"] == "branch" and row["ordinal"] == 2
+        )
+        branch_two_variant["instanced"] = False
+        branch_three_variant = dict(branch_two_variant)
+        branch_three_variant.update({
+            "ordinal": 3,
+            "card_name": "branch_sample_01_03",
+            "skeletal_asset_name": "SK_branch_sample_01_03",
+            "instanced": True,
+        })
+        manifest["registered_variants"].append(branch_three_variant)
+        for receipt in manifest["normalized_variant_receipts"]:
+            if receipt["role"] != "branch":
+                continue
+            payload = receipt["receipt"]
+            prototype = dict(payload["prototypes"][-1])
+            prototype.update({
+                "prototype_index": 3,
+                "skeletal_asset": "SK_branch_sample_01_03",
+            })
+            payload["prototypes"].append(prototype)
+            variant = dict(payload["variants"][-1])
+            variant.update({
+                "index": 3,
+                "card_index": 3,
+                "skeletal_asset": "SK_branch_sample_01_03",
+                "plan": "branch_sample_01_03",
+            })
+            payload["variants"].append(variant)
+            capture = payload["physical_capture_contract"]
+            pivot = dict(capture["attachment_pivots"][-1])
+            pivot.update({
+                "prototype_index": 3,
+                "prototype_asset": "SK_branch_sample_01_03",
+                "xml_bone_id": 3,
+                "source_world": [3.0, 0.0, 0.0],
+                "fitted_capture_world": [0.03, 0.0, 0.0],
+            })
+            capture["attachment_pivots"].append(pivot)
+            capture["contract_sha256"] = __import__("hashlib").sha256(
+                json.dumps(
+                    {
+                        key: value
+                        for key, value in capture.items()
+                        if key != "contract_sha256"
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            payload["physical_capture_contract_sha256"] = capture[
+                "contract_sha256"
+            ]
 
-    def test_every_registered_variant_must_be_instanced(self):
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["roles"]["branch"], 2)
+        self.assertEqual(report["role_ordinals"]["branch"], [1, 3])
+        self.assertEqual(report["registered_variant_count"], 6)
+        self.assertEqual(report["instanced_variant_count"], 5)
+
+    def test_every_instanced_part_requires_a_matching_registered_variant(self):
         manifest = physical_production_manifest()
         manifest["registered_variants"][0]["instanced"] = False
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "never instanced",
+            "instanced registered variants do not exactly match",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -486,7 +546,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         manifest["registered_variants"][0]["instanced"] = False
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "never instanced",
+            "instanced registered variants do not exactly match",
         ):
             validate_manifest_artifacts(manifest)
 

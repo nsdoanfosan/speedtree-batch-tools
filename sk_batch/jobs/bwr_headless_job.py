@@ -235,6 +235,20 @@ def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
                     collection.remove(value)
 
 
+def require_cluster_assembly_handoff_ready(handoff):
+    if handoff.get("status") != "blocked":
+        return
+    reasons = "; ".join(
+        f"{item.get('role') or item.get('artifact') or '?'}: "
+        f"{item.get('reason') or item.get('code')}"
+        for item in handoff.get("issues") or []
+    )
+    raise RuntimeError(
+        "PCG Cluster Assembly handoff blocked before Blender Repair: "
+        + (reasons or "unknown contract error")
+    )
+
+
 def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
     """Find the additive PCG receipt inside the existing required contract."""
     try:
@@ -376,23 +390,8 @@ def main():
                     source_fbx_path,
                 )
                 report["cluster_assembly_handoff"] = cluster_assembly_handoff
-                if cluster_assembly_handoff.get("status") == "blocked":
-                    reasons = "; ".join(
-                        f"{item.get('role') or item.get('artifact') or '?'}: "
-                        f"{item.get('reason') or item.get('code')}"
-                        for item in cluster_assembly_handoff.get("issues") or []
-                    )
-                    raise RuntimeError(
-                        "PCG Cluster Assembly handoff blocked before Blender Repair: "
-                        + (reasons or "unknown contract error")
-                    )
-            elif cluster_assembly_source_resolution.get("status") == (
-                "legacy_pass_through"
-            ):
-                report.setdefault("warnings", []).append(
-                    "Cluster Assembly source FBX is recorded as pending export "
-                    "and is absent on disk; Full SK repair continues with legacy "
-                    "pass-through."
+                require_cluster_assembly_handoff_ready(
+                    cluster_assembly_handoff
                 )
 
         settings = bpy.context.scene.speedtree_bwr_settings
@@ -463,6 +462,102 @@ def main():
         xml_export = speedtree_export["exports"].get("xml", {})
         if not fbx_export.get("exists"):
             raise RuntimeError("SpeedTree export produced no FBX to import")
+
+        # A content-driven Assembly receipt can legitimately be written before
+        # its authoritative general-tree FBX exists.  Do not silently degrade
+        # that Tree to a Full-SK-only import: export the exact source SPM named
+        # by the receipt, then reconcile the actual FBX before repair continues.
+        if (
+            cluster_assembly_contract is not None
+            and cluster_assembly_handoff is None
+            and cluster_assembly_source_resolution.get("status")
+            == "legacy_pass_through"
+            and cluster_assembly_source_resolution.get("reason")
+            == "assembly_source_fbx_pending_export"
+        ):
+            source_spm_value = cluster_assembly_source_resolution.get(
+                "source_spm"
+            )
+            expected_fbx_value = cluster_assembly_source_resolution.get(
+                "source_fbx"
+            )
+            if not source_spm_value or not expected_fbx_value:
+                raise RuntimeError(
+                    "Cluster Assembly receipt cannot resolve one authoritative "
+                    "source SPM/FBX pair"
+                )
+            source_spm_path = Path(source_spm_value).resolve()
+            expected_fbx_path = Path(expected_fbx_value).resolve()
+            if not source_spm_path.is_file():
+                raise RuntimeError(
+                    "Cluster Assembly authoritative source SPM is missing: "
+                    f"{source_spm_path}"
+                )
+
+            if source_spm_path == speedtree_spm:
+                assembly_source_export = speedtree_export
+            else:
+                assembly_source_export = bwr_core.run_speedtree_cli_export(
+                    str(source_spm_path),
+                    speedtree_exe_path=export_settings[
+                        "speedtree_exe_path"
+                    ],
+                    export_options_path=export_settings[
+                        "speedtree_export_options_path"
+                    ],
+                    fbx_export_options_path=export_settings[
+                        "speedtree_fbx_export_options_path"
+                    ],
+                    xml_export_options_path=export_settings[
+                        "speedtree_xml_export_options_path"
+                    ],
+                    output_root=export_settings["speedtree_output_root"],
+                    name_stem=source_spm_path.stem,
+                    export_fbx=export_settings["speedtree_export_fbx"],
+                    export_xml=export_settings["speedtree_export_xml"],
+                )
+            report["cluster_assembly_source_export"] = assembly_source_export
+            assembly_fbx_export = (
+                assembly_source_export.get("exports", {}).get("fbx", {})
+            )
+            actual_fbx_value = assembly_fbx_export.get("path")
+            if not assembly_fbx_export.get("exists") or not actual_fbx_value:
+                raise RuntimeError(
+                    "Cluster Assembly authoritative SpeedTree export produced "
+                    "no FBX"
+                )
+            actual_fbx_path = Path(actual_fbx_value).resolve()
+            if actual_fbx_path != expected_fbx_path:
+                raise RuntimeError(
+                    "Cluster Assembly authoritative SpeedTree export path "
+                    f"mismatch: expected {expected_fbx_path}, got "
+                    f"{actual_fbx_path}"
+                )
+
+            cluster_assembly_source_resolution = (
+                assembly_source_fbx_resolution(
+                    cluster_assembly_contract,
+                    speedtree_spm,
+                )
+            )
+            report["cluster_assembly_source_resolution"] = (
+                cluster_assembly_source_resolution
+            )
+            if cluster_assembly_source_resolution.get("status") != "ready":
+                raise RuntimeError(
+                    "Cluster Assembly source FBX remained unavailable after "
+                    "the authoritative SpeedTree export"
+                )
+            cluster_assembly_handoff = inspect_cluster_assembly_fbx(
+                cluster_receipt_path,
+                speedtree_spm,
+                expected_fbx_path,
+            )
+            report["cluster_assembly_handoff"] = cluster_assembly_handoff
+            require_cluster_assembly_handoff_ready(
+                cluster_assembly_handoff
+            )
+
         settings.source_fbx_path = fbx_export["path"]
         if xml_export.get("exists"):
             settings.xml_path = xml_export["path"]

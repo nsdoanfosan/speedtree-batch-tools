@@ -307,6 +307,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(
                 resolution["reason"], "assembly_source_fbx_pending_export"
             )
+            self.assertEqual(Path(resolution["source_spm"]), source_spm)
             self.assertEqual(Path(resolution["source_fbx"]), missing_fbx)
             self.assertIsNone(
                 assembly_source_fbx_from_contract(contract, full_spm)

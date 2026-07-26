@@ -1128,6 +1128,7 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
         runner.unreal.SkeletalMesh = FakeMesh
         runner.unreal.Name = lambda value: value
         runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            does_asset_exist=lambda _path: True,
             load_asset=lambda _path: mesh
         )
 
@@ -1160,10 +1161,13 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
 
     def test_missing_asset_is_a_fresh_import(self):
         runner = load_runner()
+        loaded = []
         runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
-            load_asset=lambda _path: None
+            does_asset_exist=lambda _path: False,
+            load_asset=lambda path: loaded.append(path),
         )
         result = runner._normalize_existing_skeletal_mesh_imported_slot_names(
             "/Game/Trees/SK_New"
         )
         self.assertEqual(result["status"], "fresh")
+        self.assertEqual(loaded, [])

@@ -559,6 +559,7 @@ def assembly_source_fbx_resolution(contract, full_spm_path):
         return {
             "status": "not_applicable",
             "reason": "no_cluster_assembly_roles",
+            "source_spm": None,
             "source_fbx": None,
             "roles": [],
         }
@@ -602,6 +603,7 @@ def assembly_source_fbx_resolution(contract, full_spm_path):
         return {
             "status": "legacy_pass_through",
             "reason": "assembly_source_fbx_pending_export",
+            "source_spm": str(authoritative_spm),
             "source_fbx": pending_paths[0] if len(pending_paths) == 1 else None,
             "roles": targets,
         }
@@ -613,6 +615,7 @@ def assembly_source_fbx_resolution(contract, full_spm_path):
     return {
         "status": "ready",
         "reason": "hash_validated_cluster_assembly_source",
+        "source_spm": str(authoritative_spm),
         "source_fbx": str(source_fbx),
         "roles": targets,
     }

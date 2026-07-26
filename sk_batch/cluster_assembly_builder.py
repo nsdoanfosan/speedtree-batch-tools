@@ -934,14 +934,8 @@ def validate_normalized_prototype_unit_contract(manifest):
         asset_names.add(asset_name.casefold())
         role_ordinals[role].append(ordinal)
 
-    for role, ordinals in role_ordinals.items():
-        checked = sorted(ordinals)
-        if checked != list(range(1, len(checked) + 1)):
-            raise ClusterAssemblyBuildError(
-                f"{role} native prototype ordinals are not consecutive from input"
-            )
-
     variant_rows = {}
+    instanced_variant_rows = {}
     for variant in variants:
         role = str(variant.get("role") or "").casefold()
         try:
@@ -953,22 +947,25 @@ def validate_normalized_prototype_unit_contract(manifest):
             raise ClusterAssemblyBuildError(
                 "registered normalized variant is invalid or duplicated"
             )
-        if variant.get("instanced") is not True:
+        instanced = variant.get("instanced")
+        if not isinstance(instanced, bool):
             raise ClusterAssemblyBuildError(
-                f"registered normalized variant is never instanced: {key}"
+                f"registered normalized variant has no usage decision: {key}"
             )
         if str(variant.get("pivot_contract") or "") != _NORMALIZED_PIVOT_CONTRACT:
             raise ClusterAssemblyBuildError(
                 f"registered normalized variant pivot contract is invalid: {key}"
             )
         variant_rows[key] = variant
-    if set(variant_rows) != set(prototype_rows):
+        if instanced:
+            instanced_variant_rows[key] = variant
+    if set(instanced_variant_rows) != set(prototype_rows):
         raise ClusterAssemblyBuildError(
-            "unique registered variants do not exactly match native prototype specs"
+            "instanced registered variants do not exactly match native prototype specs"
         )
     for key, part in prototype_rows.items():
         if (
-            str(variant_rows[key].get("skeletal_asset_name") or "")
+            str(instanced_variant_rows[key].get("skeletal_asset_name") or "")
             != str(part.get("asset_name") or "")
         ):
             raise ClusterAssemblyBuildError(
@@ -1027,9 +1024,9 @@ def validate_normalized_prototype_unit_contract(manifest):
             )
 
         expected_assets = {
-            str(part.get("asset_name") or "")
-            for (part_role, _ordinal), part in prototype_rows.items()
-            if part_role == role
+            str(variant.get("skeletal_asset_name") or "")
+            for (variant_role, _ordinal), variant in variant_rows.items()
+            if variant_role == role
         }
         receipt_prototypes = normalized.get("prototypes") or []
         receipt_assets = {
@@ -1104,11 +1101,16 @@ def validate_normalized_prototype_unit_contract(manifest):
                     f"{role} normalized variant direct-capture evidence is invalid"
                 )
             receipt_variant_rows[key] = receipt_variant
-    if set(receipt_variant_rows) != set(variant_rows):
+    relevant_variant_rows = {
+        key: variant
+        for key, variant in variant_rows.items()
+        if key[0] in role_ordinals
+    }
+    if set(receipt_variant_rows) != set(relevant_variant_rows):
         raise ClusterAssemblyBuildError(
             "normalization receipt variants do not exactly match registered variants"
         )
-    for key, registered in variant_rows.items():
+    for key, registered in relevant_variant_rows.items():
         receipt_variant = receipt_variant_rows[key]
         if (
             str(receipt_variant.get("skeletal_asset") or "")
@@ -1134,8 +1136,13 @@ def validate_normalized_prototype_unit_contract(manifest):
         "status": "verified",
         "native_prototype_count": len(prototype_rows),
         "registered_variant_count": len(variant_rows),
+        "instanced_variant_count": len(instanced_variant_rows),
         "roles": {
             role: len(ordinals)
+            for role, ordinals in sorted(role_ordinals.items())
+        },
+        "role_ordinals": {
+            role: sorted(ordinals)
             for role, ordinals in sorted(role_ordinals.items())
         },
         "physical_target_meters": unit_probe["physical_target_meters"],
