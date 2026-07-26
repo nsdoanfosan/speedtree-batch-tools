@@ -346,6 +346,28 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("Blender Repair 코드가 저장 결과보다 최신임", reason)
             self.assertIn("core.py", reason)
 
+    def test_runtime_receipt_tracks_non_addon_repair_producer(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, core, fbx_ini = self._runtime_stale_fixture(root)
+            producer = root / "cluster_assembly_builder.py"
+            producer.write_text("# producer v1", encoding="utf-8")
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app.log = mock.Mock()
+            app._repair_runtime_code_paths = mock.Mock(
+                return_value=[core, producer]
+            )
+            app._write_repair_runtime_receipt(spm)
+            self.assertTrue(app._repair_runtime_fresh(spm)[0])
+
+            producer.write_text("# producer v2", encoding="utf-8")
+
+            fresh, reason = app._repair_runtime_fresh(spm)
+            self.assertFalse(fresh)
+            self.assertIn("cluster_assembly_builder.py", reason)
+
     def test_cluster_assembly_input_change_invalidates_root_repair(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -888,6 +910,107 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(app._run_limited.call_args.args[2], 321)
             self.assertTrue(any(
                 "갱신 완료" in call.args[0]
+                for call in app.log.call_args_list
+            ))
+
+    def test_missing_cluster_receipt_is_audited_and_recovered(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+            selected = Path(temporary) / "receipt.json"
+            current = {"selected_receipt": str(selected)}
+            app._run_limited = mock.Mock(
+                return_value=(0, Path(temporary) / "refresh.log")
+            )
+
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[FileNotFoundError("missing"), current],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm, "20260725_120000"
+                )
+
+            self.assertEqual(resolution, current)
+            self.assertEqual(app._run_limited.call_count, 1)
+            command = app._run_limited.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--target") + 1], str(spm.parent)
+            )
+
+    def test_missing_non_cluster_receipt_remains_pass_through_without_audit(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_plain" / "SK_Tree_plain_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            app._run_limited = mock.Mock(
+                return_value=(0, Path(temporary) / "refresh.log")
+            )
+
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[
+                    FileNotFoundError("missing"),
+                    FileNotFoundError("still missing"),
+                ],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm, "20260725_120000"
+                )
+
+            self.assertIsNone(resolution)
+            app._run_limited.assert_not_called()
+
+    def test_missing_cluster_folder_without_actionable_receipt_passes_after_audit(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_plain" / "SK_Tree_plain_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+            app._run_limited = mock.Mock(
+                return_value=(0, Path(temporary) / "refresh.log")
+            )
+
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[
+                    FileNotFoundError("missing"),
+                    FileNotFoundError("still missing"),
+                ],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm, "20260725_120000"
+                )
+
+            self.assertIsNone(resolution)
+            self.assertEqual(app._run_limited.call_count, 1)
+            self.assertTrue(any(
+                "영수증 비대상" in call.args[0]
                 for call in app.log.call_args_list
             ))
 

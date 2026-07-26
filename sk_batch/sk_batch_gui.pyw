@@ -72,6 +72,7 @@ from sk_common import (
     summarize_job_failure,
     speedtree_output_spm_for,
     terminate_process_tree,
+    unreal_remote_execution_settings,
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
@@ -102,7 +103,7 @@ WIND_OPTIONS = (
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
-REPAIR_RUNTIME_RECEIPT_VERSION = 1
+REPAIR_RUNTIME_RECEIPT_VERSION = 2
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 CLUSTER_RECEIPT_REFRESH_LOCK = threading.Lock()
 
@@ -126,6 +127,21 @@ def normalized_folder_key(path):
         return os.path.normcase(str(Path(path).resolve())).casefold()
     except (OSError, ValueError):
         return os.path.normcase(str(Path(path).absolute())).casefold()
+
+
+def send2ue_rpc_cli_args(unreal_project):
+    """Build background-Blender RPC overrides from the target UE project."""
+    settings = unreal_remote_execution_settings(unreal_project)
+    args = []
+    bind_address = settings.get("multicast_bind_address")
+    if bind_address:
+        args.extend(["--rpc-multicast-bind-address", str(bind_address)])
+    group_endpoint = settings.get("multicast_group_endpoint")
+    if group_endpoint:
+        args.extend(["--rpc-multicast-group-endpoint", str(group_endpoint)])
+    if "multicast_ttl" in settings:
+        args.extend(["--rpc-multicast-ttl", str(settings["multicast_ttl"])])
+    return args
 
 
 def blender_open_file_window_titles(blend_path):
@@ -2137,15 +2153,52 @@ class App:
             return None
 
     @staticmethod
-    def _repair_runtime_code_state(addon_dir):
-        """Content hash per addon module, so a checkout cannot fake staleness."""
-        modules = sorted(Path(addon_dir).glob("*.py"))
+    def _repair_runtime_code_paths(addon_dir):
+        """Every producer module that can change a completed Repair result."""
+        addon_dir = Path(addon_dir)
+        paths = list(addon_dir.rglob("*.py"))
+        paths.extend([
+            REPO_DIR / "speedtree_pipeline_contract.py",
+            REPO_DIR / "cluster_spm_pair_contract.py",
+            REPO_DIR / "cluster_normalization_sync.py",
+            REPO_DIR / "pcg_st9_texture_batch"
+            / "pcg_cluster_assembly_contract.py",
+            REPO_DIR / "pcg_st9_texture_batch" / "pcg_texture_audit.py",
+            TOOL_DIR / "jobs" / "bwr_headless_job.py",
+            TOOL_DIR / "jobs" / "speedtree_material_preflight.py",
+            TOOL_DIR / "cluster_assembly_builder.py",
+            TOOL_DIR / "cluster_assembly_handoff_contract.py",
+            TOOL_DIR / "nanite_assembly_materials.py",
+            TOOL_DIR / "cage_deformation.py",
+        ])
+        unique = {}
+        for path in paths:
+            candidate = Path(path)
+            if candidate.is_file():
+                unique[
+                    os.path.normcase(str(candidate.resolve())).casefold()
+                ] = candidate.resolve()
+        return [unique[key] for key in sorted(unique)]
+
+    def _repair_runtime_code_state(self, addon_dir):
+        """Content hash per producer module, independent of timestamps."""
+        addon_dir = Path(addon_dir).resolve()
+        modules = self._repair_runtime_code_paths(addon_dir)
         if not modules:
             return None
-        return {
-            module.name: hashlib.sha256(module.read_bytes()).hexdigest()
-            for module in modules
-        }
+        state = {}
+        for module in modules:
+            try:
+                key = "addon/" + module.relative_to(addon_dir).as_posix()
+            except ValueError:
+                try:
+                    key = "repo/" + module.relative_to(
+                        REPO_DIR.resolve()
+                    ).as_posix()
+                except ValueError:
+                    key = "external/" + os.path.normcase(str(module))
+            state[key] = hashlib.sha256(module.read_bytes()).hexdigest()
+        return state
 
     @staticmethod
     def _repair_runtime_receipt_path(spm):
@@ -2229,7 +2282,17 @@ class App:
             except (OSError, ValueError):
                 candidate = None
             if isinstance(candidate, dict) and isinstance(candidate.get("code"), dict):
-                saved = candidate["code"]
+                if (
+                    candidate.get("kind") == "sk_repair_runtime"
+                    and candidate.get("version")
+                    == REPAIR_RUNTIME_RECEIPT_VERSION
+                ):
+                    saved = candidate["code"]
+                else:
+                    return False, (
+                        "Blender Repair producer receipt version changed; "
+                        "run Blender Repair again"
+                    )
         if saved is not None:
             if saved == current:
                 return True, ""
@@ -2740,19 +2803,29 @@ class App:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
     def _refresh_stale_cluster_receipt(self, spm, stamp):
-        """Regenerate a stale PCG receipt before paying to launch Blender.
+        """Regenerate a missing or stale PCG receipt before launching Blender.
 
         The receipt remains a strict hash gate.  This only reruns the existing
         read-only PCG folder audit against the current artifacts and then
-        requires a newly hash-current receipt; it never accepts stale hashes.
+        requires a newly hash-current receipt when the audit finds an Assembly
+        dependency; it never accepts stale hashes.
         """
         spm = Path(spm).resolve()
         with CLUSTER_RECEIPT_REFRESH_LOCK:
+            receipt_was_missing = False
             try:
                 return cluster_assembly_receipt_resolution(spm)
             except FileNotFoundError:
-                # Ordinary non-Cluster vegetation has no Assembly receipt.
-                return None
+                # Only an owner Tree with a real Cluster child can be missing
+                # an actionable receipt. Ordinary vegetation and the Cluster
+                # source rows themselves remain pass-through.
+                if not (spm.parent / "Cluster").is_dir():
+                    return None
+                receipt_was_missing = True
+                self.log(
+                    f"Cluster Assembly 영수증 탐색: {spm.name} "
+                    "(저장된 영수증 없음; 현재 폴더 감사)"
+                )
             except ClusterAssemblyReceiptStaleError:
                 self.log(
                     f"Cluster Assembly 영수증 갱신: {spm.name} "
@@ -2789,7 +2862,22 @@ class App:
                 )
             try:
                 resolution = cluster_assembly_receipt_resolution(spm)
-            except (FileNotFoundError, ClusterAssemblyReceiptStaleError) as exc:
+            except FileNotFoundError as exc:
+                if receipt_was_missing:
+                    # The audit persists receipts only for actionable Cluster
+                    # contracts. No receipt now proves ordinary pass-through.
+                    self.log(
+                        f"Cluster Assembly 영수증 비대상: {spm.name}"
+                    )
+                    return None
+                raise BatchItemError(
+                    "Cluster Assembly 영수증 자동 갱신 후에도 현재 해시를 "
+                    f"확인하지 못함: {spm.name}: {exc}",
+                    kind="data_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                ) from exc
+            except ClusterAssemblyReceiptStaleError as exc:
                 raise BatchItemError(
                     "Cluster Assembly 영수증 자동 갱신 후에도 현재 해시를 "
                     f"확인하지 못함: {spm.name}: {exc}",
@@ -3813,6 +3901,7 @@ class App:
             "--rpc-timeout-min", str(self.cfg.get("push_rpc_timeout_min", 180)),
             "--rpc-timeout-max", str(self.cfg.get("push_rpc_timeout_max", 900)),
         ]
+        cmd.extend(send2ue_rpc_cli_args(self.cfg.get("unreal_project")))
         wind_override = self.items.get(iid, {}).get("wind_override", "auto")
         resolved_wind = (
             wind_preset_for_spm(spm)

@@ -374,25 +374,6 @@ def main():
             report["cluster_assembly_source_resolution"] = (
                 cluster_assembly_source_resolution
             )
-            source_fbx_value = cluster_assembly_source_resolution.get(
-                "source_fbx"
-            )
-            source_fbx_path = (
-                Path(source_fbx_value)
-                if cluster_assembly_source_resolution.get("status") == "ready"
-                and source_fbx_value
-                else None
-            )
-            if source_fbx_path is not None:
-                cluster_assembly_handoff = inspect_cluster_assembly_fbx(
-                    cluster_receipt_path,
-                    speedtree_spm,
-                    source_fbx_path,
-                )
-                report["cluster_assembly_handoff"] = cluster_assembly_handoff
-                require_cluster_assembly_handoff_ready(
-                    cluster_assembly_handoff
-                )
 
         settings = bpy.context.scene.speedtree_bwr_settings
         settings.spm_path = str(speedtree_spm)
@@ -548,15 +529,45 @@ def main():
                     "Cluster Assembly source FBX remained unavailable after "
                     "the authoritative SpeedTree export"
                 )
+
+        # SpeedTree FBX export also promotes its generated STMAT sidecar, while
+        # the paired XML export replaces the XML in the same bundle.  Recheck
+        # every source contract only after all CLI exports have completed.
+        # Deferring the actual FBX import to this point also prevents a ready
+        # pre-export inventory (and its cached hashes) from being reused after
+        # the exporter replaces those files.
+        if args.material_contract:
+            material_preflight = validate_preflight_report(
+                args.material_contract,
+                speedtree_spm,
+                require_ok=True,
+            )
+            report["speedtree_pipeline_contract"] = material_preflight[
+                "speedtree_pipeline_contract"
+            ]
+            report["speedtree_pipeline_contract_revalidated_after_export"] = True
+
+        if (
+            cluster_assembly_contract is not None
+            and cluster_assembly_source_resolution.get("status") == "ready"
+        ):
+            source_fbx_value = cluster_assembly_source_resolution.get(
+                "source_fbx"
+            )
+            if not source_fbx_value:
+                raise RuntimeError(
+                    "Cluster Assembly ready source resolution has no FBX path"
+                )
             cluster_assembly_handoff = inspect_cluster_assembly_fbx(
                 cluster_receipt_path,
                 speedtree_spm,
-                expected_fbx_path,
+                Path(source_fbx_value),
             )
             report["cluster_assembly_handoff"] = cluster_assembly_handoff
             require_cluster_assembly_handoff_ready(
                 cluster_assembly_handoff
             )
+            report["cluster_assembly_handoff_revalidated_after_export"] = True
 
         settings.source_fbx_path = fbx_export["path"]
         if xml_export.get("exists"):

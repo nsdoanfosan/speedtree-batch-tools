@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -215,7 +216,7 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "STMAT source is stale"):
                 validate_preflight_envelope(envelope, first)
 
-    def test_source_fingerprint_is_canonical_source_json_sha256(self):
+    def test_source_fingerprint_is_canonical_content_identity_sha256(self):
         source = {
             "spm": {
                 "canonical_path": r"C:\Trees\SK_tree.spm",
@@ -226,11 +227,62 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
             "stmat": [],
         }
         encoded = json.dumps(
-            source, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            {
+                "spm": {
+                    "canonical_path": r"C:\Trees\SK_tree.spm",
+                    "sha256": "a" * 64,
+                    "size": 10,
+                },
+                "stmat": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         ).encode("utf-8")
         self.assertEqual(
             source_set_fingerprint(source), hashlib.sha256(encoded).hexdigest()
         )
+        touched = json.loads(json.dumps(source))
+        touched["spm"]["mtime_ns"] = 999
+        self.assertEqual(
+            source_set_fingerprint(touched),
+            source_set_fingerprint(source),
+        )
+
+    def test_preflight_validation_allows_touch_only_source_metadata_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_tree.spm")
+            stmat = write_stmat(spm, ["M_leaf_01_Mat"])
+            envelope = build_preflight_envelope(
+                spm,
+                outcome="ok",
+                texture_readiness=resolve_texture_bindings(stmat),
+            )
+
+            for source in (spm, stmat):
+                stat = source.stat()
+                os.utime(
+                    source,
+                    ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000),
+                )
+
+            validate_preflight_envelope(envelope, spm)
+
+    def test_preflight_validation_rejects_unknown_fingerprint_policy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_tree.spm")
+            stmat = write_stmat(spm, ["M_leaf_01_Mat"])
+            envelope = build_preflight_envelope(
+                spm,
+                outcome="ok",
+                texture_readiness=resolve_texture_bindings(stmat),
+            )
+            envelope["source_fingerprint_policy"] = "future_unknown_policy"
+
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                validate_preflight_envelope(envelope, spm)
 
     def test_all_backup_namespaces_are_not_live_spms(self):
         self.assertIn(

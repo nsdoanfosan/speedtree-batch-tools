@@ -659,6 +659,87 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(app.state[iid]["push_status_kind"], "imported_ok")
         self.assertIn("건너뜀", app.log.call_args.args[0])
 
+    def test_rpc_cli_uses_target_project_remote_execution_adapter(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "MyProject"
+            config_dir = project_dir / "Config"
+            config_dir.mkdir(parents=True)
+            project_path = project_dir / "MyProject.uproject"
+            project_path.write_text("{}", encoding="utf-8")
+            (config_dir / "DefaultEngine.ini").write_text(
+                "\n".join(
+                    [
+                        "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]",
+                        "bRemoteExecution=True",
+                        "RemoteExecutionMulticastGroupEndpoint=239.1.2.3:6766",
+                        "RemoteExecutionMulticastBindAddress=192.168.50.9",
+                        "RemoteExecutionMulticastTtl=1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            args = gui.send2ue_rpc_cli_args(project_path)
+
+        self.assertEqual(
+            args,
+            [
+                "--rpc-multicast-bind-address",
+                "192.168.50.9",
+                "--rpc-multicast-group-endpoint",
+                "239.1.2.3:6766",
+                "--rpc-multicast-ttl",
+                "1",
+            ],
+        )
+
+    def test_rpc_cli_does_not_invent_adapter_without_project_contract(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_path = Path(temp_dir) / "Missing.uproject"
+            args = gui.send2ue_rpc_cli_args(project_path)
+
+        self.assertEqual(args, [])
+
+    def test_rpc_cli_respects_disabled_unreal_remote_execution(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "DisabledProject"
+            config_dir = project_dir / "Config"
+            config_dir.mkdir(parents=True)
+            project_path = project_dir / "DisabledProject.uproject"
+            project_path.write_text("{}", encoding="utf-8")
+            (config_dir / "DefaultEngine.ini").write_text(
+                "\n".join(
+                    [
+                        "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]",
+                        "bRemoteExecution=False",
+                        "RemoteExecutionMulticastBindAddress=192.168.50.9",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            args = gui.send2ue_rpc_cli_args(project_path)
+
+        self.assertEqual(args, [])
+
+    def test_rpc_preferences_are_applied_before_unreal_discovery(self):
+        source = (
+            SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
+        ).read_text(encoding="utf-8")
+
+        configure = source.index(
+            'report["rpc_configuration"] = configure_send2ue_rpc_preferences(args)'
+        )
+        discover = source.index("if not utilities.is_unreal_connected():")
+        self.assertLess(configure, discover)
+        self.assertIn(
+            'preferences.command_endpoint = f"{bind_address}:{int(port_text)}"',
+            source,
+        )
+
     def test_saved_preflight_skip_is_rechecked_against_current_handoff(self):
         gui = load_gui_module()
         app = self.make_app(gui)

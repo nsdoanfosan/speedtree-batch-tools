@@ -1071,6 +1071,98 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 locate_cluster_assembly_receipt(target, receipt_dir), second
             )
 
+    def test_persisted_export_bundle_uses_content_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "Tree_elm"
+            receipt_dir = Path(temp_dir) / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"target-spm")
+            source.write_bytes(b"source-spm")
+
+            export_dir = root / "fbx"
+            export_dir.mkdir()
+            exports = {
+                "fbx": export_dir / "Tree_elm_01.fbx",
+                "xml": export_dir / "Tree_elm_01.xml",
+                "stmat": export_dir / "Tree_elm_01.stmat",
+            }
+            original = {
+                "fbx": b"fbx-content",
+                "xml": b"<xml />",
+                "stmat": b"<SpeedTreeMaterials />",
+            }
+            for artifact, path in exports.items():
+                path.write_bytes(original[artifact])
+
+            contract = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [],
+                "handoff": {
+                    "cluster_dependencies": [],
+                    "roles": [{
+                        "role": "branch",
+                        "targets": [{
+                            "spm": str(source),
+                            "export_bundle": {
+                                artifact: file_fingerprint(
+                                    path, hash_content=False
+                                )
+                                for artifact, path in exports.items()
+                            },
+                        }],
+                    }],
+                },
+            }
+            receipt = persist_cluster_assembly_receipt(
+                contract, receipt_dir=receipt_dir
+            )
+            payload = load_cluster_assembly_receipt(
+                receipt, requested_spm=target
+            )
+            persisted_bundle = payload["cluster_assembly"]["handoff"][
+                "roles"
+            ][0]["targets"][0]["export_bundle"]
+            self.assertTrue(all(
+                persisted_bundle[artifact]["sha256"]
+                for artifact in exports
+            ))
+
+            for path in exports.values():
+                stat = path.stat()
+                os.utime(
+                    path,
+                    ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+                )
+            load_cluster_assembly_receipt(receipt, requested_spm=target)
+
+            for artifact, path in exports.items():
+                with self.subTest(artifact=artifact):
+                    path.write_bytes(original[artifact] + b"-changed")
+                    with self.assertRaises(
+                        ClusterAssemblyReceiptStaleError
+                    ):
+                        load_cluster_assembly_receipt(
+                            receipt, requested_spm=target
+                        )
+                    path.write_bytes(original[artifact])
+                    stat = path.stat()
+                    os.utime(
+                        path,
+                        ns=(
+                            stat.st_atime_ns,
+                            stat.st_mtime_ns + 1_000_000,
+                        ),
+                    )
+                    load_cluster_assembly_receipt(
+                        receipt, requested_spm=target
+                    )
+
     def test_gui_rows_keep_each_cluster_spm_individually_visible(self):
         gui = load_gui_module()
         rows = gui.cluster_hierarchy_rows({

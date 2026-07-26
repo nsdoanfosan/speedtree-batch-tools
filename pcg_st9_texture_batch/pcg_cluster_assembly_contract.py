@@ -1633,7 +1633,7 @@ def cluster_assembly_receipt_path(contract, receipt_dir=None):
 
 
 def _upgrade_persisted_hashes(contract):
-    """Hash receipt-owned Cluster TGAs without changing source or audit state."""
+    """Hash receipt-owned artifacts without changing source or audit state."""
     result = copy.deepcopy(contract)
     dependency_groups = [result.get("dependencies") or []]
     handoff = result.get("handoff") or {}
@@ -1646,6 +1646,15 @@ def _upgrade_persisted_hashes(contract):
                 if isinstance(row, dict) and row.get("path") else row
                 for row in textures
             ]
+    for role in handoff.get("roles") or []:
+        for target in role.get("targets") or []:
+            bundle = target.get("export_bundle") or {}
+            for artifact in ("fbx", "xml", "stmat"):
+                row = bundle.get(artifact)
+                if isinstance(row, dict) and row.get("path"):
+                    bundle[artifact] = file_fingerprint(
+                        row["path"], hash_content=True
+                    )
     return result
 
 
@@ -1780,6 +1789,20 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
             expected_artifacts.extend(
                 row.get("plan_fbx") or {}
                 for row in variants.get("variants") or []
+            )
+    for role in (contract.get("handoff") or {}).get("roles") or []:
+        for target in role.get("targets") or []:
+            bundle = target.get("export_bundle") or {}
+            expected_artifacts.extend(
+                row
+                for row in (
+                    bundle.get("fbx"),
+                    bundle.get("xml"),
+                    bundle.get("stmat"),
+                )
+                # A missing export remains a valid pending-export state. Once
+                # present in a persisted receipt, its SHA is authoritative.
+                if isinstance(row, dict) and row.get("exists")
             )
 
     stale = []

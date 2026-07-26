@@ -44,6 +44,24 @@ def assigned_string_values(tree, target_name):
     return values
 
 
+def call_lines(tree, function_name):
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id == function_name
+            )
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == function_name
+            )
+        )
+    )
+
+
 class SourceReviewPolicyTests(unittest.TestCase):
     def test_only_reachable_policies_are_declared(self):
         policies = assigned_string_values(job_tree(), "source_review_policy")
@@ -91,6 +109,29 @@ class SourceReviewPolicyTests(unittest.TestCase):
             source,
         )
         self.assertIn('"spm": source_identity(canonical_spm)', source)
+
+    def test_source_contracts_are_revalidated_after_every_cli_export(self):
+        tree = job_tree()
+        export_lines = call_lines(tree, "run_speedtree_cli_export")
+        material_validation_lines = call_lines(
+            tree, "validate_preflight_report"
+        )
+        assembly_inspection_lines = call_lines(
+            tree, "inspect_cluster_assembly_fbx"
+        )
+        repair_lines = call_lines(tree, "run_import_and_repair")
+
+        self.assertEqual(len(export_lines), 2)
+        self.assertEqual(len(material_validation_lines), 2)
+        self.assertLess(material_validation_lines[0], export_lines[0])
+        self.assertGreater(material_validation_lines[1], max(export_lines))
+        self.assertEqual(len(assembly_inspection_lines), 1)
+        self.assertGreater(assembly_inspection_lines[0], max(export_lines))
+        self.assertEqual(len(repair_lines), 1)
+        self.assertLess(
+            max(material_validation_lines[1], assembly_inspection_lines[0]),
+            repair_lines[0],
+        )
 
 
 if __name__ == "__main__":

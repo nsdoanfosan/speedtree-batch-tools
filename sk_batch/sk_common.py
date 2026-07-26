@@ -3,7 +3,9 @@
 Pure Python (no bpy). Used by the GUI and by spm_audit; the Blender-side job
 scripts under jobs/ are self-contained on purpose (they run inside Blender).
 """
+import configparser
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -131,6 +133,71 @@ CALIBRATION_CACHE_VERSION = 2
 _JSON_WRITE_LOCK = threading.RLock()
 
 
+def unreal_remote_execution_settings(unreal_project):
+    """Read Send2UE-compatible RPC discovery settings from an Unreal project.
+
+    Unreal's Python Remote Execution plugin binds multicast discovery to the
+    adapter configured in DefaultEngine.ini.  Send2UE also uses its command
+    endpoint host as the multicast bind address, so background Blender must
+    mirror the project setting instead of assuming loopback.
+    """
+    if not unreal_project:
+        return {}
+    project_path = Path(unreal_project).expanduser()
+    project_dir = (
+        project_path.parent
+        if project_path.suffix.casefold() == ".uproject"
+        else project_path
+    )
+    ini_path = project_dir / "Config" / "DefaultEngine.ini"
+    if not ini_path.is_file():
+        return {}
+
+    parser = configparser.RawConfigParser(
+        strict=False,
+        interpolation=None,
+        allow_no_value=True,
+    )
+    try:
+        parser.read_string(ini_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, configparser.Error):
+        return {}
+
+    section_name = "/Script/PythonScriptPlugin.PythonScriptPluginSettings"
+    if not parser.has_section(section_name):
+        return {}
+    values = {
+        str(key).casefold(): str(value or "").strip()
+        for key, value in parser.items(section_name)
+    }
+    enabled = values.get("bremoteexecution", "true").casefold()
+    if enabled in {"0", "false", "no", "off"}:
+        return {}
+
+    settings = {"config_path": str(ini_path.resolve())}
+    bind_address = values.get("remoteexecutionmulticastbindaddress", "")
+    try:
+        bind_ip = ipaddress.ip_address(bind_address)
+        if bind_ip.version == 4 and not bind_ip.is_unspecified:
+            settings["multicast_bind_address"] = bind_address
+    except ValueError:
+        pass
+
+    group_endpoint = values.get("remoteexecutionmulticastgroupendpoint", "")
+    group_match = re.fullmatch(r"([^:\s]+):(\d{1,5})", group_endpoint)
+    if group_match and 0 < int(group_match.group(2)) <= 65535:
+        settings["multicast_group_endpoint"] = group_endpoint
+
+    ttl_text = values.get("remoteexecutionmulticastttl", "")
+    try:
+        ttl = int(ttl_text)
+    except ValueError:
+        ttl = None
+    if ttl is not None and 0 <= ttl <= 255:
+        settings["multicast_ttl"] = ttl
+    return settings
+
+
 def _atomic_write_json(path, data):
     """Serialize JSON without exposing a partially-written state/config file."""
     target = Path(path)
@@ -155,6 +222,11 @@ def atomic_write_bytes(path, payload):
     )
     with _JSON_WRITE_LOCK:
         try:
+            try:
+                if target.read_bytes() == payload:
+                    return
+            except OSError:
+                pass
             temp.write_bytes(payload)
             os.replace(temp, target)
         finally:

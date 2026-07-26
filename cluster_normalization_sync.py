@@ -418,13 +418,23 @@ def resolve_normalization_recipe(
         )
 
     receipt = normalization_receipt_path(blend)
+    bwr_semantic_identity = {
+        "status": str(_report.get("status") or ""),
+        "source_spm_sha256": source_hash,
+        "merged_name": merged_name,
+        "handoff_preflight_status": str(
+            (_report.get("handoff_preflight") or {}).get("status") or ""
+        ),
+    }
     normalization_contract = {
-        "version": 2,
+        "version": 3,
         "blend": str(blend),
         "canonical_spm": str(canonical),
         "source_spm_sha256": source_hash,
         "bwr_report": str(report_path),
-        "bwr_report_sha256": _sha256_file(report_path),
+        "bwr_semantic_sha256": _canonical_sha256(
+            bwr_semantic_identity
+        ),
         "source_object": merged_name,
         "source_xml": str(source_xml),
         "source_xml_sha256": _sha256_file(source_xml),

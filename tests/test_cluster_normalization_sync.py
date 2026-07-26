@@ -261,6 +261,39 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
 
             self.assertFalse(current["normalization_required"])
 
+    def test_report_diagnostic_metadata_does_not_rebuild_normalization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            first = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            report_path = Path(first["bwr_report"])
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["artifact_validation"] = [{
+                "status": "content_exact_metadata_drift",
+                "metadata_drift": ["mtime_ns"],
+                "observed_mtime_ns": 123456,
+            }]
+            report_path.write_text(
+                json.dumps(report),
+                encoding="utf-8",
+            )
+
+            second = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            self.assertEqual(
+                second["normalization_contract_sha256"],
+                first["normalization_contract_sha256"],
+            )
+
     def test_adding_owner_target_does_not_rebuild_unchanged_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)

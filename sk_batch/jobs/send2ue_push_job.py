@@ -15,6 +15,7 @@ Steps:
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -105,6 +106,9 @@ def parse_args():
     parser.add_argument("--ue-timeout", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-min", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-max", type=float, default=900.0)
+    parser.add_argument("--rpc-multicast-bind-address")
+    parser.add_argument("--rpc-multicast-group-endpoint")
+    parser.add_argument("--rpc-multicast-ttl", type=int)
     parser.add_argument("--max-push-polygons", type=int, default=2_000_000)
     parser.add_argument("--max-push-bones", type=int, default=1_500)
     parser.add_argument("--require-green-signal", action="store_true")
@@ -120,6 +124,68 @@ def parse_args():
     parser.add_argument("--unreal-ingest")
     parser.add_argument("--send2ue-unreal-py")
     return parser.parse_args(argv)
+
+
+def configure_send2ue_rpc_preferences(args):
+    """Apply project-matched RPC settings to this factory-startup session."""
+    addon = bpy.context.preferences.addons.get("send2ue")
+    if addon is None:
+        raise RuntimeError("Send2UE preferences are unavailable after add-on setup")
+    preferences = addon.preferences
+    before = {
+        "command_endpoint": str(preferences.command_endpoint),
+        "multicast_group_endpoint": str(preferences.multicast_group_endpoint),
+        "multicast_ttl": int(preferences.multicast_ttl),
+    }
+
+    bind_address = str(args.rpc_multicast_bind_address or "").strip()
+    if bind_address:
+        bind_ip = ipaddress.ip_address(bind_address)
+        if bind_ip.version != 4 or bind_ip.is_unspecified:
+            raise RuntimeError(
+                f"invalid Send2UE RPC multicast bind address: {bind_address}"
+            )
+        _old_host, separator, port_text = str(
+            preferences.command_endpoint
+        ).rpartition(":")
+        if not separator or not port_text.isdigit():
+            raise RuntimeError(
+                "invalid Send2UE RPC command endpoint: "
+                + str(preferences.command_endpoint)
+            )
+        preferences.command_endpoint = f"{bind_address}:{int(port_text)}"
+
+    group_endpoint = str(args.rpc_multicast_group_endpoint or "").strip()
+    if group_endpoint:
+        group_match = re.fullmatch(r"([^:\s]+):(\d{1,5})", group_endpoint)
+        if (
+            not group_match
+            or not 0 < int(group_match.group(2)) <= 65535
+        ):
+            raise RuntimeError(
+                f"invalid Send2UE RPC multicast group endpoint: {group_endpoint}"
+            )
+        preferences.multicast_group_endpoint = group_endpoint
+
+    if args.rpc_multicast_ttl is not None:
+        if not 0 <= args.rpc_multicast_ttl <= 255:
+            raise RuntimeError(
+                f"invalid Send2UE RPC multicast TTL: {args.rpc_multicast_ttl}"
+            )
+        preferences.multicast_ttl = args.rpc_multicast_ttl
+
+    return {
+        "before": before,
+        "effective": {
+            "command_endpoint": str(preferences.command_endpoint),
+            "multicast_bind_address": str(
+                preferences.command_endpoint
+            ).rpartition(":")[0],
+            "multicast_group_endpoint": str(preferences.multicast_group_endpoint),
+            "multicast_ttl": int(preferences.multicast_ttl),
+        },
+        "session_only": True,
+    }
 
 
 def write_report(path, data):
@@ -422,6 +488,7 @@ def main():
         enable_required_addon(addon_utils, "speedtree_bone_weight_repair")
         enable_required_addon(addon_utils, "ue_unique_export_names_addon")
         enable_required_addon(addon_utils, "send2ue")
+        report["rpc_configuration"] = configure_send2ue_rpc_preferences(args)
 
         from speedtree_bone_weight_repair.core import (
             consolidate_speedtree_group_materials,

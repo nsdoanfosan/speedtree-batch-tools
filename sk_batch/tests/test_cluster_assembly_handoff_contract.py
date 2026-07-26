@@ -14,6 +14,7 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 
 from cluster_assembly_handoff_contract import (  # noqa: E402
+    _compare_artifact,
     assembly_source_fbx_from_contract,
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -122,6 +123,63 @@ def write_receipt(
 
 
 class ClusterAssemblyHandoffTests(unittest.TestCase):
+    def test_matching_content_hash_allows_mtime_only_drift(self):
+        expected = {
+            "path": r"D:\Trees\SK_Tree_elm_01.spm",
+            "exists": True,
+            "size": 377169,
+            "mtime_ns": 100,
+            "sha256": "same-content",
+        }
+        actual = {
+            **expected,
+            "mtime_ns": 200,
+        }
+
+        validation = _compare_artifact(expected, actual)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(
+            validation["status"],
+            "content_exact_metadata_drift",
+        )
+        self.assertEqual(validation["metadata_drift"], ["mtime_ns"])
+
+    def test_content_hash_mismatch_is_not_hidden_by_matching_metadata(self):
+        expected = {
+            "path": r"D:\Trees\SK_Tree_elm_01.spm",
+            "exists": True,
+            "size": 377169,
+            "mtime_ns": 100,
+            "sha256": "old-content",
+        }
+        actual = {
+            **expected,
+            "sha256": "new-content",
+        }
+
+        validation = _compare_artifact(expected, actual)
+
+        self.assertFalse(validation["ok"])
+        self.assertEqual(validation["status"], "sha256_mismatch")
+
+    def test_metadata_only_receipt_still_rejects_mtime_drift(self):
+        expected = {
+            "path": r"D:\Trees\SK_Tree_elm_01.spm",
+            "exists": True,
+            "size": 377169,
+            "mtime_ns": 100,
+        }
+        actual = {
+            **expected,
+            "mtime_ns": 200,
+        }
+
+        validation = _compare_artifact(expected, actual)
+
+        self.assertFalse(validation["ok"])
+        self.assertEqual(validation["status"], "mtime_ns_mismatch")
+
     def test_persisted_cluster_receipt_is_preferred_without_a_new_batch_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -477,6 +535,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             fbx.write_bytes(b"current fbx")
             stale = dict(file_fingerprint(fbx))
             stale["size"] += 1
+            stale["sha256"] = "stale-content"
             write_receipt(
                 receipt,
                 spm,
@@ -492,6 +551,57 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertIn(
                 "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
                 [row["code"] for row in handoff["issues"]],
+            )
+
+    def test_post_export_handoff_rejects_replaced_xml_and_stmat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "fbx" / "SK_Tree_elm_01.fbx"
+            xml = root / "xml" / "SK_Tree_elm_01.xml"
+            stmat = fbx.with_suffix(".stmat")
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            for path, content in (
+                (fbx, b"fbx"),
+                (xml, b"<old />"),
+                (stmat, b"<old-materials />"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            bundle = payload["items"][0]["cluster_assembly"]["handoff"][
+                "roles"
+            ][0]["targets"][0]["export_bundle"]
+            bundle["xml"] = file_fingerprint(xml)
+            bundle["stmat"] = file_fingerprint(stmat)
+            receipt.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            xml.write_bytes(b"<new-and-different />")
+            stmat.write_bytes(b"<new-and-different-materials />")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)],
+                fbx,
+                {"branch": "branch_elm_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+            validations = {
+                row["artifact"]: row
+                for row in handoff["artifact_validation"]
+            }
+
+            self.assertEqual(handoff["status"], "blocked")
+            self.assertEqual(validations["xml"]["status"], "sha256_mismatch")
+            self.assertEqual(
+                validations["stmat"]["status"],
+                "sha256_mismatch",
             )
 
     def test_inventory_excludes_objects_from_another_fbx(self):

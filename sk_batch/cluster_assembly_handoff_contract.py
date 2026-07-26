@@ -656,7 +656,37 @@ def _compare_artifact(expected, actual, *, allow_pending=False):
             "expected": expected,
             "actual": actual,
         }
-    for field in ("size", "mtime_ns", "sha256"):
+    expected_hash = expected.get("sha256")
+    if expected_hash is not None:
+        if expected_hash != actual.get("sha256"):
+            return {
+                "status": "sha256_mismatch",
+                "ok": False,
+                "expected": expected,
+                "actual": actual,
+            }
+        metadata_drift = [
+            field
+            for field in ("size", "mtime_ns")
+            if (
+                expected.get(field) is not None
+                and expected.get(field) != actual.get(field)
+            )
+        ]
+        result = {
+            "status": (
+                "content_exact_metadata_drift"
+                if metadata_drift
+                else "exact"
+            ),
+            "ok": bool(expected.get("exists") and actual.get("exists")),
+            "expected": expected,
+            "actual": actual,
+        }
+        if metadata_drift:
+            result["metadata_drift"] = metadata_drift
+        return result
+    for field in ("size", "mtime_ns"):
         value = expected.get(field)
         if value is not None and value != actual.get(field):
             return {
@@ -666,7 +696,7 @@ def _compare_artifact(expected, actual, *, allow_pending=False):
                 "actual": actual,
             }
     return {
-        "status": "exact" if expected.get("sha256") else "metadata_exact",
+        "status": "metadata_exact",
         "ok": bool(expected.get("exists") and actual.get("exists")),
         "expected": expected,
         "actual": actual,

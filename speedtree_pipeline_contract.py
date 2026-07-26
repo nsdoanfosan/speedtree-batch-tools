@@ -356,9 +356,35 @@ def source_identity(path, required=True):
     raise RuntimeError(f"SpeedTree source changed while hashing: {candidate}")
 
 
-def source_set_fingerprint(source):
+SOURCE_FINGERPRINT_POLICY = "canonical_path_sha256_size_v1"
+
+
+def _content_identity(value):
+    if isinstance(value, dict):
+        return {
+            key: _content_identity(item)
+            for key, item in sorted(value.items())
+            if key != "mtime_ns"
+        }
+    if isinstance(value, list):
+        return [_content_identity(item) for item in value]
+    return value
+
+
+def source_snapshot_fingerprint(source):
     encoded = json.dumps(
         source, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def source_set_fingerprint(source):
+    """Hash stable source content identity; mtime remains diagnostic only."""
+    encoded = json.dumps(
+        _content_identity(source),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -526,6 +552,8 @@ def build_preflight_envelope(
         "outcome": str(outcome),
         "source": source,
         "source_fingerprint": source_set_fingerprint(source),
+        "source_fingerprint_policy": SOURCE_FINGERPRINT_POLICY,
+        "source_snapshot_fingerprint": source_snapshot_fingerprint(source),
         "instance_profile": normalized_profile,
         "tree_user_data": profile,
         "material_intents": material_intents,
@@ -590,8 +618,29 @@ def validate_preflight_envelope(envelope, spm_path, require_ok=True):
         raise ValueError(
             "SpeedTree preflight STMAT source is stale or belongs to another model"
         )
-    if envelope.get("source_fingerprint") != source_set_fingerprint(source):
+    recorded_fingerprint = envelope.get("source_fingerprint")
+    fingerprint_policy = envelope.get("source_fingerprint_policy")
+    if fingerprint_policy not in (None, "", SOURCE_FINGERPRINT_POLICY):
+        raise ValueError(
+            "unsupported SpeedTree preflight source fingerprint policy: "
+            + str(fingerprint_policy)
+        )
+    current_content_fingerprint = source_set_fingerprint(source)
+    legacy_snapshot_fingerprint = source_snapshot_fingerprint(source)
+    if (
+        recorded_fingerprint != current_content_fingerprint
+        and not (
+            not fingerprint_policy
+            and recorded_fingerprint == legacy_snapshot_fingerprint
+        )
+    ):
         raise ValueError("SpeedTree preflight source fingerprint mismatch")
+    recorded_snapshot = envelope.get("source_snapshot_fingerprint")
+    if (
+        recorded_snapshot is not None
+        and recorded_snapshot != legacy_snapshot_fingerprint
+    ):
+        raise ValueError("SpeedTree preflight source snapshot fingerprint mismatch")
 
     api = shared_contract_api()
     api.validate_preflight_envelope(envelope, expected_mesh_name=spm.stem)
