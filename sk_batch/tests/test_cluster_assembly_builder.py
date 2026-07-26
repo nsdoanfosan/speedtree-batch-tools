@@ -27,6 +27,7 @@ from cluster_assembly_builder import (  # noqa: E402
     make_skeleton_snapshot,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
+    _attachment_vertex_correspondence,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
     _component_groups,
@@ -139,6 +140,54 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_attachment_pivot_uv_must_exist_in_both_render_components(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+        self.assertEqual(
+            _attachment_vertex_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                [0.0, 0.0],
+            ),
+            (0, 0),
+        )
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "pivot UV is absent",
+        ):
+            _attachment_vertex_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                [0.25, 0.25],
+            )
+
+    def test_attachment_pivot_uv_rejects_split_vertices_at_different_positions(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(True)
+        target.vertices[4].co = (0.25, 0.0, 0.0)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = {
+            "vertices": list(range(len(target.vertices))),
+            "polygons": [0, 1],
+        }
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "multiple geometric positions",
+        ):
+            _attachment_vertex_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                [0.0, 0.0],
+            )
 
 
 def skeleton_snapshot():
@@ -292,6 +341,9 @@ def physical_production_manifest():
                     "prototype_index": ordinal,
                     "skeletal_asset": asset,
                     "normalized_bounds": {
+                        "minimum": [-0.03, -0.01, -0.005],
+                        "maximum": [0.05, 0.08, 0.02],
+                        "center": [0.01, 0.035, 0.0075],
                         "size": [0.08, 0.09, 0.025],
                     },
                 }
@@ -310,6 +362,14 @@ def physical_production_manifest():
                         "direct_uv_source": (
                             "same_blender_physical_capture_projection"
                         ),
+                        "attachment_vertex_index": ordinal + 10,
+                        "attachment_vertex_uv": [
+                            0.1 * ordinal,
+                            0.2 * ordinal,
+                        ],
+                        "capture_attachment": {
+                            "normalized_local": [0.0, 0.0, 0.0],
+                        },
                     },
                 }
                 for ordinal, asset in enumerate(assets, 1)
@@ -330,8 +390,12 @@ def physical_production_manifest():
                 "bindings": [{
                     "instance": 0,
                     "transform": {
-                        "fit_mode": "uniform_similarity_3d",
+                        "fit_mode": (
+                            "uniform_similarity_3d_attachment_locked"
+                        ),
                         "scale": [1.25, 1.25, 1.25],
+                        "attachment_pivot_error": 0.0,
+                        "similarity_relative_rms": 0.01,
                     },
                 }],
             })
@@ -341,6 +405,11 @@ def physical_production_manifest():
                 "card_name": f"{role}_sample_01_{ordinal:02d}",
                 "skeletal_asset_name": asset,
                 "pivot_contract": "normalized_attachment_origin_0_0_0",
+                "attachment_vertex_index": ordinal + 10,
+                "attachment_vertex_uv": [
+                    0.1 * ordinal,
+                    0.2 * ordinal,
+                ],
                 "instanced": True,
             })
     return {
@@ -379,6 +448,50 @@ def physical_production_manifest():
             ],
         },
     }
+
+
+def fake_unreal_mesh_from_blender_bounds(
+    bounds,
+    offset_cm=(0.0, 0.0, 0.0),
+    extent_scale=1.0,
+):
+    minimum = bounds["minimum"]
+    maximum = bounds["maximum"]
+    unreal_minimum = [
+        minimum[0] * 100.0,
+        -maximum[1] * 100.0,
+        minimum[2] * 100.0,
+    ]
+    unreal_maximum = [
+        maximum[0] * 100.0,
+        -minimum[1] * 100.0,
+        maximum[2] * 100.0,
+    ]
+    origin = [
+        0.5 * (unreal_minimum[index] + unreal_maximum[index])
+        + offset_cm[index]
+        for index in range(3)
+    ]
+    extent = [
+        0.5
+        * (unreal_maximum[index] - unreal_minimum[index])
+        * extent_scale
+        for index in range(3)
+    ]
+    return SimpleNamespace(
+        get_bounds=lambda: SimpleNamespace(
+            origin=SimpleNamespace(
+                x=origin[0],
+                y=origin[1],
+                z=origin[2],
+            ),
+            box_extent=SimpleNamespace(
+                x=extent[0],
+                y=extent[1],
+                z=extent[2],
+            ),
+        )
+    )
 
 
 class ContentDecisionTests(unittest.TestCase):
@@ -455,6 +568,36 @@ class PhysicalProductionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
             "invalid or duplicated",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
+    def test_centroid_fit_manifest_without_locked_pivot_is_rejected(self):
+        manifest = physical_production_manifest()
+        transform = manifest["parts"][0]["bindings"][0]["transform"]
+        transform["fit_mode"] = "uniform_similarity_3d"
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "uniform-similarity transforms",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
+    def test_nonfinite_or_missing_similarity_metrics_are_rejected(self):
+        manifest = physical_production_manifest()
+        transform = manifest["parts"][0]["bindings"][0]["transform"]
+        transform["similarity_relative_rms"] = float("nan")
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "similarity residual is invalid",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
+        manifest = physical_production_manifest()
+        del manifest["parts"][0]["bindings"][0]["transform"][
+            "attachment_pivot_error"
+        ]
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "uniform-similarity transforms",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -652,60 +795,161 @@ class PhysicalProductionContractTests(unittest.TestCase):
         for row in manifest["normalized_variant_receipts"]:
             for prototype in row["receipt"]["prototypes"]:
                 receipt_bounds[prototype["skeletal_asset"]] = (
-                    prototype["normalized_bounds"]["size"]
+                    prototype["normalized_bounds"]
                 )
-
-        def fake_mesh(size_m):
-            return SimpleNamespace(
-                get_bounds=lambda: SimpleNamespace(
-                    origin=SimpleNamespace(x=0.0, y=0.0, z=0.0),
-                    box_extent=SimpleNamespace(
-                        x=size_m[0] * 50.0,
-                        y=size_m[1] * 50.0,
-                        z=size_m[2] * 50.0,
-                    ),
-                )
-            )
 
         part_assets = {
-            part["prototype_id"]: fake_mesh(receipt_bounds[part["asset_name"]])
+            part["prototype_id"]: fake_unreal_mesh_from_blender_bounds(
+                receipt_bounds[part["asset_name"]]
+            )
             for part in manifest["parts"]
         }
-        report = validate_unreal_normalized_prototype_bounds(
-            manifest,
-            part_assets,
-        )
+        with mock.patch(
+            "cluster_assembly_builder._unreal_bone_names",
+            return_value=["part_root"],
+        ):
+            report = validate_unreal_normalized_prototype_bounds(
+                SimpleNamespace(),
+                manifest,
+                part_assets,
+            )
         self.assertEqual(report["status"], "verified")
         self.assertTrue(report["physical_production_contract"])
         self.assertEqual(report["prototype_count"], len(manifest["parts"]))
+        first = report["parts"][0]
+        self.assertEqual(first["bone_names"], ["part_root"])
+        self.assertEqual(first["expected_minimum_cm"], [-3.0, -8.0, -0.5])
+        self.assertEqual(first["expected_maximum_cm"], [5.0, 1.0, 2.0])
+        self.assertEqual(
+            [round(value, 6) for value in first["expected_origin_cm"]],
+            [1.0, -3.5, 0.75],
+        )
+        self.assertTrue(first["frame_verified"])
 
     def test_live_prototype_bounds_preflight_rejects_stale_asset(self):
         manifest = physical_production_manifest()
         manifest["coordinate_contract"] = {
             "centimeters_per_blender_unit": 100.0,
         }
+        receipt_bounds = {
+            prototype["skeletal_asset"]: prototype["normalized_bounds"]
+            for row in manifest["normalized_variant_receipts"]
+            for prototype in row["receipt"]["prototypes"]
+        }
         part_assets = {}
         for part in manifest["parts"]:
-            size_m = [0.08, 0.09, 0.025]
             multiplier = 66.0 if not part_assets else 1.0
-            part_assets[part["prototype_id"]] = SimpleNamespace(
-                get_bounds=lambda size=size_m, scale=multiplier: SimpleNamespace(
-                    origin=SimpleNamespace(x=0.0, y=0.0, z=0.0),
-                    box_extent=SimpleNamespace(
-                        x=size[0] * 50.0 * scale,
-                        y=size[1] * 50.0 * scale,
-                        z=size[2] * 50.0 * scale,
-                    ),
+            part_assets[part["prototype_id"]] = (
+                fake_unreal_mesh_from_blender_bounds(
+                    receipt_bounds[part["asset_name"]],
+                    extent_scale=multiplier,
                 )
             )
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
             "regular Blender Send to Unreal",
         ):
-            validate_unreal_normalized_prototype_bounds(
+            with mock.patch(
+                "cluster_assembly_builder._unreal_bone_names",
+                return_value=["part_root"],
+            ):
+                validate_unreal_normalized_prototype_bounds(
+                    SimpleNamespace(),
+                    manifest,
+                    part_assets,
+                )
+
+    def test_live_prototype_bounds_preflight_rejects_shifted_origin(self):
+        manifest = physical_production_manifest()
+        manifest["coordinate_contract"] = {
+            "centimeters_per_blender_unit": 100.0,
+        }
+        receipt_bounds = {
+            prototype["skeletal_asset"]: prototype["normalized_bounds"]
+            for row in manifest["normalized_variant_receipts"]
+            for prototype in row["receipt"]["prototypes"]
+        }
+        part_assets = {
+            part["prototype_id"]: fake_unreal_mesh_from_blender_bounds(
+                receipt_bounds[part["asset_name"]],
+                offset_cm=(10.0, 0.0, 0.0) if not index else (0.0, 0.0, 0.0),
+            )
+            for index, part in enumerate(manifest["parts"])
+        }
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "mesh-local bounds frame drifted",
+        ):
+            with mock.patch(
+                "cluster_assembly_builder._unreal_bone_names",
+                return_value=["part_root"],
+            ):
+                validate_unreal_normalized_prototype_bounds(
+                    SimpleNamespace(),
+                    manifest,
+                    part_assets,
+                )
+
+    def test_live_prototype_preflight_requires_only_part_root(self):
+        manifest = physical_production_manifest()
+        manifest["coordinate_contract"] = {
+            "centimeters_per_blender_unit": 100.0,
+        }
+        receipt_bounds = {
+            prototype["skeletal_asset"]: prototype["normalized_bounds"]
+            for row in manifest["normalized_variant_receipts"]
+            for prototype in row["receipt"]["prototypes"]
+        }
+        part_assets = {
+            part["prototype_id"]: fake_unreal_mesh_from_blender_bounds(
+                receipt_bounds[part["asset_name"]]
+            )
+            for part in manifest["parts"]
+        }
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "exactly one part_root deform bone",
+        ):
+            with mock.patch(
+                "cluster_assembly_builder._unreal_bone_names",
+                return_value=["Root", "Other", "part_root"],
+            ):
+                validate_unreal_normalized_prototype_bounds(
+                    SimpleNamespace(),
+                    manifest,
+                    part_assets,
+                )
+
+    def test_live_prototype_preflight_accepts_one_importer_carrier_root(self):
+        manifest = physical_production_manifest()
+        manifest["coordinate_contract"] = {
+            "centimeters_per_blender_unit": 100.0,
+        }
+        receipt_bounds = {
+            prototype["skeletal_asset"]: prototype["normalized_bounds"]
+            for row in manifest["normalized_variant_receipts"]
+            for prototype in row["receipt"]["prototypes"]
+        }
+        part_assets = {
+            part["prototype_id"]: fake_unreal_mesh_from_blender_bounds(
+                receipt_bounds[part["asset_name"]]
+            )
+            for part in manifest["parts"]
+        }
+        with mock.patch(
+            "cluster_assembly_builder._unreal_bone_names",
+            return_value=["ImportedArmature", "part_root"],
+        ):
+            report = validate_unreal_normalized_prototype_bounds(
+                SimpleNamespace(),
                 manifest,
                 part_assets,
             )
+        self.assertEqual(report["status"], "verified")
+        self.assertEqual(
+            report["parts"][0]["bone_names"],
+            ["ImportedArmature", "part_root"],
+        )
 
 
 class FinalSkeletonHierarchyTests(unittest.TestCase):
@@ -1316,6 +1560,40 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
         self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
         self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
+
+    def test_uniform_similarity_fit_locks_authored_root_on_deformed_plan(self):
+        source = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+        target = [
+            [5.0, -2.0, 7.0],
+            [7.0, -2.0, 7.0],
+            [7.0, 1.0, 7.5],
+            [5.0, 1.0, 7.0],
+        ]
+        transform = fit_uniform_similarity_transform(
+            source,
+            target,
+            source_attachment=source[0],
+            target_attachment=target[0],
+        )
+        self.assertEqual(
+            transform["fit_mode"],
+            "uniform_similarity_3d_attachment_locked",
+        )
+        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
+        self.assertEqual(transform["translation"], target[0])
+        self.assertEqual(
+            transform["trs_relative_rms"],
+            transform["similarity_relative_rms"],
+        )
+        self.assertLess(
+            transform["affine_relative_rms"],
+            transform["similarity_relative_rms"],
+        )
 
     def test_trs_fit_recovers_translation_rotation_and_scale(self):
         source = [

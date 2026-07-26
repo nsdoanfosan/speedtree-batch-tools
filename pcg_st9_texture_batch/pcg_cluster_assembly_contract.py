@@ -850,8 +850,69 @@ def _normalized_composite_parts(row, source_partition_mode):
     return checked
 
 
+def _physical_variant_attachment_contract(receipt_variant, label):
+    """Keep the authored plan pivot needed by downstream rigid placement."""
+    transfer = (receipt_variant or {}).get("plan_uv_transfer") or {}
+    try:
+        vertex_index = int(transfer.get("attachment_vertex_index"))
+        vertex_uv = [
+            float(value)
+            for value in transfer.get("attachment_vertex_uv")
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyReceiptError(
+            f"{label} physical variant attachment metadata is invalid"
+        ) from exc
+    if (
+        vertex_index < 0
+        or len(vertex_uv) != 2
+        or any(not math.isfinite(value) for value in vertex_uv)
+    ):
+        raise ClusterAssemblyReceiptError(
+            f"{label} physical variant attachment metadata is invalid"
+        )
+    normalized_local = (
+        (transfer.get("capture_attachment") or {}).get("normalized_local")
+    )
+    try:
+        normalized_local_is_origin = (
+            isinstance(normalized_local, (list, tuple))
+            and len(normalized_local) == 3
+            and max(abs(float(value)) for value in normalized_local)
+            <= 1.0e-8
+        )
+    except (TypeError, ValueError):
+        normalized_local_is_origin = False
+    if not normalized_local_is_origin:
+        raise ClusterAssemblyReceiptError(
+            f"{label} physical variant attachment is not normalized to the origin"
+        )
+    return {
+        # The index proves which authored plan vertex supplied this record.
+        # FBX may reorder vertices, so downstream correspondence uses the UV.
+        "attachment_vertex_index": vertex_index,
+        "attachment_vertex_uv": vertex_uv,
+    }
+
+
 def _normalized_variant_contract(manifest_path, payload, group):
     physical = _physical_normalization_receipt(payload)
+    receipt_variants = {}
+    if physical is not None:
+        for row in physical["receipt"].get("variants") or []:
+            key = (
+                str(row.get("plan") or ""),
+                str(
+                    row.get("skeletal_asset")
+                    or row.get("prototype_asset")
+                    or ""
+                ),
+            )
+            if not all(key) or key in receipt_variants:
+                raise ClusterAssemblyReceiptError(
+                    "Atlas physical receipt variants are missing or duplicated"
+                )
+            receipt_variants[key] = row
     mesh_ids = [int(value) for value in group.get("mesh_ids") or []]
     mesh_rows = list(group.get("meshes") or [])
     if len(mesh_ids) != len(mesh_rows) or not mesh_rows:
@@ -968,6 +1029,21 @@ def _normalized_variant_contract(manifest_path, payload, group):
                 or "normalized_attachment_origin_0_0_0"
             ),
         }
+        if physical is not None:
+            receipt_variant = receipt_variants.get(
+                (plan_name, skeletal_asset_name)
+            )
+            if receipt_variant is None:
+                raise ClusterAssemblyReceiptError(
+                    "Atlas physical receipt has no matching exported plan/SK pair: "
+                    + plan_name
+                )
+            variant.update(
+                _physical_variant_attachment_contract(
+                    receipt_variant,
+                    f"Atlas physical variant {plan_name}",
+                )
+            )
         if normalized_bounds is not None:
             variant["normalized_bounds"] = normalized_bounds
         if physical is not None:
@@ -986,22 +1062,12 @@ def _normalized_variant_contract(manifest_path, payload, group):
             + str(actual_ordinals)
         )
     if physical is not None:
-        receipt_variants = {
-            (
-                str(row.get("plan") or ""),
-                str(
-                    row.get("skeletal_asset")
-                    or row.get("prototype_asset")
-                    or ""
-                ),
-            )
-            for row in physical["receipt"].get("variants") or []
-        }
+        receipt_variant_pairs = set(receipt_variants)
         exported_variants = {
             (row["plan_name"], row["skeletal_asset_name"])
             for row in variants
         }
-        if receipt_variants != exported_variants:
+        if receipt_variant_pairs != exported_variants:
             raise ClusterAssemblyReceiptError(
                 "Atlas physical receipt variants do not match exported plan/SK pairs"
             )
@@ -1116,6 +1182,12 @@ def _atlas_normalized_variants(
                             "source_partition_mode"
                         ],
                         "plan_fbx": row["plan_fbx"].get("sha256"),
+                        "attachment_vertex_index": row.get(
+                            "attachment_vertex_index"
+                        ),
+                        "attachment_vertex_uv": row.get(
+                            "attachment_vertex_uv"
+                        ),
                     }
                     for row in contract["variants"]
                 ],

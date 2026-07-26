@@ -607,6 +607,13 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "card_index": 1,
                     "skeletal_asset": "SK_branch_elm_01_01",
                     "plan": "branch_elm_01_01",
+                    "plan_uv_transfer": {
+                        "attachment_vertex_index": 7,
+                        "attachment_vertex_uv": [0.25, 0.75],
+                        "capture_attachment": {
+                            "normalized_local": [0.0, 0.0, 0.0],
+                        },
+                    },
                 }],
             }
             payload = {
@@ -660,6 +667,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [0.08, 0.09, 0.02],
             )
             self.assertEqual(
+                contract["variants"][0]["attachment_vertex_index"],
+                7,
+            )
+            self.assertEqual(
+                contract["variants"][0]["attachment_vertex_uv"],
+                [0.25, 0.75],
+            )
+            self.assertEqual(
                 contract["production_normalization"],
                 receipt,
             )
@@ -678,6 +693,27 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 ClusterAssemblyReceiptError,
                 "bounds disagree",
+            ):
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+
+            payload["material_groups"][0]["meshes"][0][
+                "normalized_bounds"
+            ]["size"][0] = 0.08
+            del receipt["variants"][0]["plan_uv_transfer"][
+                "attachment_vertex_uv"
+            ]
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptError,
+                "attachment metadata",
             ):
                 _atlas_normalized_variants(
                     folder,
@@ -741,6 +777,118 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [row["plan_name"] for row in contract["variants"]],
                 ["branch_elm_01_01"],
             )
+
+    def test_same_plan_with_diverging_pivot_metadata_reports_multiple_receipts(self):
+        pivot_cases = (
+            ("attachment index", (8, [0.25, 0.75])),
+            ("attachment UV", (7, [0.5, 0.75])),
+        )
+        for label, changed_pivot in pivot_cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    folder = Path(temp_dir) / "Tree_elm"
+                    blend = folder / "SK_branch_elm_01.blend"
+                    plan_fbx = folder / "branch_elm_01_01.fbx"
+                    folder.mkdir(parents=True)
+                    blend.write_bytes(b"blend")
+                    plan_fbx.write_bytes(b"plan")
+                    scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+                    scope_dir.mkdir()
+                    bounds = {
+                        "minimum": [-0.04, -0.045, -0.01],
+                        "maximum": [0.04, 0.045, 0.01],
+                        "size": [0.08, 0.09, 0.02],
+                        "center": [0.0, 0.0, 0.0],
+                    }
+                    capture_hash = "physical-capture-hash"
+                    targets = []
+                    for index, (vertex_index, vertex_uv) in enumerate(
+                        ((7, [0.25, 0.75]), changed_pivot),
+                        start=1,
+                    ):
+                        target = folder / f"SK_Tree_elm_0{index}.spm"
+                        write_spm(
+                            target,
+                            [("2", "branch_elm_01", [], ("10",))],
+                            mesh_ids=("10",),
+                        )
+                        targets.append(target)
+                        receipt = {
+                            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                            "physical_capture_contract": {
+                                "kind": "speedtree_cluster_physical_capture_fit",
+                                "contract_sha256": capture_hash,
+                            },
+                            "physical_capture_contract_sha256": capture_hash,
+                            "prototypes": [{
+                                "prototype_index": 1,
+                                "skeletal_asset": "SK_branch_elm_01_01",
+                                "normalized_bounds": bounds,
+                            }],
+                            "variants": [{
+                                "card_index": 1,
+                                "skeletal_asset": "SK_branch_elm_01_01",
+                                "plan": "branch_elm_01_01",
+                                "plan_uv_transfer": {
+                                    "attachment_vertex_index": vertex_index,
+                                    "attachment_vertex_uv": vertex_uv,
+                                    "capture_attachment": {
+                                        "normalized_local": [0.0, 0.0, 0.0],
+                                    },
+                                },
+                            }],
+                        }
+                        payload = {
+                            "spm": str(target),
+                            "blend_file": str(blend),
+                            "unit_probe_contract": {
+                                "kind": "speedtree_fbx_spm_unit_probe",
+                                "status": "verified",
+                            },
+                            "normalized_prototype_receipt": receipt,
+                            "material_groups": [{
+                                "material": "branch_elm_01",
+                                "material_id": 2,
+                                "mesh_ids": [10],
+                                "meshes": [{
+                                    "source_object": "branch_elm_01_01",
+                                    "source_ordinal": 1,
+                                    "fbx": str(plan_fbx),
+                                    "skeletal_asset_name": (
+                                        "SK_branch_elm_01_01"
+                                    ),
+                                    "source_prototype_index": 1,
+                                    "source_partition_mode": (
+                                        "PER_CONNECTED_DEFORM_CLUSTER"
+                                    ),
+                                    "normalization_workflow_mode": (
+                                        "PHYSICAL_DIRECT_CAPTURE"
+                                    ),
+                                    "physical_capture_contract_sha256": (
+                                        capture_hash
+                                    ),
+                                    "normalized_bounds": bounds,
+                                }],
+                            }],
+                        }
+                        (
+                            scope_dir
+                            / f"scope_branch__{target.stem}.json"
+                        ).write_text(
+                            json.dumps(payload),
+                            encoding="utf-8",
+                        )
+
+                    with self.assertRaisesRegex(
+                        ClusterAssemblyReceiptError,
+                        "multiple current receipts",
+                    ):
+                        _atlas_normalized_variants(
+                            folder,
+                            "branch_elm_01",
+                            targets,
+                            audit=audit_module,
+                        )
 
     def test_diverging_plan_delivery_still_reports_multiple_receipts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

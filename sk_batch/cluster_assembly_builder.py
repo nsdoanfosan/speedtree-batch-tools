@@ -918,8 +918,14 @@ def validate_normalized_prototype_unit_contract(manifest):
             transform = binding.get("transform") or {}
             fit_mode = str(transform.get("fit_mode") or "")
             scale = transform.get("scale")
+            similarity_relative_rms = transform.get(
+                "similarity_relative_rms"
+            )
             if (
                 not fit_mode.startswith("uniform_similarity_3d")
+                or "attachment_locked" not in fit_mode
+                or transform.get("attachment_pivot_error") is None
+                or similarity_relative_rms is None
                 or not isinstance(scale, (list, tuple))
                 or len(scale) != 3
                 or max(float(value) for value in scale)
@@ -928,6 +934,30 @@ def validate_normalized_prototype_unit_contract(manifest):
             ):
                 raise ClusterAssemblyBuildError(
                     "normalized prototype instances require uniform-similarity transforms"
+                )
+            try:
+                pivot_error = float(
+                    transform.get("attachment_pivot_error")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ClusterAssemblyBuildError(
+                    "normalized prototype instance has no attachment-locked pivot"
+                ) from exc
+            if not math.isfinite(pivot_error) or pivot_error > 1.0e-8:
+                raise ClusterAssemblyBuildError(
+                    "normalized prototype instance attachment pivot drifted"
+                )
+            try:
+                similarity_relative_rms = float(
+                    similarity_relative_rms
+                )
+            except (TypeError, ValueError) as exc:
+                raise ClusterAssemblyBuildError(
+                    "normalized prototype instance similarity residual is invalid"
+                ) from exc
+            if not math.isfinite(similarity_relative_rms):
+                raise ClusterAssemblyBuildError(
+                    "normalized prototype instance similarity residual is invalid"
                 )
         prototype_rows[key] = part
         prototype_ids.add(prototype_id)
@@ -955,6 +985,26 @@ def validate_normalized_prototype_unit_contract(manifest):
         if str(variant.get("pivot_contract") or "") != _NORMALIZED_PIVOT_CONTRACT:
             raise ClusterAssemblyBuildError(
                 f"registered normalized variant pivot contract is invalid: {key}"
+            )
+        try:
+            attachment_index = int(
+                variant.get("attachment_vertex_index")
+            )
+            attachment_uv = [
+                float(value)
+                for value in variant.get("attachment_vertex_uv")
+            ]
+        except (TypeError, ValueError) as exc:
+            raise ClusterAssemblyBuildError(
+                f"registered normalized variant attachment is invalid: {key}"
+            ) from exc
+        if (
+            attachment_index < 0
+            or len(attachment_uv) != 2
+            or any(not math.isfinite(value) for value in attachment_uv)
+        ):
+            raise ClusterAssemblyBuildError(
+                f"registered normalized variant attachment is invalid: {key}"
             )
         variant_rows[key] = variant
         if instanced:
@@ -1088,6 +1138,17 @@ def validate_normalized_prototype_unit_contract(manifest):
                 ordinal = 0
             key = (role, ordinal)
             transfer = receipt_variant.get("plan_uv_transfer") or {}
+            try:
+                attachment_index = int(
+                    transfer.get("attachment_vertex_index")
+                )
+                attachment_uv = [
+                    float(value)
+                    for value in transfer.get("attachment_vertex_uv")
+                ]
+            except (TypeError, ValueError):
+                attachment_index = -1
+                attachment_uv = []
             if (
                 key in receipt_variant_rows
                 or receipt_variant.get("object_transforms_identity") is not True
@@ -1096,6 +1157,9 @@ def validate_normalized_prototype_unit_contract(manifest):
                 != "direct_physical_capture_projection"
                 or transfer.get("direct_uv_source")
                 != _DIRECT_CAPTURE_UV_SOURCE
+                or attachment_index < 0
+                or len(attachment_uv) != 2
+                or any(not math.isfinite(value) for value in attachment_uv)
             ):
                 raise ClusterAssemblyBuildError(
                     f"{role} normalized variant direct-capture evidence is invalid"
@@ -1117,6 +1181,22 @@ def validate_normalized_prototype_unit_contract(manifest):
             != str(registered.get("skeletal_asset_name") or "")
             or str(receipt_variant.get("plan") or "")
             != str(registered.get("card_name") or "")
+            or int(
+                (receipt_variant.get("plan_uv_transfer") or {}).get(
+                    "attachment_vertex_index"
+                )
+            )
+            != int(registered.get("attachment_vertex_index"))
+            or [
+                float(value)
+                for value in (
+                    receipt_variant.get("plan_uv_transfer") or {}
+                ).get("attachment_vertex_uv")
+            ]
+            != [
+                float(value)
+                for value in registered.get("attachment_vertex_uv")
+            ]
         ):
             raise ClusterAssemblyBuildError(
                 "registered variant identity differs from normalization receipt"
@@ -1748,14 +1828,21 @@ def fit_trs_transform(source_points, target_points):
     }
 
 
-def fit_uniform_similarity_transform(source_points, target_points):
+def fit_uniform_similarity_transform(
+    source_points,
+    target_points,
+    source_attachment=None,
+    target_attachment=None,
+):
     """Fit a stable 3D rigid rotation plus uniform scale for planar cards.
 
     A full affine/TRS decomposition is underdetermined when every source point
     lies on a plane.  Normalized SpeedTree plans are intentionally planar, so
     use orthogonal Procrustes/Kabsch fitting and one uniform scale.  This keeps
     the normalized attachment origin meaningful instead of inventing enormous
-    scale on the plane normal.
+    scale on the plane normal.  When both attachment points are supplied, fit
+    root-relative vectors and constrain translation to map that authored pivot
+    exactly instead of allowing deformation residuals to move the stem root.
     """
     try:
         import numpy as np
@@ -1773,10 +1860,28 @@ def fit_uniform_similarity_transform(source_points, target_points):
         raise ClusterAssemblyBuildError(
             "similarity fit needs at least three vertices"
         )
-    source_center = np.mean(source, axis=0)
-    target_center = np.mean(target, axis=0)
-    source_centered = source - source_center
-    target_centered = target - target_center
+    if (source_attachment is None) != (target_attachment is None):
+        raise ClusterAssemblyBuildError(
+            "similarity fit requires both source and target attachments"
+        )
+    attachment_locked = source_attachment is not None
+    if attachment_locked:
+        source_origin = np.asarray(source_attachment, dtype=np.float64)
+        target_origin = np.asarray(target_attachment, dtype=np.float64)
+        if (
+            source_origin.shape != (3,)
+            or target_origin.shape != (3,)
+            or not np.all(np.isfinite(source_origin))
+            or not np.all(np.isfinite(target_origin))
+        ):
+            raise ClusterAssemblyBuildError(
+                "similarity fit attachment points must both be finite 3D vectors"
+            )
+    else:
+        source_origin = np.mean(source, axis=0)
+        target_origin = np.mean(target, axis=0)
+    source_centered = source - source_origin
+    target_centered = target - target_origin
     source_energy = float(np.sum(source_centered * source_centered))
     if source_energy <= 1.0e-18:
         raise ClusterAssemblyBuildError(
@@ -1795,7 +1900,7 @@ def fit_uniform_similarity_transform(source_points, target_points):
             "similarity fit produced an invalid uniform scale"
         )
     linear = scale_value * rotation_rows
-    translation = target_center - source_center @ linear
+    translation = target_origin - source_origin @ linear
     prediction = source @ linear + translation
     diagonal = max(
         float(np.linalg.norm(np.max(target, axis=0) - np.min(target, axis=0))),
@@ -1804,16 +1909,63 @@ def fit_uniform_similarity_transform(source_points, target_points):
     rms = float(
         np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1)))
     )
+    augmented = np.concatenate(
+        [source, np.ones((source.shape[0], 1), dtype=np.float64)],
+        axis=1,
+    )
+    coefficients, _, _, _ = np.linalg.lstsq(
+        augmented,
+        target,
+        rcond=None,
+    )
+    affine = coefficients[:3, :]
+    affine_translation = coefficients[3, :]
+    affine_prediction = source @ affine + affine_translation
+    affine_rms = float(
+        np.sqrt(
+            np.mean(
+                np.sum((target - affine_prediction) ** 2, axis=1)
+            )
+        )
+    )
+    pivot_error = None
+    if attachment_locked:
+        pivot_prediction = source_origin @ linear + translation
+        pivot_error = float(np.linalg.norm(target_origin - pivot_prediction))
     quaternion = _rotation_matrix_to_quaternion(rotation_rows.T.tolist())
-    return {
+    source_fit_rank = int(np.linalg.matrix_rank(source_centered))
+    affine_linear_delta = float(
+        np.linalg.norm(affine - linear)
+        / max(float(np.linalg.norm(affine)), 1.0e-9)
+    )
+    result = {
         "translation": [float(value) for value in translation],
         "rotation_xyzw": quaternion,
         "scale": [scale_value, scale_value, scale_value],
-        "affine_relative_rms": rms / diagonal,
+        "affine_relative_rms": affine_rms / diagonal,
+        "similarity_relative_rms": rms / diagonal,
         "trs_relative_rms": rms / diagonal,
-        "shear_relative_norm": 0.0,
-        "fit_mode": "uniform_similarity_3d",
+        # A planar source has no observable normal-axis affine component.
+        # Keep its predictive residual, but do not present the decomposed
+        # linear delta as a trustworthy shear measurement.
+        "shear_relative_norm": (
+            affine_linear_delta if source_fit_rank == 3 else None
+        ),
+        "affine_linear_delta_relative_norm": affine_linear_delta,
+        "affine_diagnostic_only": source_fit_rank < 3,
+        "source_fit_rank": source_fit_rank,
+        "fit_mode": (
+            "uniform_similarity_3d_attachment_locked"
+            if attachment_locked
+            else "uniform_similarity_3d"
+        ),
     }
+    if pivot_error is not None:
+        result["attachment_pivot_error"] = pivot_error
+        result["attachment_pivot_error_scope"] = (
+            "normalized_plan_attachment"
+        )
+    return result
 
 
 def compose_similarity_with_relative_matrix(transform, relative_matrix):
@@ -1907,11 +2059,20 @@ def compose_similarity_with_relative_matrix(transform, relative_matrix):
         "translation": [float(value) for value in composed[:3, 3]],
         "rotation_xyzw": quaternion,
         "scale": [float(value) for value in composed_scales],
-        "fit_mode": "uniform_similarity_3d_composite_subpart",
+        "fit_mode": (
+            "uniform_similarity_3d_attachment_locked_composite_subpart"
+            if "attachment_locked"
+            in str(transform.get("fit_mode") or "")
+            else "uniform_similarity_3d_composite_subpart"
+        ),
         "composite_relative_matrix": [
             [float(value) for value in row] for row in relative
         ],
     })
+    if result.get("attachment_pivot_error") is not None:
+        result["attachment_pivot_error_scope"] = (
+            "parent_card_attachment_before_composite"
+        )
     return result
 
 
@@ -2077,6 +2238,121 @@ def _component_uv_face_counter(mesh, component):
     return Counter(faces)
 
 
+def _uv_vertex_representatives(obj, component):
+    uv_layer = obj.data.uv_layers.active
+    if uv_layer is None:
+        return None
+    values = {}
+    for polygon_index in component["polygons"]:
+        polygon = obj.data.polygons[polygon_index]
+        for loop_index in polygon.loop_indices:
+            uv = uv_layer.data[loop_index].uv
+            key = (
+                round(float(uv.x), 6),
+                round(float(uv.y), 6),
+            )
+            values.setdefault(
+                key,
+                int(obj.data.loops[loop_index].vertex_index),
+            )
+    return values
+
+
+def _coincident_uv_vertex_index(obj, component, key):
+    uv_layer = obj.data.uv_layers.active
+    indices = set()
+    for polygon_index in component["polygons"]:
+        polygon = obj.data.polygons[polygon_index]
+        for loop_index in polygon.loop_indices:
+            uv = uv_layer.data[loop_index].uv
+            loop_key = (
+                round(float(uv.x), 6),
+                round(float(uv.y), 6),
+            )
+            if loop_key == key:
+                indices.add(
+                    int(obj.data.loops[loop_index].vertex_index)
+                )
+    if not indices:
+        return None
+    component_coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    spans = [
+        max(point[axis] for point in component_coordinates)
+        - min(point[axis] for point in component_coordinates)
+        for axis in range(3)
+    ]
+    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    ordered = sorted(indices)
+    reference = tuple(
+        float(value) for value in obj.data.vertices[ordered[0]].co
+    )
+    if any(
+        math.dist(
+            reference,
+            tuple(float(value) for value in obj.data.vertices[index].co),
+        )
+        > tolerance
+        for index in ordered[1:]
+    ):
+        raise ClusterAssemblyBuildError(
+            "attachment pivot UV maps to multiple geometric positions"
+        )
+    return ordered[0]
+
+
+def _attachment_vertex_correspondence(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+    attachment_uv,
+):
+    """Resolve the authored plan root by UV after any FBX vertex reordering."""
+    if (
+        not isinstance(attachment_uv, (list, tuple))
+        or len(attachment_uv) != 2
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    try:
+        key = tuple(round(float(value), 6) for value in attachment_uv)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        ) from exc
+    if any(not math.isfinite(value) for value in key):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    if (
+        source_obj.data.uv_layers.active is None
+        or target_obj.data.uv_layers.active is None
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment correspondence requires UV layers"
+        )
+    source_index = _coincident_uv_vertex_index(
+        source_obj,
+        source_component,
+        key,
+    )
+    target_index = _coincident_uv_vertex_index(
+        target_obj,
+        target_component,
+        key,
+    )
+    if source_index is None or target_index is None:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+    return source_index, target_index
+
+
 def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
     signature = _component_signature(target_mesh, target_component)
     exact = prototypes.get(signature)
@@ -2192,21 +2468,14 @@ def _ordered_cross_object_correspondence(
     source_uv = source_obj.data.uv_layers.active
     target_uv = target_obj.data.uv_layers.active
     if source_uv is not None and target_uv is not None:
-        def representatives(obj, component, uv_layer):
-            values = {}
-            for polygon_index in component["polygons"]:
-                polygon = obj.data.polygons[polygon_index]
-                for loop_index in polygon.loop_indices:
-                    uv = uv_layer.data[loop_index].uv
-                    key = (round(float(uv.x), 6), round(float(uv.y), 6))
-                    values.setdefault(
-                        key,
-                        int(obj.data.loops[loop_index].vertex_index),
-                    )
-            return values
-
-        source_by_uv = representatives(source_obj, source_component, source_uv)
-        target_by_uv = representatives(target_obj, target_component, target_uv)
+        source_by_uv = _uv_vertex_representatives(
+            source_obj,
+            source_component,
+        )
+        target_by_uv = _uv_vertex_representatives(
+            target_obj,
+            target_component,
+        )
         common = sorted(set(source_by_uv) & set(target_by_uv))
         if len(common) < 3 or len(common) != len(target_by_uv):
             raise ClusterAssemblyBuildError(
@@ -3113,6 +3382,21 @@ def build_blender_assembly_inputs(
                         raise ClusterAssemblyBuildError(
                             "normalized variant has no ordinal/skeletal asset name"
                         )
+                    try:
+                        attachment_vertex_index = int(
+                            variant.get("attachment_vertex_index")
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ClusterAssemblyBuildError(
+                            "normalized variant has no authored attachment vertex"
+                        ) from exc
+                    attachment_vertex_uv = variant.get(
+                        "attachment_vertex_uv"
+                    )
+                    if attachment_vertex_index < 0:
+                        raise ClusterAssemblyBuildError(
+                            "normalized variant has no authored attachment vertex"
+                        )
                     prototype_id = (
                         f"{role}_normalized_{ordinal:02d}_{signature}"
                     )
@@ -3134,16 +3418,65 @@ def build_blender_assembly_inputs(
                             final_merged_mesh,
                             target_indices,
                         )
+                        (
+                            source_attachment_index,
+                            target_attachment_index,
+                        ) = _attachment_vertex_correspondence(
+                            source_obj,
+                            source_component,
+                            final_merged_mesh,
+                            component,
+                            attachment_vertex_uv,
+                        )
+                        source_attachment = _world_points(
+                            source_obj,
+                            [source_attachment_index],
+                        )[0]
+                        target_attachment = _world_points(
+                            final_merged_mesh,
+                            [target_attachment_index],
+                        )[0]
+                        source_diagonal = max(
+                            math.dist(
+                                [
+                                    min(point[axis] for point in source_world)
+                                    for axis in range(3)
+                                ],
+                                [
+                                    max(point[axis] for point in source_world)
+                                    for axis in range(3)
+                                ],
+                            ),
+                            1.0e-9,
+                        )
+                        if (
+                            math.dist(source_attachment, (0.0, 0.0, 0.0))
+                            > max(source_diagonal * 1.0e-6, 1.0e-9)
+                        ):
+                            raise ClusterAssemblyBuildError(
+                                "normalized plan attachment pivot is not at "
+                                "the authored local origin"
+                            )
                         transform = fit_uniform_similarity_transform(
                             source_world,
                             target_world,
+                            source_attachment=source_attachment,
+                            target_attachment=target_attachment,
                         )
+                        transform["attachment_vertex_index"] = (
+                            attachment_vertex_index
+                        )
+                        transform["attachment_vertex_uv"] = [
+                            float(value)
+                            for value in attachment_vertex_uv
+                        ]
                         influences = _component_influences(
                             final_merged_mesh,
                             component,
                         )
                         binding = {
                             "instance": instance_index,
+                            "card_ordinal": ordinal,
                             "component_polygon_indices": component["polygons"],
                             "transform": transform,
                             "bone_influences": influences,
@@ -3427,6 +3760,13 @@ def build_blender_assembly_inputs(
                     "pivot_contract": str(
                         variant.get("pivot_contract") or ""
                     ),
+                    "attachment_vertex_index": int(
+                        variant.get("attachment_vertex_index")
+                    ),
+                    "attachment_vertex_uv": [
+                        float(value)
+                        for value in variant.get("attachment_vertex_uv")
+                    ],
                     "instanced": (role.casefold(), ordinal) in used_variant_keys,
                 })
         manifest = {
@@ -4388,13 +4728,108 @@ def _unreal_mesh_bounds_record(mesh):
     }
 
 
+def _expected_unreal_normalized_bounds_record(
+    expected,
+    centimeters_per_blender_unit,
+    label,
+    require_frame=False,
+):
+    """Convert authored Blender bounds to the imported Unreal mesh frame."""
+    expected_size_cm = [
+        component * centimeters_per_blender_unit
+        for component in expected["size"]
+    ]
+    frame_keys = ("minimum", "maximum", "center")
+    has_frame = all(expected.get(key) is not None for key in frame_keys)
+    if not has_frame:
+        if require_frame:
+            raise ClusterAssemblyBuildError(
+                f"{label} normalized bounds must include minimum/maximum/center"
+            )
+        return {
+            "size": expected_size_cm,
+            "frame_verified": False,
+        }
+
+    checked = {}
+    for key in frame_keys:
+        value = expected.get(key)
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ClusterAssemblyBuildError(
+                f"{label} normalized bounds {key} is invalid"
+            )
+        try:
+            checked[key] = [float(component) for component in value]
+        except (TypeError, ValueError) as exc:
+            raise ClusterAssemblyBuildError(
+                f"{label} normalized bounds {key} is not numeric"
+            ) from exc
+        if any(not math.isfinite(component) for component in checked[key]):
+            raise ClusterAssemblyBuildError(
+                f"{label} normalized bounds {key} is not finite"
+            )
+
+    minimum = checked["minimum"]
+    maximum = checked["maximum"]
+    center = checked["center"]
+    if any(minimum[index] > maximum[index] for index in range(3)):
+        raise ClusterAssemblyBuildError(
+            f"{label} normalized bounds minimum/maximum are inverted"
+        )
+
+    expected_span = [
+        maximum[index] - minimum[index] for index in range(3)
+    ]
+    expected_midpoint = [
+        0.5 * (minimum[index] + maximum[index]) for index in range(3)
+    ]
+    frame_tolerance = max(max(expected["size"]) * 1.0e-6, 1.0e-9)
+    if (
+        any(
+            abs(expected_span[index] - expected["size"][index])
+            > frame_tolerance
+            for index in range(3)
+        )
+        or any(
+            abs(expected_midpoint[index] - center[index])
+            > frame_tolerance
+            for index in range(3)
+        )
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{label} normalized bounds frame is internally inconsistent"
+        )
+
+    factor = centimeters_per_blender_unit
+    return {
+        "size": expected_size_cm,
+        "minimum": [
+            minimum[0] * factor,
+            -maximum[1] * factor,
+            minimum[2] * factor,
+        ],
+        "maximum": [
+            maximum[0] * factor,
+            -minimum[1] * factor,
+            maximum[2] * factor,
+        ],
+        "origin": [
+            center[0] * factor,
+            -center[1] * factor,
+            center[2] * factor,
+        ],
+        "frame_verified": True,
+    }
+
+
 def validate_unreal_normalized_prototype_bounds(
+    unreal,
     manifest,
     part_assets,
     relative_tolerance=0.08,
     absolute_tolerance_cm=0.1,
 ):
-    """Reject stale or wrong-unit external prototypes before Assembly build."""
+    """Reject stale, shifted, or wrong-skeleton prototypes before build."""
     production_contract = validate_normalized_prototype_unit_contract(manifest)
     receipt_bounds = _receipt_normalized_bounds_by_asset(manifest)
     parts = [
@@ -4471,10 +4906,28 @@ def validate_unreal_normalized_prototype_bounds(
                 "loaded Unreal prototype is missing for bounds preflight: "
                 + prototype_id
             )
+        bone_names = _unreal_bone_names(unreal, mesh)
+        has_direct_part_root = bone_names == ["part_root"]
+        has_importer_carrier_root = (
+            len(bone_names) == 2
+            and bool(bone_names[0])
+            and bone_names[0] != "part_root"
+            and bone_names[1] == "part_root"
+        )
+        if not (has_direct_part_root or has_importer_carrier_root):
+            raise ClusterAssemblyBuildError(
+                "loaded normalized prototype must contain exactly one part_root "
+                "deform bone, with at most one importer carrier root before it: "
+                f"{asset_name} bones={bone_names}"
+            )
         actual_bounds = _unreal_mesh_bounds_record(mesh)
         actual_size_cm = [
             float(value) for value in actual_bounds.get("size") or []
         ]
+        actual_frame_vectors = {
+            key: [float(value) for value in actual_bounds.get(key) or []]
+            for key in ("minimum", "maximum", "origin")
+        }
         if (
             len(actual_size_cm) != 3
             or any(
@@ -4482,15 +4935,28 @@ def validate_unreal_normalized_prototype_bounds(
                 for value in actual_size_cm
             )
             or max(actual_size_cm) <= 0.0
+            or any(
+                len(vector) != 3
+                or any(not math.isfinite(value) for value in vector)
+                for vector in actual_frame_vectors.values()
+            )
+            or any(
+                actual_frame_vectors["minimum"][index]
+                > actual_frame_vectors["maximum"][index]
+                for index in range(3)
+            )
         ):
             raise ClusterAssemblyBuildError(
                 "loaded normalized prototype bounds are invalid: "
                 + asset_name
             )
-        expected_size_cm = [
-            component * centimeters_per_blender_unit
-            for component in expected["size"]
-        ]
+        expected_bounds = _expected_unreal_normalized_bounds_record(
+            expected,
+            centimeters_per_blender_unit,
+            f"Assembly manifest prototype {asset_name}",
+            require_frame=physical_production,
+        )
+        expected_size_cm = expected_bounds["size"]
         absolute_errors_cm = [
             abs(actual_size_cm[index] - expected_size_cm[index])
             for index in range(3)
@@ -4515,13 +4981,50 @@ def validate_unreal_normalized_prototype_bounds(
                 "Send to Unreal profile before building the Nanite Assembly; do "
                 "not compensate with generator Leaf Size or Frond Width/Height."
             )
+        frame_errors_cm = {}
+        if expected_bounds["frame_verified"]:
+            for report_key, bounds_key in (
+                ("minimum", "minimum"),
+                ("maximum", "maximum"),
+                ("center", "origin"),
+            ):
+                actual_vector = actual_frame_vectors[bounds_key]
+                expected_vector = expected_bounds[bounds_key]
+                errors = [
+                    abs(actual_vector[index] - expected_vector[index])
+                    for index in range(3)
+                ]
+                frame_errors_cm[report_key] = errors
+                if any(
+                    errors[index] > allowed_errors_cm[index]
+                    for index in range(3)
+                ):
+                    raise ClusterAssemblyBuildError(
+                        "normalized Unreal prototype mesh-local bounds frame "
+                        f"drifted for {asset_name}: {report_key} expected "
+                        f"{[round(value, 6) for value in expected_vector]} cm, "
+                        f"loaded {[round(value, 6) for value in actual_vector]} "
+                        "cm. Re-send the current normalized source blend; do "
+                        "not compensate in the Assembly node transform."
+                    )
         checked.append({
             "prototype_id": prototype_id,
             "asset_name": asset_name,
+            "bone_names": bone_names,
             "expected_size_cm": expected_size_cm,
             "actual_size_cm": actual_size_cm,
             "absolute_errors_cm": absolute_errors_cm,
             "allowed_errors_cm": allowed_errors_cm,
+            "expected_minimum_cm": expected_bounds.get("minimum"),
+            "actual_minimum_cm": actual_bounds["minimum"],
+            "expected_maximum_cm": expected_bounds.get("maximum"),
+            "actual_maximum_cm": actual_bounds["maximum"],
+            "expected_origin_cm": expected_bounds.get("origin"),
+            "actual_origin_cm": actual_bounds["origin"],
+            "expected_center_cm": expected_bounds.get("origin"),
+            "actual_center_cm": actual_bounds["origin"],
+            "frame_absolute_errors_cm": frame_errors_cm,
+            "frame_verified": expected_bounds["frame_verified"],
         })
     return {
         "status": "verified",
@@ -4553,6 +5056,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         key: load_skeletal(value) for key, value in paths["parts"].items()
     }
     prototype_bounds_preflight = validate_unreal_normalized_prototype_bounds(
+        unreal,
         manifest,
         part_assets,
     )
