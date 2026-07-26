@@ -2169,7 +2169,6 @@ class App:
             TOOL_DIR / "cluster_assembly_builder.py",
             TOOL_DIR / "cluster_assembly_handoff_contract.py",
             TOOL_DIR / "nanite_assembly_materials.py",
-            TOOL_DIR / "cage_deformation.py",
         ])
         unique = {}
         for path in paths:
