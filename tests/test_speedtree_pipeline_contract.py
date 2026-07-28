@@ -23,12 +23,14 @@ from speedtree_pipeline_contract import (
     canonical_path,
     is_live_spm,
     naming_shadow_issue,
+    prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     read_tree_instance_profile,
     shared_contract_api,
     source_set_fingerprint,
     speedtree_stmat_path,
     spm_container_format,
+    spm_file_structural_semantic_fingerprint,
     validate_preflight_envelope,
 )
 from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES, resolve_texture_bindings
@@ -78,6 +80,122 @@ def write_stmat(spm, material_names, texture_base="T_Leaf_grass_Atlas_01"):
 
 
 class SpeedTreePipelineContractTests(unittest.TestCase):
+    def test_structural_spm_fingerprint_ignores_shading_but_not_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "SK_leaf.spm"
+
+            def structural_xml(texture, material_name, cutout_mesh_id):
+                return (
+                    "<SpeedTreeModel>"
+                    "<Materials>"
+                    f'<Material_v8 ID=\"4\" Name=\"{material_name}\">'
+                    f"<TexFilename>{texture}</TexFilename>"
+                    f"<CutoutMeshID>{cutout_mesh_id}</CutoutMeshID>"
+                    "<SupplementalCutoutMeshIDs Count=\"0\" />"
+                    "<UVAreas Count=\"1\"><UVArea>0 0 1 1</UVArea></UVAreas>"
+                    "</Material_v8>"
+                    "</Materials>"
+                    "<Generators><Generator Type=\"Leaf\">"
+                    "<Name>Leaf</Name><Properties><Property>"
+                    "<Name>SpeedTree SDK:Material:Frond</Name><Value>4</Value>"
+                    "</Property></Properties></Generator></Generators>"
+                    "</SpeedTreeModel>"
+                )
+
+            source.write_bytes(
+                gzip.compress(
+                    structural_xml("old.tif", "OldMaterial", 7).encode("utf-8")
+                )
+            )
+            original = spm_file_structural_semantic_fingerprint(source)
+            source.write_bytes(
+                gzip.compress(
+                    structural_xml("new.tga", "NewMaterial", 7).encode("utf-8")
+                )
+            )
+            self.assertEqual(
+                spm_file_structural_semantic_fingerprint(source),
+                original,
+            )
+            source.write_bytes(
+                gzip.compress(
+                    structural_xml("new.tga", "NewMaterial", 8).encode("utf-8")
+                )
+            )
+            self.assertNotEqual(
+                spm_file_structural_semantic_fingerprint(source),
+                original,
+            )
+
+    def test_legacy_semantic_migration_requires_exact_normalize_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "Cluster" / "SK_leaf.spm"
+            source.parent.mkdir(parents=True)
+            before = (
+                "<SpeedTreeModel><Materials>"
+                '<Material_v8 ID="4" Name="Old">'
+                "<TexFilename>old.tif</TexFilename><CutoutMeshID>7</CutoutMeshID>"
+                '<SupplementalCutoutMeshIDs Count="0" />'
+                '<UVAreas Count="1"><UVArea>0 0 1 1</UVArea></UVAreas>'
+                "</Material_v8></Materials></SpeedTreeModel>"
+            )
+            after = before.replace("Old", "New").replace("old.tif", "new.tga")
+            source.write_bytes(gzip.compress(before.encode("utf-8")))
+            recorded_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            backup_dir = (
+                source.parent
+                / "reports"
+                / "texture_normalize_backups"
+                / "texture_normalize_20260729_030505"
+            )
+            backup_dir.mkdir(parents=True)
+            backup = backup_dir / f"0001_{source.name}"
+            backup.write_bytes(source.read_bytes())
+            source.write_bytes(gzip.compress(after.encode("utf-8")))
+
+            self.assertIsNone(
+                prove_legacy_texture_normalize_semantic_migration(
+                    source,
+                    recorded_hash,
+                )
+            )
+            receipt = source.parent / "reports" / "normalize.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "normalization": {
+                            "backup_dir": str(backup_dir),
+                            "spms": [str(source)],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence = prove_legacy_texture_normalize_semantic_migration(
+                source,
+                recorded_hash,
+            )
+            self.assertEqual(
+                evidence["status"],
+                "legacy_texture_normalize_migrated",
+            )
+            self.assertTrue(evidence["raw_sha256_drift"])
+
+            structural_change = after.replace(
+                "<CutoutMeshID>7</CutoutMeshID>",
+                "<CutoutMeshID>8</CutoutMeshID>",
+            )
+            source.write_bytes(gzip.compress(structural_change.encode("utf-8")))
+            self.assertIsNone(
+                prove_legacy_texture_normalize_semantic_migration(
+                    source,
+                    recorded_hash,
+                )
+            )
+
     def test_plain_and_gzip_spm_use_the_same_tree_profile_rule(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

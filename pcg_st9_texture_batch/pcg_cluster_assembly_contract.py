@@ -18,6 +18,7 @@ import re
 import struct
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -30,7 +31,12 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
-from speedtree_pipeline_contract import read_spm_text
+from speedtree_pipeline_contract import (
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    prove_legacy_texture_normalize_semantic_migration,
+    read_spm_text,
+    spm_file_structural_semantic_fingerprint,
+)
 
 
 SCHEMA_VERSION = 1
@@ -1135,16 +1141,96 @@ def _physical_source_3d_artifacts(receipt):
                     f"path/hash: {row.get('plan') or index}"
                 )
             fingerprint = _fresh_file_fingerprint(path)
-            if (
-                not fingerprint.get("exists")
-                or not fingerprint.get("sha256")
-                or fingerprint["sha256"].casefold() != recorded_hash
-            ):
+            if not fingerprint.get("exists") or not fingerprint.get("sha256"):
+                raise ClusterAssemblyReceiptStaleError(
+                    f"Atlas physical source {label} artifact is missing: "
+                    + path
+                )
+            if artifact == "source_spm":
+                try:
+                    current_semantic = (
+                        spm_file_structural_semantic_fingerprint(
+                            path,
+                            raw_sha256=fingerprint["sha256"],
+                        )
+                    )
+                except (OSError, ValueError, ET.ParseError) as exc:
+                    raise ClusterAssemblyReceiptStaleError(
+                        "Atlas physical source SPM structural semantic "
+                        f"fingerprint is unavailable: {path}: {exc}"
+                    ) from exc
+                recorded_semantic = str(
+                    source.get("source_spm_semantic_fingerprint") or ""
+                ).strip().casefold()
+                recorded_projection = source.get(
+                    "source_spm_semantic_projection_version"
+                )
+                migration = None
+                if recorded_semantic:
+                    if (
+                        recorded_projection
+                        != SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+                    ):
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Atlas physical source SPM structural semantic "
+                            "projection is unsupported: "
+                            + path
+                        )
+                    if current_semantic.casefold() != recorded_semantic:
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Atlas physical source SPM structural semantics "
+                            "are stale: "
+                            + path
+                        )
+                else:
+                    migration = (
+                        prove_legacy_texture_normalize_semantic_migration(
+                            path,
+                            recorded_hash,
+                        )
+                    )
+                    if migration is None:
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Atlas physical source SPM legacy raw hash drift "
+                            "has no exact texture-normalize provenance: "
+                            + path
+                        )
+                source_record = {
+                    **fingerprint,
+                    "recorded_sha256": recorded_hash,
+                    "raw_sha256_drift": (
+                        fingerprint["sha256"].casefold() != recorded_hash
+                    ),
+                    "semantic_projection_version":
+                        SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+                    "semantic_fingerprint": current_semantic,
+                }
+                if (
+                    migration is not None
+                    and migration.get("status")
+                    == "legacy_texture_normalize_migrated"
+                ):
+                    source_record["legacy_semantic_migration"] = migration
+                current[artifact] = source_record
+                identity_rows.append(
+                    (
+                        artifact,
+                        _normalized_identity_path(path),
+                        SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+                        current_semantic,
+                    )
+                )
+                continue
+            if fingerprint["sha256"].casefold() != recorded_hash:
                 raise ClusterAssemblyReceiptStaleError(
                     f"Atlas physical source {label} artifact hash is stale: "
                     + path
                 )
-            current[artifact] = fingerprint
+            current[artifact] = {
+                **fingerprint,
+                "recorded_sha256": recorded_hash,
+                "raw_sha256_drift": False,
+            }
             identity_rows.append(
                 (
                     artifact,

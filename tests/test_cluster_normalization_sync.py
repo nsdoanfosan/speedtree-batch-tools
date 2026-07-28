@@ -529,6 +529,96 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
 
             self.assertFalse(current["normalization_required"])
 
+    def test_texture_normalize_raw_drift_reuses_semantic_receipt_only_with_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            first = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            capture_manifest = write_capture_manifest(first)
+            receipt = Path(first["receipt_path"])
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "kind": "speedtree_cluster_sync_normalization",
+                        "status": "ready",
+                        "normalization_contract_sha256": first[
+                            "normalization_contract_sha256"
+                        ],
+                        "source_spm_sha256": first["source_spm_sha256"],
+                        "source_spm_semantic_projection_version": first[
+                            "source_spm_semantic_projection_version"
+                        ],
+                        "source_spm_semantic_fingerprint": first[
+                            "source_spm_semantic_fingerprint"
+                        ],
+                        "unit_probe_sha256": first["unit_probe_sha256"],
+                        "output_blend_sha256": sha256(blend),
+                        "capture_manifest": str(capture_manifest.absolute()),
+                        "capture_manifest_sha256": sha256(capture_manifest),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backup_dir = (
+                source.parent
+                / "reports"
+                / "texture_normalize_backups"
+                / "texture_normalize_20260729_030505"
+            )
+            backup_dir.mkdir(parents=True)
+            (backup_dir / f"0001_{source.name}").write_bytes(
+                source.read_bytes()
+            )
+            (source.parent / "reports" / "normalize.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "normalization": {
+                            "backup_dir": str(backup_dir),
+                            "spms": [str(source)],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            write_spm(source, "M_source_texture_rebound", 1)
+            current = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertEqual(
+                current["normalization_contract_sha256"],
+                first["normalization_contract_sha256"],
+            )
+            self.assertNotEqual(
+                current["source_spm_sha256"],
+                first["source_spm_sha256"],
+            )
+            self.assertFalse(current["normalization_required"])
+
+            source.write_text(
+                (
+                    "<SpeedTree><Generators><Generator Type=\"Leaf\">"
+                    "<Name>new-structural-generator</Name>"
+                    "</Generator></Generators></SpeedTree>"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ClusterSourceBuildRequiredError):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
+
     def test_report_diagnostic_metadata_does_not_rebuild_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)

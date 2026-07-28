@@ -38,6 +38,11 @@ from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     resolve_normalization_recipe,
 )
+from speedtree_pipeline_contract import (
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    prove_legacy_texture_normalize_semantic_migration,
+    spm_file_structural_semantic_fingerprint,
+)
 
 
 BACKUP_NAME_TOKENS = (
@@ -805,9 +810,9 @@ def _walk_dicts(value):
             yield from _walk_dicts(child)
 
 
-def _recorded_source_hashes(receipt, canonical_spm):
+def _recorded_source_spm_rows(receipt, canonical_spm):
     canonical_key = normalized_path_key(canonical_spm)
-    hashes = set()
+    rows = {}
     for row in _walk_dicts(receipt):
         source_path = str(row.get("source_spm") or "").strip()
         source_hash = str(row.get("source_spm_sha256") or "").strip().casefold()
@@ -816,8 +821,23 @@ def _recorded_source_hashes(receipt, canonical_spm):
             and source_hash
             and normalized_path_key(source_path) == canonical_key
         ):
-            hashes.add(source_hash)
-    return hashes
+            recorded = {
+                "path": str(Path(source_path).expanduser().absolute()),
+                "sha256": source_hash,
+                "semantic_projection_version": row.get(
+                    "source_spm_semantic_projection_version"
+                ),
+                "semantic_fingerprint": str(
+                    row.get("source_spm_semantic_fingerprint") or ""
+                ).strip().casefold() or None,
+            }
+            identity = json.dumps(
+                recorded,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            rows[identity] = recorded
+    return list(rows.values())
 
 
 def _recorded_source_fbx_rows(receipt):
@@ -892,14 +912,45 @@ def _physical_refresh_state(payload, canonical_spm, blend):
 
     reasons = []
     canonical = Path(canonical_spm).expanduser().absolute()
-    recorded_hashes = _recorded_source_hashes(receipt, canonical)
+    recorded_source_rows = _recorded_source_spm_rows(receipt, canonical)
     current_source_sha256 = _sha256_file(canonical) if canonical.is_file() else None
+    current_source_semantic = None
+    legacy_semantic_migration = None
     if not current_source_sha256:
         reasons.append("canonical_source_missing")
-    elif len(recorded_hashes) > 1:
+    else:
+        try:
+            current_source_semantic = (
+                spm_file_structural_semantic_fingerprint(
+                    canonical,
+                    raw_sha256=current_source_sha256,
+                )
+            )
+        except (OSError, ValueError, ET.ParseError):
+            reasons.append("canonical_source_semantic_unavailable")
+    if not recorded_source_rows:
+        reasons.append("recorded_source_missing")
+    elif len(recorded_source_rows) > 1:
         reasons.append("recorded_source_conflict")
-    elif recorded_hashes and recorded_hashes != {current_source_sha256}:
-        reasons.append("canonical_source_changed")
+    elif len(recorded_source_rows) == 1 and current_source_semantic:
+        recorded_source = recorded_source_rows[0]
+        recorded_semantic = recorded_source.get("semantic_fingerprint")
+        if recorded_semantic:
+            if (
+                recorded_source.get("semantic_projection_version")
+                != SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+                or recorded_semantic != current_source_semantic.casefold()
+            ):
+                reasons.append("canonical_source_structural_changed")
+        elif recorded_source["sha256"] != current_source_sha256.casefold():
+            legacy_semantic_migration = (
+                prove_legacy_texture_normalize_semantic_migration(
+                    canonical,
+                    recorded_source["sha256"],
+                )
+            )
+            if legacy_semantic_migration is None:
+                reasons.append("canonical_source_changed")
 
     recorded_fbx_rows = _recorded_source_fbx_rows(receipt)
     for recorded in recorded_fbx_rows:
@@ -929,9 +980,20 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         "refresh_required": bool(reasons),
         "refresh_reasons": reasons,
         "canonical_source_sha256": current_source_sha256,
+        "canonical_source_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "canonical_source_semantic_fingerprint": current_source_semantic,
         "recorded_source_sha256": (
-            next(iter(recorded_hashes)) if len(recorded_hashes) == 1 else None
+            recorded_source_rows[0]["sha256"]
+            if len(recorded_source_rows) == 1
+            else None
         ),
+        "recorded_source_semantic_fingerprint": (
+            recorded_source_rows[0]["semantic_fingerprint"]
+            if len(recorded_source_rows) == 1
+            else None
+        ),
+        "legacy_semantic_migration": legacy_semantic_migration,
         "capture_manifest": str(capture["path"]),
         "capture_contract_sha256": capture["contract_sha256"],
         "recorded_capture_contract_sha256": recorded_capture_sha256,

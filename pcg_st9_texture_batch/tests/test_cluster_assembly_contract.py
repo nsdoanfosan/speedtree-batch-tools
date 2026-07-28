@@ -45,6 +45,10 @@ from pcg_texture_audit import (
 )
 from cluster_spm_pair_contract import inspect_cluster_spm_pair
 from atlas_target_registry import save_target_registry
+from speedtree_pipeline_contract import (
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    spm_file_structural_semantic_fingerprint,
+)
 
 
 REAL_ELM_SOURCE_FBX = Path(
@@ -1008,7 +1012,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             plan_fbx = folder / "branch_elm_01_01.fbx"
             folder.mkdir(parents=True)
             blend.write_bytes(b"blend")
-            source_spm.write_bytes(b"source-spm")
+            write_spm(
+                source_spm,
+                [("2", "branch_elm_01", [], ("10",))],
+                mesh_ids=("10",),
+            )
             source_fbx.parent.mkdir()
             source_fbx.write_bytes(b"source-fbx")
             plan_fbx.write_bytes(b"plan")
@@ -1055,6 +1063,12 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                             "source_spm_sha256": file_fingerprint(
                                 source_spm
                             )["sha256"],
+                            "source_spm_semantic_projection_version":
+                                SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+                            "source_spm_semantic_fingerprint":
+                                spm_file_structural_semantic_fingerprint(
+                                    source_spm
+                                ),
                             "source_fbx": str(source_fbx),
                             "source_fbx_sha256": file_fingerprint(
                                 source_fbx
@@ -1165,22 +1179,122 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 json.dumps(payload),
                 encoding="utf-8",
             )
-            for label, source_path in (
-                ("SPM", source_spm),
-                ("FBX", source_fbx),
-            ):
-                with self.subTest(stale_source=label):
-                    original = source_path.read_bytes()
-                    source_path.write_bytes(original + b"-changed")
-                    self.assertIsNone(
-                        _atlas_normalized_variants(
-                            folder,
-                            "branch_elm_01",
-                            [target],
-                            audit=audit_module,
-                        )
+            original_spm = source_spm.read_bytes()
+            write_spm(
+                source_spm,
+                [
+                    (
+                        "2",
+                        "renamed_shading_material",
+                        ["canonical_texture.tga"],
+                        ("10",),
                     )
-                    source_path.write_bytes(original)
+                ],
+                mesh_ids=("10",),
+            )
+            texture_rebound = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+            )
+            self.assertTrue(
+                texture_rebound["source_3d_artifacts"]["source_spm"][
+                    "raw_sha256_drift"
+                ]
+            )
+
+            write_spm(
+                source_spm,
+                [("2", "branch_elm_01", [], ("11",))],
+                mesh_ids=("11",),
+            )
+            self.assertIsNone(
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+            )
+            source_spm.write_bytes(original_spm)
+
+            original_fbx = source_fbx.read_bytes()
+            source_fbx.write_bytes(original_fbx + b"-changed")
+            self.assertIsNone(
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+            )
+            source_fbx.write_bytes(original_fbx)
+
+            source_contract = receipt["variants"][0]["plan_uv_transfer"][
+                "source_3d_contract"
+            ]
+            semantic_version = source_contract.pop(
+                "source_spm_semantic_projection_version"
+            )
+            semantic_fingerprint = source_contract.pop(
+                "source_spm_semantic_fingerprint"
+            )
+            backup_dir = (
+                source_spm.parent
+                / "reports"
+                / "texture_normalize_backups"
+                / "texture_normalize_20260729_030505"
+            )
+            backup_dir.mkdir(parents=True)
+            (backup_dir / f"0001_{source_spm.name}").write_bytes(
+                original_spm
+            )
+            (source_spm.parent / "reports" / "normalize.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "normalization": {
+                            "backup_dir": str(backup_dir),
+                            "spms": [str(source_spm)],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_spm(
+                source_spm,
+                [
+                    (
+                        "2",
+                        "renamed_shading_material",
+                        ["canonical_texture.tga"],
+                        ("10",),
+                    )
+                ],
+                mesh_ids=("10",),
+            )
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            migrated = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+            )
+            self.assertEqual(
+                migrated["source_3d_artifacts"]["source_spm"][
+                    "legacy_semantic_migration"
+                ]["status"],
+                "legacy_texture_normalize_migrated",
+            )
+            source_spm.write_bytes(original_spm)
+            source_contract["source_spm_semantic_projection_version"] = (
+                semantic_version
+            )
+            source_contract["source_spm_semantic_fingerprint"] = (
+                semantic_fingerprint
+            )
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
             source_3d_contract = dict(
                 receipt["variants"][0]["plan_uv_transfer"][
@@ -1390,7 +1504,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     plan_fbx = folder / "branch_elm_01_01.fbx"
                     folder.mkdir(parents=True)
                     blend.write_bytes(b"blend")
-                    source_spm.write_bytes(b"source-spm")
+                    write_spm(
+                        source_spm,
+                        [("2", "branch_elm_01", [], ("10",))],
+                        mesh_ids=("10",),
+                    )
                     source_fbx.parent.mkdir()
                     source_fbx.write_bytes(b"source-fbx")
                     plan_fbx.write_bytes(b"plan")
@@ -1696,12 +1814,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             for path, content in (
                 (target, b"target"),
                 (source, b"source"),
-                (source_spm, b"cluster-spm"),
                 (source_fbx, b"cluster-fbx"),
                 (source_blend, b"cluster-blend"),
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
+            write_spm(
+                source_spm,
+                [("2", "branch_elm_01", [], ("10",))],
+                mesh_ids=("10",),
+            )
             registry = save_target_registry(source_blend, [target])
             source_contract = {
                 "source_spm": str(source_spm),

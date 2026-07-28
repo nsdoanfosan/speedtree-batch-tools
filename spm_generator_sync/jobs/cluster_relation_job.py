@@ -291,11 +291,19 @@ def normalize_cluster_blend(recipe):
     )
     receipt = {
         "kind": "speedtree_cluster_sync_normalization",
-        "version": 2,
+        "version": 3,
         "status": "ready",
         "blend": str(blend_path),
         "output_blend_sha256": sha256_file(blend_path),
         "canonical_spm": recipe["canonical_spm"],
+        "source_spm_semantic_projection_version": recipe[
+            "source_spm_semantic_projection_version"
+        ],
+        "source_spm_semantic_fingerprint": recipe[
+            "source_spm_semantic_fingerprint"
+        ],
+        # Retain byte identity for diagnostics without making texture-path
+        # rewrites an authoritative physical-normalization invalidator.
         "source_spm_sha256": recipe["source_spm_sha256"],
         "source_xml": str(source_xml),
         "unit_probe": str(unit_probe),

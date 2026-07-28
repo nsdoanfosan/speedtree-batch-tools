@@ -23,6 +23,7 @@ from pathlib import Path
 
 PREFLIGHT_CONTRACT_KIND = "speedtree_material_preflight"
 PREFLIGHT_SCHEMA_VERSION = 1
+SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION = 1
 TREE_USER_DATA_PROPERTY = "SpeedTree SDK:User data"
 BACKUP_DIRECTORY_NAMES = frozenset(
     {
@@ -34,6 +35,18 @@ BACKUP_DIRECTORY_NAMES = frozenset(
 )
 BACKUP_FILENAME_RE = re.compile(
     r"\.(?:codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE
+)
+_SPM_SEMANTIC_IGNORED_SUBTREE_TAGS = frozenset({"Thumbnail", "Preview"})
+_SPM_SEMANTIC_MATERIAL_GEOMETRY_TAGS = frozenset(
+    {
+        "CutoutMeshID",
+        "SupplementalCutoutMeshIDs",
+        "UVAreas",
+        "Width",
+        "Height",
+        "UnwrapScale",
+        "AtlasMaker",
+    }
 )
 
 
@@ -234,6 +247,146 @@ def read_spm_text(path):
         return handle.read().decode("utf-8", errors="replace")
 
 
+def _local_xml_tag(tag):
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def _is_material_slot_property(name):
+    folded = str(name or "").strip().casefold()
+    return (
+        folded.endswith(":material")
+        or folded.startswith("materials:")
+        or folded
+        in {
+            "material:frond",
+            "mesh:material",
+            "mesh:render material",
+        }
+    )
+
+
+def _material_slot_assignment_state(raw_value):
+    value = str(raw_value or "").strip()
+    if not value or value.casefold() in {"none", "null", "unassigned"}:
+        return "UNASSIGNED"
+    try:
+        if float(value) < 0:
+            return "UNASSIGNED"
+    except ValueError:
+        pass
+    return "ASSIGNED"
+
+
+def _remove_non_structural_spm_content(parent):
+    """Remove mutable shading metadata while retaining physical structure."""
+    for child in list(parent):
+        tag = _local_xml_tag(child.tag)
+        remove = tag in _SPM_SEMANTIC_IGNORED_SUBTREE_TAGS
+        if tag == "Material_v8":
+            cutout = child.findtext("CutoutMeshID")
+            supplemental = child.find("SupplementalCutoutMeshIDs")
+            uv_areas = child.find("UVAreas")
+            has_geometry = (
+                str(cutout or "").strip() not in {"", "-1"}
+                or (
+                    supplemental is not None
+                    and str(supplemental.get("Count") or "0") != "0"
+                )
+                or (
+                    uv_areas is not None
+                    and str(uv_areas.get("Count") or "0") != "0"
+                )
+            )
+            if not has_geometry:
+                parent.remove(child)
+                continue
+            child.attrib.pop("Name", None)
+            for material_child in list(child):
+                if (
+                    _local_xml_tag(material_child.tag)
+                    not in _SPM_SEMANTIC_MATERIAL_GEOMETRY_TAGS
+                ):
+                    child.remove(material_child)
+            continue
+        if tag == "Property":
+            name = str(child.findtext("Name") or "").strip().casefold()
+            remove = name.startswith("vertex color:")
+            if not remove and _is_material_slot_property(name):
+                value = child.find("Value")
+                if value is not None:
+                    value.text = _material_slot_assignment_state(value.text)
+        if remove:
+            parent.remove(child)
+            continue
+        _remove_non_structural_spm_content(child)
+        if (
+            _local_xml_tag(child.tag) == "Assets"
+            and not list(child)
+            and not str(child.text or "").strip()
+        ):
+            parent.remove(child)
+
+
+def spm_structural_semantic_fingerprint(source_text, *, context=None):
+    """Hash bone/geometry/cutout/generator semantics, not shading metadata."""
+    root = ET.fromstring(source_text)
+    projected = copy.deepcopy(root)
+    _remove_non_structural_spm_content(projected)
+    payload = ET.tostring(
+        projected,
+        encoding="unicode",
+        short_empty_elements=True,
+    )
+    payload = re.sub(r">\s+<", "><", payload).strip()
+    envelope = {
+        "projection_version": SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source": payload,
+        "context": context or {},
+    }
+    encoded = json.dumps(
+        envelope,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+@lru_cache(maxsize=512)
+def _spm_file_structural_semantic_fingerprint_cached(
+    path_text,
+    raw_sha256,
+    context_json,
+):
+    del raw_sha256
+    return spm_structural_semantic_fingerprint(
+        read_spm_text(path_text),
+        context=json.loads(context_json),
+    )
+
+
+def spm_file_structural_semantic_fingerprint(
+    path,
+    *,
+    context=None,
+    raw_sha256=None,
+):
+    """Hash one SPM projection once per exact raw byte identity."""
+    candidate = _canonical_path(path)
+    raw_identity = str(raw_sha256 or sha256_file(candidate)).casefold()
+    context_json = json.dumps(
+        context or {},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _spm_file_structural_semantic_fingerprint_cached(
+        str(candidate),
+        raw_identity,
+        context_json,
+    )
+
+
 def spm_container_format(path):
     with _canonical_path(path).open("rb") as handle:
         return "gzip" if handle.read(2) == b"\x1f\x8b" else "plain_xml"
@@ -330,6 +483,122 @@ def sha256_file(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _path_is_within(path, root):
+    candidate = _canonical_path(path)
+    parent = _canonical_path(root)
+    try:
+        candidate.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def prove_legacy_texture_normalize_semantic_migration(
+    source_spm,
+    recorded_raw_sha256,
+):
+    """Prove one legacy raw-hash drift came from declared texture normalization.
+
+    A legacy physical receipt has no recorded semantic fingerprint.  Raw drift
+    is accepted only when an ``ok`` texture-normalization receipt names the
+    current SPM, its declared backup contains the exact recorded bytes, and the
+    old/current structural projections are identical.  Unknown drift remains
+    fail-closed.
+    """
+    source = _canonical_path(source_spm)
+    recorded = str(recorded_raw_sha256 or "").strip().casefold()
+    if not source.is_file() or not recorded:
+        return None
+    current_raw = sha256_file(source).casefold()
+    current_semantic = spm_file_structural_semantic_fingerprint(
+        source,
+        raw_sha256=current_raw,
+    )
+    base = {
+        "source_spm": str(source),
+        "recorded_source_spm_sha256": recorded,
+        "current_source_spm_sha256": current_raw,
+        "source_spm_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source_spm_semantic_fingerprint": current_semantic,
+    }
+    if current_raw == recorded:
+        return {
+            **base,
+            "status": "legacy_raw_exact",
+            "raw_sha256_drift": False,
+        }
+
+    reports_dir = source.parent / "reports"
+    backup_root = reports_dir / "texture_normalize_backups"
+    if not reports_dir.is_dir() or not backup_root.is_dir():
+        return None
+    source_key = canonical_path_key(source)
+    for receipt_path in sorted(reports_dir.glob("*.json")):
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        normalization = (
+            payload.get("normalization")
+            if isinstance(payload, dict)
+            else None
+        )
+        if (
+            payload.get("status") != "ok"
+            or not isinstance(normalization, dict)
+            or source_key
+            not in {
+                canonical_path_key(value)
+                for value in normalization.get("spms") or []
+            }
+        ):
+            continue
+        declared_backup_dir = normalization.get("backup_dir")
+        if not declared_backup_dir:
+            continue
+        backup_dir = _canonical_path(declared_backup_dir)
+        if (
+            not backup_dir.is_dir()
+            or not _path_is_within(backup_dir, backup_root)
+            or not backup_dir.name.casefold().startswith(
+                "texture_normalize_"
+            )
+        ):
+            continue
+        suffix = "_" + source.name.casefold()
+        for backup in sorted(backup_dir.iterdir()):
+            if (
+                not backup.is_file()
+                or backup.suffix.casefold() != ".spm"
+                or (
+                    backup.name.casefold() != source.name.casefold()
+                    and not backup.name.casefold().endswith(suffix)
+                )
+            ):
+                continue
+            try:
+                backup_raw = sha256_file(backup).casefold()
+                backup_semantic = (
+                    spm_file_structural_semantic_fingerprint(
+                        backup,
+                        raw_sha256=backup_raw,
+                    )
+                )
+            except (OSError, ET.ParseError, ValueError):
+                continue
+            if backup_raw != recorded or backup_semantic != current_semantic:
+                continue
+            return {
+                **base,
+                "status": "legacy_texture_normalize_migrated",
+                "raw_sha256_drift": True,
+                "provenance_receipt": source_identity(receipt_path),
+                "recorded_source_backup": source_identity(backup),
+            }
+    return None
 
 
 def source_identity(path, required=True):
@@ -687,6 +956,7 @@ __all__ = [
     "BACKUP_DIRECTORY_NAMES",
     "PREFLIGHT_CONTRACT_KIND",
     "PREFLIGHT_SCHEMA_VERSION",
+    "SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION",
     "TREE_USER_DATA_PROPERTY",
     "build_preflight_envelope",
     "build_stmat_material_intents",
@@ -699,6 +969,7 @@ __all__ = [
     "is_production_spm_location",
     "naming_shadow_issue",
     "production_spm_folders",
+    "prove_legacy_texture_normalize_semantic_migration",
     "open_spm_binary",
     "pipeline_contract_path",
     "read_spm_text",
@@ -710,6 +981,8 @@ __all__ = [
     "source_set_fingerprint",
     "speedtree_stmat_path",
     "spm_container_format",
+    "spm_file_structural_semantic_fingerprint",
+    "spm_structural_semantic_fingerprint",
     "validate_preflight_envelope",
     "validate_preflight_report",
 ]

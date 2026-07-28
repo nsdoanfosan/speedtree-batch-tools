@@ -18,6 +18,10 @@ from cluster_blend_sync import (
     run_cluster_relation_transaction,
     set_cluster_relation_registry,
 )
+from speedtree_pipeline_contract import (
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    spm_file_structural_semantic_fingerprint,
+)
 
 
 def file_sha256(path):
@@ -46,6 +50,7 @@ def write_scope_manifest(
     material_groups=None,
     source_fbx=None,
     connection_requested=None,
+    semantic_source=True,
 ):
     scope = target.parent / ".atlas_leaf_speedtree_scopes"
     scope.mkdir(exist_ok=True)
@@ -67,6 +72,13 @@ def write_scope_manifest(
             "source_spm": str(canonical_spm),
             "source_spm_sha256": file_sha256(canonical_spm),
         }
+        if semantic_source:
+            source_contract.update({
+                "source_spm_semantic_projection_version":
+                    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+                "source_spm_semantic_fingerprint":
+                    spm_file_structural_semantic_fingerprint(canonical_spm),
+            })
         if source_fbx is not None:
             source_contract.update({
                 "source_fbx": str(source_fbx),
@@ -231,7 +243,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
             cluster = owner / "Cluster"
             cluster.mkdir(parents=True)
             canonical = cluster / "SK_branch_elm_01.spm"
-            canonical.write_bytes(b"canonical-v1")
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
             blend = cluster / "SK_branch_elm_01.blend"
             blend.touch()
             target = owner / "SK_Tree_elm_01.spm"
@@ -248,7 +262,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
             current = discover_cluster_blend_relations(owner)[0]
             self.assertEqual(current["targets"][0]["status"], "synced")
 
-            canonical.write_bytes(b"canonical-v2-with-different-size")
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 13]
+            )
             changed = discover_cluster_blend_relations(owner)[0]
 
             self.assertEqual(changed["refresh_required_count"], 1)
@@ -257,8 +273,97 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 "refresh_required",
             )
             self.assertIn(
-                "canonical_source_changed",
+                "canonical_source_structural_changed",
                 changed["targets"][0]["refresh_reasons"],
+            )
+
+    def test_texture_only_spm_drift_keeps_semantic_physical_scope_current(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.touch()
+            save_target_registry(blend, [target])
+            write_capture_manifest(blend, "capture-v1")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture-v1",
+            )
+            recorded_raw = file_sha256(canonical)
+
+            write_material_spm(
+                canonical, "M_branch_elm_texture_rebound", 8, [10, 11, 12]
+            )
+            row = discover_cluster_blend_relations(owner)[0]["targets"][0]
+
+            self.assertNotEqual(file_sha256(canonical), recorded_raw)
+            self.assertEqual(row["status"], "synced")
+            self.assertFalse(row["refresh_required"])
+            self.assertEqual(row["refresh_reasons"], [])
+
+    def test_legacy_scope_migrates_only_from_exact_texture_normalize_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.touch()
+            save_target_registry(blend, [target])
+            write_capture_manifest(blend, "capture-v1")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture-v1",
+                semantic_source=False,
+            )
+            backup_dir = (
+                cluster
+                / "reports"
+                / "texture_normalize_backups"
+                / "texture_normalize_20260729_030505"
+            )
+            backup_dir.mkdir(parents=True)
+            (backup_dir / f"0001_{canonical.name}").write_bytes(
+                canonical.read_bytes()
+            )
+            (cluster / "reports" / "normalize.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "normalization": {
+                            "backup_dir": str(backup_dir),
+                            "spms": [str(canonical)],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            write_material_spm(
+                canonical, "M_branch_elm_texture_rebound", 8, [10, 11, 12]
+            )
+            row = discover_cluster_blend_relations(owner)[0]["targets"][0]
+
+            self.assertEqual(row["status"], "synced")
+            self.assertEqual(
+                row["legacy_semantic_migration"]["status"],
+                "legacy_texture_normalize_migrated",
             )
 
     def test_new_blender_capture_contract_marks_target_for_refresh(self):
@@ -267,7 +372,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
             cluster = owner / "Cluster"
             cluster.mkdir(parents=True)
             canonical = cluster / "SK_leaf_elm_01.spm"
-            canonical.write_bytes(b"canonical")
+            write_material_spm(
+                canonical, "M_leaf_elm_01", 8, [10, 11, 12]
+            )
             blend = cluster / "SK_leaf_elm_01.blend"
             blend.touch()
             target = owner / "SK_Tree_elm_01.spm"
@@ -1006,7 +1113,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
             cluster = owner / "Cluster"
             cluster.mkdir(parents=True)
             canonical = cluster / "SK_branch_elm_01.spm"
-            canonical.write_bytes(b"canonical")
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
             blend = cluster / "SK_branch_elm_01.blend"
             blend.touch()
             target = owner / "SK_Tree_elm_01.spm"
@@ -1052,7 +1161,9 @@ class ClusterBlendSyncTests(unittest.TestCase):
             cluster = owner / "Cluster"
             cluster.mkdir(parents=True)
             canonical = cluster / "SK_branch_elm_01.spm"
-            canonical.write_bytes(b"canonical")
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
             source_fbx = cluster / "fbx" / "SK_branch_elm_01.fbx"
             source_fbx.parent.mkdir()
             source_fbx.write_bytes(b"fbx-v1")

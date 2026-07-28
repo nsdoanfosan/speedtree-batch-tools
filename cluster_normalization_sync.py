@@ -11,9 +11,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from cluster_card_pipeline.contract import _read_spm_root
+from speedtree_pipeline_contract import (
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    prove_legacy_texture_normalize_semantic_migration,
+    spm_file_structural_semantic_fingerprint,
+)
 
 
 class ClusterNormalizationSyncError(RuntimeError):
@@ -600,10 +606,59 @@ def _bwr_report(blend, canonical_spm):
         str(identity.get("canonical_path") or canonical_spm)
     ).expanduser().absolute()
     current_hash = _sha256_file(canonical_spm)
-    if (
-        reported_path != Path(canonical_spm).expanduser().absolute()
-        or str(identity.get("sha256") or "").casefold() != current_hash.casefold()
-    ):
+    try:
+        current_semantic = spm_file_structural_semantic_fingerprint(
+            canonical_spm,
+            raw_sha256=current_hash,
+        )
+    except (OSError, ValueError, ET.ParseError) as exc:
+        reason = "source_semantic_unavailable"
+        raise ClusterSourceBuildRequiredError(
+            "Cluster SPM structural semantic fingerprint is unavailable. "
+            f"Rebuild the Cluster source blend first: {canonical_spm}",
+            blend=blend,
+            canonical_spm=canonical_spm,
+            report_path=report_path,
+            reason=reason,
+        ) from exc
+    reported_hash = str(identity.get("sha256") or "").casefold()
+    reported_semantic = str(
+        identity.get("source_spm_semantic_fingerprint")
+        or identity.get("structural_semantic_fingerprint")
+        or identity.get("bone_semantic_fingerprint")
+        or identity.get("semantic_fingerprint")
+        or ""
+    ).casefold()
+    reported_projection = (
+        identity.get("source_spm_semantic_projection_version")
+        if identity.get("source_spm_semantic_projection_version") is not None
+        else identity.get("structural_semantic_projection_version")
+        if identity.get("structural_semantic_projection_version") is not None
+        else identity.get("bone_semantic_projection_version")
+        if identity.get("bone_semantic_projection_version") is not None
+        else identity.get("semantic_projection_version")
+    )
+    identity_current = (
+        reported_path == Path(canonical_spm).expanduser().absolute()
+    )
+    if reported_semantic:
+        identity_current = bool(
+            identity_current
+            and reported_projection
+            == SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+            and reported_semantic == current_semantic.casefold()
+        )
+    elif reported_hash == current_hash.casefold():
+        identity_current = bool(identity_current)
+    else:
+        identity_current = bool(
+            identity_current
+            and prove_legacy_texture_normalize_semantic_migration(
+                canonical_spm,
+                reported_hash,
+            )
+        )
+    if not identity_current:
         reason = "source_identity_stale"
         raise ClusterSourceBuildRequiredError(
             "Cluster blend/report is stale for the current Cluster SPM. "
@@ -623,7 +678,13 @@ def _bwr_report(blend, canonical_spm):
             report_path=report_path,
             reason=reason,
         )
-    return report_path, report, current_hash, merged_name
+    return (
+        report_path,
+        report,
+        current_hash,
+        current_semantic,
+        merged_name,
+    )
 
 
 def _receipt_is_current(recipe):
@@ -632,8 +693,30 @@ def _receipt_is_current(recipe):
         not receipt
         or receipt.get("kind") != "speedtree_cluster_sync_normalization"
         or receipt.get("status") != "ready"
-        or receipt.get("source_spm_sha256") != recipe["source_spm_sha256"]
         or receipt.get("unit_probe_sha256") != recipe["unit_probe_sha256"]
+    ):
+        return False
+    recorded_semantic = str(
+        receipt.get("source_spm_semantic_fingerprint") or ""
+    ).casefold()
+    if recorded_semantic:
+        if (
+            receipt.get("source_spm_semantic_projection_version")
+            != SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+            or recorded_semantic
+            != str(
+                recipe.get("source_spm_semantic_fingerprint") or ""
+            ).casefold()
+        ):
+            return False
+    elif (
+        receipt.get("source_spm_sha256")
+        != recipe["source_spm_sha256"]
+        and prove_legacy_texture_normalize_semantic_migration(
+            recipe["canonical_spm"],
+            receipt.get("source_spm_sha256"),
+        )
+        is None
     ):
         return False
     blend = Path(recipe["blend"])
@@ -760,7 +843,13 @@ def resolve_normalization_recipe(
             report_path=report_path,
             reason="blend_missing",
         )
-    report_path, _report, source_hash, merged_name = _bwr_report(
+    (
+        report_path,
+        _report,
+        source_hash,
+        source_semantic,
+        merged_name,
+    ) = _bwr_report(
         blend, canonical
     )
     source_xml = blend.parent / "xml" / f"{blend.stem}.xml"
@@ -796,17 +885,21 @@ def resolve_normalization_recipe(
     receipt = normalization_receipt_path(blend)
     bwr_semantic_identity = {
         "status": str(_report.get("status") or ""),
-        "source_spm_sha256": source_hash,
+        "source_spm_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source_spm_semantic_fingerprint": source_semantic,
         "merged_name": merged_name,
         "handoff_preflight_status": str(
             (_report.get("handoff_preflight") or {}).get("status") or ""
         ),
     }
     normalization_contract = {
-        "version": 3,
+        "version": 4,
         "blend": str(blend),
         "canonical_spm": str(canonical),
-        "source_spm_sha256": source_hash,
+        "source_spm_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source_spm_semantic_fingerprint": source_semantic,
         "bwr_report": str(report_path),
         "bwr_semantic_sha256": _canonical_sha256(
             bwr_semantic_identity
@@ -832,6 +925,9 @@ def resolve_normalization_recipe(
     recipe = {
         "kind": "speedtree_cluster_sync_normalization_recipe",
         **normalization_contract,
+        # Byte identity is retained for diagnostics and provenance, but it is
+        # deliberately outside the authoritative normalization hash.
+        "source_spm_sha256": source_hash,
         # Owner targets affect only Atlas material/mesh insertion and optional
         # Generator wiring. They are deliberately outside the Blender
         # normalization contract.
