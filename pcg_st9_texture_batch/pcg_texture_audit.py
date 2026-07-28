@@ -4175,9 +4175,15 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
         folder, cfg, tex_dirs, folder_graphs,
         preserved_definitions=cluster_definitions,
         leaf_mesh_sources=leaf_mesh_sources)
+    referenced_cluster_keys = {
+        str(path).lower() for path in referenced_clusters
+    }
+    referenced_cluster_keys.update(
+        str(path).lower() for path in assembly_cluster_usage
+    )
     ignored_cluster_spms = [
         str(cluster) for cluster in clusters
-        if str(cluster).lower() not in referenced_clusters
+        if str(cluster).lower() not in referenced_cluster_keys
     ]
     all_refs = []
     if include_refs:
@@ -4668,7 +4674,9 @@ def resolve_shared_atlas_entries(items, cfg):
 
 
 @_report_scan_cached
-def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
+def make_report(
+        cfg, targets=None, include_refs=False, pcg_targets=None,
+        target_mesh_names=None):
     pcg_targets = focus_pcg_targets(
         pcg_targets,
         cfg.get("pcg_focus_data_assets"),
@@ -4676,7 +4684,15 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
     )
     ensure_blend_source_index(cfg)
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
-    report_target_mesh_names = target_mesh_names_from_pcg_targets(pcg_targets)
+    requested_target_mesh_names = sorted({
+        normalize_local_asset_stem(name)
+        for name in target_mesh_names or []
+        if normalize_local_asset_stem(name)
+    })
+    report_target_mesh_names = (
+        target_mesh_names_from_pcg_targets(pcg_targets)
+        or requested_target_mesh_names
+    )
     items = [
         audit_folder(
             folder, cfg, include_refs=include_refs,
@@ -4691,16 +4707,25 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
     resolve_shared_atlas_entries(items, cfg)
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
     target_source_map = target_mesh_source_map(pcg_targets)
-    target_mesh_names = set(target_mesh_map)
+    pcg_target_mesh_names = set(target_mesh_map)
     matched_target_names = set()
     target_folder_matches = {}
     for item in items:
-        folder_matches = folder_target_mesh_names(item["folder"], target_mesh_names)
+        folder_matches = folder_target_mesh_names(
+            item["folder"],
+            pcg_target_mesh_names,
+        )
         if folder_matches is True:
             folder_matches = []
-        workflow_mesh_names = (
-            folder_matches or local_target_mesh_names(item["folder"])
-        )
+        if folder_matches:
+            workflow_mesh_names = folder_matches
+        elif requested_target_mesh_names:
+            workflow_mesh_names = folder_target_mesh_names(
+                item["folder"],
+                requested_target_mesh_names,
+            )
+        else:
+            workflow_mesh_names = local_target_mesh_names(item["folder"])
         matched_target_names.update(folder_matches)
         for name in folder_matches:
             target_folder_matches.setdefault(name, []).append(item["name"])
@@ -4772,7 +4797,7 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
         for entry in item.get("target_spm_statuses", []):
             status = entry.get("status", "unknown")
             target_status_counts[status] = target_status_counts.get(status, 0) + 1
-    unmatched_names = sorted(target_mesh_names - matched_target_names)
+    unmatched_names = sorted(pcg_target_mesh_names - matched_target_names)
     pcg_mesh_names = {
         name for name, source in target_source_map.items()
         if source.get("pcg")
@@ -4794,7 +4819,7 @@ def make_report(cfg, targets=None, include_refs=False, pcg_targets=None):
             "graph": pcg_targets.get("graph") if pcg_targets else None,
             "generated_at": pcg_targets.get("generated_at") if pcg_targets else None,
             "source_file": pcg_targets.get("source_file") if pcg_targets else None,
-            "mesh_count": len(target_mesh_names) if pcg_targets else 0,
+            "mesh_count": len(pcg_target_mesh_names) if pcg_targets else 0,
             "matched_mesh_count": len(matched_target_names) if pcg_targets else 0,
             "unmatched_mesh_count": len(unmatched_names) if pcg_targets else 0,
             "unmatched_mesh_names": unmatched_names,
@@ -4832,6 +4857,14 @@ def main():
         help="Vegetation folder to audit; repeatable",
     )
     parser.add_argument(
+        "--target-mesh",
+        action="append",
+        help=(
+            "Limit an audit receipt to one exact Tree mesh/SPM identity; "
+            "repeatable"
+        ),
+    )
+    parser.add_argument(
         "--prepare-sk", action="append",
         help=(
             "Non-Cluster vegetation folder whose SK SPM should be copied/"
@@ -4849,8 +4882,38 @@ def main():
         print(json.dumps({"prepare_sk": results}, indent=2, ensure_ascii=False))
         return
     pcg_targets = load_pcg_targets(args.pcg_targets) if args.pcg_targets else None
-    report = make_report(cfg, args.target, include_refs=args.include_refs, pcg_targets=pcg_targets)
-    persist_cluster_assembly_receipts(report)
+    report = make_report(
+        cfg,
+        args.target,
+        include_refs=args.include_refs,
+        pcg_targets=pcg_targets,
+        target_mesh_names=args.target_mesh,
+    )
+    # Receipt persistence is a cache/audit-trail concern.  The live report
+    # above is the authoritative data validation result, so a filesystem or
+    # receipt self-validation failure must not turn clean source data into a
+    # failed audit.  Callers can continue with the live contract embedded in
+    # this report and retry persistence on a later run.
+    try:
+        written_receipts = persist_cluster_assembly_receipts(report)
+    except Exception as exc:
+        report["cluster_assembly_receipt_persistence"] = {
+            "status": "warning",
+            "stage": "receipt_persistence",
+            "code": "RECEIPT_PERSISTENCE_FAILED",
+            "live_audit_complete": True,
+            "written": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    else:
+        report["cluster_assembly_receipt_persistence"] = {
+            "status": "ok",
+            "stage": "receipt_persistence",
+            "code": "RECEIPT_PERSISTED",
+            "live_audit_complete": True,
+            "written": written_receipts,
+            "error": "",
+        }
     save_spm_analysis_cache()
     if args.json_path:
         Path(args.json_path).parent.mkdir(parents=True, exist_ok=True)

@@ -41,6 +41,32 @@ def write_spm_with_frond_material(path, material_name, material_id):
     )
 
 
+def write_spm_with_frond_binding(
+    path,
+    material_name,
+    material_id,
+    mesh_id,
+    *,
+    generator_guid="stable-frond-guid",
+):
+    path.write_text(
+        (
+            "<SpeedTree><Assets>"
+            f'<Material_v8 ID="{material_id}" Name="{material_name}" />'
+            "</Assets><Generators><Generator Type=\"Frond\">"
+            f"<GUID>{generator_guid}</GUID>"
+            "<Name>Frond</Name><Hidden>false</Hidden><Properties><Property>"
+            "<Name>Material:Frond:0:Material</Name>"
+            f"<Value>{material_id}</Value>"
+            "</Property><Property>"
+            "<Name>Material:Frond:0:Mesh</Name>"
+            f"<Value>{mesh_id}</Value>"
+            "</Property></Properties></Generator></Generators></SpeedTree>"
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_unit_probe(path):
     path.write_text(
         json.dumps(
@@ -136,6 +162,68 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             self.assertTrue(recipe["adopt_source_material"])
             self.assertEqual(recipe["plan_collection"], "Atlas_Cluster_Cards")
 
+    def test_recipe_repairs_only_exact_backup_proven_minus9_sentinel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            write_spm_with_frond_binding(
+                target,
+                "M_leaf_elm_01",
+                6,
+                -9,
+            )
+            backup_dir = (
+                target.parent
+                / "_spm_backups"
+                / "generator_sync_20260727_010203"
+            )
+            backup_dir.mkdir(parents=True)
+            backup = backup_dir / f"01_{target.name}"
+            write_spm_with_frond_binding(
+                backup,
+                "M_leaf_elm_01",
+                19,
+                -10,
+            )
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            repairs = recipe["target_material_bindings"][0][
+                "source_binding_repairs"
+            ]
+            self.assertEqual(len(repairs), 1)
+            self.assertEqual(repairs[0]["from_mesh_id"], -9)
+            self.assertEqual(repairs[0]["to_mesh_id"], -10)
+            self.assertEqual(
+                repairs[0]["generator_guid"],
+                "stable-frond-guid",
+            )
+            self.assertEqual(repairs[0]["evidence"][0]["path"], str(backup))
+
+            conflicting = backup_dir / f"02_{target.name}"
+            write_spm_with_frond_binding(
+                conflicting,
+                "M_leaf_elm_01",
+                21,
+                -9,
+            )
+            conflicting_recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertEqual(
+                conflicting_recipe["target_material_bindings"][0][
+                    "source_binding_repairs"
+                ],
+                [],
+            )
+
     def test_pending_cluster_export_is_accepted_only_with_ready_source_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
@@ -157,6 +245,8 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 "mode": "raw_source_for_cluster_normalizer",
                 "final_export_required": True,
                 "deferred_export_issues": ["missing_export_collection"],
+                "source_blend_committed": True,
+                "source_object": report["paths"]["merged_name"],
             }
             report_path.write_text(json.dumps(report), encoding="utf-8")
 
@@ -193,6 +283,39 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                     canonical_spm=source,
                     unit_probe_path=unit_probe,
                 )
+
+    def test_explicitly_blocked_handoff_is_not_reused_as_normalizer_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            report_path = (
+                blend.parent
+                / "reports"
+                / (
+                    blend.stem
+                    + "_speedtree_repair_pipeline_report_codex.json"
+                )
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["handoff_preflight"] = {
+                "status": "blocked",
+                "empty_material_slots": [
+                    {
+                        "object": report["paths"]["merged_name"],
+                        "slot": 0,
+                    }
+                ],
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            with self.assertRaises(ClusterSourceBuildRequiredError) as caught:
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
+
+            self.assertEqual(caught.exception.reason, "source_handoff_blocked")
 
     def test_existing_material_spelling_is_preserved_for_in_place_adoption(self):
         with tempfile.TemporaryDirectory() as temporary:

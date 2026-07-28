@@ -28,6 +28,8 @@ from pcg_cluster_assembly_contract import (
     inspect_fbx_material_mesh_pairs,
     dependency_role,
     _atlas_normalized_variants,
+    _canonical_bark_contract,
+    _validate_normalized_source_dependency,
 )
 import pcg_texture_audit as audit_module
 from pcg_texture_audit import (
@@ -42,6 +44,7 @@ from pcg_texture_audit import (
     prepare_sk,
 )
 from cluster_spm_pair_contract import inspect_cluster_spm_pair
+from atlas_target_registry import save_target_registry
 
 
 REAL_ELM_SOURCE_FBX = Path(
@@ -178,6 +181,44 @@ class FbxRoleContractTests(unittest.TestCase):
 
 
 class ClusterAssemblyContractTests(unittest.TestCase):
+    def test_no_content_driven_cluster_dependency_does_not_require_bark(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_common_grass"
+            target = folder / "SK_weed_common_grass_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_common_grass_01", [], ())],
+                active_material_ids=("1",),
+            )
+
+            contract = build_cluster_assembly_contract(
+                folder,
+                [target],
+                [],
+                cluster_usage={},
+            )
+
+            self.assertEqual(
+                contract["canonical_bark"]["status"], "not_applicable"
+            )
+            self.assertEqual(contract["handoff"]["status"], "pass_through")
+            self.assertFalse(
+                contract["handoff"]["separate_nanite_assembly_requested"]
+            )
+            self.assertNotIn(
+                "CANONICAL_BARK_MISSING",
+                [
+                    row["code"]
+                    for row in contract["handoff"]["errors"]
+                ],
+            )
+
+    def test_generic_cluster_name_is_a_first_class_assembly_role(self):
+        self.assertEqual(
+            dependency_role("SK_cluster_densiflora_01"),
+            "cluster",
+        )
+
     def test_cluster_source_inventory_uses_canonical_output_names(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -248,6 +289,135 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 dependency["texture_dependencies"][0]["path"], expected
+            )
+            self.assertIn(
+                "CLUSTER_TGA_BASENAME_INVALID",
+                [row["code"] for row in contract["handoff"]["errors"]],
+            )
+
+            # Missing source data is a handoff error, not a reason for a newly
+            # written snapshot receipt to invalidate itself.  Downstream reads
+            # the hash-current receipt and reports the real audit error above.
+            receipt = persist_cluster_assembly_receipt(
+                contract, receipt_dir=Path(temp) / "receipts"
+            )
+            payload = load_cluster_assembly_receipt(
+                receipt, requested_spm=target
+            )
+            self.assertIn(
+                "CLUSTER_TGA_BASENAME_INVALID",
+                [
+                    row["code"]
+                    for row in payload["cluster_assembly"]["handoff"]["errors"]
+                ],
+            )
+
+    def test_legacy_texture_path_alias_does_not_stale_canonical_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Tree_elm"
+            cluster_dir = folder / "Cluster"
+            branch = cluster_dir / "branch_elm_01.spm"
+            target = folder / "Tree_elm_01.spm"
+            canonical = cluster_dir / "branch_elm_01.tga"
+            legacy = (
+                Path(temp) / "OldOneDrive" / "Tree_elm" / "Cluster"
+                / canonical.name
+            )
+            write_spm(branch, [("1", "M_Bark_elm_01", [], [])])
+            write_spm(target, [(
+                "2",
+                "branch_elm_01",
+                [str(legacy), "Cluster/branch_elm_01.tga"],
+                ("1",),
+            )], mesh_ids=("1",))
+            canonical.write_bytes(b"canonical-render")
+
+            usage = cluster_material_usage([target], [branch])
+            contract = build_cluster_assembly_contract(
+                folder, [target], [branch], cluster_usage=usage
+            )
+            dependency = contract["dependencies"][0]
+            validation = dependency["tga_basename_validation"]
+
+            self.assertEqual(validation["status"], "ok")
+            self.assertEqual(validation["refs"], [str(canonical)])
+            self.assertEqual(
+                validation["ignored_legacy_aliases"], [str(legacy)]
+            )
+            self.assertEqual(
+                [row["path"] for row in dependency["texture_dependencies"]],
+                [str(canonical)],
+            )
+            self.assertNotIn(
+                "CLUSTER_TGA_BASENAME_INVALID",
+                [row["code"] for row in contract["handoff"]["errors"]],
+            )
+
+            receipt = persist_cluster_assembly_receipt(
+                contract, receipt_dir=Path(temp) / "receipts"
+            )
+            payload = load_cluster_assembly_receipt(
+                receipt, requested_spm=target
+            )
+            persisted = payload["cluster_assembly"]["handoff"][
+                "cluster_dependencies"
+            ][0]
+            self.assertEqual(
+                [row["path"] for row in persisted["texture_dependencies"]],
+                [str(canonical)],
+            )
+
+            # A receipt produced by an older version can contain both rows and
+            # the resulting false handoff error.  It remains compatible: load
+            # normalizes only the duplicate alias and removes only that error.
+            legacy_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            legacy_issue = {
+                "code": "CLUSTER_TGA_BASENAME_INVALID",
+                "role": persisted["role"],
+                "spm": persisted["spm"],
+                "details": {},
+            }
+            for dependency_group in (
+                legacy_payload["cluster_assembly"]["dependencies"],
+                legacy_payload["cluster_assembly"]["handoff"][
+                    "cluster_dependencies"
+                ],
+            ):
+                legacy_dependency = dependency_group[0]
+                legacy_dependency["texture_dependencies"].append({
+                    "path": str(legacy),
+                    "exists": False,
+                    "size": None,
+                    "mtime_ns": None,
+                    "sha256": None,
+                })
+                legacy_dependency["tga_basename_validation"].update({
+                    "status": "missing",
+                    "refs": [str(canonical), str(legacy)],
+                    "missing": [str(legacy)],
+                    "invalid": [],
+                })
+            legacy_payload["cluster_assembly"]["handoff"]["issues"].append(
+                dict(legacy_issue)
+            )
+            legacy_payload["cluster_assembly"]["handoff"]["errors"].append(
+                dict(legacy_issue)
+            )
+            receipt.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+            upgraded = load_cluster_assembly_receipt(
+                receipt, requested_spm=target
+            )
+            upgraded_handoff = upgraded["cluster_assembly"]["handoff"]
+            self.assertNotIn(
+                "CLUSTER_TGA_BASENAME_INVALID",
+                [row["code"] for row in upgraded_handoff["errors"]],
+            )
+            self.assertEqual(
+                upgraded_handoff["cluster_dependencies"][0][
+                    "tga_basename_validation"
+                ]["status"],
+                "ok",
             )
 
     def test_canonical_cluster_dependency_matches_exact_raw_output_stem(self):
@@ -356,7 +526,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(children["leaf"]["references"], [])
             self.assertEqual(children["leaf_side"]["references"], [])
-            self.assertEqual(contract["canonical_bark"]["status"], "replacement_required")
+            self.assertEqual(contract["canonical_bark"]["status"], "canonical")
             self.assertEqual(contract["handoff"]["status"], "blocked")
             self.assertEqual(
                 contract["handoff"]["receipt_kind"],
@@ -567,15 +737,21 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             folder = Path(temp_dir) / "Tree_elm"
             target = folder / "SK_Tree_elm_01.spm"
             blend = folder / "SK_branch_elm_01.blend"
+            source_spm = folder / "SK_branch_elm_01.spm"
+            source_fbx = folder / "fbx" / "SK_branch_elm_01.fbx"
             plan_fbx = folder / "branch_elm_01_01.fbx"
             folder.mkdir(parents=True)
             blend.write_bytes(b"blend")
+            source_spm.write_bytes(b"source-spm")
+            source_fbx.parent.mkdir()
+            source_fbx.write_bytes(b"source-fbx")
             plan_fbx.write_bytes(b"plan")
             write_spm(
                 target,
                 [("2", "branch_elm_01", [], ("10",))],
                 mesh_ids=("10",),
             )
+            save_target_registry(blend, [target])
             bounds = {
                 "minimum": [-0.04, -0.045, -0.01],
                 "maximum": [0.04, 0.045, 0.01],
@@ -608,6 +784,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "skeletal_asset": "SK_branch_elm_01_01",
                     "plan": "branch_elm_01_01",
                     "plan_uv_transfer": {
+                        "source_3d_contract": {
+                            "source_spm": str(source_spm),
+                            "source_spm_sha256": file_fingerprint(
+                                source_spm
+                            )["sha256"],
+                            "source_fbx": str(source_fbx),
+                            "source_fbx_sha256": file_fingerprint(
+                                source_fbx
+                            )["sha256"],
+                        },
                         "attachment_vertex_index": 7,
                         "attachment_vertex_uv": [0.25, 0.75],
                         "capture_attachment": {
@@ -682,6 +868,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 contract["unit_probe_contract"]["kind"],
                 "speedtree_fbx_spm_unit_probe",
             )
+            self.assertEqual(
+                contract["source_3d_artifacts"]["source_spm"]["path"],
+                str(source_spm),
+            )
+            self.assertTrue(contract["target_registry"]["sha256"])
 
             payload["material_groups"][0]["meshes"][0][
                 "normalized_bounds"
@@ -704,6 +895,55 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             payload["material_groups"][0]["meshes"][0][
                 "normalized_bounds"
             ]["size"][0] = 0.08
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            for label, source_path in (
+                ("SPM", source_spm),
+                ("FBX", source_fbx),
+            ):
+                with self.subTest(stale_source=label):
+                    original = source_path.read_bytes()
+                    source_path.write_bytes(original + b"-changed")
+                    with self.assertRaisesRegex(
+                        ClusterAssemblyReceiptStaleError,
+                        f"source {label}.*stale",
+                    ):
+                        _atlas_normalized_variants(
+                            folder,
+                            "branch_elm_01",
+                            [target],
+                            audit=audit_module,
+                        )
+                    source_path.write_bytes(original)
+
+            source_3d_contract = dict(
+                receipt["variants"][0]["plan_uv_transfer"][
+                    "source_3d_contract"
+                ]
+            )
+            del receipt["variants"][0]["plan_uv_transfer"][
+                "source_3d_contract"
+            ]
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptError,
+                "source 3D contract",
+            ):
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+
+            receipt["variants"][0]["plan_uv_transfer"][
+                "source_3d_contract"
+            ] = source_3d_contract
             del receipt["variants"][0]["plan_uv_transfer"][
                 "attachment_vertex_uv"
             ]
@@ -720,6 +960,98 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "branch_elm_01",
                     [target],
                     audit=audit_module,
+                )
+
+    def test_physical_scope_coverage_follows_explicit_target_registry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_elm"
+            blend = folder / "SK_branch_elm_01.blend"
+            first = folder / "SK_Tree_elm_01.spm"
+            second = folder / "SK_Tree_elm_02.spm"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            manifest = scope_dir / f"scope_branch__{first.stem}.json"
+            manifest.write_text(
+                json.dumps({
+                    "spm": str(first),
+                    "blend_file": str(blend),
+                    "material_groups": [{
+                        "material": "branch_elm_01",
+                        "material_id": 2,
+                        "mesh_ids": [10],
+                        "meshes": [{}],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            normalized = {
+                "status": "ready",
+                "material": "branch_elm_01",
+                "source_blend": file_fingerprint(blend),
+                "variants": [{
+                    "ordinal": 1,
+                    "plan_name": "branch_elm_01_01",
+                    "skeletal_asset_name": "SK_branch_elm_01_01",
+                    "source_prototype_index": 1,
+                    "source_partition_mode": "WHOLE_MESH",
+                    "plan_fbx": {"sha256": "plan"},
+                    "attachment_vertex_index": 7,
+                    "attachment_vertex_uv": [0.25, 0.75],
+                }],
+                "production_normalization": {
+                    "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                },
+                "source_3d_artifacts": {
+                    "source_spm": {
+                        "path": str(folder / "SK_branch_elm_01.spm"),
+                        "sha256": "spm",
+                    },
+                    "source_fbx": {
+                        "path": str(
+                            folder / "fbx" / "SK_branch_elm_01.fbx"
+                        ),
+                        "sha256": "fbx",
+                    },
+                },
+            }
+
+            # The second target is selected for the folder audit but explicitly
+            # OFF for this blend, so no scope delivery is required for it.
+            save_target_registry(blend, [first])
+            with mock.patch(
+                "pcg_cluster_assembly_contract._normalized_variant_contract",
+                return_value=normalized,
+            ):
+                contract = _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [first, second],
+                    audit=None,
+                )
+            self.assertEqual(
+                contract["registered_target_spms"],
+                [str(first.absolute())],
+            )
+
+            # Turning the exact relation ON makes the matching target receipt
+            # mandatory; no asset/species-specific allowlist is involved.
+            save_target_registry(blend, [first, second])
+            with mock.patch(
+                "pcg_cluster_assembly_contract._normalized_variant_contract",
+                return_value=normalized,
+            ), self.assertRaisesRegex(
+                ClusterAssemblyReceiptStaleError,
+                "missing current target scope",
+            ):
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [first, second],
+                    audit=None,
                 )
 
     def test_same_delivery_to_several_targets_is_one_role_contract(self):
@@ -788,9 +1120,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     folder = Path(temp_dir) / "Tree_elm"
                     blend = folder / "SK_branch_elm_01.blend"
+                    source_spm = folder / "SK_branch_elm_01.spm"
+                    source_fbx = (
+                        folder / "fbx" / "SK_branch_elm_01.fbx"
+                    )
                     plan_fbx = folder / "branch_elm_01_01.fbx"
                     folder.mkdir(parents=True)
                     blend.write_bytes(b"blend")
+                    source_spm.write_bytes(b"source-spm")
+                    source_fbx.parent.mkdir()
+                    source_fbx.write_bytes(b"source-fbx")
                     plan_fbx.write_bytes(b"plan")
                     scope_dir = folder / ".atlas_leaf_speedtree_scopes"
                     scope_dir.mkdir()
@@ -830,6 +1169,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                                 "skeletal_asset": "SK_branch_elm_01_01",
                                 "plan": "branch_elm_01_01",
                                 "plan_uv_transfer": {
+                                    "source_3d_contract": {
+                                        "source_spm": str(source_spm),
+                                        "source_spm_sha256": file_fingerprint(
+                                            source_spm
+                                        )["sha256"],
+                                        "source_fbx": str(source_fbx),
+                                        "source_fbx_sha256": file_fingerprint(
+                                            source_fbx
+                                        )["sha256"],
+                                    },
                                     "attachment_vertex_index": vertex_index,
                                     "attachment_vertex_uv": vertex_uv,
                                     "capture_attachment": {
@@ -879,6 +1228,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                             encoding="utf-8",
                         )
 
+                    save_target_registry(blend, targets)
                     with self.assertRaisesRegex(
                         ClusterAssemblyReceiptError,
                         "multiple current receipts",
@@ -1070,6 +1420,103 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 locate_cluster_assembly_receipt(target, receipt_dir), second
             )
+
+    def test_persisted_receipt_tracks_nested_physical_source_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "Tree_elm"
+            receipt_dir = Path(temp_dir) / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            source_spm = root / "Cluster" / "SK_branch_elm_01.spm"
+            source_fbx = root / "Cluster" / "fbx" / "SK_branch_elm_01.fbx"
+            source_blend = root / "Cluster" / "SK_branch_elm_01.blend"
+            for path, content in (
+                (target, b"target"),
+                (source, b"source"),
+                (source_spm, b"cluster-spm"),
+                (source_fbx, b"cluster-fbx"),
+                (source_blend, b"cluster-blend"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            registry = save_target_registry(source_blend, [target])
+            source_contract = {
+                "source_spm": str(source_spm),
+                "source_spm_sha256": file_fingerprint(
+                    source_spm
+                )["sha256"],
+                "source_fbx": str(source_fbx),
+                "source_fbx_sha256": file_fingerprint(
+                    source_fbx
+                )["sha256"],
+            }
+            normalized = {
+                "manifest": file_fingerprint(source_fbx),
+                "source_blend": file_fingerprint(source_blend),
+                "source_3d_artifacts": {
+                    "source_spm": file_fingerprint(source_spm),
+                    "source_fbx": file_fingerprint(source_fbx),
+                },
+                "target_registry": file_fingerprint(
+                    registry["registry_path"]
+                ),
+                "production_normalization": {
+                    "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                    "variants": [{
+                        "plan_uv_transfer": {
+                            "source_3d_contract": source_contract,
+                        },
+                    }],
+                },
+                "variants": [{
+                    "plan_fbx": file_fingerprint(source_fbx),
+                }],
+            }
+            dependency = {
+                "spm_fingerprint": file_fingerprint(source_spm),
+                "normalized_variants": normalized,
+            }
+            contract = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [dependency],
+                "handoff": {"cluster_dependencies": [dependency]},
+            }
+            receipt = persist_cluster_assembly_receipt(
+                contract,
+                receipt_dir=receipt_dir,
+            )
+            load_cluster_assembly_receipt(receipt, requested_spm=target)
+
+            # Old persisted receipts copied the production normalization but
+            # omitted the extracted source/registry artifacts.  The nested
+            # provenance must still make a changed physical source stale.
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            persisted_variants = payload["cluster_assembly"]["handoff"][
+                "cluster_dependencies"
+            ][0]["normalized_variants"]
+            del persisted_variants["source_3d_artifacts"]
+            del persisted_variants["target_registry"]
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            before = source_fbx.stat()
+            replacement = b"changed-fbx"
+            self.assertEqual(len(replacement), before.st_size)
+            source_fbx.write_bytes(replacement)
+            os.utime(
+                source_fbx,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptStaleError,
+                "physical source FBX.*stale",
+            ):
+                load_cluster_assembly_receipt(
+                    receipt,
+                    requested_spm=target,
+                )
 
     def test_persisted_export_bundle_uses_content_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1630,6 +2077,344 @@ class ClusterAssemblyContractTests(unittest.TestCase):
         self.assertEqual(app.tree.focused, "cluster-child")
         self.assertTrue(app.checked_rows.cleared)
         self.assertTrue(app.target_checked_rows.cleared)
+
+
+    def test_inactive_bark_like_material_does_not_require_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "Tree_elm"
+            target = folder / "SK_Tree_elm_01.spm"
+            cluster = folder / "Cluster" / "SK_branch_elm_01.spm"
+            write_spm(target, [
+                ("1", "M_Bark_elm_01",
+                 ["texture/T_Bark_elm_01_Color.tga"], ()),
+            ])
+            write_spm(
+                cluster,
+                [
+                    ("1", "M_Bark_elm_01",
+                     ["texture/T_Bark_elm_01_Color.tga"], ()),
+                    ("9", "M_Mossy_Bark_legacy",
+                     ["foreign/Other_Bark_Color.tga"], ()),
+                ],
+                active_material_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": cluster, "spm": cluster}],
+            )
+
+            self.assertEqual(contract["status"], "canonical")
+            self.assertEqual(
+                [row["material_id"]
+                 for row in contract["cluster_bark_sources"]],
+                ["1"],
+            )
+            self.assertEqual(
+                {row["replacement"]
+                 for row in contract["cluster_bark_sources"]},
+                {"not_required"},
+            )
+
+    def test_current_isolated_bark_capture_satisfies_production_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "Tree_elm"
+            cluster_dir = folder / "Cluster"
+            output_spm = cluster_dir / "SK_branch_elm_01.spm"
+            isolated_root = cluster_dir / ".sk_batch_isolated_bark" / "sig"
+            isolated_spm = isolated_root / "Tree_elm" / "Cluster" / output_spm.name
+            isolated_fbx = (
+                isolated_spm.parent / "fbx" / f"{isolated_spm.stem}.fbx"
+            )
+            blend = cluster_dir / "SK_branch_elm_01.blend"
+            target = folder / "SK_Tree_elm_01.spm"
+            for path, content in (
+                (isolated_spm, b"isolated-spm"),
+                (isolated_fbx, b"isolated-fbx"),
+                (blend, b"source-blend"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            write_spm(
+                output_spm,
+                [(
+                    "1",
+                    "M_bark_common_end_01",
+                    ["foreign/common_bark_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+            write_spm(
+                target,
+                [(
+                    "1",
+                    "M_Bark_elm_01",
+                    ["texture/T_Bark_elm_01_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+            )
+            manifest_path = isolated_root / "bark_normalization_manifest.json"
+            manifest = {
+                "kind": "cluster_isolated_canonical_bark_source",
+                "status": "ready",
+                "source_spm": str(output_spm),
+                "source_spm_sha256": file_fingerprint(output_spm)["sha256"],
+                "speedtree_spm": str(isolated_spm),
+                "isolated_spm_sha256": file_fingerprint(isolated_spm)["sha256"],
+                "production_source_mutated": False,
+                "normalization": {
+                    "canonical_material": "M_bark_elm_01",
+                },
+            }
+            manifest_path.write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            pipeline_path = (
+                cluster_dir
+                / "reports"
+                / "SK_branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            pipeline_path.parent.mkdir(parents=True)
+            pipeline = {
+                "source_blend_identity": file_fingerprint(blend),
+                "speedtree_live_source_identity": {
+                    "spm": file_fingerprint(output_spm),
+                },
+                "cluster_bark_source_resolution": {
+                    "status": "ready",
+                    "manifest": file_fingerprint(manifest_path),
+                    "source_spm": file_fingerprint(output_spm),
+                    "speedtree_spm": file_fingerprint(isolated_spm),
+                    "canonical_material": "M_bark_elm_01",
+                    "production_source_mutated": False,
+                },
+                "cluster_bark_export_validation": {
+                    "status": "ready_for_downstream_blender_mapping",
+                    "canonical_material": "M_bark_elm_01",
+                    "output_materials": ["M_bark_common_end_01"],
+                    "fbx": {"path": str(isolated_fbx)},
+                    "material_slot_propagated": True,
+                    "texture_set_propagated": True,
+                    "uv_preserved": True,
+                    "production_sources_mutated": False,
+                },
+            }
+            pipeline_path.write_text(
+                json.dumps(pipeline),
+                encoding="utf-8",
+            )
+            normalized = {
+                "source_blend": file_fingerprint(blend),
+                "source_3d_artifacts": {
+                    "source_spm": file_fingerprint(isolated_spm),
+                    "source_fbx": file_fingerprint(isolated_fbx),
+                },
+                "production_normalization": {
+                    "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                },
+            }
+
+            with mock.patch(
+                "pcg_cluster_bark_normalization."
+                "validate_canonical_bark_export_bundle",
+                return_value={
+                    "status": "ready_for_downstream_blender_mapping",
+                    "canonical_material": "M_bark_elm_01",
+                    "output_materials": ["M_bark_common_end_01"],
+                    "fbx": {"path": str(isolated_fbx)},
+                    "material_slot_propagated": True,
+                    "texture_set_propagated": True,
+                    "uv_preserved": True,
+                    "production_sources_mutated": False,
+                },
+            ):
+                _validate_normalized_source_dependency(
+                    normalized,
+                    output_spm,
+                )
+            self.assertEqual(
+                normalized["isolated_bark_capture"]["status"],
+                "validated",
+            )
+
+            bark = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{
+                    "source_spm": str(output_spm),
+                    "spm": str(output_spm),
+                    "output_spm": str(output_spm),
+                    "normalized_variants": normalized,
+                }],
+            )
+            self.assertEqual(bark["status"], "canonical")
+            self.assertEqual(
+                bark["cluster_bark_sources"][0]["replacement"],
+                "isolated_capture_validated",
+            )
+
+    def test_same_role_secondary_is_not_bound_to_primary_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "Tree_elm"
+            cluster_dir = folder / "Cluster"
+            first = cluster_dir / "branch_elm_01.spm"
+            second = cluster_dir / "branch_elm_02.spm"
+            target = folder / "SK_Tree_elm_01.spm"
+            source = folder / "Tree_elm_01.spm"
+            tree_materials = [
+                ("1", "branch_elm_01",
+                 ["Cluster/branch_elm_01.tga"], ("1",)),
+                ("2", "branch_elm_02",
+                 ["Cluster/branch_elm_02.tga"], ("2",)),
+            ]
+            write_spm(target, tree_materials, mesh_ids=("1", "2"))
+            write_spm(source, tree_materials, mesh_ids=("1", "2"))
+            write_spm(first, [("1", "Source_01", [], ())])
+            write_spm(second, [("1", "Source_02", [], ())])
+            for cluster in (first, second):
+                (cluster_dir / f"{cluster.stem}.tga").write_bytes(b"texture")
+            write_ascii_fbx(
+                folder / "fbx" / "Tree_elm_01.fbx",
+                material_names=["branch_elm_01_Mat"],
+                mesh_names=["branch_elm_01_mesh"],
+                pairs=[("branch_elm_01_Mat", "branch_elm_01_mesh")],
+            )
+            usage = {
+                str(first).casefold(): {
+                    "spms": [str(target)],
+                    "material_names": ["branch_elm_01"],
+                    "material_names_by_spm": {
+                        str(source): ["branch_elm_01"],
+                    },
+                    "source_refs": [
+                        str(cluster_dir / "branch_elm_01.tga")
+                    ],
+                },
+                str(second).casefold(): {
+                    "spms": [str(target)],
+                    "material_names": ["branch_elm_02"],
+                    "material_names_by_spm": {
+                        str(source): ["branch_elm_02"],
+                    },
+                    "source_refs": [
+                        str(cluster_dir / "branch_elm_02.tga")
+                    ],
+                },
+            }
+            normalized = {
+                "status": "ready",
+                "variants": [{"ordinal": 1}],
+                "production_normalization": {
+                    "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                    "physical_capture_contract": {
+                        "capture_maps": [{
+                            "role": "Color",
+                            "path": str(
+                                cluster_dir / "branch_elm_01.tga"
+                            ),
+                        }],
+                    },
+                },
+            }
+
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                return_value=normalized,
+            ) as lookup, mock.patch(
+                "pcg_cluster_assembly_contract."
+                "_validate_normalized_source_dependency",
+            ):
+                contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [first, second],
+                    cluster_usage=usage,
+                    assembly_source_spms=[source],
+                )
+
+            dependencies = {
+                row["name"]: row for row in contract["dependencies"]
+            }
+            lookup.assert_called_once()
+            self.assertIs(
+                dependencies["SK_branch_elm_01"]["normalized_variants"],
+                normalized,
+            )
+            self.assertTrue(
+                dependencies["SK_branch_elm_01"]["primary_role_source"]
+            )
+            self.assertEqual(
+                dependencies["SK_branch_elm_02"]["decision"],
+                "reference_only",
+            )
+            self.assertFalse(
+                dependencies["SK_branch_elm_02"]["primary_role_source"]
+            )
+            self.assertIsNone(
+                dependencies["SK_branch_elm_02"]["normalized_variants"]
+            )
+            self.assertEqual(
+                dependencies["SK_branch_elm_01"]["texture_contract_source"],
+                "atlas_physical_capture",
+            )
+            self.assertEqual(
+                dependencies["SK_branch_elm_01"][
+                    "tga_basename_validation"
+                ]["status"],
+                "ok",
+            )
+            self.assertEqual(
+                dependencies["SK_branch_elm_02"][
+                    "tga_basename_validation"
+                ]["status"],
+                "not_applicable",
+            )
+
+    def test_owner_folder_bark_identity_is_canonical_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "tree_NothofagusSolandri"
+            cluster_dir = folder / "cluster"
+            target = folder / "SK_tree_NothofagusSolandri_01.spm"
+            provider = (
+                cluster_dir
+                / "SK_branch_tree_NothofagusSolandri_01.spm"
+            )
+            bark_name = "M_Bark_tree_NothofagusSolandri_01"
+            bark_refs = [
+                "texture/T_Bark_tree_NothofagusSolandri_01_color.tga",
+                "texture/T_Bark_tree_NothofagusSolandri_01_normal.tga",
+            ]
+            write_spm(
+                target,
+                [("1", bark_name, bark_refs, ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [("1", bark_name, bark_refs, ("1",))],
+                mesh_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{
+                    "source_spm": str(provider),
+                    "spm": str(provider),
+                }],
+            )
+
+            self.assertEqual(contract["status"], "canonical")
+            self.assertEqual(contract["canonical_material"], bark_name)
+            self.assertEqual(len(contract["canonical_sources"]), 1)
 
 
 if __name__ == "__main__":

@@ -226,6 +226,32 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 resolved = resolve_cluster_receipt_path(spm, embedded)
             self.assertEqual(resolved, embedded.resolve())
 
+    def test_stale_persisted_receipt_uses_clean_embedded_live_audit(self):
+        from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+            ClusterAssemblyReceiptStaleError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            embedded = root / "live_audit_contract.json"
+            fbx = root / "Tree_elm_01.fbx"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            with mock.patch(
+                "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+                "locate_cluster_assembly_receipt",
+                side_effect=ClusterAssemblyReceiptStaleError("old snapshot"),
+            ):
+                resolved = resolve_cluster_receipt_path(spm, embedded)
+            self.assertEqual(resolved, embedded.resolve())
+
     def test_export_name_normalization_keeps_role_identity(self):
         self.assertEqual(
             normalize_export_name("Material::M_branch_elm_01_Mat"),
@@ -236,6 +262,14 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
         from cluster_assembly_handoff_contract import dependency_role
 
         self.assertEqual(dependency_role("SK_leaf_elm_side_01"), "leaf_side")
+
+    def test_generic_cluster_is_an_independent_role(self):
+        from cluster_assembly_handoff_contract import dependency_role
+
+        self.assertEqual(
+            dependency_role("SK_cluster_densiflora_01"),
+            "cluster",
+        )
 
     def test_actual_polygon_assignment_is_complete_and_componentized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,6 +533,84 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertIn(
                 "normalized_variants_required",
                 [row.get("reason") for row in handoff["issues"]],
+            )
+
+    def test_bark_block_identifies_exact_provider_and_material(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            provider = root / "Cluster" / "SK_leaf_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            provider.parent.mkdir()
+            provider.write_bytes(b"provider")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "leaf_elm_01", "pending_export")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                    },
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            handoff_contract = payload["items"][0][
+                "cluster_assembly"
+            ]["handoff"]
+            handoff_contract["status"] = "needs_bark_normalization"
+            handoff_contract["cluster_dependencies"] = [{
+                "role": "leaf",
+                "spm": str(provider),
+                "output_spm": str(provider),
+            }]
+            handoff_contract["canonical_bark"] = {
+                "status": "replacement_required",
+                "canonical_material": "M_bark_elm_01",
+                "cluster_bark_sources": [{
+                    "cluster_spm": str(provider),
+                    "material_name": "M_bark_common_end_01",
+                    "replacement": "required",
+                    "texture_refs": ["T_bark_common_end_01_color.tga"],
+                }],
+            }
+            receipt.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+            inventory = build_blender_fbx_inventory(
+                [
+                    role_object(
+                        fbx,
+                        material="M_leaf_elm_01",
+                    )
+                ],
+                fbx,
+                {"leaf": "leaf_elm_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(handoff["status"], "blocked")
+            issue = next(
+                row
+                for row in handoff["issues"]
+                if row["code"]
+                == "CANONICAL_BARK_NORMALIZATION_REQUIRED"
+            )
+            self.assertEqual(issue["role"], "leaf")
+            self.assertEqual(issue["spm"], str(provider))
+            self.assertEqual(
+                issue["material"],
+                "M_bark_common_end_01",
+            )
+            self.assertEqual(
+                issue["canonical_material"],
+                "M_bark_elm_01",
             )
 
     def test_receipt_pass_through_disagreeing_with_real_pair_is_blocked(self):

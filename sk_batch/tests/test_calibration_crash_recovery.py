@@ -6,9 +6,12 @@ handler at all.  The in-progress marker makes that state detectable, and the
 next run repairs it from the recorded backup before reading the source.
 """
 import hashlib
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -152,6 +155,59 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertTrue(report["interrupted_calibration_recovery"]["recovered"])
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
 
+    def test_unrecoverable_marker_blocks_before_audit(self):
+        self._simulate_kill_during_calibration(backup=False)
+        with mock.patch.object(spm_audit, "audit_spm") as audit:
+            with self.assertRaisesRegex(
+                RuntimeError, "cannot be recovered safely"
+            ):
+                spm_audit.process_spm(
+                    self.spm, {"backup_spm": False}, log=lambda _m: None
+                )
+        audit.assert_not_called()
+        self.assertTrue(
+            spm_audit.calibration_marker_path(self.spm).is_file()
+        )
+        self.assertEqual(spm_audit.read_spm(self.spm), PROBE_XML)
+
+    def test_canonical_spm_lock_serializes_another_process(self):
+        acquired = self.root / "child_acquired.txt"
+        code = "\n".join(
+            (
+                "import sys",
+                "from pathlib import Path",
+                "import spm_audit",
+                "with spm_audit.spm_exclusive_lock(Path(sys.argv[1])):",
+                "    Path(sys.argv[2]).write_text('acquired', encoding='utf-8')",
+            )
+        )
+        env = dict(os.environ)
+        repo_root = str(SK_BATCH_DIR.parent)
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(
+                None,
+                (
+                    str(SK_BATCH_DIR),
+                    repo_root,
+                    env.get("PYTHONPATH", ""),
+                ),
+            )
+        )
+        with spm_audit.spm_exclusive_lock(self.spm):
+            child = subprocess.Popen(
+                [sys.executable, "-c", code, str(self.spm), str(acquired)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            time.sleep(0.25)
+            self.assertIsNone(child.poll())
+            self.assertFalse(acquired.exists())
+        stdout, stderr = child.communicate(timeout=10)
+        self.assertEqual(child.returncode, 0, (stdout, stderr))
+        self.assertEqual(acquired.read_text(encoding="utf-8"), "acquired")
+
     def test_successful_run_leaves_no_marker_behind(self):
         cfg = {"backup_spm": True, "rename_materials": False}
 
@@ -212,6 +268,40 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
 
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
+
+    def test_failing_run_without_backup_restores_bytes_and_timestamp(self):
+        cfg = {"backup_spm": False, "rename_materials": False}
+        original_mtime_ns = self.spm.stat().st_mtime_ns
+
+        def fail_after_write(spm_path, *_args, **_kwargs):
+            spm_audit.write_spm(spm_path, PROBE_XML)
+            raise RuntimeError("boom")
+
+        with mock.patch.object(
+            spm_audit, "calibrate_bones", side_effect=fail_after_write
+        ), mock.patch.object(
+            spm_audit, "audit_spm", return_value={"generators": []}
+        ), mock.patch.object(
+            spm_audit,
+            "sk_readiness",
+            return_value={
+                "ready": True,
+                "mode": "ok",
+                "disabled_generators": [],
+            },
+        ), mock.patch.object(
+            spm_audit, "plan_material_renames", return_value=([], [])
+        ), mock.patch.object(
+            spm_audit, "classify_asset_kind", return_value="plant"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                spm_audit.process_spm(
+                    self.spm, cfg, log=lambda _m: None
+                )
+
+        self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
+        self.assertEqual(self.spm.read_bytes(), self.source_bytes)
+        self.assertEqual(self.spm.stat().st_mtime_ns, original_mtime_ns)
 
 
 if __name__ == "__main__":

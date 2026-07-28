@@ -381,6 +381,24 @@ def main():
                 "실행 전에 차단했습니다. Modeler에서 Mesh Asset 참조를 "
                 "정리하거나 파일을 복구하세요."
             )
+            report["classification"] = (
+                "asset_external_mesh_path_missing"
+            )
+            report["remediation"] = (
+                "Restore the listed external FBX files at their declared "
+                "paths, or relink/remove those Mesh Asset references in "
+                "SpeedTree Modeler and save the SPM"
+            )
+            report["missing_external_meshes"] = [
+                {
+                    "filename": str(row.get("filename") or ""),
+                    "resolved_path": str(
+                        row.get("resolved_path") or ""
+                    ),
+                    "mesh_name": str(row.get("mesh_name") or ""),
+                }
+                for row in missing_mesh_files
+            ]
         else:
             report["speedtree_export"] = run_export(args, speedtree_cli)
             material = inspect_speedtree_material_export(
@@ -399,6 +417,12 @@ def main():
             ))
             missing_sources = list(textures.get("missing_sources") or [])
             missing_sets = list(texture_readiness.get("missing") or [])
+            if textures.get("classification"):
+                report["classification"] = textures["classification"]
+                report["failure_reason"] = textures.get(
+                    "failure_reason", ""
+                )
+                report["remediation"] = textures.get("remediation", "")
             if (
                 material.get("status") in {"ok", "not_applicable"}
                 and all_material.get("status") in {"ok", "not_applicable"}
@@ -457,10 +481,14 @@ def main():
                 elif missing_sources:
                     details = ", ".join(
                         f"{item.get('material', '?')}:{item.get('map', '?')}"
+                        " -> "
+                        + (
+                            str(item.get("resolved") or "<Source 미지정>")
+                        )
                         for item in missing_sources[:8]
                     )
                     report["error"] = (
-                        "SpeedTree FBX가 참조하는 텍스처 파일이 없음 — "
+                        "에셋 텍스처 Source 계약 오류 — "
                         + details
                     )
                 else:

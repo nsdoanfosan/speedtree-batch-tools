@@ -59,7 +59,12 @@ class LaunchGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("tkinter is unavailable", result.stderr)
             self.assertTrue(log.is_file())
-            appended = log.read_text(encoding="utf-8", errors="replace")[before:]
+            with log.open("rb") as handle:
+                handle.seek(before)
+                appended = handle.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
             self.assertIn("broken_gui.pyw", appended)
             self.assertIn("RuntimeError: tkinter is unavailable", appended)
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import traceback
+import uuid
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime
@@ -40,6 +42,10 @@ SCHEMA_VERSION = 1
 TERMINAL_STATES = {"imported_ok", "data_error", "manual_required", "not_run"}
 _SEND2UE_UNREAL_MODULES = {}
 PLACEHOLDER_SKELETON_NAME = "SK_PlaceholderCube_Skeleton"
+FINAL_SKELETON_HASH_METADATA = (
+    "SKBatchFinalSkeletonBoneNameIndexParentSha1"
+)
+FINAL_SKELETON_BONE_COUNT_METADATA = "SKBatchFinalSkeletonBoneCount"
 
 
 def _now():
@@ -179,48 +185,176 @@ def _without_generated_physics_assets(send2ue_unreal):
         importer_class.set_physics_asset = original
 
 
+@contextmanager
+def _without_existing_skeleton_binding(send2ue_unreal):
+    """Force primary SpeedTree FBXs to create their own Skeleton.
+
+    Assembly-generated parts are imported outside this context and can still
+    bind to the explicit final Skeleton path in their ingest plan.
+    """
+
+    importer_class = getattr(send2ue_unreal, "UnrealImportAsset", None)
+    original = getattr(importer_class, "set_skeleton", None)
+    if importer_class is None or not callable(original):
+        yield False
+        return
+
+    def clear_skeleton(self):
+        options = getattr(self, "_options", None)
+        if options is None:
+            raise RuntimeError("Send2UE import options are not initialized")
+        try:
+            options.set_editor_property("skeleton", None)
+        except Exception:
+            options.skeleton = None
+
+    importer_class.set_skeleton = clear_skeleton
+    try:
+        yield True
+    finally:
+        importer_class.set_skeleton = original
+
+
+@contextmanager
+def _with_explicit_skeleton_binding(send2ue_unreal, skeleton_path):
+    """Bind one FBX import to the incoming Skeleton created in staging."""
+
+    importer_class = getattr(send2ue_unreal, "UnrealImportAsset", None)
+    original = getattr(importer_class, "set_skeleton", None)
+    if importer_class is None or not callable(original):
+        raise RuntimeError(
+            "Send2UE importer cannot bind the incoming FBX Skeleton"
+        )
+
+    def bind_skeleton(self):
+        options = getattr(self, "_options", None)
+        if options is None:
+            raise RuntimeError("Send2UE import options are not initialized")
+        skeleton = unreal.EditorAssetLibrary.load_asset(skeleton_path)
+        if skeleton is None:
+            raise RuntimeError(
+                "incoming FBX Skeleton disappeared before final import: "
+                + skeleton_path
+            )
+        try:
+            options.set_editor_property("skeleton", skeleton)
+        except Exception:
+            options.skeleton = skeleton
+
+    importer_class.set_skeleton = bind_skeleton
+    try:
+        yield
+    finally:
+        importer_class.set_skeleton = original
+
+
 def _asset_package_path(asset):
     if asset is None:
         return ""
     try:
         return str(asset.get_path_name()).split(".", 1)[0]
     except Exception:
-        return ""
+        return str(getattr(asset, "path", "") or "").split(".", 1)[0]
 
 
-def _manifest_asset_paths(item):
-    paths = []
-    seen = set()
+def _normalized_unreal_asset_path(value):
+    return str(value or "").split(".", 1)[0]
+
+
+def _manifest_asset_path_groups(item):
+    groups = {
+        "manifest_assets": [],
+        "cluster_assembly": [],
+    }
+    invalid_contract_fields = []
+
+    def append(group, value):
+        path = _normalized_unreal_asset_path(value)
+        if path and path not in groups[group]:
+            groups[group].append(path)
+
     for manifest_asset in item.get("assets") or []:
         asset_data = manifest_asset.get("asset_data") or {}
         if asset_data.get("skip"):
             continue
-        path = str(asset_data.get("asset_path") or "").split(".", 1)[0]
-        if path and path not in seen:
-            seen.add(path)
-            paths.append(path)
+        append("manifest_assets", asset_data.get("asset_path"))
+
+    assembly = item.get("cluster_assembly") or {}
+    plan = assembly.get("ingest_plan") or {}
+    if plan.get("status") == "ready":
+        contract = plan.get("asset_contract") or {}
+        for field in (
+            "full_skeletal_mesh",
+            "base_skeletal_mesh",
+            "assembly",
+        ):
+            value = contract.get(field)
+            if not _normalized_unreal_asset_path(value):
+                invalid_contract_fields.append(field)
+            append("cluster_assembly", value)
+        parts = contract.get("parts")
+        if parts is None:
+            invalid_contract_fields.append("parts")
+        elif not isinstance(parts, dict):
+            invalid_contract_fields.append("parts:not_dict")
+        else:
+            for part_id in sorted(parts):
+                value = parts[part_id]
+                if not _normalized_unreal_asset_path(value):
+                    invalid_contract_fields.append(f"parts.{part_id}")
+                append("cluster_assembly", value)
+
+    return groups, invalid_contract_fields
+
+
+def _manifest_asset_paths(item):
+    groups, _invalid_contract_fields = _manifest_asset_path_groups(item)
+    paths = []
+    seen = set()
+    for group_paths in groups.values():
+        for path in group_paths:
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
     return paths
 
 
 def _verify_manifest_assets_exist(item):
     """Validate a local import receipt against the active Unreal project."""
+    groups, invalid_contract_fields = _manifest_asset_path_groups(item)
     paths = _manifest_asset_paths(item)
-    missing = [
-        path
-        for path in paths
-        if not unreal.EditorAssetLibrary.does_asset_exist(path)
-    ]
+    missing_by_group = {
+        group: [
+            path
+            for path in group_paths
+            if not unreal.EditorAssetLibrary.does_asset_exist(path)
+        ]
+        for group, group_paths in groups.items()
+    }
+    missing = []
+    for group_paths in missing_by_group.values():
+        for path in group_paths:
+            if path not in missing:
+                missing.append(path)
+    complete = (
+        bool(paths)
+        and not missing
+        and not invalid_contract_fields
+    )
     return {
         "status": (
             "current"
-            if paths and not missing
+            if complete
             else "missing"
-            if missing
+            if missing or invalid_contract_fields
             else "no_assets"
         ),
-        "complete": bool(paths) and not missing,
+        "complete": complete,
         "asset_paths": paths,
         "missing_asset_paths": missing,
+        "asset_path_groups": groups,
+        "missing_asset_paths_by_group": missing_by_group,
+        "invalid_contract_fields": invalid_contract_fields,
     }
 
 
@@ -559,6 +693,238 @@ def _import_manifest_asset(send2ue_unreal, manifest_asset):
     }
 
 
+def _import_manifest_asset_with_fresh_skeleton(
+    send2ue_unreal,
+    manifest_asset,
+    item=None,
+):
+    """Create the incoming Skeleton and mesh cleanly, then publish both.
+
+    Deleting and immediately reimporting at the same package path can make
+    AssetTools reuse the pending-kill SkeletalMesh and its placeholder
+    Skeleton.  Import the FBX exactly once in a transient package, move that
+    proven mesh and its incoming Skeleton to their owned public paths, and only
+    then run the original post-import operations.  A second FBX import at the
+    just-deleted public path is deliberately avoided: Unreal can reload the
+    source-controlled placeholder package during that import and silently put
+    the shared placeholder Skeleton back on the final mesh.
+    """
+
+    original_asset_data = manifest_asset.get("asset_data") or {}
+    final_asset_path = str(
+        original_asset_data.get("asset_path") or ""
+    ).split(".", 1)[0]
+    if not final_asset_path or "/" not in final_asset_path:
+        raise RuntimeError(
+            "fresh Skeleton import has no final asset path"
+        )
+    if original_asset_data.get("_asset_type") != "SkeletalMesh":
+        return _import_manifest_asset(send2ue_unreal, manifest_asset)
+
+    final_folder, final_name = final_asset_path.rsplit("/", 1)
+    expected = _expected_final_skeleton_contract(item or {})
+    legacy_token = str((expected or {}).get("hash") or "")[:12]
+    transaction_token = (
+        re.sub(r"[^0-9A-Za-z]+", "", legacy_token)[:12]
+        + f"{os.getpid():x}"
+        + uuid.uuid4().hex[:8]
+    )
+    staging_folder = (
+        f"{final_folder}/__SKBatchStaging_{transaction_token}"
+    )
+    staging_asset_path = f"{staging_folder}/{final_name}"
+    staging_skeleton_path = staging_asset_path + "_Skeleton"
+
+    staged = deepcopy(manifest_asset)
+    staged_asset_data = staged["asset_data"]
+    staged_asset_data["asset_folder"] = staging_folder + "/"
+    staged_asset_data["asset_path"] = staging_asset_path
+    staged["post_import_commands"] = []
+    staged["operations"] = {}
+    staged_result = _import_manifest_asset(send2ue_unreal, staged)
+
+    staging_mesh = unreal.EditorAssetLibrary.load_asset(
+        staging_asset_path
+    )
+    if staging_mesh is None:
+        raise RuntimeError(
+            "fresh Skeleton staging mesh was not created: "
+            + staging_asset_path
+        )
+    incoming_skeleton = staging_mesh.get_editor_property("skeleton")
+    if incoming_skeleton is None:
+        raise RuntimeError(
+            "incoming FBX created no Skeleton in staging: "
+            + staging_asset_path
+        )
+    if incoming_skeleton.get_name() == PLACEHOLDER_SKELETON_NAME:
+        raise RuntimeError(
+            "incoming FBX was incorrectly bound to the shared placeholder "
+            "even in a clean staging package"
+        )
+    incoming_skeleton_path = _asset_package_path(incoming_skeleton)
+    final_skeleton_path = final_asset_path + "_Skeleton"
+    moves = []
+    relocated = []
+    old_owned_skeletons = []
+    old_mesh = (
+        unreal.EditorAssetLibrary.load_asset(final_asset_path)
+        if unreal.EditorAssetLibrary.does_asset_exist(final_asset_path)
+        else None
+    )
+    old_mesh_skeleton = (
+        old_mesh.get_editor_property("skeleton")
+        if old_mesh is not None
+        and not _asset_path_is_redirector(final_asset_path)
+        else None
+    )
+    old_mesh_skeleton_path = _asset_package_path(old_mesh_skeleton)
+    if (
+        old_mesh_skeleton_path
+        and old_mesh_skeleton is not None
+        and old_mesh_skeleton.get_name() != PLACEHOLDER_SKELETON_NAME
+        and _is_owned_final_skeleton_path(
+            old_mesh_skeleton_path,
+            final_skeleton_path,
+        )
+        and old_mesh_skeleton_path.casefold()
+        != final_skeleton_path.casefold()
+    ):
+        old_owned_skeletons.append(old_mesh_skeleton_path)
+
+    try:
+        for canonical_path, role in (
+            (final_asset_path, "previous canonical mesh"),
+            (final_skeleton_path, "previous canonical Skeleton"),
+        ):
+            if not unreal.EditorAssetLibrary.does_asset_exist(
+                canonical_path
+            ):
+                continue
+            if _asset_path_is_redirector(canonical_path):
+                raise RuntimeError(
+                    "canonical publish path contains a pre-existing "
+                    f"redirector: {canonical_path}"
+                )
+            legacy_path = _unique_transaction_asset_path(
+                canonical_path,
+                "Legacy",
+                transaction_token,
+            )
+            record = _move_asset_for_publish(
+                moves,
+                canonical_path,
+                legacy_path,
+                role,
+            )
+            relocated.append(record)
+
+        _move_asset_for_publish(
+            moves,
+            incoming_skeleton_path,
+            final_skeleton_path,
+            "incoming Skeleton publish",
+        )
+        _move_asset_for_publish(
+            moves,
+            staging_asset_path,
+            final_asset_path,
+            "staged mesh publish",
+        )
+
+        final_mesh = unreal.EditorAssetLibrary.load_asset(
+            final_asset_path
+        )
+        final_skeleton = (
+            final_mesh.get_editor_property("skeleton")
+            if final_mesh is not None
+            else None
+        )
+        if final_skeleton is None:
+            raise RuntimeError(
+                "final SpeedTree mesh has no incoming FBX Skeleton: "
+                + final_asset_path
+            )
+        if final_skeleton.get_name() == PLACEHOLDER_SKELETON_NAME:
+            raise RuntimeError(
+                "final SpeedTree mesh still references the shared "
+                "placeholder Skeleton"
+            )
+        if (
+            _asset_package_path(final_skeleton).casefold()
+            != final_skeleton_path.casefold()
+        ):
+            raise RuntimeError(
+                "final SpeedTree mesh does not reference the canonical "
+                f"incoming Skeleton: {_asset_package_path(final_skeleton)}"
+            )
+
+        _execute_command_groups(
+            manifest_asset.get("post_import_commands"),
+            "post_import",
+        )
+        _run_lod_and_socket_operations(
+            send2ue_unreal,
+            manifest_asset,
+            original_asset_data,
+            manifest_asset.get("property_data") or {},
+        )
+    except Exception as exc:
+        rollback = _rollback_asset_publish_moves(moves)
+        if rollback["failed"]:
+            raise RuntimeError(
+                f"{exc}\nSK Batch publish rollback also failed: "
+                + "; ".join(rollback["failed"])
+            ) from exc
+        raise
+
+    legacy_cleanup = _cleanup_unreferenced_legacy_assets(
+        [
+            record["target"]
+            for record in relocated
+            if record["role"] == "previous canonical mesh"
+        ]
+        + [
+            record["target"]
+            for record in relocated
+            if record["role"] == "previous canonical Skeleton"
+        ]
+        + old_owned_skeletons
+    )
+    final_result = {
+        **staged_result,
+        "asset_path": final_asset_path,
+    }
+    staging_cleanup = {
+        "folder": staging_folder,
+        "deleted": False,
+    }
+    if unreal.EditorAssetLibrary.does_directory_exist(staging_folder):
+        staging_cleanup["deleted"] = bool(
+            unreal.EditorAssetLibrary.delete_directory(staging_folder)
+        )
+    return {
+        **final_result,
+        "asset_path": final_asset_path,
+        "staged_import": {
+            "mesh": staging_asset_path,
+            "incoming_skeleton": incoming_skeleton_path,
+            "final_mesh": final_asset_path,
+            "final_skeleton": _asset_package_path(final_skeleton),
+            "relocated_previous_assets": [
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key != "asset"
+                }
+                for record in relocated
+            ],
+            "legacy_cleanup": legacy_cleanup,
+            "staging_cleanup": staging_cleanup,
+        },
+    }
+
+
 def _parse_codex_material_tool_result(raw):
     values = raw if isinstance(raw, tuple) else (raw,)
     payload = next(
@@ -639,8 +1005,340 @@ def _normalize_existing_skeletal_mesh_imported_slot_names(asset_path):
     return {"status": "normalized", "asset": path, "changes": changes}
 
 
+def _expected_final_skeleton_contract(item):
+    policy = item.get("wind_policy") or {}
+    if not policy.get("requires_json"):
+        return None
+    wind_json = Path(str(item.get("wind_json") or ""))
+    if not wind_json.is_file():
+        raise RuntimeError(
+            "final-skeleton DynamicWind JSON is missing before import: "
+            + str(wind_json)
+        )
+    try:
+        payload = json.loads(wind_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "final-skeleton DynamicWind JSON could not be read: "
+            + str(wind_json)
+        ) from exc
+    contract = payload.get("SkeletonContract")
+    if not isinstance(contract, dict):
+        raise RuntimeError(
+            "final-skeleton DynamicWind JSON has no SkeletonContract: "
+            + str(wind_json)
+        )
+    skeleton_hash = str(
+        contract.get("BoneNameIndexParentSha1") or ""
+    ).strip()
+    bone_count = int(contract.get("BoneCount") or 0)
+    if not skeleton_hash or bone_count <= 0:
+        raise RuntimeError(
+            "final-skeleton DynamicWind JSON has an incomplete "
+            "SkeletonContract: "
+            + str(wind_json)
+        )
+    return {
+        "hash": skeleton_hash,
+        "bone_count": bone_count,
+        "wind_json": str(wind_json),
+    }
+
+
+def _asset_metadata(asset, key):
+    getter = getattr(unreal.EditorAssetLibrary, "get_metadata_tag", None)
+    if asset is None or not callable(getter):
+        return ""
+    return str(getter(asset, key) or "").strip()
+
+
+def _asset_referencers(asset_path):
+    finder = getattr(
+        unreal.EditorAssetLibrary,
+        "find_package_referencers_for_asset",
+        None,
+    )
+    if not callable(finder):
+        return []
+    try:
+        values = finder(asset_path, True)
+    except TypeError:
+        values = finder(asset_path)
+    return sorted(
+        {
+            str(value).split(".", 1)[0]
+            for value in (values or [])
+            if value
+        }
+    )
+
+
+def _asset_path_is_redirector(asset_path):
+    asset_path = str(asset_path).split(".", 1)[0]
+    if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return False
+    finder = getattr(
+        unreal.EditorAssetLibrary,
+        "find_asset_data",
+        None,
+    )
+    if callable(finder):
+        data = finder(asset_path)
+        predicate = getattr(data, "is_redirector", None)
+        if callable(predicate):
+            return bool(predicate())
+        class_path = getattr(data, "asset_class_path", None)
+        class_name = str(
+            getattr(class_path, "asset_name", "")
+            or getattr(data, "asset_class", "")
+            or ""
+        )
+        if class_name.casefold() == "objectredirector":
+            return True
+    loaded = unreal.EditorAssetLibrary.load_asset(asset_path)
+    if isinstance(loaded, dict):
+        return str(loaded.get("class") or "").casefold() == "objectredirector"
+    get_class = getattr(loaded, "get_class", None)
+    if callable(get_class):
+        klass = get_class()
+        get_name = getattr(klass, "get_name", None)
+        if callable(get_name):
+            return str(get_name()).casefold() == "objectredirector"
+    return False
+
+
+def _clear_transaction_redirector(asset_path):
+    asset_path = str(asset_path).split(".", 1)[0]
+    if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return False
+    if not _asset_path_is_redirector(asset_path):
+        raise RuntimeError(
+            "transaction path is occupied by a non-redirector asset: "
+            + asset_path
+        )
+    if not unreal.EditorAssetLibrary.delete_asset(asset_path):
+        raise RuntimeError(
+            "failed to remove transaction redirector: " + asset_path
+        )
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        raise RuntimeError(
+            "transaction redirector still occupies its package: "
+            + asset_path
+        )
+    return True
+
+
+def _unique_transaction_asset_path(asset_path, label, token):
+    asset_path = str(asset_path).split(".", 1)[0]
+    suffix = re.sub(r"[^0-9A-Za-z]+", "", str(token))[:20]
+    suffix = suffix or uuid.uuid4().hex[:12]
+    base = f"{asset_path}_{label}_{suffix}"
+    candidate = base
+    sequence = 1
+    while unreal.EditorAssetLibrary.does_asset_exist(candidate):
+        sequence += 1
+        candidate = f"{base}_{sequence:02d}"
+    return candidate
+
+
+def _move_asset_for_publish(journal, source_path, target_path, role):
+    source_path = str(source_path).split(".", 1)[0]
+    target_path = str(target_path).split(".", 1)[0]
+    if not unreal.EditorAssetLibrary.does_asset_exist(source_path):
+        raise RuntimeError(
+            f"{role} source asset is missing: {source_path}"
+        )
+    if _asset_path_is_redirector(source_path):
+        raise RuntimeError(
+            f"{role} source path is a redirector, not an asset: "
+            + source_path
+        )
+    if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+        raise RuntimeError(
+            f"{role} destination is occupied before move: "
+            + target_path
+        )
+    asset = unreal.EditorAssetLibrary.load_asset(source_path)
+    if asset is None:
+        raise RuntimeError(f"{role} source asset could not be loaded.")
+    record = {
+        "role": role,
+        "source": source_path,
+        "target": target_path,
+        "asset": asset,
+        "referencers_before": _asset_referencers(source_path),
+        "moved": False,
+        "source_redirector_cleared": False,
+    }
+    journal.append(record)
+    renamed = bool(
+        unreal.EditorAssetLibrary.rename_asset(
+            source_path,
+            target_path,
+        )
+    )
+    actual_path = _asset_package_path(asset)
+    moved = (
+        actual_path.casefold() == target_path.casefold()
+        and unreal.EditorAssetLibrary.does_asset_exist(target_path)
+    )
+    record["moved"] = moved
+    if not renamed or not moved:
+        raise RuntimeError(
+            f"{role} move failed: {source_path} -> {target_path}"
+        )
+    record["source_redirector_cleared"] = (
+        _clear_transaction_redirector(source_path)
+    )
+    return record
+
+
+def _rollback_asset_publish_moves(journal):
+    restored = []
+    failed = []
+    for record in reversed(journal):
+        if not record.get("moved"):
+            continue
+        source_path = record["source"]
+        target_path = record["target"]
+        asset = record["asset"]
+        actual_path = _asset_package_path(asset)
+        if actual_path.casefold() == source_path.casefold():
+            restored.append(record["role"])
+            continue
+        if actual_path.casefold() != target_path.casefold():
+            failed.append(
+                f"{record['role']}: asset is at {actual_path or '<missing>'}, "
+                f"expected {target_path}"
+            )
+            continue
+        try:
+            _clear_transaction_redirector(source_path)
+            if unreal.EditorAssetLibrary.does_asset_exist(source_path):
+                raise RuntimeError(
+                    "rollback destination is still occupied: "
+                    + source_path
+                )
+            rollback_journal = []
+            _move_asset_for_publish(
+                rollback_journal,
+                target_path,
+                source_path,
+                record["role"] + " rollback",
+            )
+            restored.append(record["role"])
+        except Exception as exc:
+            failed.append(
+                f"{record['role']}: {type(exc).__name__}: {exc}"
+            )
+    return {"restored": restored, "failed": failed}
+
+
+def _cleanup_unreferenced_legacy_assets(asset_paths):
+    finder = getattr(
+        unreal.EditorAssetLibrary,
+        "find_package_referencers_for_asset",
+        None,
+    )
+    cleaned = []
+    preserved = []
+    for asset_path in asset_paths:
+        asset_path = str(asset_path).split(".", 1)[0]
+        if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+            continue
+        if not callable(finder):
+            preserved.append(
+                {
+                    "asset": asset_path,
+                    "reason": "referencer API unavailable",
+                }
+            )
+            continue
+        referencers = _asset_referencers(asset_path)
+        if referencers:
+            preserved.append(
+                {
+                    "asset": asset_path,
+                    "referencers": referencers,
+                }
+            )
+            continue
+        if not unreal.EditorAssetLibrary.delete_asset(asset_path):
+            preserved.append(
+                {
+                    "asset": asset_path,
+                    "reason": "unreferenced legacy delete failed",
+                }
+            )
+            continue
+        collector = getattr(
+            getattr(unreal, "SystemLibrary", None),
+            "collect_garbage",
+            None,
+        )
+        if not callable(collector):
+            collector = getattr(unreal, "collect_garbage", None)
+        if callable(collector):
+            collector()
+        if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+            preserved.append(
+                {
+                    "asset": asset_path,
+                    "reason": (
+                        "unreferenced legacy package remains after delete"
+                    ),
+                }
+            )
+            continue
+        cleaned.append(asset_path)
+    return {"cleaned": cleaned, "preserved": preserved}
+
+
+def _vacate_canonical_skeleton_path(asset_path, *, legacy_token=""):
+    """Relocate a canonical Skeleton without deleting/reusing its package."""
+    asset_path = str(asset_path).split(".", 1)[0]
+    if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return {"status": "absent", "asset_path": asset_path}
+
+    referencers = _asset_referencers(asset_path)
+    token = re.sub(r"[^0-9A-Za-z]+", "", str(legacy_token))[:12]
+    token = token or "Preserved"
+    legacy_path = _unique_transaction_asset_path(
+        asset_path,
+        "Legacy",
+        token,
+    )
+    journal = []
+    record = _move_asset_for_publish(
+        journal,
+        asset_path,
+        legacy_path,
+        "canonical Skeleton relocation",
+    )
+    return {
+        "status": "relocated",
+        "asset_path": asset_path,
+        "legacy_path": legacy_path,
+        "redirector_cleared": record["source_redirector_cleared"],
+        "referencers": referencers,
+    }
+
+
+def _is_owned_final_skeleton_path(skeleton_path, default_skeleton):
+    """Recognize canonical and legacy content-addressed SK Batch paths."""
+    value = str(skeleton_path).casefold()
+    canonical = str(default_skeleton).casefold()
+    if value == canonical:
+        return True
+    suffix = value[len(canonical):] if value.startswith(canonical) else ""
+    return re.fullmatch(
+        r"_(?:[0-9a-f]{12}(?:_\d+)?|incoming(?:_\d+)?)",
+        suffix,
+    ) is not None
+
+
 def _clear_placeholder_skeleton_before_import(item):
-    """Force a fresh, dedicated ``<mesh>_Skeleton`` on reimport.
+    """Plan a deterministic owned-Skeleton refresh without deleting assets.
 
     The migration seeded every not-yet-converted slot with a dummy that shares a
     single ``SK_PlaceholderCube_Skeleton``.  Reimporting the real FBX *in place*
@@ -649,33 +1347,118 @@ def _clear_placeholder_skeleton_before_import(item):
     instanced skinning per skeleton, so meshes with different bone counts sharing
     one skeleton assert-crash the renderer the instant a wind provider attaches.
 
-    Deleting only the placeholder *mesh* (never the shared skeleton, which the
-    other dummies still reference) makes the subsequent Send2UE import a fresh
-    import, which creates a new dedicated skeleton the same way cleanly-imported
-    siblings got theirs.  A mesh that already has its own skeleton, or a slot with
-    nothing imported yet, is left untouched.
+    A final tree Skeleton is also replaced when its asset-grounded contract
+    metadata is missing or differs from the incoming DynamicWind
+    ``BoneNameIndexParentSha1``.  This avoids Unreal's unattended
+    "FAILED TO MERGE BONES" dialog while preserving a matching current Skeleton.
+    Shared/custom Skeletons with foreign referencers are never deleted.  Any
+    replaceable canonical mesh/Skeleton is relocated only after the incoming
+    staged pair has been validated; publish then either commits both assets or
+    rolls every move back.
     """
     mesh_path = item.get("mesh_path")
     if not mesh_path:
         return {"status": "skipped", "reason": "item has no mesh_path"}
     asset_path = mesh_path.split(".")[0]
     if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-        return {"status": "fresh"}
+        orphan_skeleton = asset_path + "_Skeleton"
+        if unreal.EditorAssetLibrary.does_asset_exist(orphan_skeleton):
+            expected = _expected_final_skeleton_contract(item)
+            return {
+                "status": "fresh_publish_required",
+                "reason": "orphan canonical Skeleton",
+                "requires_fresh_publish": True,
+                "canonical_assets": [orphan_skeleton],
+                "final_skeleton_contract": expected,
+            }
+        return {
+            "status": "fresh",
+            "requires_fresh_publish": False,
+        }
     mesh = unreal.EditorAssetLibrary.load_asset(asset_path)
     skeleton = mesh.get_editor_property("skeleton") if mesh else None
-    if skeleton is None or skeleton.get_name() != PLACEHOLDER_SKELETON_NAME:
+    skeleton_path = (
+        str(skeleton.get_path_name()).split(".", 1)[0]
+        if skeleton is not None
+        else ""
+    )
+    placeholder = (
+        skeleton is not None
+        and skeleton.get_name() == PLACEHOLDER_SKELETON_NAME
+    )
+    shared_skeleton_path = (
+        skeleton.get_path_name() if placeholder else None
+    )
+    expected = _expected_final_skeleton_contract(item)
+    saved_hash = _asset_metadata(mesh, FINAL_SKELETON_HASH_METADATA)
+    saved_bone_count = _asset_metadata(
+        mesh,
+        FINAL_SKELETON_BONE_COUNT_METADATA,
+    )
+    current_final_skeleton = bool(
+        expected
+        and saved_hash.casefold() == expected["hash"].casefold()
+        and saved_bone_count == str(expected["bone_count"])
+    )
+    if not placeholder and (expected is None or current_final_skeleton):
         return {
             "status": "ok",
             "skeleton": skeleton.get_path_name() if skeleton else None,
+            "final_skeleton_contract": (
+                {
+                    **expected,
+                    "asset_metadata_current": True,
+                }
+                if expected
+                else None
+            ),
         }
-    if not unreal.EditorAssetLibrary.delete_asset(asset_path):
-        raise RuntimeError(
-            f"failed to delete placeholder mesh for fresh skeleton: {asset_path}"
-        )
+
+    default_skeleton = asset_path + "_Skeleton"
+    owned_skeletons = []
+    if not placeholder and skeleton_path:
+        if not _is_owned_final_skeleton_path(
+            skeleton_path,
+            default_skeleton,
+        ):
+            raise RuntimeError(
+                "cannot replace stale final Skeleton because the mesh uses "
+                f"a non-owned Skeleton: {skeleton_path}"
+            )
+        owned_skeletons.append(skeleton_path)
+    if unreal.EditorAssetLibrary.does_asset_exist(default_skeleton):
+        owned_skeletons.append(default_skeleton)
+    owned_skeletons = list(dict.fromkeys(owned_skeletons))
+
+    foreign_referencers = {}
+    for owned_skeleton in owned_skeletons:
+        foreign = [
+            path
+            for path in _asset_referencers(owned_skeleton)
+            if path.casefold() != asset_path.casefold()
+        ]
+        if foreign:
+            foreign_referencers[owned_skeleton] = foreign
+
     return {
-        "status": "cleared_placeholder",
-        "deleted": asset_path,
-        "shared_skeleton": skeleton.get_path_name(),
+        "status": "fresh_publish_required",
+        "reason": (
+            "shared placeholder Skeleton"
+            if placeholder
+            else "stale final Skeleton contract"
+        ),
+        "requires_fresh_publish": True,
+        "canonical_assets": [
+            asset_path,
+            *owned_skeletons,
+        ],
+        "shared_skeleton": shared_skeleton_path,
+        "preserved_referenced_skeletons": foreign_referencers,
+        "final_skeleton_contract": expected,
+        "previous_asset_metadata": {
+            "hash": saved_hash or None,
+            "bone_count": saved_bone_count or None,
+        },
     }
 
 
@@ -722,11 +1505,45 @@ def _apply_dynamic_wind(item):
         )
     if not payload.get("skeleton_hash"):
         raise RuntimeError("dynamic wind importer returned no skeleton hash")
+    expected = _expected_final_skeleton_contract(item)
+    if expected and (
+        str(payload.get("skeleton_hash")).casefold()
+        != expected["hash"].casefold()
+        or int(payload.get("final_bones") or 0)
+        != expected["bone_count"]
+    ):
+        raise RuntimeError(
+            "dynamic wind importer returned a Skeleton that differs from "
+            "the current JSON contract"
+        )
+    metadata = {}
+    if expected:
+        setter = getattr(
+            unreal.EditorAssetLibrary,
+            "set_metadata_tag",
+            None,
+        )
+        if not callable(setter):
+            raise RuntimeError(
+                "Unreal EditorAssetLibrary cannot persist final Skeleton "
+                "contract metadata"
+            )
+        setter(mesh, FINAL_SKELETON_HASH_METADATA, expected["hash"])
+        setter(
+            mesh,
+            FINAL_SKELETON_BONE_COUNT_METADATA,
+            str(expected["bone_count"]),
+        )
+        metadata = {
+            "hash": expected["hash"],
+            "bone_count": expected["bone_count"],
+        }
     return {
         "status": "ok",
         "mesh": mesh_path,
         "wind_json": file_fingerprint(wind_json),
         "result": payload,
+        "asset_metadata": metadata,
     }
 
 
@@ -743,6 +1560,11 @@ def _save_final_skeleton_contract_assets(full_mesh):
     skeleton = full_mesh.get_editor_property("skeleton")
     if skeleton is None:
         raise RuntimeError("cannot save Full SK without its final Skeleton")
+    if skeleton.get_name() == PLACEHOLDER_SKELETON_NAME:
+        raise RuntimeError(
+            "final SpeedTree mesh still references the shared placeholder "
+            "Skeleton; refusing to save or mutate it"
+        )
     # Save the referenced dependency first, then the referring mesh package.
     asset_paths = [skeleton.get_path_name(), full_mesh.get_path_name()]
     saved = []
@@ -950,6 +1772,14 @@ def _best_effort_cancel_instanced_dynamic_wind_runtime(probe_token):
 def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     payload = item.get("cluster_assembly")
     if not payload:
+        if (
+            item.get("dependency_orchestrated")
+            or item.get("depends_on_queue_ids")
+        ):
+            raise RuntimeError(
+                "dependency-orchestrated Tree has no content-driven "
+                "Cluster Assembly manifest"
+            )
         return {"status": "skipped", "reason": "no content-driven Assembly manifest"}
     plan = payload.get("ingest_plan") or {}
     if plan.get("status") == "pass_through":
@@ -1167,15 +1997,47 @@ def _save_item_assets(item, imported_assets):
 
 def ingest_item(item):
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
-    skeleton = _clear_placeholder_skeleton_before_import(item)
     checkout = _checkout_existing_assets(item)
+    # Source-controlled packages must be writable before stale mesh/Skeleton
+    # cleanup.  Deleting a read-only package can disappear from the in-memory
+    # registry while remaining on disk, after which AssetTools reloads it and
+    # triggers Unreal's unattended "FAILED TO MERGE BONES" dialog.
+    skeleton = _clear_placeholder_skeleton_before_import(item)
     mesh_path = item["mesh_path"]
     default_physics_asset_preexisting = _default_physics_asset_preexisting(
         mesh_path
     )
-    with _without_generated_physics_assets(send2ue_unreal) as generation_disabled:
+    fresh_skeleton_import = bool(
+        skeleton.get("requires_fresh_publish")
+    )
+    with (
+        _without_generated_physics_assets(
+            send2ue_unreal
+        ) as generation_disabled,
+        _without_existing_skeleton_binding(
+            send2ue_unreal
+        ) as skeleton_binding_disabled,
+    ):
         imported_assets = [
-            _import_manifest_asset(send2ue_unreal, manifest_asset)
+            (
+                _import_manifest_asset_with_fresh_skeleton(
+                    send2ue_unreal,
+                    manifest_asset,
+                    item,
+                )
+                if fresh_skeleton_import
+                and str(
+                    (manifest_asset.get("asset_data") or {}).get(
+                        "asset_path"
+                    )
+                    or ""
+                ).split(".", 1)[0].casefold()
+                == mesh_path.casefold()
+                else _import_manifest_asset(
+                    send2ue_unreal,
+                    manifest_asset,
+                )
+            )
             for manifest_asset in item.get("assets") or []
         ]
     optimization = _prepare_speedtree_skeletal_optimization(
@@ -1183,12 +2045,23 @@ def ingest_item(item):
         default_physics_asset_preexisting,
     )
     optimization["physics_asset_generation_disabled"] = generation_disabled
+    optimization["existing_skeleton_binding_disabled"] = (
+        skeleton_binding_disabled
+    )
     material_checkouts = _material_pipeline_checkouts()
     checkout["material_pipeline"] = material_checkouts
     checkout["checked_out"] = list(
         dict.fromkeys(list(checkout["checked_out"]) + material_checkouts)
     )
     wind = _apply_dynamic_wind(item)
+    final_skeleton_saved = {}
+    if (
+        wind.get("status") == "ok"
+        and (item.get("wind_policy") or {}).get("requires_json")
+    ):
+        final_skeleton_saved = _save_final_skeleton_contract_assets(
+            unreal.EditorAssetLibrary.load_asset(mesh_path)
+        )
     assembly = _ingest_cluster_assembly(send2ue_unreal, item, wind)
     imported_assets.extend(assembly.get("assets") or [])
     saved = _save_item_assets(item, imported_assets)
@@ -1201,6 +2074,7 @@ def ingest_item(item):
         "assets": imported_assets,
         "skeleton": skeleton,
         "wind": wind,
+        "final_skeleton_saved": final_skeleton_saved,
         "cluster_assembly": assembly,
         "materials": materials,
         "optimization": optimization,

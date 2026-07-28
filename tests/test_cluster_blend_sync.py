@@ -1,5 +1,7 @@
+import gzip
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import cluster_blend_sync as cluster_sync
 from atlas_target_registry import save_target_registry
 from cluster_blend_sync import (
     ClusterBlendSyncError,
@@ -40,6 +43,9 @@ def write_scope_manifest(
     material="M_branch_elm_01",
     canonical_spm=None,
     capture_contract_sha256=None,
+    material_groups=None,
+    source_fbx=None,
+    connection_requested=None,
 ):
     scope = target.parent / ".atlas_leaf_speedtree_scopes"
     scope.mkdir(exist_ok=True)
@@ -52,16 +58,26 @@ def write_scope_manifest(
         "generator_connection": {"complete": complete},
         "source_material_adoption": {"material_name": material, "material_id": 8},
     }
+    if connection_requested is not None:
+        payload["generator_connection"]["requested"] = connection_requested
+    if material_groups is not None:
+        payload["material_groups"] = material_groups
     if canonical_spm is not None:
+        source_contract = {
+            "source_spm": str(canonical_spm),
+            "source_spm_sha256": file_sha256(canonical_spm),
+        }
+        if source_fbx is not None:
+            source_contract.update({
+                "source_fbx": str(source_fbx),
+                "source_fbx_sha256": file_sha256(source_fbx),
+            })
         payload["normalized_prototype_receipt"] = {
             "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
             "physical_capture_contract_sha256": capture_contract_sha256,
             "variants": [{
                 "plan_uv_transfer": {
-                    "source_3d_contract": {
-                        "source_spm": str(canonical_spm),
-                        "source_spm_sha256": file_sha256(canonical_spm),
-                    },
+                    "source_3d_contract": source_contract,
                 },
             }],
         }
@@ -69,7 +85,109 @@ def write_scope_manifest(
     return path
 
 
+def write_material_spm(path, material, material_id, mesh_ids):
+    mesh_ids = list(mesh_ids)
+    primary = (
+        f"<CutoutMeshID>{mesh_ids[0]}</CutoutMeshID>"
+        if mesh_ids else "<CutoutMeshID>-1</CutoutMeshID>"
+    )
+    supplemental = "".join(
+        f'<CutoutMesh ID="{value}"/>' for value in mesh_ids[1:]
+    )
+    payload = (
+        "<SpeedTree><Materials>"
+        f'<Material_v8 ID="{material_id}" Name="{material}">'
+        f"{primary}<SupplementalCutoutMeshIDs>{supplemental}"
+        "</SupplementalCutoutMeshIDs></Material_v8>"
+        "</Materials></SpeedTree>"
+    ).encode("utf-8")
+    path.write_bytes(gzip.compress(payload))
+
+
 class ClusterBlendSyncTests(unittest.TestCase):
+    def test_intentionally_unrequested_generator_connection_is_synced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "bush_blackgum"
+            cluster = owner / "cluster"
+            cluster.mkdir(parents=True)
+            target = owner / "SK_bush_blackgum_01.spm"
+            target.write_bytes(b"target")
+            canonical = cluster / "SK_cluster_blackgum_01.spm"
+            canonical.write_bytes(b"canonical")
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            set_cluster_relation_registry(blend, target, True)
+            write_scope_manifest(
+                blend,
+                target,
+                complete=False,
+                connection_requested=False,
+            )
+
+            row = discover_cluster_blend_relations(owner)[0]["targets"][0]
+
+            self.assertEqual(row["status"], "synced")
+            self.assertFalse(row["connected"])
+            self.assertFalse(row["connection_requested"])
+            self.assertTrue(row["connection_satisfied"])
+
+    def test_incomplete_requested_generator_connection_needs_attention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "bush_blackgum"
+            cluster = owner / "cluster"
+            cluster.mkdir(parents=True)
+            target = owner / "SK_bush_blackgum_01.spm"
+            target.write_bytes(b"target")
+            canonical = cluster / "SK_cluster_blackgum_01.spm"
+            canonical.write_bytes(b"canonical")
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            set_cluster_relation_registry(blend, target, True)
+            write_scope_manifest(
+                blend,
+                target,
+                complete=False,
+                connection_requested=True,
+            )
+
+            row = discover_cluster_blend_relations(owner)[0]["targets"][0]
+
+            self.assertEqual(row["status"], "attention")
+            self.assertFalse(row["connection_satisfied"])
+
+    def test_effective_target_merge_preserves_registry_and_adds_selection_once(self):
+        owner = Path("C:/Tree")
+        first = owner / "SK_Tree_01.spm"
+        second = owner / "SK_Tree_02.spm"
+        third = owner / "SK_Tree_03.spm"
+
+        merged = cluster_sync._merge_target_spms(
+            [first, second],
+            [second, third],
+        )
+
+        self.assertEqual(merged, [
+            first.absolute(),
+            second.absolute(),
+            third.absolute(),
+        ])
+
+    def test_content_hash_does_not_trust_size_and_mtime_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.spm"
+            path.write_bytes(b"source-v1")
+            before = path.stat()
+            first = cluster_sync._sha256_file(path)
+
+            path.write_bytes(b"source-v2")
+            os.utime(
+                path,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            second = cluster_sync._sha256_file(path)
+
+            self.assertNotEqual(first, second)
+
     def test_discovers_only_same_stem_sk_blend_and_lists_owner_targets_on_off(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
@@ -243,6 +361,147 @@ class ClusterBlendSyncTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(command[1:3], ["--factory-startup", "--background"])
             self.assertFalse(blend.with_suffix(".atlas_leaf_targets.json").exists())
+
+    def test_failed_apply_persists_pre_rollback_diagnostic_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            original_xml = (
+                "<SpeedTreeModel><Assets>"
+                '<Material_v8 ID="3" Name="M_branch">'
+                "<CutoutMeshID>3</CutoutMeshID>"
+                "</Material_v8>"
+                '<Mesh ID="3"><UserData /></Mesh>'
+                "</Assets></SpeedTreeModel>"
+            )
+            original_spm = gzip.compress(
+                original_xml.encode("utf-8"),
+                mtime=0,
+            )
+            target.write_bytes(original_spm)
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+
+            def fail_with_worker_report(command, **_kwargs):
+                failed_xml = (
+                    "<SpeedTreeModel><Assets>"
+                    '<Material_v8 ID="3" Name="M_branch">'
+                    "<CutoutMeshID>3</CutoutMeshID>"
+                    '<UserData>{"generator":"atlas_leaf_mesh_builder",'
+                    '"scope":"scope-a","kind":"material"}</UserData>'
+                    "</Material_v8>"
+                    '<Mesh ID="3"><UserData>{"generator":'
+                    '"atlas_leaf_mesh_builder","scope":"scope-a",'
+                    '"kind":"mesh"}</UserData></Mesh>'
+                    "</Assets></SpeedTreeModel>"
+                )
+                target.write_bytes(
+                    gzip.compress(
+                        failed_xml.encode("utf-8"),
+                        mtime=0,
+                    )
+                )
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                worker_diagnostic = (
+                    cluster
+                    / "reports"
+                    / (
+                        f"{blend.stem}_cluster_relation_failure_"
+                        "worker.json"
+                    )
+                )
+                worker_diagnostic.parent.mkdir(parents=True)
+                worker_diagnostic.write_text(
+                    json.dumps({
+                        "kind": "cluster_relation_failure_diagnostic",
+                        "version": 1,
+                        "recorded_at": "worker-time",
+                        "phase": "blender_worker_exception",
+                    }),
+                    encoding="utf-8",
+                )
+                report_path.write_text(
+                    json.dumps({
+                        "status": "error",
+                        "error": (
+                            "Adopted plans must use fresh Mesh IDs; "
+                            "source IDs cannot be reused.\n"
+                            "Failure diagnostic log: "
+                            + str(worker_diagnostic)
+                        ),
+                        "traceback": "worker traceback sentinel",
+                        "persistent_failure_report": str(
+                            worker_diagnostic
+                        ),
+                    }),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="worker stdout sentinel",
+                    stderr="worker stderr sentinel",
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=fail_with_worker_report,
+            ):
+                with self.assertRaises(ClusterBlendSyncError) as caught:
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
+                    )
+
+            reports = list(
+                (cluster / "reports").glob(
+                    f"{blend.stem}_cluster_relation_failure_*.json"
+                )
+            )
+            self.assertEqual(len(reports), 1)
+            diagnostic = json.loads(
+                reports[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["phase"], "worker_failed")
+            self.assertEqual(
+                diagnostic["worker_diagnostic"]["phase"],
+                "blender_worker_exception",
+            )
+            self.assertEqual(
+                diagnostic["worker_report"]["traceback"],
+                "worker traceback sentinel",
+            )
+            self.assertEqual(
+                diagnostic["process"]["stderr"],
+                "worker stderr sentinel",
+            )
+            self.assertTrue(
+                diagnostic["targets"][0]["changed_before_rollback"]
+            )
+            self.assertEqual(
+                diagnostic["targets"][0]["failed_spm"]["materials"][0],
+                {
+                    "id": 3,
+                    "name": "M_branch",
+                    "mesh_ids": [3],
+                    "atlas_scope": "scope-a",
+                },
+            )
+            self.assertEqual(target.read_bytes(), original_spm)
+            self.assertIn("Failure diagnostic log:", str(caught.exception))
+            self.assertIn(str(reports[0]), str(caught.exception))
+            self.assertEqual(
+                str(caught.exception).count("Failure diagnostic log:"),
+                1,
+            )
 
     def test_successful_sync_commits_shared_repair_runtime_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -517,6 +776,112 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"clean")
             self.assertFalse(blend.with_suffix(".atlas_leaf_targets.json").exists())
 
+    def test_off_failure_restores_registry_and_atlas_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.write_bytes(b"clean-spm")
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            save_target_registry(blend, [target])
+            registry_path = blend.with_suffix(".atlas_leaf_targets.json")
+            registry_before = registry_path.read_bytes()
+
+            import_manifest = owner / "speedtree_import_manifest.json"
+            import_manifest.write_bytes(b"clean-import")
+            target_receipts = owner / ".atlas_leaf_speedtree_targets"
+            target_receipts.mkdir()
+            target_receipt = target_receipts / f"{target.stem}.json"
+            target_receipt.write_bytes(b"clean-target-receipt")
+            scope = write_scope_manifest(
+                blend,
+                target,
+                material="M_branch_elm_01",
+            )
+            scope_before = scope.read_bytes()
+            meshes = owner / "meshes"
+            meshes.mkdir()
+            plan = meshes / "m_branch_elm_01__part.fbx"
+            plan.write_bytes(b"clean-plan")
+            reports = cluster / "reports"
+            reports.mkdir()
+            pipeline_report = reports / (
+                f"{blend.stem}_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            pipeline_report.write_bytes(b"clean-pipeline")
+            runtime_receipt = reports / (
+                f"{blend.stem}_repair_runtime_codex.json"
+            )
+            runtime_receipt.write_bytes(b"clean-runtime")
+
+            def half_remove(*_args, **_kwargs):
+                target.write_bytes(b"half-written-spm")
+                save_target_registry(blend, [])
+                import_manifest.write_bytes(b"half-written-import")
+                target_receipt.write_bytes(b"half-written-target-receipt")
+                scope.write_bytes(b"half-written-scope")
+                plan.write_bytes(b"half-written-plan")
+                pipeline_report.write_bytes(b"half-written-pipeline")
+                runtime_receipt.write_bytes(b"half-written-runtime")
+                (
+                    scope.parent / f"new__{target.stem}.json"
+                ).write_text(
+                    json.dumps({
+                        "blend_file": str(blend),
+                        "spm": str(target),
+                    }),
+                    encoding="utf-8",
+                )
+                (meshes / "m_branch_elm_01__new.fbx").write_bytes(
+                    b"new-plan"
+                )
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="expected OFF failure",
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=half_remove,
+            ):
+                with self.assertRaises(ClusterBlendSyncError):
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=False,
+                        blender_exe=blender,
+                    )
+
+            self.assertEqual(target.read_bytes(), b"clean-spm")
+            self.assertEqual(registry_path.read_bytes(), registry_before)
+            self.assertEqual(import_manifest.read_bytes(), b"clean-import")
+            self.assertEqual(
+                target_receipt.read_bytes(),
+                b"clean-target-receipt",
+            )
+            self.assertEqual(scope.read_bytes(), scope_before)
+            self.assertEqual(plan.read_bytes(), b"clean-plan")
+            self.assertEqual(
+                pipeline_report.read_bytes(),
+                b"clean-pipeline",
+            )
+            self.assertEqual(
+                runtime_receipt.read_bytes(),
+                b"clean-runtime",
+            )
+            self.assertFalse(
+                (scope.parent / f"new__{target.stem}.json").exists()
+            )
+            self.assertFalse(
+                (meshes / "m_branch_elm_01__new.fbx").exists()
+            )
+
     def test_folder_on_targets_every_owner_sk_and_off_targets_every_current_on(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
@@ -560,6 +925,91 @@ class ClusterBlendSyncTests(unittest.TestCase):
                     blend, enabled=False, blender_exe=blender
                 )
             self.assertEqual(remove.call_args.args[1], [first.absolute()])
+
+
+    def test_target_scope_mesh_change_marks_relation_for_refresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            canonical.write_bytes(b"canonical")
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            save_target_registry(blend, [target])
+            write_capture_manifest(blend, "capture-v1")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture-v1",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+            self.assertEqual(
+                discover_cluster_blend_relations(owner)[0]["targets"][0][
+                    "status"
+                ],
+                "synced",
+            )
+
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12, 13]
+            )
+            changed = discover_cluster_blend_relations(owner)[0]
+
+            self.assertEqual(
+                changed["targets"][0]["status"], "refresh_required"
+            )
+            self.assertIn(
+                "target_scope_changed",
+                changed["targets"][0]["refresh_reasons"],
+            )
+
+    def test_source_fbx_change_marks_relation_for_refresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            canonical.write_bytes(b"canonical")
+            source_fbx = cluster / "fbx" / "SK_branch_elm_01.fbx"
+            source_fbx.parent.mkdir()
+            source_fbx.write_bytes(b"fbx-v1")
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.touch()
+            save_target_registry(blend, [target])
+            write_capture_manifest(blend, "capture-v1")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                source_fbx=source_fbx,
+                capture_contract_sha256="capture-v1",
+            )
+            self.assertEqual(
+                discover_cluster_blend_relations(owner)[0]["targets"][0][
+                    "status"
+                ],
+                "synced",
+            )
+
+            source_fbx.write_bytes(b"fbx-v2")
+            changed = discover_cluster_blend_relations(owner)[0]
+
+            self.assertIn(
+                "source_fbx_changed",
+                changed["targets"][0]["refresh_reasons"],
+            )
 
 
 if __name__ == "__main__":

@@ -32,6 +32,8 @@ if calibration dies midway.
 Standalone:  python spm_audit.py <file.spm> [--dry-run] [--report out.json]
 """
 import argparse
+import ctypes
+import errno
 import gzip
 import hashlib
 import json
@@ -42,13 +44,25 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sk_common import file_content_fingerprint, load_config
+    from sk_common import (
+        file_content_fingerprint,
+        load_config,
+        speedtree_output_spm_for,
+    )
+else:
+    from .sk_common import (
+        file_content_fingerprint,
+        load_config,
+        speedtree_output_spm_for,
+    )
 from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
     spm_container_format,
@@ -65,6 +79,11 @@ CALIBRATION_MARKER_SUFFIX = ".skbatch_calibration_in_progress.json"
 CALIBRATION_MARKER_VERSION = 1
 PROBE_CACHE_VERSION = 1
 PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
+SPM_PROCESS_LOCK_SUFFIX = ".skbatch_process.lock"
+SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
+SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
+    r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
+)
 BONE_VALUE_RE = re.compile(
     r"(<Name>Physics:(?:Bone style|Bones)</Name>\s*<Value>)[^<]*(</Value>)",
     re.DOTALL,
@@ -102,6 +121,134 @@ class SpeedTreeExportTimeout(RuntimeError):
             f"SpeedTree {stage} export exceeded {self.timeout_seconds:g}s; "
             "skipped automatic calibration for manual bone setup"
         )
+
+
+def canonical_spm_process_lock_path(spm_path):
+    """Return the one persistent lock identity shared by a Cluster SPM pair."""
+    canonical = Path(speedtree_output_spm_for(spm_path)).expanduser().resolve()
+    return (
+        canonical.parent
+        / BACKUP_SUBDIR
+        / f"{canonical.stem}{SPM_PROCESS_LOCK_SUFFIX}"
+    )
+
+
+def _retryable_windows_lock_error(exc):
+    return (
+        getattr(exc, "errno", None)
+        in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        or getattr(exc, "winerror", None) in {33, 36, 158}
+    )
+
+
+@contextmanager
+def spm_exclusive_lock(spm_path, *, log=None, retry_seconds=0.1):
+    """Serialize every read/recovery/rewrite of one canonical SPM.
+
+    The file remains as a harmless lock identity under ``_spm_backups``.
+    The byte-range lock itself is owned by the OS and is released if a worker
+    is killed, so a stale file never means a stale lock.
+    """
+    lock_path = canonical_spm_process_lock_path(spm_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    waited = False
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if not _retryable_windows_lock_error(exc):
+                        raise
+                    if not waited and log is not None:
+                        log(
+                            "  [SPM lock] another worker is using the same "
+                            f"canonical SPM; waiting: {Path(spm_path).name}"
+                        )
+                    waited = True
+                    time.sleep(max(0.01, float(retry_seconds)))
+            try:
+                yield lock_path
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield lock_path
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def speedtree_export_gate():
+    """Allow one SpeedTree Modeler export machine-wide.
+
+    Waiting happens before the Modeler process is launched, so queue time does
+    not consume the per-export timeout.  The same stable mutex name is used by
+    the Blender repair add-on's ``speedtree_cli`` module.
+    """
+    name = os.environ.get(
+        SPEEDTREE_EXPORT_MUTEX_ENV, SPEEDTREE_EXPORT_MUTEX_DEFAULT
+    )
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_bool,
+            ctypes.c_wchar_p,
+        )
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.ReleaseMutex.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        acquired = False
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if result not in {0x00000000, 0x00000080}:
+                if result == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                raise RuntimeError(
+                    f"SpeedTree export mutex wait returned {result:#x}"
+                )
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    import fcntl
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    lock_path = Path(tempfile.gettempdir()) / f"{safe_name}.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 SYNC_MANIFEST_NAME = "spm_generator_sync.json"
@@ -1453,6 +1600,45 @@ def apply_cluster_root_bone_plan(text, plan):
     )
 
 
+def cluster_root_logical_postcondition(text):
+    """Prove that the final Cluster XML is the normalizer's fixed point."""
+    try:
+        plan = plan_cluster_root_bones(text)
+        if not plan.get("ready"):
+            return {
+                "ok": False,
+                "mode": plan.get("mode"),
+                "errors": list(plan.get("errors") or ()),
+                "expected_root_bone_count": plan.get(
+                    "expected_root_bone_count"
+                ),
+            }
+        expected = apply_cluster_root_bone_plan(text, plan)
+    except (ET.ParseError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "mode": "cluster_root_logical_postcondition_error",
+            "errors": [str(exc)],
+        }
+    return {
+        "ok": expected == text,
+        "mode": plan.get("mode"),
+        "expected_root_bone_count": plan.get("expected_root_bone_count"),
+        "selected_generator_indices": list(
+            plan.get("selected_generator_indices") or ()
+        ),
+        "disabled_generator_count": plan.get("disabled_generator_count"),
+        "errors": (
+            []
+            if expected == text
+            else [
+                "final Cluster SPM is not the fixed point of its current "
+                "render-geometry root bone plan"
+            ]
+        ),
+    }
+
+
 def apply_prioritized_branch_values(
     text, relative_indices, relative_value, disabled_base_indices=()
 ):
@@ -1669,18 +1855,19 @@ def run_speedtree_export(cmd, cwd, timeout):
         handle.seek(0)
         return handle.read().decode("utf-8", errors="replace")
 
-    with tempfile.TemporaryFile(mode="w+b") as out_file, tempfile.TemporaryFile(
-        mode="w+b"
-    ) as err_file:
-        process = subprocess.Popen(
-            cmd, stdout=out_file, stderr=err_file, **popen_kwargs
-        )
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _terminate_speedtree_tree(process)
-            raise
-        return returncode, _read(out_file), _read(err_file)
+    with speedtree_export_gate():
+        with tempfile.TemporaryFile(
+            mode="w+b"
+        ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
+            process = subprocess.Popen(
+                cmd, stdout=out_file, stderr=err_file, **popen_kwargs
+            )
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _terminate_speedtree_tree(process)
+                raise
+            return returncode, _read(out_file), _read(err_file)
 
 
 def calibration_marker_path(spm_path):
@@ -2050,6 +2237,110 @@ def estimate_relative_value_from_probe(
     )
 
 
+def shared_authored_relative_value(audit, target_indices):
+    """Return one unambiguous authored Relative value for selected targets."""
+    generators = list((audit or {}).get("generators") or ())
+    values = []
+    for index in target_indices:
+        if not 0 <= int(index) < len(generators):
+            continue
+        generator = generators[int(index)]
+        try:
+            style = float(generator.get("style"))
+            bones = float(generator.get("bones"))
+        except (TypeError, ValueError):
+            continue
+        if style == 1.0 and math.isfinite(bones) and bones > 0.0:
+            values.append(bones)
+    if not values:
+        return None
+    reference = values[0]
+    tolerance = max(1e-6, abs(reference) * 1e-6)
+    if any(abs(value - reference) > tolerance for value in values[1:]):
+        return None
+    return sum(values) / len(values)
+
+
+def _next_relative_candidate(
+    observations,
+    *,
+    target_total,
+    value_floor,
+    value_cap,
+):
+    """Choose a bounded correction from measured SpeedTree output."""
+    current_r, current_total = observations[-1]
+    under = sorted(
+        (
+            (relative, total)
+            for relative, total in observations
+            if total < target_total
+        ),
+        key=lambda item: item[0],
+    )
+    over = sorted(
+        (
+            (relative, total)
+            for relative, total in observations
+            if total > target_total
+        ),
+        key=lambda item: item[0],
+    )
+    lower = max(under, default=None, key=lambda item: item[0])
+    upper = min(over, default=None, key=lambda item: item[0])
+    if lower is not None and upper is not None and lower[0] < upper[0]:
+        if lower[0] > 0.0:
+            candidate = math.sqrt(lower[0] * upper[0])
+        else:
+            candidate = (lower[0] + upper[0]) * 0.5
+    elif current_total <= 0:
+        candidate = max(current_r * 3.0, current_r + 0.05)
+    else:
+        ratio = max(1e-9, float(target_total) / float(current_total))
+        candidate = current_r * ratio ** 0.6
+        if current_total < target_total:
+            candidate = max(candidate, current_r * 1.2)
+        else:
+            candidate = min(candidate, current_r * 0.8)
+    return max(value_floor, min(value_cap, candidate))
+
+
+def _relative_failure_mode(
+    observations,
+    *,
+    lo,
+    hi,
+    value_floor,
+    value_cap,
+):
+    """Classify why bounded Relative calibration did not converge."""
+    relative, total = observations[-1]
+    epsilon = max(1e-6, abs(relative) * 1e-6)
+    if total == 0:
+        return "manual_required_relative_zero"
+    if relative >= value_cap - epsilon and total < lo:
+        return "manual_required_relative_cap"
+    if relative <= value_floor + epsilon and total > hi:
+        return "manual_required_relative_floor"
+    for left_index, (left_r, left_total) in enumerate(observations):
+        for right_r, right_total in observations[left_index + 1:]:
+            if right_r > left_r + 1e-6 and right_total < left_total:
+                return "manual_required_relative_nonmonotonic"
+            if left_r > right_r + 1e-6 and left_total < right_total:
+                return "manual_required_relative_nonmonotonic"
+    if len(observations) >= 2:
+        previous_r, previous_total = observations[-2]
+        if (
+            total == previous_total
+            and abs(relative - previous_r)
+            > max(1e-5, abs(previous_r) * 1e-4)
+        ):
+            return "manual_required_relative_plateau"
+    if total < lo:
+        return "manual_required_relative_underflow"
+    return "manual_required_relative_overflow"
+
+
 def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=None):
     """Keep Tree density first, then solve the remaining capped bone budget.
 
@@ -2074,7 +2365,7 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     value_cap = float(cfg.get("value_cap", 64.0))
     value_floor = float(cfg.get("value_floor", 0.02))
     seed = float(cfg.get("seed_relative_value", 0.5))
-    max_rounds = int(cfg.get("max_calibration_rounds", 4))
+    max_rounds = max(1, int(cfg.get("max_calibration_rounds", 4)))
 
     original_text = source_text if source_text is not None else read_spm(spm_path)
     if (
@@ -2312,14 +2603,38 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             value_floor,
             value_cap,
         )
+        authored_r = shared_authored_relative_value(
+            audit, calibration_indices
+        )
         probe_round["estimated_relative_value"] = (
             round(estimated_r, 4) if estimated_r is not None else None
         )
+        probe_round["length_estimate_valid"] = estimated_r is not None
+        probe_round["authored_relative_value"] = (
+            round(authored_r, 4) if authored_r is not None else None
+        )
         if estimated_r is not None:
+            initial_r = estimated_r
+            initial_r_source = "absolute_probe_lengths"
             log(
                 f"  [estimate] Relative r={estimated_r:.3f} "
                 f"from {len(calibration_lengths)} branch lengths"
             )
+        elif authored_r is not None:
+            initial_r = authored_r
+            initial_r_source = "shared_authored_relative"
+            log(
+                f"  [estimate] Relative r={authored_r:.3f} "
+                "from the current rendered target generators"
+            )
+        else:
+            initial_r = seed
+            initial_r_source = "configured_seed"
+            log(
+                f"  [estimate] Relative r={seed:.3f} from configured seed "
+                "(probe lengths unavailable)"
+            )
+        probe_round["initial_relative_source"] = initial_r_source
 
         def stop_for_manual(reason, relative_value, measured_total, mode):
             # Put the logical source back immediately. process_spm restores the
@@ -2341,6 +2656,7 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                     "disabled_base_generator_count": len(disabled_base_indices),
                     "density_reduced_for_cap": density_reduced_for_cap,
                     "probe_cache_hit": probe_cache_hit,
+                    "initial_relative_source": initial_r_source,
                     "manual_required": True,
                 },
                 warnings=[reason],
@@ -2352,9 +2668,10 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         # grow super-linearly with the value. The Absolute/1 probe gives a
         # length-based first estimate; proportional correction remains for
         # unusual models whose curved spines differ from their probe chords.
-        r = estimated_r if estimated_r is not None else seed
+        r = initial_r
         final_counts = {}
         total = 0
+        observations = []
         for round_index in range(max_rounds):
             r = max(value_floor, min(value_cap, r))
             write_spm(
@@ -2369,30 +2686,41 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             log(f"  [SpeedTree] XML Relative 검증 시작 (round {round_index + 1})")
             final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
             total = sum(final_counts.values())
+            observations.append((r, total))
             rounds.append({"phase": f"relative round {round_index + 1}", "value": round(r, 4), "total_bones": total})
             log(f"  [calibrate] r={r:.3f} -> {total} bones (target {target_total:.0f}, window {lo:.0f}-{hi:.0f})")
             if lo <= total <= hi:
                 break
-            if cfg.get("fast_skip_problem_spm", True):
-                stop_for_manual(
-                    (
-                        f"first Relative verification produced {total} bones, outside "
-                        f"the accepted window {lo:.0f}-{hi:.0f}; skipped further "
-                        "SpeedTree correction rounds"
-                    ),
-                    r,
-                    total,
-                    "manual_required_relative_outlier",
-                )
-            if total == 0:
-                r *= 3
-                continue
-            new_r = max(value_floor, min(value_cap, r * (target_total / total) ** 0.6))
-            if abs(new_r - r) < 1e-4:
-                break  # hit floor/cap; can't get closer
+            new_r = _next_relative_candidate(
+                observations,
+                target_total=target_total,
+                value_floor=value_floor,
+                value_cap=value_cap,
+            )
+            if abs(new_r - r) < max(1e-6, abs(r) * 1e-6):
+                break
             r = new_r
 
         final_r = max(value_floor, min(value_cap, r))
+        if not (lo <= total <= hi):
+            failure_mode = _relative_failure_mode(
+                observations,
+                lo=lo,
+                hi=hi,
+                value_floor=value_floor,
+                value_cap=value_cap,
+            )
+            stop_for_manual(
+                (
+                    "bounded Relative calibration did not reach the accepted "
+                    f"window {lo:.0f}-{hi:.0f} after {len(observations)} "
+                    f"round(s); final r={final_r:.4f}, bones={total}, "
+                    f"classification={failure_mode}"
+                ),
+                final_r,
+                total,
+                failure_mode,
+            )
 
         if base_priority_applied:
             calibration_mode = "base_disabled_tree_relative"
@@ -2404,16 +2732,6 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
             log("  [SpeedTree] FBX geometry 검증 시작")
             if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
-                if cfg.get("fast_skip_problem_spm", True):
-                    stop_for_manual(
-                        (
-                            "first FBX geometry verification produced an armature-only "
-                            "file; skipped automatic Absolute/material fallback exports"
-                        ),
-                        final_r,
-                        total,
-                        "manual_required_geometry",
-                    )
                 # Certain root/frond assets export an armature but silently drop
                 # every mesh after Relative bone calibration. Absolute/1 is the
                 # known-good SpeedTree representation for those assets.
@@ -2453,6 +2771,19 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                         "external atlas cutouts produced no Frond geometry; restored embedded material references"
                     )
                 log(f"  [geometry fallback] Absolute/1 -> {total} bones with valid FBX geometry")
+        else:
+            fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
+            log("  [SpeedTree] FBX final geometry verification")
+            if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+                stop_for_manual(
+                    (
+                        "final Relative calibration produced an FBX without "
+                        "render mesh geometry; no Base-linked fallback is safe"
+                    ),
+                    final_r,
+                    total,
+                    "manual_required_geometry",
+                )
 
     # generator report: names may repeat; XML aggregates bones by generator name
     generators_report = dict(sorted(final_counts.items(), key=lambda kv: -kv[1]))
@@ -2479,6 +2810,8 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         "disabled_base_generator_count": len(disabled_base_indices),
         "density_reduced_for_cap": density_reduced_for_cap,
         "probe_cache_hit": probe_cache_hit,
+        "initial_relative_source": initial_r_source,
+        "verified_fbx_geometry": True,
     }
     if absolute_fallback is not None:
         meta["absolute_bones_per_branch"] = absolute_fallback
@@ -2487,7 +2820,44 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     return generators_report, rounds, total, meta, warnings, skipped, True
 
 
+def _record_final_spm_identity(report, spm_path):
+    path = Path(spm_path)
+    stat = path.stat()
+    report["final_spm_fingerprint"] = file_content_fingerprint(path)
+    report["final_spm_size"] = stat.st_size
+    report["final_spm_mtime_ns"] = stat.st_mtime_ns
+    return report
+
+
+def _restore_source_snapshot(
+    spm_path,
+    *,
+    backup,
+    source_bytes,
+    source_stat,
+):
+    if backup:
+        shutil.copy2(backup, spm_path)
+    else:
+        Path(spm_path).write_bytes(source_bytes)
+        os.utime(
+            spm_path,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+        )
+
+
 def process_spm(spm_path, cfg, log=print, dry_run=False):
+    """Run one complete SPM transaction under its canonical OS lock."""
+    with spm_exclusive_lock(spm_path, log=log):
+        return _process_spm_locked(
+            spm_path,
+            cfg,
+            log=log,
+            dry_run=dry_run,
+        )
+
+
+def _process_spm_locked(spm_path, cfg, log=print, dry_run=False):
     """Material prefix + bone calibration with backup/restore. Returns report."""
     spm_path = Path(spm_path)
     # A previous run killed mid-rewrite left probe bones in the source. Repair
@@ -2497,6 +2867,14 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         log(
             "  [복구] 중단된 캘리브레이션 감지 — 백업에서 원본 SPM 복원: "
             f"{recovery.get('backup', '')}"
+        )
+    elif (
+        recovery.get("status") != "clean"
+        and not recovery.get("cleared")
+    ):
+        raise RuntimeError(
+            "Interrupted SPM calibration marker cannot be recovered safely: "
+            + str(recovery.get("error") or recovery.get("status"))
         )
     source_bytes = spm_path.read_bytes()
     source_stat = spm_path.stat()
@@ -2549,7 +2927,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["warnings"].append(
             "Skipped without modifying the SPM because its GUID bone graph is not SK-ready."
         )
-        return report
+        return _record_final_spm_identity(report, spm_path)
 
     if dry_run:
         report["status"] = "dry-run"
@@ -2563,7 +2941,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         if apply_tree_red:
             _planned_text, vertex_report = apply_leaf_parent_red_gradient(source_text)
             report["vertex_colors"] = vertex_report
-        return report
+        return _record_final_spm_identity(report, spm_path)
 
     backup = None
     if cfg.get("backup_spm", True):
@@ -2612,11 +2990,24 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
                 vertex_changed = True
                 changed = True
 
+        final_text = read_spm(spm_path)
+        if cluster_root_mode:
+            postcondition = cluster_root_logical_postcondition(final_text)
+            report["cluster_root_logical_postcondition"] = postcondition
+            if not postcondition.get("ok"):
+                raise RuntimeError(
+                    "Cluster final logical bone postcondition failed: "
+                    + "; ".join(
+                        postcondition.get("errors")
+                        or ["unknown logical mismatch"]
+                    )
+                )
+
         # Calibration temporarily writes Absolute/1 and Relative variants. If
         # the final logical XML is identical to the source, restore the exact
         # gzip bytes and timestamps so a no-op ① run does not invalidate a
         # perfectly good .blend merely by touching the SPM.
-        if read_spm(spm_path) == source_text:
+        if final_text == source_text:
             spm_path.write_bytes(source_bytes)
             os.utime(
                 spm_path,
@@ -2631,8 +3022,12 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
             else "already-ok"
         )
     except ManualCalibrationRequired as exc:
-        if backup:
-            shutil.copy2(backup, spm_path)
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
         report["status"] = "manual-required"
         report["error"] = str(exc)
         report["rounds"] = exc.rounds
@@ -2642,14 +3037,12 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["warnings"].append("automatic calibration stopped; original SPM restored")
         report["skipped"].extend(exc.skipped)
     except SpeedTreeExportTimeout as exc:
-        if backup:
-            shutil.copy2(backup, spm_path)
-        else:
-            spm_path.write_bytes(source_bytes)
-            os.utime(
-                spm_path,
-                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
-            )
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
         report["status"] = "manual-required"
         report["error"] = str(exc)
         report["calibration"] = {
@@ -2662,8 +3055,13 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
             "SpeedTree export was too slow; automatic calibration stopped and original SPM restored"
         )
     except Exception:
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
         if backup:
-            shutil.copy2(backup, spm_path)
             report["warnings"].append("calibration failed; SPM restored from backup")
         report["status"] = "failed"
         raise
@@ -2671,7 +3069,7 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         # Every path above has already restored the source, so the marker must
         # not outlive this call and trigger a bogus recovery on the next run.
         clear_calibration_marker(spm_path)
-    return report
+    return _record_final_spm_identity(report, spm_path)
 
 
 def main():

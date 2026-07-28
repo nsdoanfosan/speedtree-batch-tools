@@ -37,7 +37,7 @@ from nanite_assembly_materials import (
 
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
-ROLE_ORDER = ("branch", "leaf", "leaf_side")
+ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 class ClusterAssemblyBuildError(RuntimeError):
     """Raised when a content or hierarchy invariant is not proven."""
 
@@ -866,6 +866,23 @@ def validate_normalized_prototype_unit_contract(manifest):
 
     parts = list((manifest or {}).get("parts") or [])
     variants = list((manifest or {}).get("registered_variants") or [])
+    prepared_unused = list(
+        (manifest or {}).get("prepared_unused_roles") or []
+    )
+    if not parts and variants and prepared_unused:
+        if any(bool(row.get("instanced")) for row in variants):
+            raise ClusterAssemblyBuildError(
+                "prepared-unused Assembly variants cannot be marked instanced"
+            )
+        return {
+            "status": "prepared_unused_only",
+            "native_prototype_count": 0,
+            "registered_variant_count": len(variants),
+            "roles": dict(Counter(
+                str(row.get("role") or "").casefold()
+                for row in variants
+            )),
+        }
     if not parts or not variants:
         raise ClusterAssemblyBuildError(
             "physical normalized production manifest has no native prototypes/variants"
@@ -2111,19 +2128,19 @@ def _component_groups(mesh, polygon_indices):
     polygon_indices = sorted(set(int(value) for value in polygon_indices))
     if not polygon_indices:
         return []
-    parent = {index: index for index in polygon_indices}
+    polygon_parent = {index: index for index in polygon_indices}
 
-    def find(value):
-        while parent[value] != value:
-            parent[value] = parent[parent[value]]
-            value = parent[value]
+    def polygon_find(value):
+        while polygon_parent[value] != value:
+            polygon_parent[value] = polygon_parent[polygon_parent[value]]
+            value = polygon_parent[value]
         return value
 
-    def union(left, right):
-        left = find(left)
-        right = find(right)
+    def polygon_union(left, right):
+        left = polygon_find(left)
+        right = polygon_find(right)
         if left != right:
-            parent[right] = left
+            polygon_parent[right] = left
 
     used_vertices = {
         int(vertex)
@@ -2144,35 +2161,53 @@ def _component_groups(mesh, polygon_indices):
     # by float noise while remaining far below authored card edge lengths.
     weld_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
     weld_tolerance_sq = weld_tolerance * weld_tolerance
-    exact_owners = {}
-    spatial_owners = defaultdict(list)
+    vertex_parent = {index: index for index in used_vertices}
+
+    def vertex_find(value):
+        while vertex_parent[value] != value:
+            vertex_parent[value] = vertex_parent[vertex_parent[value]]
+            value = vertex_parent[value]
+        return value
+
+    def vertex_union(left, right):
+        left = vertex_find(left)
+        right = vertex_find(right)
+        if left != right:
+            vertex_parent[right] = left
+
+    spatial_vertices = defaultdict(list)
+    for vertex, coordinate in coordinates.items():
+        cell = tuple(
+            int(math.floor(value / weld_tolerance))
+            for value in coordinate
+        )
+        for x in range(cell[0] - 1, cell[0] + 2):
+            for y in range(cell[1] - 1, cell[1] + 2):
+                for z in range(cell[2] - 1, cell[2] + 2):
+                    for other in spatial_vertices.get((x, y, z), ()):
+                        distance_sq = sum(
+                            (coordinate[axis] - coordinates[other][axis]) ** 2
+                            for axis in range(3)
+                        )
+                        if distance_sq <= weld_tolerance_sq:
+                            vertex_union(vertex, other)
+        spatial_vertices[cell].append(vertex)
+
+    # Reconnect FBX seam-split faces only across a geometric edge.  A single
+    # shared attachment point is not connectivity: several separately
+    # rendered cards legitimately meet at the same authored pivot.
+    coordinate_pair_owners = {}
     for polygon_index in polygon_indices:
-        polygon = mesh.polygons[polygon_index]
-        for vertex in polygon.vertices:
-            vertex = int(vertex)
-            previous = exact_owners.setdefault(vertex, polygon_index)
-            union(polygon_index, previous)
-            if previous != polygon_index:
-                continue
-            coordinate = coordinates[vertex]
-            cell = tuple(
-                int(math.floor(value / weld_tolerance))
-                for value in coordinate
-            )
-            for x in range(cell[0] - 1, cell[0] + 2):
-                for y in range(cell[1] - 1, cell[1] + 2):
-                    for z in range(cell[2] - 1, cell[2] + 2):
-                        for other, owner in spatial_owners.get((x, y, z), ()):
-                            distance_sq = sum(
-                                (coordinate[axis] - other[axis]) ** 2
-                                for axis in range(3)
-                            )
-                            if distance_sq <= weld_tolerance_sq:
-                                union(polygon_index, owner)
-            spatial_owners[cell].append((coordinate, polygon_index))
+        coordinate_vertices = sorted({
+            vertex_find(int(vertex))
+            for vertex in mesh.polygons[polygon_index].vertices
+        })
+        for pair in itertools.combinations(coordinate_vertices, 2):
+            previous = coordinate_pair_owners.setdefault(pair, polygon_index)
+            polygon_union(polygon_index, previous)
     groups = defaultdict(lambda: {"vertices": set(), "polygons": []})
     for polygon_index in polygon_indices:
-        root = find(polygon_index)
+        root = polygon_find(polygon_index)
         row = groups[root]
         row["polygons"].append(polygon_index)
         row["vertices"].update(int(value) for value in mesh.polygons[polygon_index].vertices)
@@ -2384,6 +2419,47 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             + signature
         )
     return best[0]
+
+
+def _partition_normalized_render_components(
+    prototypes,
+    target_mesh,
+    components,
+):
+    """Separate render components that can be replaced by normalized assets.
+
+    The rendered BWR mesh is authoritative.  A topology absent from the
+    normalized capture is preserved in the Base mesh instead of inventing a
+    new cluster variant or blocking the complete tree.
+    """
+    by_signature = defaultdict(list)
+    for component in components:
+        by_signature[_component_signature(target_mesh, component)].append(
+            component
+        )
+    matched = {}
+    preserved = []
+    for signature, instances in sorted(by_signature.items()):
+        prototype = _normalized_prototype_for_component(
+            prototypes,
+            target_mesh,
+            instances[0],
+        )
+        if prototype is None:
+            preserved.append({
+                "topology_signature": signature,
+                "instance_count": len(instances),
+                "polygon_count": sum(
+                    len(component["polygons"])
+                    for component in instances
+                ),
+            })
+            continue
+        matched[signature] = {
+            "prototype": prototype,
+            "instances": instances,
+        }
+    return matched, preserved
 
 
 def _vertex_descriptors(obj, component):
@@ -3206,6 +3282,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
         identity = normalize_role_identity(getattr(material, "name", ""))
         slots_by_identity[identity].add(index)
     result = {}
+    prepared_unused = {}
     for row in role_inputs:
         role = str(row["role"]).casefold()
         identity = normalize_role_identity(row.get("role_identity"))
@@ -3216,9 +3293,27 @@ def _role_material_polygons(merged_mesh, role_inputs):
             if int(polygon.material_index) in slots
         ]
         if not slots or not polygons:
-            raise ClusterAssemblyBuildError(
-                f"final BWR mesh lost the actual {role} material/mesh pair: {identity}"
-            )
+            normalized = deepcopy(row.get("normalized_variants"))
+            variants = list((normalized or {}).get("variants") or [])
+            prepared_unused[role] = {
+                "role": role,
+                "role_identity": row.get("role_identity"),
+                "status": "prepared_unused",
+                "reason": (
+                    "material_absent_from_rendered_mesh"
+                    if not slots
+                    else "material_has_no_rendered_polygons"
+                ),
+                "material_slots": sorted(slots),
+                "normalized_variants": normalized,
+                "prepared_variant_count": len(variants),
+                "prepared_skeletal_assets": [
+                    str(variant.get("skeletal_asset_name") or "")
+                    for variant in variants
+                    if str(variant.get("skeletal_asset_name") or "")
+                ],
+            }
+            continue
         result[role] = {
             "role": role,
             "role_identity": row.get("role_identity"),
@@ -3226,7 +3321,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
             "polygon_indices": polygons,
             "normalized_variants": deepcopy(row.get("normalized_variants")),
         }
-    return result
+    return result, prepared_unused
 
 
 def build_blender_assembly_inputs(
@@ -3262,7 +3357,69 @@ def build_blender_assembly_inputs(
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
     role_inputs = list((handoff.get("assembly") or {}).get("part_builder_inputs") or [])
-    roles = _role_material_polygons(final_merged_mesh, role_inputs)
+    roles, prepared_unused_roles = _role_material_polygons(
+        final_merged_mesh,
+        role_inputs,
+    )
+    if not roles and prepared_unused_roles:
+        registered_variants = []
+        for role, role_row in sorted(prepared_unused_roles.items()):
+            normalized = role_row.get("normalized_variants") or {}
+            for variant in normalized.get("variants") or []:
+                registered_variants.append({
+                    "role": role,
+                    "ordinal": int(variant.get("ordinal") or 0),
+                    "card_name": str(variant.get("plan_name") or ""),
+                    "skeletal_asset_name": str(
+                        variant.get("skeletal_asset_name") or ""
+                    ),
+                    "source_prototype_index": (
+                        int(variant["source_prototype_index"])
+                        if variant.get("source_prototype_index")
+                        else None
+                    ),
+                    "source_partition_mode": str(
+                        variant.get("source_partition_mode") or ""
+                    ),
+                    "composite_parts": deepcopy(
+                        variant.get("composite_parts") or []
+                    ),
+                    "target_mesh_id": int(variant.get("target_mesh_id") or 0),
+                    "pivot_contract": str(
+                        variant.get("pivot_contract") or ""
+                    ),
+                    "attachment_vertex_index": int(
+                        variant.get("attachment_vertex_index") or -1
+                    ),
+                    "attachment_vertex_uv": [
+                        float(value)
+                        for value in (variant.get("attachment_vertex_uv") or [])
+                    ],
+                    "instanced": False,
+                })
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": MANIFEST_KIND,
+            "status": "pass_through",
+            "content_decision": "pass_through",
+            "reason": (
+                "normalized_roles_are_prepared_but_unused_by_rendered_mesh"
+            ),
+            "full_skeletal_mesh_preserved": True,
+            "rendered_role_count": 0,
+            "registered_variants": registered_variants,
+            "prepared_unused_roles": [
+                prepared_unused_roles[role]
+                for role in ROLE_ORDER
+                if role in prepared_unused_roles
+            ],
+            "handoff_evidence": {
+                "actual_fbx": handoff.get("actual_fbx"),
+                "pcg_receipt": handoff.get("pcg_receipt"),
+                "spm": handoff.get("spm"),
+                "prepared_unused_roles": prepared_unused_roles,
+            },
+        }
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     stem = Path(str((handoff.get("spm") or {}).get("path") or full_fbx_path)).stem
@@ -3271,12 +3428,11 @@ def build_blender_assembly_inputs(
     base_fbx = output / f"{base_export_stem}.fbx"
     manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
     assembly_source_blend = output / f"{stem}_NaniteAssemblySource.blend"
-    excluded_polygons = sorted(
-        {index for row in roles.values() for index in row["polygon_indices"]}
-    )
     created_objects = []
     parts = []
     all_bindings = []
+    role_build_plans = {}
+    preserved_render_components = []
     base_obj = None
     base_armature = None
     scene_units = bpy.context.scene.unit_settings
@@ -3291,6 +3447,55 @@ def build_blender_assembly_inputs(
             f"contract, got system={source_unit_system} scale={source_scale_length}"
         )
     try:
+        for role in ROLE_ORDER:
+            role_row = roles.get(role)
+            if role_row is None:
+                continue
+            normalized_contract = role_row.get("normalized_variants")
+            if not normalized_contract:
+                raise ClusterAssemblyBuildError(
+                    f"{role} has no external normalized variants; "
+                    "component-derived tiny-part fallback is disabled"
+                )
+            validate_file_fingerprint(
+                normalized_contract.get("manifest"),
+                f"Atlas normalized variant manifest for {role}",
+            )
+            validate_file_fingerprint(
+                normalized_contract.get("source_blend"),
+                f"Send to Unreal normalized source blend for {role}",
+            )
+            prototypes, imported_objects = _import_normalized_plan_prototypes(
+                bpy,
+                normalized_contract,
+            )
+            created_objects.extend(imported_objects)
+            components = _component_groups(
+                final_merged_mesh.data,
+                role_row["polygon_indices"],
+            )
+            matched, preserved = _partition_normalized_render_components(
+                prototypes,
+                final_merged_mesh.data,
+                components,
+            )
+            role_build_plans[role] = {
+                "matched": matched,
+                "preserved": preserved,
+            }
+            for row in preserved:
+                preserved_render_components.append({
+                    "role": role,
+                    "role_identity": role_row["role_identity"],
+                    **row,
+                })
+        excluded_polygons = sorted({
+            polygon_index
+            for plan in role_build_plans.values()
+            for row in plan["matched"].values()
+            for component in row["instances"]
+            for polygon_index in component["polygons"]
+        })
         base_obj = _copy_base_without_role_polygons(
             bpy,
             final_merged_mesh,
@@ -3337,40 +3542,14 @@ def build_blender_assembly_inputs(
             role_row = roles.get(role)
             if role_row is None:
                 continue
-            components = _component_groups(
-                final_merged_mesh.data,
-                role_row["polygon_indices"],
-            )
-            by_signature = defaultdict(list)
-            for component in components:
-                by_signature[_component_signature(final_merged_mesh.data, component)].append(component)
             normalized_contract = role_row.get("normalized_variants")
             if normalized_contract:
-                validate_file_fingerprint(
-                    normalized_contract.get("manifest"),
-                    f"Atlas normalized variant manifest for {role}",
-                )
-                validate_file_fingerprint(
-                    normalized_contract.get("source_blend"),
-                    f"Send to Unreal normalized source blend for {role}",
-                )
-                prototypes, imported_objects = _import_normalized_plan_prototypes(
-                    bpy,
-                    normalized_contract,
-                )
-                created_objects.extend(imported_objects)
                 composite_accumulators = {}
-                for signature, instances in sorted(by_signature.items()):
-                    prototype = _normalized_prototype_for_component(
-                        prototypes,
-                        final_merged_mesh.data,
-                        instances[0],
-                    )
-                    if prototype is None:
-                        raise ClusterAssemblyBuildError(
-                            f"{role} plan instance has no normalized variant: "
-                            + signature
-                        )
+                for signature, match in sorted(
+                    role_build_plans[role]["matched"].items()
+                ):
+                    prototype = match["prototype"]
+                    instances = match["instances"]
                     variant = prototype["variant"]
                     source_obj = prototype["object"]
                     source_component = prototype["component"]
@@ -3734,7 +3913,9 @@ def build_blender_assembly_inputs(
                 for ordinal in ordinals
                 if int(ordinal) > 0
             )
-        for role, role_row in sorted(roles.items()):
+        registered_role_rows = dict(prepared_unused_roles)
+        registered_role_rows.update(roles)
+        for role, role_row in sorted(registered_role_rows.items()):
             normalized = role_row.get("normalized_variants") or {}
             for variant in normalized.get("variants") or []:
                 ordinal = int(variant.get("ordinal") or 0)
@@ -3790,6 +3971,12 @@ def build_blender_assembly_inputs(
             },
             "parts": parts,
             "registered_variants": registered_variants,
+            "prepared_unused_roles": [
+                prepared_unused_roles[role]
+                for role in ROLE_ORDER
+                if role in prepared_unused_roles
+            ],
+            "preserved_render_components": preserved_render_components,
             "final_skeleton": snapshot,
             "wind_contract": wind_validation,
             "coordinate_contract": {
@@ -3806,7 +3993,7 @@ def build_blender_assembly_inputs(
             "role_contract": {
                 "role_material_identities": [
                     str(row.get("role_identity") or "")
-                    for _role, row in sorted(roles.items())
+                    for _role, row in sorted(registered_role_rows.items())
                 ],
                 "registered_card_variants": [
                     row["card_name"] for row in registered_variants
@@ -3824,6 +4011,8 @@ def build_blender_assembly_inputs(
                 "pcg_receipt": handoff.get("pcg_receipt"),
                 "spm": handoff.get("spm"),
                 "roles": roles,
+                "prepared_unused_roles": prepared_unused_roles,
+                "preserved_render_components": preserved_render_components,
             },
         }
         _validate_public_export_names(manifest)

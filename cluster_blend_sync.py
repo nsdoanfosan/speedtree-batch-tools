@@ -13,12 +13,15 @@ contract recorded by their most recent Atlas scope manifest.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 from atlas_target_registry import (
@@ -48,9 +51,6 @@ BACKUP_NAME_TOKENS = (
 
 class ClusterBlendSyncError(RuntimeError):
     """Actionable Cluster blend relationship or apply failure."""
-
-
-_FILE_HASH_CACHE = {}
 
 
 def normalized_path_key(path):
@@ -155,6 +155,47 @@ def _registry_target_spms(blend):
     ]
 
 
+def _restore_registry_snapshot(registry_path, original_bytes):
+    registry_path = Path(registry_path)
+    if original_bytes is None:
+        if registry_path.exists():
+            registry_path.unlink()
+            return True
+        return False
+    current = (
+        registry_path.read_bytes()
+        if registry_path.is_file()
+        else None
+    )
+    if current == original_bytes:
+        return False
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=str(registry_path.parent),
+        prefix=f".{registry_path.name}.",
+        suffix=".rollback.tmp",
+    ) as handle:
+        temporary_registry = Path(handle.name)
+        handle.write(original_bytes)
+    try:
+        os.replace(temporary_registry, registry_path)
+    finally:
+        temporary_registry.unlink(missing_ok=True)
+    return True
+
+
+def _merge_target_spms(*target_groups):
+    """Return one stable, canonical target set without losing registry order."""
+    merged = {}
+    for group in target_groups:
+        for value in group or ():
+            target = Path(value).expanduser().absolute()
+            merged.setdefault(normalized_path_key(target), target)
+    return list(merged.values())
+
+
 def _snapshot_spm_files(paths, directory):
     """Copy every SPM an apply may rewrite so a failure can be rolled back."""
     directory = Path(directory)
@@ -228,16 +269,18 @@ def _normalization_artifact_paths(recipe):
             [
                 Path(recipe["blend"]).expanduser().absolute(),
                 Path(recipe["receipt_path"]).expanduser().absolute(),
-                (
-                    Path(recipe["blend"]).expanduser().absolute().parent
-                    / "reports"
-                    / (
-                        Path(recipe["blend"]).stem
-                        + "_speedtree_repair_pipeline_report_codex.json"
-                    )
-                ),
             ]
         )
+
+    blend = Path(recipe["blend"]).expanduser().absolute()
+    report_dir = blend.parent / "reports"
+    paths.extend([
+        report_dir / (
+            blend.stem
+            + "_speedtree_repair_pipeline_report_codex.json"
+        ),
+        report_dir / f"{blend.stem}_repair_runtime_codex.json",
+    ])
 
     first_target = Path(
         recipe["first_target_spm"]
@@ -273,12 +316,19 @@ def _normalization_artifact_paths(recipe):
     # current. Existing files must therefore participate in every relationship
     # transaction, not only a capture rebuild.
     mesh_dir = owner / "meshes"
-    mesh_pattern = (
-        str(recipe.get("material_name") or "").casefold()
-        + "__*.fbx"
-    )
-    if mesh_dir.is_dir() and mesh_pattern != "__*.fbx":
-        paths.extend(mesh_dir.glob(mesh_pattern))
+    material_names = list(recipe.get("material_names") or ())
+    if recipe.get("material_name"):
+        material_names.append(recipe["material_name"])
+    mesh_patterns = {
+        str(name).casefold() + "__*.fbx"
+        for name in material_names
+        if str(name or "").strip()
+    }
+    if recipe.get("snapshot_all_plan_meshes"):
+        mesh_patterns.add("*.fbx")
+    if mesh_dir.is_dir():
+        for mesh_pattern in sorted(mesh_patterns):
+            paths.extend(mesh_dir.glob(mesh_pattern))
 
     result = []
     seen = set()
@@ -298,12 +348,21 @@ def _normalization_artifact_globs(recipe):
     owner = Path(
         recipe["first_target_spm"]
     ).expanduser().absolute().parent
-    material_name = str(recipe.get("material_name") or "").casefold()
     globs = []
-    if material_name:
+    material_names = list(recipe.get("material_names") or ())
+    if recipe.get("material_name"):
+        material_names.append(recipe["material_name"])
+    mesh_patterns = {
+        str(name).casefold() + "__*.fbx"
+        for name in material_names
+        if str(name or "").strip()
+    }
+    if recipe.get("snapshot_all_plan_meshes"):
+        mesh_patterns.add("*.fbx")
+    for pattern in sorted(mesh_patterns):
         globs.append({
             "directory": owner / "meshes",
-            "pattern": material_name + "__*.fbx",
+            "pattern": pattern,
             "kind": "path",
         })
     globs.append({
@@ -313,6 +372,55 @@ def _normalization_artifact_globs(recipe):
         "blend": str(Path(recipe["blend"]).expanduser().absolute()),
     })
     return globs
+
+
+def _atlas_transaction_artifact_recipe(
+    blend,
+    target_spms,
+    normalization_recipe,
+):
+    """Describe every non-SPM Atlas output at risk in this transaction."""
+
+    blend = Path(blend).expanduser().absolute()
+    targets = [
+        Path(target).expanduser().absolute()
+        for target in target_spms
+    ]
+    recipe = dict(normalization_recipe or {})
+    recipe.update({
+        "blend": str(blend),
+        "normalization_required": bool(
+            recipe.get("normalization_required")
+        ),
+        "first_target_spm": str(targets[0]),
+        "target_spms": [str(target) for target in targets],
+    })
+    material_names = {
+        str(recipe.get("material_name") or "").strip()
+    }
+    for target in targets:
+        match = _matching_scope_manifest(blend, target)
+        if match is None:
+            continue
+        payload = match["payload"]
+        adoption = payload.get("source_material_adoption") or {}
+        material_names.add(str(
+            adoption.get("material_name")
+            or payload.get("material")
+            or payload.get("material_name")
+            or ""
+        ).strip())
+    material_names.discard("")
+    recipe["material_names"] = sorted(
+        material_names,
+        key=str.casefold,
+    )
+    # A first-time/manual Atlas sync has no external receipt from which the
+    # configured output material can be discovered without opening Blender.
+    # Snapshot the owner plan directory in that exceptional path so a crashed
+    # background process still cannot leave or overwrite a partial FBX.
+    recipe["snapshot_all_plan_meshes"] = not material_names
+    return recipe
 
 
 def _snapshot_normalization_artifacts(recipe, directory):
@@ -390,21 +498,271 @@ def _rollback_detail(restored, failed):
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
+def _atlas_scope_from_user_data(node):
+    try:
+        payload = json.loads(str(node.findtext("UserData") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if payload.get("generator") != "atlas_leaf_mesh_builder":
+        return None
+    return str(payload.get("scope") or "") or None
+
+
+def _spm_failure_inventory(path):
+    """Read the small ownership/ID subset needed to diagnose a failed apply."""
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+        if raw.startswith(b"\x1f\x8b"):
+            raw = gzip.decompress(raw)
+        root = ET.fromstring(raw)
+    except (OSError, EOFError, gzip.BadGzipFile, ET.ParseError) as exc:
+        return {"read_error": f"{type(exc).__name__}: {exc}"}
+    assets = root.find("Assets")
+    if assets is None:
+        return {"read_error": "Assets node is missing"}
+    materials = []
+    for material in assets.findall("Material_v8"):
+        mesh_ids = []
+        try:
+            cutout = int(str(material.findtext("CutoutMeshID") or ""))
+        except ValueError:
+            cutout = None
+        if cutout is not None:
+            mesh_ids.append(cutout)
+        supplemental = material.find("SupplementalCutoutMeshIDs")
+        if supplemental is not None:
+            for child in supplemental.findall("CutoutMesh"):
+                try:
+                    mesh_id = int(str(child.attrib.get("ID") or ""))
+                except ValueError:
+                    continue
+                if mesh_id not in mesh_ids:
+                    mesh_ids.append(mesh_id)
+        try:
+            material_id = int(str(material.attrib.get("ID") or ""))
+        except ValueError:
+            material_id = None
+        materials.append({
+            "id": material_id,
+            "name": str(material.attrib.get("Name") or ""),
+            "mesh_ids": mesh_ids,
+            "atlas_scope": _atlas_scope_from_user_data(material),
+        })
+    meshes = []
+    for mesh in assets.findall("Mesh"):
+        try:
+            mesh_id = int(str(mesh.attrib.get("ID") or ""))
+        except ValueError:
+            mesh_id = None
+        meshes.append({
+            "id": mesh_id,
+            "filename": str(
+                mesh.findtext("Filename")
+                or mesh.findtext("FileName")
+                or ""
+            ),
+            "atlas_scope": _atlas_scope_from_user_data(mesh),
+        })
+    return {
+        "materials": materials,
+        "meshes": meshes,
+    }
+
+
+def _scope_failure_diagnostics(blend, target):
+    scope_dir = Path(target).parent / ".atlas_leaf_speedtree_scopes"
+    if not scope_dir.is_dir():
+        return []
+    rows = []
+    for path in sorted(scope_dir.glob(f"*__{Path(target).stem}.json")):
+        payload = _read_json(path)
+        if not payload:
+            rows.append({"path": str(path), "read_error": "invalid JSON"})
+            continue
+        payload_blend = str(payload.get("blend_file") or "")
+        if payload_blend and (
+            normalized_path_key(payload_blend)
+            != normalized_path_key(blend)
+        ):
+            continue
+        adoption = payload.get("source_material_adoption") or {}
+        connection = payload.get("generator_connection") or {}
+        rows.append({
+            "path": str(path),
+            "export_scope_id": payload.get("export_scope_id"),
+            "spm": payload.get("spm"),
+            "material_groups": (
+                payload.get("speedtree_material_groups")
+                or payload.get("material_groups")
+                or []
+            ),
+            "source_material_adoption": {
+                "version": adoption.get("version"),
+                "scope": adoption.get("scope"),
+                "material_name": adoption.get("material_name"),
+                "material_id": adoption.get("material_id"),
+                "original_mesh_ids": adoption.get("original_mesh_ids"),
+                "generated_mesh_ids": adoption.get("generated_mesh_ids"),
+                "removed_original_mesh_ids": adoption.get(
+                    "removed_original_mesh_ids"
+                ),
+                "preserved_original_mesh_ids": adoption.get(
+                    "preserved_original_mesh_ids"
+                ),
+                "final_material_mesh_ids": adoption.get(
+                    "final_material_mesh_ids"
+                ),
+                "baseline_kind": adoption.get("baseline_kind"),
+                "reused_original_snapshot": adoption.get(
+                    "reused_original_snapshot"
+                ),
+            },
+            "generator_connection": {
+                "complete": connection.get("complete"),
+                "bindings": connection.get("bindings") or [],
+            },
+        })
+    return rows
+
+
+def _persist_cluster_relation_failure(
+    *,
+    blend,
+    targets,
+    enabled,
+    phase,
+    command,
+    snapshots,
+    artifact_recipe,
+    report=None,
+    result=None,
+    launch_error=None,
+    destination=None,
+):
+    """Persist exact pre-rollback evidence outside the temporary job folder."""
+    blend = Path(blend).expanduser().absolute()
+    snapshot_by_target = {
+        normalized_path_key(path): copy
+        for path, copy in snapshots or []
+    }
+    target_rows = []
+    for target in targets:
+        target = Path(target).expanduser().absolute()
+        snapshot = snapshot_by_target.get(normalized_path_key(target))
+        before_sha256 = (
+            _sha256_file(snapshot)
+            if snapshot is not None and snapshot.is_file()
+            else None
+        )
+        failed_sha256 = _sha256_file(target) if target.is_file() else None
+        target_rows.append({
+            "path": str(target),
+            "before_sha256": before_sha256,
+            "failed_sha256": failed_sha256,
+            "changed_before_rollback": (
+                before_sha256 is not None
+                and failed_sha256 is not None
+                and before_sha256 != failed_sha256
+            ),
+            "before_spm": (
+                _spm_failure_inventory(snapshot)
+                if snapshot is not None and snapshot.is_file()
+                else None
+            ),
+            "failed_spm": (
+                _spm_failure_inventory(target)
+                if target.is_file()
+                else None
+            ),
+            "scope_manifests": _scope_failure_diagnostics(blend, target),
+        })
+    process = None
+    if result is not None:
+        process = {
+            "returncode": getattr(result, "returncode", None),
+            "stdout": str(getattr(result, "stdout", "") or ""),
+            "stderr": str(getattr(result, "stderr", "") or ""),
+        }
+    payload = {
+        "kind": "cluster_relation_failure_diagnostic",
+        "version": 1,
+        "recorded_at": datetime.now().astimezone().isoformat(
+            timespec="microseconds"
+        ),
+        "phase": str(phase),
+        "mode": "sync" if enabled else "remove",
+        "blend": str(blend),
+        "targets": target_rows,
+        "command": [str(value) for value in command or []],
+        "worker_report": report,
+        "process": process,
+        "launch_error": (
+            f"{type(launch_error).__name__}: {launch_error}"
+            if launch_error is not None
+            else None
+        ),
+        "artifact_recipe": artifact_recipe,
+    }
+    report_dir = blend.parent / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    if destination is not None:
+        destination = Path(destination).expanduser().absolute()
+        if destination.parent != report_dir.absolute():
+            raise RuntimeError(
+                "Worker failure diagnostic is outside the Cluster reports "
+                f"directory: {destination}"
+            )
+        previous = _read_json(destination)
+        if previous:
+            payload["worker_diagnostic"] = {
+                "phase": previous.get("phase"),
+                "recorded_at": previous.get("recorded_at"),
+            }
+    else:
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        destination = (
+            report_dir
+            / f"{blend.stem}_cluster_relation_failure_{stamp}.json"
+        )
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        delete=False,
+        dir=str(report_dir),
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+        handle.write("\n")
+    try:
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def _sha256_file(path):
     path = Path(path).expanduser().absolute()
-    stat = path.stat()
-    key = normalized_path_key(path)
-    signature = (int(stat.st_size), int(stat.st_mtime_ns))
-    cached = _FILE_HASH_CACHE.get(key)
-    if cached and cached["signature"] == signature:
-        return cached["sha256"]
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    value = digest.hexdigest()
-    _FILE_HASH_CACHE[key] = {"signature": signature, "sha256": value}
-    return value
+    for _attempt in range(2):
+        before = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return digest.hexdigest()
+    raise ClusterBlendSyncError(
+        f"File changed while its content fingerprint was calculated: {path}"
+    )
 
 
 def _physical_capture_manifest_for_blend(blend):
@@ -462,6 +820,61 @@ def _recorded_source_hashes(receipt, canonical_spm):
     return hashes
 
 
+def _recorded_source_fbx_rows(receipt):
+    rows = {}
+    for row in _walk_dicts(receipt):
+        source_path = str(row.get("source_fbx") or "").strip()
+        source_hash = str(
+            row.get("source_fbx_sha256") or ""
+        ).strip().casefold()
+        if not source_path or not source_hash:
+            continue
+        rows.setdefault(normalized_path_key(source_path), {
+            "path": str(Path(source_path).expanduser().absolute()),
+            "sha256": source_hash,
+        })
+    return list(rows.values())
+
+
+def _target_scope_refresh_reasons(payload, target_spm):
+    """Compare a scope receipt with the material/mesh registry it committed."""
+    try:
+        from pcg_st9_texture_batch import pcg_texture_audit as audit
+    except ImportError:
+        import pcg_texture_audit as audit
+
+    adoption = payload.get("source_material_adoption") or {}
+    target_rows = audit.extract_material_image_refs(target_spm)
+    reasons = []
+    for group in payload.get("material_groups") or ():
+        material = str(group.get("material") or "")
+        material_id = int(group.get("material_id") or 0)
+        expected_mesh_ids = [
+            int(value) for value in group.get("mesh_ids") or ()
+        ]
+        if (
+            str(adoption.get("material_name") or "") == material
+            and int(adoption.get("material_id") or 0) == material_id
+            and adoption.get("final_material_mesh_ids") is not None
+        ):
+            expected_mesh_ids = [
+                int(value)
+                for value in adoption.get("final_material_mesh_ids") or ()
+            ]
+        matches = [
+            row for row in target_rows
+            if str(row.get("material_name") or "") == material
+            and int(row.get("material_id") or 0) == material_id
+            and [
+                int(value) for value in row.get("cutout_mesh_ids") or ()
+            ] == expected_mesh_ids
+        ]
+        if len(matches) != 1:
+            reasons.append("target_scope_changed")
+            break
+    return reasons
+
+
 def _physical_refresh_state(payload, canonical_spm, blend):
     receipt = payload.get("normalized_prototype_receipt")
     if not isinstance(receipt, dict):
@@ -488,6 +901,17 @@ def _physical_refresh_state(payload, canonical_spm, blend):
     elif recorded_hashes and recorded_hashes != {current_source_sha256}:
         reasons.append("canonical_source_changed")
 
+    recorded_fbx_rows = _recorded_source_fbx_rows(receipt)
+    for recorded in recorded_fbx_rows:
+        source_fbx = Path(recorded["path"])
+        current_fbx_sha256 = (
+            _sha256_file(source_fbx) if source_fbx.is_file() else None
+        )
+        if not current_fbx_sha256:
+            reasons.append("source_fbx_missing")
+        elif current_fbx_sha256.casefold() != recorded["sha256"]:
+            reasons.append("source_fbx_changed")
+
     capture = _physical_capture_manifest_for_blend(blend)
     recorded_capture_sha256 = str(
         receipt.get("physical_capture_contract_sha256") or ""
@@ -511,6 +935,7 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         "capture_manifest": str(capture["path"]),
         "capture_contract_sha256": capture["contract_sha256"],
         "recorded_capture_contract_sha256": recorded_capture_sha256,
+        "source_fbx_artifacts": recorded_fbx_rows,
     }
 
 
@@ -573,21 +998,29 @@ def inspect_cluster_target(
     connection = payload.get("generator_connection") or {}
     adoption = payload.get("source_material_adoption") or {}
     complete = connection.get("complete") is True
+    requested = connection.get("requested")
+    satisfied = complete or requested is False
     canonical = (
         Path(canonical_spm).expanduser().absolute()
         if canonical_spm
         else Path(blend).expanduser().absolute().with_suffix(".spm")
     )
     refresh = _physical_refresh_state(payload, canonical, blend)
-    refresh_required = complete and refresh["refresh_required"]
+    for reason in _target_scope_refresh_reasons(payload, target):
+        if reason not in refresh["refresh_reasons"]:
+            refresh["refresh_reasons"].append(reason)
+    refresh["refresh_required"] = bool(refresh["refresh_reasons"])
+    refresh_required = satisfied and refresh["refresh_required"]
     return {
         "status": (
             "refresh_required"
             if refresh_required
-            else "synced" if complete
+            else "synced" if satisfied
             else "attention"
         ),
         "connected": complete,
+        "connection_requested": requested,
+        "connection_satisfied": satisfied,
         "material": (
             adoption.get("material_name")
             or payload.get("material")
@@ -776,12 +1209,18 @@ def run_cluster_relation_transaction(
     blender = Path(blender_exe).expanduser().absolute()
     if not blender.is_file():
         raise ClusterBlendSyncError(f"Blender executable does not exist: {blender}")
+    registered_before = _registry_target_spms(blend)
+    effective_targets = (
+        _merge_target_spms(registered_before, targets)
+        if enabled
+        else list(targets)
+    )
     normalization_recipe = None
     if enabled and auto_normalize:
         try:
             normalization_recipe = resolve_normalization_recipe(
                 blend,
-                targets,
+                effective_targets,
                 canonical_spm=blend.with_suffix(".spm"),
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
@@ -813,31 +1252,99 @@ def run_cluster_relation_transaction(
         if enabled:
             for target in targets:
                 set_cluster_relation_registry(blend, target, True)
+            registered_after = _registry_target_spms(blend)
+            if {
+                normalized_path_key(path) for path in registered_after
+            } != {
+                normalized_path_key(path) for path in effective_targets
+            }:
+                try:
+                    _restore_registry_snapshot(
+                        registry_path, registry_before
+                    )
+                except OSError as restore_error:
+                    raise ClusterBlendSyncError(
+                        "Cluster target registry changed while the effective "
+                        "ON target contract was being prepared, and its "
+                        f"snapshot could not be restored: {restore_error}"
+                    ) from restore_error
+                raise ClusterBlendSyncError(
+                    "Cluster target registry changed while the effective ON "
+                    "target contract was being prepared."
+                )
 
         # The Blender job rebuilds every registered target, not only the selected
         # ones, so the whole registry is at risk - not just ``targets``.
-        at_risk = {normalized_path_key(path): path for path in targets}
-        for path in _registry_target_spms(blend):
-            at_risk.setdefault(normalized_path_key(path), path)
+        at_risk_targets = effective_targets if enabled else targets
+        at_risk = {
+            normalized_path_key(path): path for path in at_risk_targets
+        }
         snapshots = _snapshot_spm_files(
             at_risk.values(), Path(temporary) / "spm_snapshots"
         )
-        normalization_snapshots = _snapshot_normalization_artifacts(
+        artifact_recipe = _atlas_transaction_artifact_recipe(
+            blend,
+            list(at_risk.values()),
             normalization_recipe,
+        )
+        normalization_snapshots = _snapshot_normalization_artifacts(
+            artifact_recipe,
             Path(temporary) / "normalization_artifacts",
         )
+
+        def persist_failure(phase, *, report=None, result=None, error=None):
+            existing_diagnostic = (
+                str((report or {}).get("persistent_failure_report") or "")
+                or None
+            )
+            try:
+                diagnostic = _persist_cluster_relation_failure(
+                    blend=blend,
+                    targets=list(at_risk.values()),
+                    enabled=enabled,
+                    phase=phase,
+                    command=command,
+                    snapshots=snapshots,
+                    artifact_recipe=artifact_recipe,
+                    report=report,
+                    result=result,
+                    launch_error=error,
+                    destination=existing_diagnostic,
+                )
+            except Exception as diagnostic_error:
+                return (
+                    "\nCOULD NOT write failure diagnostic log: "
+                    f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+                )
+            if existing_diagnostic:
+                return ""
+            return f"\nFailure diagnostic log: {diagnostic}"
 
         def rollback():
             restored, failed = _restore_spm_files(snapshots)
             capture_restored, capture_failed = (
                 _restore_normalization_artifacts(normalization_snapshots)
             )
-            if enabled:
-                if registry_before is None:
-                    registry_path.unlink(missing_ok=True)
-                else:
-                    registry_path.write_bytes(registry_before)
+            registry_restored = []
+            registry_failed = []
+            try:
+                if _restore_registry_snapshot(
+                    registry_path, registry_before
+                ):
+                    registry_restored.append(str(registry_path))
+            except OSError as exc:
+                registry_failed.append(f"{registry_path}: {exc}")
             detail = _rollback_detail(restored, failed)
+            if registry_restored:
+                detail += (
+                    "\nRestored Cluster target registry: "
+                    + ", ".join(registry_restored)
+                )
+            if registry_failed:
+                detail += (
+                    "\nCOULD NOT restore Cluster target registry: "
+                    + "; ".join(registry_failed)
+                )
             if capture_restored:
                 detail += (
                     "\nRestored Cluster/Atlas transaction artifact(s): "
@@ -876,14 +1383,22 @@ def run_cluster_relation_transaction(
         except (subprocess.SubprocessError, OSError) as exc:
             raise ClusterBlendSyncError(
                 f"Cluster relationship {'ON' if enabled else 'OFF'} apply did not "
-                f"finish: {exc}" + rollback()
+                f"finish: {exc}"
+                + persist_failure("launch_failed", error=exc)
+                + rollback()
             ) from exc
         report = _read_json(report_path) if report_path.is_file() else None
         if result.returncode != 0 or not report or report.get("status") != "ok":
             detail = (report or {}).get("error") or (result.stderr or result.stdout)[-1200:]
             raise ClusterBlendSyncError(
                 f"Cluster relationship {'ON' if enabled else 'OFF'} apply failed: "
-                f"{detail}" + rollback()
+                f"{detail}"
+                + persist_failure(
+                    "worker_failed",
+                    report=report,
+                    result=result,
+                )
+                + rollback()
             )
         if enabled and repair_runtime_config:
             try:

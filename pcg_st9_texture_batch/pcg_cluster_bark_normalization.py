@@ -322,7 +322,8 @@ def _canonical_source(receipt):
 
 def build_isolated_bark_normalization_plan(
         contract_or_handoff, isolated_spms, isolation_root,
-        canonical_texture_map=None):
+        canonical_texture_map=None,
+        preserve_source_material_name=False):
     """Build verified in-memory SPM patches from a PCG Cluster handoff.
 
     ``isolated_spms`` maps each receipt ``cluster_spm`` to its copy.  Only
@@ -402,12 +403,17 @@ def build_isolated_bark_normalization_plan(
             canonical["block"], canonical["spm"], isolated_spm,
             tree_root, explicit_textures,
         )
+        output_material = (
+            str(row.get("material_name") or "")
+            if preserve_source_material_name
+            else canonical_name
+        )
         patched_block = _replace_material_maps(
-            target_block, canonical_maps, canonical_name)
+            target_block, canonical_maps, output_material)
         after = before[:target_match.start()] + patched_block + before[target_match.end():]
 
         if _outside_material_hash(before, row.get("material_name"), material_id) \
-                != _outside_material_hash(after, canonical_name, material_id):
+                != _outside_material_hash(after, output_material, material_id):
             raise BarkNormalizationError(
                 f"non-bark SPM payload changed unexpectedly: {isolated_spm}")
         before_active = sorted(str(value) for value in active_material_ids(isolated_spm))
@@ -441,6 +447,10 @@ def build_isolated_bark_normalization_plan(
             "canonical_source_spm": str(canonical["spm"]),
             "canonical_material": canonical_name,
             "source_material": row.get("material_name"),
+            "output_material": output_material,
+            "source_material_name_preserved": bool(
+                preserve_source_material_name
+            ),
             "material_id": material_id,
             "active_material_ids": before_active,
             "mesh_asset_ids": before_meshes,
@@ -453,6 +463,9 @@ def build_isolated_bark_normalization_plan(
         "schema_version": SCHEMA_VERSION,
         "status": "ready",
         "canonical_material": canonical_name,
+        "source_material_name_preserved": bool(
+            preserve_source_material_name
+        ),
         "isolation_root": str(root),
         "patches": patches,
     }
@@ -495,7 +508,7 @@ def apply_isolated_bark_normalization(plan):
             path = Path(patch["isolated_spm"])
             text = read_maybe_gzip_text(path)
             blocks = _material_blocks(
-                text, patch["canonical_material"], patch["material_id"])
+                text, patch["output_material"], patch["material_id"])
             if len(blocks) != 1:
                 raise BarkNormalizationError(
                     f"canonical bark write verification failed: {path}")
@@ -665,22 +678,59 @@ def _xml_material_evidence(path, canonical_name, expected_basenames):
         and _export_material_base(element.attrib.get("Name")).casefold()
         == str(canonical_name).casefold()
     ]
-    if len(materials) != 1:
+    if not materials:
         raise BarkNormalizationError(
-            f"expected one canonical bark material in {path.name}, found {len(materials)}")
-    sources = {
-        Path(element.attrib.get("Source") or "").name.casefold()
-        for element in materials[0].iter()
-        if element.attrib.get("Source")
-    }
-    missing = set(expected_basenames) - sources
-    if missing:
+            f"expected canonical bark material in {path.name}, found 0")
+    canonical_identity = normalize_export_name(canonical_name)
+    species_identity = canonical_identity
+    if species_identity.startswith("bark_"):
+        species_identity = species_identity[5:]
+    if species_identity.endswith("_01"):
+        species_identity = species_identity[:-3]
+    species_token = re.sub(r"[^a-z0-9]+", "", species_identity.casefold())
+    rows = []
+    exact_set_found = False
+    for material in materials:
+        sources = {
+            Path(element.attrib.get("Source") or "").name.casefold()
+            for element in material.iter()
+            if element.attrib.get("Source")
+        }
+        exact = set(expected_basenames).issubset(sources)
+        exact_set_found = exact_set_found or exact
+        same_species = bool(
+            sources
+            and species_token
+            and all(
+                species_token in re.sub(
+                    r"[^a-z0-9]+", "", value.casefold()
+                )
+                for value in sources
+            )
+        )
+        if not exact and not same_species:
+            raise BarkNormalizationError(
+                f"canonical bark alias in {path.name} uses another "
+                f"texture family: {sorted(sources)}"
+            )
+        rows.append({
+            "material": material.attrib.get("Name"),
+            "texture_basenames": sorted(sources),
+            "exact_normalized_set": exact,
+            "same_species_alias": same_species,
+        })
+    if not exact_set_found:
         raise BarkNormalizationError(
-            f"canonical bark textures did not propagate to {path.name}: {sorted(missing)}")
+            f"canonical bark textures did not propagate to {path.name}: "
+            f"{sorted(expected_basenames)}")
     return {
         "path": str(path),
         "material": materials[0].attrib.get("Name"),
-        "texture_basenames": sorted(sources),
+        "materials": rows,
+        "material_count": len(rows),
+        "texture_basenames": sorted({
+            value for row in rows for value in row["texture_basenames"]
+        }),
     }
 
 
@@ -695,6 +745,11 @@ def validate_canonical_bark_export_bundle(
         raise BarkNormalizationError(
             "an applied bark normalization report is required")
     canonical = normalization_report.get("canonical_material")
+    output_materials = {
+        str(output.get("output_material") or canonical)
+        for output in normalization_report.get("outputs") or []
+        if str(output.get("output_material") or canonical)
+    }
     texture_rows = [
         texture
         for output in normalization_report.get("outputs") or []
@@ -705,7 +760,7 @@ def validate_canonical_bark_export_bundle(
         for row in texture_rows
         if row.get("export_enabled", True)
     }
-    if not canonical or not expected_basenames:
+    if not canonical or not output_materials or not expected_basenames:
         raise BarkNormalizationError(
             "normalization report has no canonical material/texture evidence")
 
@@ -716,8 +771,9 @@ def validate_canonical_bark_export_bundle(
             f"FBX inspection failed: {fbx_report.get('error')}")
     pairs = [
         row for row in fbx_report.get("material_mesh_pairs") or []
-        if _export_material_base(row.get("material")).casefold()
-        == str(canonical).casefold()
+        if _export_material_base(row.get("material")).casefold() in {
+            value.casefold() for value in output_materials
+        }
     ]
     if not pairs:
         raise BarkNormalizationError(
@@ -727,22 +783,39 @@ def validate_canonical_bark_export_bundle(
     if not has_uv:
         raise BarkNormalizationError("FBX has no UV layer evidence")
 
-    stmat_report = _xml_material_evidence(
-        stmat, canonical, expected_basenames)
-    xml_report = _xml_material_evidence(
-        xml, canonical, expected_basenames)
+    stmat_reports = [
+        _xml_material_evidence(
+            stmat, material, expected_basenames
+        )
+        for material in sorted(output_materials, key=str.casefold)
+    ]
+    xml_reports = [
+        _xml_material_evidence(
+            xml, material, expected_basenames
+        )
+        for material in sorted(output_materials, key=str.casefold)
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ready_for_downstream_blender_mapping",
         "canonical_material": canonical,
+        "output_materials": sorted(output_materials, key=str.casefold),
         "fbx": {
             "path": str(fbx),
             "format": fbx_report.get("format"),
             "material_mesh_pairs": pairs,
             "uv_layer_evidence": True,
         },
-        "stmat": stmat_report,
-        "xml": xml_report,
+        "stmat": (
+            stmat_reports[0]
+            if len(stmat_reports) == 1
+            else {"materials": stmat_reports}
+        ),
+        "xml": (
+            xml_reports[0]
+            if len(xml_reports) == 1
+            else {"materials": xml_reports}
+        ),
         "material_slot_propagated": True,
         "texture_set_propagated": True,
         "uv_preserved": True,

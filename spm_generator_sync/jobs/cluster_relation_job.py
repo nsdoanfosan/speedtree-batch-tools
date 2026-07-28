@@ -3,7 +3,6 @@
 import argparse
 import hashlib
 import json
-import re
 import shutil
 import sys
 import traceback
@@ -11,6 +10,16 @@ from pathlib import Path
 
 import addon_utils
 import bpy
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from cluster_export_handoff_contract import (
+    atomic_write_json,
+    cluster_export_contract_issues as inspect_cluster_export_contract,
+    finalize_cluster_pipeline_payload,
+)
 
 
 def parse_args():
@@ -48,48 +57,10 @@ def sha256_file(path):
 
 
 def cluster_export_contract_issues(cluster_source_stem):
-    export_collection = bpy.data.collections.get("Export")
-    if export_collection is None:
-        return ["missing_export_collection"]
-    issues = [
-        f"orphan_owned_export_empty:{obj.name}"
-        for obj in export_collection.objects
-        if obj.type == "EMPTY"
-        and not obj.children
-        and bool(obj.get("codex_source_fbx", ""))
-    ]
-    pivots = [
-        obj
-        for obj in export_collection.objects
-        if obj.type == "EMPTY"
-        and obj.children
-        and bool(obj.get("speedtree_cluster_generated"))
-        and obj.get("speedtree_cluster_asset_role") == "send2ue_pivot"
-    ]
-    issues.extend(
-        f"cluster_unsuffixed_export_unit:{obj.name}"
-        for obj in export_collection.objects
-        if obj.type == "EMPTY" and obj.children and obj not in pivots
+    return inspect_cluster_export_contract(
+        bpy.data,
+        cluster_source_stem,
     )
-    pattern = re.compile(
-        rf"^{re.escape(cluster_source_stem)}_(\d{{2}})$",
-        re.IGNORECASE,
-    )
-    ordinals = []
-    for pivot in pivots:
-        match = pattern.fullmatch(pivot.name)
-        if match is None:
-            issues.append(f"cluster_invalid_export_pivot:{pivot.name}")
-        else:
-            ordinals.append(int(match.group(1)))
-    if not pivots:
-        issues.append("cluster_missing_normalized_export_pivot")
-    elif sorted(ordinals) != list(range(1, len(pivots) + 1)):
-        issues.append(
-            "cluster_nonconsecutive_export_pivots:"
-            + ",".join(str(value) for value in sorted(ordinals))
-        )
-    return issues
 
 
 def finalize_cluster_source_pipeline(recipe):
@@ -108,37 +79,16 @@ def finalize_cluster_source_pipeline(recipe):
         / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
     )
     payload = json.loads(report_path.read_text(encoding="utf-8"))
-    handoff = payload.get("handoff_preflight") or {}
-    if handoff.get("status") == "cluster_export_pending":
-        source_build = payload.get("cluster_source_build_contract") or {}
-        final_status = source_build.get(
-            "post_normalization_handoff_status", "ok"
+    try:
+        finalized, changed = finalize_cluster_pipeline_payload(
+            payload,
+            export_issues=issues,
+            expected_source_object=recipe.get("source_object"),
         )
-        if final_status not in {"ok", "source_review"}:
-            raise RuntimeError(
-                "Cluster source-build post-normalization handoff status is "
-                f"invalid: {final_status}"
-            )
-        handoff["status"] = final_status
-        handoff["export_collection_issues"] = []
-        handoff["source_review_required"] = (
-            final_status == "source_review"
-        )
-        handoff["unreal_push_ready"] = final_status == "ok"
-        payload["handoff_preflight"] = handoff
-        payload["export_collection_issues"] = []
-        payload["source_review_required"] = (
-            final_status == "source_review"
-        )
-        payload["unreal_push_ready"] = final_status == "ok"
-        source_build["status"] = "normalized"
-        source_build["deferred_export_issues"] = []
-        source_build["final_export_required"] = False
-        payload["cluster_source_build_contract"] = source_build
-        report_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if changed:
+        atomic_write_json(report_path, finalized)
     return {
         "status": "ok",
         "pipeline_report": str(report_path),
@@ -168,6 +118,36 @@ def load_normalization_recipe(path, blend, requested):
             + ", ".join(missing)
         )
     return payload
+
+
+def validate_recipe_registry_contract(recipe, registered_paths):
+    """Require one explicit material binding for every effective ON target."""
+    if not recipe:
+        raise RuntimeError(
+            "Cluster relationship Sync requires a normalization recipe."
+        )
+    registered = [key(path) for path in registered_paths]
+    recipe_targets = [key(path) for path in recipe.get("target_spms") or []]
+    bindings = recipe.get("target_material_bindings") or []
+    binding_targets = [key(row.get("target_spm")) for row in bindings]
+    if (
+        len(registered) != len(set(registered))
+        or len(recipe_targets) != len(set(recipe_targets))
+        or len(binding_targets) != len(set(binding_targets))
+        or set(recipe_targets) != set(registered)
+        or set(binding_targets) != set(registered)
+    ):
+        raise RuntimeError(
+            "Cluster normalization recipe, material bindings, and Atlas "
+            "target registry must describe the same effective ON target set."
+        )
+    for binding in bindings:
+        if binding.get("connect_generators") not in {True, False}:
+            raise RuntimeError(
+                "Cluster normalization material binding must declare "
+                "connect_generators as an explicit boolean."
+            )
+    return {key(row["target_spm"]): row for row in bindings}
 
 
 def normalize_cluster_blend(recipe):
@@ -392,8 +372,12 @@ def configure_cluster_export_properties(props, recipe):
             for row in recipe.get("target_material_bindings") or []
             if key(row.get("target_spm")) == key(first_target)
         ),
-        {},
+        None,
     )
+    if first_binding is None:
+        raise RuntimeError(
+            "Cluster normalization recipe has no binding for its first target."
+        )
     configured = configure_external_plan_target(
         props,
         collection_name=recipe["plan_collection"],
@@ -416,8 +400,8 @@ def configure_cluster_export_properties(props, recipe):
             "generator_variant_policy"
         ),
         unit_probe_contract=unit_probe,
-        connect_generators=bool(
-            first_binding.get("connect_generators", True)
+        connect_generators=(
+            first_binding.get("connect_generators") is True
         ),
     )
     props.alpha_path = str(opacity_path)
@@ -450,7 +434,7 @@ def apply_recipe_source_material_mappings(props, recipe):
                 "Cluster normalization material binding has no target SPM."
             )
         previous_key = existing_by_key.get(key(target))
-        if not binding.get("connect_generators"):
+        if binding.get("connect_generators") is not True:
             if previous_key is not None:
                 mapping.pop(previous_key, None)
             assets_only.append({
@@ -472,6 +456,9 @@ def apply_recipe_source_material_mappings(props, recipe):
             "generator_variant_policy": binding[
                 "generator_variant_policy"
             ],
+            "source_binding_repairs": list(
+                binding.get("source_binding_repairs") or []
+            ),
         }
         if mapping.get(target) == request:
             preserved.append(target)
@@ -532,18 +519,18 @@ def sync_targets(blend, requested, normalization_recipe=None):
     scene_targets = {key(item.path) for item in props.speedtree_spm_items}
     if scene_targets != registered:
         raise RuntimeError("Blender Atlas target list did not match the external JSON")
+    bindings_by_key = validate_recipe_registry_contract(
+        normalization_recipe,
+        registered_paths,
+    )
     recipe_mapping_update = apply_recipe_source_material_mappings(
         props,
         normalization_recipe,
     )
-    assets_only_keys = {
-        key(row["target_spm"])
-        for row in recipe_mapping_update.get("assets_only") or []
-    }
     connection_targets = [
         path
         for path in registered_paths
-        if key(path) not in assets_only_keys
+        if bindings_by_key[key(path)].get("connect_generators") is True
     ]
     if connection_targets:
         mapping_update = extend_source_material_adoptions_for_targets(
@@ -647,11 +634,48 @@ def main():
         )
         report = {"status": "ok", **payload}
     except Exception as exc:
+        traceback_text = traceback.format_exc()
         report = {
             "status": "error",
             "error": str(exc),
-            "traceback": traceback.format_exc(),
+            "traceback": traceback_text,
         }
+        try:
+            from cluster_blend_sync import (
+                _persist_cluster_relation_failure,
+            )
+
+            persistent_failure_report = (
+                _persist_cluster_relation_failure(
+                    blend=args.blend,
+                    targets=args.target,
+                    enabled=args.mode == "sync",
+                    phase="blender_worker_exception",
+                    command=sys.argv,
+                    snapshots=[],
+                    artifact_recipe={
+                        "normalization_recipe": (
+                            args.normalization_recipe
+                        ),
+                    },
+                    report=report,
+                )
+            )
+            report["persistent_failure_report"] = str(
+                persistent_failure_report
+            )
+            report["error"] += (
+                "\nFailure diagnostic log: "
+                + str(persistent_failure_report)
+            )
+        except Exception as diagnostic_exc:
+            report["diagnostic_write_error"] = (
+                f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+            )
+            report["error"] += (
+                "\nCOULD NOT write failure diagnostic log: "
+                + report["diagnostic_write_error"]
+            )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps(

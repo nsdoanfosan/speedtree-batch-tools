@@ -62,6 +62,30 @@ def item(queue_id, fingerprint):
 
 
 class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
+    def test_dependency_orchestrated_tree_cannot_skip_missing_assembly(self):
+        runner = load_runner()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "dependency-orchestrated Tree has no.*Assembly manifest",
+        ):
+            runner._ingest_cluster_assembly(
+                None,
+                {
+                    "dependency_orchestrated": True,
+                    "cluster_assembly": None,
+                },
+                {"status": "ok"},
+            )
+
+    def test_ordinary_non_cluster_asset_can_skip_missing_assembly(self):
+        runner = load_runner()
+        result = runner._ingest_cluster_assembly(
+            None,
+            {"cluster_assembly": None},
+            {"status": "ok"},
+        )
+        self.assertEqual(result["status"], "skipped")
+
     def test_content_absent_assembly_plan_passes_through_without_a_toggle(self):
         runner = load_runner()
         result = runner._ingest_cluster_assembly(
@@ -441,6 +465,110 @@ def test_missing_cached_cluster_asset_is_reimported(tmp_path, monkeypatch):
         result["items"]["cluster"]["asset_cache_preflight"]["status"]
         == "missing"
     )
+
+
+def test_cached_tree_verifies_every_ready_assembly_contract_asset(monkeypatch):
+    runner = load_runner(monkeypatch)
+    tree = item("tree", "tree-v1")
+    tree.update(
+        {
+            "assets": [{
+                "asset_data": {
+                    "asset_path": "/Game/Tree/SK_Tree_01"
+                }
+            }],
+            "cluster_assembly": {
+                "ingest_plan": {
+                    "status": "ready",
+                    "asset_contract": {
+                        "full_skeletal_mesh": "/Game/Tree/SK_Tree_01",
+                        "base_skeletal_mesh": (
+                            "/Game/Tree/Assembly/SK_Tree_01_NA_Base"
+                        ),
+                        "parts": {
+                            "branch": (
+                                "/Game/Tree/Assembly/"
+                                "SK_Tree_01_NA_Branch_01"
+                            ),
+                            "leaf": (
+                                "/Game/Tree/Assembly/"
+                                "SK_Tree_01_NA_Leaf_01"
+                            ),
+                        },
+                        "assembly": (
+                            "/Game/Tree/Assembly/"
+                            "SK_Tree_01_NaniteAssembly"
+                        ),
+                    },
+                }
+            },
+        }
+    )
+    runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+        does_asset_exist=lambda _path: True
+    )
+
+    result = runner._verify_manifest_assets_exist(tree)
+
+    assert result["complete"] is True
+    assert result["status"] == "current"
+    assert len(result["asset_paths"]) == 5
+    assert any(
+        path.endswith("NaniteAssembly")
+        for path in result["asset_path_groups"]["cluster_assembly"]
+    )
+
+
+def test_missing_cached_assembly_part_reimports_tree(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    missing_part = "/Game/Tree/Assembly/SK_Tree_01_NA_Leaf_01"
+    tree = item("tree", "tree-v1")
+    tree.update(
+        {
+            "verify_existing_assets": True,
+            "assets": [{
+                "asset_data": {
+                    "asset_path": "/Game/Tree/SK_Tree_01"
+                }
+            }],
+            "cluster_assembly": {
+                "ingest_plan": {
+                    "status": "ready",
+                    "asset_contract": {
+                        "full_skeletal_mesh": "/Game/Tree/SK_Tree_01",
+                        "base_skeletal_mesh": (
+                            "/Game/Tree/Assembly/SK_Tree_01_NA_Base"
+                        ),
+                        "parts": {"leaf": missing_part},
+                        "assembly": (
+                            "/Game/Tree/Assembly/"
+                            "SK_Tree_01_NaniteAssembly"
+                        ),
+                    },
+                }
+            },
+        }
+    )
+    manifest, _checkpoint, _report = write_manifest(tmp_path, [tree])
+    runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+        does_asset_exist=lambda path: path != missing_part
+    )
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: calls.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert calls == ["tree"]
+    preflight = result["items"]["tree"]["asset_cache_preflight"]
+    assert preflight["missing_asset_paths"] == [missing_part]
+    assert preflight["missing_asset_paths_by_group"][
+        "cluster_assembly"
+    ] == [missing_part]
 
 
 def test_runtime_pending_checkpoint_finishes_without_reimport(tmp_path, monkeypatch):
@@ -823,7 +951,15 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(result["saved"], [mesh_path])
 
     @staticmethod
-    def _skeleton_fixture(runner, skeleton_name, exists=True):
+    def _skeleton_fixture(
+        runner,
+        skeleton_name,
+        exists=True,
+        *,
+        default_skeleton_exists=False,
+        metadata=None,
+        referencers=None,
+    ):
         calls = {"deleted": []}
 
         class FakeSkeleton:
@@ -834,7 +970,12 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 return self._name
 
             def get_path_name(self):
-                return f"/Game/Meshes/_Placeholder/{self._name}.{self._name}"
+                folder = (
+                    "/Game/Meshes/_Placeholder"
+                    if self._name == "SK_PlaceholderCube_Skeleton"
+                    else "/Game/Meshes/Trees"
+                )
+                return f"{folder}/{self._name}.{self._name}"
 
         class FakeMesh:
             def __init__(self):
@@ -850,12 +991,22 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
         class FakeEditorAssetLibrary:
             @staticmethod
-            def does_asset_exist(_path):
+            def does_asset_exist(path):
+                if str(path).endswith("_Skeleton"):
+                    return default_skeleton_exists
                 return exists
 
             @staticmethod
             def load_asset(_path):
                 return mesh
+
+            @staticmethod
+            def get_metadata_tag(_asset, key):
+                return (metadata or {}).get(str(key), "")
+
+            @staticmethod
+            def find_package_referencers_for_asset(_path, _load_assets=True):
+                return list(referencers or [])
 
             @staticmethod
             def delete_asset(path):
@@ -876,6 +1027,23 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(result["status"], "fresh")
         self.assertEqual(calls["deleted"], [])
 
+    def test_clear_orphan_canonical_skeleton_uses_fresh_staging_import(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(
+            runner,
+            None,
+            exists=False,
+            default_skeleton_exists=True,
+        )
+
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test"}
+        )
+
+        self.assertEqual(result["status"], "fresh_publish_required")
+        self.assertTrue(result["requires_fresh_publish"])
+        self.assertEqual(calls["deleted"], [])
+
     def test_clear_skeleton_left_alone_when_dedicated(self):
         runner = load_runner()
         calls = self._skeleton_fixture(runner, "SK_Test_Skeleton")
@@ -887,35 +1055,241 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(calls["deleted"], [])
 
-    def test_clear_skeleton_deletes_placeholder_mesh(self):
+    def test_clear_skeleton_plans_placeholder_mesh_transaction(self):
         runner = load_runner()
         calls = self._skeleton_fixture(runner, "SK_PlaceholderCube_Skeleton")
+        collected = []
+        runner.unreal.SystemLibrary = types.SimpleNamespace(
+            collect_garbage=lambda: collected.append(True)
+        )
 
         result = runner._clear_placeholder_skeleton_before_import(
             {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
         )
 
-        self.assertEqual(result["status"], "cleared_placeholder")
-        self.assertEqual(calls["deleted"], ["/Game/Meshes/Trees/SK_Test"])
+        self.assertEqual(result["status"], "fresh_publish_required")
+        self.assertTrue(result["requires_fresh_publish"])
+        self.assertEqual(calls["deleted"], [])
         self.assertIn("SK_PlaceholderCube_Skeleton", result["shared_skeleton"])
+        self.assertEqual(collected, [])
 
-    def test_clear_skeleton_raises_when_delete_fails(self):
+    def test_clear_stale_final_skeleton_plans_owned_pair_transaction(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(
+            runner,
+            "SK_Test_Skeleton",
+            default_skeleton_exists=True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wind_json = Path(temp_dir) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "SkeletonContract": {
+                            "BoneCount": 3,
+                            "BoneNameIndexParentSha1": "expected",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner._clear_placeholder_skeleton_before_import(
+                {
+                    "mesh_path": "/Game/Meshes/Trees/SK_Test",
+                    "wind_json": str(wind_json),
+                    "wind_policy": {"requires_json": True},
+                }
+            )
+
+        self.assertEqual(
+            result["status"],
+            "fresh_publish_required",
+        )
+        self.assertTrue(result["requires_fresh_publish"])
+        self.assertEqual(calls["deleted"], [])
+
+    def test_clear_stale_final_skeleton_preserves_foreign_referencers(self):
+        runner = load_runner()
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        skeleton_path = mesh_path + "_Skeleton"
+        assembly_path = (
+            "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+        )
+        calls = self._skeleton_fixture(
+            runner,
+            "SK_Test_Skeleton",
+            default_skeleton_exists=True,
+            referencers=[mesh_path, assembly_path],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wind_json = Path(temp_dir) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "SkeletonContract": {
+                            "BoneCount": 3,
+                            "BoneNameIndexParentSha1": "expected",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner._clear_placeholder_skeleton_before_import(
+                {
+                    "mesh_path": mesh_path,
+                    "wind_json": str(wind_json),
+                    "wind_policy": {"requires_json": True},
+                }
+            )
+
+        self.assertEqual(
+            result["status"],
+            "fresh_publish_required",
+        )
+        self.assertEqual(calls["deleted"], [])
+        self.assertEqual(
+            result["preserved_referenced_skeletons"],
+            {skeleton_path: [assembly_path]},
+        )
+
+    def test_content_addressed_sk_batch_skeleton_is_owned_for_refresh(self):
+        runner = load_runner()
+        self.assertTrue(
+            runner._is_owned_final_skeleton_path(
+                "/Game/Meshes/Trees/SK_Test_Skeleton_0123456789ab",
+                "/Game/Meshes/Trees/SK_Test_Skeleton",
+            )
+        )
+        self.assertFalse(
+            runner._is_owned_final_skeleton_path(
+                "/Game/Meshes/Trees/SK_Test_Skeleton_Custom",
+                "/Game/Meshes/Trees/SK_Test_Skeleton",
+            )
+        )
+
+    def test_referenced_canonical_skeleton_is_relocated_for_fresh_import(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        class FakeAsset:
+            def __init__(self, path):
+                self.path = path
+
+            def get_path_name(self):
+                return self.path + "." + self.path.rsplit("/", 1)[-1]
+
+        assets = {canonical: FakeAsset(canonical)}
+        renamed = []
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(
+                _path,
+                _load_assets=True,
+            ):
+                return [
+                    "/Game/Meshes/Trees/Assembly/"
+                    "SK_Test_NaniteAssembly"
+                ]
+
+            @staticmethod
+            def rename_asset(source, target):
+                asset = assets.pop(source, None)
+                if asset is None or target in assets:
+                    return False
+                asset.path = target
+                assets[target] = asset
+                assets[source] = {"class": "ObjectRedirector"}
+                renamed.append((source, target))
+                return True
+
+            @staticmethod
+            def delete_asset(path):
+                return assets.pop(path, None) is not None
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+
+        result = runner._vacate_canonical_skeleton_path(
+            canonical,
+            legacy_token="0123456789abcdef",
+        )
+
+        self.assertEqual(result["status"], "relocated")
+        self.assertEqual(
+            renamed,
+            [(canonical, canonical + "_Legacy_0123456789ab")],
+        )
+        self.assertNotIn(canonical, assets)
+
+    def test_clear_current_final_skeleton_preserves_owned_assets(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(
+            runner,
+            "SK_Test_Skeleton",
+            default_skeleton_exists=True,
+            metadata={
+                runner.FINAL_SKELETON_HASH_METADATA: "expected",
+                runner.FINAL_SKELETON_BONE_COUNT_METADATA: "3",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wind_json = Path(temp_dir) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "SkeletonContract": {
+                            "BoneCount": 3,
+                            "BoneNameIndexParentSha1": "expected",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner._clear_placeholder_skeleton_before_import(
+                {
+                    "mesh_path": "/Game/Meshes/Trees/SK_Test",
+                    "wind_json": str(wind_json),
+                    "wind_policy": {"requires_json": True},
+                }
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(
+            result["final_skeleton_contract"]["asset_metadata_current"]
+        )
+        self.assertEqual(calls["deleted"], [])
+
+    def test_clear_skeleton_preflight_never_calls_delete(self):
         runner = load_runner()
         self._skeleton_fixture(runner, "SK_PlaceholderCube_Skeleton")
         runner.unreal.EditorAssetLibrary.delete_asset = staticmethod(
-            lambda _path: False
+            lambda _path: (_ for _ in ()).throw(
+                AssertionError("preflight must not delete")
+            )
         )
 
-        with self.assertRaises(RuntimeError):
-            runner._clear_placeholder_skeleton_before_import(
-                {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
-            )
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+        )
+
+        self.assertTrue(result["requires_fresh_publish"])
 
     def test_ingest_item_clears_skeleton_before_import(self):
         runner = load_runner()
         events = []
         mesh_path = "/Game/Meshes/Trees/SK_Test"
         self._configure_ingest_runner(runner, events, mesh_path)
+        runner._checkout_existing_assets = (
+            lambda _item: events.append("checkout")
+            or {"existing": [], "checked_out": []}
+        )
         runner._clear_placeholder_skeleton_before_import = (
             lambda _item: events.append("skeleton") or {"status": "ok"}
         )
@@ -936,9 +1310,50 @@ class UnrealIngestSaveTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(events[0], "skeleton")
+        self.assertEqual(events[:2], ["checkout", "skeleton"])
+        self.assertLess(events.index("checkout"), events.index("skeleton"))
         self.assertLess(events.index("skeleton"), events.index("import"))
         self.assertEqual(result["skeleton"], {"status": "ok"})
+
+    def test_ingest_item_routes_refresh_plan_to_transactional_publish(self):
+        runner = load_runner()
+        events = []
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        self._configure_ingest_runner(runner, events, mesh_path)
+        runner._clear_placeholder_skeleton_before_import = (
+            lambda _item: {
+                "status": "fresh_publish_required",
+                "requires_fresh_publish": True,
+            }
+        )
+        runner._import_manifest_asset = (
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("refresh must not import in place")
+            )
+        )
+        runner._import_manifest_asset_with_fresh_skeleton = (
+            lambda _send2ue, _asset, _item: events.append(
+                "transactional_publish"
+            )
+            or {"asset_path": mesh_path}
+        )
+        runner._material_compile_and_slot_validation = lambda _path: {}
+
+        runner.ingest_item(
+            {
+                "send2ue_unreal_py": "send2ue_unreal.py",
+                "assets": [
+                    {
+                        "asset_data": {
+                            "asset_path": mesh_path,
+                        }
+                    }
+                ],
+                "mesh_path": mesh_path,
+            }
+        )
+
+        self.assertIn("transactional_publish", events)
 
     def test_speedtree_import_disables_physics_asset_generation_temporarily(self):
         runner = load_runner()
@@ -964,6 +1379,541 @@ class UnrealIngestSaveTests(unittest.TestCase):
             self.assertIsNone(instance._options.physics_asset)
 
         self.assertIs(Importer.set_physics_asset, original)
+
+    def test_primary_speedtree_import_clears_retained_skeleton_binding(self):
+        runner = load_runner()
+
+        class Options:
+            skeleton = object()
+
+            def set_editor_property(self, name, value):
+                setattr(self, name, value)
+
+        class Importer:
+            def __init__(self):
+                self._options = Options()
+
+            def set_skeleton(self):
+                self._options.skeleton = object()
+
+        module = types.SimpleNamespace(UnrealImportAsset=Importer)
+        original = Importer.set_skeleton
+        with runner._without_existing_skeleton_binding(module) as disabled:
+            instance = Importer()
+            instance.set_skeleton()
+            self.assertTrue(disabled)
+            self.assertIsNone(instance._options.skeleton)
+
+        self.assertIs(Importer.set_skeleton, original)
+
+    def test_final_speedtree_import_binds_incoming_skeleton_explicitly(self):
+        runner = load_runner()
+        skeleton_path = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        incoming_skeleton = object()
+
+        class Options:
+            skeleton = None
+
+            def set_editor_property(self, name, value):
+                setattr(self, name, value)
+
+        class Importer:
+            def __init__(self):
+                self._options = Options()
+
+            def set_skeleton(self):
+                self._options.skeleton = object()
+
+        module = types.SimpleNamespace(UnrealImportAsset=Importer)
+        original = Importer.set_skeleton
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda path: (
+                incoming_skeleton if path == skeleton_path else None
+            )
+        )
+
+        with runner._with_explicit_skeleton_binding(
+            module,
+            skeleton_path,
+        ):
+            instance = Importer()
+            instance.set_skeleton()
+            self.assertIs(
+                instance._options.skeleton,
+                incoming_skeleton,
+            )
+
+        self.assertIs(Importer.set_skeleton, original)
+
+    def test_fresh_skeleton_import_publishes_staged_mesh_without_reimport(self):
+        runner = load_runner()
+        final_mesh_path = "/Game/Meshes/Trees/SK_Test"
+        imported_paths = []
+        post_import_events = []
+        assets = {}
+
+        class FakeSkeleton:
+            def __init__(self, path):
+                self.path = path
+
+            def get_name(self):
+                return self.path.rsplit("/", 1)[-1]
+
+            def get_path_name(self):
+                return self.path + "." + self.get_name()
+
+        class FakeMesh:
+            def __init__(self, path, skeleton):
+                self.path = path
+                self.skeleton = skeleton
+
+            def get_editor_property(self, name):
+                self.assert_property(name)
+                return self.skeleton
+
+            @staticmethod
+            def assert_property(name):
+                if name != "skeleton":
+                    raise AssertionError(name)
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def delete_asset(path):
+                assets.pop(path, None)
+                return True
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def rename_asset(source, target):
+                asset = assets.pop(source, None)
+                if asset is None or target in assets:
+                    return False
+                asset.path = target
+                assets[target] = asset
+                return True
+
+            @staticmethod
+            def does_directory_exist(path):
+                prefix = path.rstrip("/") + "/"
+                return any(key.startswith(prefix) for key in assets)
+
+            @staticmethod
+            def delete_directory(path):
+                prefix = path.rstrip("/") + "/"
+                for key in list(assets):
+                    if key.startswith(prefix):
+                        assets.pop(key)
+                return True
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+
+        def fake_import(_send2ue, manifest_asset):
+            path = manifest_asset["asset_data"]["asset_path"]
+            imported_paths.append(path)
+            skeleton = FakeSkeleton(path + "_Skeleton")
+            mesh = FakeMesh(path, skeleton)
+            assets[path] = mesh
+            assets[skeleton.path] = skeleton
+            return {
+                "asset_path": path,
+                "file_path": manifest_asset["asset_data"]["file_path"],
+                "imported": [path],
+            }
+
+        runner._import_manifest_asset = fake_import
+        runner._execute_command_groups = (
+            lambda commands, label: post_import_events.append(
+                (label, commands)
+            )
+        )
+        runner._run_lod_and_socket_operations = (
+            lambda _send2ue, _manifest, data, _properties:
+            post_import_events.append(("operations", data["asset_path"]))
+        )
+        manifest_asset = {
+            "asset_data": {
+                "_asset_type": "SkeletalMesh",
+                "asset_path": final_mesh_path,
+                "asset_folder": "/Game/Meshes/Trees/",
+                "file_path": "C:/exports/SK_Test.fbx",
+            },
+            "property_data": {},
+            "post_import_commands": [["post"]],
+            "operations": {"reset_and_import_lods": True},
+        }
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        self.assertEqual(len(imported_paths), 1)
+        self.assertIn("/__SKBatchStaging_", imported_paths[0])
+        self.assertEqual(result["asset_path"], final_mesh_path)
+        final_mesh = assets[final_mesh_path]
+        self.assertEqual(
+            final_mesh.get_editor_property("skeleton").get_name(),
+            "SK_Test_Skeleton",
+        )
+        self.assertEqual(
+            post_import_events,
+            [
+                ("post_import", [["post"]]),
+                ("operations", final_mesh_path),
+            ],
+        )
+
+    def _transactional_publish_fixture(
+        self,
+        *,
+        mesh_referencers=None,
+        skeleton_referencers=None,
+        fail_mesh_publish=False,
+        fail_skeleton_publish=False,
+    ):
+        runner = load_runner()
+        final_mesh_path = "/Game/Meshes/Trees/SK_Test"
+        final_skeleton_path = final_mesh_path + "_Skeleton"
+        assets = {}
+        calls = {"renamed": [], "deleted": []}
+
+        class FakeAsset:
+            def __init__(self, path, referencers=None):
+                self.path = path
+                self.external_referencers = list(referencers or [])
+
+            def get_name(self):
+                return self.path.rsplit("/", 1)[-1]
+
+            def get_path_name(self):
+                return self.path + "." + self.get_name()
+
+        class FakeSkeleton(FakeAsset):
+            pass
+
+        class FakeMesh(FakeAsset):
+            def __init__(
+                self,
+                path,
+                skeleton,
+                referencers=None,
+            ):
+                super().__init__(path, referencers)
+                self.skeleton = skeleton
+
+            def get_editor_property(self, name):
+                if name != "skeleton":
+                    raise AssertionError(name)
+                return self.skeleton
+
+        old_skeleton = FakeSkeleton(
+            final_skeleton_path,
+            skeleton_referencers,
+        )
+        old_mesh = FakeMesh(
+            final_mesh_path,
+            old_skeleton,
+            mesh_referencers,
+        )
+        assets[final_mesh_path] = old_mesh
+        assets[final_skeleton_path] = old_skeleton
+
+        class FakeAssetData:
+            def __init__(self, value):
+                self.value = value
+
+            def is_redirector(self):
+                return isinstance(self.value, dict)
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def find_asset_data(path):
+                return FakeAssetData(assets.get(path))
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(
+                path,
+                _load_assets=True,
+            ):
+                target = assets.get(path)
+                if target is None or isinstance(target, dict):
+                    return []
+                referencers = list(target.external_referencers)
+                for candidate_path, candidate in assets.items():
+                    if (
+                        isinstance(candidate, FakeMesh)
+                        and candidate.skeleton is target
+                    ):
+                        referencers.append(candidate_path)
+                return sorted(set(referencers))
+
+            @staticmethod
+            def rename_asset(source, target):
+                if (
+                    (
+                        fail_mesh_publish
+                        and "__SKBatchStaging_" in source
+                        and not source.endswith("_Skeleton")
+                        and target == final_mesh_path
+                    )
+                    or (
+                        fail_skeleton_publish
+                        and "__SKBatchStaging_" in source
+                        and source.endswith("_Skeleton")
+                        and target == final_skeleton_path
+                    )
+                ):
+                    return False
+                asset = assets.get(source)
+                if (
+                    asset is None
+                    or isinstance(asset, dict)
+                    or target in assets
+                ):
+                    return False
+                assets.pop(source)
+                asset.path = target
+                assets[target] = asset
+                assets[source] = {
+                    "class": "ObjectRedirector",
+                    "target": target,
+                }
+                calls["renamed"].append((source, target))
+                return True
+
+            @staticmethod
+            def delete_asset(path):
+                value = assets.pop(path, None)
+                calls["deleted"].append(
+                    (
+                        path,
+                        (
+                            value.get("class")
+                            if isinstance(value, dict)
+                            else type(value).__name__
+                            if value is not None
+                            else "missing"
+                        ),
+                    )
+                )
+                return value is not None
+
+            @staticmethod
+            def does_directory_exist(path):
+                prefix = path.rstrip("/") + "/"
+                return any(key.startswith(prefix) for key in assets)
+
+            @staticmethod
+            def delete_directory(path):
+                prefix = path.rstrip("/") + "/"
+                if any(key.startswith(prefix) for key in assets):
+                    return False
+                return True
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+
+        def fake_import(_send2ue, manifest_asset):
+            path = manifest_asset["asset_data"]["asset_path"]
+            skeleton = FakeSkeleton(path + "_Skeleton")
+            mesh = FakeMesh(path, skeleton)
+            assets[path] = mesh
+            assets[skeleton.path] = skeleton
+            return {"asset_path": path, "imported": [path]}
+
+        runner._import_manifest_asset = fake_import
+        runner._execute_command_groups = lambda *_args: None
+        runner._run_lod_and_socket_operations = lambda *_args: None
+        manifest_asset = {
+            "asset_data": {
+                "_asset_type": "SkeletalMesh",
+                "asset_path": final_mesh_path,
+                "asset_folder": "/Game/Meshes/Trees/",
+                "file_path": "C:/exports/SK_Test.fbx",
+            },
+            "property_data": {},
+            "post_import_commands": [],
+            "operations": {},
+        }
+        return (
+            runner,
+            manifest_asset,
+            assets,
+            calls,
+            old_mesh,
+            old_skeleton,
+        )
+
+    def test_transactional_publish_cleans_only_unreferenced_legacy_pair(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            calls,
+            old_mesh,
+            old_skeleton,
+        ) = self._transactional_publish_fixture()
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        self.assertIsNot(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
+        self.assertIsNot(
+            assets["/Game/Meshes/Trees/SK_Test_Skeleton"],
+            old_skeleton,
+        )
+        self.assertFalse(
+            any("_Legacy_" in path for path in assets)
+        )
+        self.assertTrue(
+            result["staged_import"]["legacy_cleanup"]["cleaned"]
+        )
+        canonical_deletes = [
+            kind
+            for path, kind in calls["deleted"]
+            if path in {
+                "/Game/Meshes/Trees/SK_Test",
+                "/Game/Meshes/Trees/SK_Test_Skeleton",
+            }
+        ]
+        self.assertEqual(
+            canonical_deletes,
+            ["ObjectRedirector", "ObjectRedirector"],
+        )
+
+    def test_transactional_publish_preserves_referenced_legacy_pair(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            _old_mesh,
+            _old_skeleton,
+        ) = self._transactional_publish_fixture(
+            mesh_referencers=["/Game/Maps/Test"],
+            skeleton_referencers=[
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            ],
+        )
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        preserved = result["staged_import"]["legacy_cleanup"][
+            "preserved"
+        ]
+        self.assertEqual(len(preserved), 2)
+        self.assertEqual(
+            len([path for path in assets if "_Legacy_" in path]),
+            2,
+        )
+
+    def test_transactional_mesh_publish_failure_restores_canonical_pair(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            old_mesh,
+            old_skeleton,
+        ) = self._transactional_publish_fixture(
+            fail_mesh_publish=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "staged mesh publish move failed",
+        ):
+            runner._import_manifest_asset_with_fresh_skeleton(
+                object(),
+                manifest_asset,
+                {},
+            )
+
+        self.assertIs(
+            assets["/Game/Meshes/Trees/SK_Test"],
+            old_mesh,
+        )
+        self.assertIs(
+            assets["/Game/Meshes/Trees/SK_Test_Skeleton"],
+            old_skeleton,
+        )
+        self.assertFalse(
+            any("_Legacy_" in path for path in assets)
+        )
+        staging_assets = [
+            path for path in assets if "__SKBatchStaging_" in path
+        ]
+        self.assertEqual(len(staging_assets), 2)
+        self.assertFalse(
+            any(
+                isinstance(value, dict)
+                for value in assets.values()
+            )
+        )
+
+    def test_transactional_skeleton_publish_failure_restores_canonical_pair(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            old_mesh,
+            old_skeleton,
+        ) = self._transactional_publish_fixture(
+            fail_skeleton_publish=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "incoming Skeleton publish move failed",
+        ):
+            runner._import_manifest_asset_with_fresh_skeleton(
+                object(),
+                manifest_asset,
+                {},
+            )
+
+        self.assertIs(
+            assets["/Game/Meshes/Trees/SK_Test"],
+            old_mesh,
+        )
+        self.assertIs(
+            assets["/Game/Meshes/Trees/SK_Test_Skeleton"],
+            old_skeleton,
+        )
+        self.assertFalse(
+            any("_Legacy_" in path for path in assets)
+        )
+        self.assertEqual(
+            len([
+                path
+                for path in assets
+                if "__SKBatchStaging_" in path
+            ]),
+            2,
+        )
 
     def test_speedtree_skeletal_optimization_enforces_render_and_collision_settings(self):
         runner = load_runner()
@@ -1171,3 +2121,57 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "fresh")
         self.assertEqual(loaded, [])
+
+    def test_vacating_referenced_skeleton_clears_source_redirector(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        class FakeAsset:
+            def __init__(self, path):
+                self.path = path
+
+            def get_path_name(self):
+                return self.path + "." + self.path.rsplit("/", 1)[-1]
+
+        assets = {canonical: FakeAsset(canonical)}
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(path, _load_assets=True):
+                return (
+                    ["/Game/Meshes/Trees/SK_Test"]
+                    if path == canonical else []
+                )
+
+            @staticmethod
+            def rename_asset(source, target):
+                asset = assets.pop(source, None)
+                if asset is None or target in assets:
+                    return False
+                asset.path = target
+                assets[target] = asset
+                assets[source] = {"class": "ObjectRedirector"}
+                return True
+
+            @staticmethod
+            def delete_asset(path):
+                return assets.pop(path, None) is not None
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+
+        result = runner._vacate_canonical_skeleton_path(
+            canonical,
+            legacy_token="abc123",
+        )
+
+        self.assertEqual(result["status"], "relocated")
+        self.assertTrue(result["redirector_cleared"])
+        self.assertNotIn(canonical, assets)
+        self.assertIn(canonical + "_Legacy_abc123", assets)

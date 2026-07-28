@@ -64,6 +64,12 @@ from dynamic_wind_handoff_policy import (
     CLUSTER_GENERATED_FLAG,
     resolve_dynamic_wind_policy,
 )
+from send2ue_manifest_contract import (
+    manifest_checkout_asset_paths,
+    normalize_manifest_handoff_sidecars,
+    primary_mesh_asset_path,
+)
+from speedtree_pipeline_contract import shared_contract_api
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
@@ -747,8 +753,10 @@ def main():
             scene_props.skip_animation_export = True
 
         unit_name = find_export_unit_name() or spm_path.stem
+        declared_unit_name = unit_name
         folder = scene_props.unreal_mesh_folder_path
         report["unit_name"] = unit_name
+        report["declared_export_unit_name"] = declared_unit_name
         report["unreal_folder"] = folder
         report["unreal_folder_before_sync"] = folder_before_sync
         report["unreal_folder_synced"] = folder != folder_before_sync
@@ -782,6 +790,22 @@ def main():
         manifest_assets = ingest.build_manifest_items(scene_props)
         if not manifest_assets:
             raise RuntimeError("Send2UE produced no manifest assets")
+        report["manifest_handoff_normalization"] = (
+            normalize_manifest_handoff_sidecars(
+                manifest_assets,
+                export_root,
+                sidecar_descriptor_builder=(
+                    shared_contract_api().build_sidecar_descriptor
+                ),
+            )
+        )
+        mesh_path = primary_mesh_asset_path(
+            manifest_assets,
+            preferred_path=mesh_path,
+        )
+        unit_name = mesh_path.rsplit("/", 1)[-1]
+        report["unit_name"] = unit_name
+        report["mesh_path"] = mesh_path
 
         cluster_assembly = None
         material_asset_scope = None
@@ -922,6 +946,7 @@ def main():
             "wind_policy": wind_policy,
             "code_files": code_files,
             "cluster_assembly": cluster_assembly,
+            "dependency_orchestrated": bool(args.dependency_orchestrated),
             "material_asset_scope": material_asset_scope,
         }
         fingerprint = stable_fingerprint(contract)
@@ -937,11 +962,9 @@ def main():
             "fingerprint": fingerprint,
             "send2ue_unreal_py": str(Path(args.send2ue_unreal_py).resolve()),
             "wind_json": str(wind_json) if wind_json_enabled else None,
-            "checkout_asset_paths": [
-                mesh_path,
-                mesh_path + "_Skeleton",
-                mesh_path + "_PhysicsAsset",
-            ] + (
+            "checkout_asset_paths": manifest_checkout_asset_paths(
+                manifest_assets
+            ) + (
                 [
                     cluster_assembly["ingest_plan"]["asset_contract"][key]
                     for key in ("base_skeletal_mesh", "assembly")

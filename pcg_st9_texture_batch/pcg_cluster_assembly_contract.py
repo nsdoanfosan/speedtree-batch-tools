@@ -25,15 +25,19 @@ if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
 from cluster_spm_pair_contract import resolve_cluster_spm_pair
+from atlas_target_registry import (
+    TargetRegistryError,
+    load_target_registry,
+)
 
 
 SCHEMA_VERSION = 1
 PERSISTED_RECEIPT_KIND = "pcg_cluster_assembly_receipt"
 DEFAULT_RECEIPT_DIR = Path(__file__).resolve().parent / "reports" / "cluster_assembly"
 FBX_BINARY_HEADER = b"Kaydara FBX Binary  \x00\x1a\x00"
-ROLE_ORDER = ("branch", "leaf", "leaf_side")
+ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 ROLE_PREFIX_RE = re.compile(
-    r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|leaf)(?:_|$)",
+    r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|cluster|leaf)(?:_|$)",
     re.IGNORECASE,
 )
 FBX_OBJECT_RE = re.compile(
@@ -117,6 +121,48 @@ def file_fingerprint(path, hash_content=True):
             if hash_content else None
         ),
     }
+
+
+def _fresh_file_fingerprint(path):
+    """Hash one stable snapshot without trusting the process-wide stat cache."""
+    candidate = Path(path)
+    for _attempt in range(2):
+        try:
+            before = candidate.stat()
+            digest = hashlib.sha256()
+            size = 0
+            with candidate.open("rb") as handle:
+                for chunk in iter(
+                    lambda: handle.read(1024 * 1024),
+                    b"",
+                ):
+                    digest.update(chunk)
+                    size += len(chunk)
+            after = candidate.stat()
+        except OSError:
+            return {
+                "path": str(candidate),
+                "exists": False,
+                "size": None,
+                "mtime_ns": None,
+                "sha256": None,
+            }
+        if (
+            size == after.st_size
+            and (before.st_size, before.st_mtime_ns)
+            == (after.st_size, after.st_mtime_ns)
+        ):
+            return {
+                "path": str(candidate),
+                "exists": True,
+                "size": after.st_size,
+                "mtime_ns": after.st_mtime_ns,
+                "sha256": digest.hexdigest(),
+            }
+    raise ClusterAssemblyReceiptStaleError(
+        "Artifact changed while its content fingerprint was calculated: "
+        + str(candidate)
+    )
 
 
 class _BinaryFbxReader:
@@ -562,11 +608,32 @@ def _material_rows(audit, spm):
 def _canonical_bark_contract(audit, folder, target_spms, dependencies):
     expected = f"bark_{_asset_species(folder)}_01"
     species = _asset_species(folder)
-    canonical = []
+    # Older authored trees can retain the owner-folder token in the rendered
+    # bark material (for example ``Bark_tree_<species>_01``).  That is still
+    # one content-driven canonical bark slot, not an absent material.  Prefer
+    # the compact species identity, then the exact owner-folder identity;
+    # never guess from a branch number or a convenient first material.
+    accepted_identities = [expected]
+    folder_identity = f"bark_{Path(folder).name}_01".casefold()
+    if folder_identity not in accepted_identities:
+        accepted_identities.append(folder_identity)
+    candidates = []
     for spm in target_spms:
         for row in audit.extract_material_image_refs(spm):
-            if normalize_export_name(row.get("material_name")) == expected:
-                canonical.append({"spm": str(spm), **row})
+            identity = normalize_export_name(row.get("material_name"))
+            if identity in accepted_identities:
+                candidates.append({
+                    "spm": str(spm),
+                    "identity": identity,
+                    **row,
+                })
+    canonical = []
+    for identity in accepted_identities:
+        canonical = [
+            row for row in candidates if row["identity"] == identity
+        ]
+        if canonical:
+            break
     canonical_basenames = {
         Path(value).name.casefold()
         for row in canonical for value in row.get("refs") or []
@@ -574,7 +641,34 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
     sources = []
     for dependency in dependencies:
         spm = dependency.get("source_spm") or dependency["spm"]
+        isolated_capture = (
+            (dependency.get("normalized_variants") or {}).get(
+                "isolated_bark_capture"
+            )
+            or {}
+        )
+        isolated_output_materials = {
+            normalize_export_name(value)
+            for value in isolated_capture.get("output_materials") or []
+        }
+        isolated_canonical_matches = bool(
+            isolated_capture
+            and canonical
+            and normalize_export_name(
+                isolated_capture.get("canonical_material")
+            )
+            == canonical[0]["identity"]
+        )
+        active_ids = {
+            str(value) for value in audit.active_material_ids(spm)
+        }
         for row in audit.extract_material_image_refs(spm):
+            # Cluster source files often retain unused material-library rows.
+            # The bark handoff contract is about generator-bound/rendered
+            # material data, not every dormant material whose label happens to
+            # contain "bark".
+            if str(row.get("material_id")) not in active_ids:
+                continue
             if "bark" not in normalize_export_name(row.get("material_name")):
                 continue
             source_basenames = {
@@ -593,13 +687,27 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                     species in str(value).casefold()
                     for value in row.get("refs") or []
                 )
+            isolated_capture_matches = bool(
+                isolated_canonical_matches
+                and normalize_export_name(row.get("material_name"))
+                in isolated_output_materials
+            )
             sources.append({
                 "cluster_spm": str(spm),
                 "material_id": row.get("material_id"),
                 "material_name": row.get("material_name"),
                 "texture_refs": list(row.get("refs") or []),
                 "matches_canonical_textures": matches,
-                "replacement": "not_required" if matches else "required",
+                "replacement": (
+                    "not_required"
+                    if matches
+                    else "isolated_capture_validated"
+                    if isolated_capture_matches
+                    else "required"
+                ),
+                "normalization_evidence": (
+                    isolated_capture if isolated_capture_matches else None
+                ),
             })
     if not canonical:
         status = "blocked_canonical_missing"
@@ -609,23 +717,86 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
         status = "canonical"
     return {
         "status": status,
-        "canonical_material": f"M_{expected}",
+        "canonical_material": (
+            display_export_name(canonical[0]["material_name"])
+            if canonical
+            else f"M_{expected}"
+        ),
         "canonical_sources": canonical,
         "cluster_bark_sources": sources,
         "mutation_applied": False,
     }
 
 
+def _canonical_cluster_texture_refs(values, preferred_folder):
+    """Collapse path aliases for the same Cluster texture to one authority.
+
+    Older SPMs can retain an absolute path from a previous OneDrive layout
+    alongside the current path.  Those rows describe the same texture when
+    their filenames match; recording both makes a newly written hash receipt
+    stale immediately because the legacy alias no longer exists.  Prefer an
+    existing file in the Cluster output folder, then any existing alias.  A
+    genuinely missing unique texture remains in the result and still blocks.
+    """
+    preferred_key = os.path.normcase(os.path.abspath(str(preferred_folder)))
+    groups = {}
+    group_order = []
+    for value in values or []:
+        path = Path(value)
+        name_key = path.name.casefold()
+        key = ("name", name_key) if name_key else (
+            "path", _normalized_identity_path(path)
+        )
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        normalized = _normalized_identity_path(path)
+        if all(
+            _normalized_identity_path(existing) != normalized
+            for existing in groups[key]
+        ):
+            groups[key].append(path)
+
+    selected = []
+    ignored_aliases = []
+    for key in group_order:
+        candidates = groups[key]
+
+        def rank(path):
+            parent_key = os.path.normcase(os.path.abspath(str(path.parent)))
+            return (
+                0 if path.is_file() else 1,
+                0 if parent_key == preferred_key else 1,
+                len(str(path)),
+                str(path).casefold(),
+            )
+
+        authority = min(candidates, key=rank)
+        selected.append(authority)
+        ignored_aliases.extend(
+            path for path in candidates
+            if _normalized_identity_path(path)
+            != _normalized_identity_path(authority)
+        )
+    return selected, ignored_aliases
+
+
 def _tga_basename_validation(
-        output_spm, dependency_usage, legacy_output_spm=None):
+        output_spm, dependency_usage, legacy_output_spm=None,
+        resolved_refs=None, ignored_aliases=None):
     expected = Path(output_spm).stem.casefold()
     accepted = {expected}
     if legacy_output_spm:
         accepted.add(Path(legacy_output_spm).stem.casefold())
-    connected_refs = dependency_usage.get("connected_refs")
-    if connected_refs is None:
-        connected_refs = dependency_usage.get("source_refs") or []
-    refs = [Path(value) for value in connected_refs]
+    if resolved_refs is None:
+        connected_refs = dependency_usage.get("connected_refs")
+        if connected_refs is None:
+            connected_refs = dependency_usage.get("source_refs") or []
+        refs, ignored_aliases = _canonical_cluster_texture_refs(
+            connected_refs, Path(output_spm).parent
+        )
+    else:
+        refs = [Path(value) for value in resolved_refs]
     missing = [str(path) for path in refs if not path.is_file()]
     invalid = [
         str(path) for path in refs
@@ -651,9 +822,46 @@ def _tga_basename_validation(
             Path(legacy_output_spm).stem if legacy_output_spm else None
         ),
         "refs": [str(path) for path in refs],
+        "ignored_legacy_aliases": [
+            str(path) for path in (ignored_aliases or [])
+        ],
         "missing": missing,
         "invalid": invalid,
     }
+
+
+def _normalized_capture_texture_refs(normalized_variants):
+    """Return the final physical-capture maps used by normalized Assembly parts.
+
+    The provider SPM intentionally retains its authored source images so the
+    Normalizer can regenerate the capture.  Once a hash-validated physical
+    Atlas receipt exists, those source refs are inputs, not the Assembly
+    output texture contract.  The capture maps are the actual part textures.
+    """
+    normalization = (
+        (normalized_variants or {}).get("production_normalization") or {}
+    )
+    if normalization.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE":
+        return []
+    capture = normalization.get("physical_capture_contract") or {}
+    capture_maps = (
+        normalization.get("capture_maps")
+        or capture.get("capture_maps")
+        or []
+    )
+    refs = []
+    seen = set()
+    for row in capture_maps:
+        value = str((row or {}).get("path") or "").strip()
+        if not value:
+            continue
+        path = Path(value)
+        key = _normalized_identity_path(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(path)
+    return refs
 
 
 def _atlas_manifest_candidates(folder, target_spms):
@@ -718,6 +926,71 @@ def _normalized_bounds_contract(value, label, required=False):
     return result
 
 
+def _physical_source_3d_artifacts(receipt):
+    """Validate the exact SPM/FBX inputs shared by every physical variant."""
+    artifacts = None
+    identity = None
+    variants = list((receipt or {}).get("variants") or [])
+    if not variants:
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical normalization receipt has no variants"
+        )
+    for index, row in enumerate(variants, 1):
+        transfer = row.get("plan_uv_transfer")
+        source = (
+            transfer.get("source_3d_contract")
+            if isinstance(transfer, dict)
+            else None
+        )
+        if not isinstance(source, dict):
+            raise ClusterAssemblyReceiptError(
+                "Atlas physical variant has no source 3D contract: "
+                + str(row.get("plan") or index)
+            )
+        current = {}
+        identity_rows = []
+        for artifact, label in (
+            ("source_spm", "SPM"),
+            ("source_fbx", "FBX"),
+        ):
+            path = str(source.get(artifact) or "").strip()
+            recorded_hash = str(
+                source.get(f"{artifact}_sha256") or ""
+            ).strip().casefold()
+            if not path or not recorded_hash:
+                raise ClusterAssemblyReceiptError(
+                    f"Atlas physical source 3D contract has no {label} "
+                    f"path/hash: {row.get('plan') or index}"
+                )
+            fingerprint = _fresh_file_fingerprint(path)
+            if (
+                not fingerprint.get("exists")
+                or not fingerprint.get("sha256")
+                or fingerprint["sha256"].casefold() != recorded_hash
+            ):
+                raise ClusterAssemblyReceiptStaleError(
+                    f"Atlas physical source {label} artifact hash is stale: "
+                    + path
+                )
+            current[artifact] = fingerprint
+            identity_rows.append(
+                (
+                    artifact,
+                    _normalized_identity_path(path),
+                    recorded_hash,
+                )
+            )
+        row_identity = tuple(identity_rows)
+        if identity is None:
+            identity = row_identity
+            artifacts = current
+        elif row_identity != identity:
+            raise ClusterAssemblyReceiptError(
+                "Atlas physical variants have conflicting source 3D contracts"
+            )
+    return artifacts
+
+
 def _physical_normalization_receipt(payload):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
@@ -762,6 +1035,7 @@ def _physical_normalization_receipt(payload):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no prototypes"
         )
+    source_3d_artifacts = _physical_source_3d_artifacts(receipt)
     unit_probe = (payload or {}).get("unit_probe_contract")
     if (
         not isinstance(unit_probe, dict)
@@ -776,6 +1050,7 @@ def _physical_normalization_receipt(payload):
         "prototype_bounds": prototypes,
         "capture_hash": capture_hash,
         "unit_probe_contract": copy.deepcopy(unit_probe),
+        "source_3d_artifacts": source_3d_artifacts,
     }
 
 
@@ -1095,7 +1370,60 @@ def _normalized_variant_contract(manifest_path, payload, group):
     if physical is not None:
         result["production_normalization"] = physical["receipt"]
         result["unit_probe_contract"] = physical["unit_probe_contract"]
+        result["source_3d_artifacts"] = physical["source_3d_artifacts"]
     return result
+
+
+def _physical_target_registry_contract(source_blend):
+    """Return the explicit ON-target contract for one physical source blend."""
+    blend = Path(source_blend).expanduser().absolute()
+    try:
+        registry = load_target_registry(blend)
+    except TargetRegistryError as exc:
+        raise ClusterAssemblyReceiptError(
+            f"Atlas physical target registry is invalid for {blend}: {exc}"
+        ) from exc
+    if registry is None:
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical normalization has no explicit target registry: "
+            + str(blend)
+        )
+    try:
+        registered_blend = Path(
+            str(registry.get("atlas_blend") or "")
+        ).expanduser().absolute()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical target registry has no valid blend identity: "
+            + str(blend)
+        ) from exc
+    if _normalized_identity_path(registered_blend) != _normalized_identity_path(
+        blend
+    ):
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical target registry identifies another blend: "
+            + str(registered_blend)
+        )
+    targets = [
+        Path(value).expanduser().absolute()
+        for value in registry.get("target_spms") or []
+    ]
+    registry_fingerprint = file_fingerprint(registry["registry_path"])
+    if (
+        not registry_fingerprint.get("exists")
+        or not registry_fingerprint.get("sha256")
+    ):
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical target registry fingerprint is unavailable: "
+            + str(registry.get("registry_path") or "")
+        )
+    return {
+        "fingerprint": registry_fingerprint,
+        "target_spms": targets,
+        "target_keys": {
+            _normalized_identity_path(path): path for path in targets
+        },
+    }
 
 
 def _atlas_normalized_variants(
@@ -1140,17 +1468,27 @@ def _atlas_normalized_variants(
         mesh_ids = [int(value) for value in group.get("mesh_ids") or []]
         current_matches = []
         if audit is not None:
+            adoption = payload.get("source_material_adoption") or {}
+            declared_final_mesh_ids = [
+                int(value)
+                for value in adoption.get("final_material_mesh_ids") or []
+            ]
+            expected_live_mesh_ids = (
+                declared_final_mesh_ids
+                if declared_final_mesh_ids
+                else mesh_ids
+            )
             current_matches = [
                 row
                 for row in audit.extract_material_image_refs(
                     allowed_spms[manifest_spm]
                 )
                 if normalize_export_name(row.get("material_name"))
-                == normalize_export_name(role_identity)
-                and int(row.get("material_id") or 0)
-                == int(group.get("material_id") or 0)
-                and [int(value) for value in row.get("cutout_mesh_ids") or []]
-                == mesh_ids
+                 == normalize_export_name(role_identity)
+                 and int(row.get("material_id") or 0)
+                 == int(group.get("material_id") or 0)
+                 and [int(value) for value in row.get("cutout_mesh_ids") or []]
+                 == expected_live_mesh_ids
             ]
             if len(current_matches) != 1:
                 stale.append(str(manifest_path))
@@ -1160,6 +1498,19 @@ def _atlas_normalized_variants(
             payload,
             group,
         )
+        target_registry = None
+        if contract.get("production_normalization") is not None:
+            target_registry = _physical_target_registry_contract(
+                contract["source_blend"]["path"]
+            )
+            manifest_key = _normalized_identity_path(manifest_spm)
+            if manifest_key not in target_registry["target_keys"]:
+                stale.append(str(manifest_path))
+                continue
+            contract["target_registry"] = target_registry["fingerprint"]
+            contract["registered_target_spms"] = [
+                str(path) for path in target_registry["target_spms"]
+            ]
         # One Cluster blend legitimately delivers the same plan set to several
         # tree SPMs, and each target assigns its own local Material/Mesh IDs.
         # Those per-target values must stay out of the identity: including them
@@ -1170,6 +1521,18 @@ def _atlas_normalized_variants(
             {
                 "material": normalize_export_name(contract["material"]),
                 "source_blend": contract["source_blend"].get("sha256"),
+                "source_3d_artifacts": {
+                    key: {
+                        "path": _normalized_identity_path(row.get("path")),
+                        "sha256": row.get("sha256"),
+                    }
+                    for key, row in (
+                        contract.get("source_3d_artifacts") or {}
+                    ).items()
+                },
+                "target_registry": (
+                    contract.get("target_registry") or {}
+                ).get("sha256"),
                 "variants": [
                     {
                         "ordinal": row["ordinal"],
@@ -1195,22 +1558,263 @@ def _atlas_normalized_variants(
             sort_keys=True,
             separators=(",", ":"),
         )
-        candidates.append((str(manifest_path), identity, contract))
+        candidates.append(
+            (
+                str(manifest_path),
+                identity,
+                contract,
+                _normalized_identity_path(manifest_spm),
+            )
+        )
     distinct = {}
-    for _manifest, identity, contract in sorted(candidates):
-        distinct.setdefault(identity, contract)
+    for _manifest, identity, contract, target_key in sorted(candidates):
+        selected = distinct.setdefault(
+            identity,
+            {"contract": contract, "delivered_target_keys": set()},
+        )
+        selected["delivered_target_keys"].add(target_key)
     if len(distinct) > 1:
         raise ClusterAssemblyReceiptError(
             "Atlas normalized role has multiple current receipts: "
             + str(role_identity)
         )
     if distinct:
-        return next(iter(distinct.values()))
+        selected = next(iter(distinct.values()))
+        contract = selected["contract"]
+        if contract.get("production_normalization") is not None:
+            registered = {
+                _normalized_identity_path(path): Path(path)
+                for path in contract.get("registered_target_spms") or []
+            }
+            allowed_keys = {
+                _normalized_identity_path(path) for path in allowed_spms
+            }
+            required_keys = set(registered).intersection(allowed_keys)
+            missing = sorted(
+                required_keys.difference(
+                    selected["delivered_target_keys"]
+                )
+            )
+            if missing:
+                raise ClusterAssemblyReceiptStaleError(
+                    "Atlas physical normalized role is missing current target "
+                    "scope receipts: "
+                    + "; ".join(str(registered[key]) for key in missing)
+                )
+        return contract
     if stale:
         raise ClusterAssemblyReceiptStaleError(
             "Atlas normalized role receipts are stale: " + "; ".join(stale)
         )
     return None
+
+
+def _artifact_identity_matches(recorded, current):
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    recorded_path = recorded.get("path") or recorded.get("canonical_path")
+    current_path = current.get("path") or current.get("canonical_path")
+    return bool(
+        recorded_path
+        and current_path
+        and recorded.get("sha256")
+        and current.get("sha256")
+        and _normalized_identity_path(recorded_path)
+        == _normalized_identity_path(current_path)
+        and str(recorded["sha256"]).casefold()
+        == str(current["sha256"]).casefold()
+    )
+
+
+def _validated_isolated_bark_capture(normalized_variants, output_spm):
+    """Prove that a physical Atlas capture used a current isolated bark export.
+
+    The production provider SPM intentionally keeps its authored material
+    library.  A content-addressed isolated copy may replace only the live bark
+    texture set for BWR/Atlas.  Accept that different SPM path only through the
+    immutable normalization manifest, a fresh export-bundle validation, and
+    the exact FBX/SPM artifacts recorded by the physical capture.
+    """
+    source_blend = (normalized_variants or {}).get("source_blend") or {}
+    blend_path = Path(str(source_blend.get("path") or ""))
+    if not blend_path.is_file():
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture has no current source blend"
+        )
+    current_blend = _fresh_file_fingerprint(blend_path)
+    if not _artifact_identity_matches(source_blend, current_blend):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture source blend is stale: "
+            + str(blend_path)
+        )
+    current_output = _fresh_file_fingerprint(output_spm)
+    recorded = (
+        (normalized_variants.get("source_3d_artifacts") or {}).get(
+            "source_spm"
+        )
+        or {}
+    )
+    isolated_spm_path = Path(str(recorded.get("path") or ""))
+    isolated_spm = _fresh_file_fingerprint(isolated_spm_path)
+    if not _artifact_identity_matches(recorded, isolated_spm):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas physical normalization source does not match the current "
+            "isolated bark SPM"
+        )
+
+    manifest_path = next(
+        (
+            parent / "bark_normalization_manifest.json"
+            for parent in isolated_spm_path.parents
+            if (parent / "bark_normalization_manifest.json").is_file()
+        ),
+        None,
+    )
+    if manifest_path is None:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture has no normalization manifest"
+        )
+    current_manifest = _fresh_file_fingerprint(manifest_path)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark normalization manifest is unreadable"
+        ) from exc
+    if (
+        manifest.get("kind")
+        != "cluster_isolated_canonical_bark_source"
+        or manifest.get("status") != "ready"
+        or manifest.get("production_source_mutated") is not False
+        or _normalized_identity_path(manifest.get("source_spm"))
+        != _normalized_identity_path(output_spm)
+        or str(manifest.get("source_spm_sha256") or "").casefold()
+        != str(current_output.get("sha256") or "").casefold()
+        or not _artifact_identity_matches(
+            {
+                "path": manifest.get("speedtree_spm"),
+                "sha256": manifest.get("isolated_spm_sha256"),
+            },
+            recorded,
+        )
+    ):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark normalization manifest does not match the "
+            "captured source pair"
+        )
+
+    recorded_fbx = (
+        (normalized_variants.get("source_3d_artifacts") or {}).get(
+            "source_fbx"
+        )
+        or {}
+    )
+    isolated_fbx_path = Path(str(recorded_fbx.get("path") or ""))
+    if not _artifact_identity_matches(
+        recorded_fbx,
+        _fresh_file_fingerprint(isolated_fbx_path),
+    ):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture FBX is stale"
+        )
+    try:
+        from pcg_cluster_bark_normalization import (
+            BarkNormalizationError,
+            validate_canonical_bark_export_bundle,
+        )
+
+        validation = validate_canonical_bark_export_bundle(
+            isolated_fbx_path,
+            isolated_fbx_path.with_suffix(".stmat"),
+            isolated_spm_path.parent
+            / "xml"
+            / f"{isolated_spm_path.stem}.xml",
+            manifest.get("normalization") or {},
+        )
+    except (BarkNormalizationError, OSError, ValueError) as exc:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture export bundle is no longer valid: "
+            + str(exc)
+        ) from exc
+    if (
+        validation.get("status")
+        != "ready_for_downstream_blender_mapping"
+        or validation.get("production_sources_mutated") is not False
+        or validation.get("material_slot_propagated") is not True
+        or validation.get("texture_set_propagated") is not True
+        or validation.get("uv_preserved") is not True
+        or _normalized_identity_path(
+            (validation.get("fbx") or {}).get("path")
+        )
+        != _normalized_identity_path(recorded_fbx.get("path"))
+    ):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture has no current validated FBX bark "
+            "mapping"
+        )
+
+    canonical_material = str(
+        (manifest.get("normalization") or {}).get(
+            "canonical_material"
+        )
+        or ""
+    ).strip()
+    output_materials = [
+        str(value)
+        for value in validation.get("output_materials") or []
+        if str(value).strip()
+    ]
+    if not canonical_material or not output_materials:
+        raise ClusterAssemblyReceiptError(
+            "Atlas isolated bark capture has no canonical/output material "
+            "identity"
+        )
+    return {
+        "status": "validated",
+        "policy": "current_bwr_isolated_bark_physical_capture_v1",
+        "canonical_material": canonical_material,
+        "output_materials": output_materials,
+        "production_spm": current_output,
+        "isolated_spm": isolated_spm,
+        "isolated_fbx": recorded_fbx,
+        "source_blend": current_blend,
+        "normalization_manifest": current_manifest,
+        "export_validation": validation,
+        "production_source_mutated": False,
+    }
+
+
+def _validate_normalized_source_dependency(normalized_variants, output_spm):
+    """Bind a physical normalization receipt to this exact Cluster input."""
+    if not normalized_variants or not normalized_variants.get(
+        "production_normalization"
+    ):
+        return
+    recorded = (
+        normalized_variants.get("source_3d_artifacts") or {}
+    ).get("source_spm")
+    if not isinstance(recorded, dict):
+        raise ClusterAssemblyReceiptError(
+            "Atlas physical normalized variants have no source SPM artifact"
+        )
+    expected = file_fingerprint(output_spm)
+    if (
+        not expected.get("exists")
+        or not expected.get("sha256")
+    ):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas physical normalization source does not match the current "
+            "Cluster dependency: "
+            + str(output_spm)
+        )
+    if _artifact_identity_matches(recorded, expected):
+        return
+    normalized_variants["isolated_bark_capture"] = (
+        _validated_isolated_bark_capture(
+            normalized_variants,
+            output_spm,
+        )
+    )
 
 
 def build_cluster_assembly_contract(
@@ -1253,6 +1857,23 @@ def build_cluster_assembly_contract(
         str(spm).casefold(): _export_bundle(spm)
         for spm in assembly_source_spms
     } if relevant_clusters else {}
+    primary_provider_by_role = {}
+    for role in ROLE_ORDER:
+        providers = [
+            row for row in relevant_clusters
+            if dependency_role(row["output_spm"].stem) == role
+        ]
+        if not providers:
+            continue
+        preferred_identity = _expected_role_identity(folder, role)
+        primary_provider_by_role[role] = next(
+            (
+                row for row in providers
+                if normalize_export_name(row["output_spm"].stem)
+                == normalize_export_name(preferred_identity)
+            ),
+            providers[0],
+        )
     actual_dependencies = []
     for pair_row in relevant_clusters:
         cluster = pair_row["source_spm"]
@@ -1260,17 +1881,27 @@ def build_cluster_assembly_contract(
         output_spm = pair_row["output_spm"]
         role = dependency_role(output_spm.stem)
         dependency_usage = _usage_for_cluster(usage, pair_row)
-        expected_identity = _expected_role_identity(folder, role)
-        normalized_variants = _atlas_normalized_variants(
-            folder,
-            expected_identity,
-            full_target_spms,
-            audit=audit,
-        )
+        primary_provider = primary_provider_by_role[role]
+        expected_identity = primary_provider["output_spm"].stem
         primary_role_source = (
-            normalize_export_name(output_spm.stem)
-            == normalize_export_name(expected_identity)
+            _normalized_identity_path(output_spm)
+            == _normalized_identity_path(primary_provider["output_spm"])
         )
+        # One normalized plan set belongs to the exact canonical provider for a
+        # role.  Same-role siblings are provenance/reference-only inputs and
+        # must never be validated against the canonical provider's receipt.
+        normalized_variants = None
+        if primary_role_source:
+            normalized_variants = _atlas_normalized_variants(
+                folder,
+                expected_identity,
+                full_target_spms,
+                audit=audit,
+            )
+            _validate_normalized_source_dependency(
+                normalized_variants,
+                output_spm,
+            )
         usage_roles = {
             dependency_role(name)
             for name in dependency_usage.get("material_names") or []
@@ -1336,6 +1967,53 @@ def build_cluster_assembly_contract(
         )
         if normalized_variants_missing:
             decision = "blocked"
+        capture_texture_refs = _normalized_capture_texture_refs(
+            normalized_variants
+        )
+        if capture_texture_refs:
+            texture_refs, ignored_texture_aliases = (
+                _canonical_cluster_texture_refs(
+                    capture_texture_refs, output_spm.parent
+                )
+            )
+            texture_contract_source = "atlas_physical_capture"
+        else:
+            raw_texture_refs = (
+                dependency_usage.get("connected_refs")
+                if dependency_usage.get("connected_refs") is not None
+                else dependency_usage.get("source_refs") or []
+            )
+            texture_refs, ignored_texture_aliases = (
+                _canonical_cluster_texture_refs(
+                    raw_texture_refs, output_spm.parent
+                )
+            )
+            texture_contract_source = "connected_spm_material"
+        if decision == "reference_only":
+            tga_validation = {
+                "status": "not_applicable",
+                "reason": "same_role_reference_provider_is_not_an_assembly_part",
+                "expected_base": output_spm.stem,
+                "accepted_legacy_base": (
+                    pair_row["legacy_output_spm"].stem
+                    if pair_row["legacy_output_spm"]
+                    else None
+                ),
+                "refs": [str(path) for path in texture_refs],
+                "ignored_legacy_aliases": [
+                    str(path) for path in ignored_texture_aliases
+                ],
+                "missing": [],
+                "invalid": [],
+            }
+        else:
+            tga_validation = _tga_basename_validation(
+                output_spm,
+                dependency_usage,
+                legacy_output_spm=pair_row["legacy_output_spm"],
+                resolved_refs=texture_refs,
+                ignored_aliases=ignored_texture_aliases,
+            )
         actual_dependencies.append({
             "role": role,
             "name": output_spm.stem,
@@ -1357,17 +2035,10 @@ def build_cluster_assembly_contract(
             "source_mesh_ids": sorted(audit.mesh_asset_ids(cluster)),
             "texture_dependencies": [
                 file_fingerprint(value, hash_content=False)
-                for value in (
-                    dependency_usage.get("connected_refs")
-                    if dependency_usage.get("connected_refs") is not None
-                    else dependency_usage.get("source_refs") or []
-                )
+                for value in texture_refs
             ],
-            "tga_basename_validation": _tga_basename_validation(
-                output_spm,
-                dependency_usage,
-                legacy_output_spm=pair_row["legacy_output_spm"],
-            ),
+            "texture_contract_source": texture_contract_source,
+            "tga_basename_validation": tga_validation,
             "referenced_by_spms": list(dependency_usage.get("spms") or []),
             "target_material_names": list(
                 dependency_usage.get("material_names") or []),
@@ -1385,12 +2056,10 @@ def build_cluster_assembly_contract(
         ]
         if not role_dependencies:
             continue
-        expected_identity = _expected_role_identity(folder, role)
         primary = next(
             (
                 row for row in role_dependencies
-                if normalize_export_name(row["name"])
-                == normalize_export_name(expected_identity)
+                if row.get("primary_role_source")
             ),
             role_dependencies[0],
         )
@@ -1421,12 +2090,27 @@ def build_cluster_assembly_contract(
             "authoritative_tree_source": file_fingerprint(authoritative),
         })
 
-    bark = _canonical_bark_contract(
-        audit,
-        folder,
-        full_target_spms or assembly_source_spms,
-        actual_dependencies,
-    )
+    if actual_dependencies:
+        bark = _canonical_bark_contract(
+            audit,
+            folder,
+            full_target_spms or assembly_source_spms,
+            actual_dependencies,
+        )
+    else:
+        # Canonical bark is an Assembly part-sharing contract.  Ordinary
+        # vegetation with no content-driven Cluster dependency has nothing to
+        # normalize and must remain a real pass-through instead of being
+        # blocked merely because a species-shaped bark name is absent.
+        bark = {
+            "status": "not_applicable",
+            "canonical_material": (
+                f"M_bark_{_asset_species(folder)}_01"
+            ),
+            "canonical_sources": [],
+            "cluster_bark_sources": [],
+            "mutation_applied": False,
+        }
     decisions = {
         row["decision"] for row in actual_dependencies
         if row["decision"] != "reference_only"
@@ -1473,7 +2157,7 @@ def build_cluster_assembly_contract(
                 "reason": "actionable_role_has_no_current_atlas_normalized_variants",
             })
         tga_validation = dependency.get("tga_basename_validation") or {}
-        if tga_validation.get("status") not in {"ok"}:
+        if tga_validation.get("status") not in {"ok", "not_applicable"}:
             issues.append({
                 "code": "CLUSTER_TGA_BASENAME_INVALID",
                 "role": dependency["role"],
@@ -1689,7 +2373,13 @@ def _atomic_write_json(path, payload):
 
 
 def persist_cluster_assembly_receipt(contract, receipt_dir=None):
-    """Atomically persist one self-contained receipt under the tool reports."""
+    """Atomically persist one self-consistent snapshot under tool reports.
+
+    The live audit contract remains authoritative for data errors.  A receipt
+    only proves that the existing artifacts observed by that audit have not
+    changed, so a blocked contract with a genuinely missing dependency can
+    still have a hash-current receipt whose handoff issues explain the block.
+    """
     if not isinstance(contract, dict):
         raise ClusterAssemblyReceiptError("Cluster Assembly contract must be a dict")
     persisted_contract = _upgrade_persisted_hashes(contract)
@@ -1701,6 +2391,10 @@ def persist_cluster_assembly_receipt(contract, receipt_dir=None):
         "source_path_identity": identity,
         "cluster_assembly": persisted_contract,
     }
+    # Never publish a receipt that invalidates itself immediately.  Missing
+    # source data is represented by the authoritative handoff issues, while
+    # this validation covers only artifacts that existed in the snapshot.
+    validate_cluster_assembly_receipt(payload)
     _atomic_write_json(path, payload)
     return path
 
@@ -1718,6 +2412,118 @@ def persist_cluster_assembly_receipts(report, receipt_dir=None):
     return written
 
 
+def _upgrade_legacy_texture_alias_receipt(contract):
+    """Normalize legacy duplicate texture paths without hiding real absence.
+
+    Receipts written before path-alias normalization can contain both a live
+    Cluster output and a dead absolute path from an older OneDrive layout.
+    Loading those receipts must not revive the old false data error.  This is
+    an in-memory compatibility upgrade only; genuinely unique missing paths
+    remain in both the dependency and the authoritative handoff issues.
+    """
+    handoff = contract.get("handoff") or {}
+    dependency_groups = [
+        contract.get("dependencies") or [],
+        handoff.get("cluster_dependencies") or [],
+    ]
+    healed_dependencies = set()
+    for dependencies in dependency_groups:
+        for dependency in dependencies:
+            texture_rows = [
+                row
+                for row in dependency.get("texture_dependencies") or []
+                if isinstance(row, dict) and row.get("path")
+            ]
+            if len(texture_rows) < 2:
+                continue
+            output_spm = (
+                dependency.get("output_spm")
+                or dependency.get("authoring_spm")
+                or dependency.get("spm")
+                or ""
+            )
+            selected, ignored = _canonical_cluster_texture_refs(
+                [row["path"] for row in texture_rows],
+                Path(output_spm).parent if output_spm else Path("."),
+            )
+            if not ignored:
+                continue
+            rows_by_path = {
+                _normalized_identity_path(row["path"]): row
+                for row in texture_rows
+            }
+            dependency["texture_dependencies"] = [
+                rows_by_path[_normalized_identity_path(path)]
+                for path in selected
+            ]
+
+            validation = dependency.get("tga_basename_validation")
+            if not isinstance(validation, dict):
+                continue
+            accepted = {
+                str(value).casefold()
+                for value in (
+                    validation.get("expected"),
+                    validation.get("legacy_expected"),
+                )
+                if value
+            }
+            missing = [str(path) for path in selected if not path.is_file()]
+            invalid = [
+                str(path)
+                for path in selected
+                if path.is_file()
+                and accepted
+                and path.stem.casefold() not in accepted
+            ]
+            ignored_values = list(
+                validation.get("ignored_legacy_aliases") or []
+            )
+            for path in ignored:
+                if _normalized_identity_path(path) not in {
+                    _normalized_identity_path(value)
+                    for value in ignored_values
+                }:
+                    ignored_values.append(str(path))
+            validation.update({
+                "status": (
+                    "missing" if missing else "invalid" if invalid else "ok"
+                ),
+                "refs": [str(path) for path in selected],
+                "ignored_legacy_aliases": ignored_values,
+                "missing": missing,
+                "invalid": invalid,
+            })
+            if validation["status"] == "ok":
+                healed_dependencies.add((
+                    str(dependency.get("role") or "").casefold(),
+                    _normalized_identity_path(
+                        dependency.get("spm")
+                        or dependency.get("output_spm")
+                        or ""
+                    ),
+                ))
+
+    if healed_dependencies:
+        for issue_field in ("issues", "errors"):
+            issues = handoff.get(issue_field)
+            if not isinstance(issues, list):
+                continue
+            handoff[issue_field] = [
+                issue
+                for issue in issues
+                if not (
+                    isinstance(issue, dict)
+                    and issue.get("code") == "CLUSTER_TGA_BASENAME_INVALID"
+                    and (
+                        str(issue.get("role") or "").casefold(),
+                        _normalized_identity_path(issue.get("spm") or ""),
+                    ) in healed_dependencies
+                )
+            ]
+    return contract
+
+
 def _receipt_contract(payload):
     if not isinstance(payload, dict):
         raise ClusterAssemblyReceiptError("Cluster Assembly receipt root must be a dict")
@@ -1728,6 +2534,7 @@ def _receipt_contract(payload):
     contract = payload.get("cluster_assembly")
     if not isinstance(contract, dict):
         raise ClusterAssemblyReceiptError("Cluster Assembly receipt has no contract")
+    _upgrade_legacy_texture_alias_receipt(contract)
     if payload.get("source_path_identity") != source_path_identity(contract):
         raise ClusterAssemblyReceiptStaleError(
             "Cluster Assembly receipt source path identity is stale")
@@ -1739,7 +2546,7 @@ def _current_fingerprint_matches(expected):
     expected_hash = expected.get("sha256") if isinstance(expected, dict) else None
     if not path or not expected_hash:
         return False
-    actual = file_fingerprint(path, hash_content=True)
+    actual = _fresh_file_fingerprint(path)
     return bool(
         actual.get("exists")
         and actual.get("sha256") == expected_hash
@@ -1747,7 +2554,7 @@ def _current_fingerprint_matches(expected):
 
 
 def validate_cluster_assembly_receipt(payload, requested_spm=None):
-    """Reject path mismatch and every stale Tree/Cluster SPM or TGA hash."""
+    """Reject path mismatch and changed artifacts from a persisted snapshot."""
     contract = _receipt_contract(payload)
     identity_paths = set(_tree_identity_paths(contract))
     if requested_spm is not None:
@@ -1779,13 +2586,83 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
             )
         else:
             expected_artifacts.append(dependency.get("spm_fingerprint") or {})
-        expected_artifacts.extend(dependency.get("texture_dependencies") or [])
+        expected_artifacts.extend(
+            row
+            for row in dependency.get("texture_dependencies") or []
+            # A missing texture is an authoritative live-audit data issue, not
+            # proof that the receipt snapshot itself is stale.  If the texture
+            # later appears, the next audit can produce a new ready snapshot.
+            if isinstance(row, dict) and row.get("exists")
+        )
         variants = dependency.get("normalized_variants") or {}
         if variants:
+            production = variants.get("production_normalization") or {}
+            if production.get("workflow_mode") == "PHYSICAL_DIRECT_CAPTURE":
+                try:
+                    nested_artifacts = _physical_source_3d_artifacts(
+                        production
+                    )
+                except ClusterAssemblyReceiptStaleError:
+                    raise
+                except ClusterAssemblyReceiptError as exc:
+                    raise ClusterAssemblyReceiptStaleError(
+                        "Persisted physical normalization source contract is "
+                        f"stale: {exc}"
+                    ) from exc
+                extracted_artifacts = variants.get(
+                    "source_3d_artifacts"
+                )
+                if (
+                    not isinstance(extracted_artifacts, dict)
+                    or not variants.get("target_registry")
+                ):
+                    raise ClusterAssemblyReceiptStaleError(
+                        "Persisted physical normalization receipt predates "
+                        "source/target freshness coverage and must be rebuilt"
+                    )
+                for artifact in ("source_spm", "source_fbx"):
+                    nested = nested_artifacts.get(artifact) or {}
+                    extracted = extracted_artifacts.get(artifact) or {}
+                    if (
+                        _normalized_identity_path(nested.get("path"))
+                        != _normalized_identity_path(extracted.get("path"))
+                        or str(nested.get("sha256") or "").casefold()
+                        != str(extracted.get("sha256") or "").casefold()
+                    ):
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Persisted physical normalization source artifact "
+                            f"disagrees with its nested receipt: {artifact}"
+                        )
+                dependency_spm = (
+                    dependency.get("output_spm_fingerprint")
+                    or dependency.get("authoring_spm_fingerprint")
+                    or dependency.get("spm_fingerprint")
+                    or {}
+                )
+                source_spm = extracted_artifacts.get("source_spm") or {}
+                if (
+                    _normalized_identity_path(dependency_spm.get("path"))
+                    != _normalized_identity_path(source_spm.get("path"))
+                    or str(dependency_spm.get("sha256") or "").casefold()
+                    != str(source_spm.get("sha256") or "").casefold()
+                ):
+                    raise ClusterAssemblyReceiptStaleError(
+                        "Persisted physical normalization source does not "
+                        "match its Cluster dependency"
+                    )
             expected_artifacts.extend([
                 variants.get("manifest") or {},
                 variants.get("source_blend") or {},
             ])
+            expected_artifacts.extend(
+                row
+                for row in (
+                    variants.get("source_3d_artifacts") or {}
+                ).values()
+                if isinstance(row, dict)
+            )
+            if variants.get("target_registry"):
+                expected_artifacts.append(variants["target_registry"])
             expected_artifacts.extend(
                 row.get("plan_fbx") or {}
                 for row in variants.get("variants") or []

@@ -98,6 +98,88 @@ class PushQueueFlowTests(unittest.TestCase):
     def targets(*names):
         return [{"spm": Path(name), "checked": True} for name in names]
 
+    def test_legacy_cluster_bootstraps_after_missing_canonical_schedule(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"spm_parallel_jobs": 1}
+        app.force_rerun = False
+        app.spm_calibration_signature = "current"
+        app.legacy_spm_calibration_signature = None
+        attempted = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cluster = Path(temp_dir) / "cluster"
+            cluster.mkdir()
+            legacy_spm = cluster / "branch_tree_test_01.spm"
+            canonical_spm = cluster / "SK_branch_tree_test_01.spm"
+            legacy_spm.write_bytes(b"legacy cluster spm")
+            item = {
+                "spm": canonical_spm,
+                "checked": True,
+                # Scan aliases the live legacy snapshot onto the canonical row
+                # that stage ① will create.
+                "spm_snapshot": gui.file_content_snapshot(legacy_spm),
+            }
+
+            def fake_spm(_iid, spm):
+                attempted.append(app._prepare_pair_for_job(spm))
+
+            app._job_spm = mock.Mock(side_effect=fake_spm)
+            with mock.patch.object(
+                gui, "LOG_DIR", Path(temp_dir) / "logs"
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_batch(
+                    "spm", [item], emit_done=False
+                )
+
+            self.assertTrue(result)
+            self.assertEqual(app._phase_failed_items, set())
+            self.assertEqual(len(attempted), 1)
+            self.assertEqual(attempted[0], canonical_spm.resolve())
+            self.assertEqual(
+                canonical_spm.read_bytes(), legacy_spm.read_bytes()
+            )
+
+    def test_missing_spm_during_scheduling_fails_only_that_row(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"spm_parallel_jobs": 1}
+        app.force_rerun = False
+        app.spm_calibration_signature = "current"
+        app.legacy_spm_calibration_signature = None
+        attempted = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            missing_spm = root / "SK_missing.spm"
+            existing_spm = root / "SK_existing.spm"
+            existing_spm.write_bytes(b"spm")
+            targets = [
+                {"spm": missing_spm, "checked": True},
+                {"spm": existing_spm, "checked": True},
+            ]
+
+            def fake_spm(_iid, spm):
+                attempted.append(spm)
+                if not spm.exists():
+                    raise FileNotFoundError(spm)
+
+            app._job_spm = mock.Mock(side_effect=fake_spm)
+            with mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_batch(
+                    "spm", targets, emit_done=False
+                )
+
+        self.assertTrue(result)
+        self.assertCountEqual(attempted, [missing_spm, existing_spm])
+        self.assertEqual(app._phase_failed_items, {str(missing_spm)})
+        self.assertEqual(
+            app.state[str(missing_spm)]["spm_status_kind"],
+            "data_error",
+        )
+
     def test_blender_repair_waits_for_cluster_sources_before_root_assets(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -178,6 +260,10 @@ class PushQueueFlowTests(unittest.TestCase):
             app._job_blender = mock.Mock(side_effect=fake_blender)
             with mock.patch.object(
                 gui, "LOG_DIR", Path(temp_dir) / "logs"
+            ), mock.patch.object(
+                gui,
+                "cluster_relation_output_targets",
+                return_value=(blocked_root,),
             ), mock.patch.object(gui, "save_state"):
                 result = app._run_batch(
                     "blender", targets, emit_done=False
@@ -317,9 +403,21 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertNotIn("cluster_single_bone_rigid_binding", bwr_source)
         self.assertNotIn("rigid_existing_single_bone", bwr_source)
         self.assertIn("export_collection_contract_issues(", bwr_source)
-        self.assertIn("orphan_owned_export_empty:", bwr_source)
-        self.assertIn("cluster_unsuffixed_export_unit:", bwr_source)
-        self.assertIn("cluster_missing_normalized_export_pivot", bwr_source)
+        cluster_export_contract_source = (
+            SK_BATCH_DIR.parent / "cluster_export_handoff_contract.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "orphan_owned_export_empty:",
+            cluster_export_contract_source,
+        )
+        self.assertIn(
+            "cluster_unsuffixed_export_unit:",
+            cluster_export_contract_source,
+        )
+        self.assertIn(
+            "cluster_missing_normalized_export_pivot",
+            cluster_export_contract_source,
+        )
 
         push_source = (
             SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -339,6 +437,10 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertIn(
             "not args.dependency_orchestrated",
+            push_source,
+        )
+        self.assertIn(
+            '"dependency_orchestrated": bool(args.dependency_orchestrated)',
             push_source,
         )
         sync_call = push_source.index("utilities.sync_unreal_mesh_folder_path()")
@@ -532,10 +634,15 @@ class PushQueueFlowTests(unittest.TestCase):
             return True
 
         app._run_batch = mock.Mock(side_effect=fake_batch)
-        app._run_full_pipeline(
-            [tree_item, cluster_item],
-            terminal_phase="push",
-        )
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            return_value=(tree_spm,),
+        ):
+            app._run_full_pipeline(
+                [tree_item, cluster_item],
+                terminal_phase="push",
+            )
 
         self.assertEqual(
             calls,
@@ -685,6 +792,41 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(result["items"]["item-a"]["status"], "unreal_crash")
         self.assertEqual(result["items"]["item-a"]["crash_count"], 1)
 
+    def test_headless_checkpoint_replaces_stale_blender_progress(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        item_by_id = {
+            "item-a": {"report_path": "a.json", "fingerprint": "a-v1"},
+            "item-b": {"report_path": "b.json", "fingerprint": "b-v1"},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = Path(temp_dir) / "checkpoint.json"
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "current_item": "item-b",
+                        "items": {
+                            "item-a": {"status": "imported_ok"},
+                            "item-b": {"status": "importing"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(gui, "save_state"):
+                app._sync_headless_checkpoint(checkpoint, item_by_id)
+                app._sync_headless_checkpoint(checkpoint, item_by_id)
+
+        progress = [
+            payload
+            for kind, payload in list(app.ui_queue.queue)
+            if kind == "progress"
+        ]
+        self.assertEqual(
+            progress,
+            ["Unreal Push 1/2 · headless 처리 중 1개"],
+        )
+
     def test_headless_export_failures_are_not_reported_as_cache_success(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -727,6 +869,136 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_limited.assert_not_called()
         self.assertEqual(app.state[iid]["push_status_kind"], "imported_ok")
         self.assertIn("건너뜀", app.log.call_args.args[0])
+
+    def test_ready_assembly_manifest_never_rpc_skips_live_verification(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app.cfg = {"send2ue_dir": "send2ue"}
+        spm = Path("SK_tree_assembly_01.spm")
+        iid = str(spm)
+        app.state[iid] = {"push_import_fingerprint": "item-v1"}
+        app._source_push_fingerprint = mock.Mock(return_value="source-v1")
+        app._cached_manifest_item = mock.Mock(
+            return_value={
+                "queue_id": iid,
+                "fingerprint": "item-v1",
+                "cluster_assembly": {
+                    "ingest_plan": {
+                        "status": "ready",
+                        "asset_contract": {
+                            "full_skeletal_mesh": "/Game/Tree/SK_Tree",
+                            "base_skeletal_mesh": "/Game/Tree/Base",
+                            "parts": {},
+                            "assembly": "/Game/Tree/Assembly",
+                        },
+                    }
+                },
+            }
+        )
+        app._push_material_contract = mock.Mock(
+            side_effect=RuntimeError("continued to live verification")
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "continued to live verification"
+        ):
+            app._job_push(iid, spm)
+
+        self.assertFalse(
+            any(
+                "건너뜀" in str(call.args[0])
+                for call in app.log.call_args_list
+            )
+        )
+
+    def test_headless_cache_hit_tree_with_ready_assembly_is_verified(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app._phase_failed_items = set()
+        app._active_push_dependency_map = {}
+        tree = Path("Tree") / "SK_tree_assembly_01.spm"
+        iid = str(tree)
+        app.state[iid] = {"push_import_fingerprint": "tree-v1"}
+        app.cfg = {
+            "blender_parallel_jobs": 1,
+            "unreal_editor_cmd": "UnrealEditor-Cmd.exe",
+            "unreal_project": "MyProject2.uproject",
+            "headless_item_crash_retries": 2,
+            "headless_batch_max_restarts": 0,
+            "headless_job_timeout": 100,
+        }
+        exported = {
+            "queue_id": iid,
+            "fingerprint": "tree-v1",
+            "report_path": "tree-report.json",
+            "assets": [],
+            "cluster_assembly": {
+                "ingest_plan": {
+                    "status": "ready",
+                    "asset_contract": {
+                        "full_skeletal_mesh": "/Game/Tree/SK_Tree",
+                        "base_skeletal_mesh": "/Game/Tree/Base",
+                        "parts": {},
+                        "assembly": "/Game/Tree/Assembly",
+                    },
+                }
+            },
+        }
+        captured = {}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def fake_commandlet(_cmd, log_name, _timeout, **kwargs):
+                manifest_path = Path(
+                    kwargs["env"]["SK_BATCH_MANIFEST_PATH"]
+                )
+                checkpoint_path = Path(
+                    kwargs["env"]["SK_BATCH_CHECKPOINT_PATH"]
+                )
+                report_path = Path(kwargs["env"]["SK_BATCH_REPORT_PATH"])
+                payload = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                captured["item"] = payload["items"][0]
+                states = {
+                    iid: {
+                        "status": "imported_ok",
+                        "fingerprint": "tree-v1",
+                    }
+                }
+                checkpoint_path.write_text(
+                    json.dumps(
+                        {
+                            "complete": True,
+                            "current_item": None,
+                            "items": states,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                report_path.write_text(
+                    json.dumps({"status": "complete", "items": states}),
+                    encoding="utf-8",
+                )
+                return 0, temp_root / log_name
+
+            with mock.patch.object(
+                gui, "LOG_DIR", temp_root
+            ), mock.patch.object(
+                app, "_export_manifest_item", return_value=exported
+            ), mock.patch.object(
+                app, "_run_limited", side_effect=fake_commandlet
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_headless_push_batch(
+                    [{"spm": tree, "checked": True}],
+                    emit_done=False,
+                )
+
+        self.assertTrue(result)
+        self.assertTrue(captured["item"]["verify_existing_assets"])
 
     def test_rpc_cli_uses_target_project_remote_execution_adapter(self):
         gui = load_gui_module()
@@ -856,6 +1128,48 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertIn("Push 재확인 필요", text)
         self.assertNotIn("완료", text)
+
+    def test_push_fingerprint_tracks_direct_export_and_ingest_modules(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"send2ue_dir": Path("C:/send2ue")}
+
+        paths = {
+            Path(path).resolve()
+            for path in app._push_dependency_paths()
+        }
+
+        self.assertIn(
+            (SK_BATCH_DIR / "nanite_assembly_materials.py").resolve(),
+            paths,
+        )
+        self.assertIn(
+            (
+                SK_BATCH_DIR.parent
+                / "cluster_spm_pair_contract.py"
+            ).resolve(),
+            paths,
+        )
+        self.assertIn(
+            (
+                SK_BATCH_DIR.parent
+                / "speedtree_pipeline_contract.py"
+            ).resolve(),
+            paths,
+        )
+
+    def test_push_fingerprint_tracks_item_repair_assembly_report(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"send2ue_dir": Path("C:/send2ue")}
+        spm = Path("C:/Tree/SK_tree_test_01.spm")
+
+        paths = {
+            Path(path)
+            for path in app._push_source_dependency_paths(spm)
+        }
+
+        self.assertIn(gui.repair_pipeline_report_path(spm), paths)
 
     def test_headless_exports_all_items_then_uses_one_commandlet_session(self):
         gui = load_gui_module()
@@ -1038,6 +1352,65 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(
             captured["items"][1]["depends_on_queue_ids"],
             [str(cluster)],
+        )
+
+    def test_headless_blocks_tree_before_unreal_when_cluster_export_failed(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app._phase_failed_items = set()
+        cluster = Path("Tree_elm") / "Cluster" / "SK_leaf_elm_side_01.spm"
+        root = Path("Tree_elm") / "SK_Tree_elm_01.spm"
+        app._active_push_dependency_map = {
+            str(root): (str(cluster),)
+        }
+        app.cfg = {"blender_parallel_jobs": 1}
+        targets = [
+            {"spm": cluster, "checked": False},
+            {"spm": root, "checked": True},
+        ]
+        root_export = {
+            "queue_id": str(root),
+            "fingerprint": "root-v1",
+            "report_path": "root-report.json",
+            "assets": [],
+        }
+
+        def export_item(iid, _spm, _stamp):
+            if iid == str(cluster):
+                raise gui.BatchItemError(
+                    "Blender에 저장되지 않은 변경이 있음",
+                    kind="manual_required",
+                )
+            return root_export
+
+        with mock.patch.object(
+            app, "_export_manifest_item", side_effect=export_item
+        ), mock.patch.object(
+            app,
+            "_run_limited",
+            side_effect=AssertionError(
+                "Unreal must not start for a dependency-blocked tree"
+            ),
+        ) as commandlet, mock.patch.object(gui, "save_state"):
+            result = app._run_headless_push_batch(
+                targets,
+                emit_done=False,
+            )
+
+        self.assertFalse(result)
+        commandlet.assert_not_called()
+        self.assertEqual(
+            app.state[str(cluster)]["push_status_kind"],
+            "manual_required",
+        )
+        self.assertEqual(
+            app.state[str(root)]["push_status_kind"],
+            "dependency_blocked",
+        )
+        self.assertIn(
+            cluster.name,
+            app.state[str(root)]["push_status_error"]["message"],
         )
 
 

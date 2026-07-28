@@ -654,6 +654,35 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(master.read_bytes(), original)
             self.assertFalse((folder / sync.MANIFEST_NAME).exists())
 
+    def test_master_promotion_does_not_overwrite_concurrent_spm_edit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            write_spm(master, make_master())
+            concurrent = make_master().replace(
+                property_xml("Generation:First", "0.2"),
+                property_xml("Generation:First", "0.37"),
+                1,
+            )
+            original_standardize = sync.standardize_master_document
+
+            def standardize_then_change(*args, **kwargs):
+                result = original_standardize(*args, **kwargs)
+                write_spm(master, concurrent)
+                return result
+
+            with mock.patch.object(
+                sync,
+                "standardize_master_document",
+                side_effect=standardize_then_change,
+            ):
+                with self.assertRaises(sync.SyncError):
+                    sync.promote_master(folder, master.name)
+
+            self.assertEqual(sync.read_spm_text(master)[0], concurrent)
+            self.assertFalse((folder / sync.BACKUP_SUBDIR).exists())
+            self.assertFalse((folder / sync.MANIFEST_NAME).exists())
+
     def test_base_mapping_suggestion_supports_one_to_many_branch(self):
         with tempfile.TemporaryDirectory() as temp:
             master = Path(temp) / "master.spm"
@@ -1476,6 +1505,65 @@ class GeneratorSyncTests(unittest.TestCase):
             )
             self.assertFalse((folder / sync.BACKUP_SUBDIR).exists())
 
+    def test_transaction_aborts_when_target_changes_during_plan_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            sync.assign_follower(
+                manifest,
+                master.name,
+                target.name,
+                {
+                    "Leaf 2": "Leaf",
+                    "BranchBig": "Branch",
+                    "BranchSmall": None,
+                    "End 2": "End",
+                },
+                confirmed=True,
+            )
+            sync.save_manifest(folder, manifest)
+            concurrent = make_target().replace(
+                "<Name>Leaf 2</Name>",
+                "<Name>Leaf 9</Name>",
+                1,
+            )
+            original_load = sync.SPMDocument.from_path
+            changed = False
+
+            def load_then_change(path, full=True):
+                nonlocal changed
+                document = original_load(path, full=full)
+                if Path(path) == target and not changed:
+                    changed = True
+                    write_spm(target, concurrent)
+                return document
+
+            with mock.patch.object(
+                sync.SPMDocument,
+                "from_path",
+                side_effect=load_then_change,
+            ):
+                with self.assertRaises(sync.SyncError):
+                    sync.apply_group_transaction(
+                        folder,
+                        master.name,
+                        verify_speedtree=False,
+                    )
+
+            self.assertEqual(sync.read_spm_text(target)[0], concurrent)
+            self.assertFalse((folder / sync.BACKUP_SUBDIR).exists())
+
     def test_successful_transaction_updates_manifest_and_keeps_backup(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -1528,6 +1616,64 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(follower["base_map"]["BranchBig"], "Branch")
             self.assertEqual(follower["base_map"]["End 2"], "End")
 
+    def test_up_to_date_transaction_rechecks_sources_before_manifest_save(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+            sync.assign_follower(
+                manifest,
+                master.name,
+                target.name,
+                mapping,
+                confirmed=True,
+            )
+            sync.save_manifest(folder, manifest)
+            sync.apply_group_transaction(
+                folder,
+                master.name,
+                verify_speedtree=False,
+            )
+            manifest_before = (folder / sync.MANIFEST_NAME).read_bytes()
+            original_assert = sync._assert_spm_unchanged
+
+            def rewrite_before_check(fingerprints):
+                target.write_bytes(target.read_bytes() + b"\n")
+                original_assert(fingerprints)
+
+            with mock.patch.object(
+                sync,
+                "_assert_spm_unchanged",
+                side_effect=rewrite_before_check,
+            ):
+                with self.assertRaises(sync.SyncError):
+                    sync.apply_group_transaction(
+                        folder,
+                        master.name,
+                        verify_speedtree=False,
+                    )
+
+            self.assertEqual(
+                (folder / sync.MANIFEST_NAME).read_bytes(),
+                manifest_before,
+            )
+
     def test_manifest_save_failure_rolls_back_all_spms(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -1556,6 +1702,55 @@ class GeneratorSyncTests(unittest.TestCase):
 
             self.assertEqual(master.read_bytes(), originals[master])
             self.assertEqual(target.read_bytes(), originals[target])
+
+    def test_transaction_preserves_concurrent_manifest_edit_and_rolls_back_spm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            target_before = target.read_bytes()
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            sync.assign_follower(
+                manifest,
+                master.name,
+                target.name,
+                {
+                    "Leaf 2": "Leaf",
+                    "BranchBig": "Branch",
+                    "BranchSmall": None,
+                    "End 2": "End",
+                },
+                confirmed=True,
+            )
+            sync.save_manifest(folder, manifest)
+            concurrent = copy.deepcopy(manifest)
+            concurrent["independent"] = ["external_edit.spm"]
+
+            def edit_manifest_after_spm_write(_path):
+                sync.save_manifest(folder, concurrent)
+
+            with self.assertRaises(sync.SyncError):
+                sync.apply_group_transaction(
+                    folder,
+                    master.name,
+                    verify_speedtree=False,
+                    verify_callback=edit_manifest_after_spm_write,
+                )
+
+            self.assertEqual(target.read_bytes(), target_before)
+            self.assertEqual(
+                sync.load_manifest(folder)["independent"],
+                ["external_edit.spm"],
+            )
 
 
 if __name__ == "__main__":

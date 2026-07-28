@@ -118,7 +118,12 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 )
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 payload = (
-                    [{"status": "already-ok"}]
+                    [{
+                        "status": "already-ok",
+                        "final_spm_fingerprint":
+                            source_prepare.file_content_fingerprint(spm),
+                        "cluster_root_logical_postcondition": {"ok": True},
+                    }]
                     if stage == "spm_bone_setup"
                     else {
                         "status": "ok",
@@ -233,6 +238,58 @@ class ClusterSourcePrepareTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "spm_bone_setup")
         self.assertEqual(run.call_count, 1)
 
+    def test_stale_bone_report_fingerprint_stops_before_blender(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Cluster" / "SK_branch_01.spm"
+            blend = spm.with_suffix(".blend")
+            spm.parent.mkdir(parents=True)
+            spm.write_bytes(b"spm")
+            blend.write_bytes(b"blend")
+
+            def stale_report(command, log_file, *, timeout, stage):
+                del log_file, timeout
+                self.assertEqual(stage, "spm_bone_setup")
+                report_path = Path(
+                    str(command[command.index("--report") + 1])
+                )
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps([{
+                        "status": "already-ok",
+                        "final_spm_fingerprint": "stale",
+                        "cluster_root_logical_postcondition": {"ok": True},
+                    }]),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch.object(
+                source_prepare,
+                "blender_open_file_window_titles",
+                return_value=[],
+            ), mock.patch.object(
+                source_prepare,
+                "LOG_DIR",
+                root / "logs",
+            ), mock.patch.object(
+                source_prepare,
+                "_run_stage",
+                side_effect=stale_report,
+            ) as run:
+                with self.assertRaises(
+                    source_prepare.ClusterSourcePreparationError
+                ) as caught:
+                    source_prepare._build_cluster_source(
+                        spm,
+                        blend,
+                        cfg={"spm_verify_timeout": 1},
+                    )
+
+        self.assertEqual(caught.exception.stage, "spm_bone_setup")
+        self.assertIn("SPM changed", str(caught.exception))
+        self.assertEqual(run.call_count, 1)
+
     def test_blocked_source_build_restores_previous_pipeline_report(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -278,7 +335,12 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 if stage == "spm_bone_setup":
                     report_path.write_text(
-                        json.dumps([{"status": "already-ok"}]),
+                        json.dumps([{
+                            "status": "already-ok",
+                            "final_spm_fingerprint":
+                                source_prepare.file_content_fingerprint(spm),
+                            "cluster_root_logical_postcondition": {"ok": True},
+                        }]),
                         encoding="utf-8",
                     )
                     return SimpleNamespace(returncode=0)

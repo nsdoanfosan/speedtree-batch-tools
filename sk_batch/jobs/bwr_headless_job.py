@@ -12,7 +12,7 @@ is a clean idempotent update (the operator wipes its previous build).
 import argparse
 import json
 import os
-import re
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -51,6 +51,14 @@ from cluster_assembly_handoff_contract import (
 from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from job_report_contract import mark_job_failed
+from cluster_export_handoff_contract import (
+    cluster_export_contract_issues as inspect_cluster_export_contract,
+)
+from pcg_st9_texture_batch.pcg_cluster_bark_normalization import (
+    BarkNormalizationError,
+    validate_canonical_bark_export_bundle,
+)
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -76,6 +84,7 @@ def parse_args():
     parser.add_argument("--blend", required=True)
     parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
     parser.add_argument("--material-contract", default="")
+    parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
@@ -84,6 +93,21 @@ def parse_args():
 def write_report(path, data):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def atomic_copy(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def material_slot_issues(obj):
@@ -134,58 +158,21 @@ def remove_unused_empty_material_slots(obj):
 
 def export_collection_contract_issues(cluster_source_stem=""):
     """Return Send2UE units that would become unintended standalone assets."""
-    export_collection = bpy.data.collections.get("Export")
-    if export_collection is None:
-        return ["missing_export_collection"]
-    issues = [
-        f"orphan_owned_export_empty:{obj.name}"
-        for obj in export_collection.objects
-        if obj.type == "EMPTY"
-        and not obj.children
-        and bool(obj.get("codex_source_fbx", ""))
-    ]
     if not cluster_source_stem:
-        return issues
-
-    pivots = [
-        obj
-        for obj in export_collection.objects
-        if obj.type == "EMPTY"
-        and obj.children
-        and bool(obj.get("speedtree_cluster_generated"))
-        and obj.get("speedtree_cluster_asset_role") == "send2ue_pivot"
-    ]
-    unintended = [
-        obj.name
-        for obj in export_collection.objects
-        if obj.type == "EMPTY"
-        and obj.children
-        and obj not in pivots
-    ]
-    issues.extend(
-        f"cluster_unsuffixed_export_unit:{name}"
-        for name in sorted(unintended)
+        export_collection = bpy.data.collections.get("Export")
+        if export_collection is None:
+            return ["missing_export_collection"]
+        return [
+            f"orphan_owned_export_empty:{obj.name}"
+            for obj in export_collection.objects
+            if obj.type == "EMPTY"
+            and not obj.children
+            and bool(obj.get("codex_source_fbx", ""))
+        ]
+    return inspect_cluster_export_contract(
+        bpy.data,
+        cluster_source_stem,
     )
-
-    pattern = re.compile(
-        rf"^{re.escape(cluster_source_stem)}_(\d{{2}})$",
-        re.IGNORECASE,
-    )
-    ordinals = []
-    for pivot in pivots:
-        match = pattern.fullmatch(pivot.name)
-        if match is None:
-            issues.append(f"cluster_invalid_export_pivot:{pivot.name}")
-        else:
-            ordinals.append(int(match.group(1)))
-    if not pivots:
-        issues.append("cluster_missing_normalized_export_pivot")
-    elif sorted(ordinals) != list(range(1, len(pivots) + 1)):
-        issues.append(
-            "cluster_nonconsecutive_export_pivots:"
-            + ",".join(str(value) for value in sorted(ordinals))
-        )
-    return issues
 
 
 def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
@@ -239,10 +226,36 @@ def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
 def require_cluster_assembly_handoff_ready(handoff):
     if handoff.get("status") != "blocked":
         return
+
+    def describe(item):
+        fields = [str(item.get("code") or "CLUSTER_HANDOFF_BLOCKED")]
+        if item.get("role"):
+            fields.append(f"role={item['role']}")
+        if item.get("spm"):
+            fields.append(f"provider={item['spm']}")
+        elif item.get("artifact"):
+            fields.append(f"artifact={item['artifact']}")
+        if item.get("material"):
+            fields.append(f"material={item['material']}")
+        if item.get("canonical_material"):
+            fields.append(
+                f"canonical_material={item['canonical_material']}"
+            )
+        if item.get("reason"):
+            fields.append(f"reason={item['reason']}")
+        details = item.get("details") or {}
+        if details.get("status"):
+            fields.append(f"status={details['status']}")
+        missing = list(details.get("missing") or [])
+        invalid = list(details.get("invalid") or [])
+        if missing:
+            fields.append("missing=" + ", ".join(missing[:3]))
+        if invalid:
+            fields.append("invalid=" + ", ".join(invalid[:3]))
+        return " ".join(fields)
+
     reasons = "; ".join(
-        f"{item.get('role') or item.get('artifact') or '?'}: "
-        f"{item.get('reason') or item.get('code')}"
-        for item in handoff.get("issues") or []
+        describe(item) for item in handoff.get("issues") or []
     )
     raise RuntimeError(
         "PCG Cluster Assembly handoff blocked before Blender Repair: "
@@ -272,12 +285,10 @@ def main():
         "wind": args.wind,
         "status": "failed",
     }
-    # Cluster rows reach this job already normalized to their canonical SK_
-    # name, so --spm and --speedtree-spm always name the same file.  The two
-    # former "is this a raw, unprefixed Cluster source?" policies could
-    # therefore never be selected; the pair policy resolved to the same gate as
-    # strict anyway, so only their labels were ever observable.  Legacy receipt
-    # lineage stays the one thing that relaxes the source gate.
+    # Cluster rows reach this job under their canonical SK_ output identity.
+    # ``--speedtree-spm`` can additionally point at an immutable isolated copy
+    # when the Assembly receipt requires canonical bark before Atlas capture.
+    # Legacy receipt lineage stays the one thing that relaxes the source gate.
     legacy_state = inspect_legacy_cluster_state(speedtree_spm)
     legacy_cluster_origin = bool(
         legacy_state.get("receipt_valid")
@@ -306,6 +317,53 @@ def main():
             "block Blender Repair; the permanent GUID receipt remains authoritative."
         )
     try:
+        bark_normalization_manifest = None
+        if args.bark_normalization_manifest:
+            manifest_path = Path(
+                args.bark_normalization_manifest
+            ).resolve()
+            try:
+                bark_normalization_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    "Cluster bark normalization manifest is unreadable: "
+                    f"{manifest_path}: {exc}"
+                ) from exc
+            if (
+                bark_normalization_manifest.get("kind")
+                != "cluster_isolated_canonical_bark_source"
+                or bark_normalization_manifest.get("status") != "ready"
+                or bark_normalization_manifest.get(
+                    "production_source_mutated"
+                ) is not False
+                or Path(
+                    bark_normalization_manifest.get("source_spm") or ""
+                ).resolve() != canonical_spm
+                or Path(
+                    bark_normalization_manifest.get("speedtree_spm") or ""
+                ).resolve() != speedtree_spm
+                or bark_normalization_manifest.get("source_spm_sha256")
+                != file_fingerprint(canonical_spm).get("sha256")
+                or bark_normalization_manifest.get(
+                    "isolated_spm_sha256"
+                ) != file_fingerprint(speedtree_spm).get("sha256")
+            ):
+                raise RuntimeError(
+                    "Cluster bark normalization manifest is stale or "
+                    "does not match the requested source pair"
+                )
+            report["cluster_bark_source_resolution"] = {
+                "status": "ready",
+                "manifest": file_fingerprint(manifest_path),
+                "source_spm": file_fingerprint(canonical_spm),
+                "speedtree_spm": file_fingerprint(speedtree_spm),
+                "canonical_material": (
+                    bark_normalization_manifest.get("normalization") or {}
+                ).get("canonical_material"),
+                "production_source_mutated": False,
+            }
         material_preflight = None
         if args.material_contract:
             # Validate the exact SPM/STMAT hashes before Blender or the add-on
@@ -449,6 +507,28 @@ def main():
         xml_export = speedtree_export["exports"].get("xml", {})
         if not fbx_export.get("exists"):
             raise RuntimeError("SpeedTree export produced no FBX to import")
+        if bark_normalization_manifest is not None:
+            if not xml_export.get("exists"):
+                raise RuntimeError(
+                    "Cluster canonical bark validation requires the paired "
+                    "SpeedTree XML export"
+                )
+            try:
+                report["cluster_bark_export_validation"] = (
+                    validate_canonical_bark_export_bundle(
+                        fbx_export["path"],
+                        str(Path(fbx_export["path"]).with_suffix(".stmat")),
+                        xml_export["path"],
+                        bark_normalization_manifest.get(
+                            "normalization"
+                        ) or {},
+                    )
+                )
+            except BarkNormalizationError as exc:
+                raise RuntimeError(
+                    "Cluster canonical bark export validation failed: "
+                    + str(exc)
+                ) from exc
 
         # A content-driven Assembly receipt can legitimately be written before
         # its authoritative general-tree FBX exists.  Do not silently degrade
@@ -581,6 +661,16 @@ def main():
         settings.name_stem = canonical_spm.stem
         repair_settings = settings.as_dict()
         repair_settings["cluster_source_skin_contract"] = is_cluster_source
+        repair_settings["source_identity_path"] = str(canonical_spm)
+        canonical_source_fbx = (
+            canonical_spm.parent
+            / "fbx"
+            / f"{canonical_spm.stem}.fbx"
+        ).resolve()
+        if canonical_source_fbx != Path(fbx_export["path"]).resolve():
+            repair_settings["source_fbx_cleanup_aliases"] = [
+                str(canonical_source_fbx)
+            ]
         result = bwr_core.run_import_and_repair(repair_settings)
         report["speedtree_export"] = speedtree_export
         export_collection_issues = export_collection_contract_issues(
@@ -713,7 +803,13 @@ def main():
                 or (not empty_material_slots and not material_export_blocked)
             )
         ):
-            bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+            save_result = bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+            report["blend_save_operator_result"] = sorted(save_result)
+            if "FINISHED" not in save_result:
+                raise RuntimeError(
+                    "Blender did not commit the repaired source blend: "
+                    + ", ".join(sorted(save_result))
+                )
             report["blend_resaved"] = True
 
         missing_outputs = [
@@ -765,10 +861,21 @@ def main():
             "source_review_required": handoff_status == "source_review",
             "unreal_push_ready": handoff_status == "ok",
         }
+        source_blend_committed = bool(
+            args.cluster_source_build_only
+            and report.get("blend_resaved")
+            and merged_object is not None
+            and Path(blend_path).is_file()
+            and Path(bpy.data.filepath).resolve() == Path(blend_path).resolve()
+        )
         cluster_source_build_contract = {
             "status": (
                 "ready"
-                if args.cluster_source_build_only and not hard_handoff_blocked
+                if (
+                    args.cluster_source_build_only
+                    and not hard_handoff_blocked
+                    and source_blend_committed
+                )
                 else "blocked"
                 if args.cluster_source_build_only
                 else "not_applicable"
@@ -787,6 +894,10 @@ def main():
             "post_normalization_handoff_status": (
                 "source_review" if reviewable_source_issues else "ok"
             ),
+            "source_blend_committed": source_blend_committed,
+            "source_object": (
+                merged_object.name if merged_object is not None else ""
+            ),
         }
         report["cluster_source_build_contract"] = (
             cluster_source_build_contract
@@ -795,7 +906,31 @@ def main():
         report["source_review_required"] = handoff_status == "source_review"
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
-        if preflight["status"] == "ok" and cluster_assembly_handoff is not None:
+        pass_through_handoff = None
+        if isinstance(cluster_assembly_contract, dict):
+            candidate_handoff = (
+                cluster_assembly_contract.get("handoff") or {}
+            )
+            if candidate_handoff.get("status") == "pass_through":
+                pass_through_handoff = candidate_handoff
+        if preflight["status"] == "ok" and pass_through_handoff is not None:
+            # Persist "no content-driven Assembly" as a positive current
+            # contract. Without this manifest, Push falls back to historical
+            # target registries and can falsely dependency-orchestrate an
+            # otherwise ordinary Full-SK asset.
+            assembly_manifest = build_blender_assembly_inputs(
+                pass_through_handoff,
+                None,
+                None,
+                Path(blend_dir) / "assembly",
+                "",
+                report["dynamic_wind_json"],
+            )
+            report["cluster_assembly_manifest"] = assembly_manifest
+        elif (
+            preflight["status"] == "ok"
+            and cluster_assembly_handoff is not None
+        ):
             if pipeline_data is None or merged_object is None:
                 raise RuntimeError(
                     "Cluster Assembly builder requires the final BWR pipeline mesh"
@@ -819,10 +954,36 @@ def main():
                 report["dynamic_wind_json"],
             )
             report["cluster_assembly_manifest"] = assembly_manifest
+        if (
+            bark_normalization_manifest is not None
+            and preflight["status"] != "blocked"
+        ):
+            canonical_xml = (
+                canonical_spm.parent
+                / "xml"
+                / f"{canonical_spm.stem}.xml"
+            )
+            atomic_copy(xml_export["path"], canonical_xml)
+            report["cluster_bark_canonical_xml_handoff"] = (
+                file_fingerprint(canonical_xml)
+            )
         if pipeline_data is not None:
+            pipeline_data["source_blend_identity"] = file_fingerprint(
+                Path(blend_path)
+            )
             pipeline_data["speedtree_live_source_identity"] = {
                 "spm": source_identity(canonical_spm),
             }
+            if bark_normalization_manifest is not None:
+                pipeline_data["cluster_bark_source_resolution"] = report[
+                    "cluster_bark_source_resolution"
+                ]
+                pipeline_data["cluster_bark_export_validation"] = report[
+                    "cluster_bark_export_validation"
+                ]
+                pipeline_data[
+                    "cluster_bark_canonical_xml_handoff"
+                ] = report["cluster_bark_canonical_xml_handoff"]
             pipeline_data["handoff_preflight"] = preflight
             pipeline_data["cluster_source_build_contract"] = (
                 cluster_source_build_contract
@@ -889,9 +1050,7 @@ def main():
             report["status"] = "blocked"
             report["error"] = "② Blender Repair 사전검사 차단 — " + " | ".join(reasons)
     except Exception as exc:
-        report["status"] = "failed"
-        report["error"] = str(exc)
-        report["traceback"] = traceback.format_exc()
+        mark_job_failed(report, exc, traceback.format_exc())
     write_report(args.report, report)
     if report["status"] != "ok":
         sys.exit(1)

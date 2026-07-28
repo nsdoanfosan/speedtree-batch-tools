@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
 # definitions and silently disable preserve-source handling for a folder.
 BACKUP_RE = re.compile(
     r"(codex_backup|skbatch_backup|pcgtex_backup|\.sbk$|^~|\.blend1$"
+    r"|^__spm_sync_(?:preflight|verify)_|^\.__spm_pass_repair_"
     r"|pre_xml_root_fix|(?:^|[_\-.])probe(?:[_\-.]|$)"
     r"|\s-\s(?:복사본|copy)(?:\s\(\d+\))?\.)",
     re.IGNORECASE,

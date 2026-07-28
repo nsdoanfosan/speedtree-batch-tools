@@ -8,6 +8,7 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+from unittest import mock
 
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
@@ -130,9 +131,16 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             },
         ]
 
-        ordered, dependencies, auto_added = (
-            gui.expand_blender_repair_targets(root_items, all_items)
-        )
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            side_effect=lambda spm, _refs: (
+                [root_01] if spm == cluster_a else []
+            ),
+        ):
+            ordered, dependencies, auto_added = (
+                gui.expand_blender_repair_targets(root_items, all_items)
+            )
 
         self.assertEqual(
             [item["spm"] for item in ordered],
@@ -141,6 +149,43 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertEqual(dependencies[str(root_01)], (str(cluster_a),))
         self.assertEqual(dependencies[str(root_02)], ())
         self.assertEqual(auto_added, {str(cluster_a)})
+
+    def test_blender_repair_maps_raw_tree_reference_to_selected_sk_output(self):
+        gui = load_gui_module()
+        owner = Path(r"D:\Trees\Elm")
+        raw_tree = owner / "Tree_elm_02.spm"
+        sk_tree = owner / "SK_Tree_elm_02.spm"
+        cluster = owner / "Cluster" / "SK_branch_elm_01.spm"
+        root_item = {
+            "spm": sk_tree,
+            "authoring_spm": sk_tree,
+        }
+        cluster_item = {
+            "spm": cluster,
+            "referenced_by_spms": (raw_tree,),
+        }
+
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            return_value=[raw_tree],
+        ):
+            ordered, dependencies, auto_added = (
+                gui.expand_blender_repair_targets(
+                    [root_item],
+                    [root_item, cluster_item],
+                )
+            )
+
+        self.assertEqual(
+            [item["spm"] for item in ordered],
+            [cluster, sk_tree],
+        )
+        self.assertEqual(
+            dependencies[str(sk_tree)],
+            (str(cluster),),
+        )
+        self.assertEqual(auto_added, {str(cluster)})
 
     def test_recent_24_hours_checks_only_recent_authoritative_spms(self):
         gui = load_gui_module()

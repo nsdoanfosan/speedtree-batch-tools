@@ -145,6 +145,187 @@ def _referenced_material_ids(root):
     return referenced
 
 
+def _generator_property_pairs(root):
+    pairs = []
+    for generator in root.findall(".//Generator"):
+        generator_type = str(
+            generator.get("Type") or generator.findtext("Type") or ""
+        ).strip()
+        if generator_type.casefold().replace(" ", "") not in {
+            "frond",
+            "leafmesh",
+        }:
+            continue
+        properties = generator.find("Properties")
+        if properties is None:
+            continue
+        nodes = {
+            str(node.findtext("Name") or "").strip(): node
+            for node in list(properties)
+            if str(node.findtext("Name") or "").strip()
+        }
+        for name, material_property in nodes.items():
+            if not name.casefold().endswith(":material"):
+                continue
+            slot_prefix = name.rsplit(":", 1)[0]
+            mesh_property = nodes.get(f"{slot_prefix}:Mesh")
+            if mesh_property is None:
+                continue
+            pairs.append(
+                {
+                    "generator_name": str(
+                        generator.findtext("Name") or ""
+                    ).strip(),
+                    "generator_guid": str(
+                        generator.findtext("GUID")
+                        or generator.get("GUID")
+                        or ""
+                    ).strip(),
+                    "generator_type": generator_type,
+                    "slot_prefix": slot_prefix,
+                    "material_id": _integer_text(
+                        material_property.findtext("Value")
+                    ),
+                    "mesh_id": _integer_text(
+                        mesh_property.findtext("Value")
+                    ),
+                }
+            )
+    return pairs
+
+
+def _integer_text(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _authoritative_binding_backup_paths(target_spm):
+    target = Path(target_spm).expanduser().absolute()
+    owner = target.parent
+    tree_root = owner.parent
+    candidates = []
+    candidates.extend(
+        owner.glob(
+            f"_spm_backups/generator_sync_*/*{target.name}"
+        )
+    )
+    candidates.extend(
+        tree_root.glob(
+            f"_spm_backups/texture_normalize_*/*{target.name}"
+        )
+    )
+    candidates.extend(
+        tree_root.glob(
+            "_atlas_cluster_normalization_backups/"
+            f"final_*/files/{owner.name}/{target.name}"
+        )
+    )
+    unique = {}
+    for candidate in candidates:
+        if (
+            candidate.is_file()
+            and candidate.name.casefold().endswith(target.name.casefold())
+        ):
+            unique[str(candidate.resolve()).casefold()] = candidate.resolve()
+    return [unique[key] for key in sorted(unique)]
+
+
+def _material_id_by_exact_name(root, material_name):
+    matches = [
+        node
+        for node in root.findall(".//Material_v8")
+        if str(node.get("Name") or "") == material_name
+    ]
+    if len(matches) != 1:
+        return None
+    return _integer_text(matches[0].get("ID"))
+
+
+def _source_binding_repairs(target_spm, material_record):
+    """Return only exact, backup-proven sentinel repairs for one target.
+
+    This does not infer from a Generator name or index. A repair is emitted
+    only when the live Generator has a stable GUID, the exact material/slot
+    currently contains ``-9``, and every authoritative backup that contains
+    that same GUID/material/slot agrees that the authored value was ``-10``.
+    """
+    target = Path(target_spm).expanduser().absolute()
+    root = _read_spm_root(target)
+    material_name = material_record["material_name"]
+    material_id = material_record["material_id"]
+    live_pairs = [
+        pair
+        for pair in _generator_property_pairs(root)
+        if (
+            pair["material_id"] == material_id
+            and pair["mesh_id"] == -9
+            and pair["generator_guid"]
+        )
+    ]
+    if not live_pairs:
+        return []
+    candidates = _authoritative_binding_backup_paths(target)
+    repairs = []
+    for pair in live_pairs:
+        evidence = []
+        conflicting_values = []
+        for backup in candidates:
+            try:
+                backup_root = _read_spm_root(backup)
+            except Exception:
+                continue
+            backup_material_id = _material_id_by_exact_name(
+                backup_root, material_name
+            )
+            if backup_material_id is None:
+                continue
+            matches = [
+                row
+                for row in _generator_property_pairs(backup_root)
+                if (
+                    row["generator_guid"] == pair["generator_guid"]
+                    and row["generator_type"].casefold().replace(" ", "")
+                    == pair["generator_type"].casefold().replace(" ", "")
+                    and row["slot_prefix"] == pair["slot_prefix"]
+                    and row["material_id"] == backup_material_id
+                )
+            ]
+            if len(matches) != 1:
+                continue
+            backup_mesh_id = matches[0]["mesh_id"]
+            if backup_mesh_id != -10:
+                conflicting_values.append(
+                    {
+                        "path": str(backup),
+                        "mesh_id": backup_mesh_id,
+                    }
+                )
+                continue
+            evidence.append(
+                {
+                    "path": str(backup),
+                    "sha256": _sha256_file(backup),
+                }
+            )
+        if evidence and not conflicting_values:
+            repairs.append(
+                {
+                    "generator_name": pair["generator_name"],
+                    "generator_guid": pair["generator_guid"],
+                    "generator_type": pair["generator_type"],
+                    "slot_prefix": pair["slot_prefix"],
+                    "source_material_name": material_name,
+                    "source_material_id": material_id,
+                    "from_mesh_id": -9,
+                    "to_mesh_id": -10,
+                    "evidence": evidence,
+                }
+            )
+    return repairs
+
+
 def _resolve_target_role_material(target_spm, generated_material_name):
     """Resolve overwrite/adoption or a compatible source for material creation."""
     root = _read_spm_root(target_spm)
@@ -181,6 +362,11 @@ def _resolve_target_role_material(target_spm, generated_material_name):
                 else "update_output_assets_only"
             ),
             "generator_variant_policy": "ensure_all_material_cutouts",
+            "source_binding_repairs": (
+                _source_binding_repairs(target_spm, record)
+                if connect_generators
+                else []
+            ),
         }
 
     family = _material_family_name(generated_material_name)
@@ -213,6 +399,7 @@ def _resolve_target_role_material(target_spm, generated_material_name):
         "connect_generators": False,
         "resolution": "create_output_assets_only",
         "generator_variant_policy": "ensure_all_material_cutouts",
+        "source_binding_repairs": [],
     }
 
 
@@ -264,6 +451,20 @@ def _bwr_report(blend, canonical_spm):
     handoff_status = str(
         (report.get("handoff_preflight") or {}).get("status") or ""
     ).casefold()
+    if handoff_status and handoff_status not in {
+        "ok",
+        "source_review",
+        "cluster_export_pending",
+    }:
+        reason = "source_handoff_blocked"
+        raise ClusterSourceBuildRequiredError(
+            "Cluster source-build report is not eligible for Normalizer reuse "
+            f"(handoff={handoff_status or 'missing'}): {report_path}",
+            blend=blend,
+            canonical_spm=canonical_spm,
+            report_path=report_path,
+            reason=reason,
+        )
     if handoff_status == "cluster_export_pending":
         source_build = report.get("cluster_source_build_contract") or {}
         if (
@@ -272,6 +473,9 @@ def _bwr_report(blend, canonical_spm):
             != "raw_source_for_cluster_normalizer"
             or not source_build.get("final_export_required")
             or not source_build.get("deferred_export_issues")
+            or source_build.get("source_blend_committed") is not True
+            or source_build.get("source_object")
+            != str((report.get("paths") or {}).get("merged_name") or "")
         ):
             reason = "cluster_source_build_contract_invalid"
             raise ClusterSourceBuildRequiredError(

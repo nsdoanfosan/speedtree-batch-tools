@@ -110,16 +110,39 @@ def is_active_spm(path: Path) -> bool:
     return not BACKUP_NAME_RE.search(path.name)
 
 
-def read_spm_text(path: Path) -> tuple[str, bool]:
+def read_spm_snapshot(path: Path) -> tuple[str, bool, str]:
+    """Read one stable SPM byte snapshot and retain its exact fingerprint."""
+
     path = Path(path)
-    raw = path.read_bytes()
+    raw = None
+    for _attempt in range(2):
+        before = path.stat()
+        candidate = path.read_bytes()
+        after = path.stat()
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raw = candidate
+            break
+    if raw is None:
+        raise SyncError(f"읽는 동안 SPM이 변경되었습니다: {path}")
+    fingerprint = hashlib.sha256(raw).hexdigest()
     compressed = raw.startswith(b"\x1f\x8b")
     if compressed:
         raw = gzip.decompress(raw)
     try:
-        return raw.decode("utf-8"), compressed
+        return raw.decode("utf-8"), compressed, fingerprint
     except UnicodeDecodeError as exc:
         raise SyncError(f"UTF-8 SPM이 아닙니다: {path}") from exc
+
+
+def read_spm_text(path: Path) -> tuple[str, bool]:
+    text, compressed, _fingerprint = read_spm_snapshot(path)
+    return text, compressed
 
 
 def read_spm_prefix(path: Path) -> str:
@@ -620,11 +643,19 @@ class SyncPlan:
 
 
 class SPMDocument:
-    def __init__(self, path: Path, text: str, compressed: bool, full: bool = True):
+    def __init__(
+        self,
+        path: Path,
+        text: str,
+        compressed: bool,
+        full: bool = True,
+        source_fingerprint: str | None = None,
+    ):
         self.path = Path(path)
         self.text = text if full else ""
         self.compressed = compressed
         self.full = full
+        self.source_fingerprint = source_fingerprint
         self.links_missing = _section_match(text, "Links") is None
         self.asset_names_by_id: dict[str, dict[str, str]] = {
             "Material_v8": {}, "Mesh": {},
@@ -746,12 +777,19 @@ class SPMDocument:
     def from_path(cls, path: Path, full: bool = True) -> "SPMDocument":
         path = Path(path)
         if full:
-            text, compressed = read_spm_text(path)
+            text, compressed, fingerprint = read_spm_snapshot(path)
         else:
             text = read_spm_prefix(path)
             with path.open("rb") as handle:
                 compressed = handle.read(2) == b"\x1f\x8b"
-        return cls(path, text, compressed, full=full)
+            fingerprint = None
+        return cls(
+            path,
+            text,
+            compressed,
+            full=full,
+            source_fingerprint=fingerprint,
+        )
 
     def reindex(self) -> None:
         self.generators = list(self.generators_element.findall("Generator"))
@@ -2010,7 +2048,13 @@ def standardize_master_document(
     rendered = document.render()
     document.validate(rendered)
     # Followers should read the standardized source in the same transaction.
-    standardized = SPMDocument(Path(master_path), rendered, document.compressed, full=True)
+    standardized = SPMDocument(
+        Path(master_path),
+        rendered,
+        document.compressed,
+        full=True,
+        source_fingerprint=document.source_fingerprint,
+    )
     return standardized, rendered, updates, reference_renames, warnings
 
 
@@ -2215,19 +2259,65 @@ def default_manifest() -> dict:
     return {"version": 1, "groups": [], "independent": []}
 
 
-def load_manifest(folder: Path) -> dict:
+def load_manifest_snapshot(folder: Path) -> tuple[dict, str | None]:
+    """Load one stable manifest snapshot and its exact on-disk fingerprint."""
+
     folder = Path(folder)
     path = folder / MANIFEST_NAME
-    if not path.exists():
-        return default_manifest()
+    raw = None
+    for _attempt in range(2):
+        try:
+            before = path.stat()
+            candidate = path.read_bytes()
+            after = path.stat()
+        except FileNotFoundError:
+            if not path.exists():
+                return default_manifest(), None
+            continue
+        except OSError as exc:
+            raise SyncError(
+                f"관계 설정 파일을 읽을 수 없습니다: {path}: {exc}"
+            ) from exc
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raw = candidate
+            break
+    if raw is None:
+        raise SyncError(f"읽는 동안 관계 설정 파일이 변경되었습니다: {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SyncError(f"관계 설정 파일을 읽을 수 없습니다: {path}: {exc}") from exc
     data.setdefault("version", 1)
     data.setdefault("groups", [])
     data.setdefault("independent", [])
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def load_manifest(folder: Path) -> dict:
+    manifest, _fingerprint = load_manifest_snapshot(folder)
+    return manifest
+
+
+def _assert_manifest_unchanged(
+    folder: Path,
+    expected_fingerprint: str | None,
+) -> None:
+    path = Path(folder) / MANIFEST_NAME
+    if not path.exists():
+        current_fingerprint = None
+    else:
+        _manifest, current_fingerprint = load_manifest_snapshot(folder)
+    if current_fingerprint != expected_fingerprint:
+        raise SyncError(
+            "동기화를 계산하는 동안 다른 작업이 관계 설정 파일을 "
+            f"수정했습니다. 변경을 덮어쓰지 않고 중단합니다: {path}"
+        )
 
 
 def save_manifest(folder: Path, manifest: dict) -> Path:
@@ -2299,22 +2389,32 @@ def promote_master(
     if not master_path.is_file():
         raise SyncError(f"마스터 SPM이 없습니다: {master_path}")
 
-    manifest = load_manifest(folder)
+    manifest, manifest_fingerprint = load_manifest_snapshot(folder)
     set_master(manifest, filename)
     group = find_group(manifest, filename)
-    source = SPMDocument.from_path(master_path, full=False)
-    categories = source_base_categories(source)
-    group["base_categories"] = categories
-
-    _document, rendered, color_updates, reference_renames, warnings = (
-        standardize_master_document(master_path, categories)
+    document, rendered, color_updates, reference_renames, warnings = (
+        standardize_master_document(master_path)
     )
-    original_text, compressed = read_spm_text(master_path)
+    categories = source_base_categories(document)
+    group["base_categories"] = categories
+    original_text, compressed, current_fingerprint = read_spm_snapshot(
+        master_path
+    )
+    if current_fingerprint != document.source_fingerprint:
+        raise SyncError(
+            "마스터 승격을 계산하는 동안 다른 작업이 같은 SPM을 "
+            f"수정했습니다. 원본을 덮어쓰지 않고 중단합니다: {filename}"
+        )
     changed = rendered != original_text
 
     validate_xml_text(rendered)
     check = SPMDocument(master_path, rendered, compressed, full=True)
     check.validate()
+
+    _assert_spm_unchanged({
+        master_path: document.source_fingerprint,
+    })
+    _assert_manifest_unchanged(folder, manifest_fingerprint)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_dir = folder / BACKUP_SUBDIR / f"master_promotion_{stamp}"
@@ -2328,8 +2428,13 @@ def promote_master(
     if manifest_existed:
         shutil.copy2(manifest_path, manifest_backup)
 
+    manifest_write_attempted = False
     try:
         if changed:
+            _assert_spm_unchanged({
+                master_path: document.source_fingerprint,
+            })
+            _assert_manifest_unchanged(folder, manifest_fingerprint)
             write_spm_text(master_path, rendered, compressed)
             written, written_compressed = read_spm_text(master_path)
             if written != rendered or written_compressed != compressed:
@@ -2337,13 +2442,16 @@ def promote_master(
             SPMDocument(master_path, written, compressed, full=True).validate()
             if verify_callback is not None:
                 verify_callback(master_path)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
+        manifest_write_attempted = True
         save_manifest(folder, manifest)
     except Exception:
         shutil.copy2(master_backup, master_path)
-        if manifest_existed and manifest_backup.is_file():
-            shutil.copy2(manifest_backup, manifest_path)
-        elif not manifest_existed:
-            manifest_path.unlink(missing_ok=True)
+        if manifest_write_attempted:
+            if manifest_existed and manifest_backup.is_file():
+                shutil.copy2(manifest_backup, manifest_path)
+            elif not manifest_existed:
+                manifest_path.unlink(missing_ok=True)
         raise
 
     return {
@@ -2660,6 +2768,13 @@ def build_normalized_sync_plans(
         "master_document": master_doc,
         "master_text": master_text,
         "master_hash": master_hash,
+        "source_fingerprints": {
+            master_path: master_doc.source_fingerprint,
+            **{
+                target_path: target_doc.source_fingerprint
+                for target_path, _mapping, target_doc in loaded_targets
+            },
+        },
         "plans": plans,
     }
 
@@ -2735,7 +2850,7 @@ def build_group_sync_plans(
     folder = Path(folder)
     if progress_callback is not None:
         progress_callback("설정과 마스터 읽는 중", 2)
-    manifest = load_manifest(folder)
+    manifest, manifest_fingerprint = load_manifest_snapshot(folder)
     group = find_group(manifest, master_name)
     configured = {item.get("file"): item for item in group.get("followers", [])}
     selected = follower_names or list(configured)
@@ -2771,6 +2886,7 @@ def build_group_sync_plans(
     return {
         "folder": folder,
         "manifest": manifest,
+        "manifest_fingerprint": manifest_fingerprint,
         "group": group,
         "configured": configured,
         "selected": selected,
@@ -2805,14 +2921,11 @@ def apply_group_transaction(
     master_doc = prepared["master_document"]
     master_hash = prepared["master_hash"]
     plans = prepared["plans"]
+    manifest_fingerprint = prepared["manifest_fingerprint"]
 
     # Every patch below is built from the bytes just read, so remember them and
     # re-check right before the write.
-    plan_fingerprints = {
-        path: _spm_fingerprint(path)
-        for path in dict.fromkeys([master_path, *(folder / name for name in selected)])
-        if path.is_file()
-    }
+    plan_fingerprints = dict(prepared["source_fingerprints"])
 
     if progress_callback is not None:
         progress_callback("크기 위험과 XML 무결성 확인 중", 38)
@@ -2851,6 +2964,11 @@ def apply_group_transaction(
             entry["last_target_hash"] = target_sync_signature(
                 master_doc, target_doc, entry.get("base_map") or {}
             )
+        # "Already current" still commits relationship/freshness metadata.
+        # Recheck the immutable master/follower snapshot before that write so
+        # a concurrent SPM edit cannot be stamped as synchronized.
+        _assert_spm_unchanged(plan_fingerprints)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("이미 최신 · 관계 정보 확인 완료", 100)
@@ -2887,11 +3005,16 @@ def apply_group_transaction(
         progress_callback("사전검사 완료 · 동시 수정 확인 중", 76)
 
     _assert_spm_unchanged(plan_fingerprints)
+    _assert_manifest_unchanged(folder, manifest_fingerprint)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_dir = folder / BACKUP_SUBDIR / f"generator_sync_{stamp}"
     backup_dir.mkdir(parents=True, exist_ok=False)
     backups: list[tuple[Path, Path]] = []
+    manifest_write_attempted = False
+    manifest_path = folder / MANIFEST_NAME
+    manifest_existed = manifest_fingerprint is not None
+    manifest_backup = backup_dir / f"00_{MANIFEST_NAME}"
     try:
         transaction_paths = list(dict.fromkeys(folder / name for name in selected))
         for index, path in enumerate(transaction_paths, start=1):
@@ -2903,12 +3026,12 @@ def apply_group_transaction(
             backup = backup_dir / f"{index:02d}_{path.name}"
             shutil.copy2(path, backup)
             backups.append((path, backup))
-        manifest_path = folder / MANIFEST_NAME
         if manifest_path.is_file():
-            shutil.copy2(manifest_path, backup_dir / f"00_{MANIFEST_NAME}")
+            shutil.copy2(manifest_path, manifest_backup)
         # The master remains read-only, but must still be the exact source
         # snapshot used to calculate every follower patch.
         _assert_spm_unchanged(plan_fingerprints)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
         for index, (path, text, compressed) in enumerate(patches, start=1):
             if progress_callback is not None:
                 progress_callback(
@@ -2946,6 +3069,8 @@ def apply_group_transaction(
             entry["last_target_hash"] = target_sync_signature(
                 master_doc, target_doc, entry.get("base_map") or {}
             )
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
+        manifest_write_attempted = True
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("관계 정보 저장 완료", 100)
@@ -2953,6 +3078,11 @@ def apply_group_transaction(
         for path, backup in backups:
             if backup.exists():
                 shutil.copy2(backup, path)
+        if manifest_write_attempted:
+            if manifest_existed and manifest_backup.is_file():
+                shutil.copy2(manifest_backup, manifest_path)
+            elif not manifest_existed:
+                manifest_path.unlink(missing_ok=True)
         raise
     return {
         "status": "applied",

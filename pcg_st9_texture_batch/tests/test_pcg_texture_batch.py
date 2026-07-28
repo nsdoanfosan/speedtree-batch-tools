@@ -48,6 +48,45 @@ from spm_texture_normalize import (
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_receipt_persistence_failure_does_not_fail_clean_live_audit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "audit.json"
+            clean_report = {
+                "summary": {"total": 0},
+                "items": [],
+            }
+            argv = [
+                "pcg_texture_audit.py",
+                "--target",
+                temp,
+                "--json",
+                str(report_path),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                pcg_texture_audit,
+                "load_config",
+                return_value={},
+            ), mock.patch.object(
+                pcg_texture_audit,
+                "make_report",
+                return_value=clean_report,
+            ), mock.patch.object(
+                pcg_texture_audit,
+                "persist_cluster_assembly_receipts",
+                side_effect=OSError("read-only receipt directory"),
+            ), mock.patch.object(
+                pcg_texture_audit,
+                "save_spm_analysis_cache",
+            ):
+                pcg_texture_audit.main()
+
+            written = json.loads(report_path.read_text(encoding="utf-8"))
+            persistence = written[
+                "cluster_assembly_receipt_persistence"
+            ]
+            self.assertEqual(persistence["status"], "warning")
+            self.assertIn("read-only receipt directory", persistence["error"])
+
     def test_physical_cluster_capture_receipt_tracks_color_opacity_and_resolution(self):
         with tempfile.TemporaryDirectory() as temp:
             cluster = Path(temp) / "Cluster"
@@ -89,6 +128,15 @@ class TargetCollectionTests(unittest.TestCase):
     def test_root_level_repair_and_probe_spms_are_not_pipeline_sources(self):
         self.assertTrue(is_backup_path("SK_Tree_elm_01.pre_xml_root_fix_20260724.spm"))
         self.assertTrue(is_backup_path("SK_Tree_elm_01_frond_probe.spm"))
+        self.assertTrue(
+            is_backup_path("__spm_sync_preflight_token_SK_Tree_elm_01.spm")
+        )
+        self.assertTrue(
+            is_backup_path("__spm_sync_verify_token_SK_Tree_elm_01.spm")
+        )
+        self.assertTrue(
+            is_backup_path(".__spm_pass_repair_token_SK_Tree_elm_01.spm")
+        )
         self.assertFalse(is_backup_path("SK_Tree_elm_01.spm"))
 
     def test_local_folder_targets_include_every_numbered_spm_variant(self):

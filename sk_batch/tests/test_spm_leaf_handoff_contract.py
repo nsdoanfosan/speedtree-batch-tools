@@ -237,6 +237,39 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             self.assertEqual(ready["status"], "ok")
             self.assertEqual(ready["missing_materials"], [])
 
+    def test_ladyfern_spacing_matches_sanitized_stmat_without_losing_multiplicity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_Ladyfern_01.spm"
+            write_spm(spm, [])
+            stmat = root / "fbx" / "SK_Ladyfern_01.stmat"
+            write_stmat(stmat, ["M_Material_3_Mat"])
+            now = max(spm.stat().st_mtime_ns, stmat.stat().st_mtime_ns)
+            os.utime(spm, ns=(now, now))
+            os.utime(stmat, ns=(now + 1, now + 1))
+
+            single = inspect_speedtree_material_export(
+                spm,
+                {
+                    "expected_visible_material_names": ["M_Material 3"],
+                },
+            )
+            duplicate = inspect_speedtree_material_export(
+                spm,
+                {
+                    "expected_visible_material_names": [
+                        "M_Material 3",
+                        "M_Material_3",
+                    ],
+                },
+            )
+
+            self.assertEqual(single["status"], "ok")
+            self.assertEqual(single["missing_materials"], [])
+            self.assertEqual(
+                duplicate["missing_materials"], ["M_Material_3"]
+            )
+
     def test_all_export_coverage_blocks_missing_visible_stem(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -381,12 +414,41 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
 
             missing = inspect_speedtree_texture_sources(spm)
             self.assertEqual(missing["status"], "missing_sources")
+            self.assertEqual(
+                missing["classification"],
+                "asset_texture_source_path_missing",
+            )
             self.assertEqual(missing["missing_sources"][0]["map"], "Color")
+            self.assertIn("Relink", missing["remediation"])
 
             texture.parent.mkdir()
             texture.write_bytes(b"pixels")
             ready = inspect_speedtree_texture_sources(spm)
             self.assertEqual(ready["status"], "ok")
+
+    def test_textureless_stmat_material_remains_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_reed_textureless_01.spm"
+            write_spm(spm, [])
+            stmat = root / "fbx" / "SK_reed_textureless_01.stmat"
+            write_stmat(stmat, ["M_Material_Mat"])
+            now = max(spm.stat().st_mtime_ns, stmat.stat().st_mtime_ns)
+            os.utime(spm, ns=(now, now))
+            os.utime(stmat, ns=(now + 1, now + 1))
+
+            contract = inspect_speedtree_texture_sources(spm)
+
+            self.assertEqual(contract["status"], "missing_sources")
+            self.assertEqual(
+                contract["classification"],
+                "asset_texture_source_undeclared",
+            )
+            self.assertEqual(contract["source_count"], 0)
+            self.assertEqual(
+                contract["missing_sources"][0]["material"],
+                "M_Material_Mat",
+            )
 
 
 if __name__ == "__main__":

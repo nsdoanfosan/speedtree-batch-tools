@@ -16,6 +16,7 @@ from cluster_assembly_builder import (
     validate_file_fingerprint,
     validate_manifest_artifacts,
 )
+from cluster_blend_sync import discover_cluster_blend_relations
 
 
 class PushDependencyError(RuntimeError):
@@ -48,7 +49,7 @@ def repair_pipeline_report_path(spm):
 
 
 def load_current_cluster_assembly_manifest(spm):
-    """Return a validated Assembly manifest, or ``None`` for pass-through rows."""
+    """Return the current content-driven contract, including pass-through."""
     spm = Path(spm)
     if is_cluster_source_spm(spm):
         return None
@@ -62,7 +63,11 @@ def load_current_cluster_assembly_manifest(spm):
         if not isinstance(embedded, dict):
             return None
         if embedded.get("status") == "pass_through":
-            return None
+            return {
+                "kind": MANIFEST_KIND,
+                "status": "pass_through",
+                "parts": [],
+            }
         manifest_record = embedded.get("manifest") or {}
         manifest_path = Path(str(manifest_record.get("path") or ""))
         if not manifest_path.is_file():
@@ -89,10 +94,12 @@ def load_current_cluster_assembly_manifest(spm):
         ) from exc
 
 
-def cluster_dependency_spms(root_spm):
+def _manifest_dependency_spms(root_spm):
     """Resolve exact Cluster SPM inputs from rendered-part source blends."""
     manifest = load_current_cluster_assembly_manifest(root_spm)
     if manifest is None:
+        return None
+    if manifest.get("status") == "pass_through":
         return []
 
     dependencies = []
@@ -126,6 +133,86 @@ def cluster_dependency_spms(root_spm):
     return dependencies
 
 
+def _relation_dependency_spms(root_spm, relation_cache=None):
+    """Resolve explicit ON relations before an Assembly receipt exists."""
+    root = Path(root_spm).expanduser().absolute()
+    root_key = normalized_path_key(root)
+    owner_key = normalized_path_key(root.parent)
+    if relation_cache is not None and owner_key in relation_cache:
+        relations = relation_cache[owner_key]
+    else:
+        try:
+            relations = discover_cluster_blend_relations(root.parent)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise PushDependencyError(
+                f"Cluster relation dependency contract is unreadable: {exc}"
+            ) from exc
+        if relation_cache is not None:
+            relation_cache[owner_key] = relations
+
+    dependencies = []
+    seen = set()
+    for relation in relations:
+        registry_error = str(relation.get("registry_error") or "").strip()
+        if registry_error:
+            raise PushDependencyError(
+                "Cluster relation target registry is invalid: "
+                + registry_error
+            )
+        matches_root = any(
+            target.get("relation_on") is True
+            and target.get("owner_target") is True
+            and normalized_path_key(target.get("target_spm")) == root_key
+            for target in relation.get("targets") or []
+            if target.get("target_spm")
+        )
+        if not matches_root:
+            continue
+        dependency = Path(relation.get("source_spm") or "")
+        if not is_cluster_source_spm(dependency):
+            raise PushDependencyError(
+                "Cluster relation source is outside a Cluster folder: "
+                + str(dependency)
+            )
+        if not dependency.is_file():
+            raise PushDependencyError(
+                "Cluster relation source SPM is missing: " + str(dependency)
+            )
+        key = normalized_path_key(dependency)
+        if key not in seen:
+            seen.add(key)
+            dependencies.append(dependency)
+    return dependencies
+
+
+def cluster_dependency_spms(root_spm, relation_cache=None):
+    """Prefer current content receipts; use relations only before first receipt."""
+    manifest_error = None
+    try:
+        manifest_dependencies = _manifest_dependency_spms(root_spm)
+    except PushDependencyError as exc:
+        manifest_error = exc
+        manifest_dependencies = None
+    if manifest_dependencies is not None:
+        return manifest_dependencies
+    relation_dependencies = _relation_dependency_spms(
+        root_spm,
+        relation_cache=relation_cache,
+    )
+    if manifest_error is not None and not relation_dependencies:
+        raise manifest_error
+
+    dependencies = []
+    seen = set()
+    for dependency in relation_dependencies:
+        key = normalized_path_key(dependency)
+        if key in seen:
+            continue
+        seen.add(key)
+        dependencies.append(dependency)
+    return dependencies
+
+
 def _item_path_lookup(all_items):
     lookup = {}
     values = all_items.values() if isinstance(all_items, dict) else all_items
@@ -153,6 +240,7 @@ def expand_push_targets(selected_targets, all_items):
     downstream_items = []
     dependencies_by_root = {}
     auto_added_ids = set()
+    relation_cache = {}
     selected_ids = {
         normalized_path_key(item["spm"])
         for item in selected_targets
@@ -165,7 +253,10 @@ def expand_push_targets(selected_targets, all_items):
             continue
         downstream_items.append(item)
         dependency_ids = []
-        for dependency_spm in cluster_dependency_spms(spm):
+        for dependency_spm in cluster_dependency_spms(
+            spm,
+            relation_cache=relation_cache,
+        ):
             dependency = lookup.get(normalized_path_key(dependency_spm))
             if dependency is None:
                 raise PushDependencyError(

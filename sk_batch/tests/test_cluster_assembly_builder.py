@@ -17,6 +17,7 @@ if str(SK_BATCH) not in sys.path:
 
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
+    build_blender_assembly_inputs,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
     content_build_decision,
@@ -36,6 +37,8 @@ from cluster_assembly_builder import (  # noqa: E402
     _export_selected_fbx,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
+    _partition_normalized_render_components,
+    _role_material_polygons,
     _strip_fbx_scene_textures,
     _vertex_descriptors,
     validate_binding_hierarchy,
@@ -117,6 +120,38 @@ class ComponentTopologyTests(unittest.TestCase):
             [row[0] for row in split_descriptors],
         )
 
+    def test_cards_touching_only_at_attachment_point_remain_separate(self):
+        mesh = seam_split_test_mesh(True)
+        offset = len(mesh.vertices)
+        mesh.vertices.extend([
+            SimpleNamespace(co=(0.0, 0.0, 0.0)),
+            SimpleNamespace(co=(-1.0, 0.0, 0.0)),
+            SimpleNamespace(co=(0.0, -1.0, 0.0)),
+        ])
+        loop_indices = []
+        for vertex_index, uv in zip(
+            (offset, offset + 1, offset + 2),
+            ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+        ):
+            loop_indices.append(len(mesh.loops))
+            mesh.loops.append(SimpleNamespace(vertex_index=vertex_index))
+            mesh.uv_layers.active.data.append(
+                SimpleNamespace(uv=SimpleNamespace(x=uv[0], y=uv[1]))
+            )
+        mesh.polygons.append(SimpleNamespace(
+            index=2,
+            vertices=(offset, offset + 1, offset + 2),
+            loop_indices=loop_indices,
+        ))
+
+        components = _component_groups(mesh, [0, 1, 2])
+
+        self.assertEqual(len(components), 2)
+        self.assertEqual(
+            sorted(len(component["polygons"]) for component in components),
+            [1, 2],
+        )
+
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
         target = seam_split_test_mesh(True)
@@ -140,6 +175,30 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_unmatched_render_topology_is_preserved_instead_of_invented(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        for row in target.uv_layers.active.data:
+            row.uv.x += 10.0
+            row.uv.y += 10.0
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+        prototype = {
+            "object": SimpleNamespace(data=source),
+            "component": source_component,
+        }
+
+        matched, preserved = _partition_normalized_render_components(
+            {"source": prototype},
+            target,
+            [target_component],
+        )
+
+        self.assertEqual(matched, {})
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0]["instance_count"], 1)
+        self.assertEqual(preserved[0]["polygon_count"], 2)
 
     def test_attachment_pivot_uv_must_exist_in_both_render_components(self):
         source = seam_split_test_mesh(False)
@@ -495,6 +554,56 @@ def fake_unreal_mesh_from_blender_bounds(
 
 
 class ContentDecisionTests(unittest.TestCase):
+    def test_prepared_only_render_content_returns_explicit_pass_through(self):
+        handoff = ready_handoff()
+        handoff["pcg_receipt"] = {
+            "path": "C:/receipt.json",
+            "exists": True,
+            "size": 10,
+            "sha256": "receipt-sha",
+        }
+        merged = SimpleNamespace(
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_Bark_densiflora_01")],
+                polygons=[SimpleNamespace(index=0, material_index=0)],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            full = Path(temporary) / "SK_tree_densiflora_01.fbx"
+            full.write_bytes(b"full")
+            output = Path(temporary) / "assembly"
+            with mock.patch.dict(sys.modules, {"bpy": SimpleNamespace()}), \
+                    mock.patch(
+                        "cluster_assembly_builder.snapshot_blender_armature",
+                        return_value=skeleton_snapshot(),
+                    ):
+                result = build_blender_assembly_inputs(
+                    handoff,
+                    SimpleNamespace(),
+                    merged,
+                    output,
+                    full,
+                    Path(temporary) / "wind.json",
+                )
+
+        self.assertEqual(result["status"], "pass_through")
+        self.assertEqual(
+            result["reason"],
+            "normalized_roles_are_prepared_but_unused_by_rendered_mesh",
+        )
+        self.assertEqual(result["rendered_role_count"], 0)
+        self.assertFalse(output.exists())
+        self.assertTrue(result["registered_variants"])
+        self.assertTrue(all(
+            row["instanced"] is False
+            for row in result["registered_variants"]
+        ))
+        self.assertEqual(
+            result["handoff_evidence"]["pcg_receipt"],
+            handoff["pcg_receipt"],
+        )
+
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")
 
@@ -545,8 +654,72 @@ class ContentDecisionTests(unittest.TestCase):
         ):
             content_build_decision(handoff)
 
+    def test_rendered_mesh_is_authoritative_for_prepared_unused_roles(self):
+        branch_material = SimpleNamespace(name="M_branch_lauraceae_01")
+        bark_material = SimpleNamespace(name="M_Bark_lauraceae_01")
+        merged = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[branch_material, bark_material],
+                polygons=[
+                    SimpleNamespace(index=0, material_index=1),
+                    SimpleNamespace(index=1, material_index=1),
+                ],
+            )
+        )
+        normalized = {
+            "status": "ready",
+            "variants": [
+                {
+                    "ordinal": 1,
+                    "skeletal_asset_name": "SK_branch_Lauraceae_01_01",
+                }
+            ],
+        }
+
+        rendered, prepared_unused = _role_material_polygons(
+            merged,
+            [
+                {
+                    "role": "branch",
+                    "role_identity": "M_branch_lauraceae_01",
+                    "normalized_variants": normalized,
+                }
+            ],
+        )
+
+        self.assertEqual(rendered, {})
+        self.assertEqual(
+            prepared_unused["branch"]["reason"],
+            "material_has_no_rendered_polygons",
+        )
+        self.assertEqual(
+            prepared_unused["branch"]["prepared_skeletal_assets"],
+            ["SK_branch_Lauraceae_01_01"],
+        )
+
 
 class PhysicalProductionContractTests(unittest.TestCase):
+    def test_prepared_unused_variants_are_valid_prepared_only_metadata(self):
+        manifest = physical_production_manifest()
+        manifest["parts"] = []
+        manifest["prepared_unused_roles"] = [
+            {
+                "role": "branch",
+                "status": "prepared_unused",
+            }
+        ]
+        for variant in manifest["registered_variants"]:
+            variant["instanced"] = False
+
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["status"], "prepared_unused_only")
+        self.assertEqual(report["native_prototype_count"], 0)
+        self.assertEqual(
+            report["registered_variant_count"],
+            len(manifest["registered_variants"]),
+        )
+
     def test_generic_role_counts_and_uniform_similarity_contract_pass(self):
         report = validate_normalized_prototype_unit_contract(
             physical_production_manifest()
@@ -1921,7 +2094,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 (row["logical_group_index"], row["logical_subpart_index"])
                 for row in collapsed
             ],
-            [(0, 1), (0, 2), (0, 3), (1, 1), (2, 1), (2, 2), (2, 3)],
+            [(0, 1), (0, 2), (0, 3), (2, 1), (3, 1), (3, 2), (3, 3)],
         )
 
     def test_provenance_aggregates_topology_groups_for_one_native_part(self):

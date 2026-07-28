@@ -23,7 +23,6 @@ from pathlib import Path
 
 ATLAS_LEAF_GENERATOR = "Atlas Leaf Mesh Builder"
 SEMANTIC_GENERATOR_TYPES = {"frond", "leafmesh"}
-BLENDER_DUPLICATE_SUFFIX_RE = re.compile(r"\.\d{3}$")
 REPO_DIR = Path(__file__).resolve().parent.parent
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
@@ -37,6 +36,7 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     visible_material_ids,
 )
 from speedtree_pipeline_contract import open_spm_binary  # noqa: E402
+from speedtree_texture_contract import normalize_material_key  # noqa: E402
 
 
 def _normalized_generator_type(value):
@@ -697,6 +697,7 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
         }
 
     checked = 0
+    references = []
     missing = []
     for mesh in root.iter("Mesh"):
         if mesh.attrib.get("ID") is None:
@@ -722,17 +723,21 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
                 if os.path.isabs(filename)
                 else path.parent / filename
             )
-            if not resolved.is_file():
-                missing.append({
-                    "mesh_id": _integer(mesh.attrib.get("ID")),
-                    "mesh_name": str(mesh.attrib.get("Name") or ""),
-                    "filename": filename,
-                    "resolved_path": str(resolved),
-                })
+            row = {
+                "mesh_id": _integer(mesh.attrib.get("ID")),
+                "mesh_name": str(mesh.attrib.get("Name") or ""),
+                "filename": filename,
+                "resolved_path": str(resolved),
+                "exists": resolved.is_file(),
+            }
+            references.append(row)
+            if not row["exists"]:
+                missing.append(row)
     return {
         "status": "missing_mesh_files" if missing else "ok",
         "spm": str(path),
         "checked_references": checked,
+        "references": references,
         "missing": missing,
     }
 
@@ -769,11 +774,7 @@ def speedtree_stmat_path(spm_path):
 
 
 def _normalized_material_name(value):
-    name = str(value or "").strip()
-    name = BLENDER_DUPLICATE_SUFFIX_RE.sub("", name)
-    if name.casefold().endswith("_mat"):
-        name = name[:-4]
-    return name.casefold()
+    return normalize_material_key(value)
 
 
 @functools.lru_cache(maxsize=512)
@@ -839,11 +840,14 @@ def inspect_speedtree_material_export(spm_path, leaf_contract=None):
         result["missing_materials"] = expected
         return result
     result["actual_materials"] = list(names)
-    actual_keys = {_normalized_material_name(name) for name in names}
-    missing = [
-        name for name in expected
-        if _normalized_material_name(name) not in actual_keys
-    ]
+    available = Counter(_normalized_material_name(name) for name in names)
+    missing = []
+    for name in expected:
+        key = _normalized_material_name(name)
+        if available[key] > 0:
+            available[key] -= 1
+        else:
+            missing.append(name)
     result["missing_materials"] = missing
     if missing:
         result["status"] = "missing_materials"
@@ -979,6 +983,36 @@ def inspect_speedtree_texture_sources(spm_path):
         result["error"] = error
         return result
     result["source_count"] = len(rows)
+    if not rows:
+        names, names_error = _stmat_names_cached(path_text, size, mtime_ns)
+        if names is None:
+            result["status"] = "invalid_stmat"
+            result["error"] = names_error
+            return result
+        if names:
+            result["status"] = "missing_sources"
+            result["classification"] = "asset_texture_source_undeclared"
+            result["error"] = (
+                "Exported STMAT materials declare no texture Source entries"
+            )
+            result["failure_reason"] = (
+                "The source SPM exported one or more materials, but those "
+                "materials do not declare any texture Source path"
+            )
+            result["remediation"] = (
+                "Assign the intended texture maps to the material in "
+                "SpeedTree Modeler, then save and export the SPM again"
+            )
+            result["missing_sources"] = [
+                {
+                    "material": name,
+                    "map": "<none>",
+                    "source": "",
+                    "resolved": "",
+                }
+                for name in names
+            ]
+            return result
     missing = []
     for row in rows:
         candidate = Path(row["source"]).expanduser()
@@ -995,6 +1029,19 @@ def inspect_speedtree_texture_sources(spm_path):
     result["missing_sources"] = missing
     if missing:
         result["status"] = "missing_sources"
+        result["classification"] = "asset_texture_source_path_missing"
+        result["error"] = (
+            f"{len(missing)} texture Source path(s) declared by the "
+            "exported STMAT do not resolve to a non-empty file"
+        )
+        result["failure_reason"] = (
+            "The source SPM material stores stale or missing texture file "
+            "paths; Blender Repair cannot prove the intended texture content"
+        )
+        result["remediation"] = (
+            "Relink the listed Source paths in SpeedTree Modeler to the "
+            "intended files, then save and export the SPM again"
+        )
     else:
         try:
             result["status"] = (

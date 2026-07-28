@@ -22,9 +22,9 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 CONTRACT_KIND = "pcg_cluster_blender_assembly_handoff"
-ROLE_ORDER = ("branch", "leaf", "leaf_side")
+ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 ROLE_PREFIX_RE = re.compile(
-    r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|leaf)(?:_|$)",
+    r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|cluster|leaf)(?:_|$)",
     re.IGNORECASE,
 )
 
@@ -365,13 +365,17 @@ def resolve_cluster_receipt_path(
     PCG persists the Cluster contract independently from the existing SK
     material preflight report.  Prefer that current, hash-validated receipt;
     older reports that already embed ``cluster_assembly`` remain a fallback.
-    A stale or ambiguous persisted receipt is intentionally not swallowed.
+    A stale persisted receipt is cache history, not an authoritative data
+    failure.  When the caller supplies a current embedded live-audit contract,
+    prefer that contract instead of blocking on the stale cache snapshot.
     """
     from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+        ClusterAssemblyReceiptStaleError,
         cluster_assembly_receipt_resolution,
         locate_cluster_assembly_receipt,
     )
 
+    stale_error = None
     try:
         if include_resolution:
             resolution = cluster_assembly_receipt_resolution(spm_path)
@@ -379,6 +383,8 @@ def resolve_cluster_receipt_path(
         return Path(locate_cluster_assembly_receipt(spm_path)).resolve()
     except FileNotFoundError:
         pass
+    except ClusterAssemblyReceiptStaleError as exc:
+        stale_error = str(exc)
 
     if not embedded_contract_path:
         if include_resolution:
@@ -411,12 +417,20 @@ def resolve_cluster_receipt_path(
     resolved = embedded.resolve()
     if include_resolution:
         return resolved, {
-            "policy": "embedded_material_contract_fallback",
+            "policy": (
+                "embedded_live_audit_fallback"
+                if stale_error
+                else "embedded_material_contract_fallback"
+            ),
             "requested_spm": str(spm_path),
             "selected_receipt": str(resolved),
             "current_candidates": [{"path": str(resolved)}],
             "superseded_current_receipts": [],
-            "ignored_stale_candidates": [],
+            "ignored_stale_candidates": (
+                [{"path": "", "error": stale_error}]
+                if stale_error
+                else []
+            ),
         }
     return resolved
 
@@ -874,12 +888,67 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 "reason": artifact.get("status"),
             })
 
-    pcg_handoff_status = str((contract.get("handoff") or {}).get("status") or "")
+    pcg_handoff = contract.get("handoff") or {}
+    pcg_handoff_status = str(pcg_handoff.get("status") or "")
     if pcg_handoff_status in {"blocked", "needs_bark_normalization"}:
-        issues.append({
-            "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
-            "reason": pcg_handoff_status,
-        })
+        detailed = []
+        if pcg_handoff_status == "needs_bark_normalization":
+            dependency_roles = {}
+            for dependency in (
+                pcg_handoff.get("cluster_dependencies")
+                or contract.get("dependencies")
+                or []
+            ):
+                role = str(dependency.get("role") or "")
+                for key in (
+                    "spm",
+                    "source_spm",
+                    "authoring_spm",
+                    "output_spm",
+                ):
+                    value = dependency.get(key)
+                    if value:
+                        dependency_roles[
+                            os.path.normcase(os.path.abspath(str(value)))
+                        ] = role
+            bark = pcg_handoff.get("canonical_bark") or {}
+            for source in bark.get("cluster_bark_sources") or []:
+                if source.get("replacement") != "required":
+                    continue
+                provider = str(source.get("cluster_spm") or "")
+                detailed.append({
+                    "code": "CANONICAL_BARK_NORMALIZATION_REQUIRED",
+                    "role": dependency_roles.get(
+                        os.path.normcase(os.path.abspath(provider)),
+                        "",
+                    ),
+                    "spm": provider,
+                    "material": source.get("material_name"),
+                    "canonical_material": bark.get(
+                        "canonical_material"
+                    ),
+                    "reason": "isolated_bark_capture_missing",
+                    "texture_refs": list(
+                        source.get("texture_refs") or []
+                    ),
+                })
+        else:
+            detailed = [
+                deepcopy(row)
+                for row in (
+                    pcg_handoff.get("errors")
+                    or pcg_handoff.get("issues")
+                    or []
+                )
+                if isinstance(row, dict)
+            ]
+        issues.extend(
+            detailed
+            or [{
+                "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
+                "reason": pcg_handoff_status,
+            }]
+        )
 
     normalize_roles = [row for row in roles if row["decision"] == "normalize_part"]
     if issues:

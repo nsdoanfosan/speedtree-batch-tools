@@ -210,6 +210,15 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(report["status"], "blocked")
             self.assertEqual(envelope["outcome"], "blocked")
             self.assertIn("18_leaf_gone.fbx", report["error"])
+            self.assertEqual(
+                report["classification"],
+                "asset_external_mesh_path_missing",
+            )
+            self.assertIn("relink", report["remediation"].casefold())
+            self.assertEqual(
+                report["missing_external_meshes"][0]["filename"],
+                "meshes/18_leaf_gone.fbx",
+            )
             self.assertNotIn("speedtree_export", report)
             self.assertIn(
                 "SPM_MESH_FILE_MISSING",
@@ -274,6 +283,55 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertFalse(report["problem_node_marker"]["changed"])
             self.assertEqual(
                 report["problem_node_marker"]["status"], "reported_only"
+            )
+
+    def test_textureless_stmat_remains_blocked_after_material_name_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_reed_textureless.spm"
+            report_path = root / "report.json"
+            write_spm(spm)
+            stmat = root / "fbx" / "SK_reed_textureless.stmat"
+            stmat.parent.mkdir(parents=True, exist_ok=True)
+            document = ET.Element("SpeedTreeMaterials")
+            for index, name in enumerate(
+                ("M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"), 1
+            ):
+                ET.SubElement(
+                    document, "Material", ID=str(index), Name=name
+                )
+            ET.ElementTree(document).write(
+                stmat, encoding="utf-8", xml_declaration=True
+            )
+            now = max(spm.stat().st_mtime_ns, stmat.stat().st_mtime_ns)
+            os.utime(spm, ns=(now, now))
+            os.utime(stmat, ns=(now + 1, now + 1))
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertTrue(exited)
+            export_mock.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(
+                report["speedtree_pipeline_contract"]["outcome"], "blocked"
+            )
+            self.assertEqual(
+                report["texture_source_contract"]["status"],
+                "missing_sources",
+            )
+            self.assertEqual(
+                report["classification"],
+                "asset_texture_source_undeclared",
+            )
+            self.assertIn("M_leaf_grass_dead_Mat", report["error"])
+            self.assertIn("<Source 미지정>", report["error"])
+            self.assertIn(
+                "TEXTURE_SOURCE_MISSING",
+                {
+                    issue["code"]
+                    for issue in report["speedtree_pipeline_contract"]["issues"]
+                },
             )
 
 if __name__ == "__main__":

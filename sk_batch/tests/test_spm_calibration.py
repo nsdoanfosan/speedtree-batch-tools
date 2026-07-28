@@ -220,6 +220,18 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             if item["name"] == "Visible Meshless Pivot A"
         )
         self.assertTrue(pivot["hidden"])
+        self.assertTrue(
+            spm_audit.cluster_root_logical_postcondition(patched)["ok"]
+        )
+        broken = spm_audit.apply_branch_values(
+            patched,
+            [plan["selected_generator_indices"][0]],
+            0.0,
+            0.0,
+        )
+        self.assertFalse(
+            spm_audit.cluster_root_logical_postcondition(broken)["ok"]
+        )
 
     def test_cluster_calibration_writes_and_verifies_root_only_spm(self):
         source_xml = cluster_graph_xml()
@@ -261,6 +273,13 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             self.assertEqual(
                 report["calibration"]["mode"],
                 "cluster_first_renderable_root_absolute_1",
+            )
+            self.assertTrue(
+                report["cluster_root_logical_postcondition"]["ok"]
+            )
+            self.assertEqual(
+                report["final_spm_fingerprint"],
+                spm_audit.file_content_fingerprint(spm_path),
             )
             final_audit = spm_audit.audit_spm(spm_path)
             enabled = {
@@ -381,15 +400,25 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         on the process handle only.
         """
         captured = {}
+        events = []
 
         class FakeProcess:
             pid = 4321
 
             def wait(self, timeout=None):
+                events.append("wait")
                 captured["timeout"] = timeout
                 return 0
 
+        class FakeGate:
+            def __enter__(self):
+                events.append("gate-enter")
+
+            def __exit__(self, *_args):
+                events.append("gate-exit")
+
         def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
+            events.append("popen")
             captured["cmd"] = cmd
             captured["stdout"] = stdout
             captured["stderr"] = stderr
@@ -397,7 +426,11 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             stdout.write(b"exported\n")
             return FakeProcess()
 
-        with mock.patch.object(spm_audit.subprocess, "Popen", side_effect=fake_popen):
+        with mock.patch.object(
+            spm_audit, "speedtree_export_gate", return_value=FakeGate()
+        ), mock.patch.object(
+            spm_audit.subprocess, "Popen", side_effect=fake_popen
+        ):
             returncode, stdout, stderr = spm_audit.run_speedtree_export(
                 ["SpeedTree.exe", "model.spm"], ".", 120
             )
@@ -410,6 +443,14 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         self.assertTrue(callable(getattr(captured["stdout"], "fileno", None)))
         self.assertTrue(callable(getattr(captured["stderr"], "fileno", None)))
         self.assertIs(captured["kwargs"].get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(
+            events,
+            ["gate-enter", "popen", "wait", "gate-exit"],
+        )
+        self.assertEqual(
+            spm_audit.SPEEDTREE_EXPORT_MUTEX_DEFAULT,
+            r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0",
+        )
 
     def test_speedtree_export_timeout_kills_the_whole_process_tree(self):
         killed = {}
@@ -429,7 +470,12 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             killed["terminated"] = list(cmd)
             return mock.Mock(returncode=0)
 
-        with mock.patch.object(spm_audit.subprocess, "Popen", side_effect=fake_popen):
+        gate = mock.MagicMock()
+        with mock.patch.object(
+            spm_audit, "speedtree_export_gate", return_value=gate
+        ), mock.patch.object(
+            spm_audit.subprocess, "Popen", side_effect=fake_popen
+        ):
             with mock.patch.object(spm_audit.subprocess, "run", side_effect=fake_run):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     spm_audit.run_speedtree_export(
@@ -562,13 +608,23 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             with mock.patch.object(
                 spm_audit, "export_verify_xml", side_effect=fake_export
             ) as export_mock:
-                _, rounds, total, meta, _, _, _ = spm_audit.calibrate_bones(
-                    spm_path,
-                    cfg,
-                    log=lambda _message: None,
-                    source_text=source_xml,
-                    source_audit={"bone_graph": graph},
-                )
+                with mock.patch.object(
+                    spm_audit,
+                    "export_verify_fbx_geometry",
+                    return_value=True,
+                ):
+                    _, rounds, total, meta, _, _, _ = spm_audit.calibrate_bones(
+                        spm_path,
+                        cfg,
+                        log=lambda _message: None,
+                        source_text=source_xml,
+                        source_audit={
+                            "bone_graph": graph,
+                            "generators": spm_audit.audit_spm(
+                                spm_path
+                            )["generators"],
+                        },
+                    )
 
             self.assertEqual(export_mock.call_count, 3)
             self.assertEqual(total, 40)
@@ -633,13 +689,23 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             with mock.patch.object(
                 spm_audit, "export_verify_xml", side_effect=fake_export
             ):
-                _, _, total, meta, _, _, _ = spm_audit.calibrate_bones(
-                    spm_path,
-                    cfg,
-                    log=lambda _message: None,
-                    source_text=source_xml,
-                    source_audit={"bone_graph": graph},
-                )
+                with mock.patch.object(
+                    spm_audit,
+                    "export_verify_fbx_geometry",
+                    return_value=True,
+                ):
+                    _, _, total, meta, _, _, _ = spm_audit.calibrate_bones(
+                        spm_path,
+                        cfg,
+                        log=lambda _message: None,
+                        source_text=source_xml,
+                        source_audit={
+                            "bone_graph": graph,
+                            "generators": spm_audit.audit_spm(
+                                spm_path
+                            )["generators"],
+                        },
+                    )
 
             self.assertEqual(total, 100)
             self.assertTrue(meta["base_priority_applied"])
@@ -726,7 +792,57 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         self.assertEqual(estimate_relative_value_from_probe([1.0], 1000, 0.02, 4.0), 4.0)
         self.assertIsNone(estimate_relative_value_from_probe([], 10, 0.02, 64.0))
 
-    def test_problem_spm_stops_after_first_relative_verification_and_restores_source(self):
+    def test_empty_probe_lengths_use_one_shared_authored_relative_value(self):
+        audit = {
+            "generators": [
+                {"style": 1.0, "bones": 3.7634},
+                {"style": 0.0, "bones": 0.0},
+                {"style": 1.0, "bones": 3.7634},
+            ]
+        }
+        self.assertAlmostEqual(
+            spm_audit.shared_authored_relative_value(audit, [0, 1, 2]),
+            3.7634,
+            places=4,
+        )
+        audit["generators"][2]["bones"] = 4.0
+        self.assertIsNone(
+            spm_audit.shared_authored_relative_value(audit, [0, 1, 2])
+        )
+
+    def test_relative_failure_modes_are_specific(self):
+        self.assertEqual(
+            spm_audit._relative_failure_mode(
+                [(0.5, 0), (1.5, 0)],
+                lo=100,
+                hi=200,
+                value_floor=0.02,
+                value_cap=64.0,
+            ),
+            "manual_required_relative_zero",
+        )
+        self.assertEqual(
+            spm_audit._relative_failure_mode(
+                [(1.0, 50), (2.0, 50)],
+                lo=100,
+                hi=200,
+                value_floor=0.02,
+                value_cap=64.0,
+            ),
+            "manual_required_relative_plateau",
+        )
+        self.assertEqual(
+            spm_audit._relative_failure_mode(
+                [(1.0, 120), (2.0, 90)],
+                lo=100,
+                hi=200,
+                value_floor=0.02,
+                value_cap=64.0,
+            ),
+            "manual_required_relative_nonmonotonic",
+        )
+
+    def test_persisted_fast_skip_flag_cannot_disable_bounded_correction(self):
         source_xml = """\
 <SpeedTree>
   <Generator Type="Tree">
@@ -762,6 +878,13 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
 </Bones></SpeedTreeRaw>
 """
         failed_relative_xml = "<SpeedTreeRaw><Bones /></SpeedTreeRaw>"
+        corrected_relative_xml = """\
+<SpeedTreeRaw><Bones>
+  <Bone ID="0" ParentID="-1" Generator="Trunk" />
+  <Bone ID="1" ParentID="0" Generator="Trunk" />
+  <Bone ID="2" ParentID="1" Generator="Trunk" />
+</Bones></SpeedTreeRaw>
+"""
         cfg = {
             "target_bones_per_branch": 3.0,
             "max_total_bones": 2000,
@@ -779,43 +902,39 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spm_path = Path(tmp) / "SK_problem.spm"
             spm_audit.write_spm(spm_path, source_xml)
-            original_bytes = spm_path.read_bytes()
-            exports = iter((probe_xml, failed_relative_xml))
+            exports = iter(
+                (probe_xml, failed_relative_xml, corrected_relative_xml)
+            )
 
             def fake_export(_spm_path, _cfg, out_path):
                 Path(out_path).write_text(next(exports), encoding="utf-8")
                 return out_path
 
-            with mock.patch.object(spm_audit, "export_verify_xml", side_effect=fake_export) as export_mock:
-                report = spm_audit.process_spm(spm_path, cfg, log=lambda _message: None)
-
-            self.assertEqual(export_mock.call_count, 2)
-            self.assertEqual(report["status"], "manual-required")
-            self.assertTrue(report["calibration"]["manual_required"])
-            self.assertEqual(spm_path.read_bytes(), original_bytes)
-
-            # The source was restored byte-for-byte, but its topology probe is
-            # deterministic and may be reused on the next forced attempt.
-            second_exports = iter((failed_relative_xml,))
-
-            def fake_second_export(_spm_path, _cfg, out_path):
-                Path(out_path).write_text(next(second_exports), encoding="utf-8")
-                return out_path
-
             with mock.patch.object(
-                spm_audit, "export_verify_xml", side_effect=fake_second_export
-            ) as second_export_mock:
-                second_report = spm_audit.process_spm(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=fake_export,
+            ) as export_mock, mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                return_value=True,
+            ):
+                report = spm_audit.process_spm(
                     spm_path, cfg, log=lambda _message: None
                 )
 
-            self.assertEqual(second_export_mock.call_count, 1)
-            self.assertEqual(second_report["status"], "manual-required")
-            self.assertEqual(second_report["rounds"][0]["phase"], "probe(cache)")
-            self.assertTrue(second_report["calibration"]["probe_cache_hit"])
-            self.assertEqual(spm_path.read_bytes(), original_bytes)
+            self.assertEqual(export_mock.call_count, 3)
+            self.assertEqual(report["status"], "calibrated")
+            relative_rounds = [
+                row
+                for row in report["rounds"]
+                if row["phase"].startswith("relative round")
+            ]
+            self.assertEqual(len(relative_rounds), 2)
+            self.assertEqual(relative_rounds[0]["total_bones"], 0)
+            self.assertEqual(relative_rounds[1]["total_bones"], 3)
 
-    def test_armature_only_spm_skips_automatic_geometry_fallback_exports(self):
+    def test_armature_only_spm_runs_absolute_geometry_fallback(self):
         source_xml = """\
 <SpeedTree>
   <Generator Type="Tree">
@@ -868,8 +987,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spm_path = Path(tmp) / "SK_armature_only.spm"
             spm_audit.write_spm(spm_path, source_xml)
-            original_bytes = spm_path.read_bytes()
-            exports = iter((probe_xml, valid_relative_xml))
+            exports = iter((probe_xml, valid_relative_xml, valid_relative_xml))
 
             def fake_export(_spm_path, _cfg, out_path):
                 Path(out_path).write_text(next(exports), encoding="utf-8")
@@ -879,15 +997,20 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                 with mock.patch.object(
                     spm_audit,
                     "export_verify_fbx_geometry",
-                    return_value=False,
+                    side_effect=(False, True),
                 ) as fbx_mock:
                     report = spm_audit.process_spm(spm_path, cfg, log=lambda _message: None)
 
-            self.assertEqual(xml_mock.call_count, 2)
-            self.assertEqual(fbx_mock.call_count, 1)
-            self.assertEqual(report["status"], "manual-required")
-            self.assertEqual(report["calibration"]["mode"], "manual_required_geometry")
-            self.assertEqual(spm_path.read_bytes(), original_bytes)
+            self.assertEqual(xml_mock.call_count, 3)
+            self.assertEqual(fbx_mock.call_count, 2)
+            self.assertEqual(report["status"], "calibrated")
+            self.assertEqual(
+                report["calibration"]["mode"],
+                "root_only_absolute_fallback",
+            )
+            self.assertEqual(
+                report["calibration"]["absolute_bones_per_branch"], 1
+            )
 
     def test_identical_final_bones_restore_exact_source_bytes_and_timestamp(self):
         source_xml = """\

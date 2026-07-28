@@ -24,6 +24,7 @@ from sk_batch.sk_common import (
     LOG_DIR,
     atomic_write_bytes,
     blender_open_file_window_titles,
+    file_content_fingerprint,
     load_config,
     load_job_report,
     prepare_cluster_spm_pair_for_job,
@@ -117,6 +118,37 @@ def _first_report(path):
     return payload if isinstance(payload, dict) else {}
 
 
+def _validate_spm_bone_report(canonical_spm, report):
+    """Require the producer's locked final identity and Cluster fixed point."""
+    expected = str(report.get("final_spm_fingerprint") or "")
+    if not expected:
+        raise ValueError("SPM bone report has no final content fingerprint")
+    actual = file_content_fingerprint(canonical_spm)
+    if expected != actual:
+        raise ValueError(
+            "SPM changed after its bone transaction: "
+            f"report={expected}, actual={actual}"
+        )
+    postcondition = report.get("cluster_root_logical_postcondition")
+    if not (
+        isinstance(postcondition, dict)
+        and postcondition.get("ok") is True
+    ):
+        errors = (
+            postcondition.get("errors")
+            if isinstance(postcondition, dict)
+            else None
+        )
+        raise ValueError(
+            "Cluster root bone logical postcondition is not proven"
+            + (": " + "; ".join(errors) if errors else "")
+        )
+    return {
+        "final_spm_fingerprint": actual,
+        "cluster_root_logical_postcondition": postcondition,
+    }
+
+
 def _python_executable():
     executable = str(sys.executable)
     if executable.casefold().endswith("pythonw.exe"):
@@ -186,6 +218,18 @@ def _build_cluster_source(
             report_file=spm_report_path,
             report=spm_report,
         )
+    try:
+        spm_contract = _validate_spm_bone_report(
+            canonical_spm, spm_report
+        )
+    except (OSError, ValueError) as exc:
+        raise ClusterSourcePreparationError(
+            "spm_bone_setup",
+            str(exc),
+            log_file=spm_log,
+            report_file=spm_report_path,
+            report=spm_report,
+        ) from exc
 
     fbx_ini = Path(str(cfg.get("fbx_ini") or "")).resolve()
     try:
@@ -321,6 +365,7 @@ def _build_cluster_source(
             "status": spm_status,
             "report": str(spm_report_path),
             "log": str(spm_log),
+            **spm_contract,
         },
         "material_preflight": {
             "status": "ok",

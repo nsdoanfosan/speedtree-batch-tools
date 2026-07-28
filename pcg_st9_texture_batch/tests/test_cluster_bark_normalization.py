@@ -332,6 +332,43 @@ class BarkNormalizationTests(unittest.TestCase):
             result["status"], "ready_for_downstream_blender_mapping"
         )
 
+    def test_export_bundle_allows_same_species_canonical_alias_slots(self):
+        _plan, report = self.normalize()
+        export = self.root / "export"
+        export.mkdir()
+        fbx = export / "branch_elm_01.fbx"
+        stmat = export / "branch_elm_01.stmat"
+        xml = export / "branch_elm_01.xml"
+        write_ascii_fbx(fbx)
+        expected = (
+            '<Material Name="M_bark_elm_01_Mat">'
+            '<Map Source="X:/T_bark_elm_01_color.tga"/>'
+            '<Map Source="X:/T_bark_elm_01_normal.tga"/>'
+            '</Material>'
+        )
+        alias = (
+            '<Material Name="M_Bark_elm_01_Mat">'
+            '<Map Source="X:/legacy/T_Bark_elm_01_color.tga"/>'
+            '<Map Source="X:/legacy/T_Bark_elm_01_normal.tga"/>'
+            '</Material>'
+        )
+        payload = (
+            f"<SpeedTree><Materials>{alias}{expected}"
+            "</Materials></SpeedTree>"
+        )
+        stmat.write_text(payload, encoding="utf-8")
+        xml.write_text(payload, encoding="utf-8")
+
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+
+        self.assertEqual(result["stmat"]["material_count"], 2)
+        self.assertTrue(any(
+            row["exact_normalized_set"]
+            for row in result["stmat"]["materials"]
+        ))
+
     def test_export_bundle_fails_closed_on_unbound_material(self):
         _plan, report = self.normalize()
         export = self.root / "export"
@@ -388,7 +425,7 @@ class BarkNormalizationTests(unittest.TestCase):
         write_export_xml(xml)
 
         with self.assertRaisesRegex(
-                BarkNormalizationError, "did not propagate"):
+                BarkNormalizationError, "another texture family"):
             validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
 
     @unittest.skipUnless(

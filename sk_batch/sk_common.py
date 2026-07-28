@@ -82,9 +82,6 @@ DEFAULT_CONFIG = {
     # Trunks and terminal needle/leaf spines stay at Absolute/0 and never reach
     # Blender as long pivot bones or hundreds of Start/End pairs.
     "cluster_root_only_bones": True,
-    # Stop after the first bad Relative/FBX verification. Restore the source
-    # and mark it for manual handling instead of paying for more ~16s launches.
-    "fast_skip_problem_spm": True,
     "rename_materials": True,    # checklist item 2: M_ prefix
     # Direct leaf-parent Branches receive R=0 at the root and R=1 at the tip.
     # This is tree-only and preserves the established G channel contract.
@@ -99,6 +96,10 @@ DEFAULT_CONFIG = {
     "priority": "belownormal",   # idle | belownormal | normal
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
     "spm_verify_timeout": 120,
+    # Whole-worker lifetime includes waiting for the machine-wide serialized
+    # SpeedTree exporter.  The per-export timeout above starts only after the
+    # worker owns that gate.
+    "spm_job_timeout": 7200,
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
     "cluster_receipt_refresh_timeout": 600,
@@ -502,7 +503,6 @@ def _calibration_settings_signature(cfg, include_hashed_stat=False):
         "max_calibration_rounds",
         "probe_cache_enabled",
         "cluster_root_only_bones",
-        "fast_skip_problem_spm",
         "spm_verify_timeout",
         "rename_materials",
         "tree_leaf_parent_red_gradient",

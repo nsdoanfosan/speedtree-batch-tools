@@ -293,6 +293,9 @@ class ManualBonesTests(unittest.TestCase):
                                 "status": "calibrated",
                                 "total_bones": 12,
                                 "warnings": [],
+                                "final_spm_fingerprint": (
+                                    file_content_snapshot(spm)["fingerprint"]
+                                ),
                                 "calibration": {
                                     "total_branches": 4,
                                     "capped": False,

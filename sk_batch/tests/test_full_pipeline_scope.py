@@ -213,6 +213,32 @@ class FullPipelineScopeTests(unittest.TestCase):
         app.root_entry.configure.assert_called_with(state="normal")
         app.btn_stop.configure.assert_called_with(state="disabled")
 
+    def test_batch_request_snapshot_recursively_freezes_nested_item_data(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        source = {
+            "spm": Path("SK_nested.spm"),
+            "checked": True,
+            "audit": {
+                "issues": [{"code": "before"}],
+                "paths": [Path("before.json")],
+            },
+        }
+        app.items = {"nested": source}
+
+        inventory, targets = app._snapshot_batch_request(["nested"])
+        source["audit"]["issues"][0]["code"] = "after"
+        source["audit"]["paths"].append(Path("after.json"))
+
+        self.assertEqual(
+            inventory["nested"]["audit"]["issues"],
+            [{"code": "before"}],
+        )
+        self.assertEqual(
+            targets[0]["audit"]["paths"],
+            [Path("before.json")],
+        )
+
     def test_stop_cancels_pending_jobs_but_leaves_current_job_to_stop_safely(self):
         gui = load_gui_module()
         app, _checked, _unchecked = self.make_start_app(gui)
@@ -227,6 +253,73 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertTrue(app.stop_flag.is_set())
         self.assertFalse(app.pending_batch_jobs)
         self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
+
+    def test_queued_worker_reports_item_failures_instead_of_success(self):
+        gui = load_gui_module()
+        app, checked, _unchecked = self.make_start_app(gui)
+        app.ui_queue = queue.Queue()
+
+        def partial_batch(*_args, **_kwargs):
+            app._phase_failed_items = {str(checked["spm"])}
+            return True
+
+        app._run_batch = mock.Mock(side_effect=partial_batch)
+        job = {
+            "id": 8,
+            "label": "① SPM",
+            "mode": "phase",
+            "phase": "spm",
+            "targets": [checked],
+        }
+
+        app._run_queued_batch_job(job)
+
+        self.assertEqual(
+            app.ui_queue.get_nowait(),
+            (
+                "batch_job_done",
+                {
+                    "id": 8,
+                    "error": "항목 실패/준비 제외 1개",
+                    "status": "partial",
+                    "failed_count": 1,
+                },
+            ),
+        )
+
+    def test_queued_worker_reports_stop_without_marking_completion(self):
+        gui = load_gui_module()
+        app, checked, _unchecked = self.make_start_app(gui)
+        app.ui_queue = queue.Queue()
+
+        def stopped_batch(*_args, **_kwargs):
+            app.stop_flag.set()
+            app._phase_failed_items = set()
+            return True
+
+        app._run_batch = mock.Mock(side_effect=stopped_batch)
+        job = {
+            "id": 9,
+            "label": "② Blender",
+            "mode": "phase",
+            "phase": "blender",
+            "targets": [checked],
+        }
+
+        app._run_queued_batch_job(job)
+
+        self.assertEqual(
+            app.ui_queue.get_nowait(),
+            (
+                "batch_job_done",
+                {
+                    "id": 9,
+                    "error": None,
+                    "status": "stopped",
+                    "failed_count": 0,
+                },
+            ),
+        )
 
     def test_queued_worker_uses_one_terminal_event_and_suppresses_legacy_done(self):
         gui = load_gui_module()
@@ -252,7 +345,15 @@ class FullPipelineScopeTests(unittest.TestCase):
         )
         self.assertEqual(
             app.ui_queue.get_nowait(),
-            ("batch_job_done", {"id": 7, "error": None}),
+            (
+                "batch_job_done",
+                {
+                    "id": 7,
+                    "error": None,
+                    "status": "completed",
+                    "failed_count": 0,
+                },
+            ),
         )
         self.assertTrue(app.ui_queue.empty())
 

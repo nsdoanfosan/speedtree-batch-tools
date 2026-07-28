@@ -114,9 +114,11 @@ SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 �
 - **무변경 SPM 보존**: 검증을 실행했더라도 최종 XML이 시작 XML과 같으면 원래 gzip
   바이트와 타임스탬프를 복원한다. ①의 no-op 실행 때문에 최신 `.blend`가 오래된
   것으로 바뀌어 ②를 불필요하게 다시 도는 문제를 막는다.
-- **문제 SPM 빠른 건너뛰기**: 첫 Relative 검증이 목표 범위를 벗어나거나 첫
-  root-only FBX 검증이 armature-only로 나오면 추가 보정/폴백 export를 실행하지
-  않는다. SPM은 백업 원본으로 복원되고 표에 `수동 처리 필요`로 남는다.
+- **문제 SPM 제한 보정**: 첫 Relative 검증이 목표 범위를 벗어나도 설정된 최대
+  round 안에서 측정값을 bracket해 다시 보정한다. probe 길이가 없으면 렌더 대상의
+  기존 공통 Relative 값을 우선 사용한다. root-only FBX가 armature-only이면
+  Absolute/material 폴백을 검증하며, 끝까지 수렴하거나 렌더 geometry를 만들지
+  못한 경우에만 원본을 복원하고 구체적인 실패 분류를 남긴다.
 - **중지/시간 초과 정리**: 작업용 Python만 종료해 SpeedTree가 고아 프로세스로
   남지 않도록 Windows 프로세스 트리 전체를 종료한다. 진행 로그는 unbuffered로
   기록해 실행 중인 `.log`에서도 현재 프로브 단계를 확인할 수 있다.
