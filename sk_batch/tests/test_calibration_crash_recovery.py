@@ -6,6 +6,8 @@ handler at all.  The in-progress marker makes that state detectable, and the
 next run repairs it from the recorded backup before reading the source.
 """
 import hashlib
+import gzip
+import json
 import os
 import shutil
 import subprocess
@@ -45,6 +47,17 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         spm_audit.write_calibration_marker(self.spm, backup_path, self.source_sha)
         spm_audit.write_spm(self.spm, PROBE_XML)
         return backup_path
+
+    def _make_marker_legacy(self, *, version=1):
+        marker = spm_audit.calibration_marker_path(self.spm)
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["version"] = version
+        payload.pop("last_pipeline_sha256", None)
+        marker.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return marker
 
     def test_identical_content_always_writes_identical_bytes(self):
         """Otherwise a no-op ① rewrite invalidates every content fingerprint."""
@@ -105,6 +118,151 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "concurrent_spm_modification")
         self.assertEqual(self.spm.read_bytes(), external_bytes)
         self.assertTrue(spm_audit.calibration_marker_path(self.spm).exists())
+
+    def test_legacy_marker_logical_match_clears_without_rewriting_spm(self):
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            self.source_sha,
+        )
+        marker = self._make_marker_legacy()
+        # A legacy SpeedTree/gzip rewrite may change container bytes while
+        # preserving the exact logical SPM XML.
+        self.spm.write_bytes(
+            gzip.compress(SOURCE_XML.encode("utf-8"), mtime=1)
+        )
+        before_bytes = self.spm.read_bytes()
+        before_mtime_ns = self.spm.stat().st_mtime_ns
+        self.assertNotEqual(before_bytes, self.source_bytes)
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertTrue(result["cleared"])
+        self.assertEqual(result["status"], "legacy_marker_logically_intact")
+        self.assertEqual(
+            result["legacy_marker_migration"]["policy"],
+            "clear_marker_without_spm_write",
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertEqual(self.spm.stat().st_mtime_ns, before_mtime_ns)
+        self.assertFalse(marker.exists())
+
+    def test_legacy_cluster_marker_requires_live_root_postcondition(self):
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            self.source_sha,
+        )
+        marker = self._make_marker_legacy()
+        self.spm.write_bytes(
+            gzip.compress(SOURCE_XML.encode("utf-8"), mtime=2)
+        )
+        before_bytes = self.spm.read_bytes()
+        postcondition = {
+            "ok": True,
+            "policy": "cluster_first_renderable_root_absolute_1",
+        }
+
+        with mock.patch.object(
+            spm_audit,
+            "is_cluster_normalization_spm",
+            return_value=True,
+        ), mock.patch.object(
+            spm_audit,
+            "cluster_root_logical_postcondition",
+            return_value=postcondition,
+        ) as check:
+            result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        check.assert_called_once_with(SOURCE_XML)
+        self.assertTrue(result["cleared"])
+        self.assertEqual(
+            result["legacy_marker_migration"]["cluster_postcondition"],
+            postcondition,
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertFalse(marker.exists())
+
+    def test_legacy_cluster_marker_fails_closed_on_bad_postcondition(self):
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            self.source_sha,
+        )
+        marker = self._make_marker_legacy()
+        self.spm.write_bytes(
+            gzip.compress(SOURCE_XML.encode("utf-8"), mtime=3)
+        )
+        before_bytes = self.spm.read_bytes()
+
+        with mock.patch.object(
+            spm_audit,
+            "is_cluster_normalization_spm",
+            return_value=True,
+        ), mock.patch.object(
+            spm_audit,
+            "cluster_root_logical_postcondition",
+            return_value={"ok": False, "error": "bad cluster root"},
+        ):
+            result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(result["failure_kind"], "interrupted_calibration")
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "legacy_marker_cluster_postcondition_failed",
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertTrue(marker.exists())
+
+    def test_legacy_marker_fails_closed_on_logical_mismatch(self):
+        self._simulate_kill_during_calibration()
+        marker = self._make_marker_legacy()
+        before_bytes = self.spm.read_bytes()
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(
+            result["failure_kind"],
+            "concurrent_spm_modification",
+        )
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "legacy_marker_logical_mismatch",
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertTrue(marker.exists())
+
+    def test_only_version_one_marker_may_use_legacy_no_write_migration(self):
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            self.source_sha,
+        )
+        marker = self._make_marker_legacy(version=2)
+        self.spm.write_bytes(
+            gzip.compress(SOURCE_XML.encode("utf-8"), mtime=4)
+        )
+        before_bytes = self.spm.read_bytes()
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "unsupported_marker_without_pipeline_hash",
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertTrue(marker.exists())
 
     def test_untouched_spm_reports_clean_and_recovers_nothing(self):
         state = spm_audit.inspect_interrupted_calibration(self.spm)

@@ -3108,6 +3108,7 @@ def inspect_interrupted_calibration(spm_path):
     backup = Path(payload.get("backup") or "")
     result = {
         "status": "interrupted",
+        "marker_version": payload.get("version"),
         "marker": str(marker),
         "spm": payload.get("spm", str(spm_path)),
         "backup": str(backup) if payload.get("backup") else "",
@@ -3133,6 +3134,45 @@ def inspect_interrupted_calibration(spm_path):
         # source bytes, so nothing was actually lost.
         result["status"] = "interrupted_but_intact"
     return result
+
+
+def _calibration_recovery_failure(
+    state,
+    *,
+    failure_kind,
+    category,
+    error,
+    details=None,
+):
+    message = (
+        "Interrupted SPM calibration marker cannot be recovered safely: "
+        + str(error)
+    )
+    diagnostic = {
+        "contract": "spm_calibration_recovery_v1",
+        "failure_kind": failure_kind,
+        "category": category,
+        "marker": state.get("marker", ""),
+        "spm": state.get("spm", ""),
+        "backup": state.get("backup", ""),
+        "error": message,
+    }
+    if details:
+        diagnostic["details"] = dict(details)
+    return {
+        **state,
+        "recovered": False,
+        "cleared": False,
+        "error": message,
+        "diagnostic": diagnostic,
+        "failure_kind": failure_kind,
+    }
+
+
+def _decode_spm_payload(payload):
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+    return payload.decode("utf-8")
 
 
 def _calibration_recovery_clear_result(state, spm_path, *, recovered):
@@ -3171,38 +3211,149 @@ def recover_interrupted_calibration(spm_path):
             spm_path,
             recovered=False,
         )
-    if state["status"] == "unreadable_marker" or not state.get("backup_available"):
-        return {**state, "recovered": False}
+    if state["status"] == "unreadable_marker":
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="interrupted_calibration",
+            category="unreadable_calibration_marker",
+            error=state.get("error") or "calibration marker is unreadable",
+        )
+    if not state.get("backup_available"):
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="interrupted_calibration",
+            category="calibration_backup_missing",
+            error="recorded calibration backup is unavailable",
+        )
+    backup = Path(state["backup"])
+    backup_snapshot, backup_payload = _read_content_snapshot_with_backoff(
+        backup,
+        operation="recover_interrupted_calibration:read_backup",
+        include_bytes=True,
+    )
+    source_sha256 = str(state.get("source_sha256") or "")
+    if (
+        not source_sha256
+        or backup_snapshot.get("sha256") != source_sha256
+    ):
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="concurrent_spm_modification",
+            category="calibration_backup_hash_mismatch",
+            error="recorded backup does not match the interrupted source hash",
+            details={
+                "source_sha256": source_sha256,
+                "backup_sha256": backup_snapshot.get("sha256", ""),
+            },
+        )
     if not state.get("last_pipeline_sha256"):
-        return {
+        if state.get("marker_version") != 1:
+            return _calibration_recovery_failure(
+                state,
+                failure_kind="interrupted_calibration",
+                category="unsupported_marker_without_pipeline_hash",
+                error=(
+                    "only legacy calibration marker version 1 may use "
+                    "logical no-write migration"
+                ),
+                details={
+                    "marker_version": state.get("marker_version"),
+                },
+            )
+        try:
+            current_snapshot, current_payload = (
+                _read_content_snapshot_with_backoff(
+                    spm_path,
+                    operation=(
+                        "recover_interrupted_calibration:"
+                        "read_legacy_current"
+                    ),
+                    include_bytes=True,
+                )
+            )
+            current_text = _decode_spm_payload(current_payload)
+            backup_text = _decode_spm_payload(backup_payload)
+        except (
+            AttributeError,
+            EOFError,
+            gzip.BadGzipFile,
+            OSError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as exc:
+            return _calibration_recovery_failure(
+                state,
+                failure_kind="interrupted_calibration",
+                category="legacy_marker_logical_audit_failed",
+                error=f"legacy marker logical SPM audit failed: {exc}",
+            )
+        if current_text != backup_text:
+            return _calibration_recovery_failure(
+                state,
+                failure_kind="concurrent_spm_modification",
+                category="legacy_marker_logical_mismatch",
+                error=(
+                    "legacy marker current SPM logical XML differs from "
+                    "the recorded source backup; external/probe state preserved"
+                ),
+                details={
+                    "current_sha256": current_snapshot.get("sha256", ""),
+                    "backup_sha256": backup_snapshot.get("sha256", ""),
+                },
+            )
+        cluster_postcondition = None
+        if is_cluster_normalization_spm(spm_path):
+            cluster_postcondition = cluster_root_logical_postcondition(
+                current_text
+            )
+            if not cluster_postcondition.get("ok"):
+                return _calibration_recovery_failure(
+                    state,
+                    failure_kind="interrupted_calibration",
+                    category="legacy_marker_cluster_postcondition_failed",
+                    error=(
+                        "legacy marker logical XML matches its backup, but "
+                        "the live Cluster root-bone postcondition is not valid"
+                    ),
+                    details={
+                        "cluster_postcondition": cluster_postcondition,
+                    },
+                )
+        migrated_state = {
             **state,
-            "recovered": False,
-            "error": (
-                "interrupted marker has no last pipeline content hash; "
-                "refusing to overwrite a potentially external SPM edit"
-            ),
+            "status": "legacy_marker_logically_intact",
+            "legacy_marker_migration": {
+                "policy": "clear_marker_without_spm_write",
+                "marker_version": state.get("marker_version"),
+                "backup_hash_matches_source": True,
+                "logical_xml_exact_equal": True,
+                "cluster_postcondition": cluster_postcondition,
+            },
         }
+        return _calibration_recovery_clear_result(
+            migrated_state,
+            spm_path,
+            recovered=False,
+        )
     live_sha256 = (state.get("spm_snapshot") or {}).get("sha256", "")
     if live_sha256 != state["last_pipeline_sha256"]:
-        return {
-            **state,
-            "status": "concurrent_spm_modification",
-            "recovered": False,
-            "error": (
+        return _calibration_recovery_failure(
+            {
+                **state,
+                "status": "concurrent_spm_modification",
+            },
+            failure_kind="concurrent_spm_modification",
+            category="live_spm_hash_mismatch",
+            error=(
                 "current SPM content differs from the last pipeline-authored "
                 "fingerprint; external edit preserved"
             ),
-        }
-    backup = Path(state["backup"])
-    if state.get("source_sha256") and _sha256_bytes(
-        backup.read_bytes()
-    ) != state["source_sha256"]:
-        return {
-            **state,
-            "recovered": False,
-            "error": "recorded backup does not match the interrupted source hash",
-        }
-    backup_payload = backup.read_bytes()
+            details={
+                "live_sha256": live_sha256,
+                "last_pipeline_sha256": state["last_pipeline_sha256"],
+            },
+        )
     backup_stat = backup.stat()
     _atomic_replace_payload(
         spm_path,
