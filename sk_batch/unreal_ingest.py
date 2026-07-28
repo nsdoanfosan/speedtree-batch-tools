@@ -9,6 +9,7 @@ per-poly collision, and ray-tracing geometry while enforcing Nanite Voxelize.
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
 import os
@@ -766,6 +767,7 @@ def _import_manifest_asset_with_fresh_skeleton(
     final_skeleton_path = final_asset_path + "_Skeleton"
     moves = []
     relocated = []
+    cleared_redirectors = []
     old_owned_skeletons = []
     old_mesh = (
         unreal.EditorAssetLibrary.load_asset(final_asset_path)
@@ -802,10 +804,13 @@ def _import_manifest_asset_with_fresh_skeleton(
             ):
                 continue
             if _asset_path_is_redirector(canonical_path):
-                raise RuntimeError(
-                    "canonical publish path contains a pre-existing "
-                    f"redirector: {canonical_path}"
+                cleanup = _clear_unreferenced_canonical_redirector(
+                    canonical_path
                 )
+                if cleanup is not None:
+                    cleanup["role"] = role
+                    cleared_redirectors.append(cleanup)
+                continue
             legacy_path = _unique_transaction_asset_path(
                 canonical_path,
                 "Legacy",
@@ -871,11 +876,23 @@ def _import_manifest_asset_with_fresh_skeleton(
         )
     except Exception as exc:
         rollback = _rollback_asset_publish_moves(moves)
+        redirector_note = (
+            "\nPre-existing unreferenced canonical redirector cleanup "
+            "was intentionally one-way and was not recreated: "
+            + ", ".join(
+                row["asset_path"] for row in cleared_redirectors
+            )
+            if cleared_redirectors
+            else ""
+        )
         if rollback["failed"]:
             raise RuntimeError(
                 f"{exc}\nSK Batch publish rollback also failed: "
                 + "; ".join(rollback["failed"])
+                + redirector_note
             ) from exc
+        if redirector_note:
+            raise RuntimeError(str(exc) + redirector_note) from exc
         raise
 
     legacy_cleanup = _cleanup_unreferenced_legacy_assets(
@@ -919,6 +936,7 @@ def _import_manifest_asset_with_fresh_skeleton(
                 }
                 for record in relocated
             ],
+            "cleared_unreferenced_redirectors": cleared_redirectors,
             "legacy_cleanup": legacy_cleanup,
             "staging_cleanup": staging_cleanup,
         },
@@ -1107,6 +1125,10 @@ def _asset_path_is_redirector(asset_path):
     return False
 
 
+class _RedirectorPackageStillOccupied(RuntimeError):
+    pass
+
+
 def _clear_transaction_redirector(asset_path):
     asset_path = str(asset_path).split(".", 1)[0]
     if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
@@ -1120,12 +1142,162 @@ def _clear_transaction_redirector(asset_path):
         raise RuntimeError(
             "failed to remove transaction redirector: " + asset_path
         )
+    collect_garbage = getattr(unreal, "collect_garbage", None)
+    if callable(collect_garbage):
+        collect_garbage()
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-        raise RuntimeError(
+        raise _RedirectorPackageStillOccupied(
             "transaction redirector still occupies its package: "
             + asset_path
         )
     return True
+
+
+def _quarantine_stale_redirector_package(asset_path):
+    """Evict a deleted redirector whose on-disk package kept Registry state.
+
+    A pre-existing redirector can be open for edit in source control. In that
+    state Unreal's Force Delete may mark the UObject pending-kill but leave the
+    package file and its Asset Registry row behind. Moving that proven
+    unreferenced package under Saved keeps a recoverable copy without changing
+    the source-control action on the canonical filename.
+    """
+    asset_path = str(asset_path).split(".", 1)[0]
+    if not asset_path.startswith("/Game/"):
+        raise RuntimeError(
+            "cannot quarantine a redirector outside project Content: "
+            + asset_path
+        )
+    paths = getattr(unreal, "Paths", None)
+    content_dir = getattr(paths, "project_content_dir", None)
+    saved_dir = getattr(paths, "project_saved_dir", None)
+    if not callable(content_dir) or not callable(saved_dir):
+        raise RuntimeError(
+            "cannot resolve the redirector package filename through "
+            "Unreal Paths: "
+            + asset_path
+        )
+    relative = asset_path[len("/Game/"):].replace("/", os.sep) + ".uasset"
+    source_file = Path(str(content_dir())) / relative
+    if not source_file.is_file():
+        raise RuntimeError(
+            "deleted redirector remains in the Asset Registry but its "
+            "package file cannot be found: "
+            + str(source_file)
+        )
+    backup_root = (
+        Path(str(saved_dir()))
+        / "SKBatchRedirectorBackups"
+        / Path(relative).parent
+    )
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_file = (
+        backup_root
+        / (
+            source_file.stem
+            + "_"
+            + datetime.now().strftime("%Y%m%d_%H%M%S")
+            + "_"
+            + uuid.uuid4().hex[:8]
+            + source_file.suffix
+        )
+    )
+    registry_helpers = getattr(unreal, "AssetRegistryHelpers", None)
+    get_registry = getattr(registry_helpers, "get_asset_registry", None)
+    if not callable(get_registry):
+        raise RuntimeError(
+            "cannot refresh the Asset Registry after redirector quarantine: "
+            + asset_path
+        )
+    registry = get_registry()
+    scan_modified = getattr(registry, "scan_modified_asset_files", None)
+    if not callable(scan_modified):
+        raise RuntimeError(
+            "Asset Registry cannot rescan the quarantined redirector file: "
+            + asset_path
+        )
+    os.replace(source_file, backup_file)
+    try:
+        scan_modified([str(source_file)])
+        wait_for_completion = getattr(registry, "wait_for_completion", None)
+        if callable(wait_for_completion):
+            wait_for_completion()
+        collect_garbage = getattr(unreal, "collect_garbage", None)
+        if callable(collect_garbage):
+            collect_garbage()
+        if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+            raise RuntimeError(
+                "quarantined redirector still occupies its Asset Registry "
+                "package: "
+                + asset_path
+            )
+    except Exception:
+        if not source_file.exists() and backup_file.is_file():
+            os.replace(backup_file, source_file)
+            scan_modified([str(source_file)])
+        raise
+    return {
+        "source_file": str(source_file),
+        "backup_file": str(backup_file),
+    }
+
+
+def _clear_unreferenced_canonical_redirector(asset_path):
+    """Remove only a stale canonical redirector that has no live referencers."""
+    asset_path = str(asset_path).split(".", 1)[0]
+    if not _asset_path_is_redirector(asset_path):
+        return None
+    if not _is_headless_manifest_runtime():
+        raise RuntimeError(
+            "canonical redirector cleanup is allowed only in a fresh "
+            "headless manifest commandlet: "
+            + asset_path
+        )
+    finder = getattr(
+        unreal.EditorAssetLibrary,
+        "find_package_referencers_for_asset",
+        None,
+    )
+    if not callable(finder):
+        raise RuntimeError(
+            "cannot prove canonical redirector is unreferenced because "
+            "the Unreal referencer API is unavailable: "
+            + asset_path
+        )
+    try:
+        referencers = sorted({
+            str(value).split(".", 1)[0]
+            for value in (finder(asset_path, True) or [])
+            if value
+        })
+    except Exception as exc:
+        raise RuntimeError(
+            "could not confirm canonical redirector referencers: "
+            + asset_path
+            + ": "
+            + str(exc)
+        ) from exc
+    if referencers:
+        raise RuntimeError(
+            "canonical publish path contains a referenced redirector; "
+            "fix up its referencers before replacing the asset: "
+            + asset_path
+            + " <- "
+            + ", ".join(referencers)
+        )
+    quarantine = None
+    try:
+        _clear_transaction_redirector(asset_path)
+    except _RedirectorPackageStillOccupied:
+        quarantine = _quarantine_stale_redirector_package(asset_path)
+    result = {
+        "asset_path": asset_path,
+        "referencers": [],
+        "deleted": True,
+    }
+    if quarantine is not None:
+        result["quarantine"] = quarantine
+    return result
 
 
 def _unique_transaction_asset_path(asset_path, label, token):
@@ -2258,6 +2430,19 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
                 }
             )
         finally:
+            # A headless queue can contain well over one hundred large tree
+            # imports.  Drop per-item Python references before asking Unreal
+            # to release transient import objects; otherwise one commandlet
+            # retains many gigabytes until process exit.
+            result = None
+            asset_cache = None
+            gc.collect()
+            collect_garbage = getattr(unreal, "collect_garbage", None)
+            if callable(collect_garbage):
+                try:
+                    collect_garbage()
+                except Exception as exc:
+                    state["garbage_collection_warning"] = str(exc)
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
             _atomic_write_json(checkpoint_path, checkpoint)

@@ -217,6 +217,101 @@ class BarkNormalizationTests(unittest.TestCase):
         self.assertTrue(output["uv_mesh_generator_payload_preserved"])
         self.assertFalse(report["production_sources_mutated"])
 
+    def test_multiple_bark_slots_in_one_isolated_spm_commit_atomically(self):
+        text = read_maybe_gzip_text(self.cluster)
+        second_material = (
+            '<Material_v8 ID="2" Name="M_bark_common_end_01">'
+            + map_block("Color", "../../legacy/common_end_color.tga")
+            + map_block("Normal", "../../legacy/common_end_normal.tga")
+            + '<SupplementalCutoutMeshIDs></SupplementalCutoutMeshIDs>'
+            '</Material_v8>'
+        )
+        second_generator = (
+            '<Generator Type="Branch"><Properties><Property>'
+            '<Name>Branches:Material</Name><Value>2</Value>'
+            '</Property></Properties></Generator>'
+        )
+        text = text.replace(
+            "</Materials>",
+            second_material + "</Materials>",
+            1,
+        ).replace(
+            "</Generators>",
+            second_generator + "</Generators>",
+            1,
+        )
+        with gzip.open(self.cluster, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+        shutil.copy2(self.cluster, self.cluster_copy)
+        source_hash = sha256(self.cluster)
+
+        contract = {
+            "handoff": {
+                "canonical_bark": {
+                    **self.contract["handoff"]["canonical_bark"],
+                    "cluster_bark_sources": [
+                        {
+                            "cluster_spm": str(self.cluster),
+                            "material_id": "1",
+                            "material_name": (
+                                "Bark_tree_NothofagusSolandri_01"
+                            ),
+                            "replacement": "required",
+                        },
+                        {
+                            "cluster_spm": str(self.cluster),
+                            "material_id": "2",
+                            "material_name": "M_bark_common_end_01",
+                            "replacement": "required",
+                        },
+                    ],
+                },
+            },
+        }
+
+        plan = build_isolated_bark_normalization_plan(
+            contract,
+            {str(self.cluster): str(self.cluster_copy)},
+            self.isolation,
+            preserve_source_material_name=True,
+        )
+        report = apply_isolated_bark_normalization(plan)
+
+        self.assertEqual(len(plan["patches"]), 2)
+        self.assertEqual(len(report["outputs"]), 2)
+        self.assertEqual(sha256(self.cluster), source_hash)
+        rows = {
+            row["material_id"]: row
+            for row in extract_material_image_refs(self.cluster_copy)
+        }
+        self.assertEqual(
+            rows["1"]["material_name"],
+            "Bark_tree_NothofagusSolandri_01",
+        )
+        self.assertEqual(
+            rows["2"]["material_name"],
+            "M_bark_common_end_01",
+        )
+        expected_names = {
+            "t_bark_elm_01_color.tga",
+            "t_bark_elm_01_normal.tga",
+        }
+        for material_id in ("1", "2"):
+            self.assertEqual(
+                {
+                    Path(value).name.casefold()
+                    for value in rows[material_id]["refs"]
+                },
+                expected_names,
+            )
+        self.assertEqual(
+            {
+                output["output_sha256"]
+                for output in report["outputs"]
+            },
+            {sha256(self.cluster_copy)},
+        )
+
     def test_self_closing_texfilename_does_not_consume_the_next_map(self):
         text = read_maybe_gzip_text(self.canonical)
         text = text.replace(

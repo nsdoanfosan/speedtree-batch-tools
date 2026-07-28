@@ -65,9 +65,11 @@ from dynamic_wind_handoff_policy import (
     resolve_dynamic_wind_policy,
 )
 from send2ue_manifest_contract import (
+    is_actionable_cluster_assembly_manifest,
     manifest_checkout_asset_paths,
     normalize_manifest_handoff_sidecars,
     primary_mesh_asset_path,
+    validate_material_handoff_wrapper,
 )
 from speedtree_pipeline_contract import shared_contract_api
 
@@ -513,10 +515,10 @@ def main():
         report["dependency_orchestrated"] = bool(
             args.dependency_orchestrated
         )
-        if (
-            cluster_manifest is not None
-            and not args.dependency_orchestrated
-        ):
+        actionable_cluster_manifest = (
+            is_actionable_cluster_assembly_manifest(cluster_manifest)
+        )
+        if actionable_cluster_manifest and not args.dependency_orchestrated:
             raise RuntimeError(
                 "Tree Push with Cluster Assembly must run through the SK Batch "
                 "dependency orchestrator; direct send2ue_push_job execution is "
@@ -526,14 +528,21 @@ def main():
             speedtree_spm = resolve_cluster_spm_pair(spm_path)["canonical_spm"]
         except ClusterSpmPairPathError:
             speedtree_spm = spm_path
-        source_fbx = (
-            speedtree_spm.parent / "fbx" / f"{speedtree_spm.stem}.fbx"
+        material_payload = json.loads(
+            Path(args.material_contract).read_text(encoding="utf-8")
         )
+        material_source = validate_material_handoff_wrapper(
+            material_payload,
+            speedtree_spm,
+        )
+        source_fbx = Path(material_source["fbx"])
         report["canonical_spm"] = str(spm_path)
         report["speedtree_spm"] = str(speedtree_spm)
+        report["material_source_spm"] = material_source["spm"]
+        report["material_source_stmat"] = material_source["stmat"]
         texture_contract = load_speedtree_texture_readiness_contract(
             args.material_contract,
-            spm_path=str(speedtree_spm),
+            spm_path=material_source["spm"],
             source_fbx_path=str(source_fbx),
         )
         if not texture_contract.get("strict_speedtree_pipeline_contract"):
@@ -809,7 +818,7 @@ def main():
 
         cluster_assembly = None
         material_asset_scope = None
-        if cluster_manifest is not None:
+        if actionable_cluster_manifest:
             material_asset_scope = scope_material_pipeline_for_destination(
                 manifest_assets,
                 folder,

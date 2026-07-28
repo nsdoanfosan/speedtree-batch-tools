@@ -274,6 +274,84 @@ def _artifact_fingerprints_match(expected, actual):
     )
 
 
+def _material_handoff_envelope_for_push(pipeline, canonical_spm):
+    """Select and bind the exact material input that produced the blend."""
+    canonical_spm = Path(canonical_spm).resolve()
+    handoff = pipeline.get("speedtree_material_handoff_contract")
+    if not isinstance(handoff, dict):
+        return (
+            pipeline.get("speedtree_pipeline_contract"),
+            canonical_spm,
+        )
+
+    source_spm = (
+        ((handoff.get("source") or {}).get("spm") or {}).get(
+            "canonical_path"
+        )
+        or ""
+    )
+    if not source_spm:
+        raise RuntimeError(
+            "SpeedTree material handoff contract has no source SPM identity"
+        )
+    source_spm = Path(source_spm).resolve()
+    resolution = pipeline.get("cluster_bark_source_resolution") or {}
+    isolated = resolution.get("speedtree_spm") or {}
+    production = resolution.get("source_spm") or {}
+    isolated_mode = bool(
+        resolution.get("status") == "ready"
+        and _normalized_path(production.get("path") or "")
+        != _normalized_path(isolated.get("path") or "")
+    )
+    if (
+        _normalized_path(source_spm) == _normalized_path(canonical_spm)
+        and not isolated_mode
+    ):
+        return handoff, source_spm
+    if not isolated_mode:
+        raise RuntimeError(
+            "SpeedTree material handoff source differs from the canonical "
+            "SPM without an isolated bark-normalization contract"
+        )
+
+    handoff_source = (handoff.get("source") or {}).get("spm") or {}
+    live_production = source_identity(canonical_spm)
+
+    def same_identity(left, right, *, left_path_key, right_path_key):
+        try:
+            return bool(
+                _normalized_path(left.get(left_path_key) or "")
+                == _normalized_path(right.get(right_path_key) or "")
+                and int(left.get("size")) == int(right.get("size"))
+                and str(left.get("sha256") or "").casefold()
+                == str(right.get("sha256") or "").casefold()
+                and left.get("sha256")
+            )
+        except (TypeError, ValueError):
+            return False
+
+    if not (
+        resolution.get("status") == "ready"
+        and same_identity(
+            handoff_source,
+            isolated,
+            left_path_key="canonical_path",
+            right_path_key="path",
+        )
+        and same_identity(
+            live_production,
+            production,
+            left_path_key="canonical_path",
+            right_path_key="path",
+        )
+    ):
+        raise RuntimeError(
+            "SpeedTree isolated material handoff is not bound to the "
+            "current canonical SPM and bark-normalization receipt"
+        )
+    return handoff, source_spm
+
+
 def cluster_bark_pipeline_matches_resolution(
         spm, resolution, pipeline, fingerprint):
     """Prove that a cached isolated-bark source was actually consumed by BWR."""
@@ -346,6 +424,142 @@ def cluster_receipt_resolution_uses_live_audit(resolution):
         isinstance(resolution, dict)
         and str(resolution.get("policy") or "").startswith("live_audit")
         and resolution.get("live_audit_report")
+    )
+
+
+def _cluster_variant_artifact_identity(record):
+    if not isinstance(record, dict):
+        return None
+    sha256 = str(record.get("sha256") or "").casefold()
+    path = str(record.get("path") or "")
+    try:
+        size = int(record.get("size"))
+    except (TypeError, ValueError):
+        return None
+    if not sha256 or not path or size < 0:
+        return None
+    return {
+        "path": os.path.normcase(os.path.abspath(path)).casefold(),
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def _cluster_prepared_role_identity(role):
+    if not isinstance(role, dict):
+        return None
+    normalized = role.get("normalized_variants") or {}
+    if normalized.get("status") != "ready":
+        return None
+    manifest = _cluster_variant_artifact_identity(
+        normalized.get("manifest")
+    )
+    source_blend = _cluster_variant_artifact_identity(
+        normalized.get("source_blend")
+    )
+    if manifest is None or source_blend is None:
+        return None
+    variants = []
+    for variant in normalized.get("variants") or []:
+        plan_fbx = _cluster_variant_artifact_identity(
+            variant.get("plan_fbx") if isinstance(variant, dict) else None
+        )
+        if plan_fbx is None:
+            return None
+        variants.append({
+            "ordinal": variant.get("ordinal"),
+            "plan_name": str(variant.get("plan_name") or ""),
+            "skeletal_asset_name": str(
+                variant.get("skeletal_asset_name") or ""
+            ),
+            "source_prototype_index": variant.get(
+                "source_prototype_index"
+            ),
+            "source_partition_mode": str(
+                variant.get("source_partition_mode") or ""
+            ),
+            "target_mesh_id": variant.get("target_mesh_id"),
+            "physical_capture_contract_sha256": str(
+                variant.get("physical_capture_contract_sha256") or ""
+            ).casefold(),
+            "plan_fbx": plan_fbx,
+        })
+    return {
+        "role": str(role.get("role") or "").casefold(),
+        "material": str(normalized.get("material") or "").casefold(),
+        "material_id": str(normalized.get("material_id") or ""),
+        "contract": str(normalized.get("contract") or ""),
+        "manifest": manifest,
+        "source_blend": source_blend,
+        "variants": sorted(
+            variants,
+            key=lambda row: (
+                str(row["ordinal"]),
+                row["plan_name"].casefold(),
+            ),
+        ),
+    }
+
+
+def rendered_unused_pass_through_matches_live(
+    saved_manifest,
+    live_contract,
+):
+    """Keep a content-proven unused role from recurring on every live audit."""
+    if not isinstance(saved_manifest, dict) or not isinstance(
+        live_contract, dict
+    ):
+        return False
+    try:
+        rendered_role_count = int(
+            saved_manifest.get("rendered_role_count", -1)
+        )
+    except (TypeError, ValueError):
+        return False
+    if not (
+        saved_manifest.get("status") == "pass_through"
+        and saved_manifest.get("content_decision") == "pass_through"
+        and saved_manifest.get("reason")
+        == "normalized_roles_are_prepared_but_unused_by_rendered_mesh"
+        and rendered_role_count == 0
+    ):
+        return False
+    saved_roles = (
+        saved_manifest.get("prepared_unused_roles")
+        or (saved_manifest.get("handoff_evidence") or {}).get(
+            "prepared_unused_roles"
+        )
+        or {}
+    )
+    live_handoff = live_contract.get("handoff") or {}
+    if live_handoff.get("status") != "ready":
+        return False
+    saved_identities = [
+        _cluster_prepared_role_identity(role)
+        for role in (
+            saved_roles.values()
+            if isinstance(saved_roles, dict)
+            else saved_roles
+        )
+    ]
+    live_identities = [
+        _cluster_prepared_role_identity(role)
+        for role in live_handoff.get("roles") or []
+        if isinstance(role, dict) and role.get("normalized_variants")
+    ]
+    if (
+        not saved_identities
+        or any(identity is None for identity in saved_identities)
+        or any(identity is None for identity in live_identities)
+    ):
+        return False
+    order = lambda row: (
+        row["role"],
+        row["material"],
+        row["material_id"],
+    )
+    return sorted(saved_identities, key=order) == sorted(
+        live_identities, key=order
     )
 
 
@@ -447,6 +661,36 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
     if not isinstance(report, dict):
         raise ValueError("Repair report is not an object")
 
+    bark_resolution = report.get("cluster_bark_source_resolution") or {}
+    isolated_bark_input = bool(
+        bark_resolution.get("status") == "ready"
+        and _normalized_path(
+            (bark_resolution.get("source_spm") or {}).get("path") or ""
+        )
+        != _normalized_path(
+            (bark_resolution.get("speedtree_spm") or {}).get("path") or ""
+        )
+    )
+    exact_handoff = report.get("speedtree_material_handoff_contract")
+    if isinstance(exact_handoff, dict):
+        envelope, material_source_spm = (
+            _material_handoff_envelope_for_push(
+                report,
+                canonical_spm,
+            )
+        )
+        validate_preflight_envelope(
+            envelope,
+            material_source_spm,
+            require_ok=True,
+        )
+        return report
+    if isolated_bark_input:
+        raise ValueError(
+            "Repair report used an isolated bark-normalized source but has "
+            "no exact material handoff contract; run Blender Repair again"
+        )
+
     envelope = report.get("speedtree_pipeline_contract")
     try:
         validate_preflight_envelope(envelope, canonical_spm, require_ok=True)
@@ -493,11 +737,23 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         )
     }
     migrated = dict(report)
-    migrated["speedtree_pipeline_contract"] = build_preflight_envelope(
+    migrated_envelope = build_preflight_envelope(
         canonical_spm,
         outcome="ok",
         texture_readiness=texture_readiness,
     )
+    unresolved_materials = [
+        str(intent.get("material_name") or "<unnamed>")
+        for intent in migrated_envelope.get("material_intents") or []
+        if str(intent.get("texture_source_mode") or "") == "unresolved"
+    ]
+    if unresolved_materials:
+        raise ValueError(
+            "legacy Repair report cannot prove material texture bindings; "
+            "run Blender Repair again: "
+            + ", ".join(unresolved_materials)
+        )
+    migrated["speedtree_pipeline_contract"] = migrated_envelope
     migrated["speedtree_pipeline_contract_required"] = True
     migrated["report_contract_migration"] = {
         "kind": "legacy_content_identity_upgrade",
@@ -4618,12 +4874,19 @@ class App:
                             saved_status = str(
                                 saved_manifest.get("status") or ""
                             )
-                            if (
+                            status_mismatch = (
                                 live_status == "pass_through"
                                 and saved_status != "pass_through"
                             ) or (
                                 live_status != "pass_through"
                                 and saved_status == "pass_through"
+                            )
+                            if (
+                                status_mismatch
+                                and not rendered_unused_pass_through_matches_live(
+                                    saved_manifest,
+                                    live_contract,
+                                )
                             ):
                                 repair_state["current"] = False
                         except (
@@ -5141,9 +5404,15 @@ class App:
     def _unreal_running():
         result = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
-            capture_output=True, text=True, creationflags=0x08000000,
+            capture_output=True,
+            creationflags=0x08000000,
         )
-        return "UnrealEditor.exe" in (result.stdout or "")
+        # ``tasklist`` writes in the active Windows OEM/ANSI code page.  The
+        # GUI can run under ``python -X utf8``, where text=True makes the
+        # subprocess reader thread decode that output as UTF-8 and crash on
+        # localized column text.  The executable token itself is ASCII, so
+        # inspect raw bytes and avoid a locale contract entirely.
+        return b"UnrealEditor.exe" in (result.stdout or b"")
 
     def _set_push_state(self, iid, kind, status_text, details=None, message=None):
         self.ui_queue.put(("cell", (iid, "push_status", status_text)))
@@ -5227,7 +5496,12 @@ class App:
             raise RuntimeError(
                 f"SpeedTree Repair contract report could not be read: {exc}"
             ) from exc
-        envelope = payload.get("speedtree_pipeline_contract")
+        envelope, material_source_spm = (
+            _material_handoff_envelope_for_push(
+                payload,
+                speedtree_output_spm_for(spm),
+            )
+        )
         if not isinstance(envelope, dict):
             raise RuntimeError(
                 "SpeedTree Repair report has no current pipeline contract; "
@@ -5239,7 +5513,7 @@ class App:
                 "run Blender Repair again"
             )
         validate_preflight_envelope(
-            envelope, speedtree_output_spm_for(spm), require_ok=True
+            envelope, material_source_spm, require_ok=True
         )
         source_fingerprint = str(envelope.get("source_fingerprint") or "")
         suffix = source_fingerprint[:16] or hashlib.sha256(
@@ -5253,6 +5527,10 @@ class App:
             {
                 "status": "ok",
                 "speedtree_pipeline_contract": envelope,
+                "canonical_spm": str(
+                    speedtree_output_spm_for(spm).resolve()
+                ),
+                "material_source_spm": str(material_source_spm),
                 "source_repair_report": str(repair_report.resolve()),
             },
         )

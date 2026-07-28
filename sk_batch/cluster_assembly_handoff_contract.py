@@ -570,6 +570,12 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
     audited by PCG, so its complete records are valid aliases; no species or
     ordinal naming guess is needed.
     """
+    if receipt_row is None:
+        # A general-tree FBX can legitimately contain ordinary materials such
+        # as ``M_leaf_*`` without declaring an Assembly leaf role.  Inferring a
+        # role from that generic token turns pass-through content into a false
+        # dependency.  Only a receipt-authored row can provide role identity.
+        return []
     primary = _role_identity(role, receipt_row, contract)
     aliases = [primary]
     authoritative_spm = _authoritative_spm_for_requested(contract, spm_path)
@@ -919,6 +925,101 @@ def _reconcile_role(receipt_row, actual):
     return actual_decision, "pcg_receipt_and_actual_fbx_agree"
 
 
+def _artifact_row(value):
+    value = value if isinstance(value, dict) else {}
+    row = {
+        **value,
+        "path": value.get("path") or value.get("canonical_path"),
+    }
+    if "exists" not in row and row.get("path"):
+        row["exists"] = True
+    return row
+
+
+def _validated_isolated_bark_capture(provider_spm, canonical_material):
+    provider = Path(provider_spm)
+    report_path = (
+        provider.parent
+        / "reports"
+        / f"{provider.stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+    result = {
+        "provider_spm": str(provider),
+        "canonical_material": str(canonical_material or ""),
+        "pipeline_report": file_fingerprint(report_path),
+        "status": "missing_pipeline_report",
+        "validations": [],
+    }
+    try:
+        pipeline = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return result
+    resolution = pipeline.get("cluster_bark_source_resolution") or {}
+    if resolution.get("status") != "ready":
+        result["status"] = "bark_resolution_not_ready"
+        return result
+    if resolution.get("production_source_mutated") is not False:
+        result["status"] = "production_source_mutation_not_disproven"
+        return result
+    if (
+        normalize_export_name(resolution.get("canonical_material"))
+        != normalize_export_name(canonical_material)
+    ):
+        result["status"] = "canonical_material_mismatch"
+        return result
+
+    source_expected = _artifact_row(resolution.get("source_spm"))
+    isolated_expected = _artifact_row(resolution.get("speedtree_spm"))
+    manifest_expected = _artifact_row(resolution.get("manifest"))
+    validations = [
+        {
+            "artifact": "provider_source_spm",
+            **_compare_artifact(
+                source_expected,
+                file_fingerprint(provider),
+            ),
+        },
+        {
+            "artifact": "isolated_bark_spm",
+            **_compare_artifact(
+                isolated_expected,
+                file_fingerprint(isolated_expected.get("path") or ""),
+            ),
+        },
+        {
+            "artifact": "isolated_bark_manifest",
+            **_compare_artifact(
+                manifest_expected,
+                file_fingerprint(manifest_expected.get("path") or ""),
+            ),
+        },
+    ]
+    handoff = pipeline.get("speedtree_material_handoff_contract") or {}
+    handoff_source = _artifact_row(
+        (handoff.get("source") or {}).get("spm")
+    )
+    validations.append({
+        "artifact": "material_handoff_source_spm",
+        **_compare_artifact(
+            handoff_source,
+            file_fingerprint(handoff_source.get("path") or ""),
+        ),
+    })
+    if handoff.get("outcome") != "ok":
+        result["status"] = "material_handoff_not_ready"
+    elif not all(row.get("ok") for row in validations):
+        result["status"] = "bark_capture_artifact_mismatch"
+    elif (
+        _normalized_path(handoff_source.get("path"))
+        != _normalized_path(isolated_expected.get("path"))
+    ):
+        result["status"] = "material_handoff_not_bound_to_isolated_spm"
+    else:
+        result["status"] = "ready"
+    result["validations"] = validations
+    return result
+
+
 def build_assembly_handoff(receipt_path, spm_path, inventory):
     """Reconcile one PCG receipt with the exact imported FBX inventory."""
     _payload, contract = load_cluster_contract(receipt_path, spm_path)
@@ -933,7 +1034,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             contract,
             spm_path,
         )
-        identity = identities[0]
+        identity = identities[0] if identities else ""
         actual = classify_inventory_role(
             inventory,
             role,
@@ -987,6 +1088,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
 
     pcg_handoff = contract.get("handoff") or {}
     pcg_handoff_status = str(pcg_handoff.get("status") or "")
+    canonical_bark_captures = []
     if pcg_handoff_status in {"blocked", "needs_bark_normalization"}:
         detailed = []
         if pcg_handoff_status == "needs_bark_normalization":
@@ -1013,6 +1115,13 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 if source.get("replacement") != "required":
                     continue
                 provider = str(source.get("cluster_spm") or "")
+                capture = _validated_isolated_bark_capture(
+                    provider,
+                    bark.get("canonical_material"),
+                )
+                canonical_bark_captures.append(capture)
+                if capture.get("status") == "ready":
+                    continue
                 detailed.append({
                     "code": "CANONICAL_BARK_NORMALIZATION_REQUIRED",
                     "role": dependency_roles.get(
@@ -1024,7 +1133,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                     "canonical_material": bark.get(
                         "canonical_material"
                     ),
-                    "reason": "isolated_bark_capture_missing",
+                    "reason": capture.get("status"),
                     "texture_refs": list(
                         source.get("texture_refs") or []
                     ),
@@ -1039,13 +1148,16 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 )
                 if isinstance(row, dict)
             ]
-        issues.extend(
-            detailed
-            or [{
-                "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
-                "reason": pcg_handoff_status,
-            }]
-        )
+        if pcg_handoff_status == "needs_bark_normalization":
+            issues.extend(detailed)
+        else:
+            issues.extend(
+                detailed
+                or [{
+                    "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
+                    "reason": pcg_handoff_status,
+                }]
+            )
 
     normalize_roles = [row for row in roles if row["decision"] == "normalize_part"]
     if issues:
@@ -1063,6 +1175,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
         "actual_fbx": inventory.get("source_fbx") or {},
         "artifact_validation": artifacts,
         "pcg_handoff_status": pcg_handoff_status,
+        "canonical_bark_captures": canonical_bark_captures,
         "roles": roles,
         "full_skeletal_mesh": {
             "preserved": True,

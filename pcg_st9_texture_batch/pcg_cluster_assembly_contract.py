@@ -683,7 +683,15 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
         accepted_identities.append(folder_identity)
     candidates = []
     for spm in target_spms:
+        active_ids = {
+            str(value) for value in audit.active_material_ids(spm)
+        }
         for row in audit.extract_material_image_refs(spm):
+            if (
+                active_ids
+                and str(row.get("material_id")) not in active_ids
+            ):
+                continue
             identity = normalize_export_name(row.get("material_name"))
             if identity in accepted_identities:
                 candidates.append({
@@ -746,7 +754,12 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
             # Texture provenance, rather than a convenient material label, is
             # the fallback evidence.  This catches Elm-named materials that
             # still point into a Nothofagus source set.
-            if not matches and species and row.get("refs"):
+            if (
+                not matches
+                and not canonical
+                and species
+                and row.get("refs")
+            ):
                 matches = all(
                     species in str(value).casefold()
                     for value in row.get("refs") or []
@@ -773,7 +786,53 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                     isolated_capture if isolated_capture_matches else None
                 ),
             })
-    if not canonical:
+    canonical_conflicts = []
+    if not canonical and sources:
+        provider_groups = {}
+        for row in sources:
+            if not row.get("matches_canonical_textures"):
+                continue
+            authority = normalize_export_name(row.get("material_name"))
+            texture_signature = tuple(sorted({
+                Path(value).name.casefold()
+                for value in row.get("texture_refs") or []
+            }))
+            provider_groups.setdefault(
+                (authority, texture_signature),
+                [],
+            ).append(row)
+        if len(provider_groups) == 1:
+            (authority, _texture_signature), rows = next(
+                iter(provider_groups.items())
+            )
+            canonical = [
+                {
+                    "spm": row["cluster_spm"],
+                    "identity": authority,
+                    "material_id": row.get("material_id"),
+                    "material_name": row.get("material_name"),
+                    "refs": list(row.get("texture_refs") or []),
+                    "authority": "active_provider_texture_provenance",
+                }
+                for row in rows
+            ]
+        elif provider_groups:
+            canonical_conflicts = [
+                {
+                    "material_identity": identity,
+                    "texture_basenames": list(texture_signature),
+                    "providers": sorted({
+                        row["cluster_spm"] for row in rows
+                    }),
+                }
+                for (identity, texture_signature), rows
+                in sorted(provider_groups.items())
+            ]
+    if not canonical and not sources:
+        status = "not_applicable"
+    elif canonical_conflicts:
+        status = "blocked_canonical_ambiguous"
+    elif not canonical:
         status = "blocked_canonical_missing"
     elif any(row["replacement"] == "required" for row in sources):
         status = "replacement_required"
@@ -784,9 +843,10 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
         "canonical_material": (
             display_export_name(canonical[0]["material_name"])
             if canonical
-            else f"M_{expected}"
+            else f"M_{expected}" if sources else None
         ),
         "canonical_sources": canonical,
+        "canonical_conflicts": canonical_conflicts,
         "cluster_bark_sources": sources,
         "mutation_applied": False,
     }
@@ -1922,10 +1982,27 @@ def build_cluster_assembly_contract(
         usage = audit.cluster_material_usage(
             assembly_source_spms, clusters)
 
+    for pair_row in cluster_pairs:
+        dependency_usage = _usage_for_cluster(usage, pair_row)
+        usage_roles = {
+            dependency_role(name)
+            for name in (
+                (dependency_usage or {}).get("material_names") or []
+            )
+            if dependency_role(name)
+        }
+        filename_role = dependency_role(pair_row["output_spm"].stem)
+        pair_row["filename_role"] = filename_role
+        pair_row["usage_roles"] = sorted(usage_roles)
+        pair_row["content_role"] = (
+            next(iter(usage_roles))
+            if len(usage_roles) == 1
+            else filename_role
+        )
     content_candidates = [
         row for row in cluster_pairs
         if _usage_for_cluster(usage, row) is not None
-        and dependency_role(row["output_spm"].stem) in ROLE_ORDER
+        and row.get("content_role") in ROLE_ORDER
     ]
     relevant_clusters = [
         row for row in content_candidates
@@ -1933,7 +2010,7 @@ def build_cluster_assembly_contract(
     ]
     excluded_unregistered_clusters = [
         {
-            "role": dependency_role(row["output_spm"].stem),
+            "role": row.get("content_role"),
             "name": row["output_spm"].stem,
             "spm": str(row["output_spm"]),
             "reason": "explicit_target_relation_off",
@@ -1950,7 +2027,7 @@ def build_cluster_assembly_contract(
     for role in ROLE_ORDER:
         providers = [
             row for row in relevant_clusters
-            if dependency_role(row["output_spm"].stem) == role
+            if row.get("content_role") == role
         ]
         if not providers:
             continue
@@ -1968,7 +2045,7 @@ def build_cluster_assembly_contract(
         cluster = pair_row["source_spm"]
         authoring_spm = pair_row["authoring_spm"]
         output_spm = pair_row["output_spm"]
-        role = dependency_role(output_spm.stem)
+        role = pair_row["content_role"]
         dependency_usage = _usage_for_cluster(usage, pair_row)
         primary_provider = primary_provider_by_role[role]
         expected_identity = primary_provider["output_spm"].stem
@@ -1991,12 +2068,8 @@ def build_cluster_assembly_contract(
                 normalized_variants,
                 output_spm,
             )
-        usage_roles = {
-            dependency_role(name)
-            for name in dependency_usage.get("material_names") or []
-            if dependency_role(name)
-        }
-        role_conflict = bool(usage_roles and usage_roles != {role})
+        usage_roles = set(pair_row.get("usage_roles") or [])
+        role_conflict = len(usage_roles) > 1
         material_names_by_spm = dependency_usage.get(
             "material_names_by_spm") or {}
         targets = []
@@ -2118,6 +2191,7 @@ def build_cluster_assembly_contract(
             ),
             "primary_role_source": primary_role_source,
             "role_conflict": role_conflict,
+            "filename_role": pair_row.get("filename_role"),
             "usage_roles": sorted(usage_roles),
             "spm_fingerprint": file_fingerprint(cluster),
             "authoring_spm_fingerprint": file_fingerprint(authoring_spm),

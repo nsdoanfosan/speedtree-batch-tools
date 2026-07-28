@@ -764,6 +764,16 @@ def main():
                 pipeline_data["speedtree_pipeline_contract"] = (
                     material_preflight["speedtree_pipeline_contract"]
                 )
+                # Preserve the exact validated Repair input separately from
+                # the canonical production contract. Cluster providers may be
+                # repaired from an isolated, bark-normalized SPM whose
+                # textures intentionally differ from the untouched authored
+                # source. Later normalization stages may refresh the canonical
+                # envelope, but Push must consume the same content-addressed
+                # material input that built this blend.
+                pipeline_data["speedtree_material_handoff_contract"] = (
+                    material_preflight["speedtree_pipeline_contract"]
+                )
                 pipeline_data["speedtree_pipeline_contract_required"] = True
             texture_normalization = pipeline_data.get("texture_normalization") or {}
             report["texture_normalization"] = texture_normalization

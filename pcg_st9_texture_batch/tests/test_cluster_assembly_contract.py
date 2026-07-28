@@ -242,6 +242,63 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 ],
             )
 
+    def test_content_usage_role_overrides_generic_cluster_filename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "tree_nothofagus"
+            cluster_dir = folder / "Cluster"
+            provider = cluster_dir / "SK_cluster_nothofagus_01.spm"
+            target = folder / "SK_tree_nothofagus_01.spm"
+            texture = cluster_dir / "SK_cluster_nothofagus_01.tga"
+            write_spm(
+                provider,
+                [("1", "M_leaf_nothofagus_01", [], ())],
+            )
+            write_spm(
+                target,
+                [(
+                    "2",
+                    "M_leaf_nothofagus_01",
+                    [str(texture)],
+                    ("7",),
+                )],
+                mesh_ids=("7",),
+            )
+            texture.write_bytes(b"texture")
+            usage = {
+                str(provider).casefold(): {
+                    "spms": [str(target)],
+                    "material_names": ["M_leaf_nothofagus_01"],
+                    "source_refs": [str(texture)],
+                },
+            }
+            normalized = {
+                "status": "ready",
+                "variants": [{"ordinal": 1}],
+            }
+
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                return_value=normalized,
+            ), mock.patch(
+                "pcg_cluster_assembly_contract."
+                "_validate_normalized_source_dependency",
+            ):
+                contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [provider],
+                    cluster_usage=usage,
+                )
+
+            dependency = contract["dependencies"][0]
+            self.assertEqual(dependency["filename_role"], "cluster")
+            self.assertEqual(dependency["role"], "leaf")
+            self.assertFalse(dependency["role_conflict"])
+            self.assertNotIn(
+                "CLUSTER_ROLE_CONFLICT",
+                [row["code"] for row in contract["handoff"]["errors"]],
+            )
+
     def test_explicit_off_registry_overrides_same_named_rendered_role(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "tree_lauraceae"
@@ -2488,6 +2545,174 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(contract["status"], "canonical")
             self.assertEqual(contract["canonical_material"], bark_name)
             self.assertEqual(len(contract["canonical_sources"]), 1)
+
+    def test_provider_texture_provenance_can_supply_missing_owner_bark(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_tree_black_locast_01.spm"
+            provider = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_black_locast_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [
+                    (
+                        "1",
+                        "M_bark_black_locast_01",
+                        ["Texture/black_locast/Bark_Albedo.tif"],
+                        ("1",),
+                    ),
+                    (
+                        "2",
+                        "M_bark_common_end_01",
+                        ["Texture/bark/common_end_color.tga"],
+                        ("2",),
+                    ),
+                ],
+                mesh_ids=("1", "2"),
+                active_material_ids=("1", "2"),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+            )
+
+            self.assertEqual(contract["status"], "replacement_required")
+            self.assertEqual(
+                contract["canonical_material"],
+                "M_bark_black_locast_01",
+            )
+            self.assertEqual(
+                contract["canonical_sources"][0]["authority"],
+                "active_provider_texture_provenance",
+            )
+
+    def test_direct_owner_bark_requires_same_named_provider_texture_replacement(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_bush_black_locast_01.spm"
+            provider = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            write_spm(
+                target,
+                [(
+                    "1",
+                    "M_bark_black_locast_01",
+                    ["texture/T_bark_black_locast_01_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [(
+                    "1",
+                    "M_bark_black_locast_01",
+                    ["Texture/black_locast/uktladjcw_Albedo.tif"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+            )
+
+            self.assertEqual(contract["status"], "replacement_required")
+            self.assertEqual(
+                contract["cluster_bark_sources"][0]["replacement"],
+                "required",
+            )
+
+    def test_conflicting_provider_texture_sets_do_not_invent_one_canonical(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_tree_black_locast_01.spm"
+            branch = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            cluster = folder / "cluster" / "SK_cluster_black_locast_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_black_locast_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                branch,
+                [(
+                    "1",
+                    "M_bark_black_locast_01",
+                    ["Texture/black_locast/uktladjcw_Albedo.tif"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+            write_spm(
+                cluster,
+                [(
+                    "1",
+                    "M_bark_black_locast_01",
+                    ["texture/T_bark_black_locast_01_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [
+                    {"source_spm": branch, "spm": branch},
+                    {"source_spm": cluster, "spm": cluster},
+                ],
+            )
+
+            self.assertEqual(
+                contract["status"],
+                "blocked_canonical_ambiguous",
+            )
+            self.assertEqual(contract["canonical_sources"], [])
+            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+
+    def test_barkless_owner_and_provider_do_not_invent_canonical_bark(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_meadow"
+            target = folder / "SK_weed_meadow_01.spm"
+            provider = folder / "cluster" / "SK_cluster_meadow_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_meadow_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [("1", "M_leaf_meadow_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+            )
+
+            self.assertEqual(contract["status"], "not_applicable")
+            self.assertIsNone(contract["canonical_material"])
 
 
 if __name__ == "__main__":

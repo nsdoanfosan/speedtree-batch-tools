@@ -308,6 +308,141 @@ class BlendLiveStatusTests(unittest.TestCase):
                 json.loads(report.read_text(encoding="utf-8")),
             )
 
+    def test_isolated_material_handoff_loads_without_rewriting_report(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_test" / "Cluster"
+            spm = cluster / "SK_branch_test_01.spm"
+            isolated = (
+                cluster / ".sk_batch_isolated_bark" / "scope"
+                / "Tree_test" / "Cluster" / spm.name
+            )
+            spm.parent.mkdir(parents=True)
+            isolated.parent.mkdir(parents=True)
+            write_empty_spm(spm)
+            write_empty_spm(isolated)
+            production_identity = source_identity(spm)
+            isolated_identity = source_identity(isolated)
+            handoff = {
+                "source": {
+                    "spm": isolated_identity,
+                    "stmat": [],
+                },
+            }
+            report = gui.repair_pipeline_report_path(spm)
+            report.parent.mkdir()
+            payload = {
+                "speedtree_pipeline_contract": {"legacy": True},
+                "speedtree_material_handoff_contract": handoff,
+                "cluster_bark_source_resolution": {
+                    "status": "ready",
+                    "source_spm": {
+                        "path": production_identity["canonical_path"],
+                        "size": production_identity["size"],
+                        "sha256": production_identity["sha256"],
+                    },
+                    "speedtree_spm": {
+                        "path": isolated_identity["canonical_path"],
+                        "size": isolated_identity["size"],
+                        "sha256": isolated_identity["sha256"],
+                    },
+                },
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            before = report.read_bytes()
+
+            with mock.patch.object(
+                gui,
+                "validate_preflight_envelope",
+            ) as validate:
+                loaded = gui.load_current_repair_pipeline_report(spm)
+
+            self.assertEqual(loaded, payload)
+            self.assertEqual(report.read_bytes(), before)
+            validate.assert_called_once_with(
+                handoff,
+                isolated.resolve(),
+                require_ok=True,
+            )
+
+    def test_isolated_bark_report_without_exact_handoff_never_migrates(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Tree_test" / "Cluster"
+            spm = cluster / "SK_branch_test_01.spm"
+            isolated = cluster / ".isolated" / spm.name
+            spm.parent.mkdir(parents=True)
+            isolated.parent.mkdir(parents=True)
+            write_empty_spm(spm)
+            write_empty_spm(isolated)
+            production_identity = source_identity(spm)
+            isolated_identity = source_identity(isolated)
+            report = gui.repair_pipeline_report_path(spm)
+            report.parent.mkdir()
+            payload = {
+                "speedtree_pipeline_contract": {"outcome": "ok"},
+                "cluster_bark_source_resolution": {
+                    "status": "ready",
+                    "source_spm": {
+                        "path": production_identity["canonical_path"],
+                    },
+                    "speedtree_spm": {
+                        "path": isolated_identity["canonical_path"],
+                    },
+                },
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            before = report.read_bytes()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "no exact material handoff contract",
+            ):
+                gui.load_current_repair_pipeline_report(spm)
+
+            self.assertEqual(report.read_bytes(), before)
+
+    def test_legacy_material_report_with_unresolved_bindings_never_migrates(
+        self,
+    ):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_legacy_material_01.spm"
+            blend = spm.with_suffix(".blend")
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            report = gui.repair_pipeline_report_path(spm)
+            report.parent.mkdir()
+            payload = {
+                "speedtree_live_source_identity": {
+                    "spm": source_identity(spm),
+                },
+                "texture_normalization": {"status": "ok"},
+                "handoff_preflight": {"status": "ok"},
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            self.set_time(blend, 1_000_000_000)
+            self.set_time(report, 2_000_000_000)
+            before = report.read_bytes()
+
+            with mock.patch.object(
+                gui,
+                "build_preflight_envelope",
+                return_value={
+                    "material_intents": [{
+                        "material_name": "M_Bark",
+                        "texture_source_mode": "unresolved",
+                    }],
+                },
+            ), self.assertRaisesRegex(
+                ValueError,
+                "cannot prove material texture bindings",
+            ):
+                gui.load_current_repair_pipeline_report(spm)
+
+            self.assertEqual(report.read_bytes(), before)
+
     def test_cluster_contract_uses_canonical_sk_output_and_stmat(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -1034,6 +1169,87 @@ class BlendLiveStatusTests(unittest.TestCase):
 
         self.assertTrue(ready)
         self.assertEqual(reason, "")
+
+    def test_matching_prepared_unused_role_does_not_recur_on_new_live_report(self):
+        gui = load_gui_module()
+
+        def artifact(path, sha256):
+            return {
+                "path": path,
+                "exists": True,
+                "size": 10,
+                "mtime_ns": 123,
+                "sha256": sha256,
+            }
+
+        normalized = {
+            "status": "ready",
+            "contract": "atlas_normalized_plan_skeletal_pair_v1",
+            "material": "M_cluster_densiflora_01",
+            "material_id": 5,
+            "manifest": artifact(
+                r"D:\tree\.atlas\scope.json",
+                "a" * 64,
+            ),
+            "source_blend": artifact(
+                r"D:\tree\cluster\source.blend",
+                "b" * 64,
+            ),
+            "variants": [{
+                "ordinal": 1,
+                "plan_name": "cluster_01",
+                "skeletal_asset_name": "SK_cluster_01",
+                "source_prototype_index": 1,
+                "source_partition_mode": "PER_CONNECTED_DEFORM_CLUSTER",
+                "target_mesh_id": 7,
+                "physical_capture_contract_sha256": "c" * 64,
+                "plan_fbx": artifact(
+                    r"D:\tree\meshes\cluster_01.fbx",
+                    "d" * 64,
+                ),
+            }],
+        }
+        saved_manifest = {
+            "status": "pass_through",
+            "content_decision": "pass_through",
+            "reason": (
+                "normalized_roles_are_prepared_but_unused_by_rendered_mesh"
+            ),
+            "rendered_role_count": 0,
+            "prepared_unused_roles": {
+                "cluster": {
+                    "role": "cluster",
+                    "normalized_variants": normalized,
+                },
+            },
+        }
+        live_contract = {
+            "handoff": {
+                "status": "ready",
+                "roles": [{
+                    "role": "cluster",
+                    "normalized_variants": json.loads(
+                        json.dumps(normalized)
+                    ),
+                }],
+            },
+        }
+
+        self.assertTrue(
+            gui.rendered_unused_pass_through_matches_live(
+                saved_manifest,
+                live_contract,
+            )
+        )
+        live_contract["handoff"]["roles"][0]["normalized_variants"][
+            "variants"
+        ][0]["plan_fbx"]["sha256"] = "e" * 64
+        self.assertFalse(
+            gui.rendered_unused_pass_through_matches_live(
+                saved_manifest,
+                live_contract,
+            )
+        )
 
     def test_current_receipt_must_match_ready_report_receipt_evidence(self):
         gui = load_gui_module()

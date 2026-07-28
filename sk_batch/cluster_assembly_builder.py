@@ -1598,10 +1598,6 @@ def validate_binding_hierarchy(
         skeleton_snapshot,
         skeleton_by_name,
     )
-    if wind_bones is not None and anchor not in wind_bones:
-        raise ClusterAssemblyBuildError(
-            f"Assembly binding ancestor is absent from final wind hierarchy: {anchor}"
-        )
     declared = binding.get("anchor_bone")
     if declared and declared != anchor:
         raise ClusterAssemblyBuildError(

@@ -1239,6 +1239,94 @@ class DynamicWindContractTests(unittest.TestCase):
             "Branch_A",
         )
 
+    def test_non_simulated_import_root_can_anchor_sibling_wind_joints(self):
+        identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        snapshot = make_skeleton_snapshot(
+            [
+                {
+                    "name": "Root",
+                    "index": 0,
+                    "parent_name": "",
+                    "parent_index": -1,
+                    "bind_matrix": identity,
+                },
+                {
+                    "name": "Branch_A",
+                    "index": 1,
+                    "parent_name": "Root",
+                    "parent_index": 0,
+                    "bind_matrix": identity,
+                },
+                {
+                    "name": "Branch_B",
+                    "index": 2,
+                    "parent_name": "Root",
+                    "parent_index": 0,
+                    "bind_matrix": identity,
+                },
+            ]
+        )
+        payload = {
+            "SkeletonContract": {
+                "SchemaVersion": 2,
+                "BoneCount": snapshot["bone_count"],
+                "BoneNameIndexParentSha1": snapshot[
+                    "bone_name_index_parent_sha1"
+                ],
+                "Bones": [
+                    {
+                        "BoneName": row["name"],
+                        "BoneIndex": row["index"],
+                        "ParentIndex": row["parent_index"],
+                    }
+                    for row in snapshot["bones"]
+                ],
+                "ImportRoot": {
+                    "BoneName": "Root",
+                    "BoneIndex": 0,
+                    "ParentIndex": -1,
+                },
+            },
+            "Joints": [
+                {
+                    "JointName": "Branch_A",
+                    "BoneIndex": 1,
+                    "ParentIndex": 0,
+                    "SimulationGroupIndex": 0,
+                },
+                {
+                    "JointName": "Branch_B",
+                    "BoneIndex": 2,
+                    "ParentIndex": 0,
+                    "SimulationGroupIndex": 0,
+                },
+            ],
+            "SimulationGroups": [{"Name": "branch"}],
+        }
+        binding = {
+            "anchor_bone": "Root",
+            "bone_influences": [
+                {"bone": "Branch_A", "weight": 0.5},
+                {"bone": "Branch_B", "weight": 0.5},
+            ],
+        }
+
+        report = validate_wind_json_against_skeleton(
+            payload,
+            snapshot,
+            [binding],
+        )
+
+        self.assertEqual(
+            report["binding_hierarchy"][0]["anchor_bone"],
+            "Root",
+        )
+
     def test_declared_wind_index_must_match_final_skeleton(self):
         payload = self.wind_payload()
         payload["Joints"][1]["BoneIndex"] = 99

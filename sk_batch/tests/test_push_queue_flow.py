@@ -93,6 +93,20 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(first, third)
         self.assertEqual(reads, [report, report])
 
+    def test_unreal_process_probe_uses_locale_independent_bytes(self):
+        gui = load_gui_module()
+        completed = mock.Mock(
+            stdout=b"UnrealEditor.exe   1234 Console   \xc1"
+        )
+        with mock.patch.object(
+            gui.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            self.assertTrue(gui.App._unreal_running())
+
+        self.assertNotIn("text", run.call_args.kwargs)
+
     def test_process_runner_cleans_up_child_when_progress_callback_raises(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -419,6 +433,89 @@ class PushQueueFlowTests(unittest.TestCase):
             self.assertTrue(contract_path.name.endswith(f"{'a' * 16}.json"))
             validate.assert_called_once_with(envelope, spm, require_ok=True)
 
+    def test_push_contract_uses_exact_isolated_repair_material_source(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir) / "logs"
+        ), mock.patch.object(gui, "validate_preflight_envelope") as validate:
+            root = Path(temp_dir) / "tree"
+            cluster = root / "cluster"
+            spm = cluster / "SK_branch_test_01.spm"
+            isolated = (
+                cluster / ".sk_batch_isolated_bark" / "scope"
+                / "tree" / "cluster" / spm.name
+            )
+            spm.parent.mkdir(parents=True)
+            isolated.parent.mkdir(parents=True)
+            spm.write_bytes(b"authored-production")
+            isolated.write_bytes(b"isolated-normalized")
+            production_identity = gui.source_identity(spm)
+            isolated_identity = gui.source_identity(isolated)
+            envelope = {
+                "source_fingerprint": "b" * 64,
+                "source": {
+                    "spm": isolated_identity,
+                    "stmat": [],
+                },
+            }
+            report = cluster / "reports" / (
+                "SK_branch_test_01_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {
+                        "source_fingerprint": "c" * 64,
+                    },
+                    "speedtree_material_handoff_contract": envelope,
+                    "cluster_bark_source_resolution": {
+                        "status": "ready",
+                        "source_spm": {
+                            "path": production_identity["canonical_path"],
+                            "size": production_identity["size"],
+                            "sha256": production_identity["sha256"],
+                        },
+                        "speedtree_spm": {
+                            "path": isolated_identity["canonical_path"],
+                            "size": isolated_identity["size"],
+                            "sha256": isolated_identity["sha256"],
+                        },
+                    },
+                    "handoff_preflight": {"status": "ok"},
+                }),
+                encoding="utf-8",
+            )
+
+            contract_path = gui.App._push_material_contract(spm)
+
+            payload = json.loads(contract_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["speedtree_pipeline_contract"],
+                envelope,
+            )
+            self.assertEqual(
+                Path(payload["material_source_spm"]),
+                isolated.resolve(),
+            )
+            validate.assert_called_once_with(
+                envelope,
+                isolated.resolve(),
+                require_ok=True,
+            )
+            mismatched = json.loads(report.read_text(encoding="utf-8"))
+            mismatched["speedtree_material_handoff_contract"]["source"][
+                "spm"
+            ] = production_identity
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "not bound to the current canonical SPM",
+            ):
+                gui._material_handoff_envelope_for_push(
+                    mismatched,
+                    spm,
+                )
+
     def test_push_entrypoints_forward_strict_contract_to_blender_job(self):
         gui_source = (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(encoding="utf-8")
         gui_tree = ast.parse(gui_source)
@@ -488,7 +585,7 @@ class PushQueueFlowTests(unittest.TestCase):
             push_source,
         )
         self.assertIn(
-            "cluster_manifest is not None",
+            "actionable_cluster_manifest",
             push_source,
         )
         self.assertIn(

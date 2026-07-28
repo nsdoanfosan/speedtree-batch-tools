@@ -344,6 +344,35 @@ def test_data_error_is_item_local_and_queue_continues(tmp_path, monkeypatch):
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
 
 
+def test_headless_queue_collects_transient_objects_after_each_item(
+    tmp_path, monkeypatch
+):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path,
+        [item("first", "first-v1"), item("second", "second-v1")],
+    )
+    unreal_collections = []
+    python_collections = []
+    runner.unreal.collect_garbage = lambda: unreal_collections.append(True)
+    monkeypatch.setattr(
+        runner.gc,
+        "collect",
+        lambda: python_collections.append(True),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["counts"] == {"imported_ok": 2}
+    assert unreal_collections == [True, True]
+    assert python_collections == [True, True]
+
+
 def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     root = item("tree", "tree-v1")
@@ -2175,3 +2204,195 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
         self.assertTrue(result["redirector_cleared"])
         self.assertNotIn(canonical, assets)
         self.assertIn(canonical + "_Legacy_abc123", assets)
+
+    def test_unreferenced_canonical_redirector_is_removed_for_publish(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        assets = {canonical: {"class": "ObjectRedirector"}}
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(path, _load_assets=True):
+                return []
+
+            @staticmethod
+            def delete_asset(path):
+                return assets.pop(path, None) is not None
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner._is_headless_manifest_runtime = lambda: True
+
+        result = runner._clear_unreferenced_canonical_redirector(canonical)
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["referencers"], [])
+        self.assertNotIn(canonical, assets)
+
+    def test_redirector_delete_is_collected_before_registry_recheck(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        assets = {canonical: {"class": "ObjectRedirector"}}
+        pending_delete = set()
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(path, _load_assets=True):
+                return []
+
+            @staticmethod
+            def delete_asset(path):
+                pending_delete.add(path)
+                return True
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner.unreal.collect_garbage = lambda: [
+            assets.pop(path, None)
+            for path in tuple(pending_delete)
+        ]
+        runner._is_headless_manifest_runtime = lambda: True
+
+        result = runner._clear_unreferenced_canonical_redirector(canonical)
+
+        self.assertTrue(result["deleted"])
+        self.assertNotIn(canonical, assets)
+
+    def test_persistent_redirector_package_is_quarantined_and_rescanned(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        assets = {canonical: {"class": "ObjectRedirector"}}
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            content = project / "Content"
+            saved = project / "Saved"
+            package = (
+                content
+                / "Meshes"
+                / "Trees"
+                / "SK_Test_Skeleton.uasset"
+            )
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"redirector")
+
+            class FakeEditorAssetLibrary:
+                @staticmethod
+                def does_asset_exist(path):
+                    return path in assets
+
+                @staticmethod
+                def load_asset(path):
+                    return assets.get(path)
+
+                @staticmethod
+                def find_package_referencers_for_asset(
+                    path,
+                    _load_assets=True,
+                ):
+                    return []
+
+                @staticmethod
+                def delete_asset(path):
+                    return path in assets
+
+            class FakeRegistry:
+                @staticmethod
+                def scan_modified_asset_files(_paths):
+                    if not package.exists():
+                        assets.pop(canonical, None)
+
+                @staticmethod
+                def wait_for_completion():
+                    return None
+
+            runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+            runner.unreal.Paths = types.SimpleNamespace(
+                project_content_dir=lambda: str(content),
+                project_saved_dir=lambda: str(saved),
+            )
+            runner.unreal.AssetRegistryHelpers = types.SimpleNamespace(
+                get_asset_registry=lambda: FakeRegistry(),
+            )
+            runner.unreal.collect_garbage = lambda: None
+            runner._is_headless_manifest_runtime = lambda: True
+
+            result = runner._clear_unreferenced_canonical_redirector(
+                canonical
+            )
+
+            backup = Path(result["quarantine"]["backup_file"])
+            self.assertTrue(result["deleted"])
+            self.assertFalse(package.exists())
+            self.assertTrue(backup.is_file())
+            self.assertEqual(backup.read_bytes(), b"redirector")
+            self.assertNotIn(canonical, assets)
+
+    def test_referenced_canonical_redirector_remains_blocked(self):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        assets = {canonical: {"class": "ObjectRedirector"}}
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return path in assets
+
+            @staticmethod
+            def load_asset(path):
+                return assets.get(path)
+
+            @staticmethod
+            def find_package_referencers_for_asset(path, _load_assets=True):
+                return ["/Game/Meshes/Trees/SK_Other"]
+
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner._is_headless_manifest_runtime = lambda: True
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "referenced redirector.*SK_Other",
+        ):
+            runner._clear_unreferenced_canonical_redirector(canonical)
+
+        self.assertIn(canonical, assets)
+
+    def test_canonical_redirector_cleanup_requires_headless_and_referencer_api(
+        self,
+    ):
+        runner = load_runner()
+        canonical = "/Game/Meshes/Trees/SK_Test_Skeleton"
+        assets = {canonical: {"class": "ObjectRedirector"}}
+
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            does_asset_exist=lambda path: path in assets,
+            load_asset=lambda path: assets.get(path),
+        )
+        runner._is_headless_manifest_runtime = lambda: False
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "only in a fresh headless",
+        ):
+            runner._clear_unreferenced_canonical_redirector(canonical)
+
+        runner._is_headless_manifest_runtime = lambda: True
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "referencer API is unavailable",
+        ):
+            runner._clear_unreferenced_canonical_redirector(canonical)
+
+        self.assertIn(canonical, assets)

@@ -500,6 +500,49 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(role["status"], "absent")
             self.assertEqual(role["decision"], "pass_through")
 
+    def test_undeclared_generic_leaf_material_is_not_an_assembly_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_weed_velvet_grass_03.spm"
+            fbx = root / "fbx" / "SK_weed_velvet_grass_03.fbx"
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.parent.mkdir()
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("cluster", "cluster_velvet_grass_01", "pass_through")],
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            contract = payload["items"][0]["cluster_assembly"]
+            identities = role_identity_aliases_from_contract(contract, spm)
+            inventory = build_blender_fbx_inventory(
+                [
+                    role_object(
+                        fbx,
+                        material="M_leaf_velvet_grass_01",
+                    )
+                ],
+                fbx,
+                identities,
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            leaf = next(
+                row for row in handoff["roles"] if row["role"] == "leaf"
+            )
+            self.assertEqual(identities["leaf"], [])
+            self.assertEqual(leaf["status"], "absent")
+            self.assertEqual(leaf["decision"], "pass_through")
+            self.assertEqual(
+                leaf["reconciliation"],
+                "receipt_and_fbx_absent",
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+
     def test_complete_branch_and_absent_leaf_build_separate_assembly_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -725,6 +768,105 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 issue["canonical_material"],
                 "M_bark_elm_01",
             )
+
+    def test_exact_isolated_bark_capture_satisfies_stale_receipt_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            provider = root / "Cluster" / "SK_leaf_elm_01.spm"
+            isolated = root / "isolated" / "SK_leaf_elm_01.spm"
+            manifest = root / "isolated" / "manifest.json"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            provider.parent.mkdir()
+            provider.write_bytes(b"provider")
+            isolated.parent.mkdir()
+            isolated.write_bytes(b"isolated provider")
+            manifest.write_text("{}", encoding="utf-8")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "leaf_elm_01", "pending_export")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                    },
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            handoff_contract = payload["items"][0][
+                "cluster_assembly"
+            ]["handoff"]
+            handoff_contract["status"] = "needs_bark_normalization"
+            handoff_contract["cluster_dependencies"] = [{
+                "role": "leaf",
+                "spm": str(provider),
+                "output_spm": str(provider),
+                "spm_fingerprint": file_fingerprint(provider),
+            }]
+            handoff_contract["canonical_bark"] = {
+                "status": "replacement_required",
+                "canonical_material": "M_bark_elm_01",
+                "cluster_bark_sources": [{
+                    "cluster_spm": str(provider),
+                    "material_name": "M_bark_common_end_01",
+                    "replacement": "required",
+                    "texture_refs": ["T_bark_common_end_01_color.tga"],
+                }],
+            }
+            receipt.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+            reports = provider.parent / "reports"
+            reports.mkdir()
+            source_fingerprint = file_fingerprint(provider)
+            isolated_fingerprint = file_fingerprint(isolated)
+            report = {
+                "cluster_bark_source_resolution": {
+                    "status": "ready",
+                    "production_source_mutated": False,
+                    "canonical_material": "M_bark_elm_01",
+                    "source_spm": source_fingerprint,
+                    "speedtree_spm": isolated_fingerprint,
+                    "manifest": file_fingerprint(manifest),
+                },
+                "speedtree_material_handoff_contract": {
+                    "outcome": "ok",
+                    "source": {
+                        "spm": {
+                            **isolated_fingerprint,
+                            "canonical_path": str(isolated),
+                        },
+                    },
+                },
+            }
+            (
+                reports
+                / "SK_leaf_elm_01_speedtree_repair_pipeline_report_codex.json"
+            ).write_text(json.dumps(report), encoding="utf-8")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_leaf_elm_01")],
+                fbx,
+                {"leaf": "leaf_elm_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertNotEqual(handoff["status"], "blocked", handoff)
+            self.assertEqual(
+                handoff["canonical_bark_captures"][0]["status"],
+                "ready",
+            )
+            self.assertFalse(any(
+                row.get("code")
+                == "CANONICAL_BARK_NORMALIZATION_REQUIRED"
+                for row in handoff["issues"]
+            ))
 
     def test_receipt_pass_through_disagreeing_with_real_pair_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:

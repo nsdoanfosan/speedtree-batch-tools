@@ -1,11 +1,17 @@
 import gzip
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from cluster_bark_source_resolution import (
+    _copy_canonical_textures,
+    _copy_source_external_meshes,
     _publish_cache_directory,
+    _rebase_external_mesh_refs,
     prepare_isolated_bark_source,
     resolve_cluster_bark_source_spm,
 )
@@ -72,6 +78,11 @@ def test_cache_publish_retries_transient_windows_access_denied():
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary) / "staging"
         cache_dir = Path(temporary) / "cache"
+        staging.mkdir()
+        (staging / "bark_normalization_manifest.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
         denied = PermissionError(13, "access denied", str(cache_dir))
         denied.winerror = 5
 
@@ -88,6 +99,80 @@ def test_cache_publish_retries_transient_windows_access_denied():
 
         assert replace.call_count == 2
         sleep.assert_called_once_with(0.25)
+
+
+def test_cache_publish_falls_back_to_manifest_last_copy():
+    with tempfile.TemporaryDirectory() as temporary:
+        staging = Path(temporary) / "staging"
+        cache_dir = Path(temporary) / "cache"
+        artifact = staging / "tree" / "cluster" / "source.spm"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"isolated")
+        manifest = staging / "bark_normalization_manifest.json"
+        manifest.write_text('{"status":"ready"}', encoding="utf-8")
+        denied = PermissionError(13, "access denied", str(cache_dir))
+        denied.winerror = 5
+        real_replace = __import__("os").replace
+        manifest_promoted_after_artifacts = []
+
+        def replace(source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            if source == staging:
+                raise denied
+            manifest_promoted_after_artifacts.append(
+                (cache_dir / "tree" / "cluster" / "source.spm").is_file()
+                and not (
+                    cache_dir / "bark_normalization_manifest.json"
+                ).exists()
+            )
+            return real_replace(source, destination)
+
+        with (
+            mock.patch(
+                "cluster_bark_source_resolution.os.replace",
+                side_effect=replace,
+            ),
+            mock.patch(
+                "cluster_bark_source_resolution.time.sleep"
+            ),
+        ):
+            _publish_cache_directory(staging, cache_dir)
+
+        assert (
+            cache_dir / "tree" / "cluster" / "source.spm"
+        ).read_bytes() == b"isolated"
+        assert json.loads(
+            (cache_dir / "bark_normalization_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        ) == {"status": "ready"}
+        assert manifest_promoted_after_artifacts == [True]
+
+
+def test_cache_publish_refuses_preexisting_partial_destination():
+    with tempfile.TemporaryDirectory() as temporary:
+        staging = Path(temporary) / "staging"
+        cache_dir = Path(temporary) / "cache"
+        staging.mkdir()
+        (staging / "bark_normalization_manifest.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        cache_dir.mkdir()
+        partial = cache_dir / "partial.bin"
+        partial.write_bytes(b"keep-for-diagnosis")
+
+        with pytest.raises(
+            FileExistsError,
+            match="existing bark cache directory",
+        ):
+            _publish_cache_directory(staging, cache_dir)
+
+        assert partial.read_bytes() == b"keep-for-diagnosis"
+        assert not (
+            cache_dir / "bark_normalization_manifest.json"
+        ).exists()
 
 
 def test_content_addressed_bark_source_preserves_production_spm():
@@ -251,6 +336,173 @@ def test_live_owner_contract_overrides_missing_or_stale_receipt_cache():
             resolved["target_receipts"][0]["required_material_count"] == 1
         )
 
+def test_validated_isolated_capture_remains_the_provider_runtime_source():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "Tree_chestnut"
+        source = root / "Cluster" / "SK_leaf_chestnut_01.spm"
+        target = root / "SK_tree_chestnut_01.spm"
+        canonical_refs = ["texture/bark_chestnut_01_color.tga"]
+        _write_spm(
+            source,
+            "M_bark_common_end_01",
+            ["generic/common_color.tga"],
+        )
+        source_texture = source.parent / "generic" / "common_color.tga"
+        source_texture.parent.mkdir(parents=True, exist_ok=True)
+        source_texture.write_bytes(b"generic")
+        _write_spm(target, "M_bark_chestnut_01", canonical_refs)
+        canonical_texture = root / canonical_refs[0]
+        canonical_texture.parent.mkdir(parents=True, exist_ok=True)
+        canonical_texture.write_bytes(b"canonical")
+        contract = {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(target)},
+            }],
+            "dependencies": [{
+                "spm": str(source),
+            }],
+            "handoff": {
+                "canonical_bark": {
+                    "status": "canonical",
+                    "canonical_material": "M_bark_chestnut_01",
+                    "canonical_sources": [{
+                        "spm": str(target),
+                        "material_id": "1",
+                        "material_name": "M_bark_chestnut_01",
+                        "refs": canonical_refs,
+                    }],
+                    "cluster_bark_sources": [{
+                        "cluster_spm": str(source),
+                        "material_id": "1",
+                        "material_name": "M_bark_common_end_01",
+                        "replacement": "isolated_capture_validated",
+                    }],
+                },
+            },
+        }
+        live_contracts = [{
+            "target_spm": str(target),
+            "report": str(Path(temporary) / "live.json"),
+            "policy": "live_audit_authoritative",
+            "contract": contract,
+        }]
+        cache = Path(temporary) / "cache"
+
+        prepared = resolve_cluster_bark_source_spm(
+            source,
+            [target],
+            cache_parent=cache,
+            live_target_contracts=live_contracts,
+        )
+        cached = resolve_cluster_bark_source_spm(
+            source,
+            [target],
+            cache_parent=cache,
+            live_target_contracts=live_contracts,
+        )
+
+        assert prepared["status"] == "prepared"
+        assert cached["status"] == "cached"
+        assert cached["speedtree_spm"] == prepared["speedtree_spm"]
+        assert cached["target_receipts"][0][
+            "required_material_count"
+        ] == 1
+
+
+def test_direct_owner_canonical_overrides_provider_only_target_provenance():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "weed_black_locast"
+        source = root / "cluster" / "SK_branch_black_locast_01.spm"
+        owner = root / "SK_bush_black_locast_01.spm"
+        provider_only = root / "SK_tree_black_locast_01.spm"
+        _write_spm(
+            source,
+            "M_bark_common_end_01",
+            ["generic/common_color.tga"],
+        )
+        source_texture = source.parent / "generic" / "common_color.tga"
+        source_texture.parent.mkdir(parents=True, exist_ok=True)
+        source_texture.write_bytes(b"generic")
+        owner_refs = ["texture/T_bark_black_locast_01_color.tga"]
+        _write_spm(
+            owner,
+            "M_bark_black_locast_01",
+            owner_refs,
+        )
+        owner_texture = root / owner_refs[0]
+        owner_texture.parent.mkdir(parents=True, exist_ok=True)
+        owner_texture.write_bytes(b"owner")
+        provider_refs = ["legacy/uktladjcw_Albedo.tif"]
+        _write_spm(
+            provider_only,
+            "M_bark_black_locast_01",
+            provider_refs,
+        )
+        provider_texture = root / provider_refs[0]
+        provider_texture.parent.mkdir(parents=True, exist_ok=True)
+        provider_texture.write_bytes(b"provider")
+
+        def contract(target, refs, authority=None):
+            source_row = {
+                "spm": str(target),
+                "material_id": "1",
+                "material_name": "M_bark_black_locast_01",
+                "refs": refs,
+            }
+            if authority:
+                source_row["authority"] = authority
+            return {
+                "tree_source_identities": [{
+                    "target_spm": {"path": str(target)},
+                }],
+                "dependencies": [{"spm": str(source)}],
+                "handoff": {
+                    "canonical_bark": {
+                        "canonical_material": "M_bark_black_locast_01",
+                        "canonical_sources": [source_row],
+                        "cluster_bark_sources": [{
+                            "cluster_spm": str(source),
+                            "material_id": "1",
+                            "material_name": "M_bark_common_end_01",
+                            "replacement": "required",
+                        }],
+                    },
+                },
+            }
+
+        resolved = resolve_cluster_bark_source_spm(
+            source,
+            [owner, provider_only],
+            cache_parent=Path(temporary) / "cache",
+            live_target_contracts=[
+                {
+                    "target_spm": str(owner),
+                    "contract": contract(owner, owner_refs),
+                },
+                {
+                    "target_spm": str(provider_only),
+                    "contract": contract(
+                        provider_only,
+                        provider_refs,
+                        "active_provider_texture_provenance",
+                    ),
+                },
+            ],
+        )
+
+        assert resolved["status"] == "prepared"
+        manifest = json.loads(
+            Path(resolved["manifest"]).read_text(encoding="utf-8")
+        )
+        assert (
+            manifest["normalization"]["canonical_material"]
+            == "M_bark_black_locast_01"
+        )
+        assert {
+            Path(row["source"]).name
+            for row in manifest["copied_canonical_textures"]
+        } == {"T_bark_black_locast_01_color.tga"}
+
 
 def test_live_pass_through_contract_does_not_fall_back_to_old_receipt():
     with tempfile.TemporaryDirectory() as temporary:
@@ -337,6 +589,94 @@ def test_isolated_bark_source_copies_relative_external_mesh_dependencies():
         isolated = Path(prepared["speedtree_spm"])
 
         assert (isolated.parent / external_relative).read_bytes() == b"external-fbx"
+
+
+def test_isolated_bark_source_rebases_existing_mesh_outside_workspace():
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        production = (
+            workspace / "assets" / "deep" / "Cluster" / "SK_branch_ivy.spm"
+        )
+        external_ref = "../../../shared/roof_set_broken_dummy.fbx"
+        _write_spm(
+            production,
+            "M_bark_common_end_01",
+            [],
+            external_mesh=external_ref,
+        )
+        external_mesh = (
+            production.parent / external_ref
+        ).resolve()
+        external_mesh.parent.mkdir(parents=True, exist_ok=True)
+        external_mesh.write_bytes(b"shared-external-fbx")
+        production_hash = _sha256(production)
+
+        staging = workspace / "cache" / "staging"
+        isolated = (
+            staging / "Tree_ivy" / "Cluster" / production.name
+        )
+        isolated.parent.mkdir(parents=True, exist_ok=True)
+        isolated.write_bytes(production.read_bytes())
+        copied = _copy_source_external_meshes(
+            {
+                "source_external_meshes": [{
+                    "source": str(external_mesh),
+                    "sha256": _sha256(external_mesh),
+                    "relative_to_spm": external_ref,
+                }],
+            },
+            isolated,
+            staging,
+        )
+
+        result = _rebase_external_mesh_refs(
+            isolated,
+            production,
+            copied,
+        )
+
+        assert result["status"] == "rebased"
+        assert result["rewritten_reference_count"] == 1
+        assert _sha256(production) == production_hash
+        isolated_text = gzip.decompress(isolated.read_bytes()).decode("utf-8")
+        assert external_ref not in isolated_text
+        rebased = (isolated.parent / copied[0]["spm_ref"]).resolve()
+        assert rebased.is_relative_to(staging.resolve())
+        assert rebased.read_bytes() == b"shared-external-fbx"
+
+
+def test_canonical_bark_texture_outside_tree_is_copied_by_content():
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        canonical_spm = (
+            workspace / "trees" / "Tree_owner" / "SK_tree_owner_01.spm"
+        )
+        canonical_spm.parent.mkdir(parents=True)
+        canonical_spm.write_bytes(b"spm")
+        shared_texture = workspace / "shared" / "bark_color.tga"
+        shared_texture.parent.mkdir()
+        shared_texture.write_bytes(b"shared-bark")
+        isolated_tree = workspace / "isolated" / "Tree_provider"
+
+        copied = _copy_canonical_textures(
+            {
+                "handoff": {
+                    "canonical_bark": {
+                        "canonical_sources": [{
+                            "spm": str(canonical_spm),
+                            "refs": [str(shared_texture)],
+                        }],
+                    },
+                },
+            },
+            isolated_tree,
+        )
+
+        assert len(copied) == 1
+        destination = Path(copied[0]["isolated"])
+        assert destination.is_relative_to(isolated_tree)
+        assert "_canonical_textures" in destination.parts
+        assert destination.read_bytes() == b"shared-bark"
 
 
 def test_isolated_bark_source_rebases_external_texture_dependencies():

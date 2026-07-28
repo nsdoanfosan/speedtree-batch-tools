@@ -25,6 +25,86 @@ MESH_ASSET_TYPES = {"SkeletalMesh", "StaticMesh"}
 MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
 
 
+def is_actionable_cluster_assembly_manifest(manifest):
+    """A content-driven pass-through has no additive assets to orchestrate."""
+    return bool(
+        isinstance(manifest, dict)
+        and manifest.get("status") != "pass_through"
+    )
+
+
+def strict_material_handoff_source_paths(envelope):
+    """Return the exact SPM/FBX pair fingerprinted by a strict handoff."""
+    source = envelope.get("source") if isinstance(envelope, dict) else None
+    source = source if isinstance(source, dict) else {}
+    spm_record = source.get("spm") or {}
+    spm_path = str(spm_record.get("canonical_path") or "").strip()
+    stmat_records = source.get("stmat") or []
+    if not spm_path or len(stmat_records) != 1:
+        raise ValueError(
+            "strict material handoff must identify one SPM and one STMAT"
+        )
+    stmat_path = str(
+        (stmat_records[0] or {}).get("canonical_path") or ""
+    ).strip()
+    if not stmat_path:
+        raise ValueError(
+            "strict material handoff STMAT identity has no canonical path"
+        )
+    resolved_spm = Path(spm_path).resolve()
+    resolved_stmat = Path(stmat_path).resolve()
+    expected_stmat = (
+        resolved_spm.parent
+        / "fbx"
+        / f"{resolved_spm.stem}.stmat"
+    ).resolve()
+    if os.path.normcase(str(resolved_stmat)).casefold() != os.path.normcase(
+        str(expected_stmat)
+    ).casefold():
+        raise ValueError(
+            "strict material handoff SPM and STMAT belong to different "
+            "export bundles"
+        )
+    return {
+        "spm": str(resolved_spm),
+        "fbx": str(resolved_stmat.with_suffix(".fbx")),
+        "stmat": str(resolved_stmat),
+    }
+
+
+def validate_material_handoff_wrapper(payload, expected_canonical_spm):
+    """Bind a generated Push wrapper to its requested canonical SPM."""
+    if not isinstance(payload, dict):
+        raise ValueError("material handoff wrapper is not an object")
+    source = strict_material_handoff_source_paths(
+        payload.get("speedtree_pipeline_contract")
+    )
+
+    def path_key(value):
+        return os.path.normcase(
+            os.path.abspath(str(value or ""))
+        ).casefold()
+
+    if (
+        not payload.get("canonical_spm")
+        or path_key(payload["canonical_spm"])
+        != path_key(expected_canonical_spm)
+    ):
+        raise ValueError(
+            "material handoff wrapper belongs to a different canonical SPM"
+        )
+    if (
+        not payload.get("material_source_spm")
+        or path_key(payload["material_source_spm"])
+        != path_key(source["spm"])
+    ):
+        raise ValueError(
+            "material handoff wrapper source does not match its "
+            "content-addressed envelope"
+        )
+    return source
+
+
 def _asset_data(manifest_asset):
     value = manifest_asset.get("asset_data") if isinstance(manifest_asset, dict) else None
     return value if isinstance(value, dict) else {}

@@ -486,6 +486,13 @@ def apply_isolated_bark_normalization(plan):
     originals = {}
     temps = []
     try:
+        # One provider SPM can render more than one bark material slot.  The
+        # preflight deliberately emits one material patch per receipt row, but
+        # every patch for the same SPM fingerprints the same immutable input.
+        # Compose those disjoint Material_v8 replacements in memory and commit
+        # the SPM once; applying the first patch before validating the second
+        # would make our own write look like an external preflight race.
+        grouped = {}
         for patch in plan["patches"]:
             path = Path(patch["isolated_spm"]).resolve()
             if not _is_within(path, root):
@@ -495,9 +502,40 @@ def apply_isolated_bark_normalization(plan):
             if _sha256_bytes(original) != patch["input_sha256"]:
                 raise BarkNormalizationError(
                     f"isolated SPM changed after preflight: {path}")
-            originals[path] = original
-            payload = _encoded_spm(
-                patch["_patched_text"], patch["input_compressed"])
+            group = grouped.get(path)
+            if group is None:
+                originals[path] = original
+                group = {
+                    "text": read_maybe_gzip_text(path),
+                    "compressed": patch["input_compressed"],
+                }
+                grouped[path] = group
+            elif group["compressed"] != patch["input_compressed"]:
+                raise BarkNormalizationError(
+                    f"isolated SPM compression contract disagrees: {path}")
+
+            desired = _material_blocks(
+                patch["_patched_text"],
+                patch["output_material"],
+                patch["material_id"],
+            )
+            current = _material_blocks(
+                group["text"],
+                material_id=patch["material_id"],
+            )
+            if len(desired) != 1 or len(current) != 1:
+                raise BarkNormalizationError(
+                    f"preflighted bark material patch is ambiguous: {path} "
+                    f"(material ID {patch['material_id']})")
+            match, _block = current[0]
+            group["text"] = (
+                group["text"][:match.start()]
+                + desired[0][1]
+                + group["text"][match.end():]
+            )
+
+        for path, group in grouped.items():
+            payload = _encoded_spm(group["text"], group["compressed"])
             temp = path.with_name(path.name + ".canonical-bark.tmp")
             temp.write_bytes(payload)
             temps.append(temp)

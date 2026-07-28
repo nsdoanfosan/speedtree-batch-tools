@@ -3,11 +3,104 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from sk_batch.send2ue_manifest_contract import (
+    is_actionable_cluster_assembly_manifest,
     manifest_checkout_asset_paths,
     normalize_manifest_handoff_sidecars,
     primary_mesh_asset_path,
+    strict_material_handoff_source_paths,
+    validate_material_handoff_wrapper,
 )
+
+
+def test_content_driven_pass_through_does_not_require_dependency_orchestrator():
+    assert not is_actionable_cluster_assembly_manifest(None)
+    assert not is_actionable_cluster_assembly_manifest({
+        "status": "pass_through",
+        "reason": "normalized_roles_are_prepared_but_unused_by_rendered_mesh",
+    })
+    assert is_actionable_cluster_assembly_manifest({
+        "status": "ready",
+        "parts": [{"role": "cluster"}],
+    })
+
+
+def test_strict_material_handoff_uses_recorded_isolated_spm_bundle():
+    source = strict_material_handoff_source_paths({
+        "source": {
+            "spm": {
+                "canonical_path": r"D:\tree\.isolated\SK_branch_01.spm",
+            },
+            "stmat": [{
+                "canonical_path": (
+                    r"D:\tree\.isolated\fbx\SK_branch_01.stmat"
+                ),
+            }],
+        },
+    })
+
+    assert source["spm"].endswith(
+        r"\.isolated\SK_branch_01.spm"
+    )
+    assert source["fbx"].endswith(
+        r"\.isolated\fbx\SK_branch_01.fbx"
+    )
+
+
+def test_strict_material_handoff_rejects_mixed_spm_stmat_bundle():
+    with pytest.raises(
+        ValueError,
+        match="different export bundles",
+    ):
+        strict_material_handoff_source_paths({
+            "source": {
+                "spm": {
+                    "canonical_path": r"D:\tree\SK_branch_01.spm",
+                },
+                "stmat": [{
+                    "canonical_path": (
+                        r"D:\other\fbx\SK_branch_01.stmat"
+                    ),
+                }],
+            },
+        })
+
+
+def test_material_handoff_wrapper_binds_canonical_and_exact_source():
+    canonical = r"D:\tree\cluster\SK_branch_01.spm"
+    isolated = r"D:\tree\.isolated\cluster\SK_branch_01.spm"
+    payload = {
+        "canonical_spm": canonical,
+        "material_source_spm": isolated,
+        "speedtree_pipeline_contract": {
+            "source": {
+                "spm": {"canonical_path": isolated},
+                "stmat": [{
+                    "canonical_path": (
+                        r"D:\tree\.isolated\cluster\fbx"
+                        r"\SK_branch_01.stmat"
+                    ),
+                }],
+            },
+        },
+    }
+
+    source = validate_material_handoff_wrapper(payload, canonical)
+    assert source["spm"].endswith(
+        r"\.isolated\cluster\SK_branch_01.spm"
+    )
+
+    with pytest.raises(ValueError, match="different canonical SPM"):
+        validate_material_handoff_wrapper(
+            payload,
+            r"D:\tree\cluster\SK_other.spm",
+        )
+
+    payload["material_source_spm"] = canonical
+    with pytest.raises(ValueError, match="source does not match"):
+        validate_material_handoff_wrapper(payload, canonical)
 
 
 def descriptor(mesh_name, source=None):

@@ -11,6 +11,7 @@ import copy
 import functools
 import gzip
 import hashlib
+import html
 import json
 import os
 import re
@@ -46,6 +47,7 @@ class ClusterBarkSourceResolutionError(RuntimeError):
 
 
 _BARK_CACHE_PREPARE_LOCK = threading.RLock()
+_BARK_CACHE_MANIFEST_NAME = "bark_normalization_manifest.json"
 
 
 def _serialized_bark_cache_prepare(function):
@@ -57,8 +59,83 @@ def _serialized_bark_cache_prepare(function):
     return wrapper
 
 
+def _copy_cache_directory_manifest_last(staging, cache_dir):
+    """Publish a derived cache without exposing a completed partial bundle."""
+    staging = Path(staging)
+    cache_dir = Path(cache_dir)
+    manifest = staging / _BARK_CACHE_MANIFEST_NAME
+    if not staging.is_dir() or not manifest.is_file():
+        raise ClusterBarkSourceResolutionError(
+            "prepared bark cache has no publishable manifest: "
+            + str(staging)
+        )
+    if cache_dir.exists():
+        raise FileExistsError(
+            "refusing to copy over an existing bark cache directory: "
+            + str(cache_dir)
+        )
+
+    cache_dir.mkdir()
+    try:
+        for source in sorted(staging.iterdir(), key=lambda path: path.name):
+            if source.name == _BARK_CACHE_MANIFEST_NAME:
+                continue
+            if source.is_symlink():
+                raise ClusterBarkSourceResolutionError(
+                    "prepared bark cache contains a symbolic link: "
+                    + str(source)
+                )
+            destination = cache_dir / source.name
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            elif source.is_file():
+                shutil.copy2(source, destination)
+            else:
+                raise ClusterBarkSourceResolutionError(
+                    "prepared bark cache contains an unsupported artifact: "
+                    + str(source)
+                )
+
+        # The manifest is the cache's completion marker. Copy it to a private
+        # sibling and atomically promote it only after every referenced
+        # artifact is present.
+        manifest_temp = cache_dir / (
+            "." + _BARK_CACHE_MANIFEST_NAME + ".publish.tmp"
+        )
+        manifest_final = cache_dir / _BARK_CACHE_MANIFEST_NAME
+        shutil.copy2(manifest, manifest_temp)
+        for attempt in range(8):
+            try:
+                os.replace(manifest_temp, manifest_final)
+                break
+            except PermissionError as exc:
+                if (
+                    getattr(exc, "winerror", None) != 5
+                    or attempt == 7
+                    or manifest_final.exists()
+                ):
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+    except Exception:
+        # This destination was created by this call and never had a completion
+        # manifest before it. Best-effort cleanup preserves fail-closed cache
+        # discovery even when OneDrive keeps one partial file locked.
+        try:
+            _remove_incomplete_cache_directory(cache_dir)
+        except OSError:
+            pass
+        raise
+
+
 def _publish_cache_directory(staging, cache_dir):
     """Publish a prepared directory despite transient OneDrive scan locks."""
+    staging = Path(staging)
+    cache_dir = Path(cache_dir)
+    if cache_dir.exists():
+        raise FileExistsError(
+            "refusing to replace an existing bark cache directory: "
+            + str(cache_dir)
+        )
     for attempt in range(8):
         try:
             os.replace(staging, cache_dir)
@@ -66,10 +143,12 @@ def _publish_cache_directory(staging, cache_dir):
         except PermissionError as exc:
             if (
                 getattr(exc, "winerror", None) != 5
-                or attempt == 7
                 or Path(cache_dir).exists()
             ):
                 raise
+            if attempt == 7:
+                _copy_cache_directory_manifest_last(staging, cache_dir)
+                return
             time.sleep(0.25 * (attempt + 1))
 
 
@@ -259,10 +338,32 @@ def _required_bark_rows(contract, dependency):
     return [
         copy.deepcopy(row)
         for row in bark.get("cluster_bark_sources") or []
-        if row.get("replacement") == "required"
+        if row.get("replacement") in {
+            "required",
+            "isolated_capture_validated",
+        }
         and row.get("cluster_spm")
         and _path_key(row["cluster_spm"]) in provider_paths
     ]
+
+
+def _canonical_authority_rank(contract):
+    """Prefer owner-authored bark over provider-only provenance."""
+    sources = list(
+        (
+            ((contract.get("handoff") or {}).get("canonical_bark") or {})
+            .get("canonical_sources")
+            or []
+        )
+    )
+    if not sources:
+        return 0
+    if any(
+        row.get("authority") != "active_provider_texture_provenance"
+        for row in sources
+    ):
+        return 2
+    return 1
 
 
 def _source_tree_texture_inventory(source_spm):
@@ -437,24 +538,37 @@ def _copy_canonical_textures(contract, isolated_tree_root):
         tree_root = canonical_spm.parent
         for value in row.get("refs") or []:
             source = _resolve_ref(canonical_spm, value)
+            source_hash = _sha256_file(source)
             try:
                 relative = source.resolve().relative_to(tree_root)
-            except ValueError as exc:
-                raise ClusterBarkSourceResolutionError(
-                    "canonical bark texture escapes its Tree folder: "
-                    + str(source)
-                ) from exc
-            destination = Path(isolated_tree_root) / relative
+                destination = Path(isolated_tree_root) / relative
+            except ValueError:
+                # Canonical bark may intentionally come from a shared texture
+                # library outside the owner Tree. Keep the authored source
+                # untouched and copy it into a content-addressed location that
+                # the normalization plan can reference explicitly.
+                destination = (
+                    Path(isolated_tree_root)
+                    / "_canonical_textures"
+                    / source_hash[:16]
+                    / source.name
+                )
             key = _path_key(destination)
             if key in seen:
                 continue
             seen.add(key)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+            isolated_hash = _sha256_file(destination)
+            if isolated_hash != source_hash:
+                raise ClusterBarkSourceResolutionError(
+                    "isolated canonical bark texture hash mismatch: "
+                    + str(destination)
+                )
             copied.append({
                 "source": str(source),
                 "isolated": str(destination),
-                "sha256": _sha256_file(destination),
+                "sha256": isolated_hash,
             })
     return copied
 
@@ -487,18 +601,28 @@ def _copy_source_external_meshes(identity, staged_source, staging_root):
     staged_source = Path(staged_source).resolve()
     for row in identity.get("source_external_meshes") or []:
         relative = row.get("relative_to_spm")
-        if not relative:
-            # Absolute references remain valid without being rewritten.
-            continue
         source = Path(row["source"])
-        destination = (staged_source.parent / Path(relative)).resolve()
-        try:
-            destination.relative_to(staging_root)
-        except ValueError as exc:
-            raise ClusterBarkSourceResolutionError(
-                "relative external mesh escapes the isolated workspace: "
-                + str(relative)
-            ) from exc
+        destination = (
+            (staged_source.parent / Path(relative)).resolve()
+            if relative
+            else None
+        )
+        if destination is not None:
+            try:
+                destination.relative_to(staging_root)
+            except ValueError:
+                destination = None
+        if destination is None:
+            # A valid authored reference may intentionally point at a shared
+            # library outside the Tree folder. Never recreate its ``..`` path
+            # outside our staging directory; copy it to a hash-addressed local
+            # dependency and rewrite only the isolated SPM.
+            destination = (
+                staging_root
+                / "_external_meshes"
+                / str(row["sha256"])[:16]
+                / source.name
+            ).resolve()
         key = _path_key(destination)
         if key in seen:
             continue
@@ -516,6 +640,9 @@ def _copy_source_external_meshes(identity, staged_source, staging_root):
             "isolated": str(destination),
             "sha256": actual_hash,
             "relative_to_spm": relative,
+            "spm_ref": os.path.relpath(
+                destination, staged_source.parent
+            ).replace("\\", "/"),
         })
     return copied
 
@@ -560,6 +687,92 @@ _TEX_FILENAME_RE = re.compile(
     r"(</TexFilename>|<\\TexFilename>)",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+_MESH_BLOCK_RE = re.compile(
+    r"(<Mesh\b(?=[^>]*\bID\s*=)[^>]*>)(.*?)(</Mesh>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_MESH_FILENAME_RE = re.compile(
+    r"(<Filename\b(?![^>]*?/\s*>)[^>]*>)(.*?)"
+    r"(</Filename>|<\\Filename>)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _rebase_external_mesh_refs(
+    isolated_spm,
+    production_spm,
+    copied_external_meshes,
+):
+    if not copied_external_meshes:
+        return {
+            "status": "not_required",
+            "rewritten_reference_count": 0,
+            "meshes": [],
+        }
+    isolated_spm = Path(isolated_spm)
+    before_bytes = isolated_spm.read_bytes()
+    compressed = before_bytes.startswith(b"\x1f\x8b")
+    before = (
+        gzip.decompress(before_bytes).decode("utf-8")
+        if compressed
+        else before_bytes.decode("utf-8")
+    )
+    by_source = {
+        _path_key(row["source"]): row
+        for row in copied_external_meshes
+    }
+    rewritten = []
+
+    def replace_filename(match):
+        authored = html.unescape(" ".join(match.group(2).split()))
+        row = by_source.get(_path_key(_resolve_ref(production_spm, authored)))
+        if row is None:
+            return match.group(0)
+        rewritten.append(row)
+        return (
+            match.group(1)
+            + html.escape(row["spm_ref"], quote=False)
+            + match.group(3)
+        )
+
+    def replace_mesh(match):
+        body = _MESH_FILENAME_RE.sub(replace_filename, match.group(2))
+        return match.group(1) + body + match.group(3)
+
+    after = _MESH_BLOCK_RE.sub(replace_mesh, before)
+    if not rewritten:
+        raise ClusterBarkSourceResolutionError(
+            "isolated external meshes were copied but their SPM references "
+            "could not be identified for safe rebasing"
+        )
+    payload = after.encode("utf-8")
+    if compressed:
+        payload = gzip.compress(payload)
+    temporary = isolated_spm.with_name(
+        isolated_spm.name + ".external-meshes.tmp"
+    )
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, isolated_spm)
+    finally:
+        temporary.unlink(missing_ok=True)
+    for row in rewritten:
+        destination = _resolve_ref(isolated_spm, row["spm_ref"])
+        if (
+            not destination.is_file()
+            or _sha256_file(destination) != row["sha256"]
+        ):
+            raise ClusterBarkSourceResolutionError(
+                "rebased isolated external mesh is missing or stale: "
+                + str(destination)
+            )
+    return {
+        "status": "rebased",
+        "rewritten_reference_count": len(rewritten),
+        "meshes": copied_external_meshes,
+    }
 
 
 def _rebase_external_texture_refs(
@@ -689,7 +902,7 @@ def prepare_isolated_bark_source(
     cache_dir = parent / signature[:24]
     tree_name = source.parent.parent.name
     isolated = cache_dir / tree_name / source.parent.name / source.name
-    manifest_path = cache_dir / "bark_normalization_manifest.json"
+    manifest_path = cache_dir / _BARK_CACHE_MANIFEST_NAME
     if manifest_path.is_file() and isolated.is_file():
         try:
             manifest = json.loads(
@@ -748,7 +961,15 @@ def prepare_isolated_bark_source(
         bark = copy.deepcopy(
             (contract.get("handoff") or {}).get("canonical_bark") or {}
         )
-        bark["cluster_bark_sources"] = copy.deepcopy(required_rows)
+        bark["cluster_bark_sources"] = [
+            {
+                **copy.deepcopy(row),
+                # A previously validated capture is still an instruction to
+                # rebuild the same isolated input if its cache was removed.
+                "replacement": "required",
+            }
+            for row in required_rows
+        ]
         bark["status"] = "replacement_required"
         sliced_handoff = {"canonical_bark": bark}
         try:
@@ -756,11 +977,20 @@ def prepare_isolated_bark_source(
                 sliced_handoff,
                 {str(source): str(staged_source)},
                 staging,
+                canonical_texture_map={
+                    row["source"]: row["isolated"]
+                    for row in copied_textures
+                },
                 preserve_source_material_name=True,
             )
             normalization = apply_isolated_bark_normalization(plan)
         except BarkNormalizationError as exc:
             raise ClusterBarkSourceResolutionError(str(exc)) from exc
+        external_mesh_rebase = _rebase_external_mesh_refs(
+            staged_source,
+            source,
+            copied_source_external_meshes,
+        )
         external_texture_rebase = _rebase_external_texture_refs(
             staged_source,
             source,
@@ -774,6 +1004,9 @@ def prepare_isolated_bark_source(
                 output["output_sha256"] = final_staged_hash
                 output["external_texture_rebase"] = copy.deepcopy(
                     external_texture_rebase
+                )
+                output["external_mesh_rebase"] = copy.deepcopy(
+                    external_mesh_rebase
                 )
         final_source = (
             cache_dir / tree_name / source.parent.name / source.name
@@ -796,6 +1029,9 @@ def prepare_isolated_bark_source(
         external_texture_rebase = _rebase_paths(
             external_texture_rebase, staging, cache_dir
         )
+        external_mesh_rebase = _rebase_paths(
+            external_mesh_rebase, staging, cache_dir
+        )
         manifest = {
             "schema_version": 1,
             "kind": "cluster_isolated_canonical_bark_source",
@@ -812,6 +1048,7 @@ def prepare_isolated_bark_source(
                 copied_source_external_textures
             ),
             "copied_canonical_textures": copied_textures,
+            "external_mesh_rebase": external_mesh_rebase,
             "external_texture_rebase": external_texture_rebase,
             "normalization": normalization,
             "production_source_mutated": False,
@@ -932,10 +1169,12 @@ def resolve_cluster_bark_source_spm(
         })
         if not required_rows:
             continue
-        signature, _identity = _normalization_identity(
-            contract, source, required_rows
-        )
-        actionable.append((signature, contract, required_rows))
+        actionable.append({
+            "target_spm": str(target),
+            "contract": contract,
+            "required_rows": required_rows,
+            "authority_rank": _canonical_authority_rank(contract),
+        })
     if not actionable:
         return {
             "status": "not_required",
@@ -944,12 +1183,37 @@ def resolve_cluster_bark_source_spm(
             "target_receipts": receipt_rows,
             "production_source_mutated": False,
         }
-    signatures = {row[0] for row in actionable}
+    best_authority = max(row["authority_rank"] for row in actionable)
+    selected = [
+        row for row in actionable
+        if row["authority_rank"] == best_authority
+    ]
+    for row in selected:
+        signature, identity = _normalization_identity(
+            row["contract"],
+            source,
+            row["required_rows"],
+        )
+        row["signature"] = signature
+        row["identity"] = identity
+    signatures = {row["signature"] for row in selected}
     if len(signatures) != 1:
         raise ClusterBarkSourceResolutionError(
-            "Cluster owner targets disagree on the canonical bark source"
+            "Cluster owner canonical bark texture sets disagree at the "
+            f"same authority level {best_authority}: "
+            + "; ".join(
+                (
+                    Path(row["target_spm"]).name
+                    + "="
+                    + str(row["identity"].get("canonical_material") or "?")
+                    + ":"
+                    + row["signature"][:12]
+                )
+                for row in selected
+            )
         )
-    _signature, contract, required_rows = actionable[0]
+    contract = selected[0]["contract"]
+    required_rows = selected[0]["required_rows"]
     prepared = prepare_isolated_bark_source(
         source,
         contract,
