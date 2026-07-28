@@ -339,7 +339,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             "cluster_first_renderable_root_absolute_1",
         )
 
-    def test_speedtree_timeout_becomes_manual_required_and_restores_source(self):
+    def test_speedtree_timeout_is_process_failure_and_restores_source(self):
         source_xml = mixed_base_graph_xml()
         cfg = {
             "target_bones_per_branch": 3.0,
@@ -368,12 +368,13 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                     spm_path, cfg, log=lambda _message: None
                 )
 
-            self.assertEqual(report["status"], "manual-required")
+            self.assertEqual(report["status"], "failed")
             self.assertEqual(
                 report["calibration"]["mode"],
-                "manual_required_export_timeout",
+                "process_export_timeout",
             )
             self.assertEqual(report["calibration"]["timeout_seconds"], 120.0)
+            self.assertEqual(report["failure_kind"], "process_timeout")
             self.assertEqual(spm_path.read_bytes(), original_bytes)
 
     def test_xml_subprocess_timeout_uses_export_timeout_error(self):
@@ -447,7 +448,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             )
 
         self.assertEqual((returncode, stdout, stderr), (0, "exported\n", ""))
-        self.assertEqual(captured["timeout"], 120)
+        self.assertEqual(captured["timeout"], 0.5)
         self.assertIsNot(captured["stdout"], subprocess.PIPE)
         self.assertIsNot(captured["stderr"], subprocess.PIPE)
         # Real file objects expose fileno(); a pipe placeholder is a plain int.
@@ -496,6 +497,280 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         if os.name == "nt":
             self.assertIn("/T", killed.get("terminated", []))
             self.assertIn("9876", killed.get("terminated", []))
+
+    def test_active_child_cpu_extends_the_soft_deadline(self):
+        class ProgressiveProcess:
+            pid = 54321
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls < 6:
+                    import time
+
+                    time.sleep(timeout)
+                    raise subprocess.TimeoutExpired("SpeedTree", timeout)
+                return 0
+
+        cpu = {"value": 0.0}
+
+        def progressing_cpu(_process):
+            cpu["value"] += 0.01
+            return cpu["value"]
+
+        with mock.patch.object(
+            spm_audit.subprocess,
+            "Popen",
+            return_value=ProgressiveProcess(),
+        ), mock.patch.object(
+            spm_audit,
+            "_process_cpu_seconds",
+            side_effect=progressing_cpu,
+        ), mock.patch.object(
+            spm_audit,
+            "speedtree_export_gate",
+        ):
+            result = spm_audit.run_speedtree_export(
+                ["SpeedTree.exe", "model.spm"],
+                ".",
+                0.02,
+                absolute_timeout=0.25,
+                poll_interval=0.01,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(
+            result.evidence["attempts"][0]["duration_seconds"],
+            0.02,
+        )
+        self.assertGreater(
+            result.evidence["attempts"][0]["progress_event_count"],
+            0,
+        )
+
+    def test_idle_export_reports_stalled_evidence(self):
+        class StalledProcess:
+            pid = 54322
+
+            def wait(self, timeout=None):
+                import time
+
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired("SpeedTree", timeout)
+
+        with mock.patch.object(
+            spm_audit.subprocess,
+            "Popen",
+            return_value=StalledProcess(),
+        ), mock.patch.object(
+            spm_audit,
+            "_process_cpu_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            spm_audit,
+            "_terminate_speedtree_tree",
+        ), mock.patch.object(
+            spm_audit,
+            "speedtree_export_gate",
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                spm_audit.run_speedtree_export(
+                    ["SpeedTree.exe", "model.spm"],
+                    ".",
+                    0.025,
+                    absolute_timeout=0.2,
+                    poll_interval=0.01,
+                )
+
+        self.assertEqual(caught.exception.evidence["timeout_reason"], "stalled")
+        self.assertEqual(
+            caught.exception.evidence["failure_kind"],
+            "internal_error",
+        )
+
+    def test_continuous_progress_still_stops_at_the_hard_cap(self):
+        class BusyProcess:
+            pid = 54323
+
+            def wait(self, timeout=None):
+                import time
+
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired("SpeedTree", timeout)
+
+        cpu = {"value": 0.0}
+
+        def progressing_cpu(_process):
+            cpu["value"] += 0.01
+            return cpu["value"]
+
+        with mock.patch.object(
+            spm_audit.subprocess,
+            "Popen",
+            return_value=BusyProcess(),
+        ), mock.patch.object(
+            spm_audit,
+            "_process_cpu_seconds",
+            side_effect=progressing_cpu,
+        ), mock.patch.object(
+            spm_audit,
+            "_terminate_speedtree_tree",
+        ), mock.patch.object(
+            spm_audit,
+            "speedtree_export_gate",
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                spm_audit.run_speedtree_export(
+                    ["SpeedTree.exe", "model.spm"],
+                    ".",
+                    0.03,
+                    absolute_timeout=0.075,
+                    poll_interval=0.01,
+                )
+
+        self.assertEqual(caught.exception.evidence["timeout_reason"], "hard_cap")
+
+    def test_access_violation_retries_twice_with_fresh_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "verify.xml"
+            returncodes = [0xC0000005, -1073741819, 0]
+            commands = []
+
+            class FinishedProcess:
+                pid = 54324
+
+                def __init__(self, returncode):
+                    self.returncode = returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            def fake_popen(cmd, **_kwargs):
+                commands.append(list(cmd))
+                attempt = len(commands)
+                staged = Path(cmd[cmd.index("-export") + 1])
+                staged.write_bytes(f"attempt-{attempt}".encode("ascii"))
+                return FinishedProcess(returncodes[attempt - 1])
+
+            gate = mock.MagicMock()
+            with mock.patch.object(
+                spm_audit.subprocess,
+                "Popen",
+                side_effect=fake_popen,
+            ), mock.patch.object(
+                spm_audit,
+                "_process_cpu_seconds",
+                return_value=0.0,
+            ), mock.patch.object(
+                spm_audit,
+                "speedtree_export_gate",
+                return_value=gate,
+            ):
+                result = spm_audit.run_speedtree_export(
+                    [
+                        "SpeedTree.exe",
+                        "model.spm",
+                        "-export",
+                        str(output),
+                    ],
+                    tmp,
+                    1,
+                    absolute_timeout=2,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(len(commands), 3)
+            self.assertEqual(
+                len({
+                    command[command.index("-export") + 1]
+                    for command in commands
+                }),
+                3,
+            )
+            self.assertEqual(output.read_bytes(), b"attempt-3")
+            self.assertEqual(result.evidence["retry_count"], 2)
+            self.assertEqual(gate.__enter__.call_count, 1)
+            self.assertEqual(gate.__exit__.call_count, 1)
+
+    def test_other_returncode_does_not_retry(self):
+        class FailedProcess:
+            pid = 54325
+
+            def wait(self, timeout=None):
+                return 7
+
+        with mock.patch.object(
+            spm_audit.subprocess,
+            "Popen",
+            return_value=FailedProcess(),
+        ) as popen, mock.patch.object(
+            spm_audit,
+            "_process_cpu_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            spm_audit,
+            "speedtree_export_gate",
+        ):
+            result = spm_audit.run_speedtree_export(
+                ["SpeedTree.exe", "model.spm"],
+                ".",
+                1,
+            )
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.evidence["result"], "non_retryable_returncode")
+        self.assertEqual(popen.call_count, 1)
+
+    def test_zero_returncode_without_staged_output_is_structured(self):
+        class EmptySuccessProcess:
+            pid = 54326
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            spm_audit.subprocess,
+            "Popen",
+            return_value=EmptySuccessProcess(),
+        ), mock.patch.object(
+            spm_audit,
+            "_process_cpu_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            spm_audit,
+            "speedtree_export_gate",
+        ):
+            output = Path(tmp) / "verify.xml"
+            result = spm_audit.run_speedtree_export(
+                [
+                    "SpeedTree.exe",
+                    "model.spm",
+                    "-export",
+                    str(output),
+                ],
+                tmp,
+                1,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.evidence["result"], "output_missing")
+        self.assertFalse(output.exists())
+
+    def test_mtime_only_change_is_not_export_progress(self):
+        self.assertFalse(
+            spm_audit._content_signature_advanced(
+                (4096, 100),
+                (4096, 200),
+            )
+        )
+        self.assertTrue(
+            spm_audit._content_signature_advanced(
+                (4096, 100),
+                (8192, 100),
+            )
+        )
 
     def test_guid_graph_tree_uses_root_and_first_branch_base_stage(self):
         graph = spm_audit.analyze_branch_bone_graph(

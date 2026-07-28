@@ -4352,22 +4352,55 @@ class App:
             )
             self.ui_queue.put(("cell", (iid, "spm_status", text)))
 
-        code, log_file = self._run_limited(
-            cmd,
-            f"{spm.stem}_spm_{stamp}.log",
-            max(
-                self.cfg.get("spm_verify_timeout", 120) * 5,
-                self.cfg.get("spm_job_timeout", 7200),
-            ),
-            affinity=not parallel,
-            progress_callback=report_progress,
-        )
+        try:
+            code, log_file = self._run_limited(
+                cmd,
+                f"{spm.stem}_spm_{stamp}.log",
+                max(
+                    self.cfg.get("spm_verify_timeout", 120) * 5,
+                    self.cfg.get("spm_job_timeout", 7200),
+                ),
+                affinity=not parallel,
+                progress_callback=report_progress,
+            )
+        except BatchItemError:
+            raise
+        except Exception as exc:
+            raise BatchItemError(
+                f"본 세팅 실행 실패: {exc}",
+                kind="internal_error",
+                report_file=report_path,
+            ) from exc
         if not report_path.exists():
-            raise RuntimeError(f"본 세팅 실패 — 로그: {log_file}")
-        rep = json.loads(report_path.read_text(encoding="utf-8"))[0]
+            raise BatchItemError(
+                f"본 세팅 실패 — 실행 보고서 없음 — 로그: {log_file}",
+                kind="internal_error",
+                log_file=log_file,
+                report_file=report_path,
+            )
+        try:
+            report_rows = json.loads(
+                report_path.read_text(encoding="utf-8")
+            )
+            rep = report_rows[0]
+            if not isinstance(rep, dict):
+                raise ValueError("first SPM report row is not an object")
+        except (OSError, ValueError, TypeError, IndexError) as exc:
+            raise BatchItemError(
+                f"본 세팅 실패 — 실행 보고서 손상: {exc} — 로그: {log_file}",
+                kind="internal_error",
+                log_file=log_file,
+                report_file=report_path,
+            ) from exc
         status = rep.get("status")
         if status == "failed" or (code != 0 and status != "not-sk-ready"):
-            raise RuntimeError(f"본 세팅 실패: {rep.get('error', '?')} — 로그: {log_file}")
+            raise BatchItemError(
+                f"본 세팅 실패: {rep.get('error', '?')} — 로그: {log_file}",
+                kind=rep.get("failure_kind") or "data_error",
+                report=rep,
+                log_file=log_file,
+                report_file=report_path,
+            )
         summary = self._spm_report_summary(rep)
         warn = " ⚠" if rep.get("warnings") else ""
         duration = time.perf_counter() - started

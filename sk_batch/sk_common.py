@@ -785,7 +785,10 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
     return compact_error_message(report.get("_report_error") or "원인 확인 불가", max_chars)
 
 
-BACKUP_RE = re.compile(r"\.(codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE)
+BACKUP_RE = re.compile(
+    r"\.(codex_backup|skbatch_backup|pcgtex_backup|skbatch-rescue)",
+    re.IGNORECASE,
+)
 BACKUP_SUBDIR = "_spm_backups"
 MANUAL_BONES_SUFFIX = ".skbatch_manual_bones.json"
 # Older runs used a per-tool folder name; still skip it so stragglers never

@@ -94,6 +94,18 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
 
+    def test_recovery_preserves_external_edit_after_pipeline_probe(self):
+        self._simulate_kill_during_calibration()
+        external_bytes = b"external SpeedTree edit"
+        self.spm.write_bytes(external_bytes)
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["status"], "concurrent_spm_modification")
+        self.assertEqual(self.spm.read_bytes(), external_bytes)
+        self.assertTrue(spm_audit.calibration_marker_path(self.spm).exists())
+
     def test_untouched_spm_reports_clean_and_recovers_nothing(self):
         state = spm_audit.inspect_interrupted_calibration(self.spm)
         self.assertEqual(state["status"], "clean")
@@ -110,6 +122,36 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertFalse(result["recovered"])
         self.assertTrue(result["cleared"])
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
+
+    def test_intact_recovery_reports_marker_clear_lock(self):
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            self.source_sha,
+        )
+        diagnostic = spm_audit._operation_diagnostic(
+            "process_file_lock",
+            operation="clear_calibration_marker",
+            target=spm_audit.calibration_marker_path(self.spm),
+            attempts=3,
+            error=PermissionError(13, "marker locked"),
+        )
+        with mock.patch.object(
+            spm_audit,
+            "_unlink_with_backoff",
+            side_effect=spm_audit.SPMAtomicOperationError(diagnostic),
+        ):
+            result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(result["failure_kind"], "process_file_lock")
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "process_file_lock",
+        )
+        self.assertTrue(spm_audit.calibration_marker_path(self.spm).exists())
 
     def test_backup_that_does_not_match_the_marker_is_refused(self):
         backup_path = self._simulate_kill_during_calibration()
@@ -241,11 +283,106 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
 
-    def test_failing_run_still_clears_the_marker_after_restoring(self):
+    def test_successful_run_surfaces_marker_clear_lock(self):
         cfg = {"backup_spm": True, "rename_materials": False}
 
+        def fake_calibrate(
+            spm_path,
+            cfg,
+            log=print,
+            source_text=None,
+            source_audit=None,
+        ):
+            spm_audit.write_spm(spm_path, PROBE_XML)
+            spm_audit.write_spm(spm_path, source_text)
+            return {}, [], 0, {"mode": "stub"}, [], [], False
+
+        original_unlink = spm_audit._unlink_with_backoff
+
+        def fail_marker_clear(path, *, operation, missing_ok=True):
+            if operation == "clear_calibration_marker":
+                raise spm_audit.SPMAtomicOperationError(
+                    spm_audit._operation_diagnostic(
+                        "process_file_lock",
+                        operation=operation,
+                        target=path,
+                        attempts=3,
+                        error=PermissionError(13, "marker locked"),
+                    )
+                )
+            return original_unlink(
+                path,
+                operation=operation,
+                missing_ok=missing_ok,
+            )
+
         with mock.patch.object(
-            spm_audit, "calibrate_bones", side_effect=RuntimeError("boom")
+            spm_audit,
+            "calibrate_bones",
+            side_effect=fake_calibrate,
+        ), mock.patch.object(
+            spm_audit, "audit_spm", return_value={"generators": []}
+        ), mock.patch.object(
+            spm_audit,
+            "sk_readiness",
+            return_value={
+                "ready": True,
+                "mode": "ok",
+                "disabled_generators": [],
+            },
+        ), mock.patch.object(
+            spm_audit, "plan_material_renames", return_value=([], [])
+        ), mock.patch.object(
+            spm_audit, "classify_asset_kind", return_value="plant"
+        ), mock.patch.object(
+            spm_audit,
+            "_unlink_with_backoff",
+            side_effect=fail_marker_clear,
+        ):
+            with self.assertRaises(
+                spm_audit.SPMAtomicOperationError
+            ) as caught:
+                spm_audit.process_spm(
+                    self.spm,
+                    cfg,
+                    log=lambda _m: None,
+                )
+
+        self.assertEqual(
+            caught.exception.diagnostic["failure_kind"],
+            "process_file_lock",
+        )
+        self.assertTrue(spm_audit.calibration_marker_path(self.spm).exists())
+        self.assertEqual(self.spm.read_bytes(), self.source_bytes)
+
+    def test_invalid_active_marker_update_is_not_ignored(self):
+        marker = spm_audit.calibration_marker_path(self.spm)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"{")
+
+        with self.assertRaises(
+            spm_audit.SPMAtomicOperationError
+        ) as caught:
+            spm_audit._update_calibration_marker_last_pipeline_sha(
+                self.spm,
+                self.source_sha,
+            )
+
+        self.assertEqual(
+            caught.exception.diagnostic["category"],
+            "concurrent_spm_modification",
+        )
+
+    def test_failing_run_still_clears_the_marker_after_restoring(self):
+        cfg = {"backup_spm": True, "rename_materials": False}
+        original_mtime_ns = self.spm.stat().st_mtime_ns
+
+        def fail_after_write(spm_path, *_args, **_kwargs):
+            spm_audit.write_spm(spm_path, PROBE_XML)
+            raise RuntimeError("boom")
+
+        with mock.patch.object(
+            spm_audit, "calibrate_bones", side_effect=fail_after_write
         ):
             with mock.patch.object(
                 spm_audit, "audit_spm", return_value={"generators": []}
@@ -268,6 +405,7 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
 
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
+        self.assertEqual(self.spm.stat().st_mtime_ns, original_mtime_ns)
 
     def test_failing_run_without_backup_restores_bytes_and_timestamp(self):
         cfg = {"backup_spm": False, "rename_materials": False}
@@ -302,6 +440,234 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertFalse(spm_audit.calibration_marker_path(self.spm).exists())
         self.assertEqual(self.spm.read_bytes(), self.source_bytes)
         self.assertEqual(self.spm.stat().st_mtime_ns, original_mtime_ns)
+
+    def test_rollback_refuses_external_edit_and_keeps_marker(self):
+        cfg = {"backup_spm": False, "rename_materials": False}
+        external_bytes = b"external SpeedTree edit during calibration"
+
+        def fail_after_external_write(spm_path, *_args, **_kwargs):
+            spm_audit.write_spm(spm_path, PROBE_XML)
+            Path(spm_path).write_bytes(external_bytes)
+            raise RuntimeError("pipeline failure")
+
+        with mock.patch.object(
+            spm_audit,
+            "calibrate_bones",
+            side_effect=fail_after_external_write,
+        ), mock.patch.object(
+            spm_audit, "audit_spm", return_value={"generators": []}
+        ), mock.patch.object(
+            spm_audit,
+            "sk_readiness",
+            return_value={
+                "ready": True,
+                "mode": "ok",
+                "disabled_generators": [],
+            },
+        ), mock.patch.object(
+            spm_audit, "plan_material_renames", return_value=([], [])
+        ), mock.patch.object(
+            spm_audit, "classify_asset_kind", return_value="plant"
+        ):
+            with self.assertRaises(
+                spm_audit.SPMAtomicOperationError
+            ) as caught:
+                spm_audit.process_spm(
+                    self.spm,
+                    cfg,
+                    log=lambda _m: None,
+                )
+
+        self.assertEqual(
+            caught.exception.diagnostic["category"],
+            "concurrent_spm_modification",
+        )
+        self.assertEqual(self.spm.read_bytes(), external_bytes)
+        self.assertTrue(spm_audit.calibration_marker_path(self.spm).exists())
+
+    def test_write_spm_retries_a_bounded_sharing_violation(self):
+        original_replace = spm_audit._replace_file_with_rescue
+        calls = {"count": 0}
+
+        def fail_once(temporary, target, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PermissionError(13, "sharing violation")
+            return original_replace(temporary, target, **kwargs)
+
+        with mock.patch.object(
+            spm_audit,
+            "_replace_file_with_rescue",
+            side_effect=fail_once,
+        ), mock.patch.object(spm_audit.time, "sleep"):
+            spm_audit.write_spm(self.spm, PROBE_XML)
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(spm_audit.read_spm(self.spm), PROBE_XML)
+
+    def test_write_spm_reports_process_file_lock_after_bound(self):
+        with mock.patch.object(
+            spm_audit,
+            "SPM_REPLACE_MAX_ATTEMPTS",
+            3,
+        ), mock.patch.object(
+            spm_audit,
+            "_replace_file_with_rescue",
+            side_effect=PermissionError(13, "sharing violation"),
+        ), mock.patch.object(spm_audit.time, "sleep"):
+            with self.assertRaises(
+                spm_audit.SPMAtomicOperationError
+            ) as caught:
+                spm_audit.write_spm(self.spm, PROBE_XML)
+
+        self.assertEqual(
+            caught.exception.diagnostic["category"],
+            "process_file_lock",
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["failure_kind"],
+            "process_file_lock",
+        )
+        self.assertEqual(caught.exception.diagnostic["attempts"], 3)
+        self.assertEqual(spm_audit.read_spm(self.spm), SOURCE_XML)
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_atomic_swap_restores_external_writer_that_wins_first_race(self):
+        external_bytes = b"external writer one"
+        desired_bytes = b"pipeline replacement"
+        original_swap = spm_audit._replace_file_with_rescue
+        calls = {"count": 0}
+
+        def inject_external_before_swap(temporary, target, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                Path(target).write_bytes(external_bytes)
+            return original_swap(temporary, target, **kwargs)
+
+        token = spm_audit._SPM_WRITE_TRANSACTION.set({})
+        try:
+            spm_audit._seed_spm_transaction(self.spm, self.source_bytes)
+            with mock.patch.object(
+                spm_audit,
+                "_replace_file_with_rescue",
+                side_effect=inject_external_before_swap,
+            ):
+                with self.assertRaises(
+                    spm_audit.SPMAtomicOperationError
+                ) as caught:
+                    spm_audit._atomic_replace_payload(
+                        self.spm,
+                        desired_bytes,
+                        operation="test_first_race",
+                    )
+        finally:
+            spm_audit._SPM_WRITE_TRANSACTION.reset(token)
+
+        self.assertEqual(
+            caught.exception.diagnostic["category"],
+            "concurrent_spm_modification",
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["failure_kind"],
+            "concurrent_spm_modification",
+        )
+        self.assertEqual(self.spm.read_bytes(), external_bytes)
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_second_race_keeps_newest_live_and_isolates_first_artifact(self):
+        external_one = b"external writer one"
+        external_two = b"external writer two"
+        desired_bytes = b"pipeline replacement"
+        original_swap = spm_audit._replace_file_with_rescue
+        original_restore = spm_audit._restore_conflict_rescue
+        swaps = {"count": 0}
+
+        def inject_first_external(temporary, target, **kwargs):
+            swaps["count"] += 1
+            if swaps["count"] == 1:
+                Path(target).write_bytes(external_one)
+            return original_swap(temporary, target, **kwargs)
+
+        def inject_second_external(rescue, target, **kwargs):
+            Path(target).write_bytes(external_two)
+            return original_restore(rescue, target, **kwargs)
+
+        token = spm_audit._SPM_WRITE_TRANSACTION.set({})
+        try:
+            spm_audit._seed_spm_transaction(self.spm, self.source_bytes)
+            with mock.patch.object(
+                spm_audit,
+                "_replace_file_with_rescue",
+                side_effect=inject_first_external,
+            ), mock.patch.object(
+                spm_audit,
+                "_restore_conflict_rescue",
+                side_effect=inject_second_external,
+            ):
+                with self.assertRaises(
+                    spm_audit.SPMAtomicOperationError
+                ) as caught:
+                    spm_audit._atomic_replace_payload(
+                        self.spm,
+                        desired_bytes,
+                        operation="test_second_race",
+                    )
+        finally:
+            spm_audit._SPM_WRITE_TRANSACTION.reset(token)
+
+        artifact = Path(
+            caught.exception.diagnostic["conflict_artifact"]
+        )
+        self.assertEqual(self.spm.read_bytes(), external_two)
+        self.assertTrue(artifact.is_file())
+        self.assertEqual(artifact.read_bytes(), external_one)
+        self.assertEqual(artifact.parent.name, "conflicts")
+        self.assertEqual(artifact.parent.parent.name, spm_audit.BACKUP_SUBDIR)
+        from speedtree_pipeline_contract import is_live_spm
+
+        self.assertFalse(is_live_spm(artifact))
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_existing_target_never_falls_back_to_unconditional_replace(self):
+        external_bytes = b"external recreate after delete"
+        original_swap = spm_audit._replace_file_with_rescue
+        calls = {"count": 0}
+
+        def delete_then_recreate(temporary, target, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                Path(target).unlink()
+                try:
+                    return original_swap(temporary, target, **kwargs)
+                except FileNotFoundError:
+                    Path(target).write_bytes(external_bytes)
+                    raise
+            return original_swap(temporary, target, **kwargs)
+
+        token = spm_audit._SPM_WRITE_TRANSACTION.set({})
+        try:
+            spm_audit._seed_spm_transaction(self.spm, self.source_bytes)
+            with mock.patch.object(
+                spm_audit,
+                "_replace_file_with_rescue",
+                side_effect=delete_then_recreate,
+            ):
+                with self.assertRaises(
+                    spm_audit.SPMAtomicOperationError
+                ) as caught:
+                    spm_audit._atomic_replace_payload(
+                        self.spm,
+                        b"pipeline replacement",
+                        operation="test_delete_recreate_race",
+                    )
+        finally:
+            spm_audit._SPM_WRITE_TRANSACTION.reset(token)
+
+        self.assertEqual(
+            caught.exception.diagnostic["category"],
+            "concurrent_spm_modification",
+        )
+        self.assertEqual(self.spm.read_bytes(), external_bytes)
 
 
 if __name__ == "__main__":

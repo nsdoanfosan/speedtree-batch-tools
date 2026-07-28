@@ -32,10 +32,12 @@ if calibration dies midway.
 Standalone:  python spm_audit.py <file.spm> [--dry-run] [--report out.json]
 """
 import argparse
+import contextvars
 import ctypes
 import errno
 import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -85,7 +87,6 @@ else:
     )
 from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
-    spm_container_format,
 )
 from speedtree_export_options_contract import require_texture_skip_writing
 
@@ -106,6 +107,15 @@ SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION = 1
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
+)
+SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS = 900.0
+SPEEDTREE_EXPORT_CRASH_RETRIES = 2
+SPM_REPLACE_MAX_ATTEMPTS = 9
+SPM_REPLACE_INITIAL_BACKOFF_SECONDS = 0.05
+SPM_REPLACE_MAX_BACKOFF_SECONDS = 1.0
+_SPM_WRITE_TRANSACTION = contextvars.ContextVar(
+    "spm_write_transaction",
+    default=None,
 )
 BONE_VALUE_RE = re.compile(
     r"(<Name>Physics:(?:Bone style|Bones)</Name>\s*<Value>)[^<]*(</Value>)",
@@ -137,13 +147,50 @@ class ManualCalibrationRequired(RuntimeError):
 class SpeedTreeExportTimeout(RuntimeError):
     """One SpeedTree export exceeded the automatic-calibration time budget."""
 
-    def __init__(self, stage, timeout_seconds):
+    def __init__(self, stage, timeout_seconds, *, evidence=None):
         self.stage = stage
         self.timeout_seconds = float(timeout_seconds)
+        self.evidence = dict(evidence or {})
+        reason = self.evidence.get("timeout_reason")
+        reason_detail = f" ({reason})" if reason else ""
         super().__init__(
-            f"SpeedTree {stage} export exceeded {self.timeout_seconds:g}s; "
-            "skipped automatic calibration for manual bone setup"
+            f"SpeedTree {stage} export exceeded its progress deadline"
+            f"{reason_detail}; "
+            "automatic calibration stopped and the original SPM was restored"
         )
+
+
+class SpeedTreeExportProcessError(RuntimeError):
+    """A SpeedTree process/runtime failure with report-safe evidence."""
+
+    def __init__(self, message, diagnostic):
+        self.diagnostic = dict(diagnostic)
+        super().__init__(message)
+
+
+class SPMAtomicOperationError(RuntimeError):
+    """A lock or concurrent modification that must not be hidden by rollback."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = dict(diagnostic)
+        super().__init__(
+            json.dumps(self.diagnostic, ensure_ascii=False, sort_keys=True)
+        )
+
+
+class SpeedTreeExportResult:
+    """Tuple-compatible process result with structured attempt evidence."""
+
+    def __init__(self, returncode, stdout, stderr, evidence):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.evidence = evidence
+
+    def __iter__(self):
+        yield self.returncode
+        yield self.stdout
+        yield self.stderr
 
 
 def canonical_spm_process_lock_path(spm_path):
@@ -161,6 +208,574 @@ def _retryable_windows_lock_error(exc):
         getattr(exc, "errno", None)
         in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
         or getattr(exc, "winerror", None) in {33, 36, 158}
+    )
+
+
+def _retryable_file_operation_error(exc):
+    return (
+        getattr(exc, "errno", None)
+        in {
+            errno.EACCES,
+            errno.EAGAIN,
+            getattr(errno, "EBUSY", errno.EACCES),
+        }
+        or getattr(exc, "winerror", None) in {5, 32, 33}
+    )
+
+
+def _content_snapshot_from_bytes(payload):
+    return {
+        "exists": True,
+        "size": len(payload),
+        "sha256": _sha256_bytes(payload),
+    }
+
+
+def _missing_content_snapshot():
+    return {"exists": False, "size": 0, "sha256": ""}
+
+
+def _read_content_snapshot(path, *, include_bytes=False):
+    candidate = Path(path)
+    try:
+        payload = candidate.read_bytes()
+    except FileNotFoundError:
+        snapshot = _missing_content_snapshot()
+        return (snapshot, None) if include_bytes else snapshot
+    snapshot = _content_snapshot_from_bytes(payload)
+    return (snapshot, payload) if include_bytes else snapshot
+
+
+def _same_content_snapshot(left, right):
+    return (
+        bool(left.get("exists")) == bool(right.get("exists"))
+        and int(left.get("size") or 0) == int(right.get("size") or 0)
+        and str(left.get("sha256") or "") == str(right.get("sha256") or "")
+    )
+
+
+def _content_signature_advanced(previous, current):
+    """Count content growth, never timestamp churn by itself, as progress."""
+    if current is None:
+        return False
+    if previous is None:
+        return int(current[0]) > 0
+    return int(current[0]) > int(previous[0])
+
+
+def _operation_diagnostic(
+    category,
+    *,
+    operation,
+    target,
+    attempts,
+    error=None,
+    expected=None,
+    observed=None,
+):
+    diagnostic = {
+        "contract": "spm_atomic_replace_v1",
+        "failure_kind": category,
+        "category": category,
+        "operation": operation,
+        "target": str(Path(target)),
+        "attempts": int(attempts),
+    }
+    if error is not None:
+        diagnostic.update(
+            {
+                "error": str(error),
+                "errno": getattr(error, "errno", None),
+                "winerror": getattr(error, "winerror", None),
+            }
+        )
+    if expected is not None:
+        diagnostic["expected_target"] = dict(expected)
+    if observed is not None:
+        diagnostic["observed_target"] = dict(observed)
+    return diagnostic
+
+
+def _transaction_key(path):
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _seed_spm_transaction(path, payload):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is not None:
+        transaction[_transaction_key(path)] = _content_snapshot_from_bytes(
+            payload
+        )
+
+
+def _transaction_expected(path, baseline):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is None:
+        return baseline
+    return transaction.setdefault(_transaction_key(path), baseline)
+
+
+def _transaction_record_write(path, snapshot):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is not None:
+        transaction[_transaction_key(path)] = dict(snapshot)
+    candidate = Path(path)
+    if candidate.suffix.casefold() == ".spm":
+        _update_calibration_marker_last_pipeline_sha(
+            candidate,
+            snapshot.get("sha256", ""),
+        )
+
+
+def _transaction_target_is_current(path):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is None:
+        return True
+    expected = transaction.get(_transaction_key(path))
+    if expected is None:
+        return True
+    try:
+        observed = _read_content_snapshot(path)
+    except OSError:
+        return False
+    return _same_content_snapshot(expected, observed)
+
+
+def _sleep_file_backoff(attempt):
+    delay = min(
+        SPM_REPLACE_INITIAL_BACKOFF_SECONDS * (2 ** max(0, attempt - 1)),
+        SPM_REPLACE_MAX_BACKOFF_SECONDS,
+    )
+    time.sleep(delay)
+
+
+def _read_content_snapshot_with_backoff(
+    path,
+    *,
+    operation,
+    include_bytes=False,
+):
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            return _read_content_snapshot(
+                path,
+                include_bytes=include_bytes,
+            )
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=path,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+        )
+    )
+
+
+def _unlink_with_backoff(path, *, operation, missing_ok=True):
+    candidate = Path(path)
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            candidate.unlink()
+            return True
+        except FileNotFoundError:
+            return bool(missing_ok)
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=candidate,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+        )
+    )
+
+
+def _replace_file_with_rescue(
+    temporary,
+    target,
+    *,
+    require_existing=False,
+):
+    """Atomically retain the exact replaced target on Windows.
+
+    ``ReplaceFileW`` puts the destination that existed at the instant of the
+    swap in ``rescue``. Comparing that file with the transaction fingerprint
+    closes the stat/hash -> replace race: if an unmanaged writer won that
+    window, its bytes are restored instead of being silently discarded.
+    """
+    temporary = Path(temporary)
+    target = Path(target)
+    if require_existing and os.name != "nt":
+        if not target.exists():
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "CAS target disappeared before atomic replacement",
+                str(target),
+            )
+        os.replace(temporary, target)
+        return None
+    if not require_existing and (
+        os.name != "nt" or not target.exists()
+    ):
+        os.replace(temporary, target)
+        return None
+    rescue_dir = target.parent
+    if target.suffix.casefold() == ".spm":
+        rescue_dir = target.parent / BACKUP_SUBDIR / "conflicts"
+        rescue_dir.mkdir(parents=True, exist_ok=True)
+    rescue = rescue_dir / (
+        f".{target.stem}.{os.getpid()}.{time.time_ns()}"
+        f".skbatch-rescue{target.suffix}"
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    kernel32.ReplaceFileW.restype = ctypes.c_bool
+    if not kernel32.ReplaceFileW(
+        str(target),
+        str(temporary),
+        str(rescue),
+        0,
+        None,
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return rescue
+
+
+def _restore_conflict_rescue(
+    rescue,
+    target,
+    *,
+    expected_current,
+    max_swaps=4,
+):
+    """Restore the newest unmanaged bytes without clobbering a later writer."""
+    replacement = Path(rescue)
+    target = Path(target)
+    expected = dict(expected_current)
+    for _swap in range(max(1, int(max_swaps))):
+        observed = _read_content_snapshot(target)
+        if not _same_content_snapshot(observed, expected):
+            # A newer writer already owns the live target. Keep it there and
+            # retain the earlier displaced content as an explicit artifact.
+            return {
+                "restored": False,
+                "conflict_artifact": str(replacement),
+                "observed_target": observed,
+            }
+        replacement_snapshot = _read_content_snapshot(replacement)
+        displaced = _replace_file_with_rescue(
+            replacement,
+            target,
+            require_existing=bool(expected.get("exists")),
+        )
+        if displaced is None:
+            return {"restored": True, "conflict_artifact": ""}
+        displaced_snapshot = _read_content_snapshot(displaced)
+        if _same_content_snapshot(displaced_snapshot, expected):
+            _unlink_with_backoff(
+                displaced,
+                operation="restore_conflict_rescue:discard_pipeline_bytes",
+            )
+            return {"restored": True, "conflict_artifact": ""}
+        # Another external write won between the pre-check and the atomic
+        # exchange. The now-live target is the previous replacement; exchange
+        # the newer displaced bytes back on the next bounded round.
+        replacement = Path(displaced)
+        expected = replacement_snapshot
+    return {
+        "restored": False,
+        "conflict_artifact": str(replacement),
+        "observed_target": _read_content_snapshot(target),
+    }
+
+
+def _atomic_replace_payload(
+    target,
+    payload,
+    *,
+    operation,
+    baseline=None,
+    source_stat=None,
+):
+    """CAS-replace a file, retrying only sharing/lock failures.
+
+    The transaction fingerprint is the last payload written by this process.
+    An artist or sync client changing the target between writes therefore
+    causes a fail-closed concurrent modification instead of a rollback
+    overwrite.
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if baseline is None:
+        baseline = _read_content_snapshot_with_backoff(
+            target,
+            operation=f"{operation}:initial_snapshot",
+        )
+    expected = dict(_transaction_expected(target, baseline))
+    desired = _content_snapshot_from_bytes(payload)
+    suffix = target.suffix or ".tmp"
+    temporary = None
+    try:
+        stage_error = None
+        for stage_attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{target.stem}.{os.getpid()}.",
+                    suffix=f".skbatch{suffix}",
+                    dir=str(target.parent),
+                )
+                temporary = Path(temporary_name)
+                with os.fdopen(descriptor, "wb") as raw:
+                    raw.write(payload)
+                    raw.flush()
+                    os.fsync(raw.fileno())
+                if source_stat is not None:
+                    os.utime(
+                        temporary,
+                        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                    )
+                break
+            except OSError as exc:
+                if not _retryable_file_operation_error(exc):
+                    raise
+                stage_error = exc
+                if temporary is not None and temporary.exists():
+                    try:
+                        _unlink_with_backoff(
+                            temporary,
+                            operation=f"{operation}:discard_failed_stage",
+                        )
+                    except (OSError, SPMAtomicOperationError):
+                        pass
+                temporary = None
+                if stage_attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(stage_attempt)
+        if temporary is None:
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "process_file_lock",
+                    operation=f"{operation}:stage",
+                    target=target,
+                    attempts=SPM_REPLACE_MAX_ATTEMPTS,
+                    error=stage_error,
+                )
+            )
+
+        last_error = None
+        for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+            try:
+                observed = _read_content_snapshot(target)
+            except OSError as exc:
+                if not _retryable_file_operation_error(exc):
+                    raise
+                last_error = exc
+                if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(attempt)
+                    continue
+                break
+            if not _same_content_snapshot(observed, expected):
+                # A replace can succeed even if a filesystem filter reports a
+                # late error. Treat the exact desired payload as committed.
+                if _same_content_snapshot(observed, desired):
+                    _transaction_record_write(target, desired)
+                    return target
+                raise SPMAtomicOperationError(
+                    _operation_diagnostic(
+                        "concurrent_spm_modification",
+                        operation=operation,
+                        target=target,
+                        attempts=attempt,
+                        expected=expected,
+                        observed=observed,
+                    )
+                )
+            rescue = None
+            try:
+                rescue = _replace_file_with_rescue(
+                    temporary,
+                    target,
+                    require_existing=bool(expected.get("exists")),
+                )
+                temporary = None
+                if rescue is not None:
+                    replaced_snapshot = _read_content_snapshot(rescue)
+                    if not _same_content_snapshot(
+                        replaced_snapshot,
+                        expected,
+                    ):
+                        restore = _restore_conflict_rescue(
+                            rescue,
+                            target,
+                            expected_current=desired,
+                        )
+                        rescue = None
+                        observed_external = _read_content_snapshot(target)
+                        diagnostic = _operation_diagnostic(
+                            "concurrent_spm_modification",
+                            operation=f"{operation}:atomic_swap",
+                            target=target,
+                            attempts=attempt,
+                            expected=expected,
+                            observed=observed_external,
+                        )
+                        if restore.get("conflict_artifact"):
+                            diagnostic["conflict_artifact"] = restore[
+                                "conflict_artifact"
+                            ]
+                        raise SPMAtomicOperationError(diagnostic)
+                    _unlink_with_backoff(
+                        rescue,
+                        operation=f"{operation}:discard_swap_rescue",
+                    )
+                    rescue = None
+                observed_after = _read_content_snapshot(target)
+                if not _same_content_snapshot(observed_after, desired):
+                    raise SPMAtomicOperationError(
+                        _operation_diagnostic(
+                            "concurrent_spm_modification",
+                            operation=f"{operation}:post_verify",
+                            target=target,
+                            attempts=attempt,
+                            expected=desired,
+                            observed=observed_after,
+                        )
+                    )
+                _transaction_record_write(target, desired)
+                return target
+            except FileNotFoundError as exc:
+                last_error = exc
+                if expected.get("exists") and attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    continue
+                observed_missing = _read_content_snapshot(target)
+                raise SPMAtomicOperationError(
+                    _operation_diagnostic(
+                        "concurrent_spm_modification",
+                        operation=f"{operation}:target_disappeared",
+                        target=target,
+                        attempts=attempt,
+                        expected=expected,
+                        observed=observed_missing,
+                        error=exc,
+                    )
+                ) from exc
+            except OSError as exc:
+                if rescue is not None and rescue.exists():
+                    try:
+                        _restore_conflict_rescue(
+                            rescue,
+                            target,
+                            expected_current=desired,
+                        )
+                        rescue = None
+                    except OSError:
+                        pass
+                if not _retryable_file_operation_error(exc):
+                    raise
+                last_error = exc
+                if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(attempt)
+                    continue
+                break
+        raise SPMAtomicOperationError(
+            _operation_diagnostic(
+                "process_file_lock",
+                operation=operation,
+                target=target,
+                attempts=SPM_REPLACE_MAX_ATTEMPTS,
+                error=last_error,
+                expected=expected,
+            )
+        )
+    finally:
+        if temporary is not None and temporary.exists():
+            try:
+                _unlink_with_backoff(
+                    temporary,
+                    operation=f"{operation}:discard_partial",
+                )
+            except (OSError, SPMAtomicOperationError):
+                pass
+
+
+def _atomic_publish_staged_file(
+    staged,
+    target,
+    *,
+    operation,
+    baseline,
+):
+    staged = Path(staged)
+    target = Path(target)
+    desired = _read_content_snapshot(staged)
+    expected = dict(baseline)
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            observed = _read_content_snapshot(target)
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+                continue
+            break
+        if not _same_content_snapshot(observed, expected):
+            if _same_content_snapshot(observed, desired):
+                return target
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "concurrent_spm_modification",
+                    operation=operation,
+                    target=target,
+                    attempts=attempt,
+                    expected=expected,
+                    observed=observed,
+                )
+            )
+        try:
+            os.replace(staged, target)
+            return target
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+                continue
+            break
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=target,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+            expected=expected,
+        )
     )
 
 
@@ -704,29 +1319,35 @@ def write_spm(path, text):
         truncated SPM; the previous file survives untouched.
     """
     candidate = Path(path)
-    compressed = (
-        spm_container_format(candidate) == "gzip" if candidate.is_file() else True
+    baseline, current_payload = _read_content_snapshot_with_backoff(
+        candidate,
+        operation="write_spm:initial_snapshot",
+        include_bytes=True,
     )
-    payload = text.encode("utf-8")
-    temporary = candidate.with_name(f".{candidate.name}.{os.getpid()}.skbatch.tmp")
-    try:
-        if compressed:
-            with temporary.open("wb") as raw:
-                with gzip.GzipFile(
-                    filename=candidate.name, mode="wb", fileobj=raw, mtime=0
-                ) as handle:
-                    handle.write(payload)
-                raw.flush()
-                os.fsync(raw.fileno())
-        else:
-            with temporary.open("wb") as raw:
-                raw.write(payload)
-                raw.flush()
-                os.fsync(raw.fileno())
-        os.replace(temporary, candidate)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    compressed = (
+        bool(current_payload and current_payload.startswith(b"\x1f\x8b"))
+        if baseline["exists"]
+        else True
+    )
+    text_payload = text.encode("utf-8")
+    if compressed:
+        encoded = io.BytesIO()
+        with gzip.GzipFile(
+            filename=candidate.name,
+            mode="wb",
+            fileobj=encoded,
+            mtime=0,
+        ) as handle:
+            handle.write(text_payload)
+        payload = encoded.getvalue()
+    else:
+        payload = text_payload
+    _atomic_replace_payload(
+        candidate,
+        payload,
+        operation="write_spm",
+        baseline=baseline,
+    )
 
 
 def probe_cache_path(spm_path):
@@ -1873,7 +2494,332 @@ def _terminate_speedtree_tree(process):
             pass
 
 
-def run_speedtree_export(cmd, cwd, timeout):
+class _FILETIME(ctypes.Structure):
+    _fields_ = (
+        ("low", ctypes.c_uint32),
+        ("high", ctypes.c_uint32),
+    )
+
+
+def _windows_handle_cpu_seconds(handle):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    )
+    kernel32.GetProcessTimes.restype = ctypes.c_bool
+    creation = _FILETIME()
+    exit_time = _FILETIME()
+    kernel = _FILETIME()
+    user = _FILETIME()
+    if not kernel32.GetProcessTimes(
+        ctypes.c_void_p(int(handle)),
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+
+    def seconds(value):
+        ticks = (int(value.high) << 32) | int(value.low)
+        return ticks / 10_000_000.0
+
+    return seconds(kernel) + seconds(user)
+
+
+def _windows_descendant_pids(root_pid):
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32FirstW.restype = ctypes.c_bool
+    kernel32.Process32NextW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32NextW.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot in {None, ctypes.c_void_p(-1).value}:
+        return []
+    parent_by_pid = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            parent_by_pid[int(entry.th32ProcessID)] = int(
+                entry.th32ParentProcessID
+            )
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    descendants = {int(root_pid)}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent_pid in parent_by_pid.items():
+            if parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    descendants.discard(int(root_pid))
+    return sorted(descendants)
+
+
+def _process_cpu_seconds(process):
+    """Return SpeedTree plus descendant CPU without a psutil dependency."""
+    if os.name == "nt":
+        handle = getattr(process, "_handle", None)
+        total = (
+            _windows_handle_cpu_seconds(handle)
+            if handle is not None
+            else None
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_bool,
+            ctypes.c_uint32,
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        for pid in _windows_descendant_pids(process.pid):
+            child_handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not child_handle:
+                continue
+            try:
+                value = _windows_handle_cpu_seconds(child_handle)
+                if value is not None:
+                    total = (total or 0.0) + value
+            finally:
+                kernel32.CloseHandle(child_handle)
+        return total
+
+    stat_path = Path("/proc") / str(process.pid) / "stat"
+    try:
+        fields = stat_path.read_text(encoding="ascii").split()
+        ticks = float(fields[13]) + float(fields[14])
+        return ticks / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _file_progress_signature(path):
+    if not path:
+        return None
+    try:
+        stat = Path(path).stat()
+        return (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _handle_progress_signature(handle):
+    try:
+        stat = os.fstat(handle.fileno())
+        return (stat.st_size, stat.st_mtime_ns)
+    except (AttributeError, OSError):
+        return None
+
+
+def _speedtree_export_output_path(cmd):
+    try:
+        index = list(cmd).index("-export")
+        return Path(cmd[index + 1])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _attempt_output_path(target, attempt):
+    return target.with_name(
+        f".{target.stem}.{os.getpid()}.{attempt}.{time.time_ns()}"
+        f".skbatch{target.suffix}"
+    )
+
+
+def _crashed_with_access_violation(returncode):
+    if returncode is None:
+        return False
+    return (int(returncode) & 0xFFFFFFFF) == 0xC0000005
+
+
+class _SpeedTreeProgressDeadline(subprocess.TimeoutExpired):
+    def __init__(self, cmd, timeout, *, stdout, stderr, evidence):
+        super().__init__(cmd, timeout, output=stdout, stderr=stderr)
+        self.evidence = evidence
+        self.reason = evidence.get("timeout_reason")
+
+
+def _run_speedtree_export_attempt(
+    cmd,
+    *,
+    popen_kwargs,
+    soft_timeout,
+    absolute_timeout,
+    poll_interval,
+    staged_output,
+    attempt,
+):
+    def read_handle(handle):
+        handle.flush()
+        handle.seek(0)
+        return handle.read().decode("utf-8", errors="replace")
+
+    started = time.monotonic()
+    hard_deadline = started + absolute_timeout
+    soft_deadline = min(hard_deadline, started + soft_timeout)
+    progress_events = []
+    with tempfile.TemporaryFile(
+        mode="w+b"
+    ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=out_file,
+            stderr=err_file,
+            **popen_kwargs,
+        )
+        signatures = {
+            "cpu_seconds": _process_cpu_seconds(process),
+            "output": _file_progress_signature(staged_output),
+            "stdout": _handle_progress_signature(out_file),
+            "stderr": _handle_progress_signature(err_file),
+        }
+        last_progress = started
+        while True:
+            now = time.monotonic()
+            remaining = min(soft_deadline, hard_deadline) - now
+            if remaining <= 0:
+                reason = (
+                    "hard_cap"
+                    if now >= hard_deadline
+                    else "stalled"
+                )
+                stdout = read_handle(out_file)
+                stderr = read_handle(err_file)
+                _terminate_speedtree_tree(process)
+                elapsed = max(0.0, now - started)
+                evidence = {
+                    "attempt": attempt,
+                    "timeout_reason": reason,
+                    "soft_timeout_seconds": soft_timeout,
+                    "absolute_max_seconds": absolute_timeout,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "last_progress_age_seconds": round(
+                        max(0.0, now - last_progress),
+                        3,
+                    ),
+                    "progress_event_count": len(progress_events),
+                    "progress_events": progress_events[-64:],
+                }
+                raise _SpeedTreeProgressDeadline(
+                    cmd,
+                    soft_timeout,
+                    stdout=stdout,
+                    stderr=stderr,
+                    evidence=evidence,
+                )
+            wait_slice = max(
+                0.001,
+                min(float(poll_interval), remaining),
+            )
+            try:
+                returncode = process.wait(timeout=wait_slice)
+            except subprocess.TimeoutExpired:
+                returncode = None
+            now = time.monotonic()
+            current = {
+                "cpu_seconds": _process_cpu_seconds(process),
+                "output": _file_progress_signature(staged_output),
+                "stdout": _handle_progress_signature(out_file),
+                "stderr": _handle_progress_signature(err_file),
+            }
+            changed = []
+            old_cpu = signatures.get("cpu_seconds")
+            new_cpu = current.get("cpu_seconds")
+            if (
+                old_cpu is not None
+                and new_cpu is not None
+                and new_cpu > old_cpu
+            ):
+                changed.append("child_cpu")
+            for role in ("output", "stdout", "stderr"):
+                if _content_signature_advanced(
+                    signatures.get(role),
+                    current.get(role),
+                ):
+                    changed.append(role)
+            if changed:
+                last_progress = now
+                soft_deadline = min(
+                    hard_deadline,
+                    now + soft_timeout,
+                )
+                progress_events.append(
+                    {
+                        "elapsed_seconds": round(now - started, 3),
+                        "signals": changed,
+                        "cpu_seconds": new_cpu,
+                        "output": current.get("output"),
+                        "stdout": current.get("stdout"),
+                        "stderr": current.get("stderr"),
+                    }
+                )
+            signatures = current
+            if returncode is not None:
+                stdout = read_handle(out_file)
+                stderr = read_handle(err_file)
+                return (
+                    returncode,
+                    stdout,
+                    stderr,
+                    {
+                        "attempt": attempt,
+                        "duration_seconds": round(now - started, 3),
+                        "returncode": int(returncode),
+                        "returncode_hex": (
+                            f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                        ),
+                        "progress_event_count": len(progress_events),
+                        "progress_events": progress_events[-64:],
+                    },
+                )
+
+
+def run_speedtree_export(
+    cmd,
+    cwd,
+    timeout,
+    *,
+    absolute_timeout=SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
+    poll_interval=0.5,
+    crash_retries=SPEEDTREE_EXPORT_CRASH_RETRIES,
+):
     """Run one Modeler export, waiting on the process handle, not on pipe EOF.
 
     SpeedTree is a GUI executable even under ``-export``: descendants can keep
@@ -1883,6 +2829,15 @@ def run_speedtree_export(cmd, cwd, timeout):
     Regular temporary files remove that failure mode; this mirrors the add-on's
     ``speedtree_cli._run_process`` contract.
     """
+    absolute_timeout = max(
+        0.001,
+        min(
+            SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
+            float(absolute_timeout),
+        ),
+    )
+    soft_timeout = min(absolute_timeout, max(0.001, float(timeout)))
+    crash_retries = max(0, min(2, int(crash_retries)))
     popen_kwargs = {"cwd": str(cwd), "stdin": subprocess.DEVNULL}
     if os.name == "nt":
         popen_kwargs["creationflags"] = 0x08000000 | getattr(  # CREATE_NO_WINDOW
@@ -1891,24 +2846,138 @@ def run_speedtree_export(cmd, cwd, timeout):
     else:
         popen_kwargs["start_new_session"] = True
 
-    def _read(handle):
-        handle.flush()
-        handle.seek(0)
-        return handle.read().decode("utf-8", errors="replace")
-
+    original_cmd = [str(value) for value in cmd]
+    final_output = _speedtree_export_output_path(original_cmd)
+    if final_output is not None and not final_output.is_absolute():
+        final_output = Path(cwd) / final_output
+    if final_output is not None:
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        _unlink_with_backoff(
+            final_output,
+            operation="speedtree_export:discard_stale_output",
+        )
+    evidence = {
+        "contract": "speedtree_export_runtime_v1",
+        "failure_kind": "internal_error",
+        "soft_timeout_seconds": soft_timeout,
+        "absolute_max_seconds": absolute_timeout,
+        "max_access_violation_retries": crash_retries,
+        "attempts": [],
+    }
     with speedtree_export_gate():
-        with tempfile.TemporaryFile(
-            mode="w+b"
-        ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
-            process = subprocess.Popen(
-                cmd, stdout=out_file, stderr=err_file, **popen_kwargs
+        gate_started = time.monotonic()
+        for attempt in range(1, crash_retries + 2):
+            remaining_absolute = max(
+                0.001,
+                absolute_timeout - (time.monotonic() - gate_started),
             )
+            attempt_cmd = list(original_cmd)
+            staged_output = None
+            if final_output is not None:
+                staged_output = _attempt_output_path(final_output, attempt)
+                export_index = attempt_cmd.index("-export") + 1
+                attempt_cmd[export_index] = str(staged_output)
             try:
-                returncode = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _terminate_speedtree_tree(process)
-                raise
-            return returncode, _read(out_file), _read(err_file)
+                (
+                    returncode,
+                    stdout,
+                    stderr,
+                    attempt_evidence,
+                ) = _run_speedtree_export_attempt(
+                    attempt_cmd,
+                    popen_kwargs=popen_kwargs,
+                    soft_timeout=min(soft_timeout, remaining_absolute),
+                    absolute_timeout=remaining_absolute,
+                    poll_interval=poll_interval,
+                    staged_output=staged_output,
+                    attempt=attempt,
+                )
+            except _SpeedTreeProgressDeadline as exc:
+                evidence["attempts"].append(exc.evidence)
+                evidence["result"] = "timeout"
+                evidence["timeout_reason"] = exc.reason
+                if staged_output is not None:
+                    _unlink_with_backoff(
+                        staged_output,
+                        operation="speedtree_export:discard_timeout_partial",
+                    )
+                raise _SpeedTreeProgressDeadline(
+                    original_cmd,
+                    soft_timeout,
+                    stdout=exc.output,
+                    stderr=exc.stderr,
+                    evidence=evidence,
+                ) from exc
+            attempt_evidence["stdout_tail"] = stdout[-500:]
+            attempt_evidence["stderr_tail"] = stderr[-500:]
+            attempt_evidence["access_violation"] = (
+                _crashed_with_access_violation(returncode)
+            )
+            evidence["attempts"].append(attempt_evidence)
+            if _crashed_with_access_violation(returncode):
+                if staged_output is not None:
+                    _unlink_with_backoff(
+                        staged_output,
+                        operation=(
+                            "speedtree_export:"
+                            "discard_access_violation_partial"
+                        ),
+                    )
+                if attempt <= crash_retries:
+                    continue
+                evidence["result"] = "access_violation_exhausted"
+                evidence["retry_count"] = attempt - 1
+                return SpeedTreeExportResult(
+                    returncode,
+                    stdout,
+                    stderr,
+                    evidence,
+                )
+            if returncode == 0 and staged_output is not None:
+                staged_snapshot = _read_content_snapshot(staged_output)
+                if not staged_snapshot["exists"]:
+                    evidence["result"] = "output_missing"
+                    evidence["retry_count"] = attempt - 1
+                    return SpeedTreeExportResult(
+                        returncode,
+                        stdout,
+                        stderr,
+                        evidence,
+                    )
+                final_baseline = _read_content_snapshot(final_output)
+                _atomic_publish_staged_file(
+                    staged_output,
+                    final_output,
+                    operation="speedtree_export:publish_output",
+                    baseline=final_baseline,
+                )
+                published = _read_content_snapshot(final_output)
+                if not _same_content_snapshot(staged_snapshot, published):
+                    raise SpeedTreeExportProcessError(
+                        "SpeedTree export publication changed the output bytes",
+                        {
+                            **evidence,
+                            "failure_kind": "process",
+                            "category": "output_publish_mismatch",
+                            "expected_output": staged_snapshot,
+                            "observed_output": published,
+                        },
+                    )
+            elif staged_output is not None:
+                _unlink_with_backoff(
+                    staged_output,
+                    operation="speedtree_export:discard_failed_partial",
+                )
+            evidence["result"] = (
+                "ok" if returncode == 0 else "non_retryable_returncode"
+            )
+            evidence["retry_count"] = attempt - 1
+            return SpeedTreeExportResult(
+                returncode,
+                stdout,
+                stderr,
+                evidence,
+            )
 
 
 def calibration_marker_path(spm_path):
@@ -1934,6 +3003,7 @@ def write_calibration_marker(spm_path, backup, source_sha256):
         "spm": str(Path(spm_path)),
         "backup": str(backup) if backup else "",
         "source_sha256": source_sha256,
+        "last_pipeline_sha256": source_sha256,
         "pid": os.getpid(),
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "note": (
@@ -1941,21 +3011,81 @@ def write_calibration_marker(spm_path, backup, source_sha256):
             "Restore the recorded backup before trusting its bone settings."
         ),
     }
-    marker.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    _atomic_replace_payload(
+        marker,
+        encoded,
+        operation="write_calibration_marker",
     )
     return marker
 
 
+def _update_calibration_marker_last_pipeline_sha(spm_path, sha256):
+    marker = calibration_marker_path(spm_path)
+    marker_snapshot, marker_bytes = _read_content_snapshot_with_backoff(
+        marker,
+        operation="update_calibration_marker:read",
+        include_bytes=True,
+    )
+    if not marker_snapshot.get("exists"):
+        transaction = _SPM_WRITE_TRANSACTION.get()
+        expected = (
+            transaction.get(_transaction_key(marker))
+            if transaction is not None
+            else None
+        )
+        if expected and expected.get("exists"):
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "concurrent_spm_modification",
+                    operation="update_calibration_marker:missing",
+                    target=marker,
+                    attempts=1,
+                    expected=expected,
+                    observed=_missing_content_snapshot(),
+                )
+            )
+        return False
+    try:
+        payload = json.loads(marker_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SPMAtomicOperationError(
+            _operation_diagnostic(
+                "concurrent_spm_modification",
+                operation="update_calibration_marker:invalid_json",
+                target=marker,
+                attempts=1,
+                error=exc,
+            )
+        ) from exc
+    payload["last_pipeline_sha256"] = str(sha256 or "")
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    _atomic_replace_payload(
+        marker,
+        encoded,
+        operation="update_calibration_marker",
+    )
+    return True
+
+
 def clear_calibration_marker(spm_path):
     marker = calibration_marker_path(spm_path)
-    try:
-        marker.unlink()
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return False
+    cleared = _unlink_with_backoff(
+        marker,
+        operation="clear_calibration_marker",
+        missing_ok=True,
+    )
+    if cleared:
+        _transaction_record_write(marker, _missing_content_snapshot())
+    return bool(cleared)
 
 
 def _sha256_bytes(payload):
@@ -1983,11 +3113,17 @@ def inspect_interrupted_calibration(spm_path):
         "backup": str(backup) if payload.get("backup") else "",
         "started_at": payload.get("started_at", ""),
         "source_sha256": payload.get("source_sha256", ""),
+        "last_pipeline_sha256": payload.get(
+            "last_pipeline_sha256",
+            "",
+        ),
         "backup_available": bool(payload.get("backup")) and backup.is_file(),
     }
     try:
+        current_snapshot = _read_content_snapshot(spm_path)
+        result["spm_snapshot"] = current_snapshot
         result["spm_matches_source"] = (
-            _sha256_bytes(Path(spm_path).read_bytes())
+            current_snapshot["sha256"]
             == str(payload.get("source_sha256") or "")
         )
     except OSError:
@@ -1999,16 +3135,64 @@ def inspect_interrupted_calibration(spm_path):
     return result
 
 
+def _calibration_recovery_clear_result(state, spm_path, *, recovered):
+    try:
+        cleared = clear_calibration_marker(spm_path)
+    except SPMAtomicOperationError as exc:
+        return {
+            **state,
+            "recovered": bool(recovered),
+            "cleared": False,
+            "error": (
+                "calibration marker could not be cleared safely: "
+                + str(exc)
+            ),
+            "diagnostic": exc.diagnostic,
+            "failure_kind": exc.diagnostic.get(
+                "failure_kind",
+                "process_file_lock",
+            ),
+        }
+    return {
+        **state,
+        "recovered": bool(recovered),
+        "cleared": bool(cleared),
+    }
+
+
 def recover_interrupted_calibration(spm_path):
     """Restore a killed calibration's source SPM from its recorded backup."""
     state = inspect_interrupted_calibration(spm_path)
     if state["status"] == "clean":
         return {**state, "recovered": False}
     if state["status"] == "interrupted_but_intact":
-        clear_calibration_marker(spm_path)
-        return {**state, "recovered": False, "cleared": True}
+        return _calibration_recovery_clear_result(
+            state,
+            spm_path,
+            recovered=False,
+        )
     if state["status"] == "unreadable_marker" or not state.get("backup_available"):
         return {**state, "recovered": False}
+    if not state.get("last_pipeline_sha256"):
+        return {
+            **state,
+            "recovered": False,
+            "error": (
+                "interrupted marker has no last pipeline content hash; "
+                "refusing to overwrite a potentially external SPM edit"
+            ),
+        }
+    live_sha256 = (state.get("spm_snapshot") or {}).get("sha256", "")
+    if live_sha256 != state["last_pipeline_sha256"]:
+        return {
+            **state,
+            "status": "concurrent_spm_modification",
+            "recovered": False,
+            "error": (
+                "current SPM content differs from the last pipeline-authored "
+                "fingerprint; external edit preserved"
+            ),
+        }
     backup = Path(state["backup"])
     if state.get("source_sha256") and _sha256_bytes(
         backup.read_bytes()
@@ -2018,9 +3202,20 @@ def recover_interrupted_calibration(spm_path):
             "recovered": False,
             "error": "recorded backup does not match the interrupted source hash",
         }
-    shutil.copy2(backup, spm_path)
-    clear_calibration_marker(spm_path)
-    return {**state, "recovered": True, "cleared": True}
+    backup_payload = backup.read_bytes()
+    backup_stat = backup.stat()
+    _atomic_replace_payload(
+        spm_path,
+        backup_payload,
+        operation="recover_interrupted_calibration",
+        baseline=state.get("spm_snapshot"),
+        source_stat=backup_stat,
+    )
+    return _calibration_recovery_clear_result(
+        state,
+        spm_path,
+        recovered=True,
+    )
 
 
 def export_verify_xml(spm_path, cfg, out_path):
@@ -2038,14 +3233,47 @@ def export_verify_xml(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        returncode, stdout, stderr = run_speedtree_export(
+        result = run_speedtree_export(
             cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
-        raise SpeedTreeExportTimeout("XML", timeout) from exc
+        raise SpeedTreeExportTimeout(
+            "XML",
+            timeout,
+            evidence=getattr(exc, "evidence", {}),
+        ) from exc
+    returncode, stdout, stderr = result
     if returncode != 0 or not Path(out_path).exists():
         detail = (stderr or stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree XML verify export failed ({returncode}): {detail}")
+        evidence = dict(getattr(result, "evidence", {}) or {})
+        evidence.update(
+            {
+                "stage": "XML",
+                "category": (
+                    "access_violation"
+                    if _crashed_with_access_violation(returncode)
+                    else (
+                        "output_missing"
+                        if returncode == 0
+                        else "non_retryable_returncode"
+                    )
+                ),
+                "returncode": int(returncode),
+                "returncode_hex": (
+                    f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                ),
+                "output_exists": Path(out_path).exists(),
+            }
+        )
+        evidence["failure_kind"] = (
+            "process_exporter_crash"
+            if evidence["category"] == "access_violation"
+            else "internal_error"
+        )
+        raise SpeedTreeExportProcessError(
+            f"SpeedTree XML verify export failed ({returncode}): {detail}",
+            evidence,
+        )
     return out_path
 
 
@@ -2064,15 +3292,48 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        returncode, stdout, stderr = run_speedtree_export(
+        result = run_speedtree_export(
             cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
-        raise SpeedTreeExportTimeout("FBX", timeout) from exc
+        raise SpeedTreeExportTimeout(
+            "FBX",
+            timeout,
+            evidence=getattr(exc, "evidence", {}),
+        ) from exc
+    returncode, stdout, stderr = result
     path = Path(out_path)
     if returncode != 0 or not path.exists():
         detail = (stderr or stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree FBX verify export failed ({returncode}): {detail}")
+        evidence = dict(getattr(result, "evidence", {}) or {})
+        evidence.update(
+            {
+                "stage": "FBX",
+                "category": (
+                    "access_violation"
+                    if _crashed_with_access_violation(returncode)
+                    else (
+                        "output_missing"
+                        if returncode == 0
+                        else "non_retryable_returncode"
+                    )
+                ),
+                "returncode": int(returncode),
+                "returncode_hex": (
+                    f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                ),
+                "output_exists": path.exists(),
+            }
+        )
+        evidence["failure_kind"] = (
+            "process_exporter_crash"
+            if evidence["category"] == "access_violation"
+            else "internal_error"
+        )
+        raise SpeedTreeExportProcessError(
+            f"SpeedTree FBX verify export failed ({returncode}): {detail}",
+            evidence,
+        )
     # SpeedTree writes binary FBX. A real mesh contains the FBX property name
     # "Vertices" in clear text; armature-only/container-only exports do not.
     return b"Vertices" in path.read_bytes()
@@ -3008,25 +4269,36 @@ def _restore_source_snapshot(
     source_stat,
 ):
     if backup:
-        shutil.copy2(backup, spm_path)
-    else:
-        Path(spm_path).write_bytes(source_bytes)
-        os.utime(
+        backup_path = Path(backup)
+        _atomic_replace_payload(
             spm_path,
-            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            backup_path.read_bytes(),
+            operation="rollback_from_backup",
+            source_stat=backup_path.stat(),
+        )
+    else:
+        _atomic_replace_payload(
+            spm_path,
+            source_bytes,
+            operation="rollback_source_snapshot",
+            source_stat=source_stat,
         )
 
 
 def process_spm(spm_path, cfg, log=print, dry_run=False, force_rerun=False):
     """Run one complete SPM transaction under its canonical OS lock."""
     with spm_exclusive_lock(spm_path, log=log):
-        return _process_spm_locked(
-            spm_path,
-            cfg,
-            log=log,
-            dry_run=dry_run,
-            force_rerun=force_rerun,
-        )
+        token = _SPM_WRITE_TRANSACTION.set({})
+        try:
+            return _process_spm_locked(
+                spm_path,
+                cfg,
+                log=log,
+                dry_run=dry_run,
+                force_rerun=force_rerun,
+            )
+        finally:
+            _SPM_WRITE_TRANSACTION.reset(token)
 
 
 def _process_spm_locked(
@@ -3041,6 +4313,8 @@ def _process_spm_locked(
     # A previous run killed mid-rewrite left probe bones in the source. Repair
     # that before reading it as authoritative input.
     recovery = recover_interrupted_calibration(spm_path)
+    if recovery.get("diagnostic") and not recovery.get("cleared"):
+        raise SPMAtomicOperationError(recovery["diagnostic"])
     if recovery.get("recovered"):
         log(
             "  [복구] 중단된 캘리브레이션 감지 — 백업에서 원본 SPM 복원: "
@@ -3056,6 +4330,7 @@ def _process_spm_locked(
         )
     source_bytes = spm_path.read_bytes()
     source_stat = spm_path.stat()
+    _seed_spm_transaction(spm_path, source_bytes)
     source_text = gzip.decompress(source_bytes).decode("utf-8")
     report = {
         "spm": str(spm_path),
@@ -3218,10 +4493,11 @@ def _process_spm_locked(
         # gzip bytes and timestamps so a no-op ① run does not invalidate a
         # perfectly good .blend merely by touching the SPM.
         if final_text == source_text:
-            spm_path.write_bytes(source_bytes)
-            os.utime(
+            _atomic_replace_payload(
                 spm_path,
-                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                source_bytes,
+                operation="restore_byte_identical_noop_source",
+                source_stat=source_stat,
             )
             changed = False
             report["source_restored_unchanged"] = True
@@ -3253,16 +4529,25 @@ def _process_spm_locked(
             source_bytes=source_bytes,
             source_stat=source_stat,
         )
-        report["status"] = "manual-required"
+        report["status"] = "failed"
+        report["failure_kind"] = "process_timeout"
         report["error"] = str(exc)
+        report["diagnostic"] = {
+            **dict(exc.evidence or {}),
+            "failure_kind": "process_timeout",
+            "category": "speedtree_export_timeout",
+            "stage": exc.stage,
+        }
         report["calibration"] = {
-            "mode": "manual_required_export_timeout",
+            "mode": "process_export_timeout",
             "stage": exc.stage,
             "timeout_seconds": exc.timeout_seconds,
-            "manual_required": True,
+            "export_runtime": exc.evidence,
+            "manual_required": False,
         }
         report["warnings"].append(
-            "SpeedTree export was too slow; automatic calibration stopped and original SPM restored"
+            "SpeedTree export made no progress or reached the hard cap; "
+            "automatic calibration stopped and original SPM restored"
         )
     except Exception:
         _restore_source_snapshot(
@@ -3276,9 +4561,12 @@ def _process_spm_locked(
         report["status"] = "failed"
         raise
     finally:
-        # Every path above has already restored the source, so the marker must
-        # not outlive this call and trigger a bogus recovery on the next run.
-        clear_calibration_marker(spm_path)
+        # A writer outside this transaction may have changed the SPM while
+        # SpeedTree/OneDrive still held it. Keep the marker in that case: the
+        # next run must diagnose/recover instead of declaring a false clean
+        # state.
+        if _transaction_target_is_current(spm_path):
+            clear_calibration_marker(spm_path)
     report = _record_final_spm_identity(report, spm_path)
     if report.get("status") in POSITIVE_CALIBRATION_STATUSES:
         report = _persist_positive_bone_receipt(
@@ -3315,6 +4603,13 @@ def main():
         except Exception as exc:
             print(f"FAILED: {exc}")
             rep = {"spm": spm, "status": "failed", "error": str(exc)}
+            diagnostic = getattr(exc, "diagnostic", None)
+            if diagnostic:
+                rep["diagnostic"] = diagnostic
+                rep["failure_kind"] = diagnostic.get(
+                    "failure_kind",
+                    "process",
+                )
         reports.append(rep)
         print(json.dumps(rep, indent=2, ensure_ascii=False))
     if args.report:

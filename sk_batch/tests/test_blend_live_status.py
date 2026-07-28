@@ -169,6 +169,161 @@ class BlendLiveStatusTests(unittest.TestCase):
     def set_time(path, nanoseconds):
         os.utime(path, ns=(nanoseconds, nanoseconds))
 
+    def test_spm_process_failure_kind_reaches_batch_item_error(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_process_failure.spm"
+            write_empty_spm(spm)
+            iid = str(spm)
+            app.state[iid] = {}
+            app.force_rerun = True
+            app.cfg = {
+                "spm_parallel_jobs": 1,
+                "spm_verify_timeout": 120,
+                "spm_job_timeout": 7200,
+            }
+            app.spm_calibration_signature = "settings"
+            app.legacy_spm_calibration_signature = None
+            app.log = mock.Mock()
+            app._prepare_pair_for_job = mock.Mock(return_value=spm)
+            app._batch_job_item = mock.Mock(
+                return_value={"manual_bones_locked": False}
+            )
+            app._current_spm_snapshot = mock.Mock(
+                return_value={"fingerprint": "before"}
+            )
+
+            def fake_run(command, log_name, *_args, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps([{
+                        "spm": str(spm),
+                        "status": "failed",
+                        "failure_kind": "internal_error",
+                        "error": "SpeedTree export stalled",
+                        "diagnostic": {
+                            "category": "speedtree_export_timeout",
+                        },
+                    }]),
+                    encoding="utf-8",
+                )
+                return 1, root / log_name
+
+            app._run_limited = fake_run
+            with mock.patch.object(
+                gui,
+                "LOG_DIR",
+                root / "logs",
+            ), mock.patch.object(
+                gui,
+                "should_calibrate_spm",
+                return_value=True,
+            ), self.assertRaises(gui.BatchItemError) as caught:
+                app._job_spm(iid, spm)
+
+        self.assertEqual(caught.exception.kind, "internal_error")
+        self.assertEqual(
+            caught.exception.report["diagnostic"]["category"],
+            "speedtree_export_timeout",
+        )
+
+    def test_malformed_spm_report_is_internal_error(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_bad_report.spm"
+            write_empty_spm(spm)
+            iid = str(spm)
+            app.state[iid] = {}
+            app.force_rerun = True
+            app.cfg = {
+                "spm_parallel_jobs": 1,
+                "spm_verify_timeout": 120,
+                "spm_job_timeout": 7200,
+            }
+            app.spm_calibration_signature = "settings"
+            app.legacy_spm_calibration_signature = None
+            app.log = mock.Mock()
+            app._prepare_pair_for_job = mock.Mock(return_value=spm)
+            app._batch_job_item = mock.Mock(
+                return_value={"manual_bones_locked": False}
+            )
+            app._current_spm_snapshot = mock.Mock(
+                return_value={"fingerprint": "before"}
+            )
+
+            def fake_run(command, log_name, *_args, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text("{", encoding="utf-8")
+                return 1, root / log_name
+
+            app._run_limited = fake_run
+            with mock.patch.object(
+                gui,
+                "LOG_DIR",
+                root / "logs",
+            ), mock.patch.object(
+                gui,
+                "should_calibrate_spm",
+                return_value=True,
+            ), self.assertRaises(gui.BatchItemError) as caught:
+                app._job_spm(iid, spm)
+
+        self.assertEqual(caught.exception.kind, "internal_error")
+        self.assertIn("보고서 손상", str(caught.exception))
+
+    def test_spm_worker_outer_timeout_is_internal_error(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_worker_timeout.spm"
+            write_empty_spm(spm)
+            iid = str(spm)
+            app.state[iid] = {}
+            app.force_rerun = True
+            app.cfg = {
+                "spm_parallel_jobs": 1,
+                "spm_verify_timeout": 120,
+                "spm_job_timeout": 7200,
+            }
+            app.spm_calibration_signature = "settings"
+            app.legacy_spm_calibration_signature = None
+            app.log = mock.Mock()
+            app._prepare_pair_for_job = mock.Mock(return_value=spm)
+            app._batch_job_item = mock.Mock(
+                return_value={"manual_bones_locked": False}
+            )
+            app._current_spm_snapshot = mock.Mock(
+                return_value={"fingerprint": "before"}
+            )
+            app._run_limited = mock.Mock(
+                side_effect=RuntimeError("worker watchdog timeout")
+            )
+
+            with mock.patch.object(
+                gui,
+                "LOG_DIR",
+                root / "logs",
+            ), mock.patch.object(
+                gui,
+                "should_calibrate_spm",
+                return_value=True,
+            ), self.assertRaises(gui.BatchItemError) as caught:
+                app._job_spm(iid, spm)
+
+        self.assertEqual(caught.exception.kind, "internal_error")
+        self.assertIn("watchdog timeout", str(caught.exception))
+
     def test_live_status_distinguishes_missing_stale_and_current(self):
         gui = load_gui_module()
         app = self.make_app(gui)
