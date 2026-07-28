@@ -57,15 +57,31 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sk_common import (
+        SPM_BONE_CONTRACT_VERSION,
+        calibration_settings_signature,
         file_content_fingerprint,
         load_config,
         speedtree_output_spm_for,
     )
+    from spm_calibration_receipt import (
+        POSITIVE_CALIBRATION_STATUSES,
+        bone_semantic_fingerprint,
+        load_positive_calibration_receipt,
+        write_positive_calibration_receipt,
+    )
 else:
     from .sk_common import (
+        SPM_BONE_CONTRACT_VERSION,
+        calibration_settings_signature,
         file_content_fingerprint,
         load_config,
         speedtree_output_spm_for,
+    )
+    from .spm_calibration_receipt import (
+        POSITIVE_CALIBRATION_STATUSES,
+        bone_semantic_fingerprint,
+        load_positive_calibration_receipt,
+        write_positive_calibration_receipt,
     )
 from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
@@ -85,6 +101,8 @@ CALIBRATION_MARKER_VERSION = 1
 PROBE_CACHE_VERSION = 1
 PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
 SPM_PROCESS_LOCK_SUFFIX = ".skbatch_process.lock"
+SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION = 1
+SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION = 1
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -386,6 +404,24 @@ def classify_asset_kind(spm_path):
             if owner == kind or owner.startswith(kind + "_"):
                 return kind
     return "other"
+
+
+def bone_semantic_context(spm_path):
+    """Return path/manifest semantics that affect automatic bone selection."""
+    categories, _manifest = load_sync_base_categories(spm_path)
+    return {
+        "asset_kind": classify_asset_kind(spm_path),
+        "cluster_normalization_spm": is_cluster_normalization_spm(spm_path),
+        "sync_base_categories": dict(sorted(categories.items())),
+    }
+
+
+def current_bone_semantic_fingerprint(spm_path, source_text=None):
+    text = read_spm(spm_path) if source_text is None else source_text
+    return bone_semantic_fingerprint(
+        text,
+        context=bone_semantic_context(spm_path),
+    )
 
 
 def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
@@ -2842,6 +2878,128 @@ def _record_final_spm_identity(report, spm_path):
     return report
 
 
+def _bone_receipt_cache_dir(cfg):
+    return cfg.get("spm_calibration_receipt_dir") or (
+        Path(__file__).resolve().parent / "cache" / "spm_calibration"
+    )
+
+
+def _persist_positive_bone_receipt(report, spm_path, source_text, cfg):
+    """Best-effort positive cache write; cache I/O never blocks good data."""
+    if report.get("status") not in POSITIVE_CALIBRATION_STATUSES:
+        return report
+    try:
+        semantic_fingerprint = current_bone_semantic_fingerprint(
+            spm_path,
+            source_text,
+        )
+        receipt_path = write_positive_calibration_receipt(
+            spm_path,
+            _bone_receipt_cache_dir(cfg),
+            bone_semantic_fingerprint_value=semantic_fingerprint,
+            settings_signature=calibration_settings_signature(cfg),
+            bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+            report=report,
+        )
+        report["bone_semantic_fingerprint"] = semantic_fingerprint
+        report["bone_contract_version"] = SPM_BONE_CONTRACT_VERSION
+        report["bone_receipt"] = str(receipt_path) if receipt_path else None
+    except (OSError, ValueError, TypeError) as exc:
+        report.setdefault("warnings", []).append(
+            "Bone calibration receipt cache could not be persisted: "
+            + str(exc)
+        )
+    return report
+
+
+def _apply_non_bone_transforms_from_receipt(
+    spm_path,
+    cfg,
+    *,
+    source_text,
+    source_bytes,
+    source_stat,
+    renames,
+    apply_tree_red,
+    receipt,
+    report,
+):
+    """Apply cheap SPM transforms while reusing a proven bone result."""
+    summary = receipt.get("summary") or {}
+    report["generators"] = summary.get("generators") or {}
+    report["rounds"] = summary.get("rounds") or []
+    report["total_bones"] = summary.get("total_bones")
+    report["calibration"] = summary.get("calibration") or {}
+    report["cached_display_summary"] = summary.get("display_summary")
+    report["skipped"].extend(summary.get("skipped") or [])
+    report["bone_fast_path"] = {
+        "status": "hit",
+        "reason": (
+            "bone structure/geometry, semantic contract and bone settings "
+            "are unchanged"
+        ),
+        "prior_status": receipt.get("status"),
+        "receipt_completed_at": receipt.get("completed_at"),
+    }
+
+    final_text = source_text
+    if cfg.get("rename_materials", True) and renames:
+        final_text, applied = apply_material_renames(final_text, renames)
+        report["material_renames"] = applied
+
+    if apply_tree_red:
+        final_text, vertex_report = apply_leaf_parent_red_gradient(final_text)
+        report["vertex_colors"] = vertex_report
+        if vertex_report["errors"]:
+            raise RuntimeError(
+                "SpeedTree leaf-parent VertexColor.R contract failed: "
+                + "; ".join(vertex_report["errors"])
+            )
+    cluster_root_mode = bool(
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    )
+    if cluster_root_mode:
+        postcondition = cluster_root_logical_postcondition(final_text)
+        report["cluster_root_logical_postcondition"] = postcondition
+        if not postcondition.get("ok"):
+            raise RuntimeError(
+                "Cluster cached root-bone postcondition failed: "
+                + "; ".join(postcondition.get("errors") or ["unknown mismatch"])
+            )
+
+    changed = final_text != source_text
+    if changed:
+        if cfg.get("backup_spm", True):
+            report["backup"] = backup_spm(spm_path)
+        try:
+            write_spm(spm_path, final_text)
+        except Exception:
+            _restore_source_snapshot(
+                spm_path,
+                backup=report.get("backup"),
+                source_bytes=source_bytes,
+                source_stat=source_stat,
+            )
+            raise
+
+    report["non_bone_transform_contracts"] = {
+        "material_name_version": SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION,
+        "vertex_red_version": SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION,
+    }
+    report["spm_transform_changed"] = changed
+    report["status"] = "calibrated" if changed else "already-ok"
+    if not changed:
+        report["source_restored_unchanged"] = True
+    report = _record_final_spm_identity(report, spm_path)
+    return _persist_positive_bone_receipt(
+        report,
+        spm_path,
+        final_text,
+        cfg,
+    )
+
+
 def _restore_source_snapshot(
     spm_path,
     *,
@@ -2859,7 +3017,7 @@ def _restore_source_snapshot(
         )
 
 
-def process_spm(spm_path, cfg, log=print, dry_run=False):
+def process_spm(spm_path, cfg, log=print, dry_run=False, force_rerun=False):
     """Run one complete SPM transaction under its canonical OS lock."""
     with spm_exclusive_lock(spm_path, log=log):
         return _process_spm_locked(
@@ -2867,10 +3025,17 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
             cfg,
             log=log,
             dry_run=dry_run,
+            force_rerun=force_rerun,
         )
 
 
-def _process_spm_locked(spm_path, cfg, log=print, dry_run=False):
+def _process_spm_locked(
+    spm_path,
+    cfg,
+    log=print,
+    dry_run=False,
+    force_rerun=False,
+):
     """Material prefix + bone calibration with backup/restore. Returns report."""
     spm_path = Path(spm_path)
     # A previous run killed mid-rewrite left probe bones in the source. Repair
@@ -2955,6 +3120,38 @@ def _process_spm_locked(spm_path, cfg, log=print, dry_run=False):
             _planned_text, vertex_report = apply_leaf_parent_red_gradient(source_text)
             report["vertex_colors"] = vertex_report
         return _record_final_spm_identity(report, spm_path)
+
+    bone_semantic_input = current_bone_semantic_fingerprint(
+        spm_path,
+        source_text,
+    )
+    report["bone_semantic_fingerprint"] = bone_semantic_input
+    report["bone_contract_version"] = SPM_BONE_CONTRACT_VERSION
+    receipt = None
+    if not force_rerun:
+        receipt = load_positive_calibration_receipt(
+            spm_path,
+            _bone_receipt_cache_dir(cfg),
+            bone_semantic_fingerprint_value=bone_semantic_input,
+            settings_signature=calibration_settings_signature(cfg),
+            bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+        )
+    if receipt is not None:
+        log(
+            "  [SPM bone fast-path] branch/geometry/bone semantics unchanged; "
+            "SpeedTree XML/FBX export skipped"
+        )
+        return _apply_non_bone_transforms_from_receipt(
+            spm_path,
+            cfg,
+            source_text=source_text,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+            renames=renames,
+            apply_tree_red=apply_tree_red,
+            receipt=receipt,
+            report=report,
+        )
 
     backup = None
     if cfg.get("backup_spm", True):
@@ -3082,13 +3279,26 @@ def _process_spm_locked(spm_path, cfg, log=print, dry_run=False):
         # Every path above has already restored the source, so the marker must
         # not outlive this call and trigger a bogus recovery on the next run.
         clear_calibration_marker(spm_path)
-    return _record_final_spm_identity(report, spm_path)
+    report = _record_final_spm_identity(report, spm_path)
+    if report.get("status") in POSITIVE_CALIBRATION_STATUSES:
+        report = _persist_positive_bone_receipt(
+            report,
+            spm_path,
+            read_spm(spm_path),
+            cfg,
+        )
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spm", nargs="+")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="ignore a current positive bone receipt and run SpeedTree exports",
+    )
     parser.add_argument("--report")
     args = parser.parse_args()
     cfg = load_config()
@@ -3096,7 +3306,12 @@ def main():
     for spm in args.spm:
         print(f"== {spm}")
         try:
-            rep = process_spm(spm, cfg, dry_run=args.dry_run)
+            rep = process_spm(
+                spm,
+                cfg,
+                dry_run=args.dry_run,
+                force_rerun=args.force_rerun,
+            )
         except Exception as exc:
             print(f"FAILED: {exc}")
             rep = {"spm": spm, "status": "failed", "error": str(exc)}

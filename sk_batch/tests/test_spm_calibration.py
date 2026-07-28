@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import subprocess
 import tempfile
@@ -1086,6 +1087,134 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             self.assertTrue(report["source_restored_unchanged"])
             self.assertEqual(spm_path.read_bytes(), original_bytes)
             self.assertEqual(spm_path.stat().st_mtime_ns, original_mtime_ns)
+
+    def test_texture_only_edit_uses_bone_receipt_but_bone_edit_reexports(self):
+        source_xml = """\
+<SpeedTree>
+  <Generator Type="Tree">
+    <Name>Tree</Name><GUID>tree-generator-guid</GUID><Properties />
+  </Generator>
+  <Generator Type="Branch">
+    <Name>Trunk</Name><GUID>trunk-guid</GUID>
+    <Properties>
+      <Property><Name>Physics:Bone style</Name><Value>1</Value></Property>
+      <Property><Name>Physics:Bones</Name><Value>1</Value></Property>
+    </Properties>
+  </Generator>
+  <Node Type="Tree">
+    <GeneratorGUID>tree-generator-guid</GeneratorGUID>
+    <ParentGUID></ParentGUID><GUID>tree-guid</GUID><Properties />
+  </Node>
+  <Node Type="Branch">
+    <GeneratorGUID>trunk-guid</GeneratorGUID>
+    <ParentGUID>tree-guid</ParentGUID><GUID>branch-node-guid</GUID><Properties />
+  </Node>
+</SpeedTree>
+"""
+        one_bone_xml = """\
+<SpeedTreeRaw><Bones>
+  <Bone ID="0" ParentID="-1" StartX="0" StartY="0" StartZ="0"
+        EndX="30.48" EndY="0" EndZ="0" Generator="Trunk" />
+</Bones></SpeedTreeRaw>
+"""
+        cfg = {
+            "target_bones_per_branch": 1.0,
+            "max_total_bones": 2000,
+            "total_window_low": 0.6,
+            "total_window_high": 1.5,
+            "seed_relative_value": 0.5,
+            "value_cap": 64.0,
+            "value_floor": 0.02,
+            "max_calibration_rounds": 4,
+            "cluster_root_only_bones": True,
+            "rename_materials": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": True,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm_path = root / "SK_receipt_fast_path.spm"
+            cfg["spm_calibration_receipt_dir"] = str(root / "central-cache")
+            spm_audit.write_spm(spm_path, source_xml)
+            exports = iter((one_bone_xml, one_bone_xml))
+
+            def fake_export(_spm_path, _cfg, out_path):
+                Path(out_path).write_text(next(exports), encoding="utf-8")
+                return out_path
+
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=fake_export,
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                return_value=True,
+            ):
+                first = spm_audit.process_spm(
+                    spm_path,
+                    cfg,
+                    log=lambda _message: None,
+                )
+            self.assertEqual(first["status"], "already-ok")
+            self.assertTrue(Path(first["bone_receipt"]).is_file())
+
+            texture_only = spm_audit.read_spm(spm_path).replace(
+                "</SpeedTree>",
+                (
+                    '<Assets><Material_v8 ID="1" Name="Raw">'
+                    '<Map Name="Color"><TexFilename>'
+                    r"D:\canonical\T_leaf_color.tga"
+                    "</TexFilename></Map></Material_v8></Assets>"
+                    "</SpeedTree>"
+                ),
+            )
+            spm_audit.write_spm(spm_path, texture_only)
+            cfg["rename_materials"] = True
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=AssertionError("texture edit re-exported XML"),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                side_effect=AssertionError("texture edit re-exported FBX"),
+            ):
+                second = spm_audit.process_spm(
+                    spm_path,
+                    cfg,
+                    log=lambda _message: None,
+                )
+            self.assertEqual(second["bone_fast_path"]["status"], "hit")
+            self.assertEqual(second["status"], "calibrated")
+            self.assertIn('Name="M_Raw"', spm_audit.read_spm(spm_path))
+
+            changed_bone = re.sub(
+                (
+                    r"(<Name>Physics:Bones</Name>\s*"
+                    r"<Value>)[^<]+(</Value>)"
+                ),
+                r"\g<1>2\g<2>",
+                spm_audit.read_spm(spm_path),
+                count=1,
+            )
+            spm_audit.write_spm(spm_path, changed_bone)
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=RuntimeError("semantic bone miss reached export"),
+            ) as export_xml:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "semantic bone miss reached export",
+                ):
+                    spm_audit.process_spm(
+                        spm_path,
+                        cfg,
+                        log=lambda _message: None,
+                    )
+            export_xml.assert_called()
 
 
 class ClusterOwnerClassificationTests(unittest.TestCase):

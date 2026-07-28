@@ -47,6 +47,7 @@ from sk_common import (
     PUSH_ABORT_KINDS,
     PUSH_MANIFEST_SCHEMA_VERSION,
     PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+    SPM_BONE_CONTRACT_VERSION,
     atomic_write_bytes,
     atomic_write_json,
     blend_path_for,
@@ -115,8 +116,10 @@ from repair_runtime_contract import (
 )
 from spm_audit import (
     cluster_root_logical_postcondition,
+    current_bone_semantic_fingerprint,
     read_spm,
 )
+from spm_calibration_receipt import write_positive_calibration_receipt
 
 WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
@@ -4149,6 +4152,8 @@ class App:
 
     @staticmethod
     def _spm_report_summary(rep):
+        if rep.get("cached_display_summary"):
+            return str(rep["cached_display_summary"])
         total = rep.get("total_bones")
         meta = rep.get("calibration") or {}
         branches = meta.get("total_branches")
@@ -4292,6 +4297,29 @@ class App:
                 entry["spm_status"] = cached_text
                 entry["spm_summary"] = summary
                 save_state(self.state)
+            try:
+                write_positive_calibration_receipt(
+                    spm,
+                    getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
+                    or (TOOL_DIR / "cache" / "spm_calibration"),
+                    bone_semantic_fingerprint_value=(
+                        current_bone_semantic_fingerprint(spm)
+                    ),
+                    settings_signature=self.spm_calibration_signature,
+                    bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+                    report={
+                        "status": cache.get("status"),
+                        "cached_display_summary": summary,
+                        "calibration": {
+                            "mode": "migrated_positive_gui_cache",
+                        },
+                    },
+                )
+            except Exception as exc:
+                self.log(
+                    "  [캐시 경고] SPM bone receipt migration failed: "
+                    f"{spm.name}: {exc}"
+                )
             self.log(f"본 세팅 건너뜀 (SPM/옵션 변경 없음): {spm.name}")
             return
 
@@ -4302,6 +4330,8 @@ class App:
         report_path = LOG_DIR / f"{spm.stem}_spm_{stamp}.json"
         cmd = [sys.executable.replace("pythonw.exe", "python.exe"), "-X", "utf8", "-u",
                str(TOOL_DIR / "spm_audit.py"), str(spm), "--report", str(report_path)]
+        if self.force_rerun:
+            cmd.append("--force-rerun")
         # In parallel mode, don't pin every worker to the same core subset.
         parallel = self.cfg.get("spm_parallel_jobs", 1) > 1
         progress_state = {"stage": "준비 중", "stage_started": 0.0}

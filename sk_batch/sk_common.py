@@ -77,6 +77,9 @@ DEFAULT_CONFIG = {
     "value_floor": 0.02,
     "max_calibration_rounds": 4,
     "probe_cache_enabled": True,
+    # Positive bone receipts are independent of the large GUI state JSON.
+    # Keeping them in one ignored tool cache avoids sidecars in asset folders.
+    "spm_calibration_receipt_dir": str(TOOL_DIR / "cache" / "spm_calibration"),
     # Cluster prototype SPMs use exactly one Absolute bone on the first
     # renderable structural Branch below each Tree root. Meshless placement
     # Trunks and terminal needle/leaf spines stay at Absolute/0 and never reach
@@ -137,6 +140,10 @@ PRIORITY_FLAGS = {
 }
 CREATE_NO_WINDOW = 0x08000000
 CALIBRATION_CACHE_VERSION = 2
+# Bump only when the semantic skeleton selection/calibration result changes.
+# Ordinary diagnostics, exporter presets and timeout changes are not bone
+# contracts and must not schedule every SPM again.
+SPM_BONE_CONTRACT_VERSION = 1
 _JSON_WRITE_LOCK = threading.RLock()
 
 
@@ -491,7 +498,8 @@ def _dependency_identity(path, hash_content=False, include_hashed_stat=False):
         return {"path": str(candidate), "error": str(exc)}
 
 
-def _calibration_settings_signature(cfg, include_hashed_stat=False):
+def _legacy_calibration_settings_signature(cfg):
+    """Return the pre-semantic signature for one-time GUI-state migration."""
     setting_keys = (
         "target_bones_per_branch",
         "max_total_bones",
@@ -510,20 +518,23 @@ def _calibration_settings_signature(cfg, include_hashed_stat=False):
     payload = {
         "version": CALIBRATION_CACHE_VERSION,
         "settings": {key: cfg.get(key) for key in setting_keys},
-        "spm_audit": _dependency_identity(
-            TOOL_DIR / "spm_audit.py",
-            hash_content=True,
-            include_hashed_stat=include_hashed_stat,
-        ),
+        # Last broad-signature producer before the semantic contract split.
+        # Keeping its exact content identity lets the current in-progress
+        # estate migrate once even though this module now imports the durable
+        # receipt fast-path.
+        "spm_audit": {
+            "path": str((TOOL_DIR / "spm_audit.py").resolve()),
+            "fingerprint": "d45ea6e72c0b1e506b4f07d97c6d7610",
+        },
         "xml_ini": _dependency_identity(
             cfg.get("xml_ini"),
             hash_content=True,
-            include_hashed_stat=include_hashed_stat,
+            include_hashed_stat=False,
         ),
         "fbx_ini": _dependency_identity(
             cfg.get("fbx_ini"),
             hash_content=True,
-            include_hashed_stat=include_hashed_stat,
+            include_hashed_stat=False,
         ),
         # Hashing the large executable would erase the speed win; size+mtime
         # changes whenever the installed SpeedTree build is replaced.
@@ -534,13 +545,29 @@ def _calibration_settings_signature(cfg, include_hashed_stat=False):
 
 
 def calibration_settings_signature(cfg):
-    """Invalidate calibration only when behavior or dependency content changes."""
-    return _calibration_settings_signature(cfg, include_hashed_stat=False)
+    """Hash only settings that can change the semantic skeleton result."""
+    setting_keys = (
+        "target_bones_per_branch",
+        "max_total_bones",
+        "total_window_low",
+        "total_window_high",
+        "seed_relative_value",
+        "value_cap",
+        "value_floor",
+        "max_calibration_rounds",
+        "cluster_root_only_bones",
+    )
+    payload = {
+        "bone_contract_version": SPM_BONE_CONTRACT_VERSION,
+        "settings": {key: cfg.get(key) for key in setting_keys},
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
 def legacy_calibration_settings_signature(cfg):
-    """Return the pre-v2.1 signature so current caches migrate without a rerun."""
-    return _calibration_settings_signature(cfg, include_hashed_stat=True)
+    """Return the former broad signature so current state migrates once."""
+    return _legacy_calibration_settings_signature(cfg)
 
 
 def calibration_cache_matches(

@@ -11,6 +11,7 @@ from unittest import mock
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SK_BATCH_DIR))
 
+import sk_common
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
     attach_process_kill_job,
@@ -145,7 +146,7 @@ class SkCommonOptimizationTests(unittest.TestCase):
             self.assertNotEqual(first_snapshot["fingerprint"], second_snapshot["fingerprint"])
             self.assertNotEqual(first_signature, second_signature)
 
-    def test_settings_signature_ignores_touch_for_content_hashed_dependencies(self):
+    def test_settings_signature_ignores_non_semantic_export_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             xml_ini = root / "Options.xml.ini"
@@ -164,7 +165,6 @@ class SkCommonOptimizationTests(unittest.TestCase):
             }
 
             content_signature = calibration_settings_signature(cfg)
-            legacy_signature = legacy_calibration_settings_signature(cfg)
             for path in (xml_ini, fbx_ini):
                 stat = path.stat()
                 os.utime(
@@ -173,12 +173,32 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 )
 
             self.assertEqual(calibration_settings_signature(cfg), content_signature)
-            self.assertNotEqual(
-                legacy_calibration_settings_signature(cfg), legacy_signature
-            )
-
             fbx_ini.write_text("fbx-b", encoding="utf-8")
+            xml_ini.write_text("xml-b", encoding="utf-8")
+            exe.write_bytes(b"new-exporter")
+            cfg["spm_verify_timeout"] = 999
+            cfg["probe_cache_enabled"] = False
+            cfg["rename_materials"] = False
+            cfg["tree_leaf_parent_red_gradient"] = False
+            self.assertEqual(calibration_settings_signature(cfg), content_signature)
+
+            cfg["cluster_root_only_bones"] = False
             self.assertNotEqual(calibration_settings_signature(cfg), content_signature)
+
+    def test_settings_signature_changes_only_on_explicit_contract_version_bump(self):
+        cfg = {
+            "target_bones_per_branch": 2.0,
+            "max_total_bones": 1500,
+            "cluster_root_only_bones": True,
+        }
+        current = calibration_settings_signature(cfg)
+        with mock.patch.object(
+            sk_common,
+            "SPM_BONE_CONTRACT_VERSION",
+            sk_common.SPM_BONE_CONTRACT_VERSION + 1,
+        ):
+            bumped = calibration_settings_signature(cfg)
+        self.assertNotEqual(current, bumped)
 
     def test_push_source_fingerprint_reuses_unchanged_stat_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
