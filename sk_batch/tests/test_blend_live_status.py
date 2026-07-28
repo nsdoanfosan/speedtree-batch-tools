@@ -910,6 +910,71 @@ class BlendLiveStatusTests(unittest.TestCase):
             requested_spm=spm,
         )
 
+    def test_run_specific_live_pass_through_ignores_old_persisted_relation(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_lauraceae_10.spm"
+            report = root / "reports" / (
+                "SK_tree_lauraceae_10_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            live_report = root / "live_material_contract.json"
+            report.parent.mkdir()
+            write_empty_spm(spm)
+            live_report.write_text(
+                json.dumps({
+                    "cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {"path": str(spm)},
+                            "authoritative_tree_source": {
+                                "path": str(spm),
+                            },
+                        }],
+                        "dependencies": [],
+                        "handoff": {
+                            "status": "pass_through",
+                            "roles": [],
+                            "cluster_dependencies": [],
+                            "separate_nanite_assembly_requested": False,
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {
+                        "status": "pass_through",
+                    },
+                    "cluster_assembly_receipt_resolution": {
+                        "policy": "embedded_live_audit_authoritative",
+                        "selected_receipt": str(live_report),
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=AssertionError(
+                    "old persisted receipt must not override the live run"
+                ),
+            ), mock.patch.object(
+                gui,
+                "load_cluster_assembly_receipt",
+                side_effect=AssertionError(
+                    "generic persisted receipt loader must not be used"
+                ),
+            ):
+                ready, reason = app._cluster_assembly_inputs_current(spm)
+
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "")
+
     def test_current_receipt_accepts_rendered_authority_prepared_only_report(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2102,6 +2167,65 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "영수증 비대상" in call.args[0]
                 for call in app.log.call_args_list
             ))
+
+    def test_identity_bound_live_pass_through_overrides_old_embedded_contract(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "tree_lauraceae" / "SK_tree_lauraceae_10.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {"path": str(spm)},
+                            "authoritative_tree_source": {"path": str(spm)},
+                        }],
+                        "dependencies": [],
+                        "handoff": {
+                            "status": "pass_through",
+                            "errors": [],
+                            "issues": [],
+                            "roles": [],
+                        },
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[
+                    FileNotFoundError("missing"),
+                    FileNotFoundError("still missing"),
+                ],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm, "20260728_121500"
+                )
+
+            self.assertEqual(
+                resolution["policy"],
+                "live_audit_authoritative_pass_through",
+            )
+            self.assertEqual(
+                resolution["selected_receipt"],
+                resolution["live_audit_report"],
+            )
+            self.assertIsNone(resolution["persisted_receipt"])
 
     def test_blender_job_accepts_source_review_and_leaves_push_blocked(self):
         gui = load_gui_module()

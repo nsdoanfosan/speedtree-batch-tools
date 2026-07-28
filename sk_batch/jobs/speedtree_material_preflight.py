@@ -433,6 +433,17 @@ def main():
             elif missing:
                 problems = problem_generators(leaf_contract, leaf_missing)
                 report["problem_generators"] = problems
+                report["classification"] = "asset_export_material_missing"
+                report["failure_reason"] = (
+                    "The live SpeedTree FBX/STMAT export does not contain "
+                    "materials referenced by visible SPM generators"
+                )
+                report["remediation"] = (
+                    "In SpeedTree Modeler, assign/export the listed materials "
+                    "on the reported visible generators, or remove obsolete "
+                    "material references, then save the SPM and rerun"
+                )
+                report["missing_export_materials"] = missing
                 # Material preflight is a diagnostic boundary.  Never write a
                 # foreground marker into the source SPM here: that cosmetic
                 # edit invalidates the already-current Blender repair, SK

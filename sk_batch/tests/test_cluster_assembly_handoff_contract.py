@@ -23,6 +23,7 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     file_fingerprint,
     normalize_export_name,
     resolve_cluster_receipt_path,
+    role_identity_aliases_from_contract,
 )
 
 
@@ -85,11 +86,26 @@ def write_receipt(
     fingerprint=None,
     assembly_spm=None,
     normalized_by_role=None,
+    target_material_by_role=None,
 ):
     fingerprint = dict(fingerprint or file_fingerprint(fbx))
     assembly_spm = Path(assembly_spm or spm)
     contract_roles = []
     for role, identity, decision in roles:
+        target = {
+            "spm": str(assembly_spm),
+            "export_bundle": {"fbx": fingerprint},
+            "fbx_material_mesh_pair": {"decision": decision},
+        }
+        target_material = (target_material_by_role or {}).get(role)
+        if target_material:
+            target["spm_material_mesh_pair"] = {
+                "status": "complete_pair",
+                "records": [{
+                    "material_name": target_material,
+                    "complete": True,
+                }],
+            }
         contract_roles.append({
             "role": role,
             "name": identity,
@@ -98,11 +114,7 @@ def write_receipt(
             "normalized_variants": (
                 (normalized_by_role or {}).get(role)
             ),
-            "targets": [{
-                "spm": str(assembly_spm),
-                "export_bundle": {"fbx": fingerprint},
-                "fbx_material_mesh_pair": {"decision": decision},
-            }],
+            "targets": [target],
         })
     payload = {
         "items": [{
@@ -203,6 +215,47 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             ):
                 resolved = resolve_cluster_receipt_path(spm, embedded)
             self.assertEqual(resolved, persisted.resolve())
+
+    def test_run_specific_live_audit_overrides_hash_current_persisted_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            embedded = root / "material_contract.json"
+            persisted = root / "persisted_cluster_receipt.json"
+            fbx = root / "Tree_elm_01.fbx"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pass_through")],
+            )
+            payload = json.loads(embedded.read_text(encoding="utf-8"))
+            payload["cluster_assembly_receipt_persistence"] = {
+                "status": "ok",
+                "stage": "receipt_persistence",
+                "live_audit_complete": True,
+            }
+            embedded.write_text(json.dumps(payload), encoding="utf-8")
+            persisted.write_text("{}", encoding="utf-8")
+
+            with mock.patch(
+                "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+                "cluster_assembly_receipt_resolution",
+                return_value={"selected_receipt": str(persisted)},
+            ):
+                resolved, resolution = resolve_cluster_receipt_path(
+                    spm,
+                    embedded,
+                    include_resolution=True,
+                )
+
+            self.assertEqual(resolved, embedded.resolve())
+            self.assertEqual(
+                resolution["policy"],
+                "embedded_live_audit_authoritative",
+            )
 
     def test_embedded_cluster_contract_remains_a_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +562,66 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
             self.assertFalse(
                 handoff["skeleton_wind_contract"]["production_310_bone_hard_gate"]
+            )
+
+    def test_complete_target_spm_material_is_a_content_driven_role_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_tree_willow_01.spm"
+            assembly_spm = root / "tree_willow_01.spm"
+            fbx = root / "tree_willow_01.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"sk")
+            assembly_spm.write_bytes(b"authoritative")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "M_leaf_wilow_01", "pending_export")],
+                assembly_spm=assembly_spm,
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "material": "M_leaf_wilow_01",
+                        "variants": [{
+                            "ordinal": 1,
+                            "source_partition_mode": "PER_DEFORM_ROOT",
+                        }],
+                    },
+                },
+                target_material_by_role={
+                    "leaf": "leaf_willow_01",
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            contract = payload["items"][0]["cluster_assembly"]
+            identities = role_identity_aliases_from_contract(contract, spm)
+            inventory = build_blender_fbx_inventory(
+                [
+                    role_object(
+                        fbx,
+                        material="leaf_willow_01_Mat",
+                    )
+                ],
+                fbx,
+                identities,
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(
+                identities["leaf"],
+                ["M_leaf_wilow_01", "leaf_willow_01"],
+            )
+            self.assertEqual(handoff["status"], "ready")
+            leaf = next(
+                row for row in handoff["roles"] if row["role"] == "leaf"
+            )
+            self.assertEqual(leaf["status"], "complete_pair")
+            self.assertEqual(
+                leaf["role_identity_aliases"],
+                ["leaf_willow_01"],
             )
 
     def test_actionable_role_without_normalized_variants_is_blocked(self):

@@ -166,6 +166,35 @@ class FbxRoleContractTests(unittest.TestCase):
             self.assertEqual(fruit["status"], "absent")
             self.assertEqual(fruit["decision"], "pass_through")
 
+    def test_target_spm_material_name_is_a_role_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fbx = Path(temp_dir) / "tree.fbx"
+            write_ascii_fbx(
+                fbx,
+                material_names=["leaf_weeping_willow_01_Mat"],
+                mesh_names=["leaf_weeping_willow_01"],
+                pairs=[
+                    (
+                        "leaf_weeping_willow_01_Mat",
+                        "leaf_weeping_willow_01",
+                    )
+                ],
+            )
+            report = inspect_fbx_material_mesh_pairs(fbx)
+
+            leaf = classify_fbx_role(
+                report,
+                "M_leaf_weeping_wilow_01",
+                ["leaf_weeping_willow_01"],
+            )
+
+            self.assertEqual(leaf["status"], "complete_pair")
+            self.assertEqual(leaf["decision"], "normalize_part")
+            self.assertEqual(
+                leaf["role_identity_aliases"],
+                ["leaf_weeping_willow_01"],
+            )
+
     @unittest.skipUnless(REAL_ELM_SOURCE_FBX.is_file(), "Tree Elm source FBX unavailable")
     def test_real_binary_elm_export_contains_both_role_pairs(self):
         report = inspect_fbx_material_mesh_pairs(REAL_ELM_SOURCE_FBX)
@@ -211,6 +240,53 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     row["code"]
                     for row in contract["handoff"]["errors"]
                 ],
+            )
+
+    def test_explicit_off_registry_overrides_same_named_rendered_role(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "tree_lauraceae"
+            cluster_dir = folder / "Cluster"
+            provider = cluster_dir / "SK_cluster_lauraceae_01.spm"
+            provider_blend = provider.with_suffix(".blend")
+            target = folder / "SK_tree_lauraceae_10.spm"
+            write_spm(
+                provider,
+                [("1", "M_bark_lauraceae_01", [], ())],
+            )
+            provider_blend.write_bytes(b"blend")
+            write_spm(
+                target,
+                [(
+                    "2",
+                    "cluster_lauraceae_01",
+                    ["Cluster/cluster_lauraceae_01.tga"],
+                    ("7",),
+                )],
+                mesh_ids=("7",),
+            )
+            save_target_registry(provider_blend, [])
+            usage = cluster_material_usage([target], [provider])
+
+            contract = build_cluster_assembly_contract(
+                folder,
+                [target],
+                [provider],
+                cluster_usage=usage,
+            )
+
+            self.assertEqual(contract["dependencies"], [])
+            self.assertEqual(contract["handoff"]["status"], "pass_through")
+            excluded = contract["relationship_policy"][
+                "excluded_cluster_sources"
+            ]
+            self.assertEqual(len(excluded), 1)
+            self.assertEqual(
+                excluded[0]["reason"],
+                "explicit_target_relation_off",
+            )
+            self.assertEqual(
+                excluded[0]["target_relation"]["status"],
+                "explicit_off",
             )
 
     def test_generic_cluster_name_is_a_first_class_assembly_role(self):
@@ -906,16 +982,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 with self.subTest(stale_source=label):
                     original = source_path.read_bytes()
                     source_path.write_bytes(original + b"-changed")
-                    with self.assertRaisesRegex(
-                        ClusterAssemblyReceiptStaleError,
-                        f"source {label}.*stale",
-                    ):
+                    self.assertIsNone(
                         _atlas_normalized_variants(
                             folder,
                             "branch_elm_01",
                             [target],
                             audit=audit_module,
                         )
+                    )
                     source_path.write_bytes(original)
 
             source_3d_contract = dict(
@@ -1043,15 +1117,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             with mock.patch(
                 "pcg_cluster_assembly_contract._normalized_variant_contract",
                 return_value=normalized,
-            ), self.assertRaisesRegex(
-                ClusterAssemblyReceiptStaleError,
-                "missing current target scope",
             ):
-                _atlas_normalized_variants(
-                    folder,
-                    "branch_elm_01",
-                    [first, second],
-                    audit=None,
+                self.assertIsNone(
+                    _atlas_normalized_variants(
+                        folder,
+                        "branch_elm_01",
+                        [first, second],
+                        audit=None,
+                    )
                 )
 
     def test_same_delivery_to_several_targets_is_one_role_contract(self):

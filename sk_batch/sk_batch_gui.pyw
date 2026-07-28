@@ -3197,16 +3197,32 @@ class App:
         try:
             pipeline = json.loads(report_path.read_text(encoding="utf-8"))
             embedded = pipeline.get("cluster_assembly_manifest")
-            try:
-                resolution = cluster_assembly_receipt_resolution(spm)
-            except (
-                FileNotFoundError,
-                ClusterAssemblyReceiptStaleError,
-            ):
-                # The persisted receipt is only a cache snapshot.  The BWR
-                # manifest below contains and validates the real artifact
-                # fingerprints that determine whether Repair is current.
-                resolution = None
+            pipeline_resolution = (
+                pipeline.get("cluster_assembly_receipt_resolution") or {}
+            )
+            pipeline_policy = str(
+                pipeline_resolution.get("policy") or ""
+            )
+            pipeline_live_receipt = bool(
+                pipeline_resolution.get("selected_receipt")
+                and (
+                    pipeline_policy.startswith("live_audit")
+                    or pipeline_policy == "embedded_live_audit_authoritative"
+                )
+            )
+            if pipeline_live_receipt:
+                resolution = pipeline_resolution
+            else:
+                try:
+                    resolution = cluster_assembly_receipt_resolution(spm)
+                except (
+                    FileNotFoundError,
+                    ClusterAssemblyReceiptStaleError,
+                ):
+                    # The persisted receipt is only a cache snapshot.  The BWR
+                    # manifest below contains and validates the real artifact
+                    # fingerprints that determine whether Repair is current.
+                    resolution = None
             if not isinstance(embedded, dict):
                 if resolution is None:
                     # Vegetation with no Cluster relationship is a legitimate
@@ -3223,13 +3239,26 @@ class App:
             current_handoff = {}
             if resolution and resolution.get("selected_receipt"):
                 current_receipt_path = Path(resolution["selected_receipt"])
-                current_payload = load_cluster_assembly_receipt(
-                    current_receipt_path,
-                    requested_spm=spm,
-                )
-                current_contract = (
-                    current_payload.get("cluster_assembly") or {}
-                )
+                if pipeline_live_receipt:
+                    from cluster_assembly_handoff_contract import (
+                        select_cluster_contract,
+                    )
+
+                    current_payload = json.loads(
+                        current_receipt_path.read_text(encoding="utf-8")
+                    )
+                    current_contract = select_cluster_contract(
+                        current_payload,
+                        spm,
+                    )
+                else:
+                    current_payload = load_cluster_assembly_receipt(
+                        current_receipt_path,
+                        requested_spm=spm,
+                    )
+                    current_contract = (
+                        current_payload.get("cluster_assembly") or {}
+                    )
                 current_handoff = current_contract.get("handoff") or {}
                 current_receipt_record = file_fingerprint(
                     current_receipt_path
@@ -4168,26 +4197,57 @@ class App:
                         report_file=audit_report,
                     )
 
-            def live_contract_is_actionable():
+            def selected_live_contract():
                 try:
                     from cluster_assembly_handoff_contract import (
                         select_cluster_contract,
                     )
                     contract = select_cluster_contract(payload, spm)
                 except (ImportError, ValueError):
-                    return False
-                return bool(
-                    contract.get("dependencies")
-                    and contract.get("tree_source_identities")
-                )
+                    return None
+                return contract if isinstance(contract, dict) else None
 
-            if not live_contract_is_actionable():
+            live_contract = selected_live_contract()
+            live_contract_actionable = bool(
+                live_contract
+                and live_contract.get("dependencies")
+                and live_contract.get("tree_source_identities")
+            )
+            if not live_contract_actionable:
                 # The audit persists receipts only for actionable Cluster
-                # contracts.  A clean report with no contract is ordinary
-                # pass-through, regardless of old receipt history.
+                # contracts.  A clean, identity-bound pass-through contract
+                # still has to reach BWR so an older material-preflight cache
+                # cannot reintroduce a removed Cluster relationship.
                 self.log(
                     f"Cluster Assembly 영수증 비대상: {spm.name}"
                 )
+                if (
+                    live_contract
+                    and live_contract.get("tree_source_identities")
+                    and str(
+                        (live_contract.get("handoff") or {}).get("status")
+                        or ""
+                    ) == "pass_through"
+                ):
+                    return {
+                        "policy": "live_audit_authoritative_pass_through",
+                        "requested_spm": str(spm),
+                        "selected_receipt": str(audit_report),
+                        "live_audit_report": str(audit_report),
+                        "persisted_receipt": None,
+                        "current_candidates": [],
+                        "superseded_current_receipts": [],
+                        "ignored_stale_candidates": [],
+                        "receipt_persistence_warning": str(
+                            (
+                                payload.get(
+                                    "cluster_assembly_receipt_persistence"
+                                )
+                                or {}
+                            ).get("error")
+                            or ""
+                        ),
+                    }
                 return None
 
             persistence_error = str(persistence.get("error") or "")
@@ -4707,6 +4767,11 @@ class App:
             "--material-contract", str(material_report),
             "--report", str(job_report),
         ]
+        if item.get("manual_bones_locked", False):
+            cmd.insert(
+                cmd.index("--material-contract"),
+                "--manual-bones-locked",
+            )
         if (
             bark_source_resolution
             and bark_source_resolution.get("manifest")

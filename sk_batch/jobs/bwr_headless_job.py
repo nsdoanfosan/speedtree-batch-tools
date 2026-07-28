@@ -46,7 +46,7 @@ from cluster_assembly_handoff_contract import (
     file_fingerprint,
     load_cluster_contract,
     resolve_cluster_receipt_path,
-    role_identities_from_contract,
+    role_identity_aliases_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
@@ -86,6 +86,7 @@ def parse_args():
     parser.add_argument("--material-contract", default="")
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
+    parser.add_argument("--manual-bones-locked", action="store_true")
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -183,7 +184,10 @@ def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
     without saving, so an existing user-managed Full SK blend stays untouched.
     """
     _payload, contract = load_cluster_contract(receipt_path, spm_path)
-    role_identities = role_identities_from_contract(contract)
+    role_identities = role_identity_aliases_from_contract(
+        contract,
+        spm_path,
+    )
     data_collections = ("meshes", "armatures", "materials", "images", "actions")
     before_objects = {obj.as_pointer() for obj in bpy.data.objects}
     before_data = {
@@ -283,6 +287,7 @@ def main():
         "speedtree_spm": str(speedtree_spm),
         "blend": args.blend,
         "wind": args.wind,
+        "manual_bones_locked": bool(args.manual_bones_locked),
         "status": "failed",
     }
     # Cluster rows reach this job under their canonical SK_ output identity.
@@ -394,9 +399,10 @@ def main():
         # Reject authored-but-disabled Branch skeletons before creating an
         # empty .blend. BranchMesh-only assets remain valid and use the rigid
         # one-bone fallback inside the add-on.
-        from speedtree_bone_weight_repair.core import require_spm_sk_ready
+        if not args.manual_bones_locked:
+            from speedtree_bone_weight_repair.core import require_spm_sk_ready
 
-        require_spm_sk_ready(str(speedtree_spm))
+            require_spm_sk_ready(str(speedtree_spm))
 
         blend_path = os.path.abspath(args.blend)
         blend_exists = os.path.exists(blend_path)
@@ -502,6 +508,10 @@ def main():
             name_stem=speedtree_spm.stem,
             export_fbx=export_settings["speedtree_export_fbx"],
             export_xml=export_settings["speedtree_export_xml"],
+            # A user-authored manual-bones marker is an explicit preservation
+            # contract. Keep the normal FBX preset (including authored bones)
+            # while bypassing only the automatic Branch-generator gate.
+            allow_manual_bones=bool(args.manual_bones_locked),
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -582,6 +592,11 @@ def main():
                     name_stem=source_spm_path.stem,
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
+                    # This secondary SPM contributes Assembly geometry only.
+                    # Its authored Branch bones are not the final SK skeleton,
+                    # so export it with the bundled no-bones preset when all
+                    # visible Branch generators are Absolute/0.
+                    allow_boneless=True,
                 )
             report["cluster_assembly_source_export"] = assembly_source_export
             assembly_fbx_export = (

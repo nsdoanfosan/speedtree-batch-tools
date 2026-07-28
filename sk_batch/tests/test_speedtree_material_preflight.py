@@ -279,6 +279,15 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 report["all_export_material_contract"]["missing_materials"],
                 ["M_stem_common_01"],
             )
+            self.assertEqual(
+                report["classification"],
+                "asset_export_material_missing",
+            )
+            self.assertEqual(
+                report["missing_export_materials"],
+                ["M_stem_common_01"],
+            )
+            self.assertIn("assign", report["remediation"].casefold())
             self.assertEqual(spm.read_bytes(), source_before)
             self.assertFalse(report["problem_node_marker"]["changed"])
             self.assertEqual(

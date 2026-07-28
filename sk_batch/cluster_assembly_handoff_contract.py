@@ -183,11 +183,22 @@ def build_blender_fbx_inventory(objects, source_fbx_path, role_identities):
     source FBX are admitted.
     """
     source_key = _normalized_path(source_fbx_path)
-    expected = {
-        role: normalize_export_name(identity)
-        for role, identity in (role_identities or {}).items()
-        if role in ROLE_ORDER and identity
-    }
+    expected = {}
+    for role, identities in (role_identities or {}).items():
+        if role not in ROLE_ORDER:
+            continue
+        values = (
+            identities
+            if isinstance(identities, (list, tuple, set))
+            else [identities]
+        )
+        normalized = {
+            normalize_export_name(identity)
+            for identity in values
+            if identity
+        }
+        if normalized:
+            expected[role] = normalized
     rows = []
     declared_materials = []
     for obj in objects or []:
@@ -212,8 +223,8 @@ def build_blender_fbx_inventory(objects, source_fbx_path, role_identities):
             role = next(
                 (
                     candidate
-                    for candidate, identity in expected.items()
-                    if normalize_export_name(material_name) == identity
+                    for candidate, identities in expected.items()
+                    if normalize_export_name(material_name) in identities
                 ),
                 None,
             )
@@ -250,21 +261,31 @@ def build_blender_fbx_inventory(objects, source_fbx_path, role_identities):
     }
 
 
-def classify_inventory_role(inventory, role, role_identity):
+def classify_inventory_role(
+    inventory,
+    role,
+    role_identity,
+    role_identity_aliases=(),
+):
     """Apply the independent complete/absent/partial content gate."""
-    expected = normalize_export_name(role_identity)
+    identities = [role_identity, *(role_identity_aliases or ())]
+    expected = {
+        normalize_export_name(identity)
+        for identity in identities
+        if identity
+    }
     material_matches = [
         value for value in inventory.get("materials") or []
-        if normalize_export_name(value) == expected
+        if normalize_export_name(value) in expected
     ]
     mesh_name_matches = [
         value for value in inventory.get("mesh_names") or []
-        if normalize_export_name(value) == expected
+        if normalize_export_name(value) in expected
     ]
     assignments = []
     for mesh_row in inventory.get("objects") or []:
         for usage in mesh_row.get("material_usages") or []:
-            if normalize_export_name(usage.get("material")) != expected:
+            if normalize_export_name(usage.get("material")) not in expected:
                 continue
             if int(usage.get("used_polygon_count") or 0) <= 0:
                 continue
@@ -285,6 +306,11 @@ def classify_inventory_role(inventory, role, role_identity):
     return {
         "role": role,
         "role_identity": role_identity,
+        "role_identity_aliases": [
+            identity
+            for identity in identities
+            if identity and identity != role_identity
+        ],
         "status": status,
         "decision": decision,
         "material_matches": material_matches,
@@ -375,6 +401,46 @@ def resolve_cluster_receipt_path(
         locate_cluster_assembly_receipt,
     )
 
+    embedded_resolved = None
+    embedded_live_audit = False
+    if embedded_contract_path:
+        embedded = Path(embedded_contract_path)
+        if embedded.is_file():
+            try:
+                embedded_payload = json.loads(
+                    embedded.read_text(encoding="utf-8")
+                )
+                select_cluster_contract(embedded_payload, spm_path)
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+            else:
+                embedded_resolved = embedded.resolve()
+                persistence = (
+                    embedded_payload.get(
+                        "cluster_assembly_receipt_persistence"
+                    )
+                    or {}
+                )
+                embedded_live_audit = (
+                    persistence.get("live_audit_complete") is True
+                )
+
+    # The caller writes this marker only after the run-specific PCG audit has
+    # completed and the exact selected contract has been embedded.  A persisted
+    # receipt is cache evidence and must not override that newer semantic
+    # decision merely because its historical artifact hashes still match.
+    if embedded_live_audit:
+        if include_resolution:
+            return embedded_resolved, {
+                "policy": "embedded_live_audit_authoritative",
+                "requested_spm": str(spm_path),
+                "selected_receipt": str(embedded_resolved),
+                "current_candidates": [{"path": str(embedded_resolved)}],
+                "superseded_current_receipts": [],
+                "ignored_stale_candidates": [],
+            }
+        return embedded_resolved
+
     stale_error = None
     try:
         if include_resolution:
@@ -386,7 +452,7 @@ def resolve_cluster_receipt_path(
     except ClusterAssemblyReceiptStaleError as exc:
         stale_error = str(exc)
 
-    if not embedded_contract_path:
+    if embedded_resolved is None:
         if include_resolution:
             return None, {
                 "policy": "no_cluster_assembly_receipt",
@@ -394,27 +460,7 @@ def resolve_cluster_receipt_path(
                 "selected_receipt": None,
             }
         return None
-    embedded = Path(embedded_contract_path)
-    if not embedded.is_file():
-        if include_resolution:
-            return None, {
-                "policy": "no_cluster_assembly_receipt",
-                "requested_spm": str(spm_path),
-                "selected_receipt": None,
-            }
-        return None
-    try:
-        payload = json.loads(embedded.read_text(encoding="utf-8"))
-        select_cluster_contract(payload, spm_path)
-    except (OSError, json.JSONDecodeError, ValueError):
-        if include_resolution:
-            return None, {
-                "policy": "no_cluster_assembly_receipt",
-                "requested_spm": str(spm_path),
-                "selected_receipt": None,
-            }
-        return None
-    resolved = embedded.resolve()
+    resolved = embedded_resolved
     if include_resolution:
         return resolved, {
             "policy": (
@@ -512,6 +558,46 @@ def role_identities_from_contract(contract):
     rows = _role_receipt_rows(contract)
     return {
         role: _role_identity(role, rows.get(role), contract)
+        for role in ROLE_ORDER
+    }
+
+
+def _role_identity_aliases(role, receipt_row, contract, spm_path):
+    """Return receipt-authored names that identify the same rendered role.
+
+    Legacy provider names can differ from the authoritative general-tree
+    material name.  The target SPM material/mesh pair is already content
+    audited by PCG, so its complete records are valid aliases; no species or
+    ordinal naming guess is needed.
+    """
+    primary = _role_identity(role, receipt_row, contract)
+    aliases = [primary]
+    authoritative_spm = _authoritative_spm_for_requested(contract, spm_path)
+    target = _target_for_spm(receipt_row, authoritative_spm)
+    pair = (target or {}).get("spm_material_mesh_pair") or {}
+    for record in pair.get("records") or []:
+        if record.get("complete") is not True:
+            continue
+        material_name = str(record.get("material_name") or "").strip()
+        if material_name:
+            aliases.append(material_name)
+    unique = {}
+    for identity in aliases:
+        normalized = normalize_export_name(identity)
+        if normalized and normalized not in unique:
+            unique[normalized] = identity
+    return list(unique.values())
+
+
+def role_identity_aliases_from_contract(contract, spm_path):
+    rows = _role_receipt_rows(contract)
+    return {
+        role: _role_identity_aliases(
+            role,
+            rows.get(role),
+            contract,
+            spm_path,
+        )
         for role in ROLE_ORDER
     }
 
@@ -841,8 +927,19 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
     issues = []
     for role in ROLE_ORDER:
         receipt_row = role_rows.get(role)
-        identity = _role_identity(role, receipt_row, contract)
-        actual = classify_inventory_role(inventory, role, identity)
+        identities = _role_identity_aliases(
+            role,
+            receipt_row,
+            contract,
+            spm_path,
+        )
+        identity = identities[0]
+        actual = classify_inventory_role(
+            inventory,
+            role,
+            identity,
+            identities[1:],
+        )
         decision, evidence = _reconcile_role(receipt_row, actual)
         row = {
             **actual,
@@ -1013,5 +1110,6 @@ __all__ = [
     "normalize_export_name",
     "resolve_cluster_receipt_path",
     "role_identities_from_contract",
+    "role_identity_aliases_from_contract",
     "select_cluster_contract",
 ]

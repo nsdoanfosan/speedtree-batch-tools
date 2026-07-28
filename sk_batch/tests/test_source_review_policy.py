@@ -133,6 +133,26 @@ class SourceReviewPolicyTests(unittest.TestCase):
             repair_lines[0],
         )
 
+    def test_only_secondary_assembly_geometry_export_allows_boneless_spm(self):
+        calls = sorted(
+            (
+                node
+                for node in ast.walk(job_tree())
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run_speedtree_cli_export"
+            ),
+            key=lambda node: node.lineno,
+        )
+        self.assertEqual(len(calls), 2)
+        primary_keywords = {item.arg: item.value for item in calls[0].keywords}
+        secondary_keywords = {item.arg: item.value for item in calls[1].keywords}
+        self.assertNotIn("allow_boneless", primary_keywords)
+        self.assertIsInstance(
+            secondary_keywords.get("allow_boneless"), ast.Constant
+        )
+        self.assertIs(secondary_keywords["allow_boneless"].value, True)
+
 
 if __name__ == "__main__":
     unittest.main()

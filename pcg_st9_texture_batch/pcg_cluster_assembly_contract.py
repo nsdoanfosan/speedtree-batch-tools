@@ -400,14 +400,29 @@ def inspect_fbx_material_mesh_pairs(path):
         os.path.abspath(str(candidate)), stat.st_size, stat.st_mtime_ns))
 
 
-def classify_fbx_role(fbx_report, role_identity):
+def classify_fbx_role(
+    fbx_report,
+    role_identity,
+    role_identity_aliases=(),
+):
     """Apply the independent content-driven complete/absent/partial gate."""
-    expected = normalize_export_name(role_identity)
+    identities = [role_identity, *(role_identity_aliases or ())]
+    identity_alias_values = [
+        identity
+        for identity in identities
+        if identity and identity != role_identity
+    ]
+    expected = {
+        normalize_export_name(identity)
+        for identity in identities
+        if identity
+    }
     if fbx_report.get("status") == "missing":
         return {
             "status": "pending_export",
             "decision": "pending_export",
             "role_identity": role_identity,
+            "role_identity_aliases": identity_alias_values,
             "material_matches": [],
             "mesh_name_matches": [],
             "complete_pairs": [],
@@ -420,6 +435,7 @@ def classify_fbx_role(fbx_report, role_identity):
             "status": "inspection_error",
             "decision": "blocked",
             "role_identity": role_identity,
+            "role_identity_aliases": identity_alias_values,
             "material_matches": [],
             "mesh_name_matches": [],
             "complete_pairs": [],
@@ -429,15 +445,15 @@ def classify_fbx_role(fbx_report, role_identity):
         }
     material_matches = [
         value for value in fbx_report.get("materials") or []
-        if normalize_export_name(value) == expected
+        if normalize_export_name(value) in expected
     ]
     mesh_name_matches = [
         value for value in fbx_report.get("mesh_names") or []
-        if normalize_export_name(value) == expected
+        if normalize_export_name(value) in expected
     ]
     matched_pairs = [
         row for row in fbx_report.get("material_mesh_pairs") or []
-        if normalize_export_name(row.get("material")) == expected
+        if normalize_export_name(row.get("material")) in expected
     ]
     pair_counts = {}
     for row in matched_pairs:
@@ -477,6 +493,7 @@ def classify_fbx_role(fbx_report, role_identity):
         "status": status,
         "decision": decision,
         "role_identity": role_identity,
+        "role_identity_aliases": identity_alias_values,
         "material_matches": material_matches,
         "mesh_name_matches": mesh_name_matches,
         "complete_pairs": complete_pairs,
@@ -540,6 +557,53 @@ def _cluster_pair_row(cluster):
         "legacy_output_spm": legacy,
         "source_spm": source,
         "canonical_exists": canonical.is_file(),
+    }
+
+
+def _cluster_target_relation(pair_row, target_spms):
+    """Resolve whether one physical Cluster provider is ON for this target.
+
+    Material/mesh names prove that a rendered role exists, but they do not
+    prove that a same-folder Cluster blend owns that role.  When an Atlas
+    target registry exists it is the authoritative ON/OFF relation.  Providers
+    without a registry retain the legacy content-driven behavior so older
+    projects are not silently disconnected.
+    """
+    source_blend = Path(pair_row["output_spm"]).with_suffix(".blend").absolute()
+    try:
+        registry = load_target_registry(source_blend)
+    except TargetRegistryError as exc:
+        raise ClusterAssemblyReceiptError(
+            f"Atlas target relation registry is invalid for {source_blend}: {exc}"
+        ) from exc
+    if registry is None:
+        return {
+            "status": "legacy_unregistered",
+            "allowed": True,
+            "source_blend": str(source_blend),
+            "registry": None,
+            "registered_target_spms": [],
+            "matched_target_spms": [],
+        }
+
+    registered = {
+        _normalized_identity_path(value): str(value)
+        for value in registry.get("target_spms") or []
+    }
+    selected = {
+        _normalized_identity_path(value): str(Path(value).absolute())
+        for value in target_spms or []
+    }
+    matched_keys = sorted(set(registered).intersection(selected))
+    return {
+        "status": "explicit_on" if matched_keys else "explicit_off",
+        "allowed": bool(matched_keys),
+        "source_blend": str(source_blend),
+        "registry": file_fingerprint(registry["registry_path"]),
+        "registered_target_spms": [
+            registered[key] for key in sorted(registered)
+        ],
+        "matched_target_spms": [selected[key] for key in matched_keys],
     }
 
 
@@ -1493,11 +1557,19 @@ def _atlas_normalized_variants(
             if len(current_matches) != 1:
                 stale.append(str(manifest_path))
                 continue
-        contract = _normalized_variant_contract(
-            manifest_path,
-            payload,
-            group,
-        )
+        try:
+            contract = _normalized_variant_contract(
+                manifest_path,
+                payload,
+                group,
+            )
+        except ClusterAssemblyReceiptStaleError:
+            # A normalized receipt is a cache of a previously validated
+            # delivery.  Staleness cannot decide the current content
+            # contract; ignore it here and let the live SPM/FBX role audit
+            # determine pass-through vs normalized_variants_required.
+            stale.append(str(manifest_path))
+            continue
         target_registry = None
         if contract.get("production_normalization") is not None:
             target_registry = _physical_target_registry_contract(
@@ -1596,16 +1668,10 @@ def _atlas_normalized_variants(
                 )
             )
             if missing:
-                raise ClusterAssemblyReceiptStaleError(
-                    "Atlas physical normalized role is missing current target "
-                    "scope receipts: "
-                    + "; ".join(str(registered[key]) for key in missing)
-                )
+                return None
         return contract
     if stale:
-        raise ClusterAssemblyReceiptStaleError(
-            "Atlas normalized role receipts are stale: " + "; ".join(stale)
-        )
+        return None
     return None
 
 
@@ -1842,16 +1908,39 @@ def build_cluster_assembly_contract(
         assembly_source_spms = list(dict.fromkeys(
             Path(path) for path in assembly_source_spms or []))
     cluster_pairs = [_cluster_pair_row(path) for path in clusters or []]
+    selected_relation_targets = list(dict.fromkeys(
+        full_target_spms + assembly_source_spms
+    ))
+    for pair_row in cluster_pairs:
+        pair_row["target_relation"] = _cluster_target_relation(
+            pair_row,
+            selected_relation_targets,
+        )
     clusters = [row["output_spm"] for row in cluster_pairs]
     usage = cluster_usage
     if usage is None:
         usage = audit.cluster_material_usage(
             assembly_source_spms, clusters)
 
-    relevant_clusters = [
+    content_candidates = [
         row for row in cluster_pairs
         if _usage_for_cluster(usage, row) is not None
         and dependency_role(row["output_spm"].stem) in ROLE_ORDER
+    ]
+    relevant_clusters = [
+        row for row in content_candidates
+        if row["target_relation"]["allowed"]
+    ]
+    excluded_unregistered_clusters = [
+        {
+            "role": dependency_role(row["output_spm"].stem),
+            "name": row["output_spm"].stem,
+            "spm": str(row["output_spm"]),
+            "reason": "explicit_target_relation_off",
+            "target_relation": copy.deepcopy(row["target_relation"]),
+        }
+        for row in content_candidates
+        if not row["target_relation"]["allowed"]
     ]
     export_bundles = {
         str(spm).casefold(): _export_bundle(spm)
@@ -1923,12 +2012,14 @@ def build_cluster_assembly_contract(
                 fbx_gate = classify_fbx_role(
                     export_bundles[str(spm).casefold()]["fbx_contract"],
                     role_identity,
+                    material_names,
                 )
             else:
                 fbx_gate = {
                     "status": "reference_only",
                     "decision": "reference_only",
                     "role_identity": role_identity,
+                    "role_identity_aliases": material_names,
                     "material_matches": [],
                     "mesh_name_matches": [],
                     "complete_pairs": [],
@@ -2047,6 +2138,7 @@ def build_cluster_assembly_contract(
             "normalized_variants": normalized_variants,
             "normalized_variants_required": normalized_variants_required,
             "normalized_variants_missing": normalized_variants_missing,
+            "target_relation": copy.deepcopy(pair_row["target_relation"]),
         })
 
     children = []
@@ -2230,6 +2322,7 @@ def build_cluster_assembly_contract(
             "normalized_variants_missing": row.get(
                 "normalized_variants_missing", False
             ),
+            "target_relation": row.get("target_relation"),
         }
         for row in actual_dependencies
     ]
@@ -2250,6 +2343,10 @@ def build_cluster_assembly_contract(
             "requires_binding_hierarchy_validation": True,
         },
         "roles": role_receipts,
+        "relationship_policy": {
+            "mode": "explicit_registry_when_present_else_legacy_content",
+            "excluded_cluster_sources": excluded_unregistered_clusters,
+        },
         "issues": issues,
         "errors": issues,
     }
@@ -2264,6 +2361,10 @@ def build_cluster_assembly_contract(
             "children": children,
         },
         "dependencies": actual_dependencies,
+        "relationship_policy": {
+            "mode": "explicit_registry_when_present_else_legacy_content",
+            "excluded_cluster_sources": excluded_unregistered_clusters,
+        },
         "canonical_bark": bark,
         "handoff": handoff,
     }
