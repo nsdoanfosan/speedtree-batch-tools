@@ -107,6 +107,139 @@ def write_spm(path, materials, mesh_ids=(), active_material_ids=()):
         handle.write(payload)
 
 
+def material_only_rebase_fixture(root, with_external_rebase=False):
+    folder = Path(root) / "Tree_black_locast"
+    cluster_dir = folder / "Cluster"
+    production_spm = cluster_dir / "SK_branch_black_locast_01.spm"
+    isolated_root = cluster_dir / ".sk_batch_isolated_bark" / "signature"
+    isolated_spm = (
+        isolated_root
+        / folder.name
+        / cluster_dir.name
+        / production_spm.name
+    )
+    external_rows = []
+    production_other_ref = ""
+    isolated_other_ref = ""
+    if with_external_rebase:
+        external_source = folder / "Shared" / "leaf_color.tga"
+        external_source.parent.mkdir(parents=True, exist_ok=True)
+        external_source.write_bytes(b"leaf-texture")
+        external_copy = (
+            isolated_root
+            / folder.name
+            / "_external_textures"
+            / "content"
+            / external_source.name
+        )
+        external_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(external_source, external_copy)
+        production_other_ref = os.path.relpath(
+            external_source,
+            production_spm.parent,
+        ).replace("\\", "/")
+        isolated_other_ref = os.path.relpath(
+            external_copy,
+            isolated_spm.parent,
+        ).replace("\\", "/")
+        external_rows.append({
+            "source": str(external_source),
+            "isolated": str(external_copy),
+            "sha256": file_fingerprint(external_source)["sha256"],
+            "spm_ref": isolated_other_ref,
+        })
+
+    def write_provider(path, bark_ref, other_ref, mesh_ids=("1", "2"),
+                       bark_cutouts=("1",)):
+        write_spm(
+            path,
+            [
+                (
+                    "1",
+                    "M_bark_black_locast_01",
+                    [bark_ref],
+                    bark_cutouts,
+                ),
+                (
+                    "2",
+                    "M_leaf_black_locast_01",
+                    [other_ref] if other_ref else [],
+                    ("2",),
+                ),
+            ],
+            mesh_ids=mesh_ids,
+            active_material_ids=("1", "2"),
+        )
+
+    write_provider(
+        production_spm,
+        "legacy/uktladjcw_4k_albedo.tif",
+        production_other_ref,
+    )
+    old_source_hash = file_fingerprint(production_spm)["sha256"]
+    write_provider(
+        isolated_spm,
+        "../texture/T_bark_black_locast_01_color.tga",
+        isolated_other_ref,
+    )
+    isolated_hash = file_fingerprint(isolated_spm)["sha256"]
+    # This is the live, intentional production edit that made the cache stale.
+    write_provider(
+        production_spm,
+        "texture/T_bark_black_locast_01_color.tga",
+        production_other_ref,
+    )
+    manifest_path = isolated_root / "bark_normalization_manifest.json"
+    manifest = {
+        "kind": "cluster_isolated_canonical_bark_source",
+        "status": "ready",
+        "source_spm": str(production_spm),
+        "source_spm_sha256": old_source_hash,
+        "speedtree_spm": str(isolated_spm),
+        "isolated_spm_sha256": isolated_hash,
+        "production_source_mutated": False,
+        "identity": {
+            "required_materials": [{
+                "material_id": "1",
+                "material_name": "m_bark_black_locast_01",
+            }],
+        },
+        "copied_source_external_textures": external_rows,
+        "copied_source_external_meshes": [],
+        "normalization": {
+            "status": "ready",
+            "outputs": [{
+                "source_spm": str(production_spm),
+                "isolated_spm": str(isolated_spm),
+                "input_sha256": old_source_hash,
+                "output_sha256": isolated_hash,
+                "material_id": "1",
+                "cutout_mesh_ids": ["1"],
+                "status": "normalized",
+                "source_material_name_preserved": True,
+                "uv_mesh_generator_payload_preserved": True,
+            }],
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return {
+        "folder": folder,
+        "production_spm": production_spm,
+        "isolated_spm": isolated_spm,
+        "manifest": manifest_path,
+        "normalized": {
+            "source_3d_artifacts": {
+                "source_spm": file_fingerprint(isolated_spm),
+            },
+            "production_normalization": {
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            },
+        },
+        "write_provider": write_provider,
+        "production_other_ref": production_other_ref,
+    }
+
+
 def write_ascii_fbx(path, material_names, mesh_names, pairs):
     path.parent.mkdir(parents=True, exist_ok=True)
     object_rows = []
@@ -1648,6 +1781,118 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     requested_spm=target,
                 )
 
+    def test_persisted_material_only_rebase_is_revalidated_live(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = material_only_rebase_fixture(temp_dir)
+            root = fixture["folder"]
+            receipt_dir = Path(temp_dir) / "receipts"
+            target = root / "SK_tree_black_locast_01.spm"
+            source = root / "tree_black_locast_01.spm"
+            target.write_bytes(b"target")
+            source.write_bytes(b"source")
+            isolated_spm = fixture["isolated_spm"]
+            source_fbx = (
+                isolated_spm.parent
+                / "fbx"
+                / f"{isolated_spm.stem}.fbx"
+            )
+            source_fbx.parent.mkdir(parents=True, exist_ok=True)
+            source_fbx.write_bytes(b"cluster-fbx")
+            source_blend = (
+                fixture["production_spm"].with_suffix(".blend")
+            )
+            source_blend.write_bytes(b"cluster-blend")
+            atlas_manifest = root / "atlas-normalized.json"
+            atlas_manifest.write_bytes(b"atlas")
+            registry = save_target_registry(source_blend, [target])
+            source_contract = {
+                "source_spm": str(isolated_spm),
+                "source_spm_sha256": file_fingerprint(
+                    isolated_spm
+                )["sha256"],
+                "source_fbx": str(source_fbx),
+                "source_fbx_sha256": file_fingerprint(
+                    source_fbx
+                )["sha256"],
+            }
+            normalized = fixture["normalized"]
+            normalized.update({
+                "manifest": file_fingerprint(atlas_manifest),
+                "source_blend": file_fingerprint(source_blend),
+                "source_3d_artifacts": {
+                    "source_spm": file_fingerprint(isolated_spm),
+                    "source_fbx": file_fingerprint(source_fbx),
+                },
+                "target_registry": file_fingerprint(
+                    registry["registry_path"]
+                ),
+                "production_normalization": {
+                    "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                    "variants": [{
+                        "plan_uv_transfer": {
+                            "source_3d_contract": source_contract,
+                        },
+                    }],
+                },
+                "variants": [{
+                    "plan_fbx": file_fingerprint(source_fbx),
+                }],
+            })
+            _validate_normalized_source_dependency(
+                normalized,
+                fixture["production_spm"],
+            )
+            dependency = {
+                "spm_fingerprint": file_fingerprint(
+                    fixture["production_spm"]
+                ),
+                "normalized_variants": normalized,
+            }
+            contract = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [dependency],
+                "handoff": {"cluster_dependencies": [dependency]},
+            }
+            receipt = persist_cluster_assembly_receipt(
+                contract,
+                receipt_dir=receipt_dir,
+            )
+            load_cluster_assembly_receipt(receipt, requested_spm=target)
+
+            fixture["write_provider"](
+                fixture["production_spm"],
+                "texture/T_bark_black_locast_01_color.tga",
+                "",
+                mesh_ids=("1", "2", "3"),
+            )
+            current_production = file_fingerprint(
+                fixture["production_spm"]
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            persisted = payload["cluster_assembly"]
+            for dependencies in (
+                persisted["dependencies"],
+                persisted["handoff"]["cluster_dependencies"],
+            ):
+                dependencies[0]["spm_fingerprint"] = current_production
+                dependencies[0]["normalized_variants"][
+                    "material_only_source_rebase"
+                ]["production_spm"] = current_production
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptStaleError,
+                "outside declared normalization material blocks",
+            ):
+                load_cluster_assembly_receipt(
+                    receipt,
+                    requested_spm=target,
+                )
+
     def test_persisted_export_bundle_uses_content_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "Tree_elm"
@@ -2390,6 +2635,177 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 "isolated_capture_validated",
             )
 
+    def test_stale_isolated_bark_cache_rebases_declared_material_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = material_only_rebase_fixture(
+                temporary,
+                with_external_rebase=True,
+            )
+            normalized = fixture["normalized"]
+            recorded_source = dict(
+                normalized["source_3d_artifacts"]["source_spm"]
+            )
+
+            _validate_normalized_source_dependency(
+                normalized,
+                fixture["production_spm"],
+            )
+
+            self.assertEqual(
+                normalized["source_3d_artifacts"]["source_spm"],
+                recorded_source,
+            )
+            self.assertNotIn("isolated_bark_capture", normalized)
+            evidence = normalized["material_only_source_rebase"]
+            self.assertEqual(evidence["status"], "validated")
+            self.assertEqual(evidence["declared_material_ids"], ["1"])
+            self.assertFalse(evidence["canonical_evidence_allowed"])
+            self.assertTrue(evidence["isolated_bark_capture_ignored"])
+            self.assertEqual(
+                evidence["production_spm"]["sha256"],
+                file_fingerprint(fixture["production_spm"])["sha256"],
+            )
+
+            target = fixture["folder"] / "SK_tree_black_locast_01.spm"
+            write_spm(
+                target,
+                [(
+                    "1",
+                    "M_bark_black_locast_01",
+                    ["texture/T_expected_canonical_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+            fixture["write_provider"](
+                fixture["production_spm"],
+                "texture/T_live_noncanonical_color.tga",
+                fixture["production_other_ref"],
+            )
+            bark = _canonical_bark_contract(
+                audit_module,
+                fixture["folder"],
+                [target],
+                [{
+                    "source_spm": str(fixture["production_spm"]),
+                    "spm": str(fixture["production_spm"]),
+                    "normalized_variants": normalized,
+                }],
+            )
+            self.assertEqual(bark["status"], "replacement_required")
+            self.assertEqual(
+                bark["cluster_bark_sources"][0]["replacement"],
+                "required",
+            )
+            self.assertIsNone(
+                bark["cluster_bark_sources"][0][
+                    "normalization_evidence"
+                ]
+            )
+
+    def test_stale_isolated_bark_cache_rejects_non_material_changes(self):
+        cases = (
+            ("non-declared material", "other_material"),
+            ("geometry", "geometry"),
+            ("cutout mesh binding", "cutout"),
+        )
+        for label, change in cases:
+            with self.subTest(change=label), tempfile.TemporaryDirectory() as temporary:
+                fixture = material_only_rebase_fixture(temporary)
+                if change == "other_material":
+                    write_spm(
+                        fixture["production_spm"],
+                        [
+                            (
+                                "1",
+                                "M_bark_black_locast_01",
+                                ["texture/T_bark_black_locast_01_color.tga"],
+                                ("1",),
+                            ),
+                            (
+                                "2",
+                                "M_leaf_changed",
+                                [],
+                                ("2",),
+                            ),
+                        ],
+                        mesh_ids=("1", "2"),
+                        active_material_ids=("1", "2"),
+                    )
+                    expected = "outside declared normalization material blocks"
+                elif change == "geometry":
+                    fixture["write_provider"](
+                        fixture["production_spm"],
+                        "texture/T_bark_black_locast_01_color.tga",
+                        "",
+                        mesh_ids=("1", "2", "3"),
+                    )
+                    expected = "outside declared normalization material blocks"
+                else:
+                    fixture["write_provider"](
+                        fixture["production_spm"],
+                        "texture/T_bark_black_locast_01_color.tga",
+                        "",
+                        bark_cutouts=("9",),
+                    )
+                    expected = "changed its cutout mesh binding"
+
+                with self.assertRaisesRegex(
+                    ClusterAssemblyReceiptStaleError,
+                    expected,
+                ):
+                    _validate_normalized_source_dependency(
+                        fixture["normalized"],
+                        fixture["production_spm"],
+                    )
+
+    def test_stale_isolated_bark_cache_rejects_broadened_manifest_scope(self):
+        cases = (
+            ("undeclared output", "output"),
+            ("incomplete output", "status"),
+            ("unpreserved material name", "material_name"),
+            ("unpreserved UV generator payload", "uv_payload"),
+        )
+        for label, change in cases:
+            with (
+                self.subTest(change=label),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                fixture = material_only_rebase_fixture(temporary)
+                manifest = json.loads(
+                    fixture["manifest"].read_text(encoding="utf-8")
+                )
+                output = manifest["normalization"]["outputs"][0]
+                if change == "output":
+                    expanded = dict(output)
+                    expanded["material_id"] = "2"
+                    expanded["cutout_mesh_ids"] = ["2"]
+                    manifest["normalization"]["outputs"].append(expanded)
+                    expected = "do not match its required material identity"
+                elif change == "status":
+                    output["status"] = "pending"
+                    expected = "no fail-closed normalization evidence"
+                elif change == "material_name":
+                    output["source_material_name_preserved"] = False
+                    expected = "no fail-closed normalization evidence"
+                else:
+                    output["uv_mesh_generator_payload_preserved"] = False
+                    expected = "no fail-closed normalization evidence"
+                fixture["manifest"].write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ClusterAssemblyReceiptStaleError,
+                    expected,
+                ):
+                    _validate_normalized_source_dependency(
+                        fixture["normalized"],
+                        fixture["production_spm"],
+                    )
+
     def test_same_role_secondary_is_not_bound_to_primary_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "Tree_elm"
@@ -2546,7 +2962,9 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(contract["canonical_material"], bark_name)
             self.assertEqual(len(contract["canonical_sources"]), 1)
 
-    def test_provider_texture_provenance_can_supply_missing_owner_bark(self):
+    def test_multiple_provider_signatures_cannot_supply_missing_owner_bark(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "weed_black_locast"
             target = folder / "SK_tree_black_locast_01.spm"
@@ -2583,15 +3001,179 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [{"source_spm": provider, "spm": provider}],
             )
 
-            self.assertEqual(contract["status"], "replacement_required")
+            self.assertEqual(
+                contract["status"],
+                "blocked_canonical_ambiguous",
+            )
+            self.assertEqual(contract["canonical_sources"], [])
+            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+
+    def test_same_signature_bark_labels_alias_expected_provider_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_tree_black_locast_01.spm"
+            branch = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            cluster = folder / "cluster" / "SK_cluster_black_locast_01.spm"
+            shared_refs = [
+                "texture/T_bark_black_locast_01_color.tga",
+                "texture/T_bark_black_locast_01_normal.tga",
+            ]
+            write_spm(
+                target,
+                [("1", "M_leaf_black_locast_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                branch,
+                [
+                    (
+                        "5",
+                        "M_bark_black_locast_01",
+                        shared_refs,
+                        ("5",),
+                    ),
+                    (
+                        "7",
+                        "M_bark_common_end_01",
+                        shared_refs,
+                        ("7",),
+                    ),
+                ],
+                mesh_ids=("5", "7"),
+                active_material_ids=("5", "7"),
+            )
+            write_spm(
+                cluster,
+                [(
+                    "18",
+                    "M_bark_black_locast_01",
+                    shared_refs,
+                    ("18",),
+                )],
+                mesh_ids=("18",),
+                active_material_ids=("18",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [
+                    {"source_spm": branch, "spm": branch},
+                    {"source_spm": cluster, "spm": cluster},
+                ],
+            )
+
+            self.assertEqual(contract["status"], "canonical")
             self.assertEqual(
                 contract["canonical_material"],
                 "M_bark_black_locast_01",
             )
+            self.assertEqual(contract["canonical_conflicts"], [])
             self.assertEqual(
-                contract["canonical_sources"][0]["authority"],
-                "active_provider_texture_provenance",
+                {
+                    row["material_name"]
+                    for row in contract["canonical_sources"]
+                },
+                {"M_bark_black_locast_01"},
             )
+            self.assertEqual(
+                {
+                    row["replacement"]
+                    for row in contract["cluster_bark_sources"]
+                },
+                {"not_required"},
+            )
+
+    def test_same_signature_without_expected_identity_stays_blocked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_tree_black_locast_01.spm"
+            provider = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_black_locast_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [(
+                    "1",
+                    "M_bark_common_end_01",
+                    ["texture/T_bark_black_locast_01_color.tga"],
+                    ("1",),
+                )],
+                mesh_ids=("1",),
+                active_material_ids=("1",),
+            )
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+            )
+
+            self.assertEqual(
+                contract["status"],
+                "blocked_canonical_ambiguous",
+            )
+            self.assertEqual(contract["canonical_sources"], [])
+            self.assertEqual(len(contract["canonical_conflicts"]), 1)
+
+    def test_same_basenames_in_different_folders_are_not_bark_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "weed_black_locast"
+            target = folder / "SK_tree_black_locast_01.spm"
+            provider = folder / "cluster" / "SK_branch_black_locast_01.spm"
+            write_spm(
+                target,
+                [("1", "M_leaf_black_locast_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                provider,
+                [
+                    (
+                        "1",
+                        "M_bark_black_locast_01",
+                        ["first/T_bark_black_locast_01_color.tga"],
+                        ("1",),
+                    ),
+                    (
+                        "2",
+                        "M_bark_common_end_01",
+                        ["second/T_bark_black_locast_01_color.tga"],
+                        ("2",),
+                    ),
+                ],
+                mesh_ids=("1", "2"),
+                active_material_ids=("1", "2"),
+            )
+            first = provider.parent / "first" / (
+                "T_bark_black_locast_01_color.tga"
+            )
+            second = provider.parent / "second" / (
+                "T_bark_black_locast_01_color.tga"
+            )
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            contract = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+            )
+
+            self.assertEqual(
+                contract["status"],
+                "blocked_canonical_ambiguous",
+            )
+            self.assertEqual(contract["canonical_sources"], [])
+            self.assertEqual(len(contract["canonical_conflicts"]), 2)
 
     def test_direct_owner_bark_requires_same_named_provider_texture_replacement(
         self,

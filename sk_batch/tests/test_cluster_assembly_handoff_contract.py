@@ -769,6 +769,82 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "M_bark_elm_01",
             )
 
+    def test_ambiguous_canonical_bark_preserves_provider_texture_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_tree_black_locast_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_black_locast_01", "pending_export")],
+                normalized_by_role={
+                    "branch": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                    },
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            handoff_contract = payload["items"][0][
+                "cluster_assembly"
+            ]["handoff"]
+            conflicts = [
+                {
+                    "material_identity": "bark_black_locast_01",
+                    "texture_basenames": ["uktladjcw_4k_albedo.tif"],
+                    "providers": [str(root / "SK_branch_black_locast_01.spm")],
+                },
+                {
+                    "material_identity": "bark_black_locast_01",
+                    "texture_basenames": [
+                        "t_bark_black_locast_01_color.tga"
+                    ],
+                    "providers": [str(root / "SK_cluster_black_locast_01.spm")],
+                },
+            ]
+            handoff_contract["status"] = "blocked"
+            handoff_contract["canonical_bark"] = {
+                "status": "blocked_canonical_ambiguous",
+                "canonical_material": "M_bark_black_locast_01",
+                "canonical_conflicts": conflicts,
+            }
+            receipt.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+            inventory = build_blender_fbx_inventory(
+                [
+                    role_object(
+                        fbx,
+                        material="M_branch_black_locast_01",
+                    )
+                ],
+                fbx,
+                {"branch": "branch_black_locast_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            issue = next(
+                row
+                for row in handoff["issues"]
+                if row["code"] == "CANONICAL_BARK_AMBIGUOUS"
+            )
+            self.assertEqual(
+                issue["reason"],
+                "blocked_canonical_ambiguous",
+            )
+            self.assertEqual(
+                issue["canonical_material"],
+                "M_bark_black_locast_01",
+            )
+            self.assertEqual(issue["canonical_conflicts"], conflicts)
+
     def test_exact_isolated_bark_capture_satisfies_stale_receipt_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

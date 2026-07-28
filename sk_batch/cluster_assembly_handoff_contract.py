@@ -1148,6 +1148,21 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 )
                 if isinstance(row, dict)
             ]
+            bark = pcg_handoff.get("canonical_bark") or {}
+            if (
+                not detailed
+                and bark.get("status") == "blocked_canonical_ambiguous"
+            ):
+                detailed.append({
+                    "code": "CANONICAL_BARK_AMBIGUOUS",
+                    "reason": bark.get("status"),
+                    "canonical_material": bark.get(
+                        "canonical_material"
+                    ),
+                    "canonical_conflicts": deepcopy(
+                        bark.get("canonical_conflicts") or []
+                    ),
+                })
         if pcg_handoff_status == "needs_bark_normalization":
             issues.extend(detailed)
         else:

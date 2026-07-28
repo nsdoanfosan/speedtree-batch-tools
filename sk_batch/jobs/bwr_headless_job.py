@@ -96,6 +96,56 @@ def write_report(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def save_cluster_source_mainfile(bpy_module, filepath, report):
+    """Save one Cluster source without Blender's redundant version rename.
+
+    The GUI owns a separate pre-repair copy and restores it if this producer
+    transaction fails.  Blender's additional ``.blend -> .blend1`` rename is
+    therefore redundant here and can fail when OneDrive briefly holds either
+    path.  Change the preference only in memory for this operator call and
+    restore it even when Blender raises.
+    """
+    filepaths = bpy_module.context.preferences.filepaths
+    original_save_version = int(filepaths.save_version)
+    policy = {
+        "status": "applying",
+        "policy": (
+            "gui_pre_repair_transaction_authoritative_disable_blender_"
+            "version_backup"
+        ),
+        "scope": "headless_cluster_source_final_save",
+        "preference": "bpy.context.preferences.filepaths.save_version",
+        "original_save_version": original_save_version,
+        "effective_save_version": 0,
+        "preference_persisted": False,
+        "preference_restored": False,
+        "transaction_backup": "sk_batch_gui_pre_repair_copy_and_rollback",
+    }
+    report["blend_save_policy"] = policy
+    try:
+        filepaths.save_version = 0
+        policy["observed_effective_save_version"] = int(
+            filepaths.save_version
+        )
+        result = bpy_module.ops.wm.save_as_mainfile(filepath=filepath)
+        policy["operator_result"] = sorted(result)
+        policy["status"] = (
+            "committed" if "FINISHED" in result else "operator_incomplete"
+        )
+        return result
+    except Exception as exc:
+        policy["status"] = "operator_failed"
+        policy["error_type"] = type(exc).__name__
+        policy["error"] = str(exc)
+        raise
+    finally:
+        filepaths.save_version = original_save_version
+        policy["restored_save_version"] = int(filepaths.save_version)
+        policy["preference_restored"] = (
+            int(filepaths.save_version) == original_save_version
+        )
+
+
 def atomic_copy(source, destination):
     source = Path(source)
     destination = Path(destination)
@@ -256,6 +306,21 @@ def require_cluster_assembly_handoff_ready(handoff):
             fields.append("missing=" + ", ".join(missing[:3]))
         if invalid:
             fields.append("invalid=" + ", ".join(invalid[:3]))
+        conflicts = []
+        for conflict in item.get("canonical_conflicts") or []:
+            providers = [
+                Path(value).name
+                for value in conflict.get("providers") or []
+            ]
+            textures = list(conflict.get("texture_basenames") or [])
+            conflicts.append(
+                (",".join(providers) or "?")
+                + "["
+                + ",".join(textures)
+                + "]"
+            )
+        if conflicts:
+            fields.append("conflicts=" + " vs ".join(conflicts))
         return " ".join(fields)
 
     reasons = "; ".join(
@@ -828,7 +893,16 @@ def main():
                 or (not empty_material_slots and not material_export_blocked)
             )
         ):
-            save_result = bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+            if is_cluster_source:
+                save_result = save_cluster_source_mainfile(
+                    bpy,
+                    blend_path,
+                    report,
+                )
+            else:
+                save_result = bpy.ops.wm.save_as_mainfile(
+                    filepath=blend_path
+                )
             report["blend_save_operator_result"] = sorted(save_result)
             if "FINISHED" not in save_result:
                 raise RuntimeError(
@@ -1013,6 +1087,10 @@ def main():
             pipeline_data["cluster_source_build_contract"] = (
                 cluster_source_build_contract
             )
+            if report.get("blend_save_policy") is not None:
+                pipeline_data["blend_save_policy"] = report[
+                    "blend_save_policy"
+                ]
             if assembly_manifest is not None:
                 pipeline_data["cluster_assembly_manifest"] = assembly_manifest
             write_report(pipeline_path, pipeline_data)

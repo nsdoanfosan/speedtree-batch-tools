@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import copy
+import html
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
+from speedtree_pipeline_contract import read_spm_text
 
 
 SCHEMA_VERSION = 1
@@ -790,25 +792,54 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
     if not canonical and sources:
         provider_groups = {}
         for row in sources:
-            if not row.get("matches_canonical_textures"):
-                continue
             authority = normalize_export_name(row.get("material_name"))
-            texture_signature = tuple(sorted({
-                Path(value).name.casefold()
+            authored_refs = [
+                str(value).strip()
                 for value in row.get("texture_refs") or []
-            }))
+                if str(value).strip()
+            ]
+            # Provider-label aliasing is safe only for the exact same physical
+            # texture sequence.  Basenames alone are insufficient because two
+            # libraries can contain different files with the same names.
+            texture_signature = tuple(
+                _normalized_identity_path(
+                    _resolve_ref(Path(row["cluster_spm"]), value)
+                )
+                for value in authored_refs
+            )
             provider_groups.setdefault(
                 (authority, texture_signature),
                 [],
             ).append(row)
-        if len(provider_groups) == 1:
-            (authority, _texture_signature), rows = next(
-                iter(provider_groups.items())
-            )
+        live_signatures = {
+            signature
+            for _authority, signature in provider_groups
+        }
+        provider_identity = next(
+            (
+                identity for identity in accepted_identities
+                if any(
+                    normalize_export_name(row.get("material_name"))
+                    == identity
+                    for row in sources
+                )
+            ),
+            None,
+        )
+        if (
+            provider_identity
+            and len(live_signatures) == 1
+            and next(iter(live_signatures), ())
+        ):
+            rows = [
+                row for row in sources
+                if normalize_export_name(row.get("material_name"))
+                == provider_identity
+            ]
             canonical = [
                 {
                     "spm": row["cluster_spm"],
-                    "identity": authority,
+                    "identity": provider_identity,
                     "material_id": row.get("material_id"),
                     "material_name": row.get("material_name"),
                     "refs": list(row.get("texture_refs") or []),
@@ -816,11 +847,28 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                 }
                 for row in rows
             ]
-        elif provider_groups:
+            # Identical live texture signatures are one rendered provider
+            # contract even when legacy material-library labels differ.  The
+            # accepted species/owner identity supplies the authority; the
+            # other labels are aliases, not competing canonicals.
+            for row in sources:
+                row["matches_canonical_textures"] = True
+                row["replacement"] = "not_required"
+                row["normalization_evidence"] = None
+                if (
+                    normalize_export_name(row.get("material_name"))
+                    != provider_identity
+                ):
+                    row["canonical_alias_of"] = provider_identity
+        else:
             canonical_conflicts = [
                 {
                     "material_identity": identity,
-                    "texture_basenames": list(texture_signature),
+                    "texture_basenames": [
+                        Path(value).name.casefold()
+                        for value in (rows[0].get("texture_refs") or [])
+                    ],
+                    "texture_identities": list(texture_signature),
                     "providers": sorted({
                         row["cluster_spm"] for row in rows
                     }),
@@ -1752,6 +1800,462 @@ def _artifact_identity_matches(recorded, current):
     )
 
 
+_SPM_MATERIAL_BLOCK_RE = re.compile(
+    r"<Material_v8\b[^>]*>.*?</Material_v8>",
+    re.IGNORECASE | re.DOTALL,
+)
+_SPM_MATERIAL_ID_RE = re.compile(
+    r'<Material_v8\b[^>]*\bID="([^"]+)"',
+    re.IGNORECASE,
+)
+_SPM_TEX_FILENAME_RE = re.compile(
+    r"(<TexFilename\b(?![^>]*?/\s*>)[^>]*>)(.*?)"
+    r"(</TexFilename>|<\\TexFilename>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SPM_MESH_BLOCK_RE = re.compile(
+    r"(<Mesh\b(?=[^>]*\bID\s*=)[^>]*>)(.*?)(</Mesh>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SPM_MESH_FILENAME_RE = re.compile(
+    r"(<Filename\b(?![^>]*?/\s*>)[^>]*>)(.*?)"
+    r"(</Filename>|<\\Filename>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SPM_CUTOUT_ID_RES = (
+    re.compile(
+        r"<CutoutMeshID\b[^>]*>([^<]*)</CutoutMeshID>",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'<CutoutMesh\b[^>]*\bID="([^"]+)"',
+        re.IGNORECASE,
+    ),
+)
+
+
+def _load_isolated_bark_manifest(isolated_spm_path):
+    manifest_path = next(
+        (
+            parent / "bark_normalization_manifest.json"
+            for parent in Path(isolated_spm_path).parents
+            if (parent / "bark_normalization_manifest.json").is_file()
+        ),
+        None,
+    )
+    if manifest_path is None:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark capture has no normalization manifest"
+        )
+    current_manifest = _fresh_file_fingerprint(manifest_path)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark normalization manifest is unreadable"
+        ) from exc
+    return manifest_path, current_manifest, manifest
+
+
+def _normalization_output_materials(
+    manifest,
+    output_spm,
+    isolated_spm,
+):
+    normalization = manifest.get("normalization") or {}
+    outputs = normalization.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark manifest has no declared material outputs"
+        )
+    required_materials = (
+        (manifest.get("identity") or {}).get("required_materials")
+    )
+    if not isinstance(required_materials, list) or not required_materials:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark manifest has no required material identity"
+        )
+    required_ids = []
+    for row in required_materials:
+        if not isinstance(row, dict):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark required material identity is invalid"
+            )
+        material_id = str(row.get("material_id") or "").strip()
+        if not material_id or material_id in required_ids:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark required material IDs are missing or "
+                "duplicated"
+            )
+        required_ids.append(material_id)
+    declared = {}
+    source_hash = str(manifest.get("source_spm_sha256") or "").casefold()
+    isolated_hash = str(
+        manifest.get("isolated_spm_sha256") or ""
+    ).casefold()
+    for row in outputs:
+        if not isinstance(row, dict):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest material output is invalid"
+            )
+        material_id = str(row.get("material_id") or "").strip()
+        if not material_id or material_id in declared:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest material output IDs are "
+                "missing or duplicated"
+            )
+        if (
+            row.get("status") != "normalized"
+            or row.get("source_material_name_preserved") is not True
+            or row.get("uv_mesh_generator_payload_preserved") is not True
+        ):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest material output has no "
+                "fail-closed normalization evidence"
+            )
+        if (
+            _normalized_identity_path(row.get("source_spm"))
+            != _normalized_identity_path(output_spm)
+            or _normalized_identity_path(row.get("isolated_spm"))
+            != _normalized_identity_path(isolated_spm)
+            or str(row.get("input_sha256") or "").casefold()
+            != source_hash
+            or str(row.get("output_sha256") or "").casefold()
+            != isolated_hash
+        ):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest material output does not match "
+                "its recorded source pair"
+            )
+        declared[material_id] = row
+    if set(declared) != set(required_ids):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark manifest output material IDs do not match "
+            "its required material identity"
+        )
+    return declared
+
+
+def _spm_material_cutout_ids(block):
+    values = []
+    for pattern in _SPM_CUTOUT_ID_RES:
+        values.extend(
+            match.strip()
+            for match in pattern.findall(block)
+            if match.strip() not in {"", "-1"}
+        )
+    return values
+
+
+def _manifest_rebase_rows(manifest, key):
+    rows = manifest.get(key)
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark manifest rebase inventory is invalid: "
+            + key
+        )
+    checked = []
+    seen = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest rebase row is invalid: " + key
+            )
+        source = Path(str(row.get("source") or ""))
+        isolated = Path(str(row.get("isolated") or ""))
+        spm_ref = str(row.get("spm_ref") or "").strip()
+        expected_hash = str(row.get("sha256") or "").casefold()
+        ref_key = spm_ref.replace("\\", "/").casefold()
+        isolated_spm = Path(str(manifest.get("speedtree_spm") or ""))
+        resolved_isolated = (
+            isolated_spm.parent
+            / spm_ref.replace("\\", os.sep).replace("/", os.sep)
+        ).resolve(strict=False)
+        if (
+            not source.is_file()
+            or not isolated.is_file()
+            or not spm_ref
+            or not expected_hash
+            or _normalized_identity_path(resolved_isolated)
+            != _normalized_identity_path(isolated)
+            or _fresh_file_fingerprint(source).get("sha256") != expected_hash
+            or _fresh_file_fingerprint(isolated).get("sha256")
+            != expected_hash
+        ):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest rebase artifact is missing or "
+                f"stale: {source}"
+            )
+        prior = seen.get(ref_key)
+        source_key = _normalized_identity_path(source)
+        if prior is not None and prior != source_key:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark manifest maps one cache reference to "
+                "multiple production files: "
+                + spm_ref
+            )
+        seen[ref_key] = source_key
+        checked.append({
+            "source": source,
+            "spm_ref_key": ref_key,
+        })
+    return checked
+
+
+def _inverse_manifest_reference_rebases(
+    text,
+    manifest,
+    production_spm,
+):
+    """Undo only cache path rewrites explicitly declared by the manifest."""
+    texture_rows = _manifest_rebase_rows(
+        manifest,
+        "copied_source_external_textures",
+    )
+    mesh_rows = _manifest_rebase_rows(
+        manifest,
+        "copied_source_external_meshes",
+    )
+
+    def mappings(rows):
+        return {
+            row["spm_ref_key"]: html.escape(
+                os.path.relpath(
+                    row["source"],
+                    Path(production_spm).parent,
+                ).replace("\\", "/"),
+                quote=False,
+            )
+            for row in rows
+        }
+
+    texture_map = mappings(texture_rows)
+    mesh_map = mappings(mesh_rows)
+
+    def inverse_reference(match, mapping):
+        authored = " ".join(str(match.group(2) or "").split())
+        replacement = mapping.get(
+            html.unescape(authored).replace("\\", "/").casefold()
+        )
+        if replacement is None:
+            return match.group(0)
+        return match.group(1) + replacement + match.group(3)
+
+    text = _SPM_TEX_FILENAME_RE.sub(
+        lambda match: inverse_reference(match, texture_map),
+        text,
+    )
+
+    def inverse_mesh(match):
+        body = _SPM_MESH_FILENAME_RE.sub(
+            lambda ref: inverse_reference(ref, mesh_map),
+            match.group(2),
+        )
+        return match.group(1) + body + match.group(3)
+
+    return _SPM_MESH_BLOCK_RE.sub(inverse_mesh, text)
+
+
+def _material_only_spm_contract_text(
+    spm_path,
+    declared_outputs,
+    manifest=None,
+    production_spm=None,
+):
+    """Mask declared bark blocks while preserving every other live contract.
+
+    Isolated caches rebase external file paths.  Only rewrites explicitly
+    inventoried by that cache manifest are reversed; any undeclared path,
+    material, generator, or mesh change remains byte-for-byte significant.
+    """
+    try:
+        text = read_spm_text(spm_path)
+    except Exception as exc:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark material-only comparison cannot read SPM: "
+            + str(spm_path)
+        ) from exc
+    pieces = []
+    cursor = 0
+    seen = set()
+    for match in _SPM_MATERIAL_BLOCK_RE.finditer(text):
+        pieces.append(text[cursor:match.start()])
+        block = match.group(0)
+        identity = _SPM_MATERIAL_ID_RE.search(block)
+        material_id = identity.group(1).strip() if identity else ""
+        if material_id in declared_outputs:
+            if material_id in seen:
+                raise ClusterAssemblyReceiptStaleError(
+                    "Atlas isolated bark declared material ID is duplicated "
+                    f"in SPM: {material_id}"
+                )
+            seen.add(material_id)
+            expected_cutouts = [
+                str(value)
+                for value in (
+                    declared_outputs[material_id].get("cutout_mesh_ids")
+                    or []
+                )
+                if str(value) not in {"", "-1"}
+            ]
+            if _spm_material_cutout_ids(block) != expected_cutouts:
+                raise ClusterAssemblyReceiptStaleError(
+                    "Atlas isolated bark declared material changed its cutout "
+                    f"mesh binding: {material_id}"
+                )
+            pieces.append(
+                f"<DECLARED_NORMALIZATION_MATERIAL ID={material_id}>"
+            )
+        else:
+            pieces.append(block)
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    missing = sorted(set(declared_outputs).difference(seen))
+    if missing:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark declared material IDs are missing from SPM: "
+            + ", ".join(missing)
+        )
+    masked = "".join(pieces)
+    if manifest is not None:
+        if production_spm is None:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas isolated bark cache rebase has no production SPM"
+            )
+        masked = _inverse_manifest_reference_rebases(
+            masked,
+            manifest,
+            production_spm,
+        )
+    return masked
+
+
+def _material_only_source_rebase_evidence(
+    normalized_variants,
+    output_spm,
+):
+    """Validate a stale cache whose production delta is declared bark only."""
+    recorded = (
+        (normalized_variants.get("source_3d_artifacts") or {}).get(
+            "source_spm"
+        )
+        or {}
+    )
+    isolated_spm_path = Path(str(recorded.get("path") or ""))
+    isolated_spm = _fresh_file_fingerprint(isolated_spm_path)
+    if not _artifact_identity_matches(recorded, isolated_spm):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas physical normalization source does not match the current "
+            "isolated bark SPM"
+        )
+    current_output = _fresh_file_fingerprint(output_spm)
+    if not current_output.get("exists") or not current_output.get("sha256"):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas physical normalization source does not match the current "
+            "Cluster dependency: "
+            + str(output_spm)
+        )
+    _manifest_path, current_manifest, manifest = (
+        _load_isolated_bark_manifest(isolated_spm_path)
+    )
+    if (
+        manifest.get("kind")
+        != "cluster_isolated_canonical_bark_source"
+        or manifest.get("status") != "ready"
+        or manifest.get("production_source_mutated") is not False
+        or _normalized_identity_path(manifest.get("source_spm"))
+        != _normalized_identity_path(output_spm)
+        or not str(manifest.get("source_spm_sha256") or "").strip()
+        or not _artifact_identity_matches(
+            {
+                "path": manifest.get("speedtree_spm"),
+                "sha256": manifest.get("isolated_spm_sha256"),
+            },
+            recorded,
+        )
+    ):
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas isolated bark normalization manifest does not match the "
+            "captured source pair"
+        )
+    if (
+        str(manifest.get("source_spm_sha256") or "").casefold()
+        == str(current_output.get("sha256") or "").casefold()
+    ):
+        return None
+    declared = _normalization_output_materials(
+        manifest,
+        output_spm,
+        isolated_spm_path,
+    )
+    production_contract = _material_only_spm_contract_text(
+        output_spm,
+        declared,
+    )
+    isolated_contract = _material_only_spm_contract_text(
+        isolated_spm_path,
+        declared,
+        manifest=manifest,
+        production_spm=output_spm,
+    )
+    production_digest = hashlib.sha256(
+        production_contract.encode("utf-8")
+    ).hexdigest()
+    isolated_digest = hashlib.sha256(
+        isolated_contract.encode("utf-8")
+    ).hexdigest()
+    if production_digest != isolated_digest:
+        raise ClusterAssemblyReceiptStaleError(
+            "Atlas physical normalization source changed outside declared "
+            "normalization material blocks"
+        )
+    return {
+        "status": "validated",
+        "policy": "declared_bark_material_outputs_only_v1",
+        "declared_material_ids": sorted(declared),
+        "outside_declared_materials_sha256": production_digest,
+        "recorded_source_spm_sha256": str(
+            manifest.get("source_spm_sha256")
+        ).casefold(),
+        "production_spm": current_output,
+        "isolated_spm": isolated_spm,
+        "normalization_manifest": current_manifest,
+        "isolated_bark_capture_ignored": True,
+        "canonical_evidence_allowed": False,
+        "production_source_mutated_by_normalizer": False,
+    }
+
+
+def _material_only_source_rebase_matches(recorded, current):
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    scalar_fields = (
+        "status",
+        "policy",
+        "declared_material_ids",
+        "outside_declared_materials_sha256",
+        "recorded_source_spm_sha256",
+        "isolated_bark_capture_ignored",
+        "canonical_evidence_allowed",
+        "production_source_mutated_by_normalizer",
+    )
+    if any(recorded.get(key) != current.get(key) for key in scalar_fields):
+        return False
+    return all(
+        _artifact_identity_matches(
+            recorded.get(key) or {},
+            current.get(key) or {},
+        )
+        for key in (
+            "production_spm",
+            "isolated_spm",
+            "normalization_manifest",
+        )
+    )
+
+
 def _validated_isolated_bark_capture(normalized_variants, output_spm):
     """Prove that a physical Atlas capture used a current isolated bark export.
 
@@ -1788,25 +2292,9 @@ def _validated_isolated_bark_capture(normalized_variants, output_spm):
             "isolated bark SPM"
         )
 
-    manifest_path = next(
-        (
-            parent / "bark_normalization_manifest.json"
-            for parent in isolated_spm_path.parents
-            if (parent / "bark_normalization_manifest.json").is_file()
-        ),
-        None,
+    manifest_path, current_manifest, manifest = (
+        _load_isolated_bark_manifest(isolated_spm_path)
     )
-    if manifest_path is None:
-        raise ClusterAssemblyReceiptStaleError(
-            "Atlas isolated bark capture has no normalization manifest"
-        )
-    current_manifest = _fresh_file_fingerprint(manifest_path)
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ClusterAssemblyReceiptStaleError(
-            "Atlas isolated bark normalization manifest is unreadable"
-        ) from exc
     if (
         manifest.get("kind")
         != "cluster_isolated_canonical_bark_source"
@@ -1923,7 +2411,9 @@ def _validate_normalized_source_dependency(normalized_variants, output_spm):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalized variants have no source SPM artifact"
         )
-    expected = file_fingerprint(output_spm)
+    normalized_variants.pop("isolated_bark_capture", None)
+    normalized_variants.pop("material_only_source_rebase", None)
+    expected = _fresh_file_fingerprint(output_spm)
     if (
         not expected.get("exists")
         or not expected.get("sha256")
@@ -1934,6 +2424,19 @@ def _validate_normalized_source_dependency(normalized_variants, output_spm):
             + str(output_spm)
         )
     if _artifact_identity_matches(recorded, expected):
+        return
+    material_only_rebase = _material_only_source_rebase_evidence(
+        normalized_variants,
+        output_spm,
+    )
+    if material_only_rebase is not None:
+        # Keep physical-capture provenance bound to the immutable isolated
+        # SPM/FBX.  This separate live evidence binds the normalized delivery
+        # to current production without letting the old isolated bark export
+        # satisfy today's canonical material contract.
+        normalized_variants["material_only_source_rebase"] = (
+            material_only_rebase
+        )
         return
     normalized_variants["isolated_bark_capture"] = (
         _validated_isolated_bark_capture(
@@ -2815,16 +3318,43 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
                     or {}
                 )
                 source_spm = extracted_artifacts.get("source_spm") or {}
-                if (
+                source_matches_dependency = (
                     _normalized_identity_path(dependency_spm.get("path"))
-                    != _normalized_identity_path(source_spm.get("path"))
-                    or str(dependency_spm.get("sha256") or "").casefold()
-                    != str(source_spm.get("sha256") or "").casefold()
-                ):
-                    raise ClusterAssemblyReceiptStaleError(
-                        "Persisted physical normalization source does not "
-                        "match its Cluster dependency"
+                    == _normalized_identity_path(source_spm.get("path"))
+                    and str(dependency_spm.get("sha256") or "").casefold()
+                    == str(source_spm.get("sha256") or "").casefold()
+                )
+                if not source_matches_dependency:
+                    recorded_rebase = variants.get(
+                        "material_only_source_rebase"
                     )
+                    if (
+                        not isinstance(recorded_rebase, dict)
+                        or variants.get("isolated_bark_capture")
+                    ):
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Persisted physical normalization source does not "
+                            "match its Cluster dependency"
+                        )
+                    current_rebase = _material_only_source_rebase_evidence(
+                        variants,
+                        dependency_spm.get("path"),
+                    )
+                    if (
+                        current_rebase is None
+                        or not _material_only_source_rebase_matches(
+                            recorded_rebase,
+                            current_rebase,
+                        )
+                        or not _artifact_identity_matches(
+                            dependency_spm,
+                            current_rebase.get("production_spm") or {},
+                        )
+                    ):
+                        raise ClusterAssemblyReceiptStaleError(
+                            "Persisted physical normalization material-only "
+                            "source rebase is stale"
+                        )
             expected_artifacts.extend([
                 variants.get("manifest") or {},
                 variants.get("source_blend") or {},
