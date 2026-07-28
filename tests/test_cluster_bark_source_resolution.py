@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from cluster_bark_source_resolution import (
+    ClusterBarkSourceResolutionError,
     _copy_canonical_textures,
     _copy_source_external_meshes,
     _publish_cache_directory,
@@ -15,6 +16,7 @@ from cluster_bark_source_resolution import (
     prepare_isolated_bark_source,
     resolve_cluster_bark_source_spm,
 )
+from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES
 from pcg_st9_texture_batch.pcg_texture_audit import (
     extract_material_image_refs,
 )
@@ -72,6 +74,67 @@ def _write_spm(
 
 def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _canonical_output(
+    root,
+    spm,
+    material_id,
+    material_name,
+    texture_base,
+):
+    texture_root = Path(root) / "texture"
+    texture_root.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for role in REQUIRED_TEXTURE_ROLES:
+        path = texture_root / f"{texture_base}_{role}.tga"
+        path.write_bytes(f"{texture_base}:{role}".encode("utf-8"))
+        files[role] = path.name
+    manifest_path = texture_root / "pcg_st9_canonical_outputs.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    else:
+        manifest = {
+            "kind": "pcg_st9_canonical_output_manifest",
+            "schema_version": 1,
+            "asset_root": str(Path(root).resolve()),
+            "texture_root": str(texture_root.resolve()),
+            "outputs": [],
+        }
+    manifest["outputs"] = [
+        output
+        for output in manifest["outputs"]
+        if not (
+            output["texture_base"].casefold() == texture_base.casefold()
+            and any(
+                Path(target["spm"]).resolve() == Path(spm).resolve()
+                and str(target.get("material_id")) == str(material_id)
+                for target in output["material_targets"]
+            )
+        )
+    ]
+    manifest["outputs"].append({
+        "texture_base": texture_base,
+        "required_roles": list(REQUIRED_TEXTURE_ROLES),
+        "files": files,
+        "material_targets": [{
+            "spm": str(Path(spm).resolve()),
+            "material_id": str(material_id),
+            "material_name": material_name,
+        }],
+        "producer": {
+            "tool": "PCG ST9 Texture",
+            "source": "test",
+        },
+    })
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        role: f"texture/{texture_base}_{role}.tga"
+        for role in REQUIRED_TEXTURE_ROLES
+    }
 
 
 def test_cache_publish_retries_transient_windows_access_denied():
@@ -180,9 +243,16 @@ def test_content_addressed_bark_source_preserves_production_spm():
         root = Path(temporary) / "Tree_elm"
         source = root / "Cluster" / "SK_branch_elm_01.spm"
         canonical = root / "SK_Tree_elm_01.spm"
+        canonical_outputs = _canonical_output(
+            root,
+            canonical,
+            "1",
+            "M_bark_elm_01",
+            "T_bark_elm_01",
+        )
         canonical_refs = [
-            "texture/bark_elm_01_color.tga",
-            "texture/bark_elm_01_normal.tga",
+            canonical_outputs["color"],
+            canonical_outputs["normal"],
         ]
         _write_spm(
             source,
@@ -197,10 +267,6 @@ def test_content_addressed_bark_source_preserves_production_spm():
             texture.parent.mkdir(parents=True, exist_ok=True)
             texture.write_bytes(f"generic-{index}".encode("ascii"))
         _write_spm(canonical, "M_bark_elm_01", canonical_refs)
-        for index, value in enumerate(canonical_refs, 1):
-            texture = root / value
-            texture.parent.mkdir(parents=True, exist_ok=True)
-            texture.write_bytes(f"texture-{index}".encode("ascii"))
         source_hash = _sha256(source)
         contract = {
             "handoff": {
@@ -275,7 +341,13 @@ def test_live_owner_contract_overrides_missing_or_stale_receipt_cache():
         root = Path(temporary) / "Tree_elm"
         source = root / "Cluster" / "SK_leaf_elm_01.spm"
         target = root / "SK_Tree_elm_01.spm"
-        canonical_refs = ["texture/bark_elm_01_color.tga"]
+        canonical_refs = [_canonical_output(
+            root,
+            target,
+            "1",
+            "M_bark_elm_01",
+            "T_bark_elm_01",
+        )["color"]]
         _write_spm(
             source,
             "M_bark_common_end_01",
@@ -285,9 +357,6 @@ def test_live_owner_contract_overrides_missing_or_stale_receipt_cache():
         source_texture.parent.mkdir(parents=True, exist_ok=True)
         source_texture.write_bytes(b"generic")
         _write_spm(target, "M_bark_elm_01", canonical_refs)
-        canonical_texture = root / canonical_refs[0]
-        canonical_texture.parent.mkdir(parents=True, exist_ok=True)
-        canonical_texture.write_bytes(b"canonical")
         contract = {
             "tree_source_identities": [{
                 "target_spm": {"path": str(target)},
@@ -341,7 +410,13 @@ def test_validated_isolated_capture_remains_the_provider_runtime_source():
         root = Path(temporary) / "Tree_chestnut"
         source = root / "Cluster" / "SK_leaf_chestnut_01.spm"
         target = root / "SK_tree_chestnut_01.spm"
-        canonical_refs = ["texture/bark_chestnut_01_color.tga"]
+        canonical_refs = [_canonical_output(
+            root,
+            target,
+            "1",
+            "M_bark_chestnut_01",
+            "T_bark_chestnut_01",
+        )["color"]]
         _write_spm(
             source,
             "M_bark_common_end_01",
@@ -351,9 +426,6 @@ def test_validated_isolated_capture_remains_the_provider_runtime_source():
         source_texture.parent.mkdir(parents=True, exist_ok=True)
         source_texture.write_bytes(b"generic")
         _write_spm(target, "M_bark_chestnut_01", canonical_refs)
-        canonical_texture = root / canonical_refs[0]
-        canonical_texture.parent.mkdir(parents=True, exist_ok=True)
-        canonical_texture.write_bytes(b"canonical")
         contract = {
             "tree_source_identities": [{
                 "target_spm": {"path": str(target)},
@@ -423,15 +495,18 @@ def test_direct_owner_canonical_overrides_provider_only_target_provenance():
         source_texture = source.parent / "generic" / "common_color.tga"
         source_texture.parent.mkdir(parents=True, exist_ok=True)
         source_texture.write_bytes(b"generic")
-        owner_refs = ["texture/T_bark_black_locast_01_color.tga"]
+        owner_refs = [_canonical_output(
+            root,
+            owner,
+            "1",
+            "M_bark_black_locast_01",
+            "T_bark_black_locast_01",
+        )["color"]]
         _write_spm(
             owner,
             "M_bark_black_locast_01",
             owner_refs,
         )
-        owner_texture = root / owner_refs[0]
-        owner_texture.parent.mkdir(parents=True, exist_ok=True)
-        owner_texture.write_bytes(b"owner")
         provider_refs = ["legacy/uktladjcw_Albedo.tif"]
         _write_spm(
             provider_only,
@@ -498,9 +573,16 @@ def test_direct_owner_canonical_overrides_provider_only_target_provenance():
             manifest["normalization"]["canonical_material"]
             == "M_bark_black_locast_01"
         )
+        assert manifest["copied_canonical_textures"] == []
+        assert (
+            manifest["production_texture_handoff"][
+                "rewritten_reference_count"
+            ]
+            == 1
+        )
         assert {
-            Path(row["source"]).name
-            for row in manifest["copied_canonical_textures"]
+            Path(row["expected_output"]).name
+            for row in manifest["production_texture_handoff"]["references"]
         } == {"T_bark_black_locast_01_color.tga"}
 
 
@@ -551,11 +633,14 @@ def test_isolated_bark_source_copies_relative_external_mesh_dependencies():
         external_mesh = source.parent / external_relative
         external_mesh.parent.mkdir(parents=True, exist_ok=True)
         external_mesh.write_bytes(b"external-fbx")
-        canonical_refs = ["texture/bark_chestnut_01_color.tga"]
+        canonical_refs = [_canonical_output(
+            root,
+            canonical,
+            "1",
+            "M_bark_chestnut_01",
+            "T_bark_chestnut_01",
+        )["color"]]
         _write_spm(canonical, "M_bark_chestnut_01", canonical_refs)
-        canonical_texture = root / canonical_refs[0]
-        canonical_texture.parent.mkdir(parents=True, exist_ok=True)
-        canonical_texture.write_bytes(b"canonical")
         contract = {
             "handoff": {
                 "canonical_bark": {
@@ -698,11 +783,21 @@ def test_isolated_bark_source_rebases_external_texture_dependencies():
         external_texture = workspace / "Texture" / "chestnut" / "leaf_color.tif"
         external_texture.parent.mkdir(parents=True, exist_ok=True)
         external_texture.write_bytes(b"leaf")
-        canonical_refs = ["texture/bark_chestnut_01_color.tga"]
+        canonical_refs = [_canonical_output(
+            root,
+            canonical,
+            "1",
+            "M_bark_chestnut_01",
+            "T_bark_chestnut_01",
+        )["color"]]
+        leaf_outputs = _canonical_output(
+            root,
+            source,
+            "2",
+            "M_leaf_preserved",
+            "T_leaf_chestnut_preserved",
+        )
         _write_spm(canonical, "M_bark_chestnut_01", canonical_refs)
-        canonical_texture = root / canonical_refs[0]
-        canonical_texture.parent.mkdir(parents=True, exist_ok=True)
-        canonical_texture.write_bytes(b"canonical")
         contract = {
             "handoff": {
                 "canonical_bark": {
@@ -741,5 +836,8 @@ def test_isolated_bark_source_rebases_external_texture_dependencies():
         rebased = isolated.parent / Path(leaf["refs"][0])
 
         assert rebased.resolve().is_file()
-        assert rebased.resolve().read_bytes() == b"leaf"
+        assert rebased.resolve() == (root / leaf_outputs["color"]).resolve()
+        assert rebased.resolve().read_bytes() == (
+            root / leaf_outputs["color"]
+        ).read_bytes()
         assert workspace / "Texture" / "chestnut" / "leaf_color.tif" == external_texture

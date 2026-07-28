@@ -17,6 +17,10 @@ if __package__ in (None, ""):
 
 import sbs_auto
 from export_texture_plan import build_texture_plan_from_report, bucket_refs
+from pcg_canonical_outputs import (
+    canonical_texture_root,
+    record_canonical_output,
+)
 from pcg_texture_audit import make_report
 from pcg_texture_common import REPORT_DIR, load_config
 from spm_texture_normalize import (
@@ -37,6 +41,11 @@ def current_sk_owner_rows(plan):
     """Return one render owner per texture base used by any current SK SPM."""
     groups = {}
     for row in plan.get("items", []):
+        if row.get("origin_kind") == "blender_cluster_bake":
+            # Blender physical-capture maps are already final Cluster outputs.
+            # They participate in SPM coverage as preserve-source jobs, but
+            # must never be turned into an SBS render/rename request.
+            continue
         key = str(row.get("texture_base") or row.get("atlas_base") or "").lower()
         if key:
             groups.setdefault(key, []).append(row)
@@ -45,6 +54,28 @@ def current_sk_owner_rows(plan):
         if not any(row_uses_current_sk(row) for row in rows):
             continue
         owner = next((row for row in rows if not row.get("shared_from")), rows[0])
+        owner = dict(owner)
+        material_targets = {}
+        material_spms = {}
+        for row in rows:
+            for target in row.get("material_targets") or []:
+                key = (
+                    str(Path(target.get("spm") or "").resolve()).casefold(),
+                    str(target.get("material_id") or "").casefold(),
+                    str(target.get("material_name") or "").casefold(),
+                )
+                material_targets[key] = dict(target)
+            for spm in row.get("material_spms") or []:
+                material_spms[
+                    str(Path(spm).resolve()).casefold()
+                ] = str(spm)
+        if material_targets:
+            owner["material_targets"] = [
+                material_targets[key] for key in sorted(material_targets)
+            ]
+        owner["material_spms"] = [
+            material_spms[key] for key in sorted(material_spms)
+        ]
         owners.append(owner)
     return sorted(owners, key=lambda row: str(row.get("texture_base", "")).lower())
 
@@ -242,11 +273,17 @@ def build_job(row):
             if name:
                 graph_name, graph_sbs = name, sbs
                 break
+    asset_root = row.get("folder")
+    output_dir = (
+        canonical_texture_root(asset_root)
+        if asset_root
+        else Path(row.get("texture_dir") or Path.cwd()).resolve()
+    )
     job = {
         "base": base,
         "texture_base": texture_base,
         "row": row,
-        "out_dir": row.get("texture_dir") or str(Path(row["folder"]) / "texture"),
+        "out_dir": str(output_dir),
         "normal_opengl": row.get("normal_convention") != "DirectX",
     }
     if graph_name:
@@ -382,7 +419,7 @@ def build_job(row):
     return job
 
 
-def preflight(plan, force=False):
+def preflight(plan, force=False, record_manifests=False):
     jobs = []
     skipped_complete = []
     errors = []
@@ -403,11 +440,25 @@ def preflight(plan, force=False):
                 or job.get("normalize_cluster")
                 or job.get("rename_graph_to")
             )
-            if (complete_output_set(row, expected_pixels=expected_pixels)
+            canonical_row = dict(row)
+            canonical_row["texture_dir"] = job["out_dir"]
+            if (complete_output_set(
+                    canonical_row, expected_pixels=expected_pixels)
                     and not force and not graph_needs_update
                     and not source_needs_repair
                     and not structural_needs_update):
-                skipped_complete.append(row)
+                completed_row = dict(row)
+                if record_manifests:
+                    files = verify_complete_output_set(
+                        job["out_dir"],
+                        job["texture_base"],
+                        expected_pixels=expected_pixels,
+                    )
+                    manifest = _record_job_manifest(job, files)
+                    completed_row["canonical_manifest"] = (
+                        str(manifest) if manifest else None
+                    )
+                skipped_complete.append(completed_row)
                 continue
             jobs.append(job)
         except Exception as exc:
@@ -476,6 +527,31 @@ def _merge_render_output_info(render_results):
     merged["backup_dir"] = (
         merged["backup_dirs"][0] if merged["backup_dirs"] else None)
     return merged
+
+
+def _record_job_manifest(job, files):
+    """Record production jobs; isolated renderer unit fixtures have no asset."""
+    if not job.get("row", {}).get("folder"):
+        return None
+    return record_canonical_output(
+        job["row"],
+        files,
+        producer_source=(
+            f"{job.get('sbs') or ''}#{job.get('graph') or ''}"
+        ),
+    )
+
+
+def _asset_local_legacy_maps(job):
+    """Never delete a legacy output outside this job's asset texture folder."""
+    output_dir = Path(job["out_dir"]).resolve()
+    return {
+        role: path
+        for role, path in (
+            job.get("row", {}).get("legacy_export_maps") or {}
+        ).items()
+        if path and Path(path).resolve().parent == output_dir
+    }
 
 
 def run_job(job, cfg, timeout):
@@ -575,7 +651,11 @@ def run_job(job, cfg, timeout):
                 shutil.copy2(source_repair_updates[0]["backup"], job["sbs"])
             raise
         deleted = sbs_auto.delete_legacy_m_outputs(
-            base, job["out_dir"], legacy_maps=job["row"].get("legacy_export_maps"))
+            base,
+            job["out_dir"],
+            legacy_maps=_asset_local_legacy_maps(job),
+        )
+        manifest = _record_job_manifest(job, files)
         return {
             "texture_base": texture_base,
             "mode": "direct_sbs_graph",
@@ -592,6 +672,7 @@ def run_job(job, cfg, timeout):
             "cluster_normalization": normalization_update,
             "source_repairs": source_repair_updates,
             "deleted_legacy": [str(path) for path in deleted],
+            "canonical_manifest": str(manifest) if manifest else None,
         }
     if job["mode"] == "render":
         for slot, replacement in job.get("repair_resources", {}).items():
@@ -656,7 +737,11 @@ def run_job(job, cfg, timeout):
     )
     output_changes = _merge_render_output_info([rendered])
     deleted = sbs_auto.delete_legacy_m_outputs(
-        base, job["out_dir"], legacy_maps=job["row"].get("legacy_export_maps"))
+        base,
+        job["out_dir"],
+        legacy_maps=_asset_local_legacy_maps(job),
+    )
+    manifest = _record_job_manifest(job, files)
     return {
         "texture_base": texture_base,
         "files": [str(path) for path in files],
@@ -668,6 +753,7 @@ def run_job(job, cfg, timeout):
             if output_changes["backup_dir"] else None),
         "resolution_update": resolution_update,
         "deleted_legacy": [str(path) for path in deleted],
+        "canonical_manifest": str(manifest) if manifest else None,
     }
 
 
@@ -703,7 +789,11 @@ def main():
     # also records which existing graphs have real Subsurface/Translucency.
     spm_jobs = jobs_from_texture_plan(plan)
     print("[preflight] checking render jobs", flush=True)
-    jobs, complete, errors = preflight(plan, force=args.force)
+    jobs, complete, errors = preflight(
+        plan,
+        force=args.force,
+        record_manifests=not args.dry_run,
+    )
     errors.extend(validate_spm_job_coverage(spm_jobs))
     summary = {
         "audit": str(audit_path),

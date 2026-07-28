@@ -1249,48 +1249,54 @@ def run_cluster_relation_transaction(
                 encoding="utf-8",
             )
 
-        if enabled:
-            for target in targets:
-                set_cluster_relation_registry(blend, target, True)
-            registered_after = _registry_target_spms(blend)
-            if {
-                normalized_path_key(path) for path in registered_after
-            } != {
-                normalized_path_key(path) for path in effective_targets
-            }:
+        try:
+            if enabled:
+                for target in targets:
+                    set_cluster_relation_registry(blend, target, True)
+                registered_after = _registry_target_spms(blend)
+                if {
+                    normalized_path_key(path) for path in registered_after
+                } != {
+                    normalized_path_key(path) for path in effective_targets
+                }:
+                    raise ClusterBlendSyncError(
+                        "Cluster target registry changed while the effective "
+                        "ON target contract was being prepared."
+                    )
+
+            # The Blender job rebuilds every registered target, not only the
+            # selected ones, so the whole registry is at risk - not just
+            # ``targets``.
+            at_risk_targets = effective_targets if enabled else targets
+            at_risk = {
+                normalized_path_key(path): path
+                for path in at_risk_targets
+            }
+            snapshots = _snapshot_spm_files(
+                at_risk.values(), Path(temporary) / "spm_snapshots"
+            )
+            artifact_recipe = _atlas_transaction_artifact_recipe(
+                blend,
+                list(at_risk.values()),
+                normalization_recipe,
+            )
+            normalization_snapshots = _snapshot_normalization_artifacts(
+                artifact_recipe,
+                Path(temporary) / "normalization_artifacts",
+            )
+        except Exception as preparation_error:
+            if enabled:
                 try:
                     _restore_registry_snapshot(
                         registry_path, registry_before
                     )
                 except OSError as restore_error:
                     raise ClusterBlendSyncError(
-                        "Cluster target registry changed while the effective "
-                        "ON target contract was being prepared, and its "
-                        f"snapshot could not be restored: {restore_error}"
-                    ) from restore_error
-                raise ClusterBlendSyncError(
-                    "Cluster target registry changed while the effective ON "
-                    "target contract was being prepared."
-                )
-
-        # The Blender job rebuilds every registered target, not only the selected
-        # ones, so the whole registry is at risk - not just ``targets``.
-        at_risk_targets = effective_targets if enabled else targets
-        at_risk = {
-            normalized_path_key(path): path for path in at_risk_targets
-        }
-        snapshots = _snapshot_spm_files(
-            at_risk.values(), Path(temporary) / "spm_snapshots"
-        )
-        artifact_recipe = _atlas_transaction_artifact_recipe(
-            blend,
-            list(at_risk.values()),
-            normalization_recipe,
-        )
-        normalization_snapshots = _snapshot_normalization_artifacts(
-            artifact_recipe,
-            Path(temporary) / "normalization_artifacts",
-        )
+                        "Cluster relationship preparation failed and the "
+                        "target registry snapshot could not be restored: "
+                        f"{restore_error}"
+                    ) from preparation_error
+            raise
 
         def persist_failure(phase, *, report=None, result=None, error=None):
             existing_diagnostic = (

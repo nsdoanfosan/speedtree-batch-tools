@@ -495,6 +495,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
     from atlas_leaf_mesh_builder.speedtree import (
         export_or_update_speedtree_spm_targets,
         extend_source_material_adoptions_for_targets,
+        remove_blend_target_from_spm,
     )
     from atlas_leaf_mesh_builder.target_registry import load_target_registry
 
@@ -549,6 +550,21 @@ def sync_targets(blend, requested, normalization_recipe=None):
                 str(path) for path in registered_paths
             ],
         }
+    # Rebuild existing same-blend connections from their recorded authored
+    # baseline before exporting the new output set.  Otherwise an adopted
+    # material refresh can transiently combine Generator slots that still
+    # point at the previous generated Mesh IDs with the original source
+    # cutout ordinal list, failing before the exact persisted bindings have a
+    # chance to retarget them.  Removal is receipt-scoped and fails closed on
+    # drift; the host transaction snapshots every effective target first.
+    pre_export_relation_cleanup = [
+        remove_blend_target_from_spm(
+            blend,
+            path,
+            preserve_scope_history=True,
+        )
+        for path in connection_targets
+    ]
     save_spm_target_registry(props)
     results = export_or_update_speedtree_spm_targets(
         props,
@@ -569,6 +585,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "cluster_export_configuration": export_configuration,
         "recipe_source_material_mapping_update": recipe_mapping_update,
         "source_material_mapping_update": mapping_update,
+        "pre_export_relation_cleanup": pre_export_relation_cleanup,
         "cluster_source_pipeline": cluster_source_pipeline,
         "results": results,
     }

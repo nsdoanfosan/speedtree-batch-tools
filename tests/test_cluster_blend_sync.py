@@ -362,6 +362,79 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertEqual(command[1:3], ["--factory-startup", "--background"])
             self.assertFalse(blend.with_suffix(".atlas_leaf_targets.json").exists())
 
+    def test_registry_is_restored_when_multi_target_registration_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            first = owner / "SK_Tree_elm_01.spm"
+            second = owner / "SK_Tree_elm_02.spm"
+            third = owner / "SK_Tree_elm_03.spm"
+            for target in (first, second, third):
+                target.touch()
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            set_cluster_relation_registry(blend, first, True)
+            registry_path = blend.with_suffix(".atlas_leaf_targets.json")
+            registry_before = registry_path.read_bytes()
+            original = set_cluster_relation_registry
+
+            def fail_on_third(blend_path, target, enabled):
+                if Path(target) == third:
+                    raise PermissionError("simulated OneDrive access denial")
+                return original(blend_path, target, enabled)
+
+            with mock.patch(
+                "cluster_blend_sync.set_cluster_relation_registry",
+                side_effect=fail_on_third,
+            ):
+                with self.assertRaises(PermissionError):
+                    run_cluster_relation_transaction(
+                        blend,
+                        [second, third],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
+                    )
+
+            self.assertEqual(registry_path.read_bytes(), registry_before)
+
+    def test_registry_is_restored_when_spm_snapshot_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            first = owner / "SK_Tree_elm_01.spm"
+            second = owner / "SK_Tree_elm_02.spm"
+            first.touch()
+            second.touch()
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            set_cluster_relation_registry(blend, first, True)
+            registry_path = blend.with_suffix(".atlas_leaf_targets.json")
+            registry_before = registry_path.read_bytes()
+
+            with mock.patch(
+                "cluster_blend_sync._snapshot_spm_files",
+                side_effect=PermissionError(
+                    "simulated OneDrive snapshot access denial"
+                ),
+            ):
+                with self.assertRaises(PermissionError):
+                    run_cluster_relation_transaction(
+                        blend,
+                        [second],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
+                    )
+
+            self.assertEqual(registry_path.read_bytes(), registry_before)
+
     def test_failed_apply_persists_pre_rollback_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"

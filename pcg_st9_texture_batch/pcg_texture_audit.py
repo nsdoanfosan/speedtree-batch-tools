@@ -8,6 +8,7 @@ import contextvars
 import csv
 import functools
 import gzip
+import hashlib
 import html
 import json
 import os
@@ -21,12 +22,31 @@ from pathlib import Path
 BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
-from speedtree_texture_contract import parse_managed_texture_path, resolve_texture_set
+from speedtree_texture_contract import (
+    inspect_spm_texture_slots,
+    parse_managed_texture_path,
+    resolve_blender_cluster_bake_origin,
+    resolve_texture_set,
+)
 from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from sk_batch.sk_common import scan_cluster_spm_sources
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from pcg_canonical_outputs import (
+        REQUIRED_ROLES,
+        manifest_candidates as canonical_manifest_candidates,
+        validate_manifest as validate_canonical_manifest,
+    )
+else:
+    from .pcg_canonical_outputs import (
+        REQUIRED_ROLES,
+        manifest_candidates as canonical_manifest_candidates,
+        validate_manifest as validate_canonical_manifest,
+    )
 from cluster_spm_pair_contract import (
     bootstrap_cluster_authoring,
     inspect_cluster_spm_pair,
@@ -34,7 +54,6 @@ from cluster_spm_pair_contract import (
 )
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from pcg_texture_common import (
         IMAGE_EXTS,
         REPORT_DIR,
@@ -1196,6 +1215,9 @@ def canonicalize_leaf_sources(sources, candidates, cfg, folder):
 
 def merge_leaf_mesh_sources(sources, cfg, folder):
     """Deduplicate by source atlas pair and merge final-SK application targets."""
+    provisional_declarations = atlas_provisional_source_declarations(
+        folder
+    )
     grouped = {}
     for source in sources:
         key = (
@@ -1253,6 +1275,52 @@ def merge_leaf_mesh_sources(sources, cfg, folder):
     results = list(grouped.values())
     assign_leaf_atlas_bases(results, folder, atlas_root=cfg.get("atlas_root"))
     for entry in results:
+        source_rejections = []
+        for role in ("albedo", "alpha"):
+            path = str(entry.get(role) or "")
+            state = _unsafe_provisional_source(
+                path,
+                asset_root=folder,
+                source_texture_roots=(
+                    cfg.get("source_texture_roots") or []
+                ),
+                declared_source_paths=provisional_declarations,
+            )
+            if state:
+                source_rejections.append({
+                    "role": role,
+                    "path": path,
+                    "state": state,
+                })
+        entry["source_texture_rejections"] = source_rejections
+        entry["source_texture_origin_receipts"] = {
+            role: list(
+                provisional_declarations.get(
+                    os.path.normcase(
+                        str(_resolve_for_membership(
+                            entry.get(role) or ""
+                        ))
+                    ).casefold(),
+                    [],
+                )
+            )
+            for role in ("albedo", "alpha")
+        }
+        if source_rejections:
+            states = {
+                row["state"] for row in source_rejections
+            }
+            entry["texture_contract_state"] = (
+                "blocked_cache_source"
+                if "blocked_cache_source" in states
+                else "blocked_unproven_source"
+                if "blocked_unproven_source" in states
+                else "blocked_generated_source"
+            )
+        else:
+            entry["texture_contract_state"] = (
+                "source_fallback_needs_pcg_generation"
+            )
         material_names = unique(
             material_name
             for target in entry.get("targets", [])
@@ -3627,18 +3695,210 @@ def _managed_texture_directories(spm, refs):
     return unique(directories)
 
 
-def is_cluster_render_material(folder, spm, refs):
-    """True when the authoritative Color slot is a derived SpeedTree cluster render."""
-    if not refs:
-        return False
-    color = resolve_spm_image_ref(spm, refs[0])
-    if _is_under(color, [Path(folder) / "cluster"]):
-        return True
-    # Cluster cards are frequently shared across neighbouring asset folders
-    # (for example River Birch using tree_birch_paper\cluster\branch...).
-    # The semantic boundary is the Cluster directory itself, not ownership by
-    # the current asset folder.
-    return any(part.lower() == "cluster" for part in Path(color).parts[:-1])
+def _path_identity(path):
+    return os.path.normcase(str(_resolve_for_membership(path))).casefold()
+
+
+def _normalized_capture_role(value):
+    token = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    return {
+        "albedo": "color",
+        "basecolor": "color",
+        "colour": "color",
+        "diffuse": "color",
+        "alpha": "opacity",
+        "mask": "opacity",
+        "transparency": "opacity",
+        "ambientocclusion": "ao",
+        "occlusion": "ao",
+        "displacement": "height",
+        "depth": "height",
+        "subsurface": "subsurfacecolor",
+        "translucency": "subsurfacecolor",
+        "custom": "extra",
+    }.get(token, token)
+
+
+def _spm_material_identity_and_slot_rows(
+    spm,
+    refs,
+    *,
+    material_id=None,
+    material_name=None,
+):
+    """Bind refs to exactly one material and recover its source slot roles."""
+    spm = Path(spm)
+    if not spm.is_file() or not refs:
+        return {}
+    expected_paths = tuple(
+        _path_identity(resolve_spm_image_ref(spm, ref))
+        for ref in refs
+        if str(ref or "").strip()
+    )
+    if not expected_paths:
+        return {}
+    candidates = []
+    for row in inspect_spm_texture_slots(spm).get("materials") or []:
+        if material_id not in {None, ""} and str(
+            row.get("material_id") or ""
+        ) != str(material_id):
+            continue
+        if material_name not in {None, ""} and str(
+            row.get("material_name") or ""
+        ) != str(material_name):
+            continue
+        slots = list(row.get("slots") or [])
+        row_paths = tuple(unique(
+            _path_identity(slot.get("resolved_ref") or "")
+            for slot in slots
+            if str(slot.get("resolved_ref") or "").strip()
+        ))
+        if row_paths == expected_paths:
+            candidates.append((row, slots))
+    if len(candidates) != 1:
+        return {}
+    material_row, material_slots = candidates[0]
+    slot_rows = []
+    for slot in material_slots:
+        index = int(slot.get("map_index") or 0)
+        ref = str(slot.get("authored_ref") or "")
+        resolved = _resolve_for_membership(slot.get("resolved_ref") or "")
+        slot_name = str(slot.get("map") or "")
+        role = _normalized_capture_role(slot_name)
+        if not role:
+            return {}
+        slot_rows.append({
+            "slot_index": index,
+            "slot_name": slot_name,
+            "role": role,
+            "ref": str(ref),
+            "path": str(resolved),
+        })
+    return {
+        "material_id": (
+            str(material_row["material_id"])
+            if material_row.get("material_id") not in {None, ""}
+            else None
+        ),
+        "material_name": str(material_row.get("material_name") or ""),
+        "source_refs": list(refs),
+        "slot_rows": slot_rows,
+    }
+
+
+@functools.lru_cache(maxsize=4096)
+def _capture_file_sha256_cached(path_text, size, mtime_ns):
+    digest = hashlib.sha256()
+    with Path(path_text).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _capture_file_sha256(path):
+    path = _resolve_for_membership(path)
+    stat = path.stat()
+    return _capture_file_sha256_cached(
+        str(path),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
+def cluster_render_origin_receipt(
+    folder,
+    spm,
+    refs,
+    *,
+    material_id=None,
+    material_name=None,
+):
+    """Return exact SPM-material + Blender physical-capture provenance."""
+    identity = _spm_material_identity_and_slot_rows(
+        spm,
+        refs,
+        material_id=material_id,
+        material_name=material_name,
+    )
+    if not identity:
+        return {}
+    material = {
+        "material_id": identity["material_id"],
+        "material_name": identity["material_name"],
+        "slots": [
+            {
+                "map_index": row["slot_index"],
+                "map": row["slot_name"],
+                "role": row["role"],
+                "authored_ref": row["ref"],
+                "resolved_ref": row["path"],
+            }
+            for row in identity["slot_rows"]
+        ],
+    }
+    output = {
+        "slot_files": [
+            {
+                "map_index": row["slot_index"],
+                "map": row["slot_name"],
+                "path": row["path"],
+            }
+            for row in identity["slot_rows"]
+        ],
+    }
+    spm = Path(spm)
+    asset_root = (
+        spm.parent.parent
+        if spm.parent.name.casefold() == "cluster"
+        else spm.parent
+    )
+    receipt, issue = resolve_blender_cluster_bake_origin(
+        spm,
+        material,
+        output,
+        asset_root,
+    )
+    if issue or not receipt:
+        return {}
+    normalized = dict(receipt)
+    normalized["material"] = normalized.get("material_name") or ""
+    normalized["slot_rows"] = [
+        {
+            "slot_index": row["map_index"],
+            "slot_name": row["map"],
+            "role": row.get("capture_role") or row.get("role") or "",
+            "ref": next(
+                (
+                    source["ref"]
+                    for source in identity["slot_rows"]
+                    if source["slot_index"] == row["map_index"]
+                ),
+                "",
+            ),
+            "path": row["path"],
+            "sha256": row["sha256"],
+        }
+        for row in normalized.get("slot_files") or []
+    ]
+    return normalized
+
+
+def is_cluster_render_material(
+    folder,
+    spm,
+    refs,
+    *,
+    material_id=None,
+    material_name=None,
+):
+    """True only when exact refs are proven by a physical-capture receipt."""
+    return bool(cluster_render_origin_receipt(
+        folder,
+        spm,
+        refs,
+        material_id=material_id,
+        material_name=material_name,
+    ))
 
 
 def legacy_cluster_generator_candidates(spm):
@@ -3657,7 +3917,13 @@ def legacy_cluster_generator_candidates(spm):
         if material_id:
             all_material_names[material_id] = str(
                 row.get("material_name") or "")
-        if material_id and is_cluster_render_material(spm.parent, spm, refs):
+        if material_id and is_cluster_render_material(
+            spm.parent,
+            spm,
+            refs,
+            material_id=row.get("material_id"),
+            material_name=row.get("material_name"),
+        ):
             material_names[material_id] = all_material_names[material_id]
 
     candidates = {}
@@ -3724,7 +3990,14 @@ def cluster_render_source_definitions(folder):
             if active and row.get("material_id") not in active:
                 continue
             refs = row.get("refs") or []
-            if not is_cluster_render_material(folder, source_spm, refs):
+            origin_receipt = cluster_render_origin_receipt(
+                folder,
+                source_spm,
+                refs,
+                material_id=row.get("material_id"),
+                material_name=row.get("material_name"),
+            )
+            if not origin_receipt:
                 continue
             canonical = canonical_material_name(row.get("material_name"))
             signature = tuple(
@@ -3733,6 +4006,8 @@ def cluster_render_source_definitions(folder):
                 "source_spm": str(source_spm),
                 "material_name": canonical,
                 "source_refs": list(refs),
+                "origin_kind": "blender_cluster_bake",
+                "origin_receipt": origin_receipt,
             })
     return {
         canonical: next(iter(definitions.values()))
@@ -3749,7 +4024,14 @@ def cluster_render_definitions_from_spm(folder, source_spm):
         if active and row.get("material_id") not in active:
             continue
         refs = row.get("refs") or []
-        if not is_cluster_render_material(folder, source_spm, refs):
+        origin_receipt = cluster_render_origin_receipt(
+            folder,
+            source_spm,
+            refs,
+            material_id=row.get("material_id"),
+            material_name=row.get("material_name"),
+        )
+        if not origin_receipt:
             continue
         canonical = canonical_material_name(row.get("material_name"))
         signature = tuple(
@@ -3758,6 +4040,8 @@ def cluster_render_definitions_from_spm(folder, source_spm):
             "source_spm": str(source_spm),
             "material_name": canonical,
             "source_refs": list(refs),
+            "origin_kind": "blender_cluster_bake",
+            "origin_receipt": origin_receipt,
         })
     return {
         canonical: next(iter(definitions.values()))
@@ -3872,16 +4156,36 @@ def _graph_for_materials(graphs, base, material_names):
     return None
 
 
-def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=None,
-                           leaf_mesh_sources=None):
+def material_texture_items(
+    folder,
+    cfg,
+    tex_dirs,
+    graphs,
+    preserved_definitions=None,
+    leaf_mesh_sources=None,
+    provider_spms=None,
+):
     """One managed texture-set job for every material used by a Generator."""
-    spms = preferred_sk_spms(folder) or source_spms(folder)
+    owner_spms = preferred_sk_spms(folder) or source_spms(folder)
+    spms = unique(list(owner_spms) + list(provider_spms or []))
     preserved_definitions = preserved_definitions if preserved_definitions is not None \
         else cluster_render_source_definitions(folder)
     preserved_names = set(preserved_definitions)
+    provider_keys = {
+        os.path.normcase(str(Path(path).resolve())).casefold()
+        for path in (provider_spms or [])
+    }
     blend_stems = atlas_blend_stems(cfg)
+    provisional_declarations = atlas_provisional_source_declarations(
+        folder
+    )
     records = []
+    preserved_provider_items = []
     for spm in spms:
+        spm_is_provider = (
+            os.path.normcase(str(Path(spm).resolve())).casefold()
+            in provider_keys
+        )
         referenced_ids = active_material_ids(spm)
         visible_ids = visible_material_ids(spm)
         original_ref_entries = (
@@ -3891,9 +4195,14 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
         for row in extract_material_image_refs(spm):
             # No Generator material properties means a mesh/material asset and
             # retains the legacy include-all fallback. Otherwise only visible
-            # generators contribute export jobs; hidden nodes remain available
-            # to the separate provenance tracing functions above.
-            if referenced_ids and row.get("material_id") not in visible_ids:
+            # owner generators contribute export jobs. Canonical Cluster
+            # providers are an explicit batch-pipeline dependency, so include
+            # every referenced provider material even when its authoring
+            # generator is hidden in the provider SPM.
+            included_ids = (
+                referenced_ids if spm_is_provider else visible_ids
+            )
+            if referenced_ids and row.get("material_id") not in included_ids:
                 continue
             name = row.get("material_name")
             if not name:
@@ -3940,11 +4249,76 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                     source_ref_spm = Path(
                         leaf_source.get("target_spm") or source_ref_spm
                     )
+            provider_origin_receipt = (
+                cluster_render_origin_receipt(
+                    folder,
+                    spm,
+                    refs,
+                    material_id=row.get("material_id"),
+                    material_name=row.get("material_name"),
+                )
+                if spm_is_provider
+                else {}
+            )
+            if spm_is_provider and provider_origin_receipt:
+                source_albedo, source_alpha = material_color_alpha_refs(refs)
+                material_id = (
+                    str(row["material_id"])
+                    if row.get("material_id") not in {None, ""}
+                    else None
+                )
+                source_signature = _material_ref_signature(
+                    source_ref_spm, refs, name)
+                preserved_provider_items.append({
+                    "cluster_spm": str(spm),
+                    "name": canonical_name,
+                    "source": "material",
+                    "material_names": [name],
+                    "material_aliases": [name],
+                    "material_spms": [str(spm)],
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": material_id,
+                        "material_name": name,
+                        "source_signature": list(source_signature),
+                    }],
+                    "atlas_base": canonical_name,
+                    "texture_base": "",
+                    "is_atlas": False,
+                    "needs_leaf_mesh": False,
+                    "atlas_blends": [],
+                    "export_maps": {},
+                    "missing_export_maps": [],
+                    "legacy_export_maps": {},
+                    "texture_dir": None,
+                    "m_graph": None,
+                    "m_graph_sbs": None,
+                    "legacy_m_graph": False,
+                    "source_refs": list(refs),
+                    "source_albedo": source_albedo,
+                    "source_alpha": source_alpha,
+                    "source_signature": list(source_signature),
+                    "leaf_source_provenance": False,
+                    "connection_update_needed": False,
+                    "connection_materials": [],
+                    "origin_kind": "blender_cluster_bake",
+                    "origin_receipt": provider_origin_receipt,
+                    "normalization_workflow_mode":
+                        "PHYSICAL_DIRECT_CAPTURE",
+                    "texture_contract_state": "blender_cluster_bake",
+                })
+                continue
             if canonical in preserved_names:
                 continue
             # A cluster-folder image is already a derived SpeedTree cluster
             # render, not an input set to process through Substance again.
-            if is_cluster_render_material(folder, spm, refs):
+            if cluster_render_origin_receipt(
+                folder,
+                spm,
+                refs,
+                material_id=row.get("material_id"),
+                material_name=row.get("material_name"),
+            ):
                 continue
             exact_graph = _graph_for_materials(graphs, canonical_name, [name])
             is_managed_generic = bool(
@@ -4013,7 +4387,7 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
                 base = aliases[0]["canonical"]
             grouped.append((base, signature, aliases))
 
-    items = []
+    items = preserved_provider_items
     for base, signature, aliases in grouped:
         names = unique(row["name"] for row in aliases)
         texture_base = texture_base_for_material(base)
@@ -4095,7 +4469,611 @@ def material_texture_items(folder, cfg, tex_dirs, graphs, preserved_definitions=
             "connection_update_needed": bool(connection_materials),
             "connection_materials": connection_materials,
         }
+        entry["texture_contract_state"] = texture_output_contract_state(
+            entry,
+            folder,
+            cfg.get("source_texture_roots") or [],
+            provisional_declarations,
+        )
         items.append(entry)
+    return items
+
+
+_PROVISIONAL_ARTIFACT_COMPONENTS = {
+    "cache",
+    "_cache",
+    ".cache",
+    "temp",
+    "_temp",
+    ".temp",
+    "tmp",
+    "_tmp",
+    ".tmp",
+    "copied",
+    "_copied",
+    ".copied",
+    "copy",
+    "_copy",
+    ".copy",
+    "export",
+    "exports",
+    "fbx",
+    "fbx_export",
+    "_pcgtex_backups",
+}
+_SOURCE_FALLBACK_STATUS = "source_fallback_needs_pcg_generation"
+_ATLAS_PROVISIONAL_RECEIPT_KIND = "speedtree_texture_provisional_receipt"
+_BLENDER_CLUSTER_BAKE_RECEIPT_KIND = (
+    "blender_cluster_bake_texture_origin_receipt"
+)
+
+
+def _atlas_expected_outputs_are_valid(
+    row,
+    asset_root,
+    target_spm,
+    material,
+):
+    texture_base = str(row.get("expected_texture_base") or "").strip()
+    expected_base = (
+        "T_" + material[2:]
+        if material[:2].casefold() == "m_"
+        else "T_" + material
+    )
+    if texture_base.casefold() != expected_base.casefold():
+        return False
+    target_asset_root = (
+        target_spm.parent.parent
+        if target_spm.parent.name.casefold() == "cluster"
+        else target_spm.parent
+    )
+    if _path_identity(target_asset_root) != _path_identity(asset_root):
+        return False
+    expected = row.get("expected_t_paths")
+    if (
+        not isinstance(expected, dict)
+        or {str(role).casefold() for role in expected} != set(REQUIRED_ROLES)
+    ):
+        return False
+    texture_roots = {
+        _path_identity(Path(asset_root) / "texture"),
+        _path_identity(Path(asset_root) / "textures"),
+    }
+    parent_keys = set()
+    for role in REQUIRED_ROLES:
+        value = next(
+            (
+                value
+                for key, value in expected.items()
+                if str(key).casefold() == role
+            ),
+            None,
+        )
+        path = _resolve_for_membership(value or "")
+        if (
+            Path(path).suffix.casefold() != ".tga"
+            or Path(path).stem.casefold()
+            != f"{texture_base}_{role}".casefold()
+            or _path_identity(Path(path).parent) not in texture_roots
+        ):
+            return False
+        parent_keys.add(_path_identity(Path(path).parent))
+    return len(parent_keys) == 1
+
+
+def _atlas_blender_bake_receipt_is_valid(
+    row,
+    provisional_receipt,
+    source_paths,
+    material,
+):
+    receipt = row.get("origin_receipt")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != _BLENDER_CLUSTER_BAKE_RECEIPT_KIND
+        or receipt.get("version") != 1
+        or receipt.get("source_origin") != "blender_cluster_bake"
+        or str(receipt.get("material") or "") != material
+        or not [
+            value
+            for value in receipt.get("material_users") or []
+            if str(value or "").strip()
+        ]
+    ):
+        return False
+    contract_sha256 = str(
+        receipt.get("physical_capture_contract_sha256") or ""
+    ).casefold()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", contract_sha256)
+        or provisional_receipt.get("origin_receipt_kind")
+        != _BLENDER_CLUSTER_BAKE_RECEIPT_KIND
+        or str(
+            provisional_receipt.get(
+                "physical_capture_contract_sha256"
+            )
+            or ""
+        ).casefold()
+        != contract_sha256
+        or {
+            str(role).casefold()
+            for role in receipt.get("source_roles") or []
+        }
+        != {str(role).casefold() for role in source_paths}
+    ):
+        return False
+    capture_by_path = {}
+    for capture in receipt.get("capture_maps") or []:
+        if not isinstance(capture, dict):
+            return False
+        path = _resolve_for_membership(capture.get("path") or "")
+        role = _normalized_capture_role(capture.get("role"))
+        sha256 = str(capture.get("sha256") or "").casefold()
+        key = _path_identity(path)
+        try:
+            actual_sha256 = _capture_file_sha256(path)
+        except OSError:
+            return False
+        if (
+            not role
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            or actual_sha256 != sha256
+            or key in capture_by_path
+        ):
+            return False
+        capture_by_path[key] = {
+            "role": role,
+            "sha256": sha256,
+        }
+    if not capture_by_path:
+        return False
+    for role, path in source_paths.items():
+        capture = capture_by_path.get(_path_identity(path))
+        if (
+            not capture
+            or capture["role"] != _normalized_capture_role(role)
+        ):
+            return False
+    return True
+
+
+def _atlas_provisional_source_declarations_cached(asset_root_text):
+    asset_root = _resolve_for_membership(asset_root_text)
+    manifests = []
+    for directory_name in (
+        ".atlas_leaf_speedtree_scopes",
+        ".atlas_leaf_speedtree_targets",
+    ):
+        directory = asset_root / directory_name
+        if directory.is_dir():
+            manifests.extend(sorted(directory.glob("*.json")))
+    root_manifest = asset_root / "speedtree_import_manifest.json"
+    if root_manifest.is_file():
+        manifests.append(root_manifest)
+
+    declarations = {}
+    for manifest_path in unique(manifests):
+        try:
+            payload = json.loads(
+                Path(manifest_path).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("texture_contract_status")
+            != _SOURCE_FALLBACK_STATUS
+        ):
+            continue
+        rows = [
+            row
+            for row in payload.get("source_texture_fallbacks") or []
+            if isinstance(row, dict)
+        ]
+        for group in payload.get("material_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            row = group.get("source_texture_fallback")
+            if isinstance(row, dict):
+                rows.append(row)
+        for row in rows:
+            provisional_receipt = row.get("provisional_receipt")
+            material = str(
+                row.get("material_name") or row.get("material") or ""
+            ).strip()
+            source_origin = str(row.get("source_origin") or "").strip()
+            source_paths = row.get("source_paths")
+            source_roles = (
+                {str(role).casefold() for role in source_paths}
+                if isinstance(source_paths, dict)
+                else set()
+            )
+            if (
+                row.get("texture_contract_status")
+                != _SOURCE_FALLBACK_STATUS
+                or not material
+                or source_origin not in {
+                    "atlas_mesh_build_source",
+                    "blender_cluster_bake",
+                }
+                or not isinstance(source_paths, dict)
+                or not source_paths
+                or not str(row.get("warning") or "").strip()
+                or "pcg st9 texture" not in str(
+                    row.get("remediation") or ""
+                ).casefold()
+                or source_roles
+                != {
+                    str(role).casefold()
+                    for role in row.get("source_roles") or []
+                }
+                or not isinstance(provisional_receipt, dict)
+                or provisional_receipt.get("kind")
+                != _ATLAS_PROVISIONAL_RECEIPT_KIND
+                or provisional_receipt.get("version") != 1
+                or provisional_receipt.get("status")
+                != _SOURCE_FALLBACK_STATUS
+                or provisional_receipt.get("source_origin") != source_origin
+                or str(provisional_receipt.get("material") or "") != material
+                or {
+                    str(role).casefold()
+                    for role in provisional_receipt.get("source_roles") or []
+                }
+                != source_roles
+                or provisional_receipt.get("canonical_promotion_required")
+                is not True
+                or str(provisional_receipt.get("warning") or "")
+                != str(row.get("warning") or "")
+                or str(provisional_receipt.get("remediation") or "")
+                != str(row.get("remediation") or "")
+            ):
+                continue
+            target_spm = _resolve_for_membership(
+                provisional_receipt.get("target_spm") or ""
+            )
+            if (
+                target_spm.suffix.casefold() != ".spm"
+                or not _atlas_expected_outputs_are_valid(
+                    row,
+                    asset_root,
+                    target_spm,
+                    material,
+                )
+            ):
+                continue
+            resolved_sources = {}
+            valid_sources = True
+            for role, value in source_paths.items():
+                path = Path(str(value or "")).expanduser()
+                if not path.is_absolute():
+                    path = Path(manifest_path).parent / path
+                path = _resolve_for_membership(path)
+                relative_parts = None
+                try:
+                    relative_parts = {
+                        part.casefold()
+                        for part in path.relative_to(asset_root).parts[:-1]
+                    }
+                except (OSError, ValueError):
+                    pass
+                if (
+                    not path.is_file()
+                    or relative_parts is None
+                    or relative_parts.intersection(
+                        _PROVISIONAL_ARTIFACT_COMPONENTS
+                    )
+                    or any(
+                        part.casefold().startswith((
+                            ".sk_batch_",
+                            "_sk_batch_",
+                        ))
+                        for part in path.parts
+                    )
+                    or is_backup_path(path)
+                    or GENERATED_EXPORT_RE.match(path.name)
+                ):
+                    valid_sources = False
+                    break
+                resolved_sources[str(role).casefold()] = path
+            if (
+                not valid_sources
+                or len(resolved_sources) != len(source_paths)
+                or (
+                    source_origin == "blender_cluster_bake"
+                    and not _atlas_blender_bake_receipt_is_valid(
+                        row,
+                        provisional_receipt,
+                        resolved_sources,
+                        material,
+                    )
+                )
+                or (
+                    source_origin == "atlas_mesh_build_source"
+                    and row.get("origin_receipt") is not None
+                )
+            ):
+                continue
+            for role, path in resolved_sources.items():
+                key = os.path.normcase(str(path)).casefold()
+                declarations.setdefault(key, []).append({
+                    "kind": "atlas_provisional_source_declaration",
+                    "manifest": str(Path(manifest_path).resolve()),
+                    "material": material,
+                    "role": role,
+                    "source_origin": source_origin,
+                    "target_spm": str(target_spm),
+                    "expected_texture_base": str(
+                        row.get("expected_texture_base") or ""
+                    ),
+                    "expected_t_paths": dict(
+                        row.get("expected_t_paths") or {}
+                    ),
+                    "warning": str(row.get("warning") or ""),
+                    "remediation": str(row.get("remediation") or ""),
+                    "provisional_receipt": dict(provisional_receipt),
+                })
+    return declarations
+
+
+def atlas_provisional_source_declarations(asset_root):
+    """Return exact original paths declared by valid Atlas handoff manifests."""
+    try:
+        root = str(Path(asset_root).resolve())
+    except (OSError, ValueError):
+        root = str(Path(asset_root).absolute())
+    return {
+        key: [dict(receipt) for receipt in receipts]
+        for key, receipts in (
+            _atlas_provisional_source_declarations_cached(root).items()
+        )
+    }
+
+
+def _unsafe_provisional_source(
+    path,
+    *,
+    asset_root=None,
+    source_texture_roots=None,
+    declared_source_paths=None,
+):
+    """Reject copied/generated inputs without mistaking the OS Temp root."""
+    path = _resolve_for_membership(path)
+    parts = [part.casefold() for part in path.parts]
+    if any(
+        part.startswith(".sk_batch_")
+        or part.startswith("_sk_batch_")
+        for part in parts
+    ):
+        return "blocked_cache_source"
+    if is_backup_path(path):
+        return "blocked_cache_source"
+    if GENERATED_EXPORT_RE.match(path.name):
+        return "blocked_generated_source"
+    declared_keys = {
+        os.path.normcase(str(value)).casefold()
+        for value in (
+            declared_source_paths.keys()
+            if isinstance(declared_source_paths, dict)
+            else declared_source_paths or []
+        )
+    }
+    source_roots = [
+        _resolve_for_membership(root)
+        for root in source_texture_roots or []
+        if str(root or "").strip()
+    ]
+    for root in source_roots:
+        try:
+            path.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        return None
+
+    relative_parts = None
+    if asset_root:
+        try:
+            relative_parts = [
+                part.casefold()
+                for part in path.relative_to(
+                    _resolve_for_membership(asset_root)
+                ).parts[:-1]
+            ]
+        except (OSError, ValueError):
+            relative_parts = None
+        if relative_parts is not None and set(relative_parts).intersection(
+            _PROVISIONAL_ARTIFACT_COMPONENTS
+        ):
+            return "blocked_cache_source"
+    if os.path.normcase(str(path)).casefold() in declared_keys:
+        return None
+    return "blocked_unproven_source"
+
+
+def _canonical_manifest_output(asset_root, texture_base):
+    for path in canonical_manifest_candidates(asset_root):
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            validate_canonical_manifest(payload, path, require_files=True)
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        output = next(
+            (
+                row
+                for row in payload.get("outputs") or []
+                if str(row.get("texture_base") or "").casefold()
+                == str(texture_base or "").casefold()
+            ),
+            None,
+        )
+        if output is not None:
+            return output, None
+    return None, None
+
+
+def _entry_source_values(entry):
+    values = []
+    for key in ("source_refs", "source_albedo", "source_alpha"):
+        value = entry.get(key)
+        if isinstance(value, (str, os.PathLike)):
+            values.append(str(value))
+        else:
+            values.extend(str(path) for path in value or [] if path)
+    return unique(values)
+
+
+def _live_blender_cluster_bake_receipt(entry, asset_root):
+    """Rebuild bake proof from the current SPM instead of trusting labels."""
+    old_receipt = (
+        entry.get("origin_receipt")
+        if isinstance(entry.get("origin_receipt"), dict)
+        else {}
+    )
+    spm_candidates = unique(
+        [
+            old_receipt.get("source_spm"),
+            entry.get("source_spm"),
+            entry.get("cluster_spm"),
+        ]
+        + list(entry.get("material_spms") or [])
+        + [
+            target.get("spm")
+            for target in entry.get("material_targets") or []
+            if isinstance(target, dict)
+        ]
+    )
+    spm_candidates = [
+        Path(path) for path in spm_candidates if str(path or "").strip()
+    ]
+    if len({_path_identity(path) for path in spm_candidates}) != 1:
+        return {}
+    spm = spm_candidates[0]
+    target_rows = [
+        target
+        for target in entry.get("material_targets") or []
+        if (
+            isinstance(target, dict)
+            and _path_identity(target.get("spm") or spm)
+            == _path_identity(spm)
+        )
+    ]
+    material_ids = unique(
+        [
+            old_receipt.get("material_id"),
+            entry.get("material_id"),
+        ]
+        + [row.get("material_id") for row in target_rows]
+    )
+    material_ids = [
+        str(value) for value in material_ids if value not in {None, ""}
+    ]
+    material_names = unique(
+        [
+            old_receipt.get("material_name"),
+            entry.get("material_name"),
+            entry.get("name"),
+        ]
+        + list(entry.get("material_names") or [])
+        + [row.get("material_name") for row in target_rows]
+    )
+    material_names = [
+        str(value) for value in material_names if str(value or "").strip()
+    ]
+    if len(material_ids) > 1 or len(material_names) > 1:
+        return {}
+    refs = _entry_source_values(entry) or list(
+        old_receipt.get("source_refs") or []
+    )
+    receipt = cluster_render_origin_receipt(
+        asset_root,
+        spm,
+        refs,
+        material_id=material_ids[0] if material_ids else None,
+        material_name=material_names[0] if material_names else None,
+    )
+    if receipt:
+        entry["origin_kind"] = "blender_cluster_bake"
+        entry["normalization_workflow_mode"] = "PHYSICAL_DIRECT_CAPTURE"
+        entry["origin_receipt"] = receipt
+    return receipt
+
+
+def texture_output_contract_state(
+    entry,
+    asset_root,
+    source_texture_roots=None,
+    declared_source_paths=None,
+):
+    """Classify PCG outputs without rejecting valid raw Atlas authoring input."""
+    claims_blender_bake = (
+        entry.get("origin_kind") == "blender_cluster_bake"
+        or entry.get("normalization_workflow_mode")
+        == "PHYSICAL_DIRECT_CAPTURE"
+        or (
+            isinstance(entry.get("origin_receipt"), dict)
+            and entry["origin_receipt"].get("kind")
+            == _BLENDER_CLUSTER_BAKE_RECEIPT_KIND
+        )
+    )
+    if (
+        claims_blender_bake
+        and _live_blender_cluster_bake_receipt(entry, asset_root)
+    ):
+        return "blender_cluster_bake"
+    texture_base = entry.get("texture_base") or entry.get("atlas_base")
+    missing = list(entry.get("missing_export_maps") or [])
+    if not missing:
+        manifest_output, manifest_error = _canonical_manifest_output(
+            asset_root,
+            texture_base,
+        )
+        if manifest_output is not None:
+            return "canonical"
+        if manifest_error:
+            return "canonical_manifest_invalid"
+        return "canonical_outputs_need_manifest"
+
+    sources = _entry_source_values(entry)
+    if not sources or any(not Path(path).is_file() for path in sources):
+        return "blocked_source_missing"
+    rejected = [
+        state
+        for state in (
+            _unsafe_provisional_source(
+                path,
+                asset_root=asset_root,
+                source_texture_roots=source_texture_roots,
+                declared_source_paths=declared_source_paths,
+            )
+            for path in sources
+        )
+        if state
+    ]
+    if rejected:
+        return (
+            "blocked_cache_source"
+            if "blocked_cache_source" in rejected
+            else "blocked_unproven_source"
+            if "blocked_unproven_source" in rejected
+            else "blocked_generated_source"
+        )
+    return "source_fallback_needs_pcg_generation"
+
+
+def refresh_texture_output_contract_states(items, cfg=None):
+    source_texture_roots = (cfg or {}).get("source_texture_roots") or []
+    for item in items:
+        declarations = atlas_provisional_source_declarations(
+            item.get("folder") or ""
+        )
+        for entry in item.get("cluster_items") or []:
+            entry["texture_contract_state"] = texture_output_contract_state(
+                entry,
+                item.get("folder") or "",
+                source_texture_roots,
+                declarations,
+            )
     return items
 
 
@@ -4108,7 +5086,13 @@ def infer_normal_convention(refs):
     return "unknown"
 
 
-def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
+def audit_folder(
+    folder,
+    cfg,
+    include_refs=False,
+    target_mesh_names=None,
+    provider_spms=None,
+):
     folder = Path(folder)
     preferred = preferred_sk_spms(folder)
     loose = loose_sk_spms(folder)
@@ -4124,7 +5108,11 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
     texture_dir = sbs_files[0].parent if sbs_files else (folder / "texture")
     tex_dirs = texture_dir_candidates(folder, sbs_files) or [texture_dir]
     folder_graphs = folder_m_graph_names(sbs_files)
-    clusters = cluster_spms(folder)
+    clusters = (
+        [Path(path) for path in provider_spms]
+        if provider_spms is not None
+        else cluster_spms(folder)
+    )
     target_spms = []
     for mesh_name in target_mesh_names or []:
         target = (find_sk_spm_for_mesh(folder, mesh_name)
@@ -4174,7 +5162,9 @@ def audit_folder(folder, cfg, include_refs=False, target_mesh_names=None):
     cluster_items = material_texture_items(
         folder, cfg, tex_dirs, folder_graphs,
         preserved_definitions=cluster_definitions,
-        leaf_mesh_sources=leaf_mesh_sources)
+        leaf_mesh_sources=leaf_mesh_sources,
+        provider_spms=clusters,
+    )
     referenced_cluster_keys = {
         str(path).lower() for path in referenced_clusters
     }
@@ -4673,6 +5663,24 @@ def resolve_shared_atlas_entries(items, cfg):
     return sorted(changed)
 
 
+def canonical_cluster_provider_map(root):
+    """Map every owner to the batch pipeline's connected canonical providers."""
+    result = {}
+    for row in scan_cluster_spm_sources(root):
+        owner = Path(row["owner_folder"]).resolve()
+        provider = Path(
+            row.get("authoring_spm")
+            or row.get("output_spm")
+            or row.get("source_spm")
+        ).resolve()
+        providers = result.setdefault(str(owner).casefold(), [])
+        if provider not in providers:
+            providers.append(provider)
+    for providers in result.values():
+        providers.sort(key=lambda path: str(path).casefold())
+    return result
+
+
 @_report_scan_cached
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
@@ -4684,6 +5692,11 @@ def make_report(
     )
     ensure_blend_source_index(cfg)
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
+    provider_map = (
+        canonical_cluster_provider_map(cfg["tree_root"])
+        if cfg.get("tree_root")
+        else {}
+    )
     requested_target_mesh_names = sorted({
         normalize_local_asset_stem(name)
         for name in target_mesh_names or []
@@ -4700,11 +5713,16 @@ def make_report(
                 folder, report_target_mesh_names)
                 if report_target_mesh_names
                 else local_target_mesh_names(folder),
+            provider_spms=provider_map.get(
+                str(Path(folder).resolve()).casefold(),
+                [],
+            ),
         )
         for folder in folders
     ]
     attach_global_m_graphs(items, cfg)
     resolve_shared_atlas_entries(items, cfg)
+    refresh_texture_output_contract_states(items, cfg)
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
     target_source_map = target_mesh_source_map(pcg_targets)
     pcg_target_mesh_names = set(target_mesh_map)
@@ -4848,6 +5866,37 @@ def make_report(
     }
 
 
+def persist_cluster_assembly_receipts_safely(report):
+    """Persist optional receipt snapshots without invalidating a live audit.
+
+    A Cluster receipt is a cache/audit trail.  The freshly built report is the
+    authoritative state, so a stale physical-normalization snapshot must be
+    reported as a warning instead of making the PCG GUI unusable.
+    """
+    try:
+        written = persist_cluster_assembly_receipts(report)
+    except Exception as exc:
+        state = {
+            "status": "warning",
+            "stage": "receipt_persistence",
+            "code": "RECEIPT_PERSISTENCE_FAILED",
+            "live_audit_complete": True,
+            "written": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    else:
+        state = {
+            "status": "ok",
+            "stage": "receipt_persistence",
+            "code": "RECEIPT_PERSISTED",
+            "live_audit_complete": True,
+            "written": written,
+            "error": "",
+        }
+    report["cluster_assembly_receipt_persistence"] = state
+    return state
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", dest="json_path")
@@ -4894,26 +5943,7 @@ def main():
     # receipt self-validation failure must not turn clean source data into a
     # failed audit.  Callers can continue with the live contract embedded in
     # this report and retry persistence on a later run.
-    try:
-        written_receipts = persist_cluster_assembly_receipts(report)
-    except Exception as exc:
-        report["cluster_assembly_receipt_persistence"] = {
-            "status": "warning",
-            "stage": "receipt_persistence",
-            "code": "RECEIPT_PERSISTENCE_FAILED",
-            "live_audit_complete": True,
-            "written": [],
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    else:
-        report["cluster_assembly_receipt_persistence"] = {
-            "status": "ok",
-            "stage": "receipt_persistence",
-            "code": "RECEIPT_PERSISTED",
-            "live_audit_complete": True,
-            "written": written_receipts,
-            "error": "",
-        }
+    persist_cluster_assembly_receipts_safely(report)
     save_spm_analysis_cache()
     if args.json_path:
         Path(args.json_path).parent.mkdir(parents=True, exist_ok=True)

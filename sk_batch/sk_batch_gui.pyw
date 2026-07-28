@@ -4377,7 +4377,13 @@ class App:
         else:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
-    def _refresh_stale_cluster_receipt(self, spm, stamp):
+    def _refresh_stale_cluster_receipt(
+        self,
+        spm,
+        stamp,
+        *,
+        producer_spm=None,
+    ):
         """Run the live PCG audit before launching Blender for owner Trees.
 
         The live PCG audit is authoritative.  A receipt only snapshots the
@@ -4451,7 +4457,7 @@ class App:
                     return {}
                 return value if isinstance(value, dict) else {}
 
-            def audit_failure_summary(payload):
+            def audit_issues(payload):
                 failures = []
                 for audit_item in payload.get("items") or []:
                     handoff = (
@@ -4465,37 +4471,79 @@ class App:
                         or handoff.get("issues")
                         or []
                     ):
-                        code_value = str(
-                            issue.get("code") or "CLUSTER_DATA_INVALID"
+                        failures.append(issue)
+                return failures
+
+            def audit_failure_summary(issues):
+                failures = []
+                for issue in issues:
+                    code_value = str(
+                        issue.get("code") or "CLUSTER_DATA_INVALID"
+                    )
+                    role = str(issue.get("role") or "")
+                    details = issue.get("details") or {}
+                    status = str(details.get("status") or "")
+                    missing = [
+                        str(value)
+                        for value in details.get("missing") or []
+                    ]
+                    fields = [code_value]
+                    if role:
+                        fields.append(f"role={role}")
+                    if status:
+                        fields.append(f"status={status}")
+                    if missing:
+                        fields.append(
+                            "missing=" + ", ".join(missing[:3])
                         )
-                        role = str(issue.get("role") or "")
-                        details = issue.get("details") or {}
-                        status = str(details.get("status") or "")
-                        missing = [
-                            str(value)
-                            for value in details.get("missing") or []
-                        ]
-                        fields = [code_value]
-                        if role:
-                            fields.append(f"role={role}")
-                        if status:
-                            fields.append(f"status={status}")
-                        if missing:
-                            fields.append(
-                                "missing=" + ", ".join(missing[:3])
-                            )
-                        failures.append(" ".join(fields))
+                    failures.append(" ".join(fields))
                 return " | ".join(failures[:5])
 
             payload = audit_payload()
-            actual_failure = audit_failure_summary(payload)
-            if actual_failure:
+            live_issues = audit_issues(payload)
+            actual_failure = audit_failure_summary(live_issues)
+
+            def same_file(left, right):
+                if not left or not right:
+                    return False
+                try:
+                    return (
+                        str(Path(left).expanduser().resolve()).casefold()
+                        == str(
+                            Path(right).expanduser().resolve()
+                        ).casefold()
+                    )
+                except OSError:
+                    return (
+                        str(Path(left).expanduser().absolute()).casefold()
+                        == str(
+                            Path(right).expanduser().absolute()
+                        ).casefold()
+                    )
+
+            producer_repair_only_failure = bool(
+                producer_spm
+                and live_issues
+                and all(
+                    str(issue.get("code") or "")
+                    == "NORMALIZED_VARIANTS_REQUIRED"
+                    and same_file(issue.get("spm"), producer_spm)
+                    for issue in live_issues
+                )
+            )
+            if actual_failure and not producer_repair_only_failure:
                 raise BatchItemError(
                     "Cluster Assembly actual data audit failed: "
                     + actual_failure,
                     kind="data_error",
                     log_file=log_file,
                     report_file=audit_report,
+                )
+            if producer_repair_only_failure:
+                self.log(
+                    "Cluster Assembly producer bootstrap allowed: "
+                    f"{Path(producer_spm).name} requires the normalized "
+                    "variants this Blender Repair invocation produces"
                 )
             persistence = (
                 payload.get("cluster_assembly_receipt_persistence") or {}
@@ -4635,6 +4683,14 @@ class App:
                 "receipt_persistence_warning": (
                     persistence_error or cache_resolution_error
                 ),
+                "producer_repair_issue_tolerated": (
+                    producer_repair_only_failure
+                ),
+                "producer_spm": (
+                    str(Path(producer_spm).resolve())
+                    if producer_spm
+                    else None
+                ),
             }
 
     def _job_blender(self, iid, spm, item):
@@ -4667,6 +4723,7 @@ class App:
                             self._refresh_stale_cluster_receipt(
                                 target,
                                 stamp,
+                                producer_spm=speedtree_spm,
                             )
                         )
                         live_report = (

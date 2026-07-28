@@ -23,6 +23,15 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
 
+    def test_existing_relation_is_detached_before_idempotent_rebuild(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        cleanup = source.index("pre_export_relation_cleanup = [")
+        export = source.index("export_or_update_speedtree_spm_targets(", cleanup)
+        self.assertIn(
+            "preserve_scope_history=True",
+            source[cleanup:export],
+        )
+
     def test_current_receipt_rehydrates_the_plan_collection_before_export(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn(

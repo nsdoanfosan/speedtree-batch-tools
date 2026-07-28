@@ -29,9 +29,27 @@ from spm_leaf_handoff_contract import (  # noqa: E402
     inspect_spm_mesh_file_references,
     leaf_contract_user_message,
 )
-from speedtree_texture_contract import resolve_texture_bindings  # noqa: E402
+from speedtree_texture_contract import (  # noqa: E402
+    REQUIRED_TEXTURE_ROLES,
+    TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
+    TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
+    inspect_spm_texture_slots,
+    read_stmat_material_sources,
+    resolve_texture_bindings,
+)
+from speedtree_export_options_contract import (  # noqa: E402
+    require_texture_skip_writing,
+)
 from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
+    _unsafe_provisional_source,
+    atlas_provisional_source_declarations,
     canonical_material_name as pcg_canonical_material_name,
+    cluster_render_origin_receipt,
+    texture_base_for_material,
+)
+from pcg_st9_texture_batch.pcg_texture_common import (  # noqa: E402
+    DEFAULT_CONFIG as PCG_DEFAULT_CONFIG,
+    load_config as load_pcg_texture_config,
 )
 from speedtree_pipeline_contract import (  # noqa: E402
     PREFLIGHT_CONTRACT_KIND,
@@ -105,9 +123,250 @@ def problem_generators(contract, missing_materials):
     return rows
 
 
+def _material_contract_key(value):
+    value = str(value or "").strip()
+    if value.casefold().endswith("_mat"):
+        value = value[:-4]
+    if value.casefold().startswith("m_"):
+        value = value[2:]
+    return "".join(character for character in value.casefold()
+                   if character.isalnum())
+
+
+def _path_key(value):
+    try:
+        return str(Path(str(value or "")).resolve()).casefold()
+    except (OSError, RuntimeError):
+        return str(value or "").casefold()
+
+
+def _production_asset_root(spm_path):
+    spm = Path(spm_path).resolve()
+    cluster = next(
+        (
+            parent for parent in spm.parents
+            if parent.name.casefold() == "cluster"
+        ),
+        None,
+    )
+    return cluster.parent if cluster is not None else spm.parent
+
+
+def augment_texture_readiness_contract(
+    readiness,
+    stmat_path,
+    production_spm,
+    *,
+    source_texture_roots=None,
+):
+    """Add provisional/raw and Blender-bake provenance to STMAT readiness."""
+    readiness = dict(readiness or {})
+    bindings = [
+        dict(binding)
+        for binding in readiness.get("bindings") or []
+    ]
+    readiness["bindings"] = bindings
+    parsed = read_stmat_material_sources(stmat_path)
+    parsed_by_index = {
+        int(material["material_index"]): material
+        for material in parsed.get("materials") or []
+    }
+    spm_inspection = inspect_spm_texture_slots(production_spm)
+    spm_by_key = {}
+    for material in spm_inspection.get("materials") or []:
+        spm_by_key.setdefault(
+            _material_contract_key(material.get("material_name")),
+            [],
+        ).append(material)
+    asset_root = _production_asset_root(production_spm)
+    provisional_declarations = atlas_provisional_source_declarations(
+        asset_root
+    )
+    source_roots = list(
+        source_texture_roots
+        if source_texture_roots is not None
+        else PCG_DEFAULT_CONFIG.get("source_texture_roots") or []
+    )
+    warnings = list(readiness.get("warnings") or [])
+    missing = list(readiness.get("missing") or [])
+
+    for binding in bindings:
+        if binding.get("status") != "not_managed":
+            continue
+        material = parsed_by_index.get(
+            int(binding.get("material_index", -1))
+        )
+        sources = list((material or {}).get("sources") or [])
+        if not sources:
+            continue
+        source_paths = {
+            str(source.get("map") or "").strip().casefold(): str(
+                source.get("resolved_source") or ""
+            )
+            for source in sources
+            if source.get("resolved_source")
+        }
+        spm_matches = spm_by_key.get(
+            _material_contract_key(binding.get("material")),
+            [],
+        )
+        bake_receipt = {}
+        if len(spm_matches) == 1:
+            spm_material = spm_matches[0]
+            spm_slots = list(spm_material.get("slots") or [])
+            spm_source_paths = {
+                str(slot.get("map") or "").strip().casefold(): str(
+                    slot.get("resolved_ref") or ""
+                )
+                for slot in spm_slots
+                if slot.get("resolved_ref")
+            }
+            if {
+                _path_key(path)
+                for path in source_paths.values()
+            } == {
+                _path_key(path)
+                for path in spm_source_paths.values()
+            }:
+                bake_receipt = cluster_render_origin_receipt(
+                    asset_root,
+                    production_spm,
+                    [
+                        slot["authored_ref"]
+                        for slot in spm_slots
+                    ],
+                )
+                if bake_receipt:
+                    bake_receipt = {
+                        **bake_receipt,
+                        "material_id": str(
+                            spm_material.get("material_id") or ""
+                        ),
+                        "material_name": str(
+                            spm_material.get("material_name") or ""
+                        ),
+                        "slot_files": [
+                            {
+                                "map_index": int(
+                                    slot.get("map_index", -1)
+                                ),
+                                "map": str(slot.get("map") or ""),
+                                "role": str(slot.get("role") or ""),
+                                "path": str(
+                                    slot.get("resolved_ref") or ""
+                                ),
+                            }
+                            for slot in spm_slots
+                        ],
+                    }
+        if bake_receipt:
+            binding.update({
+                "texture_contract_status": "blender_cluster_bake",
+                "origin_kind": "blender_cluster_bake",
+                "origin_state": TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
+                "origin_receipt": bake_receipt,
+                "source_paths": spm_source_paths,
+            })
+            continue
+
+        expected_base = texture_base_for_material(
+            pcg_canonical_material_name(
+                str(binding.get("material") or "").removesuffix("_Mat")
+            )
+        )
+        expected_t_paths = {
+            role: str(
+                asset_root / "texture"
+                / f"{expected_base}_{role}.tga"
+            )
+            for role in REQUIRED_TEXTURE_ROLES
+        }
+        rejected = []
+        for source in sources:
+            path = str(source.get("resolved_source") or "")
+            state = _unsafe_provisional_source(
+                path,
+                asset_root=asset_root,
+                source_texture_roots=source_roots,
+                declared_source_paths=provisional_declarations,
+            )
+            if state:
+                rejected.append({
+                    "material": binding.get("material"),
+                    "role": str(source.get("map") or "").casefold(),
+                    "path": path,
+                    "state": state,
+                })
+        if rejected:
+            binding["status"] = "blocked_source"
+            binding["texture_contract_status"] = "blocked_source"
+            binding["source_rejections"] = rejected
+            missing_row = {
+                "material": binding.get("material"),
+                "material_index": binding.get("material_index"),
+                "reason": "provisional_source_blocked",
+                "missing_roles": sorted({
+                    row["role"] for row in rejected if row["role"]
+                }),
+                "expected_texture_base": expected_base,
+                "expected_t_paths": expected_t_paths,
+                "source_rejections": rejected,
+            }
+            missing.append(missing_row)
+            continue
+
+        source_roles = sorted(source_paths)
+        warning = (
+            f"{binding.get('material')}: 원본 texture 역할 "
+            f"{', '.join(source_roles)}을 provisional로 사용 중입니다. "
+            f"{expected_base} 6역할 T_* output 생성이 필요합니다."
+        )
+        binding.update({
+            "texture_contract_status":
+                "source_fallback_needs_pcg_generation",
+            "origin_state": TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
+            "source_paths": source_paths,
+            "source_roles": source_roles,
+            "expected_texture_base": expected_base,
+            "expected_t_paths": expected_t_paths,
+            "warning": warning,
+            "remediation": (
+                "PCG ST9 Texture에서 Substance 그래프 생성 및 export 실행"
+            ),
+        })
+        warnings.append({
+            "material": binding.get("material"),
+            "material_index": binding.get("material_index"),
+            "status": "source_fallback_needs_pcg_generation",
+            "origin_state": TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
+            "source_paths": source_paths,
+            "source_roles": source_roles,
+            "expected_texture_base": expected_base,
+            "expected_t_paths": expected_t_paths,
+            "warning": warning,
+            "remediation": (
+                "PCG ST9 Texture에서 Substance 그래프 생성 및 export 실행"
+            ),
+        })
+
+    readiness["missing"] = missing
+    readiness["warnings"] = warnings
+    if missing:
+        readiness["status"] = "incomplete"
+    elif warnings:
+        readiness["status"] = (
+            "source_fallback_needs_pcg_generation"
+        )
+    return readiness
+
+
 def run_export(args, speedtree_cli):
     spm = Path(args.spm)
     target = spm.parent / "fbx" / f"{spm.stem}.fbx"
+    require_texture_skip_writing(
+        args.fbx_ini,
+        purpose=f"{spm.name} material-preflight FBX export",
+    )
     return speedtree_cli.export_target(
         exe=Path(args.speedtree_exe),
         spm=spm,
@@ -275,6 +534,29 @@ def preflight_contract_issues(report):
         )
 
     readiness = report.get("texture_readiness_contract") or {}
+    for warning in readiness.get("warnings") or []:
+        issues.append(
+            _issue(
+                "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
+                "material",
+                warning.get("material"),
+                warning.get("warning")
+                or "Original source texture is provisional",
+                severity="warning",
+                details={
+                    "material_index": warning.get("material_index"),
+                    "source_roles": warning.get("source_roles") or [],
+                    "source_paths": warning.get("source_paths") or {},
+                    "expected_texture_base": warning.get(
+                        "expected_texture_base"
+                    )
+                    or "",
+                    "expected_t_paths": warning.get("expected_t_paths")
+                    or {},
+                    "remediation": warning.get("remediation") or "",
+                },
+            )
+        )
     for missing in readiness.get("missing") or []:
         issues.append(
             _issue(
@@ -406,7 +688,17 @@ def main():
             )
             all_material = inspect_all_speedtree_material_export(speedtree_spm)
             textures = inspect_speedtree_texture_sources(speedtree_spm)
-            texture_readiness = resolve_texture_bindings(textures.get("stmat"))
+            texture_readiness = augment_texture_readiness_contract(
+                resolve_texture_bindings(textures.get("stmat")),
+                textures.get("stmat"),
+                canonical_spm,
+                source_texture_roots=(
+                    load_pcg_texture_config().get(
+                        "source_texture_roots"
+                    )
+                    or []
+                ),
+            )
             report["material_export_contract"] = material
             report["all_export_material_contract"] = all_material
             report["texture_source_contract"] = textures
@@ -427,7 +719,11 @@ def main():
                 material.get("status") in {"ok", "not_applicable"}
                 and all_material.get("status") in {"ok", "not_applicable"}
                 and textures.get("status") == "ok"
-                and texture_readiness.get("status") in {"ok", "not_applicable"}
+                and texture_readiness.get("status") in {
+                    "ok",
+                    "not_applicable",
+                    "source_fallback_needs_pcg_generation",
+                }
             ):
                 report["status"] = "ok"
             elif missing:

@@ -376,18 +376,28 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             self.assertEqual(spm_path.read_bytes(), original_bytes)
 
     def test_xml_subprocess_timeout_uses_export_timeout_error(self):
-        cfg = {
-            "speedtree_exe": "SpeedTree.exe",
-            "xml_ini": "Options.ini",
-            "spm_verify_timeout": 120,
-        }
-        with mock.patch.object(
-            spm_audit,
-            "run_speedtree_export",
-            side_effect=subprocess.TimeoutExpired("SpeedTree", 120),
-        ):
-            with self.assertRaises(spm_audit.SpeedTreeExportTimeout) as caught:
-                spm_audit.export_verify_xml("SK_test.spm", cfg, "out.xml")
+        with tempfile.TemporaryDirectory() as tmp:
+            options = Path(tmp) / "Options.ini"
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            cfg = {
+                "speedtree_exe": "SpeedTree.exe",
+                "xml_ini": str(options),
+                "spm_verify_timeout": 120,
+            }
+            with mock.patch.object(
+                spm_audit,
+                "run_speedtree_export",
+                side_effect=subprocess.TimeoutExpired("SpeedTree", 120),
+            ):
+                with self.assertRaises(
+                    spm_audit.SpeedTreeExportTimeout
+                ) as caught:
+                    spm_audit.export_verify_xml(
+                        "SK_test.spm", cfg, "out.xml"
+                    )
 
         self.assertEqual(caught.exception.stage, "XML")
         self.assertEqual(caught.exception.timeout_seconds, 120.0)

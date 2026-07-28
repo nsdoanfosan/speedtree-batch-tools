@@ -1418,8 +1418,11 @@ class App:
         self.set_selected_cluster_relation(True, refresh_only=True)
 
     def set_selected_cluster_relation(self, enabled, *, refresh_only=False):
+        # ON/OFF is a folder-wide contract just like refresh.  Expand a
+        # selected Cluster folder to its child relation rows so the folder
+        # action cannot silently preserve an old one-target partial registry.
         rows = self.selected_cluster_relations(
-            include_cluster_folders=refresh_only
+            include_cluster_folders=True
         )
         if not rows:
             messagebox.showinfo(

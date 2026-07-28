@@ -35,10 +35,20 @@ from pcg_st9_texture_batch.pcg_cluster_bark_normalization import (
     build_isolated_bark_normalization_plan,
 )
 from pcg_st9_texture_batch.pcg_texture_audit import (
+    cluster_render_origin_receipt,
     extract_material_image_refs,
 )
 from sk_batch.spm_leaf_handoff_contract import (
     inspect_spm_mesh_file_references,
+)
+from speedtree_texture_contract import (
+    CanonicalTextureContractError,
+    PCG_ST9_REMEDIATION,
+    build_spm_canonical_texture_plan,
+    inspect_spm_texture_slots,
+    load_canonical_output_manifest,
+    rebase_spm_copy_to_canonical_outputs,
+    resolve_manifest_material_output,
 )
 
 
@@ -464,6 +474,235 @@ def _source_external_texture_inventory(source_spm):
     return sorted(rows, key=lambda row: row["source"].casefold())
 
 
+def _canonical_texture_error_message(spm, issues):
+    details = []
+    for issue in (issues or [])[:8]:
+        details.append(
+            (
+                f"material={issue.get('material') or '?'} "
+                f"id={issue.get('material_id') or '?'} "
+                f"role={issue.get('role') or '?'} "
+                f"expected={issue.get('expected_output') or '?'} "
+                f"reason={issue.get('reason') or '?'}"
+            )
+        )
+    suffix = " | " + " | ".join(details) if details else ""
+    return (
+        f"{Path(spm).name}: production texture handoff is blocked."
+        f"{suffix}. {PCG_ST9_REMEDIATION}"
+    )
+
+
+def _blender_cluster_bake_overrides(contract, source_spm):
+    """Preserve only receipt-declared Blender Cluster bake outputs.
+
+    A path merely containing a ``Cluster`` segment is not authority.  The
+    current assembly contract must explicitly classify the dependency's
+    texture origin and list the exact hash/audit-validated files in actual use.
+    """
+    dependency = _dependency_for_source(contract, source_spm)
+    if (
+        dependency is None
+        or dependency.get("texture_origin_kind")
+        != "blender_cluster_bake"
+        or (dependency.get("tga_basename_validation") or {}).get("status")
+        != "ok"
+    ):
+        return {}
+    declared = {
+        _path_key(row.get("path") or "")
+        for row in dependency.get("texture_dependencies") or []
+        if row.get("path") and row.get("exists", True)
+    }
+    declared.update(
+        _path_key(value)
+        for value in (
+            (dependency.get("tga_basename_validation") or {}).get("refs")
+            or []
+        )
+    )
+    if not declared:
+        return {}
+
+    overrides = {}
+    inspection = inspect_spm_texture_slots(source_spm)
+    for material in inspection["materials"]:
+        if not material["slots"] or not material["material_id"]:
+            continue
+        if not all(
+            _path_key(slot["resolved_ref"]) in declared
+            for slot in material["slots"]
+        ):
+            continue
+        slot_files = []
+        for slot in material["slots"]:
+            slot_files.append({
+                "map_index": slot["map_index"],
+                "map": slot["map"],
+                "role": slot["role"],
+                "path": slot["resolved_ref"],
+            })
+        origin_receipt = cluster_render_origin_receipt(
+            Path(source_spm).parent,
+            source_spm,
+            [slot["authored_ref"] for slot in material["slots"]],
+        )
+        if not origin_receipt:
+            continue
+        origin_receipt = {
+            **origin_receipt,
+            "material_id": str(material["material_id"]),
+            "material_name": str(material["material_name"]),
+        }
+        overrides[str(material["material_id"])] = {
+            "origin_kind": "blender_cluster_bake",
+            "origin_receipt": origin_receipt,
+            "texture_base": "",
+            "required_roles": [],
+            "files": {},
+            # Blender bake roles are SpeedTree Map-slot exact. Gloss and AO
+            # are independent files even though the PCG six-role contract
+            # packs both into "extra"; likewise Subsurface Color/Amount.
+            "slot_files": slot_files,
+            "producer": {
+                "tool": "cluster_assembly_receipt",
+                "source": str(
+                    dependency.get("texture_contract_source") or ""
+                ),
+            },
+        }
+    return overrides
+
+
+def _canonical_bark_output(contract, source_spm, manifest):
+    bark = ((contract.get("handoff") or {}).get("canonical_bark") or {})
+    resolved = []
+    for row in bark.get("canonical_sources") or []:
+        output = resolve_manifest_material_output(
+            manifest,
+            row.get("spm"),
+            row.get("material_id"),
+            row.get("material_name"),
+        )
+        if output is None:
+            raise ClusterBarkSourceResolutionError(
+                _canonical_texture_error_message(
+                    source_spm,
+                    [{
+                        "material": row.get("material_name"),
+                        "material_id": row.get("material_id"),
+                        "role": "*",
+                        "expected_output": manifest.get("manifest"),
+                        "reason": "canonical_bark_manifest_target_missing",
+                    }],
+                )
+            )
+        materials = [
+            material
+            for material in inspect_spm_texture_slots(row.get("spm"))[
+                "materials"
+            ]
+            if (
+                str(material.get("material_id") or "")
+                == str(row.get("material_id") or "")
+            )
+        ]
+        issues = []
+        if len(materials) != 1:
+            issues.append({
+                "material": row.get("material_name"),
+                "material_id": row.get("material_id"),
+                "role": "*",
+                "expected_output": manifest.get("manifest"),
+                "reason": "canonical_bark_material_ambiguous",
+            })
+        else:
+            for slot in materials[0]["slots"]:
+                expected = str(
+                    (output.get("files") or {}).get(slot["role"]) or ""
+                )
+                if (
+                    not slot["role"]
+                    or not expected
+                    or _path_key(slot["resolved_ref"]) != _path_key(expected)
+                ):
+                    issues.append({
+                        "material": row.get("material_name"),
+                        "material_id": row.get("material_id"),
+                        "role": slot["role"] or "unknown",
+                        "expected_output": expected or manifest.get("manifest"),
+                        "reason": (
+                            "canonical_bark_production_ref_not_manifest_output"
+                        ),
+                    })
+        if issues:
+            raise ClusterBarkSourceResolutionError(
+                _canonical_texture_error_message(source_spm, issues)
+            )
+        resolved.append(output)
+    signatures = {
+        (
+            output["texture_base"].casefold(),
+            tuple(
+                (role, _path_key(path))
+                for role, path in sorted(output["files"].items())
+            ),
+        )
+        for output in resolved
+    }
+    if len(signatures) != 1:
+        raise ClusterBarkSourceResolutionError(
+            f"{Path(source_spm).name}: canonical bark manifest outputs "
+            "are missing or disagree at the same authority level. "
+            + PCG_ST9_REMEDIATION
+        )
+    return resolved[0]
+
+
+def _production_texture_handoff_plan(contract, source_spm, required_rows):
+    """Build one origin-aware, no-fallback texture plan for an isolated copy."""
+    try:
+        manifest = load_canonical_output_manifest(source_spm)
+    except CanonicalTextureContractError as exc:
+        raise ClusterBarkSourceResolutionError(
+            _canonical_texture_error_message(source_spm, exc.issues)
+        ) from exc
+    overrides = _blender_cluster_bake_overrides(contract, source_spm)
+    bark_output = _canonical_bark_output(contract, source_spm, manifest)
+    for row in required_rows:
+        material_id = str(row.get("material_id") or "").strip()
+        if not material_id:
+            raise ClusterBarkSourceResolutionError(
+                _canonical_texture_error_message(
+                    source_spm,
+                    [{
+                        "material": row.get("material_name"),
+                        "material_id": "",
+                        "role": "*",
+                        "expected_output": manifest["manifest"],
+                        "reason": "canonical_bark_material_id_missing",
+                    }],
+                )
+            )
+        overrides[material_id] = {
+            **copy.deepcopy(bark_output),
+            "origin_kind": "pcg_sbs",
+        }
+    plan = build_spm_canonical_texture_plan(
+        source_spm,
+        manifest["manifest"],
+        overrides,
+    )
+    if plan.get("status") not in {"ok", "not_applicable"}:
+        raise ClusterBarkSourceResolutionError(
+            _canonical_texture_error_message(
+                source_spm, plan.get("issues") or []
+            )
+        )
+    plan["material_output_overrides"] = overrides
+    return plan
+
+
 def _normalization_identity(contract, source_spm, required_rows):
     bark = ((contract.get("handoff") or {}).get("canonical_bark") or {})
     canonical_sources = list(bark.get("canonical_sources") or [])
@@ -488,12 +727,15 @@ def _normalization_identity(contract, source_spm, required_rows):
                 "name": path.name.casefold(),
                 "sha256": _sha256_file(path),
             })
+    texture_handoff = _production_texture_handoff_plan(
+        contract,
+        source_spm,
+        required_rows,
+    )
     identity = {
         "source_spm_sha256": _sha256_file(source_spm),
         "source_material_name_preserved": True,
-        "source_tree_textures": _source_tree_texture_inventory(
-            source_spm
-        ),
+        "production_texture_handoff": texture_handoff,
         "canonical_material": normalize_export_name(
             bark.get("canonical_material")
         ),
@@ -520,9 +762,6 @@ def _normalization_identity(contract, source_spm, required_rows):
         # mesh assets, while making every referenced FBX part of the immutable
         # isolated-source identity when those assets do exist.
         identity["source_external_meshes"] = external_meshes
-    external_textures = _source_external_texture_inventory(source_spm)
-    if external_textures:
-        identity["source_external_textures"] = external_textures
     signature = hashlib.sha256(
         _canonical_json(identity).encode("utf-8")
     ).hexdigest()
@@ -942,19 +1181,21 @@ def prepare_isolated_bark_source(
         )
         staged_source.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, staged_source)
-        copied_source_textures = _copy_source_tree_textures(
-            identity, isolated_tree_root
-        )
+        # Authoring/source textures are inputs to PCG/SBS, not isolated
+        # SpeedTree dependencies.  The final isolated SPM is rebound below to
+        # the explicit production manifest (or receipt-declared Blender
+        # Cluster bake outputs); no source/cache fallback is copied.
+        copied_source_textures = []
         copied_source_external_meshes = _copy_source_external_meshes(
             identity,
             staged_source,
             staging,
         )
-        copied_source_external_textures = _copy_source_external_textures(
-            identity,
-            staged_source,
-            isolated_tree_root,
-        )
+        copied_source_external_textures = []
+        # Bark normalization currently needs a temporary in-isolation mirror
+        # to prove byte identity while constructing its material-only patch.
+        # These files are removed before the cache is published after every
+        # TexFilename has been rebound to production outputs.
         copied_textures = _copy_canonical_textures(
             contract, isolated_tree_root
         )
@@ -991,11 +1232,31 @@ def prepare_isolated_bark_source(
             source,
             copied_source_external_meshes,
         )
-        external_texture_rebase = _rebase_external_texture_refs(
-            staged_source,
-            source,
-            copied_source_external_textures,
-        )
+        try:
+            production_texture_rebase = (
+                rebase_spm_copy_to_canonical_outputs(
+                    staged_source,
+                    source,
+                    identity["production_texture_handoff"],
+                )
+            )
+        except CanonicalTextureContractError as exc:
+            raise ClusterBarkSourceResolutionError(
+                _canonical_texture_error_message(source, exc.issues)
+            ) from exc
+        external_texture_rebase = {
+            "status": "replaced_by_production_texture_handoff",
+            "rewritten_reference_count": production_texture_rebase[
+                "rewritten_reference_count"
+            ],
+            "textures": [],
+        }
+        for row in copied_textures:
+            temporary_texture = Path(row["isolated"])
+            try:
+                temporary_texture.unlink()
+            except FileNotFoundError:
+                pass
         final_staged_hash = _sha256_file(staged_source)
         for output in normalization.get("outputs") or []:
             if _path_key(output.get("isolated_spm") or "") == _path_key(
@@ -1007,6 +1268,39 @@ def prepare_isolated_bark_source(
                 )
                 output["external_mesh_rebase"] = copy.deepcopy(
                     external_mesh_rebase
+                )
+                rebound = [
+                    row
+                    for row in production_texture_rebase.get(
+                        "references"
+                    ) or []
+                    if str(row.get("material_id") or "")
+                    == str(output.get("material_id") or "")
+                ]
+                output["canonical_textures"] = [
+                    {
+                        "map": row["map"],
+                        "source": row["expected_output"],
+                        "isolated": row["expected_output"],
+                        "sha256": _sha256_file(row["expected_output"]),
+                        "spm_ref": row["after"],
+                        "export_enabled": True,
+                        "origin_kind": next(
+                            (
+                                binding.get("origin_kind")
+                                for binding in identity[
+                                    "production_texture_handoff"
+                                ].get("bindings") or []
+                                if str(binding.get("material_id") or "")
+                                == str(row.get("material_id") or "")
+                            ),
+                            "pcg_sbs",
+                        ),
+                    }
+                    for row in rebound
+                ]
+                output["production_texture_handoff"] = copy.deepcopy(
+                    production_texture_rebase
                 )
         final_source = (
             cache_dir / tree_name / source.parent.name / source.name
@@ -1029,6 +1323,9 @@ def prepare_isolated_bark_source(
         external_texture_rebase = _rebase_paths(
             external_texture_rebase, staging, cache_dir
         )
+        production_texture_rebase = _rebase_paths(
+            production_texture_rebase, staging, cache_dir
+        )
         external_mesh_rebase = _rebase_paths(
             external_mesh_rebase, staging, cache_dir
         )
@@ -1047,9 +1344,11 @@ def prepare_isolated_bark_source(
             "copied_source_external_textures": (
                 copied_source_external_textures
             ),
-            "copied_canonical_textures": copied_textures,
+            "copied_canonical_textures": [],
+            "temporary_canonical_texture_count": len(copied_textures),
             "external_mesh_rebase": external_mesh_rebase,
             "external_texture_rebase": external_texture_rebase,
+            "production_texture_handoff": production_texture_rebase,
             "normalization": normalization,
             "production_source_mutated": False,
         }

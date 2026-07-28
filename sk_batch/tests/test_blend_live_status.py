@@ -2030,6 +2030,156 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             self.assertIn("missing.tga", str(raised.exception))
 
+    def _run_producer_variant_receipt_refresh(
+        self,
+        gui,
+        *,
+        exit_code,
+        issue_spm_kind="producer",
+        extra_issues=None,
+    ):
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            producer = cluster / "SK_cluster_elm_02.spm"
+            producer.write_bytes(b"cluster")
+            other_producer = cluster / "SK_cluster_elm_03.spm"
+            other_producer.write_bytes(b"other cluster")
+            selected = Path(temporary) / "receipt.json"
+            issue_spm = (
+                producer
+                if issue_spm_kind == "producer"
+                else other_producer
+            )
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                issues = [{
+                    "code": "NORMALIZED_VARIANTS_REQUIRED",
+                    "role": "cluster",
+                    "spm": str(issue_spm),
+                }]
+                issues.extend(extra_issues or [])
+                report.write_text(
+                    json.dumps({
+                        "items": [{
+                            "cluster_assembly": {
+                                "tree_source_identities": [{
+                                    "target_spm": {"path": str(spm)},
+                                }],
+                                "dependencies": [{
+                                    "role": "cluster",
+                                    "spm": str(producer),
+                                }],
+                                "handoff": {
+                                    "errors": issues,
+                                },
+                            }
+                        }]
+                    }),
+                    encoding="utf-8",
+                )
+                return exit_code, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=[
+                    gui.ClusterAssemblyReceiptStaleError("stale"),
+                    {"selected_receipt": str(selected)},
+                ],
+            ):
+                resolution = app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260725_120000",
+                    producer_spm=producer,
+                )
+
+            return app, resolution, producer
+
+    def test_receipt_refresh_allows_exact_producer_variant_bootstrap(self):
+        gui = load_gui_module()
+        app, resolution, producer = (
+            self._run_producer_variant_receipt_refresh(
+                gui,
+                exit_code=0,
+            )
+        )
+
+        self.assertEqual(
+            resolution["policy"],
+            "live_audit_authoritative",
+        )
+        self.assertTrue(
+            resolution["producer_repair_issue_tolerated"]
+        )
+        self.assertEqual(
+            Path(resolution["producer_spm"]),
+            producer.resolve(),
+        )
+        self.assertTrue(any(
+            "producer bootstrap allowed" in call.args[0]
+            for call in app.log.call_args_list
+        ))
+
+    def test_producer_variant_bootstrap_nonzero_exit_is_internal_error(self):
+        gui = load_gui_module()
+        with self.assertRaises(gui.BatchItemError) as raised:
+            self._run_producer_variant_receipt_refresh(
+                gui,
+                exit_code=1,
+            )
+
+        self.assertEqual(raised.exception.kind, "internal_error")
+        self.assertIn("live audit process failed", str(raised.exception))
+
+    def test_producer_variant_bootstrap_rejects_mixed_data_issues(self):
+        gui = load_gui_module()
+        with self.assertRaises(gui.BatchItemError) as raised:
+            self._run_producer_variant_receipt_refresh(
+                gui,
+                exit_code=0,
+                extra_issues=[{
+                    "code": "CLUSTER_TGA_BASENAME_INVALID",
+                    "role": "branch",
+                    "details": {
+                        "status": "missing",
+                        "missing": ["missing.tga"],
+                    },
+                }],
+            )
+
+        self.assertEqual(raised.exception.kind, "data_error")
+        self.assertIn(
+            "CLUSTER_TGA_BASENAME_INVALID",
+            str(raised.exception),
+        )
+
+    def test_producer_variant_bootstrap_rejects_wrong_producer(self):
+        gui = load_gui_module()
+        with self.assertRaises(gui.BatchItemError) as raised:
+            self._run_producer_variant_receipt_refresh(
+                gui,
+                exit_code=0,
+                issue_spm_kind="other",
+            )
+
+        self.assertEqual(raised.exception.kind, "data_error")
+        self.assertIn(
+            "NORMALIZED_VARIANTS_REQUIRED",
+            str(raised.exception),
+        )
+
     def test_receipt_self_stale_after_clean_audit_uses_live_contract(self):
         gui = load_gui_module()
         app = self.make_app(gui)

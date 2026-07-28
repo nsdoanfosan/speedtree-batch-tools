@@ -109,7 +109,22 @@ def _material_record(node, target_spm):
     return {
         "material_id": material_id,
         "material_name": str(node.get("Name") or ""),
+        "mesh_ids": _material_mesh_ids(node),
     }
+
+
+def _material_mesh_ids(node):
+    values = []
+    primary = _integer_text(node.findtext("CutoutMeshID"))
+    if primary is not None and primary >= 0:
+        values.append(primary)
+    for item in node.findall(
+        "./SupplementalCutoutMeshIDs/CutoutMesh"
+    ):
+        mesh_id = _integer_text(item.get("ID"))
+        if mesh_id is not None and mesh_id >= 0:
+            values.append(mesh_id)
+    return values
 
 
 def _material_family_name(value):
@@ -243,24 +258,78 @@ def _material_id_by_exact_name(root, material_name):
     return _integer_text(matches[0].get("ID"))
 
 
+def _atlas_target_relation_manifest(target_spm):
+    target = Path(target_spm).expanduser().absolute()
+    manifest_dir = target.parent / ".atlas_leaf_speedtree_targets"
+    if not manifest_dir.is_dir():
+        return {}
+    target_key = str(target.resolve()).casefold()
+    matches = []
+    for path in sorted(manifest_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        spm = str((payload or {}).get("spm") or "").strip()
+        if not spm:
+            continue
+        try:
+            spm_key = str(Path(spm).expanduser().resolve()).casefold()
+        except OSError:
+            spm_key = str(Path(spm).expanduser().absolute()).casefold()
+        if (
+            spm_key == target_key
+            and (payload.get("generator_connection") or {}).get(
+                "complete"
+            )
+        ):
+            matches.append(payload)
+    if len(matches) > 1:
+        raise ClusterNormalizationSyncError(
+            "Multiple Atlas target manifests describe the same SPM: "
+            f"{target}"
+        )
+    return matches[0] if matches else {}
+
+
 def _source_binding_repairs(target_spm, material_record):
-    """Return only exact, backup-proven sentinel repairs for one target.
+    """Return only exact GUID/slot repairs proven by authored backups.
 
     This does not infer from a Generator name or index. A repair is emitted
-    only when the live Generator has a stable GUID, the exact material/slot
-    currently contains ``-9``, and every authoritative backup that contains
-    that same GUID/material/slot agrees that the authored value was ``-10``.
+    only when the live Generator has a stable GUID, its Mesh is not an authored
+    cutout (or is the legacy ``-9`` sentinel), and every authoritative backup
+    containing that exact GUID/material/slot agrees on one authored cutout or
+    ``-10``. Backups that still carry the current Atlas-managed target Mesh are
+    ignored when the live target manifest proves that relationship.
     """
     target = Path(target_spm).expanduser().absolute()
     root = _read_spm_root(target)
     material_name = material_record["material_name"]
     material_id = material_record["material_id"]
+    material_mesh_ids = set(material_record.get("mesh_ids") or [])
+    atlas_manifest = _atlas_target_relation_manifest(target)
+    atlas_bindings = {
+        (
+            str(item.get("generator_guid") or "").strip(),
+            str(item.get("slot_prefix") or "").strip(),
+        ): item
+        for item in (
+            atlas_manifest.get("generator_connection") or {}
+        ).get("bindings") or []
+        if isinstance(item, dict)
+    }
     live_pairs = [
         pair
         for pair in _generator_property_pairs(root)
         if (
             pair["material_id"] == material_id
-            and pair["mesh_id"] == -9
+            and (
+                pair["mesh_id"] == -9
+                or (
+                    pair["mesh_id"] != -10
+                    and pair["mesh_id"] not in material_mesh_ids
+                )
+            )
             and pair["generator_guid"]
         )
     ]
@@ -269,15 +338,38 @@ def _source_binding_repairs(target_spm, material_record):
     candidates = _authoritative_binding_backup_paths(target)
     repairs = []
     for pair in live_pairs:
-        evidence = []
+        atlas_binding = atlas_bindings.get(
+            (pair["generator_guid"], pair["slot_prefix"])
+        )
+        if (
+            atlas_binding is not None
+            and _integer_text(atlas_binding.get("source_mesh_id"))
+            is not None
+        ):
+            # Relationship removal already owns this exact restoration.
+            continue
+        managed_target_mesh_id = (
+            _integer_text(atlas_binding.get("target_mesh_id"))
+            if atlas_binding is not None
+            else None
+        )
+        evidence_by_value = {}
         conflicting_values = []
         for backup in candidates:
             try:
                 backup_root = _read_spm_root(backup)
             except Exception:
                 continue
-            backup_material_id = _material_id_by_exact_name(
-                backup_root, material_name
+            backup_materials = [
+                node
+                for node in backup_root.findall(".//Material_v8")
+                if str(node.get("Name") or "") == material_name
+            ]
+            if len(backup_materials) != 1:
+                continue
+            backup_material = backup_materials[0]
+            backup_material_id = _integer_text(
+                backup_material.get("ID")
             )
             if backup_material_id is None:
                 continue
@@ -295,7 +387,16 @@ def _source_binding_repairs(target_spm, material_record):
             if len(matches) != 1:
                 continue
             backup_mesh_id = matches[0]["mesh_id"]
-            if backup_mesh_id != -10:
+            if (
+                managed_target_mesh_id == pair["mesh_id"]
+                and backup_mesh_id == managed_target_mesh_id
+            ):
+                continue
+            backup_cutouts = set(_material_mesh_ids(backup_material))
+            if (
+                backup_mesh_id != -10
+                and backup_mesh_id not in backup_cutouts
+            ):
                 conflicting_values.append(
                     {
                         "path": str(backup),
@@ -303,13 +404,21 @@ def _source_binding_repairs(target_spm, material_record):
                     }
                 )
                 continue
-            evidence.append(
+            evidence_by_value.setdefault(backup_mesh_id, []).append(
                 {
                     "path": str(backup),
                     "sha256": _sha256_file(backup),
                 }
             )
-        if evidence and not conflicting_values:
+        if (
+            len(evidence_by_value) == 1
+            and not conflicting_values
+        ):
+            to_mesh_id, evidence = next(
+                iter(evidence_by_value.items())
+            )
+            if to_mesh_id == pair["mesh_id"]:
+                continue
             repairs.append(
                 {
                     "generator_name": pair["generator_name"],
@@ -318,8 +427,8 @@ def _source_binding_repairs(target_spm, material_record):
                     "slot_prefix": pair["slot_prefix"],
                     "source_material_name": material_name,
                     "source_material_id": material_id,
-                    "from_mesh_id": -9,
-                    "to_mesh_id": -10,
+                    "from_mesh_id": pair["mesh_id"],
+                    "to_mesh_id": to_mesh_id,
                     "evidence": evidence,
                 }
             )

@@ -48,11 +48,25 @@ def write_spm_with_frond_binding(
     mesh_id,
     *,
     generator_guid="stable-frond-guid",
+    material_mesh_ids=None,
 ):
+    material_mesh_ids = list(material_mesh_ids or [])
+    cutout_xml = ""
+    if material_mesh_ids:
+        cutout_xml = (
+            f"<CutoutMeshID>{material_mesh_ids[0]}</CutoutMeshID>"
+            "<SupplementalCutoutMeshIDs>"
+            + "".join(
+                f'<CutoutMesh ID="{mesh_id}" />'
+                for mesh_id in material_mesh_ids[1:]
+            )
+            + "</SupplementalCutoutMeshIDs>"
+        )
     path.write_text(
         (
             "<SpeedTree><Assets>"
-            f'<Material_v8 ID="{material_id}" Name="{material_name}" />'
+            f'<Material_v8 ID="{material_id}" Name="{material_name}">'
+            f"{cutout_xml}</Material_v8>"
             "</Assets><Generators><Generator Type=\"Frond\">"
             f"<GUID>{generator_guid}</GUID>"
             "<Name>Frond</Name><Hidden>false</Hidden><Properties><Property>"
@@ -222,6 +236,78 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                     "source_binding_repairs"
                 ],
                 [],
+            )
+
+    def test_recipe_repairs_atlas_managed_orphan_from_authored_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            write_spm_with_frond_binding(
+                target,
+                "M_leaf_elm_01",
+                6,
+                107,
+                material_mesh_ids=[2, 3, 4, 5, 6],
+            )
+            backup_dir = (
+                target.parent
+                / "_spm_backups"
+                / "generator_sync_20260727_010203"
+            )
+            backup_dir.mkdir(parents=True)
+            authored = backup_dir / f"01_{target.name}"
+            write_spm_with_frond_binding(
+                authored,
+                "M_leaf_elm_01",
+                19,
+                5,
+                material_mesh_ids=[2, 3, 4, 5, 6],
+            )
+            managed = backup_dir / f"02_{target.name}"
+            write_spm_with_frond_binding(
+                managed,
+                "M_leaf_elm_01",
+                20,
+                107,
+                material_mesh_ids=[106, 107, 108],
+            )
+            manifest_dir = target.parent / ".atlas_leaf_speedtree_targets"
+            manifest_dir.mkdir()
+            (manifest_dir / "target.json").write_text(
+                json.dumps(
+                    {
+                        "spm": str(target),
+                        "generator_connection": {
+                            "complete": True,
+                            "bindings": [
+                                {
+                                    "generator_guid": "stable-frond-guid",
+                                    "slot_prefix": "Material:Frond:0",
+                                    "source_mesh_id": None,
+                                    "target_mesh_id": 107,
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            repairs = recipe["target_material_bindings"][0][
+                "source_binding_repairs"
+            ]
+            self.assertEqual(len(repairs), 1)
+            self.assertEqual(repairs[0]["from_mesh_id"], 107)
+            self.assertEqual(repairs[0]["to_mesh_id"], 5)
+            self.assertEqual(
+                [item["path"] for item in repairs[0]["evidence"]],
+                [str(authored)],
             )
 
     def test_pending_cluster_export_is_accepted_only_with_ready_source_contract(self):

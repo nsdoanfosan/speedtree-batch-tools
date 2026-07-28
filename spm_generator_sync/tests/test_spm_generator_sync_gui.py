@@ -285,6 +285,61 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_cluster_folder_on_expands_selection_and_runs_folder_transaction(self):
+        owner = Path(r"D:\Trees\bush_Silky_Dogwood")
+        blend = (
+            owner
+            / "Cluster"
+            / "SK_cluster_Silky_Dogwood_01.blend"
+        )
+        targets = [
+            owner / f"SK_bush_Silky_Dogwood_0{index}.spm"
+            for index in (1, 2, 3)
+        ]
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app.selected_cluster_relations = mock.Mock(return_value=[{
+            "blend": blend,
+            "folder_relation": "partial",
+            "target_count": 3,
+            "on_target_spms": [targets[0]],
+            "target_spms": targets,
+            "all_synced": False,
+        }])
+
+        def run_now(_label, work, done, **_kwargs):
+            done(work(lambda *_args: None))
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.messagebox, "showinfo"
+        ), mock.patch.object(
+            GUI, "run_cluster_relation_transaction"
+        ) as refresh, mock.patch.object(
+            GUI,
+            "run_cluster_folder_relation_transaction",
+            return_value={"status": "ok", "mode": "sync"},
+        ) as normalize:
+            app.set_selected_cluster_relation(True)
+
+        app.selected_cluster_relations.assert_called_once_with(
+            include_cluster_folders=True
+        )
+        normalize.assert_called_once_with(
+            blend,
+            enabled=True,
+            blender_exe=Path(r"C:\Blender\blender.exe"),
+            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+            capture_resolution=1024,
+            repair_runtime_config=app.config,
+        )
+        refresh.assert_not_called()
+
     def test_follower_extra_structure_is_shown_as_one_way_removal(self):
         root = tk.Tk()
         root.withdraw()

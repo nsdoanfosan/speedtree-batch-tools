@@ -44,14 +44,20 @@ from pcg_texture_common import (
     TARGETS_PATH, load_config, load_pcg_targets, save_config,
 )
 from pcg_texture_audit import (
+    _unsafe_provisional_source,
+    atlas_provisional_source_declarations,
     make_report,
-    persist_cluster_assembly_receipts,
+    persist_cluster_assembly_receipts_safely,
     prepare_sk,
     register_blend_source_images,
     save_spm_analysis_cache,
 )
 from export_review_queue import GENERIC_MATERIAL_RE
 from export_texture_plan import bucket_refs, build_texture_plan_from_report
+from pcg_canonical_outputs import (
+    canonical_texture_root,
+    record_canonical_output,
+)
 import sbs_auto
 from migrate_current_sk_textures import (
     build_job as build_texture_job,
@@ -124,6 +130,21 @@ def cluster_texture_status_text(child, output_paths, missing_output_paths):
                 size = f"{width}²" if width == height else f"{width}×{height}"
                 return f"Blender 촬영 {size} · 완료 ✓"
         return "Blender 촬영 완료 ✓"
+    contract_state = child.get("texture_contract_state")
+    if contract_state == "source_fallback_needs_pcg_generation":
+        return "원본 provisional · PCG T_* 생성 필요"
+    if contract_state == "blocked_source_missing":
+        return "원본 입력 누락 · PCG 생성 차단"
+    if contract_state == "blocked_cache_source":
+        return "cache/isolated 입력 차단"
+    if contract_state == "blocked_generated_source":
+        return "생성 출력의 source 재사용 차단"
+    if contract_state == "canonical_outputs_need_manifest":
+        return "T_* 6장 있음 · canonical manifest 생성 필요"
+    if contract_state == "canonical_manifest_invalid":
+        return "canonical manifest 오류"
+    if contract_state == "canonical":
+        return "PCG canonical T_* 6장 ✓"
     if output_paths:
         return (
             f"Cluster 출력 TGA 연결 {len(output_paths)}장"
@@ -789,6 +810,13 @@ def leaf_target_connection_complete(target):
 def leaf_source_step2_state(source):
     """Summarize blend generation and final-SK Generator connection."""
     has_blend = bool(source.get("atlas_blends"))
+    source_contract_state = str(
+        source.get("texture_contract_state") or ""
+    )
+    source_blocked = (
+        not has_blend
+        and source_contract_state.startswith("blocked_")
+    )
     targets = [
         target for target in source.get("targets", []) if target.get("spm")
     ]
@@ -816,9 +844,11 @@ def leaf_source_step2_state(source):
         "connection_required": connection_required,
         "connection_complete": connection_complete,
         "complete": has_blend and connection_complete,
-        "needs_build": not has_blend,
+        "needs_build": not has_blend and not source_blocked,
         "needs_connection": has_blend and connection_required
         and not connection_complete,
+        "source_blocked": source_blocked,
+        "source_contract_state": source_contract_state,
         "targets": targets,
     }
 
@@ -1633,7 +1663,7 @@ class App:
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
-                persist_cluster_assembly_receipts(report)
+                persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -1657,6 +1687,14 @@ class App:
             self._set_busy(False)
         else:
             self.report = report
+            persistence = (
+                report.get("cluster_assembly_receipt_persistence") or {}
+            )
+            if persistence.get("status") == "warning":
+                self.log(
+                    "[검사 경고] live audit는 완료됐지만 Cluster receipt "
+                    f"저장에 실패했습니다: {persistence.get('error', '')}"
+                )
             self.texplan_cache.clear()
             if not hasattr(self, "texplan_errors"):
                 self.texplan_errors = {}
@@ -1755,7 +1793,7 @@ class App:
                     load_pcg_targets() if use_pcg_targets else None
                 )
                 report = make_report(cfg, pcg_targets=pcg_targets)
-                persist_cluster_assembly_receipts(report)
+                persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -1781,6 +1819,14 @@ class App:
         else:
             self.report = report
             self.sync_state = sync_state
+            persistence = (
+                report.get("cluster_assembly_receipt_persistence") or {}
+            )
+            if persistence.get("status") == "warning":
+                self.log(
+                    "[검사 경고] live audit는 완료됐지만 Cluster receipt "
+                    f"저장에 실패했습니다: {persistence.get('error', '')}"
+                )
             self.texplan_cache.clear()
             if not hasattr(self, "texplan_errors"):
                 self.texplan_errors = {}
@@ -1814,7 +1860,7 @@ class App:
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
-                persist_cluster_assembly_receipts(report)
+                persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -2268,6 +2314,7 @@ class App:
         complete = sum(1 for state in states if state["complete"])
         builds = sum(1 for state in states if state["needs_build"])
         connects = sum(1 for state in states if state["needs_connection"])
+        blocked = sum(1 for state in states if state["source_blocked"])
         targets = {
             target.get("spm", "").lower()
             for source in sources for target in source.get("targets", [])
@@ -2280,6 +2327,8 @@ class App:
             parts.append(f"현재 연결 완료 {complete}세트")
         if builds:
             parts.append(f"새로 만들기 {builds}세트")
+        if blocked:
+            parts.append(f"원본 차단 {blocked}세트")
         if connects:
             parts.append(f"기존 매쉬 연결 {connects}세트")
         if targets:
@@ -3042,6 +3091,34 @@ class App:
                         missing.append("알파")
                     skipped.append((item, base, f"{'/'.join(missing)} 원본 파일 없음"))
                     continue
+                if not audited_blend:
+                    declarations = atlas_provisional_source_declarations(
+                        item.get("folder") or ""
+                    )
+                    blocked_sources = []
+                    for role, path in (
+                        ("Albedo", albedo),
+                        ("Alpha", alpha),
+                    ):
+                        blocked_state = _unsafe_provisional_source(
+                            path,
+                            asset_root=item.get("folder") or "",
+                            source_texture_roots=(
+                                self.cfg.get("source_texture_roots") or []
+                            ),
+                            declared_source_paths=declarations,
+                        )
+                        if blocked_state:
+                            blocked_sources.append(
+                                f"{role}={path} ({blocked_state})"
+                            )
+                    if blocked_sources:
+                        skipped.append((
+                            item,
+                            base,
+                            "원본 차단: " + "; ".join(blocked_sources),
+                        ))
+                        continue
 
                 pending_targets = pending_leaf_targets(source) if connect_spm else []
                 target_errors = []
@@ -3219,7 +3296,10 @@ class App:
                     graph_needs_update = sbs_auto.managed_graph_resolution_state(
                         job["sbs"], job["graph"])["needs_update"]
                 source_needs_repair = job_needs_source_repair(job)
-                complete = complete_output_set(row, expected_pixels=expected_pixels)
+                canonical_row = dict(row)
+                canonical_row["texture_dir"] = job["out_dir"]
+                complete = complete_output_set(
+                    canonical_row, expected_pixels=expected_pixels)
                 if force_rerender:
                     job["force_cluster_recook"] = True
                 if (complete and not force_rerender
@@ -3245,20 +3325,29 @@ class App:
         """Collect complete selected sets, including rows that need no render."""
         files = []
         seen = set()
+        manifest_rows = []
         for _item, row in self._checked_texplan_rows():
-            texture_dir = row.get("texture_dir")
+            texture_dir = (
+                canonical_texture_root(row["folder"])
+                if row.get("folder")
+                else row.get("texture_dir")
+            )
             texture_base = row.get("texture_base") or row.get("atlas_base")
             if not texture_dir or not texture_base:
                 continue
             paths = output_paths(texture_dir, texture_base)
             selected = [paths[role] for role in sbs_auto.RENDER_MAPS]
-            if not all(path.is_file() and path.stat().st_size > 0 for path in selected):
+            canonical_row = dict(row)
+            canonical_row["texture_dir"] = str(texture_dir)
+            if not complete_output_set(canonical_row):
                 continue
+            manifest_rows.append((row, [str(path) for path in selected]))
             for path in selected:
                 key = os.path.normcase(os.path.abspath(str(path)))
                 if key not in seen:
                     seen.add(key)
                     files.append(str(path))
+        self._pending_step3_manifest_rows = manifest_rows
         return files
 
     def _sync_pending_texture_files(
@@ -3318,6 +3407,7 @@ class App:
         return errors
 
     def start_step3_force(self):
+        self._pending_step3_manifest_rows = []
         if not self.report:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 전체 재추출을 다시 실행하세요.")
@@ -3519,7 +3609,33 @@ class App:
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
         sync_deferred = None
-        sync_candidates = list(sync_files or [])
+        sync_candidates = []
+        pending_manifest_rows = list(
+            getattr(self, "_pending_step3_manifest_rows", []) or []
+        )
+        self._pending_step3_manifest_rows = []
+        if pending_manifest_rows:
+            for row, files in pending_manifest_rows:
+                try:
+                    manifest = record_canonical_output(
+                        row,
+                        files,
+                        producer_source=(
+                            f"{row.get('m_graph_sbs') or ''}"
+                            f"#{row.get('m_graph') or row.get('texture_base') or ''}"
+                        ),
+                    )
+                    sync_candidates.extend(files)
+                    self._ui(lambda path=manifest: self.log(
+                        f"[③ canonical manifest] {path}"
+                    ))
+                except Exception as exc:
+                    failed += 1
+                    self._ui(lambda e=exc: self.log(
+                        f"[③ canonical manifest 실패] {e}"
+                    ))
+        else:
+            sync_candidates.extend(sync_files or [])
         total = len(jobs)
         timeout = self.cfg.get("sbsrender_timeout", 1800)
         for index, job in enumerate(jobs, 1):
@@ -3550,7 +3666,7 @@ class App:
                     str(Path(path).parent) for path in affected_spms
                 }, key=os.path.normcase)
                 report = make_report(self.cfg, targets=affected_folders)
-                persist_cluster_assembly_receipts(report)
+                persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
                 exact_plan = dict(plan)

@@ -450,6 +450,181 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertFalse(repeat.changed)
             self.assertFalse(any(result.copied_assets for result in repeat.base_results))
 
+    def test_cloned_generator_uses_atlas_authored_binding_not_managed_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+
+            master_root = ET.fromstring(make_master())
+            source_generator = next(
+                item
+                for item in master_root.findall("./Generators/Generator")
+                if item.findtext("GUID") == "leaf-mesh-b"
+            )
+            source_properties = source_generator.find("Properties")
+            source_properties.append(
+                ET.fromstring(
+                    "<Property><Name>Leaves:Type</Name>"
+                    "<MultiPropertyChildren>2</MultiPropertyChildren>"
+                    "</Property>"
+                )
+            )
+            source_properties.append(
+                ET.fromstring(
+                    property_xml("Leaves:Type:0:Mesh", "20")
+                )
+            )
+            source_properties.append(
+                ET.fromstring(
+                    property_xml("Leaves:Type:1:Material", "12")
+                )
+            )
+            source_properties.append(
+                ET.fromstring(
+                    property_xml("Leaves:Type:1:Mesh", "21")
+                )
+            )
+            source_properties.append(
+                ET.fromstring(
+                    property_xml("Leaves:Type:1:Weight", "1")
+                )
+            )
+            source_material = (
+                '<Assets><Material_v8 ID="12" Name="M_cluster_test">'
+                "<CutoutMeshID>20</CutoutMeshID>"
+                '<SupplementalCutoutMeshIDs Count="1">'
+                '<CutoutMesh ID="21" />'
+                "</SupplementalCutoutMeshIDs></Material_v8>"
+                '<Mesh ID="18" Name="authored_01" />'
+                '<Mesh ID="19" Name="authored_02" />'
+                '<Mesh ID="20" Name="managed_01" />'
+                '<Mesh ID="21" Name="managed_02" /></Assets>'
+            )
+            master_text = ET.tostring(master_root, encoding="unicode")
+            master_text = master_text.replace(
+                "<Generators>",
+                source_material + "<Generators>",
+                1,
+            )
+
+            target_material = (
+                '<Assets><Material_v8 ID="14" Name="M_cluster_test">'
+                "<CutoutMeshID>30</CutoutMeshID>"
+                '<SupplementalCutoutMeshIDs Count="1">'
+                '<CutoutMesh ID="31" />'
+                "</SupplementalCutoutMeshIDs></Material_v8>"
+                '<Mesh ID="30" Name="target_authored_01" />'
+                '<Mesh ID="31" Name="target_authored_02" /></Assets>'
+            )
+            target_text = make_target().replace(
+                "<Generators>",
+                target_material + "<Generators>",
+                1,
+            )
+            write_spm(master, master_text)
+            write_spm(target, target_text)
+
+            manifest = {
+                "spm": str(master),
+                "source_material_adoption": {
+                    "material_id": 12,
+                    "original_mesh_ids": [18, 19],
+                },
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [
+                        {
+                            "generator_guid": "leaf-mesh-b",
+                            "generator_name": "Leaf 2",
+                            "slot_prefix": "Leaves:Type:0",
+                            "source_material_id": 12,
+                            "source_material_name": "M_cluster_test",
+                            "source_mesh_id": 18,
+                            "target_material_id": 12,
+                            "target_mesh_id": 20,
+                            "created_slot": False,
+                        },
+                        {
+                            "generator_guid": "leaf-mesh-b",
+                            "generator_name": "Leaf 2",
+                            "slot_prefix": "Leaves:Type:1",
+                            "source_material_id": 12,
+                            "source_material_name": "M_cluster_test",
+                            "source_mesh_id": 19,
+                            "target_material_id": 12,
+                            "target_mesh_id": 21,
+                            "created_slot": True,
+                            "variant_parent_property": "Leaves:Type",
+                            "variant_parent_children_before": 1,
+                            "created_property_names": [
+                                "Leaves:Type:1:Material",
+                                "Leaves:Type:1:Mesh",
+                                "Leaves:Type:1:Weight",
+                            ],
+                        },
+                    ],
+                },
+            }
+            manifest_dir = folder / ".atlas_leaf_speedtree_targets"
+            manifest_dir.mkdir()
+            (manifest_dir / "tree_01.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+
+            plan = sync.build_sync_plan(master, target, mapping)
+            patched = sync.SPMDocument(
+                target,
+                plan.patched_text,
+                plan.compressed,
+                full=True,
+            )
+            added_leaf = next(
+                detail
+                for result in plan.base_results
+                for detail in result.added_node_details
+                if detail["name"] == "Leaf 2"
+            )
+            clone = patched.by_guid[added_leaf["guid"]]
+
+            self.assertEqual(
+                property_value(clone, "Leaves:Type:0:Material"),
+                "14",
+            )
+            self.assertEqual(
+                property_value(clone, "Leaves:Type:0:Mesh"),
+                "30",
+            )
+            self.assertIsNone(
+                property_value(clone, "Leaves:Type:1:Material")
+            )
+            self.assertIsNone(
+                property_value(clone, "Leaves:Type:1:Mesh")
+            )
+            parent = next(
+                prop
+                for prop in clone.findall("./Properties/Property")
+                if prop.findtext("Name") == "Leaves:Type"
+            )
+            self.assertEqual(
+                parent.findtext("MultiPropertyChildren"),
+                "1",
+            )
+            copied_names = {
+                item["name"]
+                for result in plan.base_results
+                for item in result.copied_assets
+            }
+            self.assertNotIn("managed_01", copied_names)
+            self.assertNotIn("managed_02", copied_names)
+
     def test_scale_risk_uses_tree_radius_and_blocks_dangerous_apply(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -504,6 +679,35 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(original.read_bytes(), original_bytes)
             self.assertTrue(seen)
             self.assertFalse(seen[0].exists())
+
+    def test_speedtree_verify_rejects_texture_writing_before_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            spm = folder / "tree_02.spm"
+            executable = folder / "SpeedTree_Modeler.exe"
+            options = folder / "Options_HI_Xml.ini"
+            write_spm(spm, make_target())
+            executable.write_bytes(b"fake-speedtree")
+            options.write_text(
+                "[Options]\n"
+                "Filetype=SpeedTree XML (*.xml)\n"
+                "TextureSkipWriting=false\n",
+                encoding="utf-8",
+            )
+            spm_before = spm.read_bytes()
+            options_before = options.read_bytes()
+
+            with mock.patch.object(sync.subprocess, "run") as run:
+                with self.assertRaisesRegex(
+                    RuntimeError, "TextureSkipWriting=false"
+                ):
+                    sync.verify_speedtree_export(
+                        spm, executable, options
+                    )
+
+            run.assert_not_called()
+            self.assertEqual(spm.read_bytes(), spm_before)
+            self.assertEqual(options.read_bytes(), options_before)
 
     def test_auto_copy_verification_keeps_follower_extra_out_of_master_plan(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -50,6 +50,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
+if str(BATCH_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(BATCH_TOOLS_DIR))
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sk_common import (
@@ -67,6 +71,7 @@ from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
     spm_container_format,
 )
+from speedtree_export_options_contract import require_texture_skip_writing
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
@@ -1983,6 +1988,10 @@ def recover_interrupted_calibration(spm_path):
 
 
 def export_verify_xml(spm_path, cfg, out_path):
+    require_texture_skip_writing(
+        cfg["xml_ini"],
+        purpose=f"{Path(spm_path).name} verification XML export",
+    )
     cmd = [
         cfg["speedtree_exe"],
         str(spm_path),
@@ -2005,6 +2014,10 @@ def export_verify_xml(spm_path, cfg, out_path):
 
 
 def export_verify_fbx_geometry(spm_path, cfg, out_path):
+    require_texture_skip_writing(
+        cfg["fbx_ini"],
+        purpose=f"{Path(spm_path).name} verification FBX export",
+    )
     cmd = [
         cfg["speedtree_exe"],
         str(spm_path),

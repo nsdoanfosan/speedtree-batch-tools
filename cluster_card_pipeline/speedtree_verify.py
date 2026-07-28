@@ -10,6 +10,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from speedtree_export_options_contract import require_texture_skip_writing
 from .contract import (
     ContractError,
     _fingerprint,
@@ -21,6 +22,10 @@ from .contract import (
 
 def _run_export(executable, spm, options, output, timeout):
     output = Path(output)
+    require_texture_skip_writing(
+        options,
+        purpose=f"{Path(spm).name} Cluster card verification export",
+    )
     if output.exists():
         output.unlink()
     command = [str(executable), str(spm), "-export_options", str(options), "-export", str(output)]

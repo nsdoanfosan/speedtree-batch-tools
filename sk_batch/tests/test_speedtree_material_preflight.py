@@ -98,6 +98,127 @@ def write_stmat(spm, material_names):
 
 
 class SpeedTreeMaterialPreflightTests(unittest.TestCase):
+    def test_raw_source_is_structured_provisional_until_pcg_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "tree_test" / "SK_tree_test.spm"
+            spm.parent.mkdir()
+            write_spm(spm)
+            source_root = root / "Texture"
+            source_root.mkdir()
+            albedo = source_root / "TCom_leaf_albedo.tif"
+            opacity = source_root / "TCom_leaf_opacity.tif"
+            albedo.write_bytes(b"albedo")
+            opacity.write_bytes(b"opacity")
+            stmat = spm.parent / "fbx" / "SK_tree_test.stmat"
+            stmat.parent.mkdir()
+            self._write_raw_stmat(
+                stmat,
+                "M_leaf_grass_dead_Mat",
+                {"Color": albedo, "Opacity": opacity},
+            )
+
+            result = preflight.augment_texture_readiness_contract(
+                preflight.resolve_texture_bindings(stmat),
+                stmat,
+                spm,
+                source_texture_roots=[source_root],
+            )
+
+            self.assertEqual(
+                result["status"],
+                "source_fallback_needs_pcg_generation",
+            )
+            self.assertEqual(result["missing"], [])
+            warning = result["warnings"][0]
+            self.assertEqual(
+                set(warning["expected_t_paths"]),
+                set(REQUIRED_TEXTURE_ROLES),
+            )
+            self.assertEqual(
+                warning["expected_texture_base"],
+                "T_leaf_grass_dead",
+            )
+            self.assertIn("PCG ST9 Texture", warning["remediation"])
+            self.assertEqual(
+                result["bindings"][0]["texture_contract_status"],
+                "source_fallback_needs_pcg_generation",
+            )
+            self.assertEqual(
+                result["bindings"][0]["origin_state"],
+                "source_fallback_needs_pcg_generation",
+            )
+            issues = preflight.preflight_contract_issues({
+                "texture_readiness_contract": result,
+            })
+            self.assertEqual(
+                issues[0]["code"],
+                "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
+            )
+            self.assertEqual(issues[0]["severity"], "warning")
+
+    def test_fbx_copy_is_blocked_instead_of_becoming_provisional(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "tree_test"
+            spm = asset / "SK_tree_test.spm"
+            asset.mkdir()
+            write_spm(spm)
+            source_root = root / "Texture"
+            source_root.mkdir()
+            copied = asset / "fbx" / "TCom_leaf_albedo.tif"
+            copied.parent.mkdir()
+            copied.write_bytes(b"copied")
+            stmat = asset / "fbx" / "SK_tree_test.stmat"
+            self._write_raw_stmat(
+                stmat,
+                "M_leaf_grass_dead_Mat",
+                {"Color": copied},
+            )
+
+            result = preflight.augment_texture_readiness_contract(
+                preflight.resolve_texture_bindings(stmat),
+                stmat,
+                spm,
+                source_texture_roots=[source_root],
+            )
+
+            self.assertEqual(result["status"], "incomplete")
+            self.assertEqual(
+                result["missing"][0]["reason"],
+                "provisional_source_blocked",
+            )
+            self.assertEqual(
+                result["missing"][0]["source_rejections"][0]["state"],
+                "blocked_cache_source",
+            )
+            self.assertEqual(
+                result["missing"][0]["source_rejections"][0]["path"],
+                str(copied.resolve()),
+            )
+
+    @staticmethod
+    def _write_raw_stmat(path, material_name, maps):
+        root = ET.Element("SpeedTreeMaterials")
+        material = ET.SubElement(
+            root,
+            "Material",
+            ID="1",
+            Name=material_name,
+        )
+        for map_name, source in maps.items():
+            ET.SubElement(
+                material,
+                "Map",
+                Name=map_name,
+                Source=str(source),
+            )
+        ET.ElementTree(root).write(
+            path,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
     def test_marker_only_atlas_ownership_emits_the_shadow_issue(self):
         issues = preflight.preflight_contract_issues({
             "spm": "SK_atlas.spm",
@@ -180,6 +301,82 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                     for intent in envelope["material_intents"]
                 )
             )
+
+    def test_main_returns_success_with_structured_provisional_warning(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "tree_test"
+            asset.mkdir()
+            spm = asset / "SK_tree_test.spm"
+            report_path = root / "report.json"
+            write_spm(spm)
+            source_root = root / "Texture"
+            source_root.mkdir()
+            albedo = source_root / "TCom_leaf_albedo.tif"
+            albedo.write_bytes(b"albedo")
+            stmat = asset / "fbx" / "SK_tree_test.stmat"
+            stmat.parent.mkdir()
+            document = ET.Element("SpeedTreeMaterials")
+            for index, name in enumerate(
+                ("M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"),
+                1,
+            ):
+                material = ET.SubElement(
+                    document,
+                    "Material",
+                    ID=str(index),
+                    Name=name,
+                )
+                ET.SubElement(
+                    material,
+                    "Map",
+                    Name="Color",
+                    Source=str(albedo),
+                )
+            ET.ElementTree(document).write(
+                stmat,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+            now = max(spm.stat().st_mtime_ns, stmat.stat().st_mtime_ns)
+            os.utime(spm, ns=(now, now))
+            os.utime(stmat, ns=(now + 1, now + 1))
+
+            with mock.patch.object(
+                preflight,
+                "load_pcg_texture_config",
+                return_value={
+                    "source_texture_roots": [str(source_root)]
+                },
+            ):
+                exited, export_mock = self.run_preflight(
+                    spm,
+                    report_path,
+                )
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "ok")
+            readiness = report["texture_readiness_contract"]
+            self.assertEqual(
+                readiness["status"],
+                "source_fallback_needs_pcg_generation",
+            )
+            self.assertEqual(len(readiness["warnings"]), 2)
+            issues = report["speedtree_pipeline_contract"]["issues"]
+            self.assertEqual(
+                {
+                    issue["code"] for issue in issues
+                    if issue["severity"] == "warning"
+                },
+                {"TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION"},
+            )
+            self.assertTrue(all(
+                set(warning["expected_t_paths"])
+                == set(REQUIRED_TEXTURE_ROLES)
+                for warning in readiness["warnings"]
+            ))
 
     def test_missing_mesh_file_blocks_before_speedtree_export(self):
         with tempfile.TemporaryDirectory() as temporary:

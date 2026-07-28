@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -45,6 +46,47 @@ from spm_texture_normalize import (
     jobs_from_texture_plan,
     normalize_spms_transactionally,
 )
+
+
+def write_physical_capture_manifest(manifest, role_paths):
+    contract_sha256 = hashlib.sha256(
+        str(manifest).encode("utf-8")
+    ).hexdigest()
+    maps = []
+    for role, path in role_paths:
+        path = Path(path)
+        maps.append({
+            "role": role,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "physical_capture_contract_sha256": contract_sha256,
+        })
+    manifest.write_text(json.dumps({
+        "kind": "speedtree_cluster_blender_auto_capture",
+        "version": 2,
+        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "direct_uv_source": "same_blender_physical_capture_projection",
+        "physical_capture_contract_sha256": contract_sha256,
+        "maps": maps,
+        "physical_capture_contract": {
+            "kind": "speedtree_cluster_physical_capture_fit",
+            "version": 1,
+            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "direct_uv_source":
+                "same_blender_physical_capture_projection",
+            "capture_manifest": str(manifest),
+            "capture_maps": [
+                {
+                    "role": row["role"],
+                    "path": row["path"],
+                    "sha256": row["sha256"],
+                }
+                for row in maps
+            ],
+            "contract_sha256": contract_sha256,
+        },
+    }), encoding="utf-8")
+    return contract_sha256
 
 
 class TargetCollectionTests(unittest.TestCase):
@@ -971,6 +1013,162 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual([item["atlas_base"] for item in items], ["M_used"])
             self.assertEqual(items[0]["texture_base"], "T_used")
 
+    def test_canonical_cluster_provider_materials_reach_texture_plan_and_spm_jobs(self):
+        def write_spm(
+                path, material_id, material_name, source, *, hidden=False):
+            hidden_xml = "<Hidden>true</Hidden>" if hidden else ""
+            xml = (
+                '<SpeedTree><Materials>'
+                f'<Material_v8 ID="{material_id}" Name="{material_name}">'
+                '<Map Name="Color">'
+                f'<TexFilename>{source}</TexFilename>'
+                '</Map>'
+                '</Material_v8></Materials><Generators><Generator>'
+                f'{hidden_xml}'
+                '<Properties>'
+                '<Property><Name>Leaves:Material</Name>'
+                f'<Value>{material_id}</Value></Property>'
+                '</Properties></Generator></Generators></SpeedTree>'
+            ).encode()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "wb") as handle:
+                handle.write(xml)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = self._image(root / "source" / "leaf_albedo.tif")
+            owner = root / "SK_tree_test_01.spm"
+            provider = root / "Cluster" / "SK_leaf_test_01.spm"
+            bake_source = self._image(
+                root / "Cluster" / "cluster_leaf_bake_color.tga")
+            write_physical_capture_manifest(
+                root
+                / "Cluster"
+                / "cluster_leaf_bake_color_auto_capture_manifest.json",
+                [("Color", bake_source)],
+            )
+            bake_provider = (
+                root / "Cluster" / "SK_cluster_leaf_bake_01.spm")
+            write_spm(owner, "1", "M_bark_test", source)
+            write_spm(
+                provider, "7", "M_leaf_test", source, hidden=True)
+            write_spm(
+                bake_provider,
+                "11",
+                "M_cluster_leaf_bake",
+                bake_source,
+                hidden=True,
+            )
+            items = material_texture_items(
+                root,
+                {
+                    "atlas_root": str(root / "atlas"),
+                    "required_export_maps": list(sbs_auto.RENDER_MAPS),
+                    "source_texture_roots": [str(root / "source")],
+                },
+                [root / "texture"],
+                {},
+                preserved_definitions={},
+                provider_spms=[provider, bake_provider],
+            )
+
+            leaf = next(
+                item for item in items
+                if item["texture_base"] == "T_leaf_test"
+            )
+            self.assertEqual(
+                leaf["texture_contract_state"],
+                "source_fallback_needs_pcg_generation",
+            )
+            self.assertEqual(
+                {target["spm"] for target in leaf["material_targets"]},
+                {str(provider)},
+            )
+            bake = next(
+                item for item in items
+                if item.get("origin_kind") == "blender_cluster_bake"
+            )
+            self.assertEqual(
+                bake["texture_contract_state"],
+                "blender_cluster_bake",
+            )
+            self.assertEqual(
+                bake["material_targets"],
+                [{
+                    "spm": str(bake_provider),
+                    "material_id": "11",
+                    "material_name": "M_cluster_leaf_bake",
+                    "source_signature": [
+                        str(bake_source).lower(),
+                    ],
+                }],
+            )
+
+            report = {
+                "items": [{
+                    "name": root.name,
+                    "folder": str(root),
+                    "status": "needs_texture_work",
+                    "chosen_spm": str(owner),
+                    "sbs_files": [],
+                    "texture_dir": str(root / "texture"),
+                    "normal_convention": "unknown",
+                    "ao_policy": "",
+                    "sdf_policy": "",
+                    "actions": [],
+                    "leaf_mesh_sources": [],
+                    "cluster_items": items,
+                }],
+                "pcg_targets": {},
+                "config": {},
+            }
+            plan = build_texture_plan_from_report(report)
+            planned_leaf = next(
+                row for row in plan["items"]
+                if row["texture_base"] == "T_leaf_test"
+            )
+            self.assertEqual(
+                {target["spm"] for target in planned_leaf["material_targets"]},
+                {str(provider)},
+            )
+            planned_bake = next(
+                row for row in plan["items"]
+                if row.get("origin_kind") == "blender_cluster_bake"
+            )
+            self.assertEqual(
+                planned_bake["texture_contract_state"],
+                "blender_cluster_bake",
+            )
+            self.assertEqual(
+                planned_bake["export_status"],
+                "preserved_cluster_bake",
+            )
+            spm_jobs = jobs_from_texture_plan(plan)
+            self.assertIn(
+                str(provider),
+                {job["spm"] for job in spm_jobs},
+            )
+            bake_job = next(
+                job for job in spm_jobs
+                if job["spm"] == str(bake_provider)
+            )
+            self.assertEqual(
+                bake_job["materials"],
+                {
+                    "@id:11": {
+                        "mode": "preserve_source",
+                        "source_spm": str(bake_provider),
+                    },
+                },
+            )
+            self.assertFalse(
+                build_spm_patch(
+                    bake_provider,
+                    bake_job["materials"],
+                    require_outputs=False,
+                )["changed"],
+            )
+
     def test_active_collection_classifications_share_one_atlas_texture_job(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1856,6 +2054,21 @@ class SourceSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "cluster").mkdir()
+            capture_paths = []
+            for role, suffix in (
+                ("Color", ""),
+                ("Opacity", "_Opacity"),
+                ("Normal", "_Normal"),
+            ):
+                path = root / "cluster" / f"branch_01{suffix}.tga"
+                path.write_bytes(role.encode("ascii"))
+                capture_paths.append((role, path))
+            write_physical_capture_manifest(
+                root
+                / "cluster"
+                / "branch_01_auto_capture_manifest.json",
+                capture_paths,
+            )
             source_maps = "".join([
                 map_template.format(name="Color", value="1", filename="cluster/branch_01.tga"),
                 map_template.format(name="Opacity", value="1", filename="cluster/branch_01_Opacity.tga"),
@@ -1899,10 +2112,110 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(slots["color"]["filename"], "cluster/branch_01.tga")
             self.assertEqual(slots["opacity"]["filename"], "cluster/branch_01_Opacity.tga")
             self.assertTrue(slots["opacity"]["enabled"] == "true")
-            self.assertTrue(is_cluster_render_material(
+            self.assertFalse(is_cluster_render_material(
                 root,
                 sk,
                 [r"..\shared_asset\cluster\branch_shared_01.tga"],
+            ))
+
+    def test_cluster_bake_live_receipt_binds_spm_material_slots_and_maps(self):
+        map_template = (
+            '<Map Name="{name}"><TexFilename>{filename}</TexFilename>'
+            '<TexEnabled>true</TexEnabled></Map>'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cluster = root / "cluster"
+            cluster.mkdir()
+            role_paths = []
+            refs = []
+            for role, suffix in (
+                ("Color", ""),
+                ("Opacity", "_Opacity"),
+                ("Normal", "_Normal"),
+            ):
+                path = cluster / f"branch_exact_01{suffix}.tga"
+                path.write_bytes(role.encode("ascii"))
+                role_paths.append((role, path))
+                refs.append(f"cluster/{path.name}")
+            manifest = (
+                cluster / "branch_exact_01_auto_capture_manifest.json"
+            )
+            write_physical_capture_manifest(manifest, role_paths)
+            maps = "".join(
+                map_template.format(name=role, filename=ref)
+                for (role, _path), ref in zip(role_paths, refs)
+            )
+            spm = root / "tree_exact.spm"
+            with gzip.open(spm, "wb") as handle:
+                handle.write((
+                    '<SpeedTree><Materials>'
+                    '<Material_v8 ID="7" Name="M_branch_exact">'
+                    f"{maps}</Material_v8>"
+                    '</Materials></SpeedTree>'
+                ).encode())
+
+            receipt = pcg_texture_audit.cluster_render_origin_receipt(
+                root,
+                spm,
+                refs,
+                material_id="7",
+                material_name="M_branch_exact",
+            )
+            self.assertEqual(receipt["source_spm"], str(spm.resolve()))
+            self.assertEqual(receipt["material_id"], "7")
+            self.assertEqual(receipt["material_name"], "M_branch_exact")
+            self.assertEqual(
+                [row["role"] for row in receipt["slot_rows"]],
+                ["color", "opacity", "normal"],
+            )
+            self.assertTrue(all(
+                len(row["sha256"]) == 64 for row in receipt["slot_rows"]
+            ))
+
+            entry = {
+                "origin_kind": "blender_cluster_bake",
+                "cluster_spm": str(spm),
+                "material_targets": [{
+                    "spm": str(spm),
+                    "material_id": "7",
+                    "material_name": "M_branch_exact",
+                }],
+                "material_names": ["M_branch_exact"],
+                "source_refs": refs,
+                "missing_export_maps": list(sbs_auto.RENDER_MAPS),
+            }
+            self.assertEqual(
+                pcg_texture_audit.texture_output_contract_state(
+                    entry,
+                    root,
+                ),
+                "blender_cluster_bake",
+            )
+            self.assertEqual(
+                entry["origin_receipt"]["slot_rows"],
+                receipt["slot_rows"],
+            )
+            self.assertFalse(pcg_texture_audit.cluster_render_origin_receipt(
+                root,
+                spm,
+                refs,
+                material_id="7",
+                material_name="M_wrong_material",
+            ))
+
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["maps"][1]["role"] = "Normal"
+            payload["physical_capture_contract"]["capture_maps"][1][
+                "role"
+            ] = "Normal"
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(pcg_texture_audit.cluster_render_origin_receipt(
+                root,
+                spm,
+                refs,
+                material_id="7",
+                material_name="M_branch_exact",
             ))
 
     def test_normalized_subsurface_activation_is_idempotent(self):
@@ -2394,6 +2707,42 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(app.populate.call_count, 2)
         self.assertEqual(app._update_summary.call_count, 2)
         self.assertIsNone(app.worker)
+
+    def test_initial_refresh_keeps_live_report_when_receipt_persistence_warns(self):
+        report = {
+            "items": [],
+            "cluster_assembly_receipt_persistence": {
+                "status": "warning",
+                "error": (
+                    "ClusterAssemblyReceiptStaleError: Persisted physical "
+                    "normalization source does not match its Cluster dependency"
+                ),
+            },
+        }
+        app = self.gui.App.__new__(self.gui.App)
+        app.worker = mock.Mock()
+        app._initial_refreshing = True
+        app._pending_refresh = False
+        app.report = None
+        app.texplan_cache = {"stale": []}
+        app.texplan_errors = {"stale": "error"}
+        app.sync_state = {"migration_complete": True}
+        app.status_var = mock.Mock()
+        app._set_busy = mock.Mock()
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+        app._start_sync_state_migration = mock.Mock()
+        app.log = mock.Mock()
+
+        with mock.patch.object(self.gui.messagebox, "showerror") as showerror:
+            app._initial_refresh_done(report)
+
+        showerror.assert_not_called()
+        self.assertIs(app.report, report)
+        app.populate.assert_called_once_with()
+        app._update_summary.assert_called_once_with()
+        app._start_sync_state_migration.assert_called_once_with()
+        self.assertIn("live audit는 완료", app.log.call_args.args[0])
 
     def test_manual_refresh_runs_audit_in_worker(self):
         class FakeRoot:
@@ -3467,6 +3816,184 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(jobs, [])
         self.assertEqual(len(skipped), 1)
         self.assertIn("알베도/알파 원본 파일 없음", skipped[0][2])
+
+    def test_step2_accepts_provisional_original_atlas_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            atlas = root / "atlas"
+            atlas.mkdir()
+            source_root = root / "Texture"
+            source_root.mkdir()
+            albedo = source_root / "TCom_leaf_albedo.tif"
+            alpha = source_root / "TCom_leaf_opacity.tif"
+            albedo.write_bytes(b"source")
+            alpha.write_bytes(b"source")
+            item = {
+                "name": "tree_atlas_source",
+                "leaf_mesh_sources": [{
+                    "atlas_base": "M_leaf_atlas_source",
+                    "albedo": albedo,
+                    "alpha": alpha,
+                    "atlas_blends": [],
+                    "targets": [],
+                    "texture_contract_state":
+                        "source_fallback_needs_pcg_generation",
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {
+                "atlas_root": str(atlas),
+                "source_texture_roots": [str(source_root)],
+            }
+            app.items = {
+                "tree_atlas_source": {"checked": True, "item": item},
+            }
+
+            jobs, skipped = app._step2_jobs(connect_spm=False)
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(jobs), 1)
+        self.assertFalse(jobs[0]["reuse_existing_blend"])
+        self.assertEqual(jobs[0]["albedo"], albedo)
+        self.assertEqual(jobs[0]["alpha"], alpha)
+
+    def test_step2_accepts_structured_asset_local_atlas_declaration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            atlas = root / "atlas"
+            atlas.mkdir()
+            asset = root / "tree_declared"
+            source_dir = asset / "source"
+            source_dir.mkdir(parents=True)
+            albedo = source_dir / "TCom_leaf_albedo.tif"
+            alpha = source_dir / "TCom_leaf_opacity.tif"
+            albedo.write_bytes(b"source")
+            alpha.write_bytes(b"source")
+            material = "M_leaf_declared"
+            texture_base = "T_leaf_declared"
+            warning = "PCG ST9 Texture generation is required."
+            remediation = "Generate and export in PCG ST9 Texture."
+            source_paths = {
+                "albedo": str(albedo),
+                "alpha": str(alpha),
+            }
+            fallback = {
+                "texture_contract_status":
+                    "source_fallback_needs_pcg_generation",
+                "material": material,
+                "source_origin": "atlas_mesh_build_source",
+                "source_paths": source_paths,
+                "source_roles": sorted(source_paths),
+                "expected_t_paths": {
+                    role: str(
+                        asset
+                        / "texture"
+                        / f"{texture_base}_{role}.tga"
+                    )
+                    for role in sbs_auto.RENDER_MAPS
+                },
+                "expected_texture_base": texture_base,
+                "warning": warning,
+                "remediation": remediation,
+                "provisional_receipt": {
+                    "kind": "speedtree_texture_provisional_receipt",
+                    "version": 1,
+                    "status":
+                        "source_fallback_needs_pcg_generation",
+                    "source_origin": "atlas_mesh_build_source",
+                    "material": material,
+                    "target_spm": str(asset / "SK_tree_declared.spm"),
+                    "source_roles": sorted(source_paths),
+                    "warning": warning,
+                    "remediation": remediation,
+                    "canonical_promotion_required": True,
+                },
+            }
+            (asset / "speedtree_import_manifest.json").write_text(
+                json.dumps({
+                    "texture_contract_status":
+                        "source_fallback_needs_pcg_generation",
+                    "source_texture_fallbacks": [fallback],
+                }),
+                encoding="utf-8",
+            )
+            item = {
+                "name": "tree_declared",
+                "folder": str(asset),
+                "leaf_mesh_sources": [{
+                    "atlas_base": material,
+                    "albedo": albedo,
+                    "alpha": alpha,
+                    "atlas_blends": [],
+                    "targets": [],
+                    "texture_contract_state":
+                        "source_fallback_needs_pcg_generation",
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {"atlas_root": str(atlas)}
+            app.items = {
+                "tree_declared": {"checked": True, "item": item},
+            }
+
+            jobs, skipped = app._step2_jobs(connect_spm=False)
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["albedo"], albedo)
+        self.assertEqual(jobs[0]["alpha"], alpha)
+
+    def test_step2_blocks_export_or_cache_copies_before_blender(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            atlas = root / "atlas"
+            atlas.mkdir()
+            source_root = root / "Texture"
+            source_root.mkdir()
+            asset = root / "tree_test"
+            copied_root = asset / "fbx"
+            copied_root.mkdir(parents=True)
+            albedo = copied_root / "TCom_leaf_albedo.tif"
+            alpha = copied_root / "TCom_leaf_opacity.tif"
+            albedo.write_bytes(b"copy")
+            alpha.write_bytes(b"copy")
+            item = {
+                "name": "tree_copied_source",
+                "folder": str(asset),
+                "leaf_mesh_sources": [{
+                    "atlas_base": "M_leaf_copied_source",
+                    "albedo": albedo,
+                    "alpha": alpha,
+                    "atlas_blends": [],
+                    "targets": [],
+                    "texture_contract_state": "blocked_cache_source",
+                }],
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {
+                "atlas_root": str(atlas),
+                "source_texture_roots": [str(source_root)],
+            }
+            app.items = {
+                "tree_copied_source": {
+                    "checked": True,
+                    "item": item,
+                },
+            }
+
+            jobs, skipped = app._step2_jobs(connect_spm=False)
+
+        self.assertEqual(jobs, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("원본 차단", skipped[0][2])
+        self.assertIn("Albedo=", skipped[0][2])
+        self.assertIn(str(albedo), skipped[0][2])
+        self.assertIn("blocked_cache_source", skipped[0][2])
+        state = self.gui.leaf_source_step2_state(
+            item["leaf_mesh_sources"][0]
+        )
+        self.assertTrue(state["source_blocked"])
+        self.assertFalse(state["needs_build"])
 
     def test_step2_does_not_count_unverified_generator_result_as_success(self):
         with self.assertRaisesRegex(RuntimeError, "Generator Material/Mesh 연결 검증"):

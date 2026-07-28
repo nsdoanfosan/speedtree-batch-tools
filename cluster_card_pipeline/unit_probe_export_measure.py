@@ -7,8 +7,15 @@ import hashlib
 import json
 import statistics
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from speedtree_export_options_contract import require_texture_skip_writing
 
 
 class UnitProbeExportError(RuntimeError):
@@ -38,6 +45,10 @@ def _fingerprint(path):
 
 def _export(speedtree_exe, spm, options, output, timeout):
     output = Path(output).expanduser().resolve()
+    require_texture_skip_writing(
+        options,
+        purpose=f"{Path(spm).name} unit-probe XML export",
+    )
     if output.exists():
         output.unlink()
     command = [

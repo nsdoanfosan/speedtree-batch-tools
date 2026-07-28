@@ -50,6 +50,7 @@ if str(REPO_DIR) not in sys.path:
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
 from cluster_blend_sync import discover_cluster_blend_relations
+from speedtree_export_options_contract import require_texture_skip_writing
 
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
@@ -642,6 +643,58 @@ class SyncPlan:
         return lines
 
 
+def _path_identity(path: Path | str) -> str:
+    try:
+        value = Path(path).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        value = Path(str(path or ""))
+    return os.path.normcase(str(value))
+
+
+def _atlas_target_relation_manifest(spm_path: Path) -> dict:
+    """Load the one exact target-local Atlas relationship manifest, if any."""
+    manifest_dir = Path(spm_path).parent / ".atlas_leaf_speedtree_targets"
+    if not manifest_dir.is_dir():
+        return {}
+    target_key = _path_identity(spm_path)
+    matches = []
+    for path in sorted(manifest_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("spm")
+            and _path_identity(payload["spm"]) == target_key
+            and (payload.get("generator_connection") or {}).get("complete")
+        ):
+            matches.append(payload)
+    if len(matches) > 1:
+        raise SyncError(
+            "동일 SPM을 가리키는 Atlas target manifest가 여러 개입니다: "
+            f"{spm_path}"
+        )
+    return matches[0] if matches else {}
+
+
+def _material_cutout_ids(material: ET.Element | None) -> list[str]:
+    if material is None:
+        return []
+    values = []
+    primary = str(material.findtext("CutoutMeshID") or "").strip()
+    if primary and primary != "-1":
+        values.append(primary)
+    values.extend(
+        str(item.attrib.get("ID") or "").strip()
+        for item in material.findall(
+            "./SupplementalCutoutMeshIDs/CutoutMesh"
+        )
+        if str(item.attrib.get("ID") or "").strip() not in {"", "-1"}
+    )
+    return values
+
+
 class SPMDocument:
     def __init__(
         self,
@@ -667,6 +720,28 @@ class SPMDocument:
             "Material_v8": {}, "Mesh": {},
         }
         self.pending_asset_elements: list[ET.Element] = []
+        self.atlas_relation_manifest = (
+            _atlas_target_relation_manifest(self.path) if full else {}
+        )
+        self.atlas_relation_bindings: dict[tuple[str, str], dict] = {}
+        for binding in (
+            self.atlas_relation_manifest.get("generator_connection") or {}
+        ).get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            key = (
+                str(binding.get("generator_guid") or "").strip(),
+                str(binding.get("slot_prefix") or "").strip(),
+            )
+            if not all(key):
+                continue
+            previous = self.atlas_relation_bindings.get(key)
+            if previous is not None and previous != binding:
+                raise SyncError(
+                    "Atlas target manifest에 충돌하는 Generator binding이 "
+                    f"있습니다: {self.path.name} · {key[0]} · {key[1]}"
+                )
+            self.atlas_relation_bindings[key] = binding
         if full:
             self._index_assets(text)
         try:
@@ -1341,6 +1416,190 @@ def _asset_role(asset_name: str | None) -> str | None:
     return None
 
 
+def _atlas_binding_for_property(
+    source_document: SPMDocument,
+    source_generator: ET.Element,
+    property_name: str,
+) -> dict | None:
+    suffix = str(property_name or "").rsplit(":", 1)
+    if len(suffix) != 2 or suffix[1].casefold() not in {"material", "mesh"}:
+        return None
+    return source_document.atlas_relation_bindings.get(
+        (
+            source_document.generator_guid(source_generator),
+            suffix[0],
+        )
+    )
+
+
+def _target_material_id_by_exact_name(
+    target_document: SPMDocument,
+    material_name: str,
+) -> str:
+    matches = [
+        asset_id
+        for asset_id, name in target_document.asset_names_by_id[
+            "Material_v8"
+        ].items()
+        if name.casefold() == str(material_name).casefold()
+    ]
+    if len(matches) != 1:
+        raise SyncError(
+            "Atlas 관계 Generator를 follower에 추가하려면 원본 material이 "
+            "대상 SPM에서 정확히 하나여야 합니다: "
+            f"{target_document.path.name} · {material_name} · {len(matches)}개"
+        )
+    return matches[0]
+
+
+def _atlas_binding_target_local_value(
+    source_document: SPMDocument,
+    target_document: SPMDocument,
+    binding: dict,
+    kind: str,
+) -> str:
+    material_name = str(binding.get("source_material_name") or "").strip()
+    source_material_id = str(binding.get("source_material_id") or "").strip()
+    if not material_name or not source_material_id:
+        raise SyncError(
+            "Atlas 관계 출력 Generator의 원본 Material provenance가 "
+            "없어 follower에 안전하게 복제할 수 없습니다: "
+            f"{source_document.path.name} · "
+            f"{binding.get('generator_name')} · "
+            f"{binding.get('slot_prefix')}"
+        )
+    target_material_id = _target_material_id_by_exact_name(
+        target_document,
+        material_name,
+    )
+    if kind == "Material_v8":
+        return target_material_id
+
+    source_mesh_id = str(binding.get("source_mesh_id") or "").strip()
+    if source_mesh_id == "-10":
+        return source_mesh_id
+    if not source_mesh_id or source_mesh_id.startswith("-"):
+        raise SyncError(
+            "Atlas 관계 출력 Generator의 원본 Mesh provenance가 "
+            "없어 follower에 안전하게 복제할 수 없습니다: "
+            f"{source_document.path.name} · "
+            f"{binding.get('generator_name')} · "
+            f"{binding.get('slot_prefix')}"
+        )
+
+    adoption = source_document.atlas_relation_manifest.get(
+        "source_material_adoption"
+    ) or {}
+    if (
+        str(adoption.get("material_id") or "").strip()
+        == source_material_id
+    ):
+        source_cutouts = [
+            str(value)
+            for value in adoption.get("original_mesh_ids") or []
+        ]
+    else:
+        source_cutouts = _material_cutout_ids(
+            source_document.asset_elements_by_id["Material_v8"].get(
+                source_material_id
+            )
+        )
+    if source_mesh_id not in source_cutouts:
+        raise SyncError(
+            "Atlas 관계 manifest의 원본 Mesh가 source material cutout에 "
+            "없습니다: "
+            f"{source_document.path.name} · {material_name} · "
+            f"{source_mesh_id} not in {source_cutouts}"
+        )
+    ordinal = source_cutouts.index(source_mesh_id)
+    target_cutouts = _material_cutout_ids(
+        target_document.asset_elements_by_id["Material_v8"].get(
+            target_material_id
+        )
+    )
+    if ordinal >= len(target_cutouts):
+        raise SyncError(
+            "Atlas 관계 Generator의 원본 cutout ordinal을 follower "
+            "material에 적용할 수 없습니다: "
+            f"{target_document.path.name} · {material_name} · "
+            f"ordinal {ordinal + 1}/{len(target_cutouts)}"
+        )
+    return target_cutouts[ordinal]
+
+
+def strip_atlas_created_variant_slots_from_clone(
+    source_document: SPMDocument,
+    source_generator: ET.Element,
+    clone: ET.Element,
+) -> list[str]:
+    """Remove relationship-owned variant slots before cloning a Generator."""
+    guid = source_document.generator_guid(source_generator)
+    bindings = [
+        binding
+        for (binding_guid, _slot), binding
+        in source_document.atlas_relation_bindings.items()
+        if binding_guid == guid and binding.get("created_slot")
+    ]
+    properties = clone.find("Properties")
+    if not bindings or properties is None:
+        return []
+    removed = []
+    authored_counts: dict[str, set[int]] = defaultdict(set)
+    for binding in bindings:
+        names = {
+            str(value)
+            for value in binding.get("created_property_names") or []
+            if str(value)
+        }
+        names.update(
+            str(binding.get(field) or "")
+            for field in (
+                "created_material_property",
+                "created_mesh_property",
+            )
+            if str(binding.get(field) or "")
+        )
+        for prop in list(properties):
+            if _property_name(prop) in names:
+                removed.append(_property_name(prop))
+                properties.remove(prop)
+        parent_name = str(
+            binding.get("variant_parent_property") or ""
+        ).strip()
+        before = binding.get("variant_parent_children_before")
+        try:
+            before = int(before)
+        except (TypeError, ValueError):
+            before = None
+        if parent_name and before is not None:
+            authored_counts[parent_name].add(before)
+    for parent_name, counts in authored_counts.items():
+        if len(counts) != 1:
+            raise SyncError(
+                "Atlas 관계 manifest의 authored variant count가 "
+                f"충돌합니다: {source_document.path.name} · {parent_name}"
+            )
+        parent = next(
+            (
+                prop
+                for prop in list(properties)
+                if _property_name(prop) == parent_name
+            ),
+            None,
+        )
+        if parent is None:
+            raise SyncError(
+                "Atlas 관계 manifest가 가리키는 variant parent가 "
+                f"없습니다: {source_document.path.name} · {parent_name}"
+            )
+        _set_child_text(
+            parent,
+            "MultiPropertyChildren",
+            str(next(iter(counts))),
+        )
+    return removed
+
+
 def remap_generator_asset_references(
     source_document: SPMDocument,
     target_document: SPMDocument,
@@ -1370,6 +1629,25 @@ def remap_generator_asset_references(
             continue
         target_prop = target_by_name.get(property_name)
         if target_prop is None:
+            continue
+        atlas_binding = _atlas_binding_for_property(
+            source_document,
+            source_generator,
+            property_name,
+        )
+        if atlas_binding is not None:
+            if not force:
+                continue
+            target_value = _atlas_binding_target_local_value(
+                source_document,
+                target_document,
+                atlas_binding,
+                kind,
+            )
+            current_id = _property_value(target_prop)
+            if current_id != target_value:
+                _set_child_text(target_prop, "Value", target_value)
+                updates += 1
             continue
         source_asset_name = source_document.asset_name(kind, _property_value(source_prop))
         if source_asset_name is None:
@@ -1423,6 +1701,18 @@ def clone_subtree(
     new_guid = _new_guid()
     _set_child_text(clone, "GUID", new_guid)
     _set_child_text(clone, "Level", str(target_parent_level + 1))
+    removed_relation_slots = strip_atlas_created_variant_slots_from_clone(
+        source_document,
+        source,
+        clone,
+    )
+    if removed_relation_slots:
+        result.warnings.append(
+            "Atlas 관계가 만든 Generator variant slot은 follower 구조 "
+            "동기화에서 제외함: "
+            f"{source_document.generator_name(source)} · "
+            + ", ".join(sorted(removed_relation_slots))
+        )
     asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
         source_document, target_document, source, clone, force=True
     )
@@ -2560,6 +2850,10 @@ def verify_speedtree_export(
         raise SyncError(f"SpeedTree 실행 파일이 없습니다: {speedtree_exe}")
     if not xml_ini.is_file():
         raise SyncError(f"SpeedTree XML export 설정이 없습니다: {xml_ini}")
+    require_texture_skip_writing(
+        xml_ini,
+        purpose=f"{spm_path.name} Generator Sync verification XML export",
+    )
     with tempfile.TemporaryDirectory(prefix="spm_generator_sync_verify_") as temp:
         output = Path(temp) / f"{spm_path.stem}_verify.xml"
         cmd = [

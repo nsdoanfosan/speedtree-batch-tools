@@ -2681,6 +2681,13 @@ def build_cluster_assembly_contract(
                 resolved_refs=texture_refs,
                 ignored_aliases=ignored_texture_aliases,
             )
+        texture_origin_kind = (
+            "blender_cluster_bake"
+            if tga_validation.get("status") == "ok"
+            else "unclassified"
+            if texture_refs
+            else "none"
+        )
         actual_dependencies.append({
             "role": role,
             "name": output_spm.stem,
@@ -2705,6 +2712,7 @@ def build_cluster_assembly_contract(
                 file_fingerprint(value, hash_content=False)
                 for value in texture_refs
             ],
+            "texture_origin_kind": texture_origin_kind,
             "texture_contract_source": texture_contract_source,
             "tga_basename_validation": tga_validation,
             "referenced_by_spms": list(dependency_usage.get("spms") or []),
@@ -2890,6 +2898,7 @@ def build_cluster_assembly_contract(
             "source_materials": row["source_materials"],
             "source_mesh_ids": row["source_mesh_ids"],
             "texture_dependencies": row["texture_dependencies"],
+            "texture_origin_kind": row["texture_origin_kind"],
             "tga_basename_validation": row["tga_basename_validation"],
             "referenced_by_spms": row["referenced_by_spms"],
             "normalized_variants": row.get("normalized_variants"),

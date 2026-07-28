@@ -261,6 +261,18 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             continue
         matched_count += 1
         if output.get("mode") == "preserve_source":
+            try:
+                source_is_target = (
+                    Path(output["source_spm"]).resolve() == spm.resolve()
+                )
+            except (OSError, ValueError):
+                source_is_target = (
+                    os.path.normcase(os.path.abspath(str(
+                        output["source_spm"])))
+                    == os.path.normcase(os.path.abspath(str(spm)))
+                )
+            if source_is_target:
+                continue
             source_block = _source_material_block(output["source_spm"], canonical)
             patched = restore_material_maps(block, canonical, source_block)
             expected_row = next(iter(inspect_material_slots(patched).values()))
@@ -466,11 +478,14 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
 
 
 def cleanup_preserved_cluster_outputs(plan):
-    """Undo managed T_ artifacts for materials restored to cluster renders."""
-    import sbs_auto
+    """Report preserved Cluster bake materials without mutating their assets.
 
-    cleaned = []
-    conflicts = []
+    Blender physical-capture outputs and SBS/PCG T_* outputs have independent
+    provenance.  A Cluster material selecting its bake maps is not evidence
+    that an asset-local T_* graph or file is stale or unreferenced, so cleanup
+    belongs to the later reference-audited cache transaction, never migration.
+    """
+    preserved = []
     seen = set()
     for row in plan.get("preserved_cluster_materials") or []:
         material = canonical_material_name(row.get("material_name"))
@@ -478,39 +493,19 @@ def cleanup_preserved_cluster_outputs(plan):
         if key in seen:
             continue
         seen.add(key)
-        folder = Path(row["spm"]).parent
-        texture_base = texture_base_for_material(material)
-        renamed = None
-        for sbs in active_sbs_files(folder):
-            t_graph = sbs_auto.find_m_graph_name(sbs, texture_base)
-            m_graph = sbs_auto.find_m_graph_name(sbs, material)
-            if t_graph and not m_graph:
-                renamed = sbs_auto.rename_managed_graph(sbs, t_graph, material)
-                break
-            if t_graph and m_graph:
-                conflicts.append({
-                    "material": material,
-                    "sbs": str(sbs),
-                    "reason": "both M_ authoring and T_ managed graphs exist",
-                })
-        candidates = []
-        for texture_dir in (folder / "texture", folder / "textures"):
-            if not texture_dir.is_dir():
-                continue
-            for role in ("color", "normal", "extra", "height", "opacity", "subsurface"):
-                candidates.extend(texture_dir.glob(f"{texture_base}_{role}.*"))
-        files = [path for path in candidates if path.is_file()]
-        if files:
-            for path in files:
-                path.unlink()
-        cleaned.append({
+        preserved.append({
+            "spm": str(row.get("spm") or ""),
             "material": material,
-            "texture_base": texture_base,
-            "graph_rename": renamed,
-            "removed_outputs": [str(path) for path in files],
-            "backup_dir": None,
+            "source_spm": str(row.get("source_spm") or ""),
+            "source_refs": list(row.get("source_refs") or []),
+            "reason": str(row.get("reason") or "blender_cluster_bake"),
         })
-    return {"cleaned": cleaned, "conflicts": conflicts}
+    return {
+        "status": "preserved_no_mutation",
+        "cleaned": [],
+        "conflicts": [],
+        "preserved": preserved,
+    }
 
 
 def jobs_from_texture_plan(plan, only_existing_sk=True, allowed_spms=None):
@@ -618,6 +613,33 @@ def jobs_from_texture_plan(plan, only_existing_sk=True, allowed_spms=None):
 
     by_spm = {}
     for row in plan.get("items", []):
+        if (
+            row.get("origin_kind") == "blender_cluster_bake"
+            or row.get("normalization_workflow_mode")
+            == "PHYSICAL_DIRECT_CAPTURE"
+        ):
+            for target in row.get("material_targets") or []:
+                material_id = target.get("material_id")
+                if not target.get("spm") or not material_id:
+                    raise RuntimeError(
+                        "blender_cluster_bake material target requires "
+                        "exact spm and material_id")
+                spm = Path(target["spm"])
+                if not spm_is_allowed(spm):
+                    continue
+                if only_existing_sk and not spm.name.lower().startswith("sk_"):
+                    continue
+                if not spm.is_file():
+                    continue
+                add_material_mapping(
+                    spm,
+                    f"@id:{str(material_id).strip().lower()}",
+                    {
+                        "mode": "preserve_source",
+                        "source_spm": str(spm),
+                    },
+                )
+            continue
         texture_dir = row.get("texture_dir")
         texture_base = row.get("texture_base")
         if not texture_dir or not texture_base:

@@ -237,6 +237,24 @@ SPM과 Cluster TGA SHA-256을 다시 확인하므로 변경된 stale receipt는 
   소유한 checkout에만 `revert unchanged`를 적용한다. Virtual Texture Streaming을 켜고
   Max Texture Size는 0(제한 없음)으로 유지한다.
 
+### canonical output manifest
+
+PCG ST9 Texture/SBS가 새 6장 세트를 성공적으로 검증하면 asset의
+`texture/pcg_st9_canonical_outputs.json`을 원자적으로 갱신한다. 이 파일은
+`kind=pcg_st9_canonical_output_manifest`, `schema_version=1`이며 각 output에
+`texture_base`, 6개 `required_roles`, manifest-relative `files`,
+`material_targets`(`material_id` 우선, `material_name` 보조),
+`producer.tool/source`를 기록한다. 필수 역할은
+`color/opacity/normal/height/extra/subsurface`다. Height에서 만든 AO만
+`texture/_pcgtex_generated/T_*_ao_from_height.*`로 추가할 수 있다.
+
+`D:\OneDrive\Forestportfolio\Texture` 및 TCom/Megascans 파일은 SBS authoring
+입력이다. manifest의 `files`나 production SpeedTree material `TexFilename`으로
+사용하지 않는다. Atlas Blender mesh-build의 원본 입력은 별도 제작 단계라 이
+규칙으로 치환하지 않는다. Blender Cluster bake/export 결과도 별도
+`origin_kind=blender_cluster_bake` 계약이며, PCG material output manifest가
+비-`T_` bake 이름을 `T_*` 누락으로 추측하지 않는다.
+
 설정(`pcg_texture_config.json`): `unreal_levels`, `blender_exe`, `designer_dir`(sbsrender 위치),
 `cluster_sbsar`, `cluster_sbsar_normal_behavior`, `atlas_job_timeout`, `sbsrender_timeout`,
 `unreal_editor_cmd`, `unreal_texture_sync_enabled`, `unreal_texture_commandlet_fallback`,

@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -53,7 +54,8 @@ def add_material(assets, material_id, name, mesh_id, color_ref):
     )
     ET.SubElement(material, "CutoutMeshID").text = str(mesh_id)
     textures = ET.SubElement(material, "Textures")
-    ET.SubElement(textures, "TexFilename").text = color_ref
+    color_map = ET.SubElement(textures, "Map", Name="Color")
+    ET.SubElement(color_map, "TexFilename").text = color_ref
     ET.SubElement(assets, "Mesh", ID=str(mesh_id), Name=f"mesh_{mesh_id}")
 
 
@@ -87,7 +89,31 @@ def write_spm(path, *, include_cluster=True):
     texture_dir = path.parent / "texture"
     cluster_dir.mkdir(exist_ok=True)
     texture_dir.mkdir(exist_ok=True)
-    (cluster_dir / "old_cluster_color.tga").write_bytes(b"cluster")
+    cluster_color = cluster_dir / "old_cluster_color.tga"
+    cluster_color.write_bytes(b"cluster")
+    if include_cluster:
+        cluster_sha256 = hashlib.sha256(
+            cluster_color.read_bytes()
+        ).hexdigest()
+        (
+            cluster_dir / "old_cluster_color_auto_capture_manifest.json"
+        ).write_text(
+            json.dumps({
+                "kind": "speedtree_cluster_blender_auto_capture",
+                "version": 2,
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "direct_uv_source":
+                    "same_blender_physical_capture_projection",
+                "physical_capture_contract_sha256":
+                    hashlib.sha256(b"marker-test").hexdigest(),
+                "maps": [{
+                    "role": "Color",
+                    "path": str(cluster_color.resolve()),
+                    "sha256": cluster_sha256,
+                }],
+            }),
+            encoding="utf-8",
+        )
     (texture_dir / "new_atlas_color.tga").write_bytes(b"atlas")
 
     root = ET.Element("SpeedTreeModel")
@@ -209,7 +235,7 @@ class LegacyClusterMarkerTests(unittest.TestCase):
                 item for item in model.findall("./Assets/Material_v8")
                 if item.attrib.get("ID") == "2"
             )
-            source.find("./Textures/TexFilename").text = (
+            source.find("./Textures/Map/TexFilename").text = (
                 r"texture\new_atlas_color.tga"
             )
             visible = next(
