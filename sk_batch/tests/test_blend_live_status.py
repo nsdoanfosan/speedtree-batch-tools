@@ -6,6 +6,7 @@ import queue
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
@@ -2130,6 +2131,1121 @@ class BlendLiveStatusTests(unittest.TestCase):
                 for call in app.log.call_args_list
             ))
 
+    def test_cluster_live_audit_memo_reuses_only_current_batch_success(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            current = {
+                "selected_receipt": str(
+                    Path(temporary) / "receipt.json"
+                )
+            }
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value=current,
+            ):
+                first = app._refresh_stale_cluster_receipt(
+                    spm, "20260729_010101"
+                )
+                second = app._refresh_stale_cluster_receipt(
+                    spm, "20260729_010102"
+                )
+                app._reset_cluster_receipt_refresh_memo()
+                third = app._refresh_stale_cluster_receipt(
+                    spm, "20260729_010103"
+                )
+
+        self.assertEqual(first["policy"], "live_audit_authoritative")
+        self.assertEqual(second, first)
+        self.assertEqual(third["policy"], "live_audit_authoritative")
+        self.assertEqual(app._run_limited.call_count, 2)
+        self.assertTrue(any(
+            "memo hit" in call.args[0]
+            for call in app.log.call_args_list
+        ))
+
+    def test_cluster_live_audit_memo_invalidates_spm_and_manifest_changes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm-v1")
+            cluster = spm.parent / "Cluster"
+            cluster.mkdir()
+            manifest = cluster / "SK_cluster_elm_01.atlas_leaf_targets.json"
+            manifest.write_text('{"version": 1}', encoding="utf-8")
+            manifest_mtime_ns = manifest.stat().st_mtime_ns
+            capture = cluster / "cluster_elm_01.tga"
+            capture.write_bytes(b"capture-v1")
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{
+                            "role": "branch",
+                            "texture_dependencies": [{
+                                "path": str(capture),
+                                "exists": True,
+                                "size": capture.stat().st_size,
+                                "mtime_ns": capture.stat().st_mtime_ns,
+                            }],
+                        }],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ):
+                app._refresh_stale_cluster_receipt(
+                    spm, "20260729_020101"
+                )
+                app._refresh_stale_cluster_receipt(
+                    spm, "20260729_020102"
+                )
+                capture.write_bytes(b"capture-version-two")
+                app._refresh_stale_cluster_receipt(
+                    spm, "20260729_020103"
+                )
+                manifest.write_text('{"version": 2}', encoding="utf-8")
+                os.utime(
+                    manifest,
+                    ns=(manifest_mtime_ns, manifest_mtime_ns),
+                )
+                app._refresh_stale_cluster_receipt(
+                    spm, "20260729_020104"
+                )
+                spm.write_bytes(b"spm-v2")
+                app._refresh_stale_cluster_receipt(
+                    spm, "20260729_020105"
+                )
+
+        self.assertEqual(app._run_limited.call_count, 4)
+
+    def test_cluster_live_audit_retries_when_input_changes_mid_audit(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            manifest = cluster / "SK_cluster_elm_01.atlas_leaf_targets.json"
+            manifest.write_text('{"version": 1}', encoding="utf-8")
+            calls = {"count": 0}
+
+            def run_audit(command, *_args, **_kwargs):
+                calls["count"] += 1
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                if calls["count"] == 1:
+                    manifest.write_text('{"version": 2}', encoding="utf-8")
+                report.write_text(
+                    json.dumps({
+                        "attempt": calls["count"],
+                        "items": [{"cluster_assembly": {
+                            "tree_source_identities": [{
+                                "target_spm": {
+                                    "path": str(spm),
+                                    "exists": True,
+                                },
+                            }],
+                            "dependencies": [{"role": "branch"}],
+                            "handoff": {"errors": [], "issues": []},
+                        }}],
+                    }),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ):
+                first = app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_025101",
+                )
+                second = app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_025102",
+                )
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(first["live_audit_payload"]["attempt"], 2)
+        self.assertEqual(second["live_audit_payload"]["attempt"], 2)
+        self.assertTrue(any(
+            "retrying once" in call.args[0]
+            for call in app.log.call_args_list
+        ))
+
+    def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            reports = cluster / "reports"
+            reports.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ):
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_026101",
+                )
+                (reports / (
+                    "SK_Tree_elm_01_"
+                    "speedtree_repair_pipeline_report_codex.json"
+                )).write_text('{"status":"ok"}', encoding="utf-8")
+                backups = owner / "_spm_backups"
+                backups.mkdir()
+                (backups / "SK_Tree_elm_01.spm").write_bytes(b"backup")
+                isolated = cluster / ".sk_batch_isolated_bark" / "run"
+                isolated.mkdir(parents=True)
+                (isolated / "SK_cluster_elm_01.spm").write_bytes(
+                    b"isolated"
+                )
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_026102",
+                )
+
+        self.assertEqual(app._run_limited.call_count, 1)
+
+    def test_cluster_live_audit_report_shape_failures_are_internal_errors(
+        self,
+    ):
+        gui = load_gui_module()
+        variants = {
+            "missing": None,
+            "corrupt": "{",
+            "empty_object": "{}",
+            "empty_items": '{"items":[]}',
+            "identity_unbound": json.dumps({
+                "items": [{"cluster_assembly": {
+                    "dependencies": [{"role": "branch"}],
+                    "handoff": {"errors": [], "issues": []},
+                }}],
+            }),
+        }
+        for label, report_text in variants.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                app = self.make_app(gui)
+                app.log = mock.Mock()
+                app.cfg = {"cluster_receipt_refresh_timeout": 321}
+                owner = Path(temporary) / "Tree_elm"
+                (owner / "Cluster").mkdir(parents=True)
+                spm = owner / "SK_Tree_elm_01.spm"
+                spm.write_bytes(b"tree")
+
+                def run_audit(command, *_args, **_kwargs):
+                    report = Path(command[command.index("--json") + 1])
+                    if report_text is not None:
+                        report.parent.mkdir(parents=True, exist_ok=True)
+                        report.write_text(report_text, encoding="utf-8")
+                    return 0, Path(temporary) / "refresh.log"
+
+                app._run_limited = mock.Mock(side_effect=run_audit)
+                with mock.patch.object(
+                    gui,
+                    "LOG_DIR",
+                    Path(temporary) / "logs",
+                ), mock.patch.object(
+                    gui,
+                    "cluster_assembly_receipt_resolution",
+                    return_value={
+                        "selected_receipt": str(
+                            Path(temporary) / "receipt.json"
+                        )
+                    },
+                ), self.assertRaises(gui.BatchItemError) as raised:
+                    app._refresh_stale_cluster_receipt(
+                        spm,
+                        "20260729_027101",
+                    )
+
+                self.assertEqual(raised.exception.kind, "internal_error")
+                self.assertFalse(app._cluster_receipt_refresh_memo)
+
+    def test_cluster_live_audit_rejects_wrong_singleton_tree_identity(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            (owner / "Cluster").mkdir(parents=True)
+            requested = owner / "SK_Tree_elm_01.spm"
+            wrong = owner / "SK_Tree_elm_02.spm"
+            requested.write_bytes(b"requested")
+            wrong.write_bytes(b"wrong")
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(wrong),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ), self.assertRaises(gui.BatchItemError) as raised:
+                app._refresh_stale_cluster_receipt(
+                    requested,
+                    "20260729_027151",
+                )
+
+        self.assertEqual(raised.exception.kind, "internal_error")
+        self.assertIn("strict identity-bound", str(raised.exception))
+        self.assertFalse(app._cluster_receipt_refresh_memo)
+
+    def test_cluster_live_audit_unique_report_and_immutable_return_payload(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owners = [
+                Path(temporary) / "owner_a" / "Tree_elm",
+                Path(temporary) / "owner_b" / "Tree_elm",
+            ]
+            spms = []
+            for owner in owners:
+                (owner / "Cluster").mkdir(parents=True)
+                spm = owner / "SK_Tree_elm_01.spm"
+                spm.write_bytes(str(owner).encode("utf-8"))
+                spms.append(spm)
+
+            def run_audit(command, *_args, **_kwargs):
+                target = Path(command[command.index("--target") + 1])
+                requested = target / "SK_Tree_elm_01.spm"
+                marker = target.parent.name
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({
+                        "marker": marker,
+                        "items": [{"cluster_assembly": {
+                            "tree_source_identities": [{
+                                "target_spm": {
+                                    "path": str(requested),
+                                    "exists": True,
+                                },
+                            }],
+                            "dependencies": [{"role": "branch"}],
+                            "handoff": {"errors": [], "issues": []},
+                        }}],
+                    }),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / f"{marker}.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ):
+                first = app._refresh_stale_cluster_receipt(
+                    spms[0],
+                    "20260729_027201",
+                )
+                second = app._refresh_stale_cluster_receipt(
+                    spms[1],
+                    "20260729_027201",
+                )
+
+            first_report = Path(first["live_audit_report"])
+            second_report = Path(second["live_audit_report"])
+            self.assertNotEqual(first_report, second_report)
+            first_report.write_text(
+                json.dumps(second["live_audit_payload"]),
+                encoding="utf-8",
+            )
+
+        self.assertEqual(first["live_audit_payload"]["marker"], "owner_a")
+        self.assertEqual(
+            Path(first["selected_contract"][
+                "tree_source_identities"
+            ][0]["target_spm"]["path"]),
+            spms[0],
+        )
+        self.assertEqual(second["live_audit_payload"]["marker"], "owner_b")
+
+    def test_cluster_live_audit_memo_single_flight_shares_one_result(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+            report = Path(temporary) / "live.json"
+            report.write_text(
+                json.dumps({"items": [{"cluster_assembly": {
+                    "tree_source_identities": [{
+                        "target_spm": {
+                            "path": str(spm),
+                            "exists": True,
+                        },
+                    }],
+                }}]}),
+                encoding="utf-8",
+            )
+            started = threading.Event()
+            release = threading.Event()
+            waiter_started = threading.Event()
+            calls = {"count": 0}
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    waiter_started.set()
+                    return super().result(*args, **kwargs)
+
+            def run_uncached(*_args, **_kwargs):
+                calls["count"] += 1
+                started.set()
+                self.assertTrue(release.wait(5))
+                return {
+                    "requested_spm": str(spm),
+                    "payload": {"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]},
+                    "audit_report": str(report),
+                    "log_file": str(Path(temporary) / "live.log"),
+                    "persistence": {},
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = run_uncached
+            with mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                first_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_030101",
+                )
+                self.assertTrue(started.wait(5))
+                second_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_030102",
+                )
+                self.assertTrue(waiter_started.wait(5))
+                release.set()
+                first = first_future.result(timeout=5)
+                second = second_future.result(timeout=5)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first["policy"], "live_audit_authoritative")
+
+    def test_cluster_live_audit_different_owners_run_concurrently(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spms = []
+            for owner_name in ("Tree_elm_a", "Tree_elm_b"):
+                owner = Path(temporary) / owner_name
+                (owner / "Cluster").mkdir(parents=True)
+                spm = owner / "SK_Tree_elm_01.spm"
+                spm.write_bytes(owner_name.encode("utf-8"))
+                spms.append(spm)
+            both_entered = threading.Barrier(2)
+
+            def run_audit(command, *_args, **_kwargs):
+                target = Path(command[command.index("--target") + 1])
+                requested = target / "SK_Tree_elm_01.spm"
+                both_entered.wait(timeout=5)
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(requested),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / f"{target.name}.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(
+                        app._refresh_stale_cluster_receipt,
+                        spm,
+                        "20260729_030201",
+                    )
+                    for spm in spms
+                ]
+                resolutions = [
+                    future.result(timeout=10) for future in futures
+                ]
+
+        self.assertEqual(app._run_limited.call_count, 2)
+        self.assertTrue(all(
+            row["policy"] == "live_audit_authoritative"
+            for row in resolutions
+        ))
+
+    def test_cluster_live_audit_different_owner_hashes_are_not_serialized(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            spms = []
+            for owner_name in ("Tree_elm_a", "Tree_elm_b"):
+                owner = Path(temporary) / owner_name
+                (owner / "Cluster").mkdir(parents=True)
+                spm = owner / "SK_Tree_elm_01.spm"
+                spm.write_bytes(owner_name.encode("utf-8"))
+                spms.append(spm)
+            hash_barrier = threading.Barrier(2)
+            thread_state = threading.local()
+
+            def fingerprint(spm, **_kwargs):
+                count = getattr(thread_state, "count", 0)
+                thread_state.count = count + 1
+                if count == 0:
+                    hash_barrier.wait(timeout=5)
+                return f"stable:{gui.normalized_folder_key(spm)}"
+
+            def run_uncached(spm, *_args, **_kwargs):
+                contract = {
+                    "tree_source_identities": [{
+                        "target_spm": {
+                            "path": str(spm),
+                            "exists": True,
+                        },
+                    }],
+                    "dependencies": [{"role": "branch"}],
+                    "handoff": {"errors": [], "issues": []},
+                }
+                return {
+                    "requested_spm": str(spm),
+                    "payload": {"items": [{
+                        "cluster_assembly": contract,
+                    }]},
+                    "selected_contract": contract,
+                    "audit_report": str(
+                        Path(temporary) / f"{spm.parent.name}.json"
+                    ),
+                    "log_file": str(
+                        Path(temporary) / f"{spm.parent.name}.log"
+                    ),
+                    "persistence": {},
+                }
+
+            app._cluster_receipt_refresh_input_fingerprint = fingerprint
+            app._refresh_stale_cluster_receipt_uncached = run_uncached
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(
+                        app._refresh_stale_cluster_receipt,
+                        spm,
+                        "20260729_030251",
+                    )
+                    for spm in spms
+                ]
+                resolutions = [
+                    future.result(timeout=10) for future in futures
+                ]
+
+        self.assertEqual(len(resolutions), 2)
+
+    def test_cluster_live_audit_single_flight_keeps_caller_policy_separate(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            producer = cluster / "SK_cluster_elm_02.spm"
+            producer.write_bytes(b"cluster")
+            started = threading.Event()
+            release = threading.Event()
+            waiter_started = threading.Event()
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    waiter_started.set()
+                    return super().result(*args, **kwargs)
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                started.set()
+                self.assertTrue(release.wait(5))
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{
+                            "role": "cluster",
+                            "spm": str(producer),
+                        }],
+                        "handoff": {"errors": [{
+                            "code": "NORMALIZED_VARIANTS_REQUIRED",
+                            "role": "cluster",
+                            "spm": str(producer),
+                        }]},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            persisted = {
+                "selected_receipt": str(
+                    Path(temporary) / "receipt.json"
+                )
+            }
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value=persisted,
+            ), mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                producer_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_035101",
+                    producer_spm=producer,
+                )
+                self.assertTrue(started.wait(5))
+                owner_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_035102",
+                )
+                self.assertTrue(waiter_started.wait(5))
+                release.set()
+                producer_resolution = producer_future.result(timeout=5)
+                with self.assertRaises(gui.BatchItemError) as raised:
+                    owner_future.result(timeout=5)
+
+        self.assertEqual(app._run_limited.call_count, 1)
+        self.assertTrue(
+            producer_resolution["producer_repair_issue_tolerated"]
+        )
+        self.assertEqual(raised.exception.kind, "data_error")
+        self.assertIn(
+            "NORMALIZED_VARIANTS_REQUIRED",
+            str(raised.exception),
+        )
+
+    def test_cluster_live_audit_allows_planned_producers_but_owner_is_strict(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            producer_a = cluster / "SK_cluster_elm_01.spm"
+            producer_b = cluster / "SK_cluster_elm_02.spm"
+            producer_a.write_bytes(b"a")
+            producer_b.write_bytes(b"b")
+            started = threading.Event()
+            release = threading.Event()
+            waiters_ready = threading.Event()
+            waiter_count = {"value": 0}
+            waiter_lock = threading.Lock()
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    with waiter_lock:
+                        waiter_count["value"] += 1
+                        if waiter_count["value"] == 2:
+                            waiters_ready.set()
+                    return super().result(*args, **kwargs)
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                started.set()
+                self.assertTrue(release.wait(5))
+                report.write_text(
+                    json.dumps({"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [
+                            {"role": "cluster", "spm": str(producer_a)},
+                            {"role": "cluster", "spm": str(producer_b)},
+                        ],
+                        "handoff": {"errors": [
+                            {
+                                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                                "role": "cluster",
+                                "spm": str(producer_a),
+                            },
+                            {
+                                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                                "role": "cluster",
+                                "spm": str(producer_b),
+                            },
+                        ]},
+                    }}]}),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            allowed = (producer_a, producer_b)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ), mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=3) as pool:
+                future_a = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_036101",
+                    producer_spm=producer_a,
+                    allowed_producer_spms=allowed,
+                )
+                self.assertTrue(started.wait(5))
+                future_b = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_036102",
+                    producer_spm=producer_b,
+                    allowed_producer_spms=allowed,
+                )
+                owner_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_036103",
+                )
+                self.assertTrue(waiters_ready.wait(5))
+                release.set()
+                resolution_a = future_a.result(timeout=5)
+                resolution_b = future_b.result(timeout=5)
+                with self.assertRaises(gui.BatchItemError) as raised:
+                    owner_future.result(timeout=5)
+
+        self.assertEqual(app._run_limited.call_count, 1)
+        self.assertTrue(resolution_a["producer_repair_issue_tolerated"])
+        self.assertTrue(resolution_b["producer_repair_issue_tolerated"])
+        self.assertEqual(raised.exception.kind, "data_error")
+
+    def test_cluster_live_audit_bookkeeping_error_releases_waiter(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.stop_flag = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            (owner / "Cluster").mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            started = threading.Event()
+            release = threading.Event()
+            waiter_started = threading.Event()
+            audit_finished = threading.Event()
+            completions = {"result": 0, "exception": 0}
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    waiter_started.set()
+                    return super().result(*args, **kwargs)
+
+                def set_result(self, result):
+                    completions["result"] += 1
+                    return super().set_result(result)
+
+                def set_exception(self, exception):
+                    completions["exception"] += 1
+                    return super().set_exception(exception)
+
+            def fingerprint(*_args, **_kwargs):
+                if audit_finished.is_set():
+                    raise RuntimeError("post-audit bookkeeping failed")
+                return "stable"
+
+            def run_uncached(*_args, **_kwargs):
+                started.set()
+                self.assertTrue(release.wait(5))
+                audit_finished.set()
+                return {
+                    "requested_spm": str(spm),
+                    "payload": {"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]},
+                    "selected_contract": {
+                        "tree_source_identities": [{"target_spm": {
+                            "path": str(spm),
+                        }}],
+                        "dependencies": [{"role": "branch"}],
+                    },
+                    "audit_report": str(Path(temporary) / "live.json"),
+                    "log_file": str(Path(temporary) / "live.log"),
+                    "persistence": {},
+                }
+
+            app._cluster_receipt_refresh_input_fingerprint = fingerprint
+            app._refresh_stale_cluster_receipt_uncached = run_uncached
+            with mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                first_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_037101",
+                )
+                self.assertTrue(started.wait(5))
+                second_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_037102",
+                )
+                self.assertTrue(waiter_started.wait(5))
+                release.set()
+                for future in (first_future, second_future):
+                    with self.assertRaises(RuntimeError):
+                        future.result(timeout=5)
+
+        self.assertEqual(completions, {"result": 0, "exception": 1})
+        self.assertFalse(app._cluster_receipt_refresh_flights)
+
+    def test_cluster_live_audit_waiter_honors_stop_request(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.stop_flag = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            (owner / "Cluster").mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            started = threading.Event()
+            release = threading.Event()
+            waiter_started = threading.Event()
+            report = Path(temporary) / "live.json"
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    waiter_started.set()
+                    return super().result(*args, **kwargs)
+
+            def run_uncached(*_args, **_kwargs):
+                started.set()
+                self.assertTrue(release.wait(5))
+                return {
+                    "requested_spm": str(spm),
+                    "payload": {"items": [{"cluster_assembly": {
+                        "tree_source_identities": [{
+                            "target_spm": {
+                                "path": str(spm),
+                                "exists": True,
+                            },
+                        }],
+                        "dependencies": [{"role": "branch"}],
+                        "handoff": {"errors": [], "issues": []},
+                    }}]},
+                    "selected_contract": {
+                        "tree_source_identities": [{"target_spm": {
+                            "path": str(spm),
+                        }}],
+                        "dependencies": [{"role": "branch"}],
+                    },
+                    "audit_report": str(report),
+                    "log_file": str(Path(temporary) / "live.log"),
+                    "persistence": {},
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = run_uncached
+            with mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                owner_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_038101",
+                )
+                self.assertTrue(started.wait(5))
+                waiter_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_038102",
+                )
+                self.assertTrue(waiter_started.wait(5))
+                app.stop_flag.set()
+                with self.assertRaises(gui.BatchItemError) as raised:
+                    waiter_future.result(timeout=2)
+                release.set()
+                owner_future.result(timeout=5)
+
+        self.assertIn("wait stopped", str(raised.exception))
+
+    def test_cluster_live_audit_memo_shares_but_does_not_cache_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            (spm.parent / "Cluster").mkdir()
+            started = threading.Event()
+            release = threading.Event()
+            waiter_started = threading.Event()
+            calls = {"count": 0}
+
+            class ObservableFuture(gui.Future):
+                def result(self, *args, **kwargs):
+                    waiter_started.set()
+                    return super().result(*args, **kwargs)
+
+            def run_uncached(*_args, **_kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    started.set()
+                    self.assertTrue(release.wait(5))
+                raise gui.BatchItemError(
+                    "live audit failed",
+                    kind="internal_error",
+                )
+
+            app._refresh_stale_cluster_receipt_uncached = run_uncached
+            with mock.patch.object(
+                gui,
+                "Future",
+                ObservableFuture,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                first_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_040101",
+                )
+                self.assertTrue(started.wait(5))
+                second_future = pool.submit(
+                    app._refresh_stale_cluster_receipt,
+                    spm,
+                    "20260729_040102",
+                )
+                self.assertTrue(waiter_started.wait(5))
+                release.set()
+                for future in (first_future, second_future):
+                    with self.assertRaises(gui.BatchItemError):
+                        future.result(timeout=5)
+
+            with self.assertRaises(gui.BatchItemError):
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_040103",
+                )
+
+        self.assertEqual(calls["count"], 2)
+
     def test_receipt_refresh_reports_live_audit_data_error(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2149,6 +3265,13 @@ class BlendLiveStatusTests(unittest.TestCase):
                     json.dumps({
                         "items": [{
                             "cluster_assembly": {
+                                "tree_source_identities": [{
+                                    "target_spm": {
+                                        "path": str(spm),
+                                        "exists": True,
+                                    },
+                                }],
+                                "dependencies": [{"role": "branch"}],
                                 "handoff": {
                                     "errors": [{
                                         "code": "CLUSTER_TGA_BASENAME_INVALID",
@@ -2379,10 +3502,10 @@ class BlendLiveStatusTests(unittest.TestCase):
                 resolution["policy"],
                 "live_audit_authoritative",
             )
-            self.assertEqual(
-                Path(resolution["live_audit_report"]).name,
-                "SK_Tree_elm_01_cluster_receipt_refresh_20260725_120000.json",
-            )
+            report_name = Path(resolution["live_audit_report"]).name
+            self.assertTrue(report_name.startswith("SK_Tree_elm_01_"))
+            self.assertIn("_jobadhoc_20260725_120000_", report_name)
+            self.assertTrue(report_name.endswith(".json"))
             self.assertIn(
                 "self-stale",
                 resolution["receipt_persistence_warning"],
@@ -2470,7 +3593,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(raised.exception.kind, "internal_error")
             self.assertIn("live audit process failed", str(raised.exception))
 
-    def test_blender_job_reuses_live_audit_fallback_after_preflight(self):
+    def test_blender_job_reuses_immutable_live_audit_after_preflight(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
@@ -2499,23 +3622,29 @@ class BlendLiveStatusTests(unittest.TestCase):
             speedtree_cli.parent.mkdir(parents=True, exist_ok=True)
             speedtree_cli.write_text("# test", encoding="utf-8")
             live_report = Path(temporary) / "live_audit.json"
-            live_report.write_text(
-                json.dumps({"items": [{"cluster_assembly": {
+            live_payload = {"items": [{"cluster_assembly": {
                     "tree_source_identities": [{
                         "target_spm": {"path": str(spm)},
                     }],
                     "dependencies": [{"role": "branch"}],
                     "handoff": {"errors": [], "issues": []},
-                }}]}),
+                }}]}
+            selected_contract = live_payload["items"][0][
+                "cluster_assembly"
+            ]
+            live_report.write_text(
+                json.dumps(live_payload),
                 encoding="utf-8",
             )
-            fallback = {
-                "policy": "live_audit_fallback",
+            embedded_live_audit = {
+                "policy": "live_audit_authoritative",
                 "live_audit_report": str(live_report),
+                "live_audit_payload": live_payload,
+                "selected_contract": selected_contract,
                 "receipt_persistence_warning": "read-only",
             }
             app._refresh_stale_cluster_receipt = mock.Mock(
-                return_value=fallback
+                return_value=embedded_live_audit
             )
             app._leaf_reference_ready = mock.Mock(
                 return_value=(True, "ok")
@@ -2652,7 +3781,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIsNone(resolution)
             app._run_limited.assert_not_called()
 
-    def test_missing_cluster_folder_without_actionable_receipt_passes_after_audit(
+    def test_missing_cluster_owner_audit_report_fails_closed(
         self,
     ):
         gui = load_gui_module()
@@ -2677,17 +3806,14 @@ class BlendLiveStatusTests(unittest.TestCase):
                     FileNotFoundError("missing"),
                     FileNotFoundError("still missing"),
                 ],
-            ):
-                resolution = app._refresh_stale_cluster_receipt(
+            ), self.assertRaises(gui.BatchItemError) as raised:
+                app._refresh_stale_cluster_receipt(
                     spm, "20260725_120000"
                 )
 
-            self.assertIsNone(resolution)
+            self.assertEqual(raised.exception.kind, "internal_error")
+            self.assertIn("missing, corrupt, or empty", str(raised.exception))
             self.assertEqual(app._run_limited.call_count, 1)
-            self.assertTrue(any(
-                "영수증 비대상" in call.args[0]
-                for call in app.log.call_args_list
-            ))
 
     def test_identity_bound_live_pass_through_overrides_old_embedded_contract(
         self,
@@ -2833,6 +3959,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             write_empty_spm(target)
             write_empty_spm(source_target)
+            other_producer = cluster / "SK_cluster_elm_02.spm"
+            write_empty_spm(other_producer)
             blend = spm.with_suffix(".blend")
             blend.write_bytes(b"old-normalized-blend")
             from atlas_target_registry import save_target_registry
@@ -2907,6 +4035,12 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._refresh_stale_cluster_receipt = mock.Mock(
                 return_value=None
             )
+            app._active_blender_planned_cluster_producers_by_owner = {
+                gui.normalized_folder_key(target): (
+                    spm,
+                    other_producer,
+                )
+            }
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
             app._handoff_ready = mock.Mock(return_value=(True, "ready"))
             app._blend_status_text = mock.Mock(return_value="latest")
@@ -2944,6 +4078,21 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(
                 relation.call_args.args[1],
                 [target.absolute()],
+            )
+            refresh_kwargs = next(
+                call.kwargs
+                for call in (
+                    app._refresh_stale_cluster_receipt.call_args_list
+                )
+                if call.kwargs.get("producer_spm")
+            )
+            self.assertEqual(
+                refresh_kwargs["producer_spm"],
+                spm.resolve(),
+            )
+            self.assertEqual(
+                tuple(refresh_kwargs["allowed_producer_spms"]),
+                (spm, other_producer),
             )
 
     def test_relation_off_cluster_runs_standalone_final_handoff(self):

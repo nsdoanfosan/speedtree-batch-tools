@@ -14,6 +14,7 @@
 모든 무거운 작업은 낮은 우선순위 + CPU 코어 제한이 걸린 백그라운드 프로세스로
 실행된다 (자식 SpeedTree CLI에 상속. 헤드리스 Blender는 GPU를 쓰지 않음).
 """
+import copy
 import ctypes
 import hashlib
 import json
@@ -26,9 +27,15 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import uuid
 import xml.etree.ElementTree as ET
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+)
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -132,7 +139,6 @@ BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
-CLUSTER_RECEIPT_REFRESH_LOCK = threading.Lock()
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
@@ -1299,6 +1305,7 @@ class App:
         self.active_procs = set()          # all running child procs (serial or parallel)
         self.procs_lock = threading.Lock()
         self.state_lock = threading.RLock()  # guards self.state writes across worker threads
+        self._reset_cluster_receipt_refresh_memo()
         self._scan_generation = 0
         self.scan_worker = None
         self._live_poll_active = False
@@ -2734,6 +2741,7 @@ class App:
         self.active_push_transport = job["push_transport"]
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
+        self._reset_cluster_receipt_refresh_memo()
         self.stop_flag.clear()
         self.batch_progress.configure(value=0)
         pending = len(self.pending_batch_jobs)
@@ -2838,10 +2846,15 @@ class App:
             "_active_batch_inventory",
             "_active_batch_items",
             "_active_blender_dependency_map",
+            "_active_blender_planned_cluster_producers_by_owner",
             "_pipeline_upstream_failed_items",
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
             "_phase_failed_items",
+            "_cluster_receipt_refresh_memo_lock",
+            "_cluster_receipt_refresh_memo",
+            "_cluster_receipt_refresh_flights",
+            "_cluster_receipt_owner_locks",
         ):
             self.__dict__.pop(key, None)
         if self.pending_batch_jobs:
@@ -3210,6 +3223,28 @@ class App:
                 or {str(item["spm"]): item for item in targets},
             )
         blender_dependency_map = blender_dependency_map or {}
+        planned_cluster_producers_by_owner = {}
+        if phase == "blender":
+            for planned_item in targets:
+                planned_spm = planned_item.get("spm")
+                if not planned_spm or not is_cluster_source_spm(planned_spm):
+                    continue
+                planned_output = speedtree_output_spm_for(planned_spm)
+                for planned_target in cluster_relation_output_targets(
+                    planned_spm,
+                    planned_item.get("referenced_by_spms") or (),
+                ):
+                    owner_key = normalized_folder_key(planned_target)
+                    planned_cluster_producers_by_owner.setdefault(
+                        owner_key,
+                        [],
+                    ).append(planned_output)
+        self._active_blender_planned_cluster_producers_by_owner = {
+            owner_key: tuple(dict.fromkeys(producers))
+            for owner_key, producers in (
+                planned_cluster_producers_by_owner.items()
+            )
+        }
         upstream_failed_items = set(
             getattr(self, "_pipeline_upstream_failed_items", set())
         )
@@ -3382,6 +3417,10 @@ class App:
             self._phase_failed_items = set(failed_items)
             if phase != "check":
                 save_state(self.state)
+        self.__dict__.pop(
+            "_active_blender_planned_cluster_producers_by_owner",
+            None,
+        )
         if emit_done:
             progress = (
                 f"{title} 중단 — {self._phase_abort_reason}"
@@ -4440,12 +4479,569 @@ class App:
         else:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
+    def _reset_cluster_receipt_refresh_memo(self):
+        """Start one process-local Cluster audit memo generation.
+
+        A queued GUI job owns exactly one generation. Nothing is written to
+        disk, and starting the next queued job discards every successful
+        result and in-flight handle from the previous one.
+        """
+        self._cluster_receipt_refresh_memo_lock = threading.Lock()
+        self._cluster_receipt_refresh_memo = {}
+        self._cluster_receipt_refresh_flights = {}
+        self._cluster_receipt_owner_locks = {}
+
+    def _ensure_cluster_receipt_refresh_memo(self):
+        if not hasattr(self, "_cluster_receipt_refresh_memo_lock"):
+            self._reset_cluster_receipt_refresh_memo()
+
+    def _cluster_receipt_owner_lock(self, spm):
+        self._ensure_cluster_receipt_refresh_memo()
+        scope = self._cluster_receipt_refresh_scope(spm)
+        with self._cluster_receipt_refresh_memo_lock:
+            return self._cluster_receipt_owner_locks.setdefault(
+                scope,
+                threading.Lock(),
+            )
+
+    def _wait_cluster_receipt_refresh_flight(self, flight, spm):
+        while True:
+            stop_flag = getattr(self, "stop_flag", None)
+            if stop_flag is not None and stop_flag.is_set():
+                raise BatchItemError(
+                    "Cluster Assembly live audit wait stopped: "
+                    f"{Path(spm).name}",
+                    kind="internal_error",
+                )
+            try:
+                return flight.result(timeout=0.2)
+            except FutureTimeoutError:
+                continue
+
+    @staticmethod
+    def _cluster_receipt_refresh_scope(spm):
+        return os.path.normcase(
+            os.path.abspath(str(Path(spm).expanduser()))
+        )
+
+    @staticmethod
+    def _cluster_contract_identifies_requested_spm(contract, spm):
+        """Require an explicit Tree identity for the requested owner SPM."""
+        if not isinstance(contract, dict):
+            return False
+        requested_key = normalized_folder_key(spm)
+        for row in contract.get("tree_source_identities") or ():
+            if not isinstance(row, dict):
+                continue
+            for field in ("target_spm", "authoritative_tree_source"):
+                identity = row.get(field) or {}
+                path = identity.get("path")
+                if (
+                    path
+                    and normalized_folder_key(path) == requested_key
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _cluster_receipt_live_artifact_records(payload):
+        """Return file identities recorded by the immutable audit payload."""
+        records = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                path = value.get("path")
+                if (
+                    path
+                    and any(
+                        key in value
+                        for key in (
+                            "sha256",
+                            "fingerprint",
+                            "exists",
+                            "size",
+                            "mtime_ns",
+                        )
+                    )
+                ):
+                    records.append({
+                        key: value.get(key)
+                        for key in (
+                            "path",
+                            "exists",
+                            "size",
+                            "mtime_ns",
+                            "sha256",
+                            "fingerprint",
+                        )
+                        if key in value
+                    })
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(payload)
+        return tuple(records)
+
+    @classmethod
+    def _cluster_receipt_live_artifact_paths(
+        cls,
+        payload,
+        *,
+        report_path=None,
+    ):
+        paths = {
+            os.path.normcase(
+                os.path.abspath(
+                    str(Path(record["path"]).expanduser())
+                )
+            )
+            for record in cls._cluster_receipt_live_artifact_records(payload)
+        }
+        if report_path:
+            paths.add(
+                os.path.normcase(
+                    os.path.abspath(
+                        str(Path(report_path).expanduser())
+                    )
+                )
+            )
+        return tuple(sorted(paths))
+
+    @classmethod
+    def _cluster_receipt_live_artifacts_match(cls, payload):
+        """Verify that report evidence still describes the current files."""
+        errors = []
+        for record in cls._cluster_receipt_live_artifact_records(payload):
+            candidate = Path(record["path"]).expanduser()
+            exists = candidate.exists()
+            if (
+                "exists" in record
+                and bool(record.get("exists")) != exists
+            ):
+                errors.append(f"exists changed: {candidate}")
+                continue
+            if not exists:
+                continue
+            try:
+                stat = candidate.stat()
+                if (
+                    record.get("size") is not None
+                    and int(record["size"]) != stat.st_size
+                ):
+                    errors.append(f"size changed: {candidate}")
+                    continue
+                if (
+                    record.get("mtime_ns") is not None
+                    and int(record["mtime_ns"]) != stat.st_mtime_ns
+                ):
+                    errors.append(f"mtime changed: {candidate}")
+                    continue
+                expected_sha256 = record.get("sha256")
+                if expected_sha256:
+                    current_sha256 = _sha256_snapshot(candidate)["sha256"]
+                    if (
+                        str(expected_sha256).casefold()
+                        != current_sha256.casefold()
+                    ):
+                        errors.append(f"sha256 changed: {candidate}")
+                        continue
+                expected_fingerprint = record.get("fingerprint")
+                if isinstance(expected_fingerprint, str) and expected_fingerprint:
+                    current_fingerprint = file_content_snapshot(
+                        candidate
+                    )["fingerprint"]
+                    if (
+                        expected_fingerprint.casefold()
+                        != current_fingerprint.casefold()
+                    ):
+                        errors.append(f"fingerprint changed: {candidate}")
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                errors.append(f"identity unavailable: {candidate}: {exc}")
+        return not errors, tuple(errors)
+
+    @staticmethod
+    def _cluster_receipt_discovery_input_paths(spm):
+        """Discover only contract inputs, never BWR/runtime report JSON."""
+        spm = Path(spm).resolve()
+        owner = spm.parent
+        paths = {
+            spm,
+            Path(__file__).resolve(),
+            (
+                REPO_DIR
+                / "pcg_st9_texture_batch"
+                / "pcg_texture_audit.py"
+            ).resolve(),
+        }
+
+        def is_temporary_contract_path(candidate):
+            try:
+                relative = candidate.relative_to(owner)
+            except ValueError:
+                return False
+            return any(
+                part.casefold()
+                in {"_spm_backups", ".sk_batch_isolated_bark"}
+                for part in relative.parts
+            )
+
+        for candidate in owner.rglob("*.spm"):
+            if (
+                candidate.is_file()
+                and not is_temporary_contract_path(candidate)
+            ):
+                paths.add(candidate.resolve())
+
+        input_json_patterns = (
+            "*.atlas_leaf_targets.json",
+            "*_auto_capture_manifest.json",
+            "*_normalization_manifest.json",
+            "bark_normalization_manifest.json",
+            "*_bark_source_manifest.json",
+        )
+        for pattern in input_json_patterns:
+            for candidate in owner.rglob(pattern):
+                if (
+                    candidate.is_file()
+                    and not is_temporary_contract_path(candidate)
+                ):
+                    paths.add(candidate.resolve())
+
+        import_manifest = owner / "speedtree_import_manifest.json"
+        if import_manifest.is_file():
+            paths.add(import_manifest.resolve())
+        for folder_name in (
+            ".atlas_leaf_speedtree_scopes",
+            ".atlas_leaf_speedtree_targets",
+        ):
+            folder = owner / folder_name
+            if not folder.is_dir():
+                continue
+            for candidate in folder.glob("*.json"):
+                if candidate.is_file():
+                    paths.add(candidate.resolve())
+        return paths
+
+    def _cluster_receipt_refresh_input_fingerprint(
+        self,
+        spm,
+        *,
+        live_artifact_paths=(),
+    ):
+        """Hash the owner inputs while keeping stable large files O(1).
+
+        SPM and JSON manifests use content hashes. Large Blender/FBX/texture
+        artifacts already covered by the live report use path/size/mtime
+        identities, matching the repository's other content-addressed cache
+        validators. Missing paths remain part of the key, so an artifact
+        appearing later invalidates the memo automatically.
+        """
+        spm = Path(spm).resolve()
+        content_paths = self._cluster_receipt_discovery_input_paths(spm)
+
+        all_paths = {
+            Path(path).resolve()
+            for path in live_artifact_paths
+        }
+        all_paths.update(content_paths)
+        records = []
+        for candidate in sorted(
+            all_paths,
+            key=lambda path: os.path.normcase(str(path)),
+        ):
+            key = os.path.normcase(os.path.abspath(str(candidate)))
+            try:
+                stat = candidate.stat()
+            except FileNotFoundError:
+                records.append({"path": key, "exists": False})
+                continue
+            if (
+                candidate in content_paths
+                or candidate.suffix.casefold() in {".spm", ".json"}
+            ):
+                snapshot = file_content_snapshot(candidate)
+                records.append({
+                    "path": key,
+                    "exists": True,
+                    **snapshot,
+                })
+            else:
+                records.append({
+                    "path": key,
+                    "exists": True,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                })
+
+        envelope = {
+            "version": 1,
+            "scope": self._cluster_receipt_refresh_scope(spm),
+            "files": records,
+        }
+        encoded = json.dumps(
+            envelope,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
     def _refresh_stale_cluster_receipt(
         self,
         spm,
         stamp,
         *,
         producer_spm=None,
+        allowed_producer_spms=(),
+    ):
+        """Reuse one hash-current live audit inside the active GUI batch.
+
+        The memo stores only the raw live-audit observation. Producer bootstrap
+        tolerance is evaluated after reuse for each caller, so a producer call
+        cannot turn the same owner's data error into a cached success.
+
+        Successful raw audits only are memoized. Concurrent callers for the
+        same owner/input share one Future; an execution exception reaches all
+        existing waiters but is removed immediately so a later caller may
+        retry.
+        """
+        spm = Path(spm).resolve()
+        if not (spm.parent / "Cluster").is_dir():
+            return self._refresh_stale_cluster_receipt_uncached(
+                spm,
+                stamp,
+                producer_spm=producer_spm,
+                allowed_producer_spms=allowed_producer_spms,
+            )
+
+        self._ensure_cluster_receipt_refresh_memo()
+        scope = self._cluster_receipt_refresh_scope(spm)
+        cached_hit = False
+        cached_raw_audit = None
+        while True:
+            with self._cluster_receipt_refresh_memo_lock:
+                cached = self._cluster_receipt_refresh_memo.get(scope)
+                cached_live_artifact_paths = (
+                    (cached or {}).get("live_artifact_paths") or ()
+                )
+            try:
+                current_cache_fingerprint = (
+                    self._cluster_receipt_refresh_input_fingerprint(
+                        spm,
+                        live_artifact_paths=cached_live_artifact_paths,
+                    )
+                )
+                pre_discovery_fingerprint = (
+                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                )
+            except (OSError, RuntimeError) as exc:
+                raise BatchItemError(
+                    "Cluster Assembly live audit input fingerprint failed: "
+                    f"{spm.name}: {exc}",
+                    kind="internal_error",
+                ) from exc
+            cached_artifacts_match = False
+            if cached is not None:
+                cached_artifacts_match, _cached_artifact_errors = (
+                    self._cluster_receipt_live_artifacts_match(
+                        (cached.get("raw_audit") or {}).get("payload") or {}
+                    )
+                )
+            with self._cluster_receipt_refresh_memo_lock:
+                # Another owner-equivalent caller may have published a newer
+                # immutable cache entry while hashes were calculated. Validate
+                # that entry outside the lock instead of accepting or
+                # overwriting it based on the older snapshot.
+                if self._cluster_receipt_refresh_memo.get(scope) is not cached:
+                    continue
+                if (
+                    cached is not None
+                    and cached.get("input_fingerprint")
+                    == current_cache_fingerprint
+                    and cached.get("discovery_fingerprint")
+                    == pre_discovery_fingerprint
+                    and cached_artifacts_match
+                ):
+                    cached_raw_audit = cached.get("raw_audit")
+                    cached_hit = True
+                    flight_key = None
+                    flight = None
+                    owns_flight = False
+                else:
+                    flight_key = (scope, pre_discovery_fingerprint)
+                    flight = self._cluster_receipt_refresh_flights.get(
+                        flight_key
+                    )
+                    if flight is None:
+                        flight = Future()
+                        self._cluster_receipt_refresh_flights[
+                            flight_key
+                        ] = flight
+                        owns_flight = True
+                    else:
+                        owns_flight = False
+                break
+
+        if cached_hit:
+            if hasattr(self, "log"):
+                self.log(
+                    "Cluster Assembly live audit memo hit: "
+                    f"{spm.name}"
+                )
+            return self._evaluate_cluster_receipt_live_audit(
+                spm,
+                copy.deepcopy(cached_raw_audit),
+                producer_spm=producer_spm,
+                allowed_producer_spms=allowed_producer_spms,
+            )
+        if not owns_flight:
+            raw_audit = copy.deepcopy(
+                self._wait_cluster_receipt_refresh_flight(flight, spm)
+            )
+            return self._evaluate_cluster_receipt_live_audit(
+                spm,
+                raw_audit,
+                producer_spm=producer_spm,
+                allowed_producer_spms=allowed_producer_spms,
+            )
+
+        completion_error = None
+        cache_entry = None
+        try:
+            attempt_pre_fingerprint = pre_discovery_fingerprint
+            for attempt in range(2):
+                raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                    spm,
+                    (
+                        stamp
+                        if attempt == 0
+                        else f"{stamp}_retry{attempt}"
+                    ),
+                    _raw_only=True,
+                )
+                post_discovery_fingerprint = (
+                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                )
+                artifacts_match, artifact_errors = (
+                    self._cluster_receipt_live_artifacts_match(
+                        raw_audit.get("payload") or {}
+                    )
+                )
+                stable = bool(
+                    attempt_pre_fingerprint
+                    == post_discovery_fingerprint
+                    and artifacts_match
+                )
+                if stable:
+                    live_artifact_paths = (
+                        self._cluster_receipt_live_artifact_paths(
+                            raw_audit.get("payload") or {},
+                            report_path=raw_audit.get("audit_report"),
+                        )
+                    )
+                    post_cache_fingerprint = (
+                        self._cluster_receipt_refresh_input_fingerprint(
+                            spm,
+                            live_artifact_paths=live_artifact_paths,
+                        )
+                    )
+                    final_discovery_fingerprint = (
+                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                    )
+                    final_artifacts_match, final_artifact_errors = (
+                        self._cluster_receipt_live_artifacts_match(
+                            raw_audit.get("payload") or {}
+                        )
+                    )
+                    stable = bool(
+                        final_discovery_fingerprint
+                        == attempt_pre_fingerprint
+                        and final_artifacts_match
+                    )
+                    if stable:
+                        cache_entry = {
+                            "input_fingerprint": post_cache_fingerprint,
+                            "discovery_fingerprint": (
+                                final_discovery_fingerprint
+                            ),
+                            "live_artifact_paths": live_artifact_paths,
+                            "raw_audit": copy.deepcopy(raw_audit),
+                        }
+                        break
+                    artifact_errors = final_artifact_errors
+                if attempt == 0:
+                    self.log(
+                        "Cluster Assembly live audit input changed during "
+                        f"audit; retrying once: {spm.name}"
+                    )
+                    attempt_pre_fingerprint = (
+                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                    )
+                    continue
+                detail = "; ".join(artifact_errors[:3])
+                raise BatchItemError(
+                    "Cluster Assembly live audit inputs kept changing; "
+                    f"result was not cached: {spm.name}"
+                    + (f": {detail}" if detail else ""),
+                    kind="internal_error",
+                    log_file=raw_audit.get("log_file"),
+                    report_file=raw_audit.get("audit_report"),
+                )
+        except Exception as exc:
+            completion_error = exc
+
+        publish_error = completion_error
+        with self._cluster_receipt_refresh_memo_lock:
+            try:
+                if publish_error is None and cache_entry is not None:
+                    self._cluster_receipt_refresh_memo[scope] = cache_entry
+                if publish_error is None:
+                    flight.set_result(copy.deepcopy(raw_audit))
+                else:
+                    flight.set_exception(publish_error)
+            except Exception as exc:
+                publish_error = publish_error or exc
+                if (
+                    cache_entry is not None
+                    and self._cluster_receipt_refresh_memo.get(scope)
+                    is cache_entry
+                ):
+                    self._cluster_receipt_refresh_memo.pop(scope, None)
+                if not flight.done():
+                    try:
+                        flight.set_exception(publish_error)
+                    except Exception:
+                        pass
+            finally:
+                if (
+                    self._cluster_receipt_refresh_flights.get(flight_key)
+                    is flight
+                ):
+                    self._cluster_receipt_refresh_flights.pop(
+                        flight_key,
+                        None,
+                    )
+
+        if publish_error is not None:
+            raise publish_error
+        return self._evaluate_cluster_receipt_live_audit(
+            spm,
+            raw_audit,
+            producer_spm=producer_spm,
+            allowed_producer_spms=allowed_producer_spms,
+        )
+
+    def _refresh_stale_cluster_receipt_uncached(
+        self,
+        spm,
+        stamp,
+        *,
+        producer_spm=None,
+        allowed_producer_spms=(),
+        _raw_only=False,
     ):
         """Run the live PCG audit before launching Blender for owner Trees.
 
@@ -4459,7 +5055,7 @@ class App:
         reselected.
         """
         spm = Path(spm).resolve()
-        with CLUSTER_RECEIPT_REFRESH_LOCK:
+        with self._cluster_receipt_owner_lock(spm):
             owner_has_cluster = (spm.parent / "Cluster").is_dir()
             try:
                 cached_resolution = cluster_assembly_receipt_resolution(spm)
@@ -4485,9 +5081,21 @@ class App:
                     f"(현재 산출물 해시 재감사)"
                 )
 
-            audit_report = LOG_DIR / (
-                f"{spm.stem}_cluster_receipt_refresh_{stamp}.json"
+            scope_hash = hashlib.blake2b(
+                self._cluster_receipt_refresh_scope(spm).encode("utf-8"),
+                digest_size=8,
+            ).hexdigest()
+            active_job = getattr(self, "active_batch_job", None)
+            job_id = (
+                str(active_job.get("id"))
+                if isinstance(active_job, dict) and active_job.get("id")
+                else "adhoc"
             )
+            run_identity = (
+                f"{spm.stem}_{scope_hash}_job{job_id}_{stamp}_"
+                f"{uuid.uuid4().hex[:12]}"
+            )
+            audit_report = LOG_DIR / f"{run_identity}.json"
             audit_script = (
                 REPO_DIR
                 / "pcg_st9_texture_batch"
@@ -4506,110 +5114,23 @@ class App:
                     ),
                     "--json", str(audit_report),
                 ],
-                f"{spm.stem}_cluster_receipt_refresh_{stamp}.log",
+                f"{run_identity}.log",
                 timeout,
                 affinity=False,
             )
 
-            def audit_payload():
-                try:
-                    value = json.loads(
-                        audit_report.read_text(encoding="utf-8")
-                    )
-                except (OSError, TypeError, ValueError):
-                    return {}
-                return value if isinstance(value, dict) else {}
-
-            def audit_issues(payload):
-                failures = []
-                for audit_item in payload.get("items") or []:
-                    handoff = (
-                        (audit_item.get("cluster_assembly") or {}).get(
-                            "handoff"
-                        )
-                        or {}
-                    )
-                    for issue in (
-                        handoff.get("errors")
-                        or handoff.get("issues")
-                        or []
-                    ):
-                        failures.append(issue)
-                return failures
-
-            def audit_failure_summary(issues):
-                failures = []
-                for issue in issues:
-                    code_value = str(
-                        issue.get("code") or "CLUSTER_DATA_INVALID"
-                    )
-                    role = str(issue.get("role") or "")
-                    details = issue.get("details") or {}
-                    status = str(details.get("status") or "")
-                    missing = [
-                        str(value)
-                        for value in details.get("missing") or []
-                    ]
-                    fields = [code_value]
-                    if role:
-                        fields.append(f"role={role}")
-                    if status:
-                        fields.append(f"status={status}")
-                    if missing:
-                        fields.append(
-                            "missing=" + ", ".join(missing[:3])
-                        )
-                    failures.append(" ".join(fields))
-                return " | ".join(failures[:5])
-
-            payload = audit_payload()
-            live_issues = audit_issues(payload)
-            actual_failure = audit_failure_summary(live_issues)
-
-            def same_file(left, right):
-                if not left or not right:
-                    return False
-                try:
-                    return (
-                        str(Path(left).expanduser().resolve()).casefold()
-                        == str(
-                            Path(right).expanduser().resolve()
-                        ).casefold()
-                    )
-                except OSError:
-                    return (
-                        str(Path(left).expanduser().absolute()).casefold()
-                        == str(
-                            Path(right).expanduser().absolute()
-                        ).casefold()
-                    )
-
-            producer_repair_only_failure = bool(
-                producer_spm
-                and live_issues
-                and all(
-                    str(issue.get("code") or "")
-                    == "NORMALIZED_VARIANTS_REQUIRED"
-                    and same_file(issue.get("spm"), producer_spm)
-                    for issue in live_issues
+            payload_error = None
+            try:
+                payload = json.loads(
+                    audit_report.read_text(encoding="utf-8")
                 )
-            )
-            if actual_failure and not producer_repair_only_failure:
-                raise BatchItemError(
-                    "Cluster Assembly actual data audit failed: "
-                    + actual_failure,
-                    kind="data_error",
-                    log_file=log_file,
-                    report_file=audit_report,
-                )
-            if producer_repair_only_failure:
-                self.log(
-                    "Cluster Assembly producer bootstrap allowed: "
-                    f"{Path(producer_spm).name} requires the normalized "
-                    "variants this Blender Repair invocation produces"
-                )
+            except (OSError, TypeError, ValueError) as exc:
+                payload = None
+                payload_error = exc
             persistence = (
                 payload.get("cluster_assembly_receipt_persistence") or {}
+                if isinstance(payload, dict)
+                else {}
             )
             persistence_only_failure = bool(
                 persistence.get("status") == "warning"
@@ -4618,143 +5139,320 @@ class App:
                 == "RECEIPT_PERSISTENCE_FAILED"
                 and persistence.get("live_audit_complete") is True
             )
+            if code != 0 and not persistence_only_failure:
+                raise BatchItemError(
+                    "Cluster Assembly live audit process failed: "
+                    f"{spm.name} (exit {code})",
+                    kind="internal_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("items"), list)
+                or not payload.get("items")
+            ):
+                raise BatchItemError(
+                    "Cluster Assembly live audit report is missing, corrupt, "
+                    f"or empty: {spm.name}"
+                    + (f": {payload_error}" if payload_error else ""),
+                    kind="internal_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
             if code != 0:
-                if persistence_only_failure:
-                    self.log(
-                        "Cluster Assembly 영수증 저장 경고 무시 "
-                        f"(live audit 완료): {spm.name}: "
-                        f"{persistence.get('error') or f'exit {code}'}"
-                    )
-                else:
-                    raise BatchItemError(
-                        "Cluster Assembly live audit process failed: "
-                        f"{spm.name} (exit {code})",
-                        kind="internal_error",
-                        log_file=log_file,
-                        report_file=audit_report,
-                    )
-
-            def selected_live_contract():
-                try:
-                    from cluster_assembly_handoff_contract import (
-                        select_cluster_contract,
-                    )
-                    contract = select_cluster_contract(payload, spm)
-                except (ImportError, ValueError):
-                    return None
-                return contract if isinstance(contract, dict) else None
-
-            live_contract = selected_live_contract()
-            live_contract_actionable = bool(
-                live_contract
-                and live_contract.get("dependencies")
-                and live_contract.get("tree_source_identities")
-            )
-            if not live_contract_actionable:
-                # The audit persists receipts only for actionable Cluster
-                # contracts.  A clean, identity-bound pass-through contract
-                # still has to reach BWR so an older material-preflight cache
-                # cannot reintroduce a removed Cluster relationship.
                 self.log(
-                    f"Cluster Assembly 영수증 비대상: {spm.name}"
+                    "Cluster Assembly 영수증 저장 경고 무시 "
+                    f"(live audit 완료): {spm.name}: "
+                    f"{persistence.get('error') or f'exit {code}'}"
                 )
-                if (
-                    live_contract
-                    and live_contract.get("tree_source_identities")
-                    and str(
-                        (live_contract.get("handoff") or {}).get("status")
-                        or ""
-                    ) == "pass_through"
-                ):
-                    return {
-                        "policy": "live_audit_authoritative_pass_through",
-                        "requested_spm": str(spm),
-                        "selected_receipt": str(audit_report),
-                        "live_audit_report": str(audit_report),
-                        "persisted_receipt": None,
-                        "current_candidates": [],
-                        "superseded_current_receipts": [],
-                        "ignored_stale_candidates": [],
-                        "receipt_persistence_warning": str(
-                            (
-                                payload.get(
-                                    "cluster_assembly_receipt_persistence"
-                                )
-                                or {}
-                            ).get("error")
-                            or ""
-                        ),
-                    }
-                return None
-
-            persistence_error = str(persistence.get("error") or "")
-            persisted_resolution = None
-            ignored_stale = []
-            cache_resolution_error = ""
             try:
-                persisted_resolution = cluster_assembly_receipt_resolution(
-                    spm
+                from cluster_assembly_handoff_contract import (
+                    select_cluster_contract,
                 )
-            except (
-                FileNotFoundError,
-                ClusterAssemblyReceiptStaleError,
-            ) as exc:
-                cache_resolution_error = str(exc)
-                ignored_stale.append({
-                    "path": "",
-                    "error": cache_resolution_error,
-                })
-                self.log(
-                    "Cluster Assembly live audit 사용 "
-                    f"(영수증은 캐시 경고): {spm.name}: "
-                    + (persistence_error or cache_resolution_error)
+                selected_contract = select_cluster_contract(payload, spm)
+            except (ImportError, ValueError) as exc:
+                raise BatchItemError(
+                    "Cluster Assembly live audit could not select an "
+                    f"identity-bound owner contract: {spm.name}: {exc}",
+                    kind="internal_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                ) from exc
+            if (
+                owner_has_cluster
+                and (
+                    not isinstance(selected_contract, dict)
+                    or not selected_contract.get("tree_source_identities")
+                    or not self._cluster_contract_identifies_requested_spm(
+                        selected_contract,
+                        spm,
+                    )
                 )
-            else:
-                self.log(
-                    "Cluster Assembly live audit 완료 · 캐시 영수증 갱신: "
-                    f"{Path(persisted_resolution['selected_receipt']).name}"
+            ):
+                raise BatchItemError(
+                    "Cluster Assembly live audit did not return a strict "
+                    f"identity-bound owner contract: {spm.name}",
+                    kind="internal_error",
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
+            raw_audit = {
+                "requested_spm": str(spm),
+                "payload": payload,
+                "selected_contract": selected_contract,
+                "audit_report": str(audit_report),
+                "log_file": str(log_file) if log_file else None,
+                "persistence": persistence,
+            }
+            if _raw_only:
+                return raw_audit
+            return self._evaluate_cluster_receipt_live_audit(
+                spm,
+                raw_audit,
+                producer_spm=producer_spm,
+                allowed_producer_spms=allowed_producer_spms,
+            )
+
+    def _evaluate_cluster_receipt_live_audit(
+        self,
+        spm,
+        raw_audit,
+        *,
+        producer_spm=None,
+        allowed_producer_spms=(),
+    ):
+        """Apply caller policy to one reusable, successful live observation."""
+        spm = Path(spm).resolve()
+        raw_audit = raw_audit if isinstance(raw_audit, dict) else {}
+        payload = raw_audit.get("payload") or {}
+        audit_report = Path(
+            raw_audit.get("audit_report")
+            or (
+                LOG_DIR
+                / f"{spm.stem}_cluster_receipt_refresh_unknown.json"
+            )
+        )
+        log_value = raw_audit.get("log_file")
+        log_file = Path(log_value) if log_value else None
+        persistence = (
+            raw_audit.get("persistence")
+            or payload.get("cluster_assembly_receipt_persistence")
+            or {}
+        )
+
+        live_issues = []
+        for audit_item in payload.get("items") or []:
+            handoff = (
+                (audit_item.get("cluster_assembly") or {}).get("handoff")
+                or {}
+            )
+            live_issues.extend(
+                handoff.get("errors")
+                or handoff.get("issues")
+                or []
+            )
+
+        failures = []
+        for issue in live_issues:
+            code_value = str(
+                issue.get("code") or "CLUSTER_DATA_INVALID"
+            )
+            role = str(issue.get("role") or "")
+            details = issue.get("details") or {}
+            status = str(details.get("status") or "")
+            missing = [
+                str(value)
+                for value in details.get("missing") or []
+            ]
+            fields = [code_value]
+            if role:
+                fields.append(f"role={role}")
+            if status:
+                fields.append(f"status={status}")
+            if missing:
+                fields.append("missing=" + ", ".join(missing[:3]))
+            failures.append(" ".join(fields))
+        actual_failure = " | ".join(failures[:5])
+
+        def same_file(left, right):
+            if not left or not right:
+                return False
+            try:
+                return (
+                    str(Path(left).expanduser().resolve()).casefold()
+                    == str(Path(right).expanduser().resolve()).casefold()
+                )
+            except OSError:
+                return (
+                    str(Path(left).expanduser().absolute()).casefold()
+                    == str(Path(right).expanduser().absolute()).casefold()
                 )
 
-            # The live report, not the optional persisted cache, is the
-            # contract consumed by this BWR invocation.  This prevents a
-            # hash-current receipt written by older producer code from
-            # repeating a semantic false block.
-            return {
-                "policy": "live_audit_authoritative",
-                "requested_spm": str(spm),
-                "selected_receipt": str(audit_report),
-                "live_audit_report": str(audit_report),
-                "persisted_receipt": (
-                    (persisted_resolution or {}).get("selected_receipt")
-                ),
-                "current_candidates": (
-                    (persisted_resolution or {}).get(
-                        "current_candidates", []
-                    )
-                ),
-                "superseded_current_receipts": (
-                    (persisted_resolution or {}).get(
-                        "superseded_current_receipts", []
-                    )
-                ),
-                "ignored_stale_candidates": (
-                    (persisted_resolution or {}).get(
-                        "ignored_stale_candidates", []
-                    )
-                    + ignored_stale
-                ),
-                "receipt_persistence_warning": (
-                    persistence_error or cache_resolution_error
-                ),
-                "producer_repair_issue_tolerated": (
-                    producer_repair_only_failure
-                ),
-                "producer_spm": (
-                    str(Path(producer_spm).resolve())
-                    if producer_spm
-                    else None
-                ),
-            }
+        allowed_producers = [
+            Path(value).expanduser().resolve()
+            for value in (
+                tuple(allowed_producer_spms or ())
+                + ((producer_spm,) if producer_spm else ())
+            )
+            if value
+        ]
+        allowed_producers = list(dict.fromkeys(allowed_producers))
+        producer_repair_only_failure = bool(
+            producer_spm
+            and allowed_producers
+            and live_issues
+            and all(
+                str(issue.get("code") or "")
+                == "NORMALIZED_VARIANTS_REQUIRED"
+                and any(
+                    same_file(issue.get("spm"), allowed)
+                    for allowed in allowed_producers
+                )
+                for issue in live_issues
+            )
+        )
+        if actual_failure and not producer_repair_only_failure:
+            raise BatchItemError(
+                "Cluster Assembly actual data audit failed: "
+                + actual_failure,
+                kind="data_error",
+                log_file=log_file,
+                report_file=audit_report,
+            )
+        if producer_repair_only_failure:
+            self.log(
+                "Cluster Assembly producer bootstrap allowed: "
+                + ", ".join(path.name for path in allowed_producers)
+                + " require the normalized variants planned in this "
+                "Blender Repair wave"
+            )
+
+        live_contract = copy.deepcopy(raw_audit.get("selected_contract"))
+        if not isinstance(live_contract, dict):
+            try:
+                from cluster_assembly_handoff_contract import (
+                    select_cluster_contract,
+                )
+                live_contract = select_cluster_contract(payload, spm)
+            except (ImportError, ValueError):
+                live_contract = None
+        if not isinstance(live_contract, dict):
+            live_contract = None
+        if (
+            live_contract is not None
+            and not self._cluster_contract_identifies_requested_spm(
+                live_contract,
+                spm,
+            )
+        ):
+            raise BatchItemError(
+                "Cluster Assembly live audit selected a contract for a "
+                f"different owner SPM: {spm.name}",
+                kind="internal_error",
+                log_file=log_file,
+                report_file=audit_report,
+            )
+
+        live_contract_actionable = bool(
+            live_contract
+            and live_contract.get("dependencies")
+            and live_contract.get("tree_source_identities")
+        )
+        if not live_contract_actionable:
+            # A clean identity-bound pass-through still has to reach BWR so an
+            # older cache cannot reintroduce a removed Cluster relationship.
+            self.log(f"Cluster Assembly 영수증 비대상: {spm.name}")
+            if (
+                live_contract
+                and live_contract.get("tree_source_identities")
+                and str(
+                    (live_contract.get("handoff") or {}).get("status")
+                    or ""
+                ) == "pass_through"
+            ):
+                return {
+                    "policy": "live_audit_authoritative_pass_through",
+                    "requested_spm": str(spm),
+                    "selected_receipt": str(audit_report),
+                    "live_audit_report": str(audit_report),
+                    "live_audit_payload": copy.deepcopy(payload),
+                    "selected_contract": copy.deepcopy(live_contract),
+                    "persisted_receipt": None,
+                    "current_candidates": [],
+                    "superseded_current_receipts": [],
+                    "ignored_stale_candidates": [],
+                    "receipt_persistence_warning": str(
+                        persistence.get("error") or ""
+                    ),
+                }
+            return None
+
+        persistence_error = str(persistence.get("error") or "")
+        persisted_resolution = None
+        ignored_stale = []
+        cache_resolution_error = ""
+        try:
+            persisted_resolution = cluster_assembly_receipt_resolution(spm)
+        except (
+            FileNotFoundError,
+            ClusterAssemblyReceiptStaleError,
+        ) as exc:
+            cache_resolution_error = str(exc)
+            ignored_stale.append({
+                "path": "",
+                "error": cache_resolution_error,
+            })
+            self.log(
+                "Cluster Assembly live audit 사용 "
+                f"(영수증은 캐시 경고): {spm.name}: "
+                + (persistence_error or cache_resolution_error)
+            )
+        else:
+            self.log(
+                "Cluster Assembly live audit 완료 · 캐시 영수증 갱신: "
+                f"{Path(persisted_resolution['selected_receipt']).name}"
+            )
+
+        return {
+            "policy": "live_audit_authoritative",
+            "requested_spm": str(spm),
+            "selected_receipt": str(audit_report),
+            "live_audit_report": str(audit_report),
+            "live_audit_payload": copy.deepcopy(payload),
+            "selected_contract": copy.deepcopy(live_contract),
+            "persisted_receipt": (
+                (persisted_resolution or {}).get("selected_receipt")
+            ),
+            "current_candidates": (
+                (persisted_resolution or {}).get("current_candidates", [])
+            ),
+            "superseded_current_receipts": (
+                (persisted_resolution or {}).get(
+                    "superseded_current_receipts", []
+                )
+            ),
+            "ignored_stale_candidates": (
+                (persisted_resolution or {}).get(
+                    "ignored_stale_candidates", []
+                )
+                + ignored_stale
+            ),
+            "receipt_persistence_warning": (
+                persistence_error or cache_resolution_error
+            ),
+            "producer_repair_issue_tolerated": (
+                producer_repair_only_failure
+            ),
+            "producer_spm": (
+                str(Path(producer_spm).resolve())
+                if producer_spm
+                else None
+            ),
+            "allowed_producer_spms": [
+                str(path) for path in allowed_producers
+            ],
+        }
 
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
@@ -4782,11 +5480,23 @@ class App:
                 try:
                     live_target_contracts = []
                     for target in relation_targets:
+                        planned_producers = getattr(
+                            self,
+                            (
+                                "_active_blender_planned_cluster_"
+                                "producers_by_owner"
+                            ),
+                            {},
+                        ).get(
+                            normalized_folder_key(target),
+                            (speedtree_spm,),
+                        )
                         live_resolution = (
                             self._refresh_stale_cluster_receipt(
                                 target,
                                 stamp,
                                 producer_spm=speedtree_spm,
+                                allowed_producer_spms=planned_producers,
                             )
                         )
                         live_report = (
@@ -4796,8 +5506,12 @@ class App:
                             if isinstance(live_resolution, dict)
                             else None
                         )
-                        contract = None
-                        if live_report:
+                        contract = copy.deepcopy(
+                            (live_resolution or {}).get(
+                                "selected_contract"
+                            )
+                        )
+                        if contract is None and live_report:
                             payload = json.loads(
                                 Path(live_report).read_text(
                                     encoding="utf-8"
@@ -4970,21 +5684,15 @@ class App:
                         repair_state["current"] = False
                     else:
                         try:
-                            from cluster_assembly_handoff_contract import (
-                                select_cluster_contract,
+                            live_contract = copy.deepcopy(
+                                cluster_receipt_resolution.get(
+                                    "selected_contract"
+                                )
                             )
-                            live_report = Path(
-                                cluster_receipt_resolution[
-                                    "live_audit_report"
-                                ]
-                            )
-                            live_payload = json.loads(
-                                live_report.read_text(encoding="utf-8")
-                            )
-                            live_contract = select_cluster_contract(
-                                live_payload,
-                                speedtree_spm,
-                            )
+                            if not isinstance(live_contract, dict):
+                                raise ValueError(
+                                    "selected live contract is unavailable"
+                                )
                             live_status = str(
                                 (
                                     live_contract.get("handoff") or {}
@@ -5119,15 +5827,20 @@ class App:
                 cluster_receipt_resolution["live_audit_report"]
             )
             try:
-                from cluster_assembly_handoff_contract import (
-                    select_cluster_contract,
+                live_payload = copy.deepcopy(
+                    cluster_receipt_resolution.get("live_audit_payload")
                 )
-                live_payload = json.loads(
-                    live_report.read_text(encoding="utf-8")
+                selected_contract = copy.deepcopy(
+                    cluster_receipt_resolution.get("selected_contract")
                 )
-                material_result["cluster_assembly"] = (
-                    select_cluster_contract(live_payload, speedtree_spm)
-                )
+                if (
+                    not isinstance(live_payload, dict)
+                    or not isinstance(selected_contract, dict)
+                ):
+                    raise ValueError(
+                        "immutable live audit payload/contract is unavailable"
+                    )
+                material_result["cluster_assembly"] = selected_contract
                 material_result[
                     "cluster_assembly_receipt_persistence"
                 ] = live_payload.get(
