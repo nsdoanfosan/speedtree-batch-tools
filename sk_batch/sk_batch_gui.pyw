@@ -29,6 +29,7 @@ import traceback
 import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -130,6 +131,7 @@ CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 CLUSTER_RECEIPT_REFRESH_LOCK = threading.Lock()
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
+_REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
 
 
@@ -192,6 +194,57 @@ def repair_pipeline_report_path(spm):
         spm.parent / "reports" /
         f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
     )
+
+
+@contextmanager
+def repair_report_read_scope():
+    """Reuse one large Repair JSON only within one semantic status decision."""
+    previous = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
+    _REPAIR_REPORT_READ_LOCAL.cache = {}
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _REPAIR_REPORT_READ_LOCAL.cache
+            except AttributeError:
+                pass
+        else:
+            _REPAIR_REPORT_READ_LOCAL.cache = previous
+
+
+def _repair_report_stat_key(path):
+    path = Path(path)
+    stat = path.stat()
+    return (
+        os.path.normcase(os.path.abspath(str(path))),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
+def _read_repair_pipeline_json(path):
+    """Read a report once per scope without retaining multi-MB data globally."""
+    path = Path(path)
+    cache = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
+    key = _repair_report_stat_key(path)
+    if cache is not None and key in cache:
+        return cache[key]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if cache is not None:
+        # A status decision concerns one SPM. Keep this cache explicitly
+        # bounded in case a future nested helper consults a second report.
+        cache.clear()
+        cache[key] = payload
+    return payload
+
+
+def _cache_written_repair_pipeline_json(path, payload):
+    cache = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
+    if cache is None:
+        return
+    cache.clear()
+    cache[_repair_report_stat_key(path)] = payload
 
 
 def _artifact_fingerprints_match(expected, actual):
@@ -388,7 +441,7 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
     canonical_spm = speedtree_output_spm_for(spm)
     report_path = repair_pipeline_report_path(spm)
     try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report = _read_repair_pipeline_json(report_path)
     except (OSError, ValueError) as exc:
         raise ValueError(f"Repair report could not be read: {exc}") from exc
     if not isinstance(report, dict):
@@ -451,6 +504,7 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         "source_identity": current_identity,
     }
     atomic_write_json(report_path, migrated)
+    _cache_written_repair_pipeline_json(report_path, migrated)
     return migrated
 
 
@@ -599,12 +653,24 @@ def blender_open_file_window_titles(blend_path):
     titles = []
     try:
         user32 = ctypes.windll.user32
+        current_pid = os.getpid()
         callback_type = ctypes.WINFUNCTYPE(
             ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
         )
 
         @callback_type
         def collect(window, _extra):
+            # GetWindowTextLengthW sends WM_GETTEXTLENGTH when the window
+            # belongs to this process.  The batch main thread waits for these
+            # workers, so querying its hidden Tk window here deadlocks both
+            # sides.  Only external Blender windows can satisfy this guard;
+            # reject our own windows before asking Windows for their titles.
+            window_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(
+                window, ctypes.byref(window_pid)
+            )
+            if window_pid.value == current_pid:
+                return True
             length = user32.GetWindowTextLengthW(window)
             if length <= 0:
                 return True
@@ -3447,6 +3513,10 @@ class App:
         return True, ""
 
     def _repair_output_state(self, spm):
+        with repair_report_read_scope():
+            return self._repair_output_state_scoped(spm)
+
+    def _repair_output_state_scoped(self, spm):
         """One semantic decision shared by row status and the ② queue gate."""
         leaf_ok, leaf_reason = self._leaf_reference_ready(
             speedtree_output_spm_for(spm)

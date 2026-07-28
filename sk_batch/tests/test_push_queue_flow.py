@@ -37,6 +37,62 @@ class PushQueueFlowTests(unittest.TestCase):
         app.log = mock.Mock()
         return app
 
+    def test_blender_window_guard_skips_own_tk_windows_before_title_query(self):
+        gui = load_gui_module()
+        blend = Path(r"C:\assets\tree.blend")
+        queried = []
+
+        class FakeUser32:
+            def EnumWindows(self, callback, _extra):
+                callback(101, 0)
+                callback(202, 0)
+
+            def GetWindowThreadProcessId(self, window, pid_pointer):
+                pid_pointer._obj.value = (
+                    gui.os.getpid() if window == 101 else gui.os.getpid() + 1
+                )
+                return 1
+
+            def GetWindowTextLengthW(self, window):
+                queried.append(window)
+                return len(f"{blend.resolve()} - Blender")
+
+            def GetWindowTextW(self, _window, buffer, _length):
+                buffer.value = f"{blend.resolve()} - Blender"
+                return len(buffer.value)
+
+        with mock.patch.object(
+            gui.ctypes,
+            "windll",
+            mock.Mock(user32=FakeUser32()),
+        ):
+            titles = gui.blender_open_file_window_titles(blend)
+
+        self.assertEqual(queried, [202])
+        self.assertEqual(titles, [f"{blend.resolve()} - Blender"])
+
+    def test_repair_report_is_read_once_inside_one_status_scope(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "repair.json"
+            report.write_text('{"status":"ok"}', encoding="utf-8")
+            original_read_text = gui.Path.read_text
+            reads = []
+
+            def tracked_read_text(path, *args, **kwargs):
+                reads.append(path)
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(gui.Path, "read_text", tracked_read_text):
+                with gui.repair_report_read_scope():
+                    first = gui._read_repair_pipeline_json(report)
+                    second = gui._read_repair_pipeline_json(report)
+                third = gui._read_repair_pipeline_json(report)
+
+        self.assertIs(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(reads, [report, report])
+
     def test_process_runner_cleans_up_child_when_progress_callback_raises(self):
         gui = load_gui_module()
         app = self.make_app(gui)
