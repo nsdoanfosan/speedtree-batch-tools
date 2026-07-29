@@ -4419,6 +4419,126 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(after["Height"].resolve(), before["Height"].resolve())
             self.assertEqual(after["Depth"].resolve(), before["Depth"].resolve())
 
+    def test_inserted_graph_resources_keep_original_source_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sbs = root / "test.sbs"
+            sbs.write_text(
+                """<?xml version="1.0"?>
+<package>
+  <dependencies>
+    <dependency><filename v="?himself"/><uid v="1"/>
+      <type v="package"/><fileUID v="0"/><versionUID v="0"/></dependency>
+  </dependencies>
+  <content>
+    <group><identifier v="Resources"/><uid v="2"/><content/></group>
+  </content>
+</package>""",
+                encoding="utf-8",
+            )
+            albedo = root / "Original_Leaf_Albedo.png"
+            opacity = root / "Original_Leaf_Opacity.png"
+            Image.new("RGBA", (4, 4), (80, 120, 40, 255)).save(albedo)
+            Image.new("L", (4, 4), 255).save(opacity)
+            result = sbs_auto.insert_m_graph(
+                sbs,
+                "T_leaf_test_atlas_01",
+                {
+                    "Base_Color": albedo,
+                    "Opacity": opacity,
+                },
+            )
+
+            text = sbs.read_text(encoding="utf-8")
+            parsed = sbs_auto.parse_m_graph(
+                sbs, "T_leaf_test_atlas_01"
+            )
+            self.assertNotIn("T_leaf_test_atlas_01_albedo", text)
+            self.assertIn("Original_Leaf_Albedo", text)
+            self.assertEqual(
+                parsed["inputs"]["Base_Color"].resolve(),
+                Path(albedo).resolve(),
+            )
+            self.assertTrue(Path(result["backup"]).is_file())
+
+    def test_source_rebind_removes_output_named_input_resources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sbs = root / "test.sbs"
+            sbs.write_text(
+                """<?xml version="1.0"?>
+<package>
+  <dependencies>
+    <dependency><filename v="?himself"/><uid v="1"/>
+      <type v="package"/><fileUID v="0"/><versionUID v="0"/></dependency>
+  </dependencies>
+  <content>
+    <group><identifier v="Resources"/><uid v="2"/><content/></group>
+  </content>
+</package>""",
+                encoding="utf-8",
+            )
+            first = root / "First_Albedo.png"
+            replacement = root / "Original_Atlas_Albedo.png"
+            Image.new("RGBA", (4, 4), (80, 120, 40, 255)).save(first)
+            Image.new("RGBA", (4, 4), (120, 80, 40, 255)).save(
+                replacement
+            )
+            sbs_auto.insert_m_graph(
+                sbs,
+                "T_leaf_test_atlas_01",
+                {
+                    "Base_Color": first,
+                    "Opacity": first,
+                },
+            )
+            tree = ET.parse(sbs)
+            xml_root = tree.getroot()
+            graph = sbs_auto._find_graph(
+                xml_root, "T_leaf_test_atlas_01"
+            )
+            for element in graph.iter():
+                value = element.get("v", "")
+                if "First_Albedo" in value:
+                    element.set(
+                        "v",
+                        value.replace(
+                            "First_Albedo",
+                            "T_leaf_test_atlas_01_albedo",
+                        ),
+                    )
+                    break
+            resource = next(
+                resource
+                for resource in xml_root.iter("resource")
+                if resource.find("identifier") is not None
+                and resource.find("identifier").get("v")
+                == "First_Albedo"
+            )
+            resource.find("identifier").set(
+                "v", "T_leaf_test_atlas_01_albedo"
+            )
+            tree.write(sbs, encoding="utf-8", xml_declaration=True)
+
+            result = sbs_auto.rebind_managed_graph_source_inputs(
+                sbs,
+                "T_leaf_test_atlas_01",
+                {"Base_Color": replacement},
+                output_dir=root / "texture",
+            )
+            parsed = sbs_auto.parse_m_graph(
+                sbs, "T_leaf_test_atlas_01"
+            )
+            text = sbs.read_text(encoding="utf-8")
+
+            self.assertEqual(
+                parsed["inputs"]["Base_Color"].resolve(),
+                Path(replacement).resolve(),
+            )
+            self.assertNotIn("T_leaf_test_atlas_01_albedo", text)
+            self.assertIn("Original_Atlas_Albedo", text)
+            self.assertTrue(Path(result["backup"]).is_file())
+
     def test_legacy_m_graph_renames_to_t_graph_with_backup(self):
         source_sbs = Path(
             r"D:\OneDrive\Forestportfolio\Texture\bark\bark_common_end_01\bark_common_end_01.sbs"

@@ -61,6 +61,10 @@ class ManualFullRerenderTests(unittest.TestCase):
             self.gui, "complete_output_set", return_value=True
         ), mock.patch.object(
             self.gui, "job_needs_source_repair", return_value=False
+        ), mock.patch.object(
+            self.gui,
+            "step3_existing_output_freshness",
+            return_value={"fresh": True, "reason": "outputs_current"},
         ):
             normal_jobs, normal_skipped = app._step3_jobs()
             forced_jobs, forced_skipped = app._step3_jobs(

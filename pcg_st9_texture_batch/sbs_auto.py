@@ -602,6 +602,228 @@ def rename_managed_graph(sbs_path, old_name, new_name):
             "backup": str(backup)}
 
 
+def _source_resource_identifier(input_path, slot, occupied):
+    """Return a source-named SBS resource identifier, never an output T_ name."""
+    stem = re.sub(
+        r"[^A-Za-z0-9_]+",
+        "_",
+        Path(input_path).stem,
+    ).strip("_") or "source"
+    candidate = stem
+    if candidate.casefold() in occupied:
+        slot_suffix = re.sub(
+            r"[^A-Za-z0-9_]+",
+            "_",
+            str(slot),
+        ).strip("_")
+        candidate = f"{stem}_{slot_suffix}" if slot_suffix else f"{stem}_source"
+    index = 2
+    base = candidate
+    while candidate.casefold() in occupied:
+        candidate = f"{base}_{index}"
+        index += 1
+    occupied.add(candidate.casefold())
+    return candidate
+
+
+def _set_cluster_instance_parameter(instance, name, tag, value):
+    parameters = instance.find("parameters")
+    if parameters is None:
+        parameters = ET.SubElement(instance, "parameters")
+    parameter = next((
+        candidate for candidate in parameters.findall("parameter")
+        if candidate.find("name") is not None
+        and candidate.find("name").get("v") == name
+    ), None)
+    if parameter is None:
+        parameter = ET.SubElement(parameters, "parameter")
+        ET.SubElement(parameter, "name").set("v", name)
+        ET.SubElement(parameter, "relativeTo").set("v", "0")
+        ET.SubElement(parameter, "paramValue")
+    param_value = parameter.find("paramValue")
+    if param_value is None:
+        param_value = ET.SubElement(parameter, "paramValue")
+    for child in list(param_value):
+        param_value.remove(child)
+    ET.SubElement(param_value, tag).set("v", str(value))
+
+
+def rebind_managed_graph_source_inputs(
+        sbs_path, graph_name, inputs, params=None, output_dir=None):
+    """Transactionally point one T_ graph at explicit original source images.
+
+    Managed graph names describe outputs. Bitmap resource identifiers describe
+    inputs and therefore retain the original file stem. A graph may never read
+    its own ``T_<graph>_<role>`` output back as an input.
+    """
+    sbs_path = Path(sbs_path)
+    requested = {
+        str(slot): Path(path).resolve()
+        for slot, path in dict(inputs or {}).items()
+    }
+    for slot, path in requested.items():
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(f"{graph_name}: source input missing: {slot}={path}")
+        if path.stem.casefold().startswith(
+                str(graph_name).casefold() + "_"):
+            raise RuntimeError(
+                f"{graph_name}: managed output cannot be its own input: {path.name}"
+            )
+
+    tree = ET.parse(sbs_path)
+    root = tree.getroot()
+    graph = _find_graph(root, graph_name)
+    if graph is None:
+        raise RuntimeError(f"graph not found: {graph_name} in {sbs_path.name}")
+    nodes, bitmap_by_uid = _graph_bitmap_nodes(graph)
+    instance_node = next((
+        node for node in graph.find("compNodes") or []
+        if _is_cluster_instance(_node_implementation(node))
+    ), None)
+    if instance_node is None:
+        raise RuntimeError(f"{graph_name}: Cluster_System instance not found")
+    instance = _node_implementation(instance_node)
+
+    resources = {
+        resource.find("identifier").get("v"): resource
+        for resource in root.iter("resource")
+        if resource.find("identifier") is not None
+        and resource.find("filepath") is not None
+    }
+    graph_descendants = set(graph.iter())
+    resource_descendants = {
+        element
+        for resource in root.iter("resource")
+        for element in resource.iter()
+    }
+    occupied = {name.casefold() for name in resources}
+    mappings = []
+
+    for slot, input_path in requested.items():
+        connection = next((
+            candidate for candidate in instance_node.iter("connection")
+            if candidate.find("identifier") is not None
+            and candidate.find("identifier").get("v") == slot
+        ), None)
+        if connection is None or connection.find("connRef") is None:
+            raise RuntimeError(f"{graph_name}: input connection not found: {slot}")
+        upstream = _upstream_bitmap_resources(
+            connection.find("connRef").get("v"),
+            nodes,
+            bitmap_by_uid,
+        )
+        if len(upstream) != 1:
+            raise RuntimeError(
+                f"{graph_name}: expected one source bitmap for {slot}, got {upstream}"
+            )
+        old_name = upstream[0]
+        resource = resources.get(old_name)
+        if resource is None:
+            raise RuntimeError(
+                f"{graph_name}: resource element not found: {old_name}"
+            )
+        needle = f"pkg:///resources/{old_name}".casefold()
+        external_users = [
+            element for element in root.iter()
+            if element not in graph_descendants
+            and element not in resource_descendants
+            and needle in str(element.get("v") or "").casefold()
+        ]
+        if external_users:
+            raise RuntimeError(
+                f"{graph_name}: source resource is shared outside the graph: "
+                f"{old_name}"
+            )
+
+        occupied.discard(old_name.casefold())
+        new_name = _source_resource_identifier(input_path, slot, occupied)
+        resource.find("identifier").set("v", new_name)
+        resource.find("filepath").set(
+            "v", _relpath_posix(input_path, sbs_path.parent)
+        )
+        format_element = resource.find("format")
+        if format_element is not None:
+            format_element.set(
+                "v", IMAGE_EXT_FORMAT.get(input_path.suffix.lower(), "png")
+            )
+        pattern = re.compile(
+            rf"(?i)(pkg:///resources/){re.escape(old_name)}(?=[?/#]|$)"
+        )
+        replaced = False
+        for element in graph.iter():
+            value = element.get("v")
+            if not value:
+                continue
+            updated = pattern.sub(rf"\1{new_name}", value)
+            if updated != value:
+                element.set("v", updated)
+                replaced = True
+        if not replaced:
+            raise RuntimeError(
+                f"{graph_name}: bitmap reference not found: {old_name}"
+            )
+        mappings.append({
+            "slot": slot,
+            "old_resource": old_name,
+            "resource": new_name,
+            "path": str(input_path),
+        })
+
+    for name, tag_value in dict(params or {}).items():
+        tag, value = tag_value
+        _set_cluster_instance_parameter(instance, str(name), str(tag), value)
+    if output_dir is not None:
+        destination = str(Path(output_dir).resolve()).replace("\\", "/")
+        for mode in ("export/fromGraph", "export/batch"):
+            _set_graph_export_option(
+                graph, f"{mode}/destination", destination
+            )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = sbs_path.with_name(
+        f"{sbs_path.stem}.pcgtex_backup_before_source_rebind_"
+        f"{graph_name}_{stamp}.sbs"
+    )
+    temporary = sbs_path.with_name(
+        f".{sbs_path.stem}.pcgtex_source_rebind_{stamp}.tmp.sbs"
+    )
+    shutil.copy2(sbs_path, backup)
+    try:
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        parsed = parse_m_graph(temporary, graph_name)
+        for slot, expected in requested.items():
+            actual = parsed["inputs"].get(slot)
+            if actual is None or Path(actual).resolve() != expected:
+                raise RuntimeError(
+                    f"{graph_name}: source rebind verification failed: "
+                    f"{slot}={actual}"
+                )
+        verify_root = ET.parse(temporary).getroot()
+        verify_graph = _find_graph(verify_root, graph_name)
+        state = _graph_cluster_normalization_state(verify_graph)
+        if not state.get("fully_normalized") or not state.get(
+                "integrity", {}).get("valid"):
+            raise RuntimeError(
+                f"{graph_name}: graph contract invalid after source rebind"
+            )
+        temporary.replace(sbs_path)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return {
+        "sbs": str(sbs_path),
+        "graph": graph_name,
+        "backup": str(backup),
+        "inputs": {slot: str(path) for slot, path in requested.items()},
+        "resources": mappings,
+        "output_dir": (
+            str(Path(output_dir).resolve())
+            if output_dir is not None else None
+        ),
+    }
+
+
 def parse_m_graph(sbs_path, graph_name):
     """T_ 관리 그래프의 비트맵 연결과 인스턴스 파라미터를 읽는다."""
     sbs_path = Path(sbs_path)
@@ -1508,6 +1730,71 @@ def cook_sbs_package(sbs_path, cache_root, cfg=None, timeout=1800):
     return sbsar
 
 
+_EXTERNAL_INPUT_HASH_CACHE = {}
+
+
+def _cached_external_input_hash(path):
+    """Hash a live bitmap once per file identity for SBSAR cache invalidation."""
+    path = Path(path)
+    stat = path.stat()
+    key = (
+        str(path.resolve()).casefold(),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    cached = _EXTERNAL_INPUT_HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = _file_content_hash(path)
+    if len(_EXTERNAL_INPUT_HASH_CACHE) >= 4096:
+        _EXTERNAL_INPUT_HASH_CACHE.clear()
+    _EXTERNAL_INPUT_HASH_CACHE[key] = digest
+    return digest
+
+
+def graph_external_input_fingerprint(sbs_path, graph_names):
+    """Fingerprint current external bitmaps used by the requested graph set."""
+    sbs_path = Path(sbs_path)
+    inputs = {}
+    for graph_name in graph_names:
+        try:
+            source = inspect_graph_sources(sbs_path, graph_name)
+        except Exception:
+            source = {}
+        for bitmap in source.get("bitmaps") or []:
+            raw_path = bitmap.get("path")
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path.absolute()).casefold()
+            inputs[key] = path
+        try:
+            parsed = parse_m_graph(sbs_path, graph_name)
+        except Exception:
+            parsed = {}
+        for raw_path in (parsed.get("inputs") or {}).values():
+            path = Path(raw_path)
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path.absolute()).casefold()
+            inputs[key] = path
+    rows = []
+    for key, path in sorted(inputs.items()):
+        if not path.is_file():
+            rows.append(f"{key}|missing")
+            continue
+        stat = path.stat()
+        rows.append(
+            f"{key}|{stat.st_size}|{stat.st_mtime_ns}|"
+            f"{_cached_external_input_hash(path)}"
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
 def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
                            timeout=1800, force_recook=False):
     """Cook only the requested graphs while retaining package resources/dependencies.
@@ -1520,19 +1807,6 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
     sbs_path = Path(sbs_path)
     requested = list(dict.fromkeys(str(name) for name in graph_names))
     stat = sbs_path.stat()
-    key = hashlib.sha1(
-        (f"{sbs_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
-         + "|".join(name.lower() for name in requested)).encode("utf-8")
-    ).hexdigest()[:16]
-    if force_recook:
-        # This is an explicit user action after Cluster_System changes.  Use a
-        # fresh cache location so no previously cooked dependency can survive.
-        key += "_manual_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    cache_dir = Path(cache_root) / f"{sbs_path.stem}_graphs_{key}"
-    stable_sbsar = cache_dir / f"{sbs_path.stem}_{key}.sbsar"
-    if stable_sbsar.is_file() and stable_sbsar.stat().st_size > 0:
-        return stable_sbsar
-
     tree = ET.parse(sbs_path)
     root = tree.getroot()
     graphs = {
@@ -1568,6 +1842,27 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
                     and local_name not in keep:
                 keep.add(local_name)
                 pending.append(local_name)
+
+    kept_graph_names = [
+        graphs[name].find("identifier").get("v", name)
+        for name in sorted(keep)
+    ]
+    input_fingerprint = graph_external_input_fingerprint(
+        sbs_path, kept_graph_names
+    )
+    key = hashlib.sha1(
+        (f"{sbs_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+         + "|".join(name.lower() for name in requested)
+         + f"|inputs={input_fingerprint}").encode("utf-8")
+    ).hexdigest()[:16]
+    if force_recook:
+        # This is an explicit user action after Cluster_System changes.  Use a
+        # fresh cache location so no previously cooked dependency can survive.
+        key += "_manual_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    cache_dir = Path(cache_root) / f"{sbs_path.stem}_graphs_{key}"
+    stable_sbsar = cache_dir / f"{sbs_path.stem}_{key}.sbsar"
+    if stable_sbsar.is_file() and stable_sbsar.stat().st_size > 0:
+        return stable_sbsar
 
     for parent in root.iter():
         for child in list(parent):
@@ -2953,6 +3248,11 @@ def insert_m_graph(sbs_path, graph_name, inputs, normal_opengl=True, cfg=None):
             path = neutral_image(neutral_kind_for_slot(slot))
         filled[slot] = Path(path)
 
+    existing_resource_names = {
+        resource.find("identifier").get("v", "").casefold()
+        for resource in root.iter("resource")
+        if resource.find("identifier") is not None
+    }
     resources = []
     for el in graph.iter():
         if el.tag != "compImplementation" or not len(el):
@@ -2976,9 +3276,20 @@ def insert_m_graph(sbs_path, graph_name, inputs, normal_opengl=True, cfg=None):
                 slot = TEMPLATE_SUFFIX_TO_SLOT.get(suffix)
                 if slot is None:
                     raise RuntimeError(f"템플릿 리소스 접미사 해석 실패: {old_res}")
-                new_res = f"{graph_name}_{SLOT_SUFFIX[slot]}"
+                input_path = filled[slot]
+                if input_path.stem.casefold().startswith(
+                        graph_name.casefold() + "_"):
+                    raise RuntimeError(
+                        f"{graph_name}: managed output cannot be its own input: "
+                        f"{input_path.name}"
+                    )
+                new_res = _source_resource_identifier(
+                    input_path,
+                    slot,
+                    existing_resource_names,
+                )
                 value_el.set("v", f"pkg:///Resources/{new_res}?dependency={himself_uid}")
-                resources.append((new_res, filled[slot]))
+                resources.append((new_res, input_path))
 
     # 3) 리소스 요소 생성 (Resources 그룹의 content 안)
     content = root.find("content")

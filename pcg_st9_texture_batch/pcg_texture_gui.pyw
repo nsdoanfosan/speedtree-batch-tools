@@ -336,6 +336,90 @@ def step3_texture_row_key(item, atlas_base):
     return folder, str(atlas_base or "").strip().casefold()
 
 
+def step3_job_dependency_paths(job):
+    """Return current SBS/bitmap inputs whose changes invalidate old outputs."""
+    paths = []
+    sbs_path = Path(job["sbs"]) if job.get("sbs") else None
+    if sbs_path and sbs_path.is_file():
+        paths.append(sbs_path)
+    for value in (job.get("inputs") or {}).values():
+        path = Path(value)
+        if path.is_file():
+            paths.append(path)
+    graph = job.get("graph")
+    if sbs_path and graph:
+        try:
+            parsed = sbs_auto.parse_m_graph(sbs_path, graph)
+        except Exception:
+            parsed = {}
+        for value in (parsed.get("inputs") or {}).values():
+            path = Path(value)
+            if path.is_file():
+                paths.append(path)
+        try:
+            inspected = sbs_auto.inspect_graph_sources(sbs_path, graph)
+        except Exception:
+            inspected = {}
+        for bitmap in inspected.get("bitmaps") or []:
+            path = Path(bitmap.get("path") or "")
+            if path.is_file():
+                paths.append(path)
+    result = []
+    seen = set()
+    for path in paths:
+        try:
+            absolute = path.resolve()
+        except OSError:
+            absolute = path.absolute()
+        key = os.path.normcase(str(absolute))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(absolute)
+    return result
+
+
+def step3_existing_output_freshness(job):
+    """Prove that a complete output set is not older than its live sources."""
+    texture_base = job.get("texture_base") or job.get("base")
+    out_dir = job.get("out_dir")
+    if not texture_base or not out_dir:
+        return {
+            "fresh": False,
+            "reason": "output_identity_missing",
+            "dependencies": [],
+            "outputs": [],
+        }
+    outputs = [
+        Path(path)
+        for path in output_paths(out_dir, texture_base).values()
+    ]
+    if any(not path.is_file() or path.stat().st_size <= 0 for path in outputs):
+        return {
+            "fresh": False,
+            "reason": "output_set_incomplete",
+            "dependencies": [],
+            "outputs": [str(path) for path in outputs],
+        }
+    dependencies = step3_job_dependency_paths(job)
+    oldest_output_ns = min(path.stat().st_mtime_ns for path in outputs)
+    newer = [
+        path for path in dependencies
+        if path.stat().st_mtime_ns > oldest_output_ns
+    ]
+    return {
+        "fresh": not newer,
+        "reason": (
+            "current_source_newer_than_outputs"
+            if newer else "outputs_current"
+        ),
+        "dependencies": [str(path) for path in dependencies],
+        "newer_dependencies": [str(path) for path in newer],
+        "outputs": [str(path) for path in outputs],
+        "oldest_output_mtime_ns": oldest_output_ns,
+    }
+
+
 def checked_step3_spms(entries, allowed_folders=None):
     """Return exact selected final-SK paths, preserving PCG target identity."""
     allowed = (
@@ -3393,11 +3477,14 @@ class App:
     # ------------------------------------------------------------- ③ 실행
     def _step3_jobs(self, force_rerender=False, all_rows=False):
         jobs, skipped = [], []
+        self._step3_render_required_row_keys = set()
+        self._step3_existing_output_row_keys = set()
         scoped_rows = (
             self._all_texplan_rows() if all_rows else self._checked_texplan_rows()
         )
         for item, row in scoped_rows:
             base = row["atlas_base"]
+            row_key = step3_texture_row_key(item, base)
             if row.get("shared_from"):
                 continue  # 다른 폴더에서 관리 — 그쪽 행에서 처리
             try:
@@ -3410,15 +3497,39 @@ class App:
                     graph_needs_update = sbs_auto.managed_graph_resolution_state(
                         job["sbs"], job["graph"])["needs_update"]
                 source_needs_repair = job_needs_source_repair(job)
+                structural_needs_update = bool(
+                    job.get("mode") == "insert"
+                    or job.get("promote_authoring")
+                    or job.get("normalize_cluster")
+                    or job.get("rename_graph_to")
+                    or job.get("repair_resources")
+                )
                 canonical_row = dict(row)
                 canonical_row["texture_dir"] = job["out_dir"]
                 complete = complete_output_set(
                     canonical_row, expected_pixels=expected_pixels)
+                freshness = (
+                    step3_existing_output_freshness(job)
+                    if complete else {
+                        "fresh": False,
+                        "reason": "output_set_incomplete",
+                    }
+                )
+                job["existing_output_freshness"] = freshness
+                render_required = bool(
+                    force_rerender
+                    or not complete
+                    or graph_needs_update
+                    or source_needs_repair
+                    or structural_needs_update
+                    or not freshness["fresh"]
+                )
                 if force_rerender:
                     job["force_cluster_recook"] = True
-                if (complete and not force_rerender
-                        and not graph_needs_update and not source_needs_repair):
+                if not render_required:
+                    self._step3_existing_output_row_keys.add(row_key)
                     continue
+                self._step3_render_required_row_keys.add(row_key)
                 jobs.append(job)
             except Exception as exc:
                 skipped.append((item, base, str(exc)))
@@ -3436,15 +3547,25 @@ class App:
         return jobs, skipped
 
     def _step3_sync_files(self, excluded_row_keys=None):
-        """Collect complete selected sets, including rows that need no render."""
+        """Collect only complete sets proven current by the preceding preflight."""
         excluded = set(excluded_row_keys or ())
+        current_existing = getattr(
+            self, "_step3_existing_output_row_keys", None
+        )
         files = []
         seen = set()
         manifest_rows = []
         for item, row in self._checked_texplan_rows():
-            if step3_texture_row_key(
+            row_key = step3_texture_row_key(
                 item, row.get("atlas_base")
-            ) in excluded:
+            )
+            if row_key in excluded:
+                continue
+            # start_step3 always calls _step3_jobs first.  Only rows that
+            # passed that live SBS/input freshness check may turn pre-existing
+            # files into a canonical manifest.  ``None`` keeps direct helper
+            # calls backward compatible while the real GUI remains fail-safe.
+            if current_existing is not None and row_key not in current_existing:
                 continue
             texture_dir = (
                 canonical_texture_root(row["folder"])
