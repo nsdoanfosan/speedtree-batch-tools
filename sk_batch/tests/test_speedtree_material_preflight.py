@@ -18,12 +18,22 @@ for path in (REPO, SK_DIR, JOBS_DIR):
         sys.path.insert(0, str(path))
 
 import speedtree_material_preflight as preflight
+from sk_batch.spm_leaf_handoff_contract import (
+    inspect_spm_mesh_file_references,
+)
 from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES
 
 
-def write_spm(path, mesh_filenames=()):
+def write_spm(
+    path,
+    mesh_filenames=(),
+    referenced_external_mesh_indexes=(),
+    material_external_mesh_indexes=(),
+    managed_leaf=False,
+):
     model = ET.Element("SpeedTreeModel")
     assets = ET.SubElement(model, "Assets")
+    leaf_material = None
     for material_id, name, mesh_id in (
         (1, "M_leaf_grass_dead", 11),
         (2, "M_stem_common_01", 12),
@@ -33,12 +43,42 @@ def write_spm(path, mesh_filenames=()):
         )
         ET.SubElement(material, "CutoutMeshID").text = str(mesh_id)
         ET.SubElement(assets, "Mesh", ID=str(mesh_id), Name=f"mesh_{mesh_id}")
+        if material_id == 1:
+            leaf_material = material
+    if managed_leaf:
+        ET.SubElement(leaf_material, "UserData").text = json.dumps(
+            {
+                "generator": "Atlas Leaf Mesh Builder",
+                "scope": "test-scope",
+                "kind": "material",
+            }
+        )
+    external_mesh_ids = []
     for index, filename in enumerate(mesh_filenames, 90):
         mesh = ET.SubElement(
             assets, "Mesh", ID=str(index), Name=f"plate_{index}"
         )
         ET.SubElement(mesh, "Filename").text = filename
         ET.SubElement(mesh, "Embedded").text = "false"
+        external_mesh_ids.append(index)
+    supplemental_indexes = tuple(
+        dict.fromkeys(
+            tuple(referenced_external_mesh_indexes)
+            + tuple(material_external_mesh_indexes)
+        )
+    )
+    if supplemental_indexes:
+        supplemental = ET.SubElement(
+            leaf_material,
+            "SupplementalCutoutMeshIDs",
+            Count=str(len(supplemental_indexes)),
+        )
+        for external_index in supplemental_indexes:
+            ET.SubElement(
+                supplemental,
+                "CutoutMesh",
+                ID=str(external_mesh_ids[external_index]),
+            )
 
     tree = ET.SubElement(model, "Generator", Type="Tree")
     properties = ET.SubElement(tree, "Properties")
@@ -62,6 +102,21 @@ def write_spm(path, mesh_filenames=()):
             prop = ET.SubElement(properties, "Property")
             ET.SubElement(prop, "Name").text = f"{property_name}:{suffix}"
             ET.SubElement(prop, "Value").text = str(value)
+        if generator_type == "Leaf Mesh":
+            for slot_index, external_index in enumerate(
+                referenced_external_mesh_indexes,
+                start=1,
+            ):
+                external_mesh_id = external_mesh_ids[external_index]
+                for suffix, value in (
+                    ("Material", 1),
+                    ("Mesh", external_mesh_id),
+                ):
+                    prop = ET.SubElement(properties, "Property")
+                    ET.SubElement(prop, "Name").text = (
+                        f"Leaves:Type:{slot_index}:{suffix}"
+                    )
+                    ET.SubElement(prop, "Value").text = str(value)
         node = ET.SubElement(model, "Node", Type=generator_type)
         ET.SubElement(node, "GeneratorGUID").text = guid
         ET.SubElement(node, "ParentGUID").text = "parent"
@@ -392,6 +447,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                     "meshes/01_leaf_present.fbx",
                     "meshes/18_leaf_gone.fbx",
                 ),
+                referenced_external_mesh_indexes=(1,),
             )
             write_stmat(
                 spm,
@@ -427,6 +483,133 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 [row["filename"] for row in contract["missing"]],
                 ["meshes/18_leaf_gone.fbx"],
             )
+
+    def test_missing_orphan_mesh_file_is_reported_but_does_not_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_fern_orphan_mesh.spm"
+            report_path = root / "report.json"
+            write_spm(
+                spm,
+                mesh_filenames=("meshes/old_atlas_plate.fbx",),
+            )
+            write_stmat(
+                spm,
+                ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
+            )
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            contract = report["mesh_file_reference_contract"]
+            self.assertEqual(
+                contract["status"],
+                "orphan_missing_mesh_assets",
+            )
+            self.assertEqual(contract["missing"], [])
+            self.assertEqual(
+                [row["filename"] for row in contract["orphan_missing"]],
+                ["meshes/old_atlas_plate.fbx"],
+            )
+            self.assertEqual(
+                contract["orphan_missing"][0]["usage"],
+                "orphan",
+            )
+            self.assertNotIn(
+                "SPM_MESH_FILE_MISSING",
+                {
+                    issue["code"]
+                    for issue in report["speedtree_pipeline_contract"][
+                        "issues"
+                    ]
+                },
+            )
+
+    def test_unbound_managed_mesh_is_nonblocking_when_material_keeps_others(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_fern_managed_orphan.spm"
+            report_path = root / "report.json"
+            present = root / "meshes" / "present_plate.fbx"
+            present.parent.mkdir()
+            present.write_bytes(b"fbx")
+            write_spm(
+                spm,
+                mesh_filenames=(
+                    "meshes/present_plate.fbx",
+                    "meshes/removed_plate.fbx",
+                ),
+                material_external_mesh_indexes=(0, 1),
+                managed_leaf=True,
+            )
+            write_stmat(
+                spm,
+                ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
+            )
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            contract = json.loads(
+                report_path.read_text(encoding="utf-8")
+            )["mesh_file_reference_contract"]
+            self.assertEqual(
+                contract["status"],
+                "orphan_missing_mesh_assets",
+            )
+            self.assertEqual(contract["missing"], [])
+            self.assertEqual(
+                contract["orphan_missing"][0]["usage"],
+                "managed_orphan",
+            )
+
+    def test_final_managed_material_mesh_stays_a_blocking_reference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_final_managed_mesh.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            material = ET.SubElement(
+                assets,
+                "Material_v8",
+                ID="1",
+                Name="M_leaf_atlas",
+            )
+            ET.SubElement(material, "CutoutMeshID").text = "90"
+            ET.SubElement(material, "UserData").text = json.dumps(
+                {
+                    "generator": "Atlas Leaf Mesh Builder",
+                    "scope": "test-scope",
+                    "kind": "material",
+                }
+            )
+            mesh = ET.SubElement(
+                assets,
+                "Mesh",
+                ID="90",
+                Name="last_plate",
+            )
+            ET.SubElement(mesh, "Filename").text = (
+                "meshes/missing_last_plate.fbx"
+            )
+            ET.SubElement(mesh, "Embedded").text = "false"
+            spm.write_bytes(
+                gzip.compress(ET.tostring(model, encoding="utf-8"))
+            )
+
+            contract = inspect_spm_mesh_file_references(spm)
+
+            self.assertEqual(contract["status"], "missing_mesh_files")
+            self.assertEqual(
+                [row["mesh_id"] for row in contract["missing"]],
+                [90],
+            )
+            self.assertEqual(contract["missing"][0]["usage"], "active")
 
     def test_existing_mesh_files_do_not_block_the_export(self):
         with tempfile.TemporaryDirectory() as temporary:

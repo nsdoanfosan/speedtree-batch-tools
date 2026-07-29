@@ -682,6 +682,72 @@ def leaf_contract_user_message(contract):
     return True, "현재 내보내는 잎 재질 연결 정상"
 
 
+def _atlas_managed_material_node(material):
+    try:
+        marker = json.loads(str(material.findtext("UserData") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(marker, dict)
+        and str(marker.get("generator") or "").casefold()
+        == ATLAS_LEAF_GENERATOR.casefold()
+        and str(marker.get("kind") or "").casefold() == "material"
+    )
+
+
+def _spm_mesh_reference_states(root):
+    """Separate live references from removable managed Atlas library residue."""
+    material_references = {}
+    for material in root.iter("Material_v8"):
+        mesh_ids = set()
+        cutout = _integer(material.findtext("CutoutMeshID"))
+        if cutout is not None and cutout >= 0:
+            mesh_ids.add(cutout)
+        supplemental = material.find("SupplementalCutoutMeshIDs")
+        if supplemental is not None:
+            for node in supplemental.iter():
+                value = _integer(
+                    node.attrib.get("ID")
+                    if node.attrib.get("ID") is not None
+                    else node.text
+                )
+                if value is not None and value >= 0:
+                    mesh_ids.add(value)
+        managed = _atlas_managed_material_node(material)
+        for mesh_id in mesh_ids:
+            material_references.setdefault(mesh_id, []).append(
+                (managed, len(mesh_ids))
+            )
+    generator_references = set()
+    for prop in root.iter("Property"):
+        name = str(prop.findtext("Name") or "").strip().casefold()
+        if not name.endswith(":mesh"):
+            continue
+        value = _integer(prop.findtext("Value"))
+        if value is not None and value >= 0:
+            generator_references.add(value)
+    live = set(generator_references)
+    managed_orphans = set()
+    for mesh_id, material_states in material_references.items():
+        removable_from_all_materials = all(
+            managed and mesh_count > 1
+            for managed, mesh_count in material_states
+        )
+        if (
+            mesh_id in generator_references
+            or not removable_from_all_materials
+        ):
+            live.add(mesh_id)
+        else:
+            managed_orphans.add(mesh_id)
+    return {
+        "live": live,
+        "managed_orphans": managed_orphans,
+        "generator": generator_references,
+        "material": set(material_references),
+    }
+
+
 @functools.lru_cache(maxsize=512)
 def _mesh_file_references_cached(path_text, _size, _mtime_ns):
     path = Path(path_text)
@@ -699,9 +765,12 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
     checked = 0
     references = []
     missing = []
+    orphan_missing = []
+    reference_states = _spm_mesh_reference_states(root)
     for mesh in root.iter("Mesh"):
         if mesh.attrib.get("ID") is None:
             continue
+        mesh_id = _integer(mesh.attrib.get("ID"))
         # Embedded meshes carry their geometry inside the SPM; their Filename
         # is provenance only and must not block the export.
         embedded = str(mesh.findtext("Embedded") or "").strip().casefold() in {
@@ -723,22 +792,48 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
                 if os.path.isabs(filename)
                 else path.parent / filename
             )
+            usage = (
+                "active"
+                if mesh_id in reference_states["live"]
+                else "managed_orphan"
+                if mesh_id in reference_states["managed_orphans"]
+                else "orphan"
+            )
             row = {
-                "mesh_id": _integer(mesh.attrib.get("ID")),
+                "mesh_id": mesh_id,
                 "mesh_name": str(mesh.attrib.get("Name") or ""),
                 "filename": filename,
                 "resolved_path": str(resolved),
                 "exists": resolved.is_file(),
+                "referenced": usage == "active",
+                "usage": usage,
+                "generator_referenced": (
+                    mesh_id in reference_states["generator"]
+                ),
+                "material_referenced": (
+                    mesh_id in reference_states["material"]
+                ),
             }
             references.append(row)
             if not row["exists"]:
-                missing.append(row)
+                if row["referenced"]:
+                    missing.append(row)
+                else:
+                    orphan_missing.append(row)
+    status = (
+        "missing_mesh_files"
+        if missing
+        else "orphan_missing_mesh_assets"
+        if orphan_missing
+        else "ok"
+    )
     return {
-        "status": "missing_mesh_files" if missing else "ok",
+        "status": status,
         "spm": str(path),
         "checked_references": checked,
         "references": references,
         "missing": missing,
+        "orphan_missing": orphan_missing,
     }
 
 
