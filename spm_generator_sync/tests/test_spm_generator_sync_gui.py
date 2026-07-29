@@ -51,6 +51,30 @@ class ClipboardRecorder:
 
 
 class GeneratorSyncGuiCacheTests(unittest.TestCase):
+    def test_initial_fast_refresh_defers_physical_validation(self):
+        app = GUI.App.__new__(GUI.App)
+        app.persist_config = mock.Mock()
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = r"D:\Trees"
+        app.sk_only_var = mock.Mock()
+        app.sk_only_var.get.return_value = True
+        app.render_board = mock.Mock()
+        app.status_var = mock.Mock()
+
+        with mock.patch.object(
+            GUI.engine,
+            "scan_tree_folders",
+            return_value=[],
+        ) as scan:
+            app.refresh(fast=True)
+
+        scan.assert_called_once_with(
+            Path(r"D:\Trees"),
+            sk_only=True,
+            verify_physical=False,
+        )
+        app.render_board.assert_called_once_with(fast=True)
+
     def test_gui_uses_full_sibling_engine_module(self):
         self.assertEqual(
             Path(GUI.engine.__file__).resolve(),
@@ -337,6 +361,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
             capture_resolution=1024,
             repair_runtime_config=app.config,
+            progress_callback=mock.ANY,
         )
         refresh.assert_not_called()
 
@@ -472,6 +497,8 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
             capture_resolution=1024,
             repair_runtime_config=app.config,
+            force_refresh=True,
+            progress_callback=mock.ANY,
         )
         prepare.assert_called_once_with(
             blend,
@@ -557,6 +584,8 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
                     repair_runtime_config=app.config,
+                    force_refresh=True,
+                    progress_callback=mock.ANY,
                 ),
                 mock.call(
                     leaf_blend,
@@ -566,6 +595,8 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
                     repair_runtime_config=app.config,
+                    force_refresh=True,
+                    progress_callback=mock.ANY,
                 ),
             ],
         )

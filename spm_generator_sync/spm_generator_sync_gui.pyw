@@ -450,7 +450,7 @@ class App:
         root.geometry("1460x880")
         root.minsize(1120, 680)
         self._build_ui()
-        self.refresh()
+        self.refresh(fast=True)
 
     def _build_ui(self):
         style = ttk.Style(self.root)
@@ -708,17 +708,18 @@ class App:
             self.persist_config()
             self.refresh()
 
-    def refresh(self, reveal=None):
+    def refresh(self, reveal=None, *, fast=False):
         self.persist_config()
         try:
             self.board = engine.scan_tree_folders(
                 Path(self.root_var.get().strip()),
                 sk_only=bool(self.sk_only_var.get()),
+                verify_physical=not fast,
             )
         except Exception as exc:
             messagebox.showerror("검사 실패", str(exc), parent=self.root)
             return
-        self.render_board()
+        self.render_board(fast=fast)
         folder_count = len(self.board)
         spm_count = sum(len(item["spms"]) for item in self.board)
         cluster_count = sum(len(item.get("cluster_blends") or ()) for item in self.board)
@@ -739,14 +740,32 @@ class App:
                     self.update_details()
                     break
 
-    def master_status(self, folder: Path, group: dict) -> tuple[str, str]:
+    def master_status(
+        self,
+        folder: Path,
+        group: dict,
+        *,
+        fast=False,
+    ) -> tuple[str, str | None]:
         categories = group.get("base_categories") or {}
+        followers = group.get("followers", [])
+        if fast:
+            recorded = {
+                str(item.get("last_master_hash") or "").strip()
+                for item in followers
+                if str(item.get("last_master_hash") or "").strip()
+            }
+            signature = next(iter(recorded)) if len(recorded) == 1 else None
+            if not followers:
+                return "자식 없음", signature
+            if any(not item.get("base_map_confirmed") for item in followers):
+                return "매핑 필요", signature
+            return "정밀 검사 대기", signature
         try:
             master_path = folder / group["master"]
             signature = self.cached_master_signature(master_path, categories)
         except Exception as exc:
             return "검사 실패", str(exc)
-        followers = group.get("followers", [])
         if not followers:
             return "자식 없음", signature
         if any(not item.get("base_map_confirmed") for item in followers):
@@ -756,7 +775,7 @@ class App:
             return "최신", signature
         return "마스터 변경", signature
 
-    def render_board(self):
+    def render_board(self, *, fast=False):
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         for folder_item in self.board:
@@ -782,7 +801,11 @@ class App:
                 category_text = ", ".join(
                     f"{name}:{category or '미분류'}" for name, category in categories.items()
                 ) or "자동 분류"
-                status, signature = self.master_status(folder, group)
+                status, signature = self.master_status(
+                    folder,
+                    group,
+                    fast=fast,
+                )
                 master_iid = self.tree.insert(
                     folder_iid, "end", text=f"◆ {master}",
                     values=("MASTER", category_text, "기준 Base", status, ""),
@@ -814,6 +837,9 @@ class App:
                     if not follower.get("base_map_confirmed"):
                         structure = "매핑 확인 필요"
                         current_target_hash = None
+                    elif fast:
+                        structure = "정밀 검사 대기"
+                        current_target_hash = None
                     else:
                         try:
                             delta, current_target_hash = self.cached_follower_analysis(
@@ -839,6 +865,12 @@ class App:
                     last_hash = follower.get("last_master_hash")
                     if not follower.get("base_map_confirmed"):
                         follower_status = "매핑 필요"
+                    elif fast:
+                        follower_status = (
+                            "정밀 검사 대기"
+                            if follower.get("last_sync")
+                            else "미실행"
+                        )
                     elif follower.get("last_sync") and last_hash != signature:
                         follower_status = "마스터 변경"
                     elif follower.get("last_sync") and delta.get("remove"):
@@ -926,6 +958,9 @@ class App:
                     refresh_required_count = int(
                         blend_row.get("refresh_required_count") or 0
                     )
+                    refresh_deferred_count = int(
+                        blend_row.get("refresh_deferred_count") or 0
+                    )
                     refresh_reasons = list(
                         blend_row.get("refresh_reasons") or []
                     )
@@ -959,6 +994,11 @@ class App:
                         status_text = (
                             f"Cluster 원본 변경 · 폴더 SK "
                             f"{refresh_required_count}개 갱신 필요"
+                        )
+                        tag = "cluster_pending"
+                    elif refresh_deferred_count:
+                        status_text = (
+                            f"폴더 SK {total_count}개 전체 ON · 정밀 검사 대기"
                         )
                         tag = "cluster_pending"
                     elif all_synced:
@@ -1596,6 +1636,16 @@ class App:
                         unit_probe_path=unit_probe_path,
                         capture_resolution=capture_resolution,
                         repair_runtime_config=job_config,
+                        force_refresh=True,
+                        progress_callback=(
+                            lambda _stage, message, i=index: report(
+                                f"Cluster refresh {i}/{cluster_count} · "
+                                f"{message}",
+                                10 + int(
+                                    80 * (i - 0.5) / cluster_count
+                                ),
+                            )
+                        ),
                     )
                     relation_result["source_preparation"] = preparation
                     results.append(relation_result)
@@ -1624,6 +1674,10 @@ class App:
                         job_config.get("cluster_capture_resolution") or 1024
                     ),
                     repair_runtime_config=job_config,
+                    progress_callback=lambda _stage, message: report(
+                        f"Cluster relationship · {message}",
+                        55,
+                    ),
                 )
             report("Cluster SPM 메시/Generator 검증 완료", 95)
             return result

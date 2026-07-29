@@ -2826,6 +2826,53 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 ]
             )
 
+    def test_stale_isolated_bark_cache_accepts_unused_material_id_rebase(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = material_only_rebase_fixture(temporary)
+
+            def add_unused_material(path, material_id):
+                with gzip.open(path, "rt", encoding="utf-8") as handle:
+                    source = handle.read()
+                source = source.replace(
+                    "</Materials>",
+                    (
+                        f'<Material_v8 ID="{material_id}" Name="Unused">'
+                        "<TexFilename>same-unused.tga</TexFilename>"
+                        '<SupplementalCutoutMeshIDs Count="0" />'
+                        "</Material_v8></Materials>"
+                    ),
+                )
+                with gzip.open(path, "wt", encoding="utf-8") as handle:
+                    handle.write(source)
+
+            add_unused_material(fixture["production_spm"], "90")
+            add_unused_material(fixture["isolated_spm"], "91")
+            isolated_identity = file_fingerprint(fixture["isolated_spm"])
+            manifest = json.loads(
+                fixture["manifest"].read_text(encoding="utf-8")
+            )
+            manifest["isolated_spm_sha256"] = isolated_identity["sha256"]
+            manifest["normalization"]["outputs"][0]["output_sha256"] = (
+                isolated_identity["sha256"]
+            )
+            fixture["manifest"].write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            fixture["normalized"]["source_3d_artifacts"]["source_spm"] = (
+                isolated_identity
+            )
+
+            _validate_normalized_source_dependency(
+                fixture["normalized"],
+                fixture["production_spm"],
+            )
+            evidence = fixture["normalized"]["material_only_source_rebase"]
+            self.assertEqual(
+                evidence["policy"],
+                "declared_bark_outputs_or_unused_material_id_rebase_v2",
+            )
+
     def test_stale_isolated_bark_cache_rejects_non_material_changes(self):
         cases = (
             ("non-declared material", "other_material"),

@@ -317,6 +317,27 @@ class GeneratorSyncTests(unittest.TestCase):
                 "off",
             )
 
+    def test_quick_scan_defers_physical_cluster_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            owner = root / "Tree_elm"
+            owner.mkdir()
+            write_spm(owner / "SK_Tree_elm_01.spm", make_master())
+
+            with mock.patch.object(
+                sync,
+                "discover_cluster_blend_relations",
+                return_value=[],
+            ) as discover:
+                board = sync.scan_tree_folders(
+                    root,
+                    sk_only=True,
+                    verify_physical=False,
+                )
+
+            self.assertEqual([Path(row["folder"]) for row in board], [owner])
+            discover.assert_any_call(owner, verify_physical=False)
+
     def test_cloned_and_previously_wrong_leaf_material_ids_are_remapped_by_asset_name(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

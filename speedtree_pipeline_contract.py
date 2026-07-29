@@ -541,11 +541,9 @@ def prove_legacy_texture_normalize_semantic_migration(
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
-        normalization = (
-            payload.get("normalization")
-            if isinstance(payload, dict)
-            else None
-        )
+        if not isinstance(payload, dict):
+            continue
+        normalization = payload.get("normalization")
         if (
             payload.get("status") != "ok"
             or not isinstance(normalization, dict)

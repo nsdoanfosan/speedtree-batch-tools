@@ -162,6 +162,10 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 )
             )
             receipt = source.parent / "reports" / "normalize.json"
+            (source.parent / "reports" / "000_spm_audit.json").write_text(
+                json.dumps([{"status": "already-ok", "spm": str(source)}]),
+                encoding="utf-8",
+            )
             receipt.write_text(
                 json.dumps(
                     {

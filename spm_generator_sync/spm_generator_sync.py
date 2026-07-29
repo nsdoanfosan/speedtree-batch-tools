@@ -2786,18 +2786,37 @@ def assign_follower(
     return manifest
 
 
-def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
+def scan_tree_folders(
+    root: Path,
+    sk_only: bool = False,
+    *,
+    verify_physical: bool = True,
+) -> list[dict]:
     root = Path(root)
     if not root.is_dir():
         raise SyncError(f"나무 루트 폴더가 없습니다: {root}")
     folders: list[dict] = []
-    for current, dirs, files in os.walk(root):
-        dirs[:] = [
-            name for name in dirs
-            if name.lower() not in {item.lower() for item in SKIP_DIRS}
-            and name.casefold() != "cluster"
-        ]
-        folder = Path(current)
+    skipped = {item.casefold() for item in SKIP_DIRS}
+    candidates = [root]
+    try:
+        candidates.extend(
+            path for path in root.iterdir()
+            if (
+                path.is_dir()
+                and path.name.casefold() not in skipped
+                and path.name.casefold() != "cluster"
+            )
+        )
+    except OSError as exc:
+        raise SyncError(f"나무 루트를 읽을 수 없습니다: {root}") from exc
+    for folder in sorted(
+        candidates,
+        key=lambda path: (path != root, path.name.casefold()),
+    ):
+        try:
+            files = [path.name for path in folder.iterdir() if path.is_file()]
+        except OSError:
+            continue
         spms = sorted(
             [
                 folder / name
@@ -2808,7 +2827,10 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
             key=lambda item: item.name.casefold(),
         )
         cluster_blends = json.loads(json.dumps(
-            discover_cluster_blend_relations(folder),
+            discover_cluster_blend_relations(
+                folder,
+                verify_physical=verify_physical,
+            ),
             default=str,
         ))
         if not spms and not cluster_blends:

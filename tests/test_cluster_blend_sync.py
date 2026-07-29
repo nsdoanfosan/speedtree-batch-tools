@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,6 +118,49 @@ def write_material_spm(path, material, material_id, mesh_ids):
 
 
 class ClusterBlendSyncTests(unittest.TestCase):
+    def test_shallow_discovery_does_not_hash_physical_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(target, "M_branch_elm_01", 8, [10, 11, 12])
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical,
+                "M_branch_elm_01",
+                8,
+                [10, 11, 12],
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            set_cluster_relation_registry(blend, target, True)
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+
+            with mock.patch.object(
+                cluster_sync,
+                "_sha256_file",
+                side_effect=AssertionError("shallow scan hashed a source"),
+            ):
+                row = discover_cluster_blend_relations(
+                    owner,
+                    verify_physical=False,
+                )[0]
+
+            self.assertEqual(row["targets"][0]["status"], "registered")
+            self.assertTrue(row["targets"][0]["refresh_deferred"])
+            self.assertEqual(row["refresh_deferred_count"], 1)
+
     def test_intentionally_unrequested_generator_connection_is_synced(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "bush_blackgum"
@@ -683,6 +727,133 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 1,
             )
 
+    def test_preparation_failure_persists_diagnostic_and_restores_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.write_bytes(
+                gzip.compress(
+                    (
+                        "<SpeedTreeModel><Assets>"
+                        '<Material_v8 ID="3" Name="M_branch">'
+                        "<CutoutMeshID>3</CutoutMeshID>"
+                        "</Material_v8>"
+                        '<Mesh ID="3"><UserData /></Mesh>'
+                        "</Assets></SpeedTreeModel>"
+                    ).encode("utf-8"),
+                    mtime=0,
+                )
+            )
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            registry = cluster_sync.registry_path_for_blend(blend)
+
+            with mock.patch(
+                "cluster_blend_sync._atlas_transaction_artifact_recipe",
+                side_effect=RuntimeError("artifact snapshot sentinel"),
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
+                    )
+
+            self.assertFalse(registry.exists())
+            reports = list(
+                (cluster / "reports").glob(
+                    f"{blend.stem}_cluster_relation_failure_*.json"
+                )
+            )
+            self.assertEqual(len(reports), 1)
+            diagnostic = json.loads(
+                reports[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["phase"], "preparation_failed")
+            self.assertEqual(
+                diagnostic["launch_error"],
+                "RuntimeError: artifact snapshot sentinel",
+            )
+            self.assertEqual(
+                diagnostic["targets"][0]["before_sha256"],
+                diagnostic["targets"][0]["failed_sha256"],
+            )
+            self.assertIn(
+                "Failure diagnostic log:",
+                str(caught.exception),
+            )
+
+    def test_normalization_recipe_failure_persists_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.touch()
+            target = owner / "SK_Tree_elm_01.spm"
+            target.write_bytes(
+                gzip.compress(
+                    (
+                        "<SpeedTreeModel><Assets>"
+                        '<Material_v8 ID="3" Name="M_branch">'
+                        "<CutoutMeshID>3</CutoutMeshID>"
+                        "</Material_v8>"
+                        '<Mesh ID="3"><UserData /></Mesh>'
+                        "</Assets></SpeedTreeModel>"
+                    ).encode("utf-8"),
+                    mtime=0,
+                )
+            )
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+
+            with mock.patch(
+                "cluster_blend_sync.resolve_normalization_recipe",
+                side_effect=cluster_sync.ClusterNormalizationSyncError(
+                    "normalization recipe sentinel"
+                ),
+            ):
+                with self.assertRaises(ClusterBlendSyncError) as caught:
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=True,
+                    )
+
+            reports = list(
+                (cluster / "reports").glob(
+                    f"{blend.stem}_cluster_relation_failure_*.json"
+                )
+            )
+            self.assertEqual(len(reports), 1)
+            diagnostic = json.loads(
+                reports[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                diagnostic["phase"],
+                "normalization_recipe_failed",
+            )
+            self.assertEqual(
+                diagnostic["launch_error"],
+                (
+                    "ClusterNormalizationSyncError: "
+                    "normalization recipe sentinel"
+                ),
+            )
+            self.assertEqual(diagnostic["command"], [])
+            self.assertIn(
+                "Failure diagnostic log:",
+                str(caught.exception),
+            )
+
     def test_successful_sync_commits_shared_repair_runtime_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
@@ -734,6 +905,302 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 result["repair_runtime_receipt"],
                 str(runtime_receipt),
             )
+
+    def test_already_on_and_physically_current_skips_blender_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            set_cluster_relation_registry(blend, target, True)
+            write_capture_manifest(blend, "capture")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+
+            with mock.patch(
+                "cluster_blend_sync.resolve_normalization_recipe"
+            ) as normalize, mock.patch(
+                "cluster_blend_sync.subprocess.run"
+            ) as worker:
+                result = run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=Path(temporary) / "missing-blender.exe",
+                )
+
+            normalize.assert_not_called()
+            worker.assert_not_called()
+            self.assertTrue(result["no_change"])
+            self.assertTrue(result["already_on"])
+            self.assertEqual(
+                result["skip_reason"],
+                "already_on_up_to_date",
+            )
+
+            with mock.patch(
+                "cluster_blend_sync._write_shared_repair_runtime_receipt",
+                side_effect=OSError("receipt sentinel"),
+            ):
+                with self.assertRaises(ClusterBlendSyncError) as caught:
+                    run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=(
+                            Path(temporary) / "missing-blender.exe"
+                        ),
+                        repair_runtime_config={"configured": True},
+                    )
+            failure_reports = list(
+                (cluster / "reports").glob(
+                    f"{blend.stem}_cluster_relation_failure_*.json"
+                )
+            )
+            self.assertEqual(len(failure_reports), 1)
+            failure = json.loads(
+                failure_reports[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                failure["phase"],
+                "no_op_runtime_receipt_failed",
+            )
+            self.assertIn(
+                "Failure diagnostic log:",
+                str(caught.exception),
+            )
+
+    def test_already_on_but_changed_source_runs_blender_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            set_cluster_relation_registry(blend, target, True)
+            write_capture_manifest(blend, "capture")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 13]
+            )
+
+            def complete(command, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.write_text(
+                    json.dumps({"status": "ok"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr=""
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=complete,
+            ) as worker:
+                result = run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=blender,
+                    auto_normalize=False,
+                )
+
+            worker.assert_called_once()
+            self.assertNotIn("no_change", result)
+
+    def test_already_on_without_physical_proof_runs_blender_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            set_cluster_relation_registry(blend, target, True)
+
+            def complete(command, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.write_text(
+                    json.dumps({"status": "ok"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr=""
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=complete,
+            ) as worker:
+                result = run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=blender,
+                    auto_normalize=False,
+                )
+
+            worker.assert_called_once()
+            self.assertNotIn("no_change", result)
+
+    def test_force_refresh_bypasses_current_on_noop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            set_cluster_relation_registry(blend, target, True)
+            write_capture_manifest(blend, "capture")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+
+            def complete(command, **_kwargs):
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.write_text(
+                    json.dumps({"status": "ok"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr=""
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=complete,
+            ) as worker:
+                run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=blender,
+                    auto_normalize=False,
+                    force_refresh=True,
+                )
+
+            worker.assert_called_once()
+
+    def test_long_blender_worker_emits_progress_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            blend = cluster / "SK_branch_elm_01.blend"
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            target.write_bytes(b"target")
+            blender = Path(temporary) / "blender.exe"
+            blender.touch()
+            progress = []
+
+            def complete(command, **_kwargs):
+                time.sleep(0.04)
+                report_path = Path(
+                    command[command.index("--report") + 1]
+                )
+                report_path.write_text(
+                    json.dumps({"status": "ok"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr=""
+                )
+
+            with mock.patch(
+                "cluster_blend_sync.CLUSTER_RELATION_HEARTBEAT_SECONDS",
+                0.01,
+            ), mock.patch(
+                "cluster_blend_sync.subprocess.run",
+                side_effect=complete,
+            ):
+                run_cluster_relation_transaction(
+                    blend,
+                    [target],
+                    enabled=True,
+                    blender_exe=blender,
+                    auto_normalize=False,
+                    progress_callback=lambda stage, message: progress.append(
+                        (stage, message)
+                    ),
+                )
+
+            stages = [stage for stage, _message in progress]
+            self.assertIn("blender_worker_started", stages)
+            self.assertIn("blender_worker_running", stages)
+            self.assertIn("blender_worker_finished", stages)
 
     def test_on_failure_restores_every_spm_the_job_half_wrote(self):
         with tempfile.TemporaryDirectory() as temporary:

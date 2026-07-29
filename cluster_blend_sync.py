@@ -20,6 +20,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,8 @@ BACKUP_NAME_TOKENS = (
     "skbatch_backup",
     ".pre_",
 )
+
+CLUSTER_RELATION_HEARTBEAT_SECONDS = 5.0
 
 
 class ClusterBlendSyncError(RuntimeError):
@@ -1032,6 +1036,7 @@ def inspect_cluster_target(
     relation_on,
     *,
     canonical_spm=None,
+    verify_physical=True,
 ):
     target = Path(target_spm).expanduser().absolute()
     if not relation_on:
@@ -1067,16 +1072,31 @@ def inspect_cluster_target(
         if canonical_spm
         else Path(blend).expanduser().absolute().with_suffix(".spm")
     )
-    refresh = _physical_refresh_state(payload, canonical, blend)
-    for reason in _target_scope_refresh_reasons(payload, target):
-        if reason not in refresh["refresh_reasons"]:
-            refresh["refresh_reasons"].append(reason)
-    refresh["refresh_required"] = bool(refresh["refresh_reasons"])
+    if verify_physical:
+        refresh = _physical_refresh_state(payload, canonical, blend)
+        for reason in _target_scope_refresh_reasons(payload, target):
+            if reason not in refresh["refresh_reasons"]:
+                refresh["refresh_reasons"].append(reason)
+        refresh["refresh_required"] = bool(refresh["refresh_reasons"])
+    else:
+        normalized_receipt = payload.get("normalized_prototype_receipt")
+        refresh = {
+            "physical": (
+                isinstance(normalized_receipt, dict)
+                and normalized_receipt.get("workflow_mode")
+                == "PHYSICAL_DIRECT_CAPTURE"
+            ),
+            "refresh_required": False,
+            "refresh_reasons": [],
+            "refresh_deferred": True,
+        }
     refresh_required = satisfied and refresh["refresh_required"]
     return {
         "status": (
             "refresh_required"
             if refresh_required
+            else "registered"
+            if not verify_physical and satisfied
             else "synced" if satisfied
             else "attention"
         ),
@@ -1098,7 +1118,11 @@ def inspect_cluster_target(
     }
 
 
-def discover_cluster_blend_relations(owner_folder):
+def discover_cluster_blend_relations(
+    owner_folder,
+    *,
+    verify_physical=True,
+):
     """Discover normalized Cluster blends and their owner-folder ON/OFF state.
 
     The target rows remain available as audit evidence for Blender/PCG, but the
@@ -1142,6 +1166,7 @@ def discover_cluster_blend_relations(owner_folder):
                 target,
                 relation_on,
                 canonical_spm=canonical,
+                verify_physical=verify_physical,
             )
             relation_rows.append({
                 "target_spm": target,
@@ -1185,6 +1210,11 @@ def discover_cluster_blend_relations(owner_folder):
                 relation.get("status") == "refresh_required"
                 for relation in owner_relations
             ),
+            "refresh_deferred_count": sum(
+                relation.get("refresh_deferred") is True
+                for relation in owner_relations
+                if relation.get("relation_on")
+            ),
             "refresh_reasons": sorted({
                 reason
                 for relation in owner_relations
@@ -1199,6 +1229,71 @@ def discover_cluster_blend_relations(owner_folder):
             ),
         })
     return sorted(rows, key=lambda row: row["blend"].name.casefold())
+
+
+def _current_on_relation_evidence(blend, targets):
+    """Return current physical proof, or ``None`` when a refresh is required.
+
+    The registry alone is not enough to skip work.  A no-op is safe only when
+    every effective target is local, still has an exact synced scope, and that
+    scope proves the current canonical source/capture/material state.
+    """
+    blend = Path(blend).expanduser().absolute()
+    owner = blend.parent.parent
+    canonical = blend.with_suffix(".spm")
+    if not canonical.is_file():
+        return None
+
+    evidence = []
+    for target in targets:
+        target = Path(target).expanduser().absolute()
+        if target.parent != owner or not target.is_file():
+            return None
+        state = inspect_cluster_target(
+            blend,
+            target,
+            True,
+            canonical_spm=canonical,
+            verify_physical=True,
+        )
+        if not (
+            state.get("status") == "synced"
+            and state.get("connection_satisfied") is True
+            and state.get("physical") is True
+            and state.get("refresh_required") is False
+            and state.get("refresh_deferred") is not True
+        ):
+            return None
+        evidence.append({
+            "target_spm": str(target),
+            "manifest": state.get("manifest"),
+            "material": state.get("material"),
+            "material_id": state.get("material_id"),
+        })
+    return evidence
+
+
+def _emit_cluster_relation_progress(callback, stage, message):
+    if callback is None:
+        print(message, flush=True)
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        # Progress reporting must never turn a successful transaction into a
+        # rollback. The authoritative result still comes from the worker.
+        return
+
+
+def _write_shared_repair_runtime_receipt(blend, repair_runtime_config):
+    if not repair_runtime_config:
+        return None
+    from sk_batch.repair_runtime_contract import write_repair_runtime_receipt
+
+    return write_repair_runtime_receipt(
+        Path(blend).expanduser().absolute().with_suffix(".spm"),
+        repair_runtime_config,
+    )
 
 
 def _validate_local_relation(blend, target_spm):
@@ -1244,6 +1339,8 @@ def run_cluster_relation_transaction(
     capture_resolution=1024,
     auto_normalize=True,
     repair_runtime_config=None,
+    force_refresh=False,
+    progress_callback=None,
     timeout=1800,
 ):
     """Apply ON through automatic Normalizer + Atlas, or reversible OFF.
@@ -1268,15 +1365,91 @@ def run_cluster_relation_transaction(
             targets.append(target)
     if not targets:
         raise ClusterBlendSyncError("No Cluster relationship target was selected")
-    blender = Path(blender_exe).expanduser().absolute()
-    if not blender.is_file():
-        raise ClusterBlendSyncError(f"Blender executable does not exist: {blender}")
     registered_before = _registry_target_spms(blend)
     effective_targets = (
         _merge_target_spms(registered_before, targets)
         if enabled
         else list(targets)
     )
+    requested_keys = {normalized_path_key(path) for path in targets}
+    registered_keys = {
+        normalized_path_key(path) for path in registered_before
+    }
+    if (
+        enabled
+        and not force_refresh
+        and requested_keys.issubset(registered_keys)
+    ):
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "verify_existing_relation",
+            "Verifying the existing Cluster ON relationship...",
+        )
+        current_evidence = _current_on_relation_evidence(
+            blend,
+            effective_targets,
+        )
+        if current_evidence is not None:
+            report = {
+                "status": "ok",
+                "mode": "sync",
+                "blend": str(blend),
+                "target_spms": [
+                    str(path) for path in effective_targets
+                ],
+                "folder_relation": "on",
+                "no_change": True,
+                "already_on": True,
+                "skip_reason": "already_on_up_to_date",
+                "verification": current_evidence,
+            }
+            try:
+                runtime_receipt = _write_shared_repair_runtime_receipt(
+                    blend,
+                    repair_runtime_config,
+                )
+            except OSError as exc:
+                try:
+                    diagnostic = _persist_cluster_relation_failure(
+                        blend=blend,
+                        targets=effective_targets,
+                        enabled=True,
+                        phase="no_op_runtime_receipt_failed",
+                        command=[],
+                        snapshots=[],
+                        artifact_recipe=None,
+                        launch_error=exc,
+                    )
+                    diagnostic_detail = (
+                        f"\nFailure diagnostic log: {diagnostic}"
+                    )
+                except Exception as diagnostic_error:
+                    diagnostic_detail = (
+                        "\nCOULD NOT write failure diagnostic log: "
+                        f"{type(diagnostic_error).__name__}: "
+                        f"{diagnostic_error}"
+                    )
+                raise ClusterBlendSyncError(
+                    "The existing Cluster relationship is current, but the "
+                    "shared Blender/Normalizer completion receipt could not "
+                    f"be committed: {exc}"
+                    + diagnostic_detail
+                ) from exc
+            if runtime_receipt is not None:
+                report["repair_runtime_receipt"] = str(runtime_receipt)
+            _emit_cluster_relation_progress(
+                progress_callback,
+                "already_on_up_to_date",
+                "Cluster relationship is already ON and up to date; "
+                "Blender bake/export was skipped.",
+            )
+            return report
+
+    blender = Path(blender_exe).expanduser().absolute()
+    if not blender.is_file():
+        raise ClusterBlendSyncError(
+            f"Blender executable does not exist: {blender}"
+        )
     normalization_recipe = None
     if enabled and auto_normalize:
         try:
@@ -1288,7 +1461,26 @@ def run_cluster_relation_transaction(
                 capture_resolution=capture_resolution,
             )
         except ClusterNormalizationSyncError as exc:
-            raise ClusterBlendSyncError(str(exc)) from exc
+            try:
+                diagnostic = _persist_cluster_relation_failure(
+                    blend=blend,
+                    targets=effective_targets,
+                    enabled=enabled,
+                    phase="normalization_recipe_failed",
+                    command=[],
+                    snapshots=[],
+                    artifact_recipe=None,
+                    launch_error=exc,
+                )
+                diagnostic_detail = f"\nFailure diagnostic log: {diagnostic}"
+            except Exception as diagnostic_error:
+                diagnostic_detail = (
+                    "\nCOULD NOT write failure diagnostic log: "
+                    f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+                )
+            raise ClusterBlendSyncError(
+                str(exc) + diagnostic_detail
+            ) from exc
 
     job = Path(__file__).resolve().parent / "spm_generator_sync" / "jobs" / "cluster_relation_job.py"
     if not job.is_file():
@@ -1311,54 +1503,29 @@ def run_cluster_relation_transaction(
                 encoding="utf-8",
             )
 
-        try:
-            if enabled:
-                for target in targets:
-                    set_cluster_relation_registry(blend, target, True)
-                registered_after = _registry_target_spms(blend)
-                if {
-                    normalized_path_key(path) for path in registered_after
-                } != {
-                    normalized_path_key(path) for path in effective_targets
-                }:
-                    raise ClusterBlendSyncError(
-                        "Cluster target registry changed while the effective "
-                        "ON target contract was being prepared."
-                    )
-
-            # The Blender job rebuilds every registered target, not only the
-            # selected ones, so the whole registry is at risk - not just
-            # ``targets``.
-            at_risk_targets = effective_targets if enabled else targets
-            at_risk = {
-                normalized_path_key(path): path
-                for path in at_risk_targets
-            }
-            snapshots = _snapshot_spm_files(
-                at_risk.values(), Path(temporary) / "spm_snapshots"
-            )
-            artifact_recipe = _atlas_transaction_artifact_recipe(
-                blend,
-                list(at_risk.values()),
-                normalization_recipe,
-            )
-            normalization_snapshots = _snapshot_normalization_artifacts(
-                artifact_recipe,
-                Path(temporary) / "normalization_artifacts",
-            )
-        except Exception as preparation_error:
-            if enabled:
-                try:
-                    _restore_registry_snapshot(
-                        registry_path, registry_before
-                    )
-                except OSError as restore_error:
-                    raise ClusterBlendSyncError(
-                        "Cluster relationship preparation failed and the "
-                        "target registry snapshot could not be restored: "
-                        f"{restore_error}"
-                    ) from preparation_error
-            raise
+        at_risk_targets = effective_targets if enabled else targets
+        at_risk = {
+            normalized_path_key(path): path
+            for path in at_risk_targets
+        }
+        snapshots = []
+        normalization_snapshots = []
+        artifact_recipe = None
+        command = [str(blender), "--factory-startup"]
+        if enabled:
+            command.extend(["--background", str(blend)])
+        else:
+            command.append("--background")
+        command.extend([
+            "--python", str(job), "--",
+            "--mode", "sync" if enabled else "remove",
+            "--blend", str(blend),
+            "--report", str(report_path),
+        ])
+        for target in targets:
+            command.extend(["--target", str(target)])
+        if recipe_path is not None:
+            command.extend(["--normalization-recipe", str(recipe_path)])
 
         def persist_failure(phase, *, report=None, result=None, error=None):
             existing_diagnostic = (
@@ -1387,6 +1554,63 @@ def run_cluster_relation_transaction(
             if existing_diagnostic:
                 return ""
             return f"\nFailure diagnostic log: {diagnostic}"
+
+        try:
+            if enabled:
+                for target in targets:
+                    set_cluster_relation_registry(blend, target, True)
+                registered_after = _registry_target_spms(blend)
+                if {
+                    normalized_path_key(path) for path in registered_after
+                } != {
+                    normalized_path_key(path) for path in effective_targets
+                }:
+                    raise ClusterBlendSyncError(
+                        "Cluster target registry changed while the effective "
+                        "ON target contract was being prepared."
+                    )
+
+            # The Blender job rebuilds every registered target, not only the
+            # selected ones, so the whole registry is at risk - not just
+            # ``targets``.
+            snapshots = _snapshot_spm_files(
+                at_risk.values(), Path(temporary) / "spm_snapshots"
+            )
+            artifact_recipe = _atlas_transaction_artifact_recipe(
+                blend,
+                list(at_risk.values()),
+                normalization_recipe,
+            )
+            normalization_snapshots = _snapshot_normalization_artifacts(
+                artifact_recipe,
+                Path(temporary) / "normalization_artifacts",
+            )
+        except Exception as preparation_error:
+            diagnostic_detail = persist_failure(
+                "preparation_failed",
+                error=preparation_error,
+            )
+            if enabled:
+                try:
+                    _restore_registry_snapshot(
+                        registry_path, registry_before
+                    )
+                except OSError as restore_error:
+                    raise ClusterBlendSyncError(
+                        "Cluster relationship preparation failed and the "
+                        "target registry snapshot could not be restored: "
+                        f"{restore_error}"
+                        + diagnostic_detail
+                    ) from preparation_error
+            original_args = tuple(preparation_error.args)
+            if original_args:
+                preparation_error.args = (
+                    str(original_args[0]) + diagnostic_detail,
+                    *original_args[1:],
+                )
+            else:
+                preparation_error.args = (diagnostic_detail.lstrip(),)
+            raise
 
         def rollback():
             restored, failed = _restore_spm_files(snapshots)
@@ -1425,21 +1649,34 @@ def run_cluster_relation_transaction(
                 )
             return detail
 
-        command = [str(blender), "--factory-startup"]
-        if enabled:
-            command.extend(["--background", str(blend)])
-        else:
-            command.append("--background")
-        command.extend([
-            "--python", str(job), "--",
-            "--mode", "sync" if enabled else "remove",
-            "--blend", str(blend),
-            "--report", str(report_path),
-        ])
-        for target in targets:
-            command.extend(["--target", str(target)])
-        if recipe_path is not None:
-            command.extend(["--normalization-recipe", str(recipe_path)])
+        heartbeat_stop = threading.Event()
+        worker_started_at = time.monotonic()
+
+        def heartbeat():
+            while not heartbeat_stop.wait(
+                CLUSTER_RELATION_HEARTBEAT_SECONDS
+            ):
+                elapsed = max(
+                    1, int(time.monotonic() - worker_started_at)
+                )
+                _emit_cluster_relation_progress(
+                    progress_callback,
+                    "blender_worker_running",
+                    "Blender background Cluster bake/export is still "
+                    f"running ({elapsed}s elapsed)...",
+                )
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name="cluster-relation-heartbeat",
+            daemon=True,
+        )
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "blender_worker_started",
+            "Starting Blender background Cluster bake/export...",
+        )
+        heartbeat_thread.start()
         try:
             result = subprocess.run(
                 command,
@@ -1455,6 +1692,15 @@ def run_cluster_relation_transaction(
                 + persist_failure("launch_failed", error=exc)
                 + rollback()
             ) from exc
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "blender_worker_finished",
+            "Blender background Cluster bake/export finished; "
+            "validating its receipt...",
+        )
         report = _read_json(report_path) if report_path.is_file() else None
         if result.returncode != 0 or not report or report.get("status") != "ok":
             detail = (report or {}).get("error") or (result.stderr or result.stdout)[-1200:]
@@ -1470,18 +1716,19 @@ def run_cluster_relation_transaction(
             )
         if enabled and repair_runtime_config:
             try:
-                from sk_batch.repair_runtime_contract import (
-                    write_repair_runtime_receipt,
-                )
-
-                runtime_receipt = write_repair_runtime_receipt(
-                    blend.with_suffix(".spm"),
+                runtime_receipt = _write_shared_repair_runtime_receipt(
+                    blend,
                     repair_runtime_config,
                 )
             except OSError as exc:
                 raise ClusterBlendSyncError(
                     "Cluster Sync completed but could not commit the shared "
                     f"Blender/Normalizer completion receipt: {exc}"
+                    + persist_failure(
+                        "runtime_receipt_failed",
+                        report=report,
+                        error=exc,
+                    )
                     + rollback()
                 ) from exc
             if runtime_receipt is not None:
@@ -1498,12 +1745,20 @@ def run_cluster_folder_relation_transaction(
     capture_resolution=1024,
     auto_normalize=True,
     repair_runtime_config=None,
+    force_refresh=False,
+    progress_callback=None,
     timeout=1800,
 ):
     """Normalize one Cluster blend relationship across every owner SK SPM."""
     blend = Path(blend).expanduser().absolute()
     owner = blend.parent.parent
-    discovered = discover_cluster_blend_relations(owner)
+    # This pass only selects the folder's targets. The transaction below owns
+    # the single authoritative physical receipt/hash verification, so hashing
+    # the same source once here and again there only adds latency.
+    discovered = discover_cluster_blend_relations(
+        owner,
+        verify_physical=False,
+    )
     row = next(
         (
             candidate for candidate in discovered
@@ -1546,6 +1801,8 @@ def run_cluster_folder_relation_transaction(
         capture_resolution=capture_resolution,
         auto_normalize=auto_normalize,
         repair_runtime_config=repair_runtime_config,
+        force_refresh=force_refresh,
+        progress_callback=progress_callback,
         timeout=timeout,
     )
     result["folder_target_count"] = len(owner_targets)

@@ -2292,14 +2292,59 @@ def _material_only_source_rebase_evidence(
     isolated_digest = hashlib.sha256(
         isolated_contract.encode("utf-8")
     ).hexdigest()
+    policy = "declared_bark_material_outputs_only_v1"
     if production_digest != isolated_digest:
-        raise ClusterAssemblyReceiptStaleError(
-            "Atlas physical normalization source changed outside declared "
-            "normalization material blocks"
+        production_semantic = spm_file_structural_semantic_fingerprint(
+            output_spm,
+            raw_sha256=current_output.get("sha256"),
+        )
+        isolated_semantic = spm_file_structural_semantic_fingerprint(
+            isolated_spm_path,
+            raw_sha256=isolated_spm.get("sha256"),
+        )
+
+        def normalize_unused_material_ids(text):
+            ordinal = 0
+
+            def replace_block(match):
+                nonlocal ordinal
+                ordinal += 1
+                return _SPM_MATERIAL_ID_RE.sub(
+                    f'<Material_v8 ID="UNUSED-{ordinal}"',
+                    match.group(0),
+                    count=1,
+                )
+
+            return _SPM_MATERIAL_BLOCK_RE.sub(replace_block, text)
+
+        production_id_normalized = normalize_unused_material_ids(
+            production_contract
+        )
+        isolated_id_normalized = normalize_unused_material_ids(
+            isolated_contract
+        )
+        production_id_digest = hashlib.sha256(
+            production_id_normalized.encode("utf-8")
+        ).hexdigest()
+        isolated_id_digest = hashlib.sha256(
+            isolated_id_normalized.encode("utf-8")
+        ).hexdigest()
+        if (
+            production_semantic != isolated_semantic
+            or production_id_digest != isolated_id_digest
+        ):
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas physical normalization source changed outside declared "
+                "normalization material blocks"
+            )
+        production_digest = production_id_digest
+        isolated_digest = isolated_id_digest
+        policy = (
+            "declared_bark_outputs_or_unused_material_id_rebase_v2"
         )
     return {
         "status": "validated",
-        "policy": "declared_bark_material_outputs_only_v1",
+        "policy": policy,
         "declared_material_ids": sorted(declared),
         "outside_declared_materials_sha256": production_digest,
         "recorded_source_spm_sha256": str(
