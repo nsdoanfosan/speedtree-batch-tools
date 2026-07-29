@@ -30,12 +30,26 @@ except ImportError:
 
 
 SPM_CALIBRATION_RECEIPT_VERSION = 1
-SPM_BONE_SEMANTIC_PROJECTION_VERSION = (
-    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
-)
+# v1 inherited the shared structural projection, which ignored scalar
+# ``Property`` vertex-color values but accidentally retained the real
+# ``SplineProperty`` values used by SpeedTree.  Those values cannot change
+# skeleton output, so v2 removes both forms without changing the shared
+# structural projection used by Cluster relationship receipts.
+SPM_BONE_SEMANTIC_PROJECTION_VERSION = 2
 POSITIVE_CALIBRATION_STATUSES = frozenset({"calibrated", "already-ok"})
 
+
 def bone_semantic_fingerprint(source_text, *, context=None):
+    return spm_structural_semantic_fingerprint(
+        source_text,
+        context=context,
+        ignore_vertex_color_spline_properties=True,
+        projection_version=SPM_BONE_SEMANTIC_PROJECTION_VERSION,
+    )
+
+
+def legacy_bone_semantic_fingerprint(source_text, *, context=None):
+    """Return the v1 fingerprint so current positive receipts migrate once."""
     return spm_structural_semantic_fingerprint(
         source_text,
         context=context,
@@ -59,6 +73,7 @@ def load_positive_calibration_receipt(
     bone_semantic_fingerprint_value,
     settings_signature,
     bone_contract_version,
+    legacy_bone_semantic_fingerprint_values=(),
 ):
     """Return a current positive receipt, otherwise ``None``."""
     path = calibration_receipt_path(spm_path, cache_dir)
@@ -66,18 +81,32 @@ def load_positive_calibration_receipt(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return None
+    stored_fingerprint = payload.get("bone_semantic_fingerprint")
+    stored_projection = payload.get("bone_semantic_projection_version")
+    current_fingerprint_match = (
+        stored_fingerprint == bone_semantic_fingerprint_value
+        and stored_projection == SPM_BONE_SEMANTIC_PROJECTION_VERSION
+    )
+    legacy_fingerprint_match = (
+        stored_projection == SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+        and stored_fingerprint
+        in frozenset(legacy_bone_semantic_fingerprint_values or ())
+    )
     if (
-        not isinstance(payload, dict)
-        or payload.get("kind") != "spm_bone_calibration_positive_receipt"
+        payload.get("kind") != "spm_bone_calibration_positive_receipt"
         or payload.get("version") != SPM_CALIBRATION_RECEIPT_VERSION
         or payload.get("status") not in POSITIVE_CALIBRATION_STATUSES
         or payload.get("spm_identity") != normalized_spm_identity(spm_path)
-        or payload.get("bone_semantic_fingerprint")
-        != bone_semantic_fingerprint_value
+        or not (current_fingerprint_match or legacy_fingerprint_match)
         or payload.get("settings_signature") != settings_signature
         or payload.get("bone_contract_version") != bone_contract_version
     ):
         return None
+    if legacy_fingerprint_match:
+        payload = dict(payload)
+        payload["legacy_bone_semantic_receipt_migrated"] = True
     return payload
 
 
@@ -135,6 +164,7 @@ __all__ = [
     "SPM_CALIBRATION_RECEIPT_VERSION",
     "bone_semantic_fingerprint",
     "calibration_receipt_path",
+    "legacy_bone_semantic_fingerprint",
     "load_positive_calibration_receipt",
     "normalized_spm_identity",
     "write_positive_calibration_receipt",

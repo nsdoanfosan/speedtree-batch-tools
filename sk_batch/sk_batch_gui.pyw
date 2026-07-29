@@ -100,6 +100,9 @@ from speedtree_pipeline_contract import (
     source_identity,
     validate_preflight_envelope,
 )
+from speedtree_texture_contract import (
+    TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
+)
 from push_dependency_schedule import (
     PushDependencyError,
     expand_push_targets,
@@ -4022,18 +4025,26 @@ class App:
         # stale "ok" label. Preserved Cluster rows carry their own source-file
         # map and are validated the same way.
         for material in normalization.get("materials", []):
-            if material.get("status") not in {"ok", "preserved_cluster"}:
+            material_status = str(material.get("status") or "")
+            if material_status not in {
+                "ok",
+                "preserved_cluster",
+                "needs_pcg_generation",
+            }:
                 continue
             files = (
                 material.get("files")
                 or material.get("preserved_files")
                 or material.get("source_maps")
+                or material.get("source_paths")
                 or {}
             )
             missing_roles = [
                 role for role, value in files.items()
                 if recorded_file_missing(value)
             ]
+            if material_status == "needs_pcg_generation" and not files:
+                missing_roles = list(material.get("source_roles") or ["source"])
             if missing_roles:
                 missing.append(
                     {
@@ -4058,7 +4069,27 @@ class App:
                 "텍스처 준비 안 됨: " + " | ".join(details)
                 + " → PCG ③ 또는 ② Repair 확인"
             )
-        if normalization.get("status") not in {"ok", "preserved_cluster"}:
+        normalization_status = str(normalization.get("status") or "")
+        fallback_rows = [
+            material
+            for material in normalization.get("materials", [])
+            if str(material.get("status") or "") == "needs_pcg_generation"
+        ]
+        source_fallback_ready = (
+            normalization_status == "needs_pcg_generation"
+            and str(normalization.get("texture_contract_status") or "")
+            == TEXTURE_ORIGIN_NEEDS_PCG_GENERATION
+            and bool(fallback_rows)
+            and all(
+                str(material.get("texture_contract_status") or "")
+                == TEXTURE_ORIGIN_NEEDS_PCG_GENERATION
+                for material in fallback_rows
+            )
+        )
+        if (
+            normalization_status not in {"ok", "preserved_cluster"}
+            and not source_fallback_ready
+        ):
             return False, "텍스처 정규화 미완료 → ② 필요"
         handoff = report.get("handoff_preflight")
         if not isinstance(handoff, dict):
@@ -4097,6 +4128,12 @@ class App:
         )
         if preserved_count:
             return True, f"텍스처 준비 완료 · 보존 Cluster {preserved_count}세트"
+        if source_fallback_ready:
+            return True, (
+                "텍스처 준비 완료 · 원본 텍스처 사용 중 · "
+                "canonical T_* 미생성 "
+                f"{len(fallback_rows)}세트"
+            )
         return True, "텍스처 정규화 완료"
 
     def _blend_status_text(self, spm):
@@ -4116,6 +4153,11 @@ class App:
         texture_reason = state.get("texture_reason", "")
         if "보존 Cluster" in texture_reason:
             return "최신 ✓ · 보존 Cluster ✓"
+        if "canonical T_* 미생성" in texture_reason:
+            return (
+                "최신 ✓ · 원본 텍스처 사용 중 · "
+                "T_* 미생성 (비차단)"
+            )
         return "최신 ✓"
 
     def _record_live_blend_status(self, iid, spm, persist=True):

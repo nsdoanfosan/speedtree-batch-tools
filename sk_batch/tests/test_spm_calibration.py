@@ -290,6 +290,52 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             }
             self.assertEqual(enabled, {"Structural A", "Structural B"})
 
+    def test_cluster_fixed_point_skips_speedtree_without_prior_receipt(self):
+        source_xml = cluster_graph_xml()
+        fixed = spm_audit.apply_cluster_root_bone_plan(
+            source_xml,
+            spm_audit.plan_cluster_root_bones(source_xml),
+        )
+        cfg = {
+            "cluster_root_only_bones": True,
+            "rename_materials": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cluster_dir = root / "cluster"
+            cluster_dir.mkdir()
+            spm_path = cluster_dir / "SK_leaf_example_01.spm"
+            cfg["spm_calibration_receipt_dir"] = str(root / "receipts")
+            spm_audit.write_spm(spm_path, fixed)
+
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=AssertionError("fixed point exported XML"),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                side_effect=AssertionError("fixed point exported FBX"),
+            ):
+                report = spm_audit.process_spm(
+                    spm_path,
+                    cfg,
+                    log=lambda _message: None,
+                )
+
+        self.assertEqual(report["status"], "already-ok")
+        self.assertEqual(report["bone_fast_path"]["status"], "hit")
+        self.assertEqual(
+            report["calibration"]["verification"],
+            "live_logical_fixed_point",
+        )
+        self.assertTrue(
+            report["calibration"]["speedtree_export_skipped"]
+        )
+        self.assertEqual(report["total_bones"], 2)
+
     def test_cluster_calibration_reaches_root_normalizer_when_generic_gate_is_off(self):
         source_xml = cluster_graph_xml()
         cfg = {

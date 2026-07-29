@@ -231,15 +231,30 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         str(value).lower() for value in active_material_ids(spm)
     }
     if referenced_ids:
-        active_ids = {
+        visible_ids = {
             str(value).lower() for value in visible_material_ids(spm)
         }
+        # A production SPM can intentionally hide every provider generator
+        # while keeping its material bindings authoritative for relationship
+        # or export handoff.  Exact audited material-ID mappings must remain
+        # usable in that state; an empty visibility projection is not evidence
+        # that every referenced material is inactive.
+        active_ids = visible_ids or referenced_ids
     else:
         active_ids = {
             _material_id(match.group(0)).lower()
             for match in MATERIAL_BLOCK_RE.finditer(text)
             if _material_id(match.group(0))
         }
+    # Exact plan targets are already provenance-checked by the audit.  Include
+    # those material IDs even when an Atlas Auto Split sibling is currently
+    # hidden or has no Generator slot; this lets all same-source collection
+    # variants share the default suffix-free T_* atlas set.
+    active_ids.update(
+        str(key)[4:].strip().lower()
+        for key in material_outputs
+        if str(key).lower().startswith("@id:") and str(key)[4:].strip()
+    )
     changed = []
     missing = []
     matched_count = 0

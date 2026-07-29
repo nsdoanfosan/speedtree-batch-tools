@@ -35,6 +35,7 @@ from speedtree_texture_contract import (  # noqa: E402
     TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
     inspect_spm_texture_slots,
     read_stmat_material_sources,
+    resolve_blender_cluster_bake_origin,
     resolve_texture_bindings,
 )
 from speedtree_export_options_contract import (  # noqa: E402
@@ -44,7 +45,6 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
     canonical_material_name as pcg_canonical_material_name,
-    cluster_render_origin_receipt,
     texture_base_for_material,
 )
 from pcg_st9_texture_batch.pcg_texture_common import (  # noqa: E402
@@ -152,6 +152,22 @@ def _production_asset_root(spm_path):
     return cluster.parent if cluster is not None else spm.parent
 
 
+def _is_cluster_capture_source_set(paths):
+    """True for maps stored directly in an asset Cluster output folder."""
+    try:
+        resolved = [
+            Path(path).expanduser().resolve()
+            for path in paths
+            if str(path or "").strip()
+        ]
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(resolved) and all(
+        path.parent.name.casefold() == "cluster"
+        for path in resolved
+    )
+
+
 def augment_texture_readiness_contract(
     readiness,
     stmat_path,
@@ -211,6 +227,8 @@ def augment_texture_readiness_contract(
             [],
         )
         bake_receipt = {}
+        bake_issue = ""
+        spm_source_paths = {}
         if len(spm_matches) == 1:
             spm_material = spm_matches[0]
             spm_slots = list(spm_material.get("slots") or [])
@@ -228,13 +246,27 @@ def augment_texture_readiness_contract(
                 _path_key(path)
                 for path in spm_source_paths.values()
             }:
-                bake_receipt = cluster_render_origin_receipt(
-                    asset_root,
-                    production_spm,
-                    [
-                        slot["authored_ref"]
-                        for slot in spm_slots
-                    ],
+                bake_receipt, bake_issue = (
+                    resolve_blender_cluster_bake_origin(
+                        production_spm,
+                        spm_material,
+                        {
+                            "slot_files": [
+                                {
+                                    "map_index": int(
+                                        slot.get("map_index", -1)
+                                    ),
+                                    "map": str(slot.get("map") or ""),
+                                    "role": str(slot.get("role") or ""),
+                                    "path": str(
+                                        slot.get("resolved_ref") or ""
+                                    ),
+                                }
+                                for slot in spm_slots
+                            ],
+                        },
+                        asset_root,
+                    )
                 )
                 if bake_receipt:
                     bake_receipt = {
@@ -266,6 +298,45 @@ def augment_texture_readiness_contract(
                 "origin_state": TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
                 "origin_receipt": bake_receipt,
                 "source_paths": spm_source_paths,
+            })
+            continue
+        if (
+            bake_issue
+            and _is_cluster_capture_source_set(
+                spm_source_paths.values(),
+            )
+        ):
+            validation = {
+                "classification":
+                    "asset_cluster_bake_texture_contract_invalid",
+                "issue": bake_issue,
+                "material": str(
+                    (spm_matches[0] if spm_matches else {}).get(
+                        "material_name"
+                    )
+                    or binding.get("material")
+                    or ""
+                ),
+                "material_id": str(
+                    (spm_matches[0] if spm_matches else {}).get(
+                        "material_id"
+                    )
+                    or ""
+                ),
+                "source_paths": dict(spm_source_paths),
+            }
+            binding.update({
+                "status": "blocked_source",
+                "texture_contract_status": "blocked_source",
+                "source_paths": dict(spm_source_paths),
+                "origin_validation": validation,
+            })
+            missing.append({
+                "material": binding.get("material"),
+                "material_index": binding.get("material_index"),
+                "reason": "blender_cluster_bake_origin_invalid",
+                "origin_validation_issue": bake_issue,
+                "origin_validation": validation,
             })
             continue
 

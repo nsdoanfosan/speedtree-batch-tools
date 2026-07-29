@@ -68,6 +68,7 @@ if __package__ in (None, ""):
     from spm_calibration_receipt import (
         POSITIVE_CALIBRATION_STATUSES,
         bone_semantic_fingerprint,
+        legacy_bone_semantic_fingerprint,
         load_positive_calibration_receipt,
         write_positive_calibration_receipt,
     )
@@ -82,16 +83,19 @@ else:
     from .spm_calibration_receipt import (
         POSITIVE_CALIBRATION_STATUSES,
         bone_semantic_fingerprint,
+        legacy_bone_semantic_fingerprint,
         load_positive_calibration_receipt,
         write_positive_calibration_receipt,
     )
 from speedtree_pipeline_contract import (
+    branch_generator_has_render_geometry,
     read_spm_text as read_pipeline_spm_text,
 )
 from speedtree_export_options_contract import require_texture_skip_writing
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
+NODE_TYPE_RE = re.compile(r'<Node\b[^>]*Type="([^"]+)"')
 FIRST_NAME_RE = re.compile(r"<Name>([^<]*)</Name>")
 FIRST_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>")
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
@@ -1039,6 +1043,14 @@ def current_bone_semantic_fingerprint(spm_path, source_text=None):
     )
 
 
+def current_legacy_bone_semantic_fingerprint(spm_path, source_text=None):
+    text = read_spm(spm_path) if source_text is None else source_text
+    return legacy_bone_semantic_fingerprint(
+        text,
+        context=bone_semantic_context(spm_path),
+    )
+
+
 def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
     """Select automatic bone generators from Generator/Node GUID ancestry.
 
@@ -1458,6 +1470,14 @@ def _is_leaf_generator_type(generator_type):
     of artist-controlled generator names.
     """
     return "leaf" in str(generator_type or "").strip().casefold()
+
+
+def _contains_leaf_node(text):
+    """Cheaply reject SPMs where the Red leaf-parent transform is irrelevant."""
+    return any(
+        _is_leaf_generator_type(match.group(1))
+        for match in NODE_TYPE_RE.finditer(text)
+    )
 
 
 def _direct_vertex_color_properties(generator):
@@ -2036,17 +2056,7 @@ def is_cluster_normalization_spm(spm_path):
 
 def _cluster_branch_has_render_geometry(properties):
     """Return whether a Branch generator contributes renderable geometry."""
-    skin_type = _number(properties.get("Skin:Type"))
-    skin_visibility = _number(properties.get("Skin:Visibility"))
-    segment_mesh = str(
-        properties.get("Segments:Features:Mesh:Enabled") or ""
-    ).strip().casefold() in {"1", "true", "yes"}
-    has_visible_skin = (
-        skin_type is not None
-        and skin_type != 3.0
-        and (skin_visibility is None or skin_visibility > 0.0)
-    )
-    return bool(has_visible_skin or segment_mesh)
+    return branch_generator_has_render_geometry(properties)
 
 
 def plan_cluster_root_bones(text):
@@ -3200,6 +3210,63 @@ def _calibration_recovery_clear_result(state, spm_path, *, recovered):
     }
 
 
+def _restore_legacy_calibration_values(
+    spm_path,
+    current_text,
+    backup_text,
+):
+    """Restore only Branch bone properties that an interrupted probe mutates."""
+    current = audit_spm(
+        spm_path,
+        text=current_text,
+        analyze_bone_graph=False,
+    )["generators"]
+    backup = {
+        row["guid"]: row
+        for row in audit_spm(
+            spm_path,
+            text=backup_text,
+            analyze_bone_graph=False,
+        )["generators"]
+        if (
+            row.get("guid")
+            and row.get("style") is not None
+            and row.get("bones") is not None
+        )
+    }
+    patched = current_text
+    repairs = []
+    shared = 0
+    for branch_index, row in enumerate(current):
+        source = backup.get(row.get("guid"))
+        if source is None:
+            continue
+        shared += 1
+        before = (row.get("style"), row.get("bones"))
+        after = (source["style"], source["bones"])
+        if before == after:
+            continue
+        patched = apply_branch_values(
+            patched,
+            [branch_index],
+            source["style"],
+            source["bones"],
+        )
+        repairs.append({
+            "guid": row.get("guid"),
+            "name": row.get("name"),
+            "before": {
+                "style": before[0],
+                "bones": before[1],
+            },
+            "restored": {
+                "style": after[0],
+                "bones": after[1],
+            },
+        })
+    return patched, repairs, shared
+
+
 def recover_interrupted_calibration(spm_path):
     """Restore a killed calibration's source SPM from its recorded backup."""
     state = inspect_interrupted_calibration(spm_path)
@@ -3288,20 +3355,53 @@ def recover_interrupted_calibration(spm_path):
                 category="legacy_marker_logical_audit_failed",
                 error=f"legacy marker logical SPM audit failed: {exc}",
             )
-        if current_text != backup_text:
-            return _calibration_recovery_failure(
-                state,
-                failure_kind="concurrent_spm_modification",
-                category="legacy_marker_logical_mismatch",
-                error=(
-                    "legacy marker current SPM logical XML differs from "
-                    "the recorded source backup; external/probe state preserved"
-                ),
-                details={
-                    "current_sha256": current_snapshot.get("sha256", ""),
-                    "backup_sha256": backup_snapshot.get("sha256", ""),
-                },
+        calibration_repairs = []
+        shared_calibration_generators = 0
+        logical_xml_exact_equal = current_text == backup_text
+        if not logical_xml_exact_equal:
+            (
+                recovered_text,
+                calibration_repairs,
+                shared_calibration_generators,
+            ) = _restore_legacy_calibration_values(
+                spm_path,
+                current_text,
+                backup_text,
             )
+            if not shared_calibration_generators:
+                return _calibration_recovery_failure(
+                    state,
+                    failure_kind="concurrent_spm_modification",
+                    category="legacy_marker_logical_mismatch",
+                    error=(
+                        "legacy marker current SPM logical XML differs from "
+                        "the recorded source backup, and no shared Branch "
+                        "calibration properties can be recovered safely"
+                    ),
+                    details={
+                        "current_sha256": current_snapshot.get(
+                            "sha256", ""
+                        ),
+                        "backup_sha256": backup_snapshot.get(
+                            "sha256", ""
+                        ),
+                    },
+                )
+            if recovered_text != current_text:
+                write_spm(spm_path, recovered_text)
+                current_text = read_spm(spm_path)
+                if current_text != recovered_text:
+                    return _calibration_recovery_failure(
+                        state,
+                        failure_kind="interrupted_calibration",
+                        category=(
+                            "legacy_marker_calibration_restore_verify_failed"
+                        ),
+                        error=(
+                            "selectively restored Branch calibration values "
+                            "did not verify after the atomic SPM write"
+                        ),
+                    )
         cluster_postcondition = None
         if is_cluster_normalization_spm(spm_path):
             cluster_postcondition = cluster_root_logical_postcondition(
@@ -3322,19 +3422,32 @@ def recover_interrupted_calibration(spm_path):
                 )
         migrated_state = {
             **state,
-            "status": "legacy_marker_logically_intact",
+            "status": (
+                "legacy_marker_calibration_values_restored"
+                if calibration_repairs
+                else "legacy_marker_logically_intact"
+            ),
             "legacy_marker_migration": {
-                "policy": "clear_marker_without_spm_write",
+                "policy": (
+                    "restore_only_interrupted_branch_calibration_values"
+                    if calibration_repairs
+                    else "clear_marker_without_spm_write"
+                ),
                 "marker_version": state.get("marker_version"),
                 "backup_hash_matches_source": True,
-                "logical_xml_exact_equal": True,
+                "logical_xml_exact_equal": logical_xml_exact_equal,
+                "shared_calibration_generator_count":
+                    shared_calibration_generators,
+                "restored_calibration_generator_count":
+                    len(calibration_repairs),
+                "restored_calibration_generators": calibration_repairs,
                 "cluster_postcondition": cluster_postcondition,
             },
         }
         return _calibration_recovery_clear_result(
             migrated_state,
             spm_path,
-            recovered=False,
+            recovered=bool(calibration_repairs),
         )
     live_sha256 = (state.get("spm_snapshot") or {}).get("sha256", "")
     if live_sha256 != state["last_pipeline_sha256"]:
@@ -4296,15 +4409,23 @@ def _bone_receipt_cache_dir(cfg):
     )
 
 
-def _persist_positive_bone_receipt(report, spm_path, source_text, cfg):
+def _persist_positive_bone_receipt(
+    report,
+    spm_path,
+    source_text,
+    cfg,
+    *,
+    semantic_fingerprint=None,
+):
     """Best-effort positive cache write; cache I/O never blocks good data."""
     if report.get("status") not in POSITIVE_CALIBRATION_STATUSES:
         return report
     try:
-        semantic_fingerprint = current_bone_semantic_fingerprint(
-            spm_path,
-            source_text,
-        )
+        if semantic_fingerprint is None:
+            semantic_fingerprint = current_bone_semantic_fingerprint(
+                spm_path,
+                source_text,
+            )
         receipt_path = write_positive_calibration_receipt(
             spm_path,
             _bone_receipt_cache_dir(cfg),
@@ -4335,6 +4456,8 @@ def _apply_non_bone_transforms_from_receipt(
     apply_tree_red,
     receipt,
     report,
+    semantic_fingerprint=None,
+    cluster_postcondition=None,
 ):
     """Apply cheap SPM transforms while reusing a proven bone result."""
     summary = receipt.get("summary") or {}
@@ -4372,7 +4495,11 @@ def _apply_non_bone_transforms_from_receipt(
         and is_cluster_normalization_spm(spm_path)
     )
     if cluster_root_mode:
-        postcondition = cluster_root_logical_postcondition(final_text)
+        postcondition = (
+            cluster_postcondition
+            if cluster_postcondition is not None and final_text == source_text
+            else cluster_root_logical_postcondition(final_text)
+        )
         report["cluster_root_logical_postcondition"] = postcondition
         if not postcondition.get("ok"):
             raise RuntimeError(
@@ -4409,6 +4536,9 @@ def _apply_non_bone_transforms_from_receipt(
         spm_path,
         final_text,
         cfg,
+        semantic_fingerprint=(
+            semantic_fingerprint if final_text == source_text else None
+        ),
     )
 
 
@@ -4502,18 +4632,26 @@ def _process_spm_locked(
                 + str(recovery.get("error") or recovery.get("status"))
             )
 
-    audit = audit_spm(spm_path, text=source_text, analyze_bone_graph=True)
-    readiness = sk_readiness(audit)
-    report["sk_readiness"] = readiness
     cluster_root_mode = bool(
         cfg.get("cluster_root_only_bones", True)
         and is_cluster_normalization_spm(spm_path)
     )
+    # Cluster prototypes use their dedicated Tree->first-renderable-Branch
+    # root plan. Building the whole generic Tree/Base bone graph here is both
+    # irrelevant and very expensive on large production SPMs.
+    audit = audit_spm(
+        spm_path,
+        text=source_text,
+        analyze_bone_graph=not cluster_root_mode,
+    )
+    readiness = sk_readiness(audit)
+    report["sk_readiness"] = readiness
     renames, mat_skipped = plan_material_renames(audit)
     report["skipped"].extend(mat_skipped)
     apply_tree_red = bool(
         cfg.get("tree_leaf_parent_red_gradient", True)
         and classify_asset_kind(spm_path) == "tree"
+        and _contains_leaf_node(source_text)
     )
 
     # A Cluster source is intentionally allowed to arrive with every authored
@@ -4562,6 +4700,25 @@ def _process_spm_locked(
             settings_signature=calibration_settings_signature(cfg),
             bone_contract_version=SPM_BONE_CONTRACT_VERSION,
         )
+        if receipt is None and not cluster_root_mode:
+            # Existing v1 receipts migrate without an export when the current
+            # file still matches their former projection. Cluster prototypes
+            # use the stronger live fixed-point proof below, avoiding a second
+            # parse of large SPMs.
+            legacy_semantic_input = current_legacy_bone_semantic_fingerprint(
+                spm_path,
+                source_text,
+            )
+            receipt = load_positive_calibration_receipt(
+                spm_path,
+                _bone_receipt_cache_dir(cfg),
+                bone_semantic_fingerprint_value=bone_semantic_input,
+                legacy_bone_semantic_fingerprint_values=(
+                    legacy_semantic_input,
+                ),
+                settings_signature=calibration_settings_signature(cfg),
+                bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+            )
     if receipt is not None:
         log(
             "  [SPM bone fast-path] branch/geometry/bone semantics unchanged; "
@@ -4577,7 +4734,52 @@ def _process_spm_locked(
             apply_tree_red=apply_tree_red,
             receipt=receipt,
             report=report,
+            semantic_fingerprint=bone_semantic_input,
         )
+
+    if not force_rerun and cluster_root_mode:
+        cluster_postcondition = cluster_root_logical_postcondition(source_text)
+        report["cluster_root_logical_postcondition"] = cluster_postcondition
+        if cluster_postcondition.get("ok"):
+            expected_bones = cluster_postcondition.get(
+                "expected_root_bone_count"
+            )
+            log(
+                "  [SPM bone fast-path] Cluster root settings are already the "
+                "logical fixed point; SpeedTree XML/FBX export skipped"
+            )
+            return _apply_non_bone_transforms_from_receipt(
+                spm_path,
+                cfg,
+                source_text=source_text,
+                source_bytes=source_bytes,
+                source_stat=source_stat,
+                renames=renames,
+                apply_tree_red=apply_tree_red,
+                receipt={
+                    "status": "already-ok",
+                    "completed_at": None,
+                    "summary": {
+                        "display_summary": (
+                            "already-ok"
+                            if expected_bones is None
+                            else f"already-ok · Cluster root {expected_bones}"
+                        ),
+                        "generators": {},
+                        "rounds": [],
+                        "total_bones": expected_bones,
+                        "calibration": {
+                            "mode": cluster_postcondition.get("mode"),
+                            "verification": "live_logical_fixed_point",
+                            "speedtree_export_skipped": True,
+                        },
+                        "skipped": [],
+                    },
+                },
+                report=report,
+                semantic_fingerprint=bone_semantic_input,
+                cluster_postcondition=cluster_postcondition,
+            )
 
     backup = None
     if cfg.get("backup_spm", True):

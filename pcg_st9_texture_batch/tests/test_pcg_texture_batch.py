@@ -724,6 +724,36 @@ class SourceSelectionTests(unittest.TestCase):
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS_DIRTY = old_dirty
 
+    def test_non_render_branch_scaffold_does_not_require_its_material(self):
+        def branch(material_id, skin_type, segment_mesh):
+            return (
+                '<Generator Type="Branch"><Name>Trunk</Name>'
+                '<GUID>branch-guid</GUID><Hidden>false</Hidden><Properties>'
+                '<Property><Name>Branches:Material</Name>'
+                f'<Value>{material_id}</Value></Property>'
+                '<Property><Name>Skin:Type</Name>'
+                f'<Value>{skin_type}</Value></Property>'
+                '<Property><Name>Segments:Features:Mesh:Enabled</Name>'
+                f'<Value>{segment_mesh}</Value></Property>'
+                '</Properties></Generator>'
+            )
+
+        def visible_ids(skin_type, segment_mesh):
+            text = (
+                '<SpeedTree><Generators>'
+                + branch("3", skin_type, segment_mesh)
+                + '</Generators></SpeedTree>'
+            )
+            return pcg_texture_audit._visible_material_ids_from_text(
+                text,
+                export_node_counts={"branch-guid": 25},
+                total_nodes=25,
+            )
+
+        self.assertNotIn("3", visible_ids("3", "false"))
+        self.assertIn("3", visible_ids("0", "false"))
+        self.assertIn("3", visible_ids("3", "true"))
+
     def _image(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (2, 2), (128, 128, 128)).save(path)
@@ -1385,7 +1415,7 @@ class SourceSelectionTests(unittest.TestCase):
                 )
             )
 
-    def test_visible_auto_split_aliases_share_one_source_texture_set(self):
+    def test_same_source_auto_split_aliases_share_one_source_texture_set(self):
         def material(material_id, name, refs):
             filenames = "".join(
                 f"<TexFilename>{ref}</TexFilename>" for ref in refs)
@@ -1455,10 +1485,13 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(
                 set(row["material_names"]),
                 {"M_cluster_fern_Atlas_01_green",
-                 "M_cluster_fern_Atlas_01_stem"},
+                 "M_cluster_fern_Atlas_01_stem",
+                 "M_cluster_fern_Atlas_01_yellow"},
             )
-            self.assertNotIn("M_cluster_fern_Atlas_01_yellow",
-                             row["material_names"])
+            self.assertEqual(
+                {target["material_id"] for target in row["material_targets"]},
+                {"1", "2", "3"},
+            )
             self.assertEqual(set(row["source_refs"]), set(source_refs))
             self.assertTrue(row["connection_update_needed"])
             self.assertEqual(set(row["connection_materials"]),
@@ -1881,6 +1914,66 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(inspected["slots"]["subsurfaceamount"]["color_x"], "0")
             self.assertEqual(inspected["slots"]["height"]["filename"], "texture/T_bark_test_height.tga")
             self.assertNotIn("T_bark_test", inspect_material_slots(patch["text"])["2"]["slots"]["color"]["filename"])
+
+    def test_spm_normalization_uses_exact_active_ids_when_all_generators_hidden(self):
+        map_template = '''<Map Name="{name}">
+<ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
+<TexFilename>old_{name}.png</TexFilename><TexSource>0</TexSource>
+<TexInvert>false</TexInvert><TexInvertRed>false</TexInvertRed>
+<TexInvertGreen>false</TexInvertGreen><TexInvertBlue>false</TexInvertBlue>
+<TexEnabled>true</TexEnabled></Map>'''
+        maps = "".join(
+            map_template.format(name=name)
+            for name in ("Color", "Opacity", "Normal", "Gloss")
+        )
+        xml = (
+            f'<SpeedTree><Materials><Material_v8 ID="3" '
+            f'Name="M_leaf_hidden">{maps}</Material_v8></Materials></SpeedTree>'
+        ).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = root / "SK_hidden_provider.spm"
+            texture_dir = root / "texture"
+            texture_dir.mkdir()
+            for role in (
+                "color", "normal", "extra", "height", "opacity", "subsurface"
+            ):
+                (texture_dir / f"T_leaf_hidden_{role}.tga").write_bytes(
+                    role.encode()
+                )
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+            with mock.patch(
+                "spm_texture_normalize.active_material_ids",
+                return_value={"3"},
+            ), mock.patch(
+                "spm_texture_normalize.visible_material_ids",
+                return_value=set(),
+            ):
+                patch = build_spm_patch(
+                    spm,
+                    {
+                        "@id:3": {
+                            "texture_dir": str(texture_dir),
+                            "texture_base": "T_leaf_hidden",
+                            "subsurface_enabled": True,
+                        }
+                    },
+                )
+            self.assertTrue(patch["changed"])
+            row = inspect_material_slots(patch["text"])["3"]
+            self.assertEqual(row["name"], "M_leaf_hidden")
+            self.assertEqual(
+                row["slots"]["color"]["filename"],
+                "texture/T_leaf_hidden_color.tga",
+            )
+            self.assertEqual(
+                row["slots"]["gloss"]["filename"],
+                "texture/T_leaf_hidden_extra.tga",
+            )
+            self.assertEqual(row["slots"]["gloss"]["source"], "2")
+            self.assertEqual(row["slots"]["gloss"]["invert"], "true")
+            self.assertEqual(row["slots"]["ao"]["source"], "1")
 
     def test_spm_normalization_writes_backup_and_preserves_six_images(self):
         map_template = '''<Map Name="{name}"><ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
@@ -2674,7 +2767,10 @@ class GuiLabelTests(unittest.TestCase):
 
             threads[0].target()
             make_report.assert_called_once_with(
-                {"tree_root": "new"}, pcg_targets={"meshes": []})
+                {"tree_root": "new"},
+                pcg_targets={"meshes": []},
+                progress_callback=mock.ANY,
+            )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
             self.assertEqual(len(app.root.callbacks), 1)
@@ -2809,7 +2905,9 @@ class GuiLabelTests(unittest.TestCase):
 
             threads[0].target()
             make_report.assert_called_once_with(
-                {"tree_root": "new"}, pcg_targets={"meshes": []}
+                {"tree_root": "new"},
+                pcg_targets={"meshes": []},
+                progress_callback=mock.ANY,
             )
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)

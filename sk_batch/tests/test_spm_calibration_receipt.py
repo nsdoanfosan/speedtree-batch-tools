@@ -10,8 +10,10 @@ SK_BATCH_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SK_BATCH_DIR))
 
 from spm_calibration_receipt import (
+    SPM_BONE_SEMANTIC_PROJECTION_VERSION,
     bone_semantic_fingerprint,
     calibration_receipt_path,
+    legacy_bone_semantic_fingerprint,
     load_positive_calibration_receipt,
     write_positive_calibration_receipt,
 )
@@ -62,6 +64,37 @@ class SpmCalibrationReceiptTests(unittest.TestCase):
             context={"asset_kind": "tree"},
         )
         self.assertEqual(first, second)
+
+    def test_projection_ignores_real_vertex_color_spline_properties(self):
+        source = SOURCE.replace(
+            (
+                "<Name>Vertex Color:Red:Value</Name><Value>0</Value>"
+                "</Property>"
+            ),
+            (
+                "<Name>Vertex Color:Red:Value</Name><Value>0</Value>"
+                "</Property>"
+                "<SplineProperty>"
+                "<Name>Vertex Color:Green:Value</Name><Value>-0.5</Value>"
+                "<ProfileSpline><ControlPoint><X>0</X><Y>1</Y>"
+                "<TangentX>1</TangentX><TangentY>0</TangentY>"
+                "</ControlPoint></ProfileSpline>"
+                "</SplineProperty>"
+            ),
+        )
+        changed = (
+            source.replace("<Value>-0.5</Value>", "<Value>0</Value>")
+            .replace("<Y>1</Y>", "<Y>0</Y>")
+            .replace("<TangentX>1</TangentX>", "<TangentX>0</TangentX>")
+        )
+        self.assertEqual(
+            bone_semantic_fingerprint(source),
+            bone_semantic_fingerprint(changed),
+        )
+        self.assertNotEqual(
+            legacy_bone_semantic_fingerprint(source),
+            legacy_bone_semantic_fingerprint(changed),
+        )
 
     def test_material_slot_identity_is_ignored_but_assignment_state_is_not(self):
         first = bone_semantic_fingerprint(SOURCE)
@@ -136,6 +169,11 @@ class SpmCalibrationReceiptTests(unittest.TestCase):
                     bone_contract_version=3,
                 )
             )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["bone_semantic_projection_version"],
+                SPM_BONE_SEMANTIC_PROJECTION_VERSION,
+            )
             self.assertIsNone(
                 load_positive_calibration_receipt(
                     spm,
@@ -151,6 +189,52 @@ class SpmCalibrationReceiptTests(unittest.TestCase):
                     spm,
                     cache,
                     bone_semantic_fingerprint_value="semantic-a",
+                    settings_signature="settings-a",
+                    bone_contract_version=3,
+                )
+            )
+
+    def test_v1_positive_receipt_migrates_only_on_exact_legacy_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree.spm"
+            spm.write_bytes(b"spm")
+            cache = root / "central-cache"
+            path = calibration_receipt_path(spm, cache)
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "kind": "spm_bone_calibration_positive_receipt",
+                        "version": 1,
+                        "spm_identity": str(spm.resolve()).lower(),
+                        "bone_semantic_projection_version": 1,
+                        "bone_semantic_fingerprint": "legacy-a",
+                        "settings_signature": "settings-a",
+                        "bone_contract_version": 3,
+                        "status": "already-ok",
+                        "summary": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            migrated = load_positive_calibration_receipt(
+                spm,
+                cache,
+                bone_semantic_fingerprint_value="current-a",
+                legacy_bone_semantic_fingerprint_values=("legacy-a",),
+                settings_signature="settings-a",
+                bone_contract_version=3,
+            )
+            self.assertTrue(
+                migrated["legacy_bone_semantic_receipt_migrated"]
+            )
+            self.assertIsNone(
+                load_positive_calibration_receipt(
+                    spm,
+                    cache,
+                    bone_semantic_fingerprint_value="current-a",
+                    legacy_bone_semantic_fingerprint_values=("other",),
                     settings_signature="settings-a",
                     bone_contract_version=3,
                 )

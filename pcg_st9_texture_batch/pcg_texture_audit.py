@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from speedtree_texture_contract import (
     resolve_texture_set,
 )
 from speedtree_pipeline_contract import (
+    branch_generator_has_render_geometry,
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
@@ -157,8 +159,9 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
-# v4 additionally stores semantic Frond/Leaf Mesh bindings and material mesh IDs.
-SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v4.json"
+# v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
+# material visibility set.
+SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
 SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
 BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v1.json"
 _PERSISTENT_SBS_GRAPHS = None
@@ -383,7 +386,39 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
             hidden_by_guid[guid] = bool(
                 hidden_match and hidden_match.group(1).strip().lower() == "true"
             )
-        generators.append((guid, ids))
+        type_match = GENERATOR_TYPE_RE.search(block)
+        generator_type = (
+            html.unescape(type_match.group(1).strip())
+            if type_match
+            else ""
+        )
+        contributes_render_geometry = True
+        if _normalized_generator_type(generator_type) in {
+            "branch",
+            "trunk",
+        }:
+            properties = {}
+            for property_match in PROPERTY_BLOCK_RE.finditer(block):
+                property_block = property_match.group(0)
+                property_name = PROPERTY_NAME_RE.search(property_block)
+                property_value = PROPERTY_VALUE_RE.search(property_block)
+                if property_name and property_value:
+                    properties[
+                        html.unescape(property_name.group(1).strip())
+                    ] = html.unescape(property_value.group(1).strip())
+            # Older/minimal SPMs may omit both render-shape properties.
+            # Preserve the fail-closed material requirement in that case;
+            # only an explicit Skin/segment contract can prove a scaffold.
+            if (
+                "Skin:Type" in properties
+                or "Segments:Features:Mesh:Enabled" in properties
+            ):
+                contributes_render_geometry = (
+                    branch_generator_has_render_geometry(properties)
+                )
+        generators.append(
+            (guid, ids, contributes_render_geometry)
+        )
     if not generators:
         return all_ids
 
@@ -405,14 +440,18 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
         return False
 
     active = all_ids - generator_ids
-    for guid, ids in generators:
+    for guid, ids, contributes_render_geometry in generators:
         graph_visible = not guid or not effectively_hidden(guid)
         has_export_nodes = (
             not total_nodes
             or not guid
             or bool((export_node_counts or {}).get(guid, 0))
         )
-        if graph_visible and has_export_nodes:
+        if (
+            graph_visible
+            and has_export_nodes
+            and contributes_render_geometry
+        ):
             active |= ids
     return active
 
@@ -3719,6 +3758,17 @@ def _normalized_capture_role(value):
     }.get(token, token)
 
 
+@functools.lru_cache(maxsize=512)
+def _inspect_spm_texture_slots_cached(path_text, size, mtime_ns):
+    del size, mtime_ns
+    return inspect_spm_texture_slots(path_text)
+
+
+def _cached_spm_texture_slots(path):
+    path_text, size, mtime_ns = _file_cache_key(path)
+    return _inspect_spm_texture_slots_cached(path_text, size, mtime_ns)
+
+
 def _spm_material_identity_and_slot_rows(
     spm,
     refs,
@@ -3738,7 +3788,7 @@ def _spm_material_identity_and_slot_rows(
     if not expected_paths:
         return {}
     candidates = []
-    for row in inspect_spm_texture_slots(spm).get("materials") or []:
+    for row in _cached_spm_texture_slots(spm).get("materials") or []:
         if material_id not in {None, ""} and str(
             row.get("material_id") or ""
         ) != str(material_id):
@@ -4202,10 +4252,21 @@ def material_texture_items(
             included_ids = (
                 referenced_ids if spm_is_provider else visible_ids
             )
-            if referenced_ids and row.get("material_id") not in included_ids:
-                continue
             name = row.get("material_name")
             if not name:
+                continue
+            contributes_directly = (
+                not referenced_ids
+                or row.get("material_id") in included_ids
+            )
+            # Atlas Auto Split creates sibling materials such as
+            # ``M_x_atlas_01_<collection>``.  A sibling can be hidden or have
+            # no current Generator slot while its mesh cutouts still belong
+            # to the same authored atlas.  Keep it as a candidate here and
+            # let the existing exact source-signature grouping below decide
+            # whether it shares the base texture set.  Arbitrary inactive
+            # materials and siblings with different sources remain excluded.
+            if not contributes_directly and not derived_material_base(name):
                 continue
             current_refs = list(row.get("refs") or [])
             refs = list(current_refs)
@@ -4356,6 +4417,7 @@ def material_texture_items(
                 "leaf_source": leaf_source,
                 "strong_base": strong_base,
                 "candidate_base": candidate_base,
+                "contributes_directly": contributes_directly,
                 "referenced_legacy": legacy_export_maps_from_refs(
                     spm, current_refs, name, cfg["required_export_maps"]),
             })
@@ -4375,6 +4437,12 @@ def material_texture_items(
             signature_groups.setdefault(record["source_signature"], []).append(record)
         collision = len(signature_groups) > 1
         for signature, aliases in signature_groups.items():
+            # A parsed production-group suffix is grouping metadata, not proof
+            # by itself.  At least one alias must still be used by the live
+            # owner/provider, and every alias in this group has already
+            # proven the exact same resolved source signature.
+            if not any(row["contributes_directly"] for row in aliases):
+                continue
             if not collision and (
                     any(row.get("strong_base") for row in aliases)
                     or len(aliases) > 1):
@@ -5684,7 +5752,7 @@ def canonical_cluster_provider_map(root):
 @_report_scan_cached
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
-        target_mesh_names=None):
+        target_mesh_names=None, progress_callback=None):
     pcg_targets = focus_pcg_targets(
         pcg_targets,
         cfg.get("pcg_focus_data_assets"),
@@ -5706,8 +5774,8 @@ def make_report(
         target_mesh_names_from_pcg_targets(pcg_targets)
         or requested_target_mesh_names
     )
-    items = [
-        audit_folder(
+    def audit_one(folder):
+        return audit_folder(
             folder, cfg, include_refs=include_refs,
             target_mesh_names=folder_target_mesh_names(
                 folder, report_target_mesh_names)
@@ -5718,8 +5786,37 @@ def make_report(
                 [],
             ),
         )
-        for folder in folders
-    ]
+
+    items = []
+    total_folders = len(folders)
+    if total_folders <= 1:
+        for folder in folders:
+            items.append(audit_one(folder))
+            if progress_callback is not None:
+                progress_callback(1, total_folders, folder)
+    else:
+        # Asset folders are independent read-only audits. Running four at a
+        # time avoids making GUI startup proportional to the sum of every
+        # large SPM while keeping OneDrive I/O bounded.
+        indexed_items = {}
+        with ThreadPoolExecutor(
+            max_workers=min(4, total_folders),
+            thread_name_prefix="pcg-audit",
+        ) as executor:
+            futures = {
+                executor.submit(audit_one, folder): (index, folder)
+                for index, folder in enumerate(folders)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                index, folder = futures[future]
+                indexed_items[index] = future.result()
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(completed, total_folders, folder)
+        items = [
+            indexed_items[index] for index in range(total_folders)
+        ]
     attach_global_m_graphs(items, cfg)
     resolve_shared_atlas_entries(items, cfg)
     refresh_texture_output_contract_states(items, cfg)

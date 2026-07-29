@@ -576,8 +576,8 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
         # role from that generic token turns pass-through content into a false
         # dependency.  Only a receipt-authored row can provide role identity.
         return []
-    primary = _role_identity(role, receipt_row, contract)
-    aliases = [primary]
+    receipt_identity = _role_identity(role, receipt_row, contract)
+    identities = []
     authoritative_spm = _authoritative_spm_for_requested(contract, spm_path)
     target = _target_for_spm(receipt_row, authoritative_spm)
     pair = (target or {}).get("spm_material_mesh_pair") or {}
@@ -586,9 +586,15 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
             continue
         material_name = str(record.get("material_name") or "").strip()
         if material_name:
-            aliases.append(material_name)
+            identities.append(material_name)
+    # The rendered target SPM is authoritative for the material identity used
+    # to cut the base mesh.  Keep a provider/receipt spelling only as an alias;
+    # otherwise a legacy typo (for example ``wilow``) leaks into every newly
+    # generated assembly binding even when the actual target material is
+    # correctly named.
+    identities.append(receipt_identity)
     unique = {}
-    for identity in aliases:
+    for identity in identities:
         normalized = normalize_export_name(identity)
         if normalized and normalized not in unique:
             unique[normalized] = identity
@@ -1208,6 +1214,9 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 {
                     "role": row["role"],
                     "role_identity": row["role_identity"],
+                    "role_identity_aliases": deepcopy(
+                        row.get("role_identity_aliases") or []
+                    ),
                     "assignments": row["assignments"],
                     "normalized_variants": row.get("normalized_variants"),
                 }

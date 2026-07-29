@@ -655,16 +655,23 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             self.assertEqual(
                 identities["leaf"],
-                ["M_leaf_wilow_01", "leaf_willow_01"],
+                ["leaf_willow_01", "M_leaf_wilow_01"],
             )
             self.assertEqual(handoff["status"], "ready")
             leaf = next(
                 row for row in handoff["roles"] if row["role"] == "leaf"
             )
+            self.assertEqual(leaf["role_identity"], "leaf_willow_01")
             self.assertEqual(leaf["status"], "complete_pair")
             self.assertEqual(
                 leaf["role_identity_aliases"],
-                ["leaf_willow_01"],
+                ["M_leaf_wilow_01"],
+            )
+            self.assertEqual(
+                handoff["assembly"]["part_builder_inputs"][0][
+                    "role_identity_aliases"
+                ],
+                ["M_leaf_wilow_01"],
             )
 
     def test_actionable_role_without_normalized_variants_is_blocked(self):

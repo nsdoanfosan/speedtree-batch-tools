@@ -252,6 +252,100 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 str(copied.resolve()),
             )
 
+    def test_invalid_cluster_bake_preserves_exact_origin_issue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "weed_test"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = asset / "SK_weed_test_01.spm"
+            write_spm(spm)
+            color = cluster / "cluster_test_01.tga"
+            subsurface = cluster / "cluster_test_01_Subsurface.tga"
+            color.write_bytes(b"color")
+            subsurface.write_bytes(b"subsurface")
+            stmat = asset / "fbx" / "SK_weed_test_01.stmat"
+            stmat.parent.mkdir()
+            self._write_raw_stmat(
+                stmat,
+                "M_leaf_test_atlas_01_Mat",
+                {
+                    "Color": color,
+                    "SubsurfaceColor": subsurface,
+                    "SubsurfaceAmount": subsurface,
+                },
+            )
+            slots = [
+                {
+                    "map_index": index,
+                    "map": map_name,
+                    "role": map_name.casefold(),
+                    "authored_ref": f"cluster/{source.name}",
+                    "resolved_ref": str(source.resolve()),
+                }
+                for index, (map_name, source) in enumerate(
+                    (
+                        ("Color", color),
+                        ("SubsurfaceColor", subsurface),
+                        ("SubsurfaceAmount", subsurface),
+                    )
+                )
+            ]
+            inspection = {
+                "materials": [{
+                    "material_id": "22",
+                    "material_name": "M_leaf_test_atlas_01",
+                    "slots": slots,
+                }],
+            }
+
+            with mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value=inspection,
+            ), mock.patch.object(
+                preflight,
+                "resolve_blender_cluster_bake_origin",
+                return_value=(
+                    {},
+                    "blender_cluster_bake_map_role_mismatch",
+                ),
+            ):
+                result = preflight.augment_texture_readiness_contract(
+                    preflight.resolve_texture_bindings(stmat),
+                    stmat,
+                    spm,
+                    source_texture_roots=[],
+                )
+
+            self.assertEqual(result["status"], "incomplete")
+            self.assertEqual(
+                result["missing"][0]["reason"],
+                "blender_cluster_bake_origin_invalid",
+            )
+            self.assertEqual(
+                result["missing"][0]["origin_validation_issue"],
+                "blender_cluster_bake_map_role_mismatch",
+            )
+            self.assertEqual(
+                result["bindings"][0]["origin_validation"][
+                    "classification"
+                ],
+                "asset_cluster_bake_texture_contract_invalid",
+            )
+            self.assertTrue(
+                preflight._is_cluster_capture_source_set([
+                    Path(temporary)
+                    / "other_asset"
+                    / "cluster"
+                    / "cluster_shared.tga"
+                ])
+            )
+            self.assertFalse(
+                preflight._is_cluster_capture_source_set([
+                    Path(temporary) / "Texture" / "leaf_source.tif"
+                ])
+            )
+
     @staticmethod
     def _write_raw_stmat(path, material_name, maps):
         root = ET.Element("SpeedTreeMaterials")

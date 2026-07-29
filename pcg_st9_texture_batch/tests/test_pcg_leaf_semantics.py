@@ -882,7 +882,7 @@ class GeneratorConnectionTests(unittest.TestCase):
 
     def test_cache_schema_is_v4_and_exposes_semantic_bindings(self):
         self.assertEqual(audit.SPM_ANALYSIS_CACHE_PATH.name,
-                         "spm_analysis_v4.json")
+                         "spm_analysis_v5.json")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             spm = root / "test.spm"

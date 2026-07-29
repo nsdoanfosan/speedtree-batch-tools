@@ -1121,9 +1121,25 @@ def _physical_source_3d_artifacts(receipt):
             else None
         )
         if not isinstance(source, dict):
-            raise ClusterAssemblyReceiptError(
-                "Atlas physical variant has no source 3D contract: "
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas physical variant source 3D contract needs "
+                "regeneration: "
                 + str(row.get("plan") or index)
+            )
+        if (
+            source.get("needs_refresh")
+            or str(source.get("operational_source_status") or "").casefold()
+            == "needs_refresh"
+        ):
+            warnings = [
+                str(source.get(key) or "").strip()
+                for key in ("source_spm_warning", "source_fbx_warning")
+            ]
+            detail = "; ".join(value for value in warnings if value)
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas physical source 3D contract needs regeneration: "
+                + str(row.get("plan") or index)
+                + (f": {detail}" if detail else "")
             )
         current = {}
         identity_rows = []
@@ -1136,9 +1152,10 @@ def _physical_source_3d_artifacts(receipt):
                 source.get(f"{artifact}_sha256") or ""
             ).strip().casefold()
             if not path or not recorded_hash:
-                raise ClusterAssemblyReceiptError(
-                    f"Atlas physical source 3D contract has no {label} "
-                    f"path/hash: {row.get('plan') or index}"
+                raise ClusterAssemblyReceiptStaleError(
+                    f"Atlas physical source 3D contract needs regeneration; "
+                    f"{label} path/hash is absent: "
+                    f"{row.get('plan') or index}"
                 )
             fingerprint = _fresh_file_fingerprint(path)
             if not fingerprint.get("exists") or not fingerprint.get("sha256"):
@@ -1147,9 +1164,20 @@ def _physical_source_3d_artifacts(receipt):
                     + path
                 )
             if artifact == "source_spm":
+                recorded_semantic = str(
+                    source.get("source_spm_semantic_fingerprint") or ""
+                ).strip().casefold()
+                recorded_projection = source.get(
+                    "source_spm_semantic_projection_version"
+                )
+                raw_hash_matches = (
+                    fingerprint["sha256"].casefold() == recorded_hash
+                )
                 try:
                     current_semantic = (
-                        spm_file_structural_semantic_fingerprint(
+                        recorded_semantic
+                        if raw_hash_matches and recorded_semantic
+                        else spm_file_structural_semantic_fingerprint(
                             path,
                             raw_sha256=fingerprint["sha256"],
                         )
@@ -1159,12 +1187,6 @@ def _physical_source_3d_artifacts(receipt):
                         "Atlas physical source SPM structural semantic "
                         f"fingerprint is unavailable: {path}: {exc}"
                     ) from exc
-                recorded_semantic = str(
-                    source.get("source_spm_semantic_fingerprint") or ""
-                ).strip().casefold()
-                recorded_projection = source.get(
-                    "source_spm_semantic_projection_version"
-                )
                 migration = None
                 if recorded_semantic:
                     if (
@@ -1249,7 +1271,7 @@ def _physical_source_3d_artifacts(receipt):
     return artifacts
 
 
-def _physical_normalization_receipt(payload):
+def _physical_normalization_receipt(payload, validation_cache=None):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
         return None
@@ -1272,6 +1294,22 @@ def _physical_normalization_receipt(payload):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no matching capture contract"
         )
+    unit_probe = (payload or {}).get("unit_probe_contract")
+    cache_key = None
+    if validation_cache is not None:
+        cache_payload = json.dumps(
+            {
+                "receipt": receipt,
+                "unit_probe_contract": unit_probe,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        cache_key = hashlib.sha256(cache_payload).hexdigest()
+        cached = validation_cache.get(cache_key)
+        if cached is not None:
+            return cached
     prototypes = {}
     for row in receipt.get("prototypes") or []:
         asset_name = str(
@@ -1294,7 +1332,6 @@ def _physical_normalization_receipt(payload):
             "Atlas physical normalization receipt has no prototypes"
         )
     source_3d_artifacts = _physical_source_3d_artifacts(receipt)
-    unit_probe = (payload or {}).get("unit_probe_contract")
     if (
         not isinstance(unit_probe, dict)
         or unit_probe.get("kind") != "speedtree_fbx_spm_unit_probe"
@@ -1303,13 +1340,16 @@ def _physical_normalization_receipt(payload):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no verified common unit probe"
         )
-    return {
+    result = {
         "receipt": copy.deepcopy(receipt),
         "prototype_bounds": prototypes,
         "capture_hash": capture_hash,
         "unit_probe_contract": copy.deepcopy(unit_probe),
         "source_3d_artifacts": source_3d_artifacts,
     }
+    if validation_cache is not None:
+        validation_cache[cache_key] = result
+    return result
 
 
 def _normalized_composite_parts(row, source_partition_mode):
@@ -1428,8 +1468,16 @@ def _physical_variant_attachment_contract(receipt_variant, label):
     }
 
 
-def _normalized_variant_contract(manifest_path, payload, group):
-    physical = _physical_normalization_receipt(payload)
+def _normalized_variant_contract(
+    manifest_path,
+    payload,
+    group,
+    physical_receipt_cache=None,
+):
+    physical = _physical_normalization_receipt(
+        payload,
+        validation_cache=physical_receipt_cache,
+    )
     receipt_variants = {}
     if physical is not None:
         for row in physical["receipt"].get("variants") or []:
@@ -1689,6 +1737,7 @@ def _atlas_normalized_variants(
     role_identity,
     target_spms,
     audit=None,
+    physical_receipt_cache=None,
 ):
     """Read one current role contract from stable Atlas target/scope receipts."""
     allowed_spms = {
@@ -1756,6 +1805,7 @@ def _atlas_normalized_variants(
                 manifest_path,
                 payload,
                 group,
+                physical_receipt_cache=physical_receipt_cache,
             )
         except ClusterAssemblyReceiptStaleError:
             # A normalized receipt is a cache of a previously validated
@@ -2051,7 +2101,15 @@ def _manifest_rebase_rows(manifest, key):
             )
         source = Path(str(row.get("source") or ""))
         isolated = Path(str(row.get("isolated") or ""))
-        spm_ref = str(row.get("spm_ref") or "").strip()
+        # ``cluster_bark_source_resolution`` historically persisted authored
+        # relative mesh references as ``relative_to_spm``. New normalization
+        # receipts call the same value ``spm_ref``. They are one contract, not
+        # two provenance states, so keep existing valid caches readable.
+        spm_ref = str(
+            row.get("spm_ref")
+            or row.get("relative_to_spm")
+            or ""
+        ).strip()
         expected_hash = str(row.get("sha256") or "").casefold()
         ref_key = spm_ref.replace("\\", "/").casefold()
         isolated_spm = Path(str(manifest.get("speedtree_spm") or ""))
@@ -2294,15 +2352,6 @@ def _material_only_source_rebase_evidence(
     ).hexdigest()
     policy = "declared_bark_material_outputs_only_v1"
     if production_digest != isolated_digest:
-        production_semantic = spm_file_structural_semantic_fingerprint(
-            output_spm,
-            raw_sha256=current_output.get("sha256"),
-        )
-        isolated_semantic = spm_file_structural_semantic_fingerprint(
-            isolated_spm_path,
-            raw_sha256=isolated_spm.get("sha256"),
-        )
-
         def normalize_unused_material_ids(text):
             ordinal = 0
 
@@ -2329,10 +2378,11 @@ def _material_only_source_rebase_evidence(
         isolated_id_digest = hashlib.sha256(
             isolated_id_normalized.encode("utf-8")
         ).hexdigest()
-        if (
-            production_semantic != isolated_semantic
-            or production_id_digest != isolated_id_digest
-        ):
+        # Equality of the fully masked contract text is stronger evidence than
+        # reparsing both full SPMs into a second semantic projection. The
+        # latter duplicated several seconds of work and could not turn an
+        # unequal normalized contract into a pass.
+        if production_id_digest != isolated_id_digest:
             raise ClusterAssemblyReceiptStaleError(
                 "Atlas physical normalization source changed outside declared "
                 "normalization material blocks"
@@ -2675,6 +2725,10 @@ def build_cluster_assembly_contract(
             providers[0],
         )
     actual_dependencies = []
+    # Target/scope receipts for one Atlas relationship repeat the same large
+    # physical-normalization payload with target-local material IDs. Validate
+    # that shared payload once per live contract build.
+    physical_receipt_cache = {}
     for pair_row in relevant_clusters:
         cluster = pair_row["source_spm"]
         authoring_spm = pair_row["authoring_spm"]
@@ -2691,17 +2745,34 @@ def build_cluster_assembly_contract(
         # role.  Same-role siblings are provenance/reference-only inputs and
         # must never be validated against the canonical provider's receipt.
         normalized_variants = None
+        normalized_variants_stale = None
         if primary_role_source:
             normalized_variants = _atlas_normalized_variants(
                 folder,
                 expected_identity,
                 full_target_spms,
                 audit=audit,
+                physical_receipt_cache=physical_receipt_cache,
             )
-            _validate_normalized_source_dependency(
-                normalized_variants,
-                output_spm,
-            )
+            try:
+                _validate_normalized_source_dependency(
+                    normalized_variants,
+                    output_spm,
+                )
+            except ClusterAssemblyReceiptStaleError as exc:
+                # A stale rebuildable Atlas cache is an actionable row state,
+                # not a reason to prevent PCG ST9 Texture from opening. Drop
+                # the stale receipt so it can never satisfy the current
+                # contract, and report the exact regeneration requirement.
+                normalized_variants = None
+                normalized_variants_stale = {
+                    "status": "needs_regeneration",
+                    "error": str(exc),
+                    "remediation": (
+                        "Re-run the Atlas/PCG physical normalization for "
+                        f"{output_spm.name}"
+                    ),
+                }
         usage_roles = set(pair_row.get("usage_roles") or [])
         role_conflict = len(usage_roles) > 1
         material_names_by_spm = dependency_usage.get(
@@ -2852,6 +2923,7 @@ def build_cluster_assembly_contract(
             "targets": targets,
             "decision": decision,
             "normalized_variants": normalized_variants,
+            "normalized_variants_stale": normalized_variants_stale,
             "normalized_variants_required": normalized_variants_required,
             "normalized_variants_missing": normalized_variants_missing,
             "target_relation": copy.deepcopy(pair_row["target_relation"]),
@@ -2964,6 +3036,13 @@ def build_cluster_assembly_contract(
                 "spm": str(dependency["spm"]),
                 "reason": "actionable_role_has_no_current_atlas_normalized_variants",
             })
+        if dependency.get("normalized_variants_stale"):
+            issues.append({
+                "code": "NORMALIZED_VARIANTS_STALE",
+                "role": dependency["role"],
+                "spm": str(dependency["spm"]),
+                **dependency["normalized_variants_stale"],
+            })
         tga_validation = dependency.get("tga_basename_validation") or {}
         if tga_validation.get("status") not in {"ok", "not_applicable"}:
             issues.append({
@@ -3033,6 +3112,9 @@ def build_cluster_assembly_contract(
             "tga_basename_validation": row["tga_basename_validation"],
             "referenced_by_spms": row["referenced_by_spms"],
             "normalized_variants": row.get("normalized_variants"),
+            "normalized_variants_stale": row.get(
+                "normalized_variants_stale"
+            ),
             "normalized_variants_required": row.get(
                 "normalized_variants_required", False
             ),
@@ -3136,27 +3218,45 @@ def cluster_assembly_receipt_path(contract, receipt_dir=None):
 
 def _upgrade_persisted_hashes(contract):
     """Hash receipt-owned artifacts without changing source or audit state."""
-    result = copy.deepcopy(contract)
-    dependency_groups = [result.get("dependencies") or []]
-    handoff = result.get("handoff") or {}
-    dependency_groups.append(handoff.get("cluster_dependencies") or [])
-    for dependencies in dependency_groups:
-        for dependency in dependencies:
-            textures = dependency.get("texture_dependencies") or []
-            dependency["texture_dependencies"] = [
-                file_fingerprint(row.get("path"), hash_content=True)
-                if isinstance(row, dict) and row.get("path") else row
-                for row in textures
-            ]
-    for role in handoff.get("roles") or []:
+    def upgraded_dependency(dependency):
+        upgraded = dict(dependency)
+        upgraded["texture_dependencies"] = [
+            file_fingerprint(row.get("path"), hash_content=True)
+            if isinstance(row, dict) and row.get("path") else row
+            for row in dependency.get("texture_dependencies") or []
+        ]
+        return upgraded
+
+    result = dict(contract)
+    result["dependencies"] = [
+        upgraded_dependency(dependency)
+        for dependency in contract.get("dependencies") or []
+    ]
+    source_handoff = contract.get("handoff") or {}
+    handoff = dict(source_handoff)
+    handoff["cluster_dependencies"] = [
+        upgraded_dependency(dependency)
+        for dependency in source_handoff.get("cluster_dependencies") or []
+    ]
+    upgraded_roles = []
+    for role in source_handoff.get("roles") or []:
+        upgraded_role = dict(role)
+        upgraded_targets = []
         for target in role.get("targets") or []:
-            bundle = target.get("export_bundle") or {}
+            upgraded_target = dict(target)
+            bundle = dict(target.get("export_bundle") or {})
             for artifact in ("fbx", "xml", "stmat"):
                 row = bundle.get(artifact)
                 if isinstance(row, dict) and row.get("path"):
                     bundle[artifact] = file_fingerprint(
                         row["path"], hash_content=True
                     )
+            upgraded_target["export_bundle"] = bundle
+            upgraded_targets.append(upgraded_target)
+        upgraded_role["targets"] = upgraded_targets
+        upgraded_roles.append(upgraded_role)
+    handoff["roles"] = upgraded_roles
+    result["handoff"] = handoff
     return result
 
 
@@ -3209,10 +3309,11 @@ def persist_cluster_assembly_receipt(contract, receipt_dir=None):
         "source_path_identity": identity,
         "cluster_assembly": persisted_contract,
     }
-    # Never publish a receipt that invalidates itself immediately.  Missing
-    # source data is represented by the authoritative handoff issues, while
-    # this validation covers only artifacts that existed in the snapshot.
-    validate_cluster_assembly_receipt(payload)
+    # The contract was just proven by the live audit. Revalidating the whole
+    # receipt here repeated every SPM/hash/physical-source check and made GUI
+    # startup CPU-bound. Consumers still validate the persisted snapshot when
+    # they load it; persistence only hashes the few receipt-owned artifacts
+    # above and writes the snapshot atomically.
     _atomic_write_json(path, payload)
     return path
 

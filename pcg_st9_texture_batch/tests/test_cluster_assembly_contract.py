@@ -1308,16 +1308,39 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 json.dumps(payload),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(
-                ClusterAssemblyReceiptError,
-                "source 3D contract",
-            ):
+            self.assertIsNone(
                 _atlas_normalized_variants(
                     folder,
                     "branch_elm_01",
                     [target],
                     audit=audit_module,
                 )
+            )
+
+            receipt["variants"][0]["plan_uv_transfer"][
+                "source_3d_contract"
+            ] = source_3d_contract
+            receipt["variants"][0]["plan_uv_transfer"][
+                "source_3d_contract"
+            ] = {
+                "needs_refresh": True,
+                "operational_source_status": "needs_refresh",
+                "source_spm_warning": (
+                    "isolated source has no production rebase"
+                ),
+            }
+            manifest_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [target],
+                    audit=audit_module,
+                )
+            )
 
             receipt["variants"][0]["plan_uv_transfer"][
                 "source_3d_contract"
@@ -2826,6 +2849,34 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 ]
             )
 
+    def test_stale_isolated_bark_cache_accepts_legacy_relative_mesh_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = material_only_rebase_fixture(
+                temporary,
+                with_external_rebase=True,
+            )
+            manifest = json.loads(
+                fixture["manifest"].read_text(encoding="utf-8")
+            )
+            for row in manifest["copied_source_external_meshes"]:
+                row["relative_to_spm"] = row.pop("spm_ref")
+            fixture["manifest"].write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+
+            _validate_normalized_source_dependency(
+                fixture["normalized"],
+                fixture["production_spm"],
+            )
+
+            self.assertEqual(
+                fixture["normalized"]["material_only_source_rebase"][
+                    "status"
+                ],
+                "validated",
+            )
+
     def test_stale_isolated_bark_cache_accepts_unused_material_id_rebase(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = material_only_rebase_fixture(temporary)
@@ -3074,6 +3125,41 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertIsNone(
                 dependencies["SK_branch_elm_02"]["normalized_variants"]
+            )
+
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                return_value=normalized,
+            ), mock.patch(
+                "pcg_cluster_assembly_contract."
+                "_validate_normalized_source_dependency",
+                side_effect=ClusterAssemblyReceiptStaleError(
+                    "stale Atlas cache sentinel"
+                ),
+            ):
+                stale_contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [first, second],
+                    cluster_usage=usage,
+                    assembly_source_spms=[source],
+                )
+
+            stale_primary = next(
+                row for row in stale_contract["dependencies"]
+                if row["primary_role_source"]
+            )
+            self.assertIsNone(stale_primary["normalized_variants"])
+            self.assertEqual(
+                stale_primary["normalized_variants_stale"]["status"],
+                "needs_regeneration",
+            )
+            self.assertIn(
+                "NORMALIZED_VARIANTS_STALE",
+                [
+                    row["code"]
+                    for row in stale_contract["handoff"]["issues"]
+                ],
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_01"]["texture_contract_source"],

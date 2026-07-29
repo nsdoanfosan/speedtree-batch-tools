@@ -240,6 +240,57 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertEqual(self.spm.read_bytes(), before_bytes)
         self.assertTrue(marker.exists())
 
+    def test_legacy_marker_restores_only_probe_bones_after_external_edit(self):
+        source = """<SpeedTreeRaw>
+<Generator Type="Branch"><Name>Branch</Name><GUID>branch-guid</GUID>
+<Properties>
+<Property><Name>Physics:Bone style</Name><Value>1</Value></Property>
+<Property><Name>Physics:Bones</Name><Value>2.5</Value></Property>
+</Properties></Generator>
+</SpeedTreeRaw>"""
+        probed_with_external_edit = """<SpeedTreeRaw>
+<Generator Type="Branch"><Name>Branch</Name><GUID>branch-guid</GUID>
+<Properties>
+<Property><Name>Physics:Bone style</Name><Value>0</Value></Property>
+<Property><Name>Physics:Bones</Name><Value>1</Value></Property>
+</Properties></Generator>
+<Materials><Material_v8 ID="9" Name="M_external_edit"/></Materials>
+</SpeedTreeRaw>"""
+        spm_audit.write_spm(self.spm, source)
+        source_sha = hashlib.sha256(self.spm.read_bytes()).hexdigest()
+        backup_path = spm_audit.backup_spm(self.spm)
+        spm_audit.write_calibration_marker(
+            self.spm,
+            backup_path,
+            source_sha,
+        )
+        spm_audit.write_spm(self.spm, probed_with_external_edit)
+        marker = self._make_marker_legacy()
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+        restored = spm_audit.read_spm(self.spm)
+
+        self.assertTrue(result["recovered"])
+        self.assertTrue(result["cleared"])
+        self.assertEqual(
+            result["status"],
+            "legacy_marker_calibration_values_restored",
+        )
+        self.assertEqual(
+            result["legacy_marker_migration"]["policy"],
+            "restore_only_interrupted_branch_calibration_values",
+        )
+        self.assertIn('Name="M_external_edit"', restored)
+        self.assertIn(
+            "<Name>Physics:Bone style</Name><Value>1</Value>",
+            restored,
+        )
+        self.assertIn(
+            "<Name>Physics:Bones</Name><Value>2.5</Value>",
+            restored,
+        )
+        self.assertFalse(marker.exists())
+
     def test_only_version_one_marker_may_use_legacy_no_write_migration(self):
         backup_path = spm_audit.backup_spm(self.spm)
         spm_audit.write_calibration_marker(

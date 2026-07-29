@@ -547,6 +547,52 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
                 asset / "texture" / "pcg_st9_canonical_outputs.json",
             )
 
+    def test_shared_owner_manifest_allows_exact_external_material_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            forest = Path(temporary) / "Forest"
+            owner = forest / "Tree_owner"
+            consumer = forest / "Tree_consumer"
+            source = consumer / "Cluster" / "SK_leaf_test.spm"
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                [("Color", "old_color.tif")],
+            )
+            manifest, texture_root = self._write_manifest(owner, source)
+
+            plan = build_spm_canonical_texture_plan(source, manifest)
+
+            self.assertEqual(plan["status"], "ok")
+            self.assertEqual(Path(plan["asset_root"]), owner.resolve())
+            self.assertEqual(Path(plan["texture_root"]), texture_root.resolve())
+            self.assertEqual(plan["bindings"][0]["material_id"], "7")
+            self.assertEqual(
+                plan["bindings"][0]["origin_state"],
+                "canonical_t",
+            )
+
+    def test_shared_owner_manifest_rejects_undeclared_external_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            forest = Path(temporary) / "Forest"
+            owner = forest / "Tree_owner"
+            consumer = forest / "Tree_consumer"
+            source = consumer / "Cluster" / "SK_leaf_test.spm"
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                [("Color", "old_color.tif")],
+            )
+            other = owner / "SK_other.spm"
+            manifest, _texture_root = self._write_manifest(owner, other)
+
+            plan = build_spm_canonical_texture_plan(source, manifest)
+
+            self.assertEqual(plan["status"], "blocked")
+            self.assertIn(
+                "production_spm_outside_manifest_asset",
+                {row["reason"] for row in plan["issues"]},
+            )
+
     def test_blender_cluster_bake_preserves_all_eight_speedtree_map_slots(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree_test"

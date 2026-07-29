@@ -1681,6 +1681,128 @@ class BlendLiveStatusTests(unittest.TestCase):
                     (True, "텍스처 준비 완료 · 보존 Cluster 1세트"),
                 )
 
+    def test_source_fallback_needing_pcg_is_ready_but_remains_visible(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_cluster_Silky_Dogwood_01.spm"
+            blend = spm.with_suffix(".blend")
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            source_texture = root / "original" / "leaf_albedo.jpg"
+            source_texture.parent.mkdir()
+            source_texture.write_bytes(b"pixels")
+            report = root / "reports" / (
+                "SK_cluster_Silky_Dogwood_01_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {},
+                    "texture_normalization": {
+                        "status": "needs_pcg_generation",
+                        "texture_contract_status": (
+                            "source_fallback_needs_pcg_generation"
+                        ),
+                        "missing": [],
+                        "materials": [{
+                            "material": "M_leaf_silky_dogwood_atlas_01_green",
+                            "status": "needs_pcg_generation",
+                            "texture_contract_status": (
+                                "source_fallback_needs_pcg_generation"
+                            ),
+                            "source_paths": {"color": str(source_texture)},
+                            "source_roles": ["color"],
+                        }],
+                    },
+                    "handoff_preflight": {
+                        "status": "ok",
+                        "missing_textures": [],
+                        "missing_outputs": [],
+                        "missing_materials": [],
+                    },
+                }),
+                encoding="utf-8",
+            )
+            wind = root / "JSON" / (
+                "SK_cluster_Silky_Dogwood_01_dynamic_wind_import_"
+                "from_megaplant_groups.json"
+            )
+            wind.parent.mkdir()
+            write_valid_wind(wind)
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(blend, 2_000_000_000)
+            self.set_time(report, 3_000_000_000)
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+            app._repair_runtime_fresh = mock.Mock(return_value=(True, ""))
+            app._repair_contract_current = mock.Mock(return_value=True)
+            app._cluster_assembly_inputs_current = mock.Mock(
+                return_value=(True, "")
+            )
+            app._material_export_ready = mock.Mock(return_value=(True, "ok"))
+
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._handoff_ready(spm)
+                status = app._blend_status_text(spm)
+
+            self.assertTrue(ready, reason)
+            self.assertEqual(reason, "준비됨 ✓")
+            self.assertEqual(
+                status,
+                "최신 ✓ · 원본 텍스처 사용 중 · T_* 미생성 (비차단)",
+            )
+
+            source_texture.unlink()
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._handoff_ready(spm)
+
+            self.assertFalse(ready)
+            self.assertIn("텍스처 준비 안 됨", reason)
+            self.assertIn("M_leaf_silky_dogwood_atlas_01_green", reason)
+
+    def test_unrecognized_needs_pcg_status_does_not_bypass_handoff(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_cluster_unknown_01.spm"
+            write_empty_spm(spm)
+            source_texture = root / "leaf_albedo.jpg"
+            source_texture.write_bytes(b"pixels")
+            report = root / "reports" / (
+                "SK_cluster_unknown_01_"
+                "speedtree_repair_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {},
+                    "texture_normalization": {
+                        "status": "needs_pcg_generation",
+                        "texture_contract_status": "unknown_contract",
+                        "missing": [],
+                        "materials": [{
+                            "material": "M_leaf",
+                            "status": "needs_pcg_generation",
+                            "texture_contract_status": "unknown_contract",
+                            "source_paths": {"color": str(source_texture)},
+                        }],
+                    },
+                    "handoff_preflight": {"status": "ok"},
+                }),
+                encoding="utf-8",
+            )
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(report, 2_000_000_000)
+
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._texture_normalization_ready(spm)
+
+            self.assertFalse(ready)
+            self.assertIn("텍스처 정규화 미완료", reason)
+
     def test_live_signature_tracks_reported_texture_deletion(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:

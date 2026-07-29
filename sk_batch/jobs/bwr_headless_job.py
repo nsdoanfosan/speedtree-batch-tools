@@ -741,6 +741,13 @@ def main():
         settings.name_stem = canonical_spm.stem
         repair_settings = settings.as_dict()
         repair_settings["cluster_source_skin_contract"] = is_cluster_source
+        # A Cluster source is parked outside Send2UE only when this invocation
+        # is the raw producer for the downstream Cluster Normalizer. Standalone
+        # Cluster assets have no later stage that can create ordinal Export
+        # pivots, so they must build the normal final Export structure here.
+        repair_settings["defer_cluster_export_to_normalizer"] = bool(
+            args.cluster_source_build_only
+        )
         repair_settings["source_identity_path"] = str(canonical_spm)
         canonical_source_fbx = (
             canonical_spm.parent

@@ -26,6 +26,12 @@ REQUIRED_ROLES = (
     "subsurface",
 )
 GENERATED_DIR_NAME = "_pcgtex_generated"
+FORBIDDEN_OUTPUT_DIR_NAMES = {
+    "cache",
+    "temp",
+    "tmp",
+    ".sk_batch_isolated_bark",
+}
 
 
 class CanonicalOutputManifestError(RuntimeError):
@@ -95,9 +101,25 @@ def _manifest_relative_path(path, texture_root, *, role, texture_base):
             f"{texture_base}/{role}: output is outside asset texture root: {path}"
         )
     relative = path.relative_to(texture_root)
+    forbidden = next(
+        (
+            part
+            for part in relative.parts[:-1]
+            if (
+                part.casefold() in FORBIDDEN_OUTPUT_DIR_NAMES
+                or part.casefold().startswith(".sk_batch_")
+            )
+        ),
+        "",
+    )
+    if forbidden:
+        raise CanonicalOutputManifestError(
+            f"{texture_base}/{role}: output uses derived cache directory "
+            f"{forbidden}: {relative}"
+        )
     if role in REQUIRED_ROLES:
         expected = f"{texture_base}_{role}.tga"
-        if relative.parent != Path(".") or relative.name.casefold() != expected.casefold():
+        if relative.name.casefold() != expected.casefold():
             raise CanonicalOutputManifestError(
                 f"{texture_base}/{role}: expected asset-local {expected}, got {relative}"
             )

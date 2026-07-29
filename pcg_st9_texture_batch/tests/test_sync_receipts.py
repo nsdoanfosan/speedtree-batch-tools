@@ -475,6 +475,217 @@ class GuiSyncStateTests(unittest.TestCase):
         self.assertIn("실행 차단", app.status_var.value)
         self.assertFalse(hasattr(app, "worker"))
 
+    def test_skipped_texture_plan_can_exclude_errors_and_run_valid_work(self):
+        class Root:
+            @staticmethod
+            def update_idletasks():
+                return None
+
+        class Value:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        good = {
+            "name": "good_tree",
+            "folder": r"D:\Tree\good",
+            "sk_spms": [r"D:\Tree\good\SK_good.spm"],
+        }
+        broken = {
+            "name": "broken_tree",
+            "folder": r"D:\Tree\broken",
+            "sk_spms": [r"D:\Tree\broken\SK_broken.spm"],
+        }
+        good_job = {
+            "item": good,
+            "base": "M_leaf_good",
+            "texture_base": "T_leaf_good",
+            "mode": "render",
+        }
+        skipped = [(broken, "M_leaf_broken", "missing albedo")]
+        sync_files = [r"D:\Tree\good\texture\T_leaf_good_color.tga"]
+        app = self.gui.App.__new__(self.gui.App)
+        app.report = {"items": [good, broken]}
+        app.root = Root()
+        app.status_var = Value()
+        app.items = {
+            good["folder"]: {"checked": True, "item": good},
+            broken["folder"]: {"checked": True, "item": broken},
+        }
+        app.log = mock.Mock()
+        app._set_busy = mock.Mock()
+        app._step3_jobs = mock.Mock(return_value=([good_job], skipped))
+        app._step3_sync_files = mock.Mock(return_value=sync_files)
+        app._checked_texplan_rows = mock.Mock(return_value=[
+            (good, {"atlas_base": "M_leaf_good"}),
+            (broken, {"atlas_base": "M_leaf_broken"}),
+        ])
+        app._step3_unreal_name_errors = mock.Mock(return_value=[])
+        fake_worker = mock.Mock()
+
+        with mock.patch.object(
+                self.gui, "step3_selection_state",
+                return_value={"force_unreal_verify": False}
+        ), mock.patch.object(
+                self.gui.messagebox, "askyesno", return_value=True
+        ) as askyesno, mock.patch.object(
+                self.gui.threading, "Thread", return_value=fake_worker
+        ) as thread_class:
+            app.start_step3()
+
+        askyesno.assert_called_once()
+        self.assertIn("제외하고 계속", askyesno.call_args.args[1])
+        excluded = app._step3_exclusion_keys(skipped)
+        app._step3_sync_files.assert_called_once_with(excluded)
+        thread_kwargs = thread_class.call_args.kwargs
+        self.assertEqual(thread_kwargs["args"], (
+            [good_job],
+            [good["sk_spms"][0]],
+            sync_files,
+            False,
+        ))
+        self.assertEqual(
+            thread_kwargs["kwargs"],
+            {
+                "planned_skipped": 1,
+                "allowed_step3_row_keys": (
+                    self.gui.step3_texture_row_key(
+                        good,
+                        "M_leaf_good",
+                    ),
+                ),
+            },
+        )
+        self.assertIn("계획 오류 제외 1개", app.status_var.value)
+        fake_worker.start.assert_called_once_with()
+
+    def test_step3_sync_files_omits_excluded_plan_rows(self):
+        app = self.gui.App.__new__(self.gui.App)
+        good = {"folder": r"D:\Tree\good"}
+        broken = {"folder": r"D:\Tree\broken"}
+        good_row = {
+            "folder": good["folder"],
+            "atlas_base": "M_leaf_good",
+            "texture_base": "T_leaf_good",
+            "texture_dir": r"D:\Tree\good\texture",
+        }
+        broken_row = {
+            "folder": broken["folder"],
+            "atlas_base": "M_leaf_broken",
+            "texture_base": "T_leaf_broken",
+            "texture_dir": r"D:\Tree\broken\texture",
+        }
+        app._checked_texplan_rows = mock.Mock(return_value=[
+            (good, good_row),
+            (broken, broken_row),
+        ])
+        excluded = {
+            self.gui.step3_texture_row_key(
+                broken,
+                broken_row["atlas_base"],
+            )
+        }
+
+        def fake_paths(_folder, texture_base):
+            return {
+                role: Path(r"D:\Output") / f"{texture_base}_{role}.tga"
+                for role in self.gui.sbs_auto.RENDER_MAPS
+            }
+
+        with mock.patch.object(
+                self.gui, "canonical_texture_root",
+                side_effect=lambda folder: Path(folder) / "texture"
+        ), mock.patch.object(
+                self.gui, "output_paths", side_effect=fake_paths
+        ), mock.patch.object(
+                self.gui, "complete_output_set", return_value=True
+        ):
+            files = app._step3_sync_files(excluded)
+
+        self.assertTrue(files)
+        self.assertTrue(
+            all("T_leaf_good" in path for path in files)
+        )
+        self.assertEqual(
+            [row["atlas_base"]
+             for row, _files in app._pending_step3_manifest_rows],
+            ["M_leaf_good"],
+        )
+
+    def test_step3_normalization_omits_excluded_row_in_same_spm(self):
+        selected = r"D:\Trees\ladyfern\SK_weed_ladyfern_01.spm"
+        folder = r"D:\Trees\ladyfern"
+        app = self.gui.App.__new__(self.gui.App)
+        app.cfg = {
+            "tree_root": r"D:\Trees",
+            "sbsrender_timeout": 10,
+            "unreal_texture_sync_enabled": False,
+        }
+        app.status_var = mock.Mock()
+        app.log = mock.Mock()
+        app._ui = lambda callback: callback()
+        app._step3_finished = mock.Mock()
+        plan = {
+            "items": [
+                {
+                    "folder": folder,
+                    "atlas_base": "M_leaf_valid",
+                },
+                {
+                    "folder": folder,
+                    "atlas_base": "M_leaf_excluded",
+                },
+            ],
+            "preserved_cluster_materials": [],
+        }
+        allowed = {
+            self.gui.step3_texture_row_key(
+                {"folder": folder},
+                "M_leaf_valid",
+            )
+        }
+
+        with mock.patch.object(
+                self.gui, "make_report", return_value={}
+        ), mock.patch.object(
+                self.gui, "persist_cluster_assembly_receipts_safely"
+        ), mock.patch.object(
+                self.gui, "save_spm_analysis_cache"
+        ), mock.patch.object(
+                self.gui, "build_texture_plan_from_report", return_value=plan
+        ), mock.patch.object(
+                self.gui, "jobs_from_texture_plan", return_value=[]
+        ) as build_jobs, mock.patch.object(
+                self.gui, "normalize_spms_transactionally",
+                return_value={
+                    "spms": [],
+                    "materials": 0,
+                    "backup_dir": None,
+                    "skipped": [],
+                },
+        ), mock.patch.object(
+                self.gui, "cleanup_preserved_cluster_outputs",
+                return_value={"cleaned": [], "conflicts": []},
+        ):
+            app._run_step3(
+                [],
+                [selected],
+                sync_files=[],
+                allowed_step3_row_keys=allowed,
+            )
+
+        exact_plan = build_jobs.call_args.args[0]
+        self.assertEqual(
+            [row["atlas_base"] for row in exact_plan["items"]],
+            ["M_leaf_valid"],
+        )
+        self.assertEqual(
+            build_jobs.call_args.kwargs["allowed_spms"],
+            [selected],
+        )
+
     def test_invalid_planned_unreal_name_is_blocked_before_render(self):
         with tempfile.TemporaryDirectory() as temp:
             errors = self.gui.App._step3_unreal_name_errors(
@@ -610,6 +821,7 @@ class GuiSyncStateTests(unittest.TestCase):
         app._step3_finished(
             0, 0, {"latest": 42, "changed": 3, "failed": 1},
             report_path=report_path,
+            planned_skipped=17,
         )
         messages = [call.args[0] for call in app.log.call_args_list]
         self.assertTrue(any(
@@ -617,6 +829,7 @@ class GuiSyncStateTests(unittest.TestCase):
             and "실패 1장" in message for message in messages))
         final_status = app._start_completion_refresh.call_args.args[0]
         self.assertIn(report_path, final_status)
+        self.assertIn("계획 오류 제외 17개", final_status)
         app._start_completion_refresh.assert_called_once_with(final_status)
 
     def test_completion_refresh_audits_in_worker_and_restores_final_status(self):

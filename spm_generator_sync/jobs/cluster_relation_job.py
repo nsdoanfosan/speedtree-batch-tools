@@ -491,6 +491,58 @@ def apply_recipe_source_material_mappings(props, recipe):
     }
 
 
+def relation_manifest_requires_pre_export_cleanup(manifest):
+    """Return whether a manifest records an actual relationship to detach.
+
+    A scope manifest can also describe a plain Atlas/Cluster material export
+    with no Generator relationship yet.  Removing that scope before an
+    in-place source-material adoption deletes the very Material_v8 that the
+    adoption must snapshot and reuse.
+    """
+    if not isinstance(manifest, dict):
+        return False
+    adoption = manifest.get("source_material_adoption")
+    if isinstance(adoption, dict) and adoption:
+        return True
+    connection = manifest.get("generator_connection")
+    if not isinstance(connection, dict):
+        return False
+    return bool(
+        connection.get("requested") is True
+        or connection.get("complete") is True
+        or connection.get("bindings")
+    )
+
+
+def cleanup_existing_relation_for_rebuild(
+    blend,
+    target,
+    *,
+    target_scope_manifests_for_blend,
+    remove_blend_target_from_spm,
+):
+    """Detach a prior relationship, while preserving a plain export baseline."""
+    manifests = target_scope_manifests_for_blend(target, blend)
+    if not any(
+        relation_manifest_requires_pre_export_cleanup(manifest)
+        for manifest in manifests
+    ):
+        return {
+            "status": "not_required_no_active_relation",
+            "spm": str(target),
+            "backup": None,
+            "scope_manifests": [
+                str(manifest.get("_scope_manifest_path") or "")
+                for manifest in manifests
+            ],
+        }
+    return remove_blend_target_from_spm(
+        blend,
+        target,
+        preserve_scope_history=True,
+    )
+
+
 def sync_targets(blend, requested, normalization_recipe=None):
     if key(bpy.data.filepath) != key(blend):
         raise RuntimeError(
@@ -504,6 +556,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
         export_or_update_speedtree_spm_targets,
         extend_source_material_adoptions_for_targets,
         remove_blend_target_from_spm,
+        target_scope_manifests_for_blend,
     )
     from atlas_leaf_mesh_builder.target_registry import load_target_registry
 
@@ -566,10 +619,11 @@ def sync_targets(blend, requested, normalization_recipe=None):
     # chance to retarget them.  Removal is receipt-scoped and fails closed on
     # drift; the host transaction snapshots every effective target first.
     pre_export_relation_cleanup = [
-        remove_blend_target_from_spm(
+        cleanup_existing_relation_for_rebuild(
             blend,
             path,
-            preserve_scope_history=True,
+            target_scope_manifests_for_blend=target_scope_manifests_for_blend,
+            remove_blend_target_from_spm=remove_blend_target_from_spm,
         )
         for path in connection_targets
     ]

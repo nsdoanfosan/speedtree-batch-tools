@@ -554,7 +554,7 @@ def fake_unreal_mesh_from_blender_bounds(
 
 
 class ContentDecisionTests(unittest.TestCase):
-    def test_prepared_only_render_content_returns_explicit_pass_through(self):
+    def test_ready_handoff_cannot_disappear_before_assembly_build(self):
         handoff = ready_handoff()
         handoff["pcg_receipt"] = {
             "path": "C:/receipt.json",
@@ -578,31 +578,83 @@ class ContentDecisionTests(unittest.TestCase):
                         "cluster_assembly_builder.snapshot_blender_armature",
                         return_value=skeleton_snapshot(),
                     ):
-                result = build_blender_assembly_inputs(
-                    handoff,
-                    SimpleNamespace(),
-                    merged,
-                    output,
-                    full,
-                    Path(temporary) / "wind.json",
-                )
+                with self.assertRaisesRegex(
+                    ClusterAssemblyBuildError,
+                    "requested rendered roles that disappeared",
+                ):
+                    build_blender_assembly_inputs(
+                        handoff,
+                        SimpleNamespace(),
+                        merged,
+                        output,
+                        full,
+                        Path(temporary) / "wind.json",
+                    )
 
-        self.assertEqual(result["status"], "pass_through")
-        self.assertEqual(
-            result["reason"],
-            "normalized_roles_are_prepared_but_unused_by_rendered_mesh",
-        )
-        self.assertEqual(result["rendered_role_count"], 0)
         self.assertFalse(output.exists())
-        self.assertTrue(result["registered_variants"])
-        self.assertTrue(all(
-            row["instanced"] is False
-            for row in result["registered_variants"]
-        ))
-        self.assertEqual(
-            result["handoff_evidence"]["pcg_receipt"],
-            handoff["pcg_receipt"],
+
+    def test_builder_matches_handoff_alias_and_assignment_material(self):
+        merged = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[
+                    SimpleNamespace(name="M_leaf_weeping_willow_01"),
+                ],
+                polygons=[
+                    SimpleNamespace(index=0, material_index=0),
+                    SimpleNamespace(index=1, material_index=0),
+                ],
+            ),
         )
+
+        rendered, unused = _role_material_polygons(
+            merged,
+            [{
+                "role": "leaf",
+                "role_identity": "M_leaf_weeping_wilow_01",
+                "role_identity_aliases": ["leaf_weeping_willow_01"],
+                "assignments": [{
+                    "material": "leaf_weeping_willow_01_Mat",
+                }],
+                "normalized_variants": {
+                    "status": "ready",
+                    "variants": [{"ordinal": 1}],
+                },
+            }],
+        )
+
+        self.assertEqual(unused, {})
+        self.assertEqual(rendered["leaf"]["material_slots"], [0])
+        self.assertEqual(rendered["leaf"]["polygon_indices"], [0, 1])
+        self.assertIn(
+            "leaf_weeping_willow_01",
+            rendered["leaf"]["matched_material_identities"],
+        )
+
+    def test_builder_blocks_one_material_slot_claimed_by_multiple_roles(self):
+        merged = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_shared_cards_01")],
+                polygons=[SimpleNamespace(index=0, material_index=0)],
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "claimed by multiple roles",
+        ):
+            _role_material_polygons(
+                merged,
+                [
+                    {
+                        "role": "branch",
+                        "role_identity": "M_shared_cards_01",
+                    },
+                    {
+                        "role": "leaf",
+                        "role_identity": "M_shared_cards_01",
+                    },
+                ],
+            )
 
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")
@@ -719,6 +771,22 @@ class PhysicalProductionContractTests(unittest.TestCase):
             report["registered_variant_count"],
             len(manifest["registered_variants"]),
         )
+
+    def test_ready_manifest_cannot_publish_prepared_unused_only(self):
+        manifest = physical_production_manifest()
+        manifest["parts"] = []
+        manifest["prepared_unused_roles"] = [{
+            "role": "branch",
+            "status": "prepared_unused",
+        }]
+        for variant in manifest["registered_variants"]:
+            variant["instanced"] = False
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "has no instantiated parts",
+        ):
+            validate_manifest_artifacts(manifest)
 
     def test_generic_role_counts_and_uniform_similarity_contract_pass(self):
         report = validate_normalized_prototype_unit_contract(

@@ -28,9 +28,23 @@ class ClusterRelationJobContractTests(unittest.TestCase):
         cleanup = source.index("pre_export_relation_cleanup = [")
         export = source.index("export_or_update_speedtree_spm_targets(", cleanup)
         self.assertIn(
-            "preserve_scope_history=True",
+            "cleanup_existing_relation_for_rebuild(",
             source[cleanup:export],
         )
+
+    def test_plain_export_scope_is_not_removed_before_first_adoption(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        helper = source[
+            source.index("def relation_manifest_requires_pre_export_cleanup("):
+            source.index("\ndef sync_targets(", source.index(
+                "def relation_manifest_requires_pre_export_cleanup("
+            ))
+        ]
+        self.assertIn('manifest.get("source_material_adoption")', helper)
+        self.assertIn('manifest.get("generator_connection")', helper)
+        self.assertIn('connection.get("requested") is True', helper)
+        self.assertIn('"not_required_no_active_relation"', helper)
+        self.assertIn("preserve_scope_history=True", helper)
 
     def test_current_receipt_rehydrates_the_plan_collection_before_export(self):
         source = JOB_PATH.read_text(encoding="utf-8")

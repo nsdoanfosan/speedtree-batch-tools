@@ -656,8 +656,18 @@ def load_canonical_output_manifest(spm_path, manifest_path=None):
 
     asset_root = _manifest_path(payload.get("asset_root"), manifest.parent)
     texture_root = _manifest_path(payload.get("texture_root"), manifest.parent)
+    declared_target_keys = {
+        _path_key(_manifest_path(target.get("spm"), asset_root))
+        for output in payload.get("outputs") or []
+        if isinstance(output, dict)
+        for target in output.get("material_targets") or []
+        if isinstance(target, dict) and target.get("spm")
+    }
     issues = []
-    if not _is_within(production_spm, asset_root):
+    if (
+        not _is_within(production_spm, asset_root)
+        and _path_key(production_spm) not in declared_target_keys
+    ):
         issues.append(_manifest_issue(
             "production_spm_outside_manifest_asset",
             spm=str(production_spm),
@@ -829,6 +839,7 @@ def load_canonical_output_manifest(spm_path, manifest_path=None):
         "manifest": str(manifest),
         "asset_root": str(asset_root),
         "texture_root": str(texture_root),
+        "shared_owner": not _is_within(production_spm, asset_root),
         "outputs": normalized_outputs,
     }
 

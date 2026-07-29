@@ -1521,12 +1521,16 @@ def _clear_placeholder_skeleton_before_import(item):
 
     A final tree Skeleton is also replaced when its asset-grounded contract
     metadata is missing or differs from the incoming DynamicWind
-    ``BoneNameIndexParentSha1``.  This avoids Unreal's unattended
-    "FAILED TO MERGE BONES" dialog while preserving a matching current Skeleton.
-    Shared/custom Skeletons with foreign referencers are never deleted.  Any
-    replaceable canonical mesh/Skeleton is relocated only after the incoming
-    staged pair has been validated; publish then either commits both assets or
-    rolls every move back.
+    ``BoneNameIndexParentSha1``.  An existing SkeletalMesh whose live Skeleton
+    pointer is null is likewise broken even when the item intentionally defers
+    DynamicWind (for example, a normalized Cluster prototype); importing over
+    that package in place can preserve its stale serialized dependency.  These
+    cases use the same clean staged pair publish.  This avoids Unreal's
+    unattended "FAILED TO MERGE BONES" dialog while preserving a matching
+    current Skeleton.  Shared/custom Skeletons with foreign referencers are
+    never deleted.  Any replaceable canonical mesh/Skeleton is relocated only
+    after the incoming staged pair has been validated; publish then either
+    commits both assets or rolls every move back.
     """
     mesh_path = item.get("mesh_path")
     if not mesh_path:
@@ -1558,6 +1562,7 @@ def _clear_placeholder_skeleton_before_import(item):
         skeleton is not None
         and skeleton.get_name() == PLACEHOLDER_SKELETON_NAME
     )
+    missing_skeleton = skeleton is None
     shared_skeleton_path = (
         skeleton.get_path_name() if placeholder else None
     )
@@ -1572,7 +1577,11 @@ def _clear_placeholder_skeleton_before_import(item):
         and saved_hash.casefold() == expected["hash"].casefold()
         and saved_bone_count == str(expected["bone_count"])
     )
-    if not placeholder and (expected is None or current_final_skeleton):
+    if (
+        not missing_skeleton
+        and not placeholder
+        and (expected is None or current_final_skeleton)
+    ):
         return {
             "status": "ok",
             "skeleton": skeleton.get_path_name() if skeleton else None,
@@ -1617,7 +1626,11 @@ def _clear_placeholder_skeleton_before_import(item):
         "reason": (
             "shared placeholder Skeleton"
             if placeholder
-            else "stale final Skeleton contract"
+            else (
+                "existing SkeletalMesh has no Skeleton"
+                if missing_skeleton
+                else "stale final Skeleton contract"
+            )
         ),
         "requires_fresh_publish": True,
         "canonical_assets": [
@@ -2179,9 +2192,55 @@ def ingest_item(item):
     default_physics_asset_preexisting = _default_physics_asset_preexisting(
         mesh_path
     )
-    fresh_skeleton_import = bool(
-        skeleton.get("requires_fresh_publish")
-    )
+    primary_mesh_key = mesh_path.casefold()
+    skeleton_refresh_plans = {
+        primary_mesh_key: {
+            "asset_path": mesh_path,
+            "item": item,
+            "plan": skeleton,
+        }
+    }
+    for manifest_asset in item.get("assets") or []:
+        asset_data = manifest_asset.get("asset_data") or {}
+        asset_path = str(asset_data.get("asset_path") or "").split(".", 1)[0]
+        asset_key = asset_path.casefold()
+        if (
+            asset_data.get("_asset_type") != "SkeletalMesh"
+            or not asset_path
+            or asset_key in skeleton_refresh_plans
+        ):
+            continue
+        # A Send2UE item can contain several independently skinned normalized
+        # Cluster prototypes.  The item-level DynamicWind contract belongs only
+        # to its primary mesh; each companion needs a dedicated live-Skeleton
+        # preflight so a broken/null Skeleton is not silently retained by an
+        # in-place import.
+        asset_item = dict(item)
+        asset_item["mesh_path"] = asset_path
+        asset_item["wind_json"] = None
+        asset_item["wind_policy"] = {
+            "mode": "dedicated_manifest_asset_preflight",
+            "requires_json": False,
+        }
+        skeleton_refresh_plans[asset_key] = {
+            "asset_path": asset_path,
+            "item": asset_item,
+            "plan": _clear_placeholder_skeleton_before_import(asset_item),
+        }
+
+    def import_asset(manifest_asset):
+        asset_path = str(
+            ((manifest_asset.get("asset_data") or {}).get("asset_path") or "")
+        ).split(".", 1)[0]
+        refresh = skeleton_refresh_plans.get(asset_path.casefold())
+        if refresh and refresh["plan"].get("requires_fresh_publish"):
+            return _import_manifest_asset_with_fresh_skeleton(
+                send2ue_unreal,
+                manifest_asset,
+                refresh["item"],
+            )
+        return _import_manifest_asset(send2ue_unreal, manifest_asset)
+
     with (
         _without_generated_physics_assets(
             send2ue_unreal
@@ -2191,25 +2250,7 @@ def ingest_item(item):
         ) as skeleton_binding_disabled,
     ):
         imported_assets = [
-            (
-                _import_manifest_asset_with_fresh_skeleton(
-                    send2ue_unreal,
-                    manifest_asset,
-                    item,
-                )
-                if fresh_skeleton_import
-                and str(
-                    (manifest_asset.get("asset_data") or {}).get(
-                        "asset_path"
-                    )
-                    or ""
-                ).split(".", 1)[0].casefold()
-                == mesh_path.casefold()
-                else _import_manifest_asset(
-                    send2ue_unreal,
-                    manifest_asset,
-                )
-            )
+            import_asset(manifest_asset)
             for manifest_asset in item.get("assets") or []
         ]
     optimization = _prepare_speedtree_skeletal_optimization(
@@ -2245,6 +2286,10 @@ def ingest_item(item):
         "checkout": checkout,
         "assets": imported_assets,
         "skeleton": skeleton,
+        "skeleton_refresh_plans": {
+            record["asset_path"]: record["plan"]
+            for record in skeleton_refresh_plans.values()
+        },
         "wind": wind,
         "final_skeleton_saved": final_skeleton_saved,
         "cluster_assembly": assembly,

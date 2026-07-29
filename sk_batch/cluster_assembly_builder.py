@@ -1254,6 +1254,11 @@ def validate_manifest_artifacts(manifest):
     """Revalidate every Blender/FBX/wind artifact at each consumer boundary."""
     if (manifest or {}).get("status") != "ready":
         raise ClusterAssemblyBuildError("Assembly manifest is not ready")
+    if not list((manifest or {}).get("parts") or []):
+        raise ClusterAssemblyBuildError(
+            "ready Assembly manifest has no instantiated parts; prepared-only "
+            "content must be pass_through and cannot publish an Assembly"
+        )
     normalized_contract = validate_normalized_prototype_unit_contract(manifest)
     _validate_public_export_names(manifest)
     checked = {
@@ -3279,10 +3284,36 @@ def _role_material_polygons(merged_mesh, role_inputs):
         slots_by_identity[identity].add(index)
     result = {}
     prepared_unused = {}
+    claimed_slots = {}
     for row in role_inputs:
         role = str(row["role"]).casefold()
-        identity = normalize_role_identity(row.get("role_identity"))
-        slots = slots_by_identity.get(identity) or set()
+        identity_values = [
+            row.get("role_identity"),
+            *(row.get("role_identity_aliases") or []),
+            *[
+                assignment.get("material")
+                for assignment in (row.get("assignments") or [])
+                if isinstance(assignment, dict)
+            ],
+        ]
+        identities = []
+        for value in identity_values:
+            identity = normalize_role_identity(value)
+            if identity and identity not in identities:
+                identities.append(identity)
+        slots = {
+            slot
+            for identity in identities
+            for slot in (slots_by_identity.get(identity) or set())
+        }
+        for slot in sorted(slots):
+            owner = claimed_slots.get(slot)
+            if owner is not None and owner != role:
+                raise ClusterAssemblyBuildError(
+                    "Assembly material slot is claimed by multiple roles: "
+                    f"slot={slot}, roles={owner},{role}"
+                )
+            claimed_slots[slot] = role
         polygons = [
             int(polygon.index)
             for polygon in merged_mesh.data.polygons
@@ -3294,6 +3325,10 @@ def _role_material_polygons(merged_mesh, role_inputs):
             prepared_unused[role] = {
                 "role": role,
                 "role_identity": row.get("role_identity"),
+                "role_identity_aliases": deepcopy(
+                    row.get("role_identity_aliases") or []
+                ),
+                "matched_material_identities": identities,
                 "status": "prepared_unused",
                 "reason": (
                     "material_absent_from_rendered_mesh"
@@ -3313,6 +3348,10 @@ def _role_material_polygons(merged_mesh, role_inputs):
         result[role] = {
             "role": role,
             "role_identity": row.get("role_identity"),
+            "role_identity_aliases": deepcopy(
+                row.get("role_identity_aliases") or []
+            ),
+            "matched_material_identities": identities,
             "material_slots": sorted(slots),
             "polygon_indices": polygons,
             "normalized_variants": deepcopy(row.get("normalized_variants")),
@@ -3357,65 +3396,24 @@ def build_blender_assembly_inputs(
         final_merged_mesh,
         role_inputs,
     )
-    if not roles and prepared_unused_roles:
-        registered_variants = []
-        for role, role_row in sorted(prepared_unused_roles.items()):
-            normalized = role_row.get("normalized_variants") or {}
-            for variant in normalized.get("variants") or []:
-                registered_variants.append({
-                    "role": role,
-                    "ordinal": int(variant.get("ordinal") or 0),
-                    "card_name": str(variant.get("plan_name") or ""),
-                    "skeletal_asset_name": str(
-                        variant.get("skeletal_asset_name") or ""
-                    ),
-                    "source_prototype_index": (
-                        int(variant["source_prototype_index"])
-                        if variant.get("source_prototype_index")
-                        else None
-                    ),
-                    "source_partition_mode": str(
-                        variant.get("source_partition_mode") or ""
-                    ),
-                    "composite_parts": deepcopy(
-                        variant.get("composite_parts") or []
-                    ),
-                    "target_mesh_id": int(variant.get("target_mesh_id") or 0),
-                    "pivot_contract": str(
-                        variant.get("pivot_contract") or ""
-                    ),
-                    "attachment_vertex_index": int(
-                        variant.get("attachment_vertex_index") or -1
-                    ),
-                    "attachment_vertex_uv": [
-                        float(value)
-                        for value in (variant.get("attachment_vertex_uv") or [])
-                    ],
-                    "instanced": False,
-                })
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": MANIFEST_KIND,
-            "status": "pass_through",
-            "content_decision": "pass_through",
-            "reason": (
-                "normalized_roles_are_prepared_but_unused_by_rendered_mesh"
-            ),
-            "full_skeletal_mesh_preserved": True,
-            "rendered_role_count": 0,
-            "registered_variants": registered_variants,
-            "prepared_unused_roles": [
-                prepared_unused_roles[role]
-                for role in ROLE_ORDER
-                if role in prepared_unused_roles
-            ],
-            "handoff_evidence": {
-                "actual_fbx": handoff.get("actual_fbx"),
-                "pcg_receipt": handoff.get("pcg_receipt"),
-                "spm": handoff.get("spm"),
-                "prepared_unused_roles": prepared_unused_roles,
-            },
-        }
+    if prepared_unused_roles:
+        details = [
+            {
+                "role": role,
+                "role_identity": row.get("role_identity"),
+                "role_identity_aliases": row.get("role_identity_aliases") or [],
+                "matched_material_identities": (
+                    row.get("matched_material_identities") or []
+                ),
+                "reason": row.get("reason"),
+            }
+            for role, row in sorted(prepared_unused_roles.items())
+        ]
+        raise ClusterAssemblyBuildError(
+            "Assembly handoff requested rendered roles that disappeared before "
+            "the Blender Assembly build: "
+            + _canonical_json(details)
+        )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     stem = Path(str((handoff.get("spm") or {}).get("path") or full_fbx_path)).stem
@@ -3895,6 +3893,11 @@ def build_blender_assembly_inputs(
                 + ", ".join(missing_base_wind_bones[:20])
             )
         parts = _coalesce_normalized_external_parts(parts)
+        if not parts:
+            raise ClusterAssemblyBuildError(
+                "Assembly handoff requested rendered roles, but no normalized "
+                "prototype matched any rendered mesh component"
+            )
         registered_variants = []
         used_variant_keys = set()
         for part in parts:

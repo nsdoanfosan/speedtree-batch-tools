@@ -553,6 +553,10 @@ class PushQueueFlowTests(unittest.TestCase):
             'repair_settings["cluster_source_skin_contract"] = is_cluster_source',
             bwr_source,
         )
+        self.assertIn(
+            'repair_settings["defer_cluster_export_to_normalizer"] = bool(',
+            bwr_source,
+        )
         self.assertNotIn("cluster_single_bone_rigid_binding", bwr_source)
         self.assertNotIn("rigid_existing_single_bone", bwr_source)
         self.assertIn("export_collection_contract_issues(", bwr_source)

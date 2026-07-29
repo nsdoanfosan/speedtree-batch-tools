@@ -157,6 +157,63 @@ class CanonicalOutputManifestTests(unittest.TestCase):
                 "_pcgtex_generated/T_leaf_test_ao_from_height.png",
             )
 
+    def test_records_verified_output_in_asset_texture_subdirectory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            output_dir = asset / "texture" / "substance"
+            output_dir.mkdir(parents=True)
+            paths = []
+            for role in REQUIRED_ROLES:
+                path = output_dir / f"T_leaf_test_{role}.tga"
+                path.write_bytes(role.encode())
+                paths.append(path)
+
+            manifest = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_dir": str(output_dir),
+                    "texture_base": "T_leaf_test",
+                },
+                paths,
+                producer_source=output_dir / "tree_test.sbs",
+            )
+
+            self.assertEqual(manifest, asset / "texture" / MANIFEST_NAME)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["outputs"][0]["files"],
+                {
+                    role: f"substance/T_leaf_test_{role}.tga"
+                    for role in REQUIRED_ROLES
+                },
+            )
+            validate_manifest(payload, manifest)
+
+    def test_rejects_asset_local_derived_cache_subdirectory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            output_dir = asset / "texture" / ".sk_batch_isolated_bark"
+            output_dir.mkdir(parents=True)
+            paths = []
+            for role in REQUIRED_ROLES:
+                path = output_dir / f"T_leaf_test_{role}.tga"
+                path.write_bytes(role.encode())
+                paths.append(path)
+
+            with self.assertRaisesRegex(
+                CanonicalOutputManifestError,
+                "derived cache directory",
+            ):
+                record_canonical_output(
+                    {
+                        "folder": str(asset),
+                        "texture_dir": str(output_dir),
+                        "texture_base": "T_leaf_test",
+                    },
+                    paths,
+                    producer_source="test.sbs#T_leaf_test",
+                )
+
     def test_rejects_source_or_cache_path_as_canonical_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

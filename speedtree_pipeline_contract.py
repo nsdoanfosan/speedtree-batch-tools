@@ -68,6 +68,34 @@ def canonical_path_key(value):
     return os.path.normcase(canonical_path(value)).casefold()
 
 
+def branch_generator_has_render_geometry(properties):
+    """Return whether one Branch/Trunk generator can contribute a render mesh.
+
+    ``Skin:Type=3`` is an authoring scaffold unless a segment mesh is enabled.
+    Generated spline nodes alone do not make that scaffold an FBX material
+    consumer.
+    """
+    properties = properties or {}
+
+    def number(value):
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    skin_type = number(properties.get("Skin:Type"))
+    skin_visibility = number(properties.get("Skin:Visibility"))
+    segment_mesh = str(
+        properties.get("Segments:Features:Mesh:Enabled") or ""
+    ).strip().casefold() in {"1", "true", "yes"}
+    has_visible_skin = (
+        skin_type is not None
+        and skin_type != 3.0
+        and (skin_visibility is None or skin_visibility > 0.0)
+    )
+    return bool(has_visible_skin or segment_mesh)
+
+
 def is_live_spm(path, require_file=True):
     """Classify an active SPM while excluding every pipeline backup namespace."""
     candidate = _canonical_path(path)
@@ -277,7 +305,11 @@ def _material_slot_assignment_state(raw_value):
     return "ASSIGNED"
 
 
-def _remove_non_structural_spm_content(parent):
+def _remove_non_structural_spm_content(
+    parent,
+    *,
+    ignore_vertex_color_spline_properties=False,
+):
     """Remove mutable shading metadata while retaining physical structure."""
     for child in list(parent):
         tag = _local_xml_tag(child.tag)
@@ -308,7 +340,10 @@ def _remove_non_structural_spm_content(parent):
                 ):
                     child.remove(material_child)
             continue
-        if tag == "Property":
+        if tag == "Property" or (
+            ignore_vertex_color_spline_properties
+            and tag == "SplineProperty"
+        ):
             name = str(child.findtext("Name") or "").strip().casefold()
             remove = name.startswith("vertex color:")
             if not remove and _is_material_slot_property(name):
@@ -318,7 +353,12 @@ def _remove_non_structural_spm_content(parent):
         if remove:
             parent.remove(child)
             continue
-        _remove_non_structural_spm_content(child)
+        _remove_non_structural_spm_content(
+            child,
+            ignore_vertex_color_spline_properties=(
+                ignore_vertex_color_spline_properties
+            ),
+        )
         if (
             _local_xml_tag(child.tag) == "Assets"
             and not list(child)
@@ -327,11 +367,25 @@ def _remove_non_structural_spm_content(parent):
             parent.remove(child)
 
 
-def spm_structural_semantic_fingerprint(source_text, *, context=None):
+def spm_structural_semantic_fingerprint(
+    source_text,
+    *,
+    context=None,
+    ignore_vertex_color_spline_properties=False,
+    projection_version=None,
+):
     """Hash bone/geometry/cutout/generator semantics, not shading metadata."""
-    root = ET.fromstring(source_text)
-    projected = copy.deepcopy(root)
-    _remove_non_structural_spm_content(projected)
+    # ``root`` is a fresh parse owned by this function. Mutating it directly
+    # produces the same projection while avoiding a second full in-memory XML
+    # tree; production SPMs can otherwise spend several seconds just copying
+    # data before every compatibility check.
+    projected = ET.fromstring(source_text)
+    _remove_non_structural_spm_content(
+        projected,
+        ignore_vertex_color_spline_properties=(
+            ignore_vertex_color_spline_properties
+        ),
+    )
     payload = ET.tostring(
         projected,
         encoding="unicode",
@@ -339,7 +393,11 @@ def spm_structural_semantic_fingerprint(source_text, *, context=None):
     )
     payload = re.sub(r">\s+<", "><", payload).strip()
     envelope = {
-        "projection_version": SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "projection_version": (
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+            if projection_version is None
+            else projection_version
+        ),
         "source": payload,
         "context": context or {},
     }

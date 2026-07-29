@@ -1084,6 +1084,34 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(calls["deleted"], [])
 
+    def test_clear_existing_mesh_without_skeleton_requires_fresh_publish(self):
+        runner = load_runner()
+        calls = self._skeleton_fixture(
+            runner,
+            None,
+            exists=True,
+            default_skeleton_exists=True,
+        )
+
+        result = runner._clear_placeholder_skeleton_before_import(
+            {"mesh_path": "/Game/Meshes/Trees/SK_Test.SK_Test"}
+        )
+
+        self.assertEqual(result["status"], "fresh_publish_required")
+        self.assertTrue(result["requires_fresh_publish"])
+        self.assertEqual(
+            result["reason"],
+            "existing SkeletalMesh has no Skeleton",
+        )
+        self.assertEqual(
+            result["canonical_assets"],
+            [
+                "/Game/Meshes/Trees/SK_Test",
+                "/Game/Meshes/Trees/SK_Test_Skeleton",
+            ],
+        )
+        self.assertEqual(calls["deleted"], [])
+
     def test_clear_skeleton_plans_placeholder_mesh_transaction(self):
         runner = load_runner()
         calls = self._skeleton_fixture(runner, "SK_PlaceholderCube_Skeleton")
@@ -1383,6 +1411,76 @@ class UnrealIngestSaveTests(unittest.TestCase):
         )
 
         self.assertIn("transactional_publish", events)
+
+    def test_ingest_item_refreshes_each_broken_skeletal_manifest_asset(self):
+        runner = load_runner()
+        events = []
+        primary = "/Game/Meshes/Trees/SK_Cluster_01"
+        companion = "/Game/Meshes/Trees/SK_Cluster_02"
+        self._configure_ingest_runner(runner, events, primary)
+
+        def skeleton_plan(item):
+            path = item["mesh_path"]
+            events.append(("preflight", path))
+            return {
+                "status": "fresh_publish_required",
+                "reason": "existing SkeletalMesh has no Skeleton",
+                "requires_fresh_publish": True,
+            }
+
+        runner._clear_placeholder_skeleton_before_import = skeleton_plan
+        runner._import_manifest_asset = (
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("broken assets must not import in place")
+            )
+        )
+        runner._import_manifest_asset_with_fresh_skeleton = (
+            lambda _send2ue, asset, refresh_item: events.append(
+                (
+                    "transactional_publish",
+                    asset["asset_data"]["asset_path"],
+                    refresh_item["mesh_path"],
+                )
+            )
+            or {"asset_path": asset["asset_data"]["asset_path"]}
+        )
+        runner._material_compile_and_slot_validation = lambda _path: {}
+
+        result = runner.ingest_item(
+            {
+                "send2ue_unreal_py": "send2ue_unreal.py",
+                "assets": [
+                    {
+                        "asset_data": {
+                            "_asset_type": "SkeletalMesh",
+                            "asset_path": primary,
+                        }
+                    },
+                    {
+                        "asset_data": {
+                            "_asset_type": "SkeletalMesh",
+                            "asset_path": companion,
+                        }
+                    },
+                ],
+                "mesh_path": primary,
+            }
+        )
+
+        self.assertIn(("preflight", primary), events)
+        self.assertIn(("preflight", companion), events)
+        self.assertIn(
+            ("transactional_publish", primary, primary),
+            events,
+        )
+        self.assertIn(
+            ("transactional_publish", companion, companion),
+            events,
+        )
+        self.assertEqual(
+            set(result["skeleton_refresh_plans"]),
+            {primary, companion},
+        )
 
     def test_speedtree_import_disables_physics_asset_generation_temporarily(self):
         runner = load_runner()

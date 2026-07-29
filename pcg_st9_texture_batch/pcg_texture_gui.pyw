@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -327,14 +328,36 @@ def spm_display_rows(item):
     return rows
 
 
-def checked_step3_spms(entries):
+def step3_texture_row_key(item, atlas_base):
+    """Return the stable folder/material key used by Step 3 exclusions."""
+    folder = os.path.normcase(
+        os.path.abspath(str((item or {}).get("folder") or ""))
+    )
+    return folder, str(atlas_base or "").strip().casefold()
+
+
+def checked_step3_spms(entries, allowed_folders=None):
     """Return exact selected final-SK paths, preserving PCG target identity."""
+    allowed = (
+        {
+            os.path.normcase(os.path.abspath(str(folder)))
+            for folder in allowed_folders
+        }
+        if allowed_folders is not None
+        else None
+    )
     result = []
     seen = set()
     for entry in entries.values():
         if not entry.get("checked"):
             continue
-        for value in spm_paths_for_item(entry.get("item") or {}):
+        item = entry.get("item") or {}
+        folder_key = os.path.normcase(
+            os.path.abspath(str(item.get("folder") or ""))
+        )
+        if allowed is not None and folder_key not in allowed:
+            continue
+        for value in spm_paths_for_item(item):
             path = Path(value)
             if not path.name.lower().startswith("sk_"):
                 continue
@@ -535,6 +558,9 @@ def blender_connection_rows(item):
     mention the same blend, so current inventory has the final say for an
     explicit per-SPM connection result.
     """
+    cached = item.get("_gui_blender_connection_rows")
+    if isinstance(cached, list):
+        return cached
     rows_by_blend = {}
     collections = (
         (0, item.get("leaf_mesh_sources") or ()),
@@ -671,6 +697,29 @@ def blender_connection_rows(item):
             row["blend"].name.casefold(), str(row["blend"]).casefold()
         ),
     )
+
+
+def cache_blender_connection_rows(report, progress_callback=None):
+    """Resolve expensive relation rows off the Tk main thread once."""
+    items = list((report or {}).get("items") or [])
+    if not items:
+        return report
+    with ThreadPoolExecutor(
+        max_workers=min(4, len(items)),
+        thread_name_prefix="pcg-gui-relations",
+    ) as executor:
+        futures = {
+            executor.submit(blender_connection_rows, item): item
+            for item in items
+        }
+        completed = 0
+        for future in as_completed(futures):
+            item = futures[future]
+            item["_gui_blender_connection_rows"] = future.result()
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, len(items), item)
+    return report
 
 
 def blender_connection_summary(row):
@@ -1662,8 +1711,40 @@ class App:
             error = None
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
-                report = make_report(cfg, pcg_targets=pcg_targets)
-                persist_cluster_assembly_receipts_safely(report)
+
+                def progress(completed, total, folder):
+                    message = (
+                        f"초기 검사 중... {completed}/{total} "
+                        f"({Path(folder).name})"
+                    )
+                    self.root.after(
+                        0,
+                        lambda value=message: self.status_var.set(value),
+                    )
+
+                report = make_report(
+                    cfg,
+                    pcg_targets=pcg_targets,
+                    progress_callback=progress,
+                )
+
+                def relation_progress(completed, total, item):
+                    message = (
+                        f"연결 표시 준비 중... {completed}/{total} "
+                        f"({item.get('name') or Path(item['folder']).name})"
+                    )
+                    self.root.after(
+                        0,
+                        lambda value=message: self.status_var.set(value),
+                    )
+
+                cache_blender_connection_rows(
+                    report,
+                    progress_callback=relation_progress,
+                )
+                # Opening the board is a read-only live audit. Receipt
+                # snapshots are persisted after an actual batch/completion
+                # refresh, not while the user is waiting for the first table.
                 save_spm_analysis_cache()
                 self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -1792,8 +1873,40 @@ class App:
                 pcg_targets = (
                     load_pcg_targets() if use_pcg_targets else None
                 )
-                report = make_report(cfg, pcg_targets=pcg_targets)
-                persist_cluster_assembly_receipts_safely(report)
+
+                def progress(completed, total, folder):
+                    message = (
+                        f"다시 검사 중... {completed}/{total} "
+                        f"({Path(folder).name})"
+                    )
+                    self.root.after(
+                        0,
+                        lambda value=message: self.status_var.set(value),
+                    )
+
+                report = make_report(
+                    cfg,
+                    pcg_targets=pcg_targets,
+                    progress_callback=progress,
+                )
+
+                def relation_progress(completed, total, item):
+                    message = (
+                        f"연결 표시 준비 중... {completed}/{total} "
+                        f"({item.get('name') or Path(item['folder']).name})"
+                    )
+                    self.root.after(
+                        0,
+                        lambda value=message: self.status_var.set(value),
+                    )
+
+                cache_blender_connection_rows(
+                    report,
+                    progress_callback=relation_progress,
+                )
+                # Manual "rescan" is also read-only. Keep receipt writes on
+                # the mutation/completion path so refreshing the board cannot
+                # spend minutes serializing every asset contract.
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -1860,6 +1973,7 @@ class App:
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
                 report = make_report(cfg, pcg_targets=pcg_targets)
+                cache_blender_connection_rows(report)
                 persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
@@ -3321,12 +3435,17 @@ class App:
                 ))
         return jobs, skipped
 
-    def _step3_sync_files(self):
+    def _step3_sync_files(self, excluded_row_keys=None):
         """Collect complete selected sets, including rows that need no render."""
+        excluded = set(excluded_row_keys or ())
         files = []
         seen = set()
         manifest_rows = []
-        for _item, row in self._checked_texplan_rows():
+        for item, row in self._checked_texplan_rows():
+            if step3_texture_row_key(
+                item, row.get("atlas_base")
+            ) in excluded:
+                continue
             texture_dir = (
                 canonical_texture_root(row["folder"])
                 if row.get("folder")
@@ -3349,6 +3468,50 @@ class App:
                     files.append(str(path))
         self._pending_step3_manifest_rows = manifest_rows
         return files
+
+    @staticmethod
+    def _step3_exclusion_keys(skipped):
+        return {
+            step3_texture_row_key(item, base)
+            for item, base, _reason in skipped
+        }
+
+    def _step3_eligible_row_keys(self, excluded_row_keys):
+        excluded = set(excluded_row_keys or ())
+        return {
+            step3_texture_row_key(item, row.get("atlas_base"))
+            for item, row in self._checked_texplan_rows()
+            if step3_texture_row_key(
+                item, row.get("atlas_base")
+            ) not in excluded
+        }
+
+    @staticmethod
+    def _step3_exclusion_message(
+            skipped, render_count, sync_file_count, *, force=False):
+        operation = "③ 전체 재추출" if force else "③ 실행"
+        lines = [
+            f"텍스처 계획 오류 {len(skipped)}개를 제외하고 "
+            f"나머지 {operation} 대상을 처리할 수 있습니다.",
+            "",
+            f"정상 렌더 대상: {render_count}세트",
+        ]
+        if not force:
+            lines.append(
+                f"완성 출력·Unreal 동기화 후보: {sync_file_count}장"
+            )
+        lines.extend([
+            "",
+            "제외 항목은 렌더·manifest·Unreal 동기화·SPM 정리에서 "
+            "빠지며 로그와 최종 결과에 제외 건수로 남습니다.",
+            "",
+        ])
+        for item, base, reason in skipped[:8]:
+            lines.append(f"· {item['name']} / {base}: {reason}")
+        if len(skipped) > 8:
+            lines.append(f"· ... 외 {len(skipped) - 8}개")
+        lines.extend(["", "오류 항목을 제외하고 계속 실행하시겠습니까?"])
+        return "\n".join(lines)
 
     def _sync_pending_texture_files(
             self, files, progress=None, force_verify=False):
@@ -3460,6 +3623,7 @@ class App:
         self.worker.start()
 
     def start_step3(self):
+        self._pending_step3_manifest_rows = []
         if not self.report:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 ③을 다시 실행하세요.")
@@ -3467,25 +3631,30 @@ class App:
         self.status_var.set("③ 대상 확인 중...")
         self.root.update_idletasks()
         jobs, skipped = self._step3_jobs()
-        sync_files = self._step3_sync_files()
+        excluded_row_keys = self._step3_exclusion_keys(skipped)
+        sync_files = (
+            self._step3_sync_files(excluded_row_keys)
+            if excluded_row_keys
+            else self._step3_sync_files()
+        )
         selection_state = step3_selection_state(getattr(self, "items", {}))
         force_unreal_verify = bool(
             selection_state.get("force_unreal_verify")
-        )
+        ) and not skipped
         for item, base, reason in skipped:
             self.log(f"[③ 건너뜀] {item['name']} / {base}: {reason}")
-        if skipped:
+        if skipped and not jobs and not sync_files:
             lines = [
-                "선택 항목의 텍스처 계획을 완성하지 못해 ③ 실행을 중단합니다.",
-                "일부 항목만 처리해 전체 성공처럼 보이지 않도록 차단했습니다.",
+                "텍스처 계획 오류를 제외하면 ③에서 실행할 정상 대상이 없습니다.",
                 "",
             ]
             for item, base, reason in skipped[:8]:
                 lines.append(f"· {item['name']} / {base}: {reason}")
             if len(skipped) > 8:
                 lines.append(f"· ... 외 {len(skipped) - 8}개")
-            messagebox.showerror("③ 실행 차단", "\n".join(lines))
+            messagebox.showerror("③ 실행 불가", "\n".join(lines))
             self.status_var.set(f"③ 실행 차단 · 계획 오류 {len(skipped)}개")
+            self._pending_step3_manifest_rows = []
             return
         invalid_names = self._step3_unreal_name_errors(jobs, sync_files)
         if invalid_names:
@@ -3503,8 +3672,37 @@ class App:
             self.status_var.set(
                 f"③ 실행 차단 · Unreal 이름 오류 {len(invalid_names)}개"
             )
+            self._pending_step3_manifest_rows = []
             return
-        exact_step3_spms = checked_step3_spms(self.items)
+        eligible_row_keys = (
+            self._step3_eligible_row_keys(excluded_row_keys)
+            if excluded_row_keys
+            else None
+        )
+        exact_step3_spms = checked_step3_spms(
+            self.items,
+            allowed_folders=(
+                {key[0] for key in eligible_row_keys}
+                if eligible_row_keys is not None
+                else None
+            ),
+        )
+        exclusions_confirmed = False
+        if skipped:
+            exclusions_confirmed = messagebox.askyesno(
+                "③ 오류 항목 제외 후 실행",
+                self._step3_exclusion_message(
+                    skipped,
+                    len(jobs),
+                    len(sync_files),
+                ),
+            )
+            if not exclusions_confirmed:
+                self.status_var.set(
+                    f"③ 실행 취소 · 계획 오류 {len(skipped)}개"
+                )
+                self._pending_step3_manifest_rows = []
+                return
         if not jobs:
             if not sync_files:
                 messagebox.showinfo(
@@ -3513,6 +3711,7 @@ class App:
                     "③ 컬럼의 누락 파일 또는 텍스처 계획 오류를 먼저 확인하세요.",
                 )
                 self.status_var.set("대기")
+                self._pending_step3_manifest_rows = []
                 return
             if force_unreal_verify:
                 confirm_message = (
@@ -3527,14 +3726,31 @@ class App:
                     "체크된 SK SPM의 머티리얼 슬롯을 정리하고 Unreal의 T_ 에셋도\n"
                     "내용 해시 기준으로 확인·동기화할까요?"
                 )
-            if not messagebox.askyesno("③ 실행", confirm_message):
+            if (
+                not exclusions_confirmed
+                and not messagebox.askyesno("③ 실행", confirm_message)
+            ):
                 self.status_var.set("대기")
+                self._pending_step3_manifest_rows = []
                 return
             self._set_busy(True)
+            exclusion_status = (
+                f" · 계획 오류 제외 {len(skipped)}개"
+                if skipped else ""
+            )
             self.status_var.set(
                 f"③ Unreal 동기화 시작 · 대상 {len(sync_files)}장"
+                f"{exclusion_status}"
             )
             self.root.update_idletasks()
+            worker_options = {}
+            if skipped:
+                worker_options["kwargs"] = {
+                    "planned_skipped": len(skipped),
+                    "allowed_step3_row_keys": tuple(
+                        sorted(eligible_row_keys)
+                    ),
+                }
             self.worker = threading.Thread(
                 target=self._run_step3,
                 args=(
@@ -3544,6 +3760,7 @@ class App:
                     force_unreal_verify,
                 ),
                 daemon=True,
+                **worker_options,
             )
             self.worker.start()
             return
@@ -3579,17 +3796,33 @@ class App:
                 "\nUnreal은 receipt 캐시를 무시하고 전체 재확인합니다."
             )
         msg.append("\n묶음당 ~1분 걸립니다. 계속할까요?")
-        if not messagebox.askyesno("③ 실행", "\n".join(msg)):
+        if (
+            not exclusions_confirmed
+            and not messagebox.askyesno("③ 실행", "\n".join(msg))
+        ):
             self.status_var.set("대기")
+            self._pending_step3_manifest_rows = []
             return
         self._set_busy(True)
+        exclusion_status = (
+            f" · 계획 오류 제외 {len(skipped)}개" if skipped else ""
+        )
         self.status_var.set(
-            f"③ 작업 시작 · 렌더 {len(jobs)}세트 · Unreal 후보 {len(sync_files)}장"
+            f"③ 작업 시작 · 렌더 {len(jobs)}세트 · "
+            f"Unreal 후보 {len(sync_files)}장{exclusion_status}"
         )
         self.root.update_idletasks()
         # Shared texture owners can render on behalf of another checked row,
         # but only the exact checked/PCG-target SK paths may be normalized.
         # A folder can contain sibling variants that were not selected.
+        worker_options = {}
+        if skipped:
+            worker_options["kwargs"] = {
+                "planned_skipped": len(skipped),
+                "allowed_step3_row_keys": tuple(
+                    sorted(eligible_row_keys)
+                ),
+            }
         self.worker = threading.Thread(
             target=self._run_step3,
             args=(
@@ -3599,12 +3832,14 @@ class App:
                 force_unreal_verify,
             ),
             daemon=True,
+            **worker_options,
         )
         self.worker.start()
 
     def _run_step3(
             self, jobs, affected_spms, sync_files=None,
-            force_unreal_verify=False, require_all_renders_for_sync=False):
+            force_unreal_verify=False, require_all_renders_for_sync=False,
+            planned_skipped=0, allowed_step3_row_keys=None):
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
@@ -3670,6 +3905,17 @@ class App:
                 save_spm_analysis_cache()
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
                 exact_plan = dict(plan)
+                if allowed_step3_row_keys is not None:
+                    allowed_rows = {
+                        tuple(key) for key in allowed_step3_row_keys
+                    }
+                    exact_plan["items"] = [
+                        row for row in plan.get("items") or []
+                        if step3_texture_row_key(
+                            {"folder": row.get("folder")},
+                            row.get("atlas_base"),
+                        ) in allowed_rows
+                    ]
                 exact_plan["preserved_cluster_materials"] = [
                     row for row in plan.get("preserved_cluster_materials") or []
                     if os.path.normcase(os.path.abspath(str(row.get("spm", ""))))
@@ -3802,10 +4048,17 @@ class App:
                 self._ui(lambda e=exc: self.log(
                     f"[③ Unreal 동기화 실패] 로컬 TGA/SPM은 보존됨: {e}"))
         self._ui(lambda: self._step3_finished(
-            done, failed, sync_summary, sync_report_path, sync_deferred))
+            done,
+            failed,
+            sync_summary,
+            sync_report_path,
+            sync_deferred,
+            planned_skipped,
+        ))
 
     def _step3_finished(self, render_done, failed, sync_summary,
-                        report_path=None, deferred=None):
+                        report_path=None, deferred=None,
+                        planned_skipped=0):
         sync_total = sum(sync_summary.values())
         render_failed = max(0, failed - sync_summary["failed"])
         if sync_total or deferred:
@@ -3818,6 +4071,13 @@ class App:
             )
         else:
             summary = f"③ 완료: 렌더 {render_done}세트 · 실패 {failed}개"
+        if planned_skipped:
+            summary = summary.replace(
+                "③ 완료:",
+                "③ 부분 완료:",
+                1,
+            )
+            summary += f" · 계획 오류 제외 {planned_skipped}개"
         self.log(summary)
         if report_path:
             self.log(f"③ 결과 리포트: {report_path}")
