@@ -38,7 +38,12 @@ from cluster_spm_pair_contract import (
 )
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
+    ClusterSourceBuildRequiredError,
     resolve_normalization_recipe,
+)
+from cluster_source_prepare import (
+    ClusterSourcePreparationError,
+    prepare_cluster_source_if_required,
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
@@ -711,6 +716,9 @@ def _persist_cluster_relation_failure(
             if launch_error is not None
             else None
         ),
+        "failure_contract": _cluster_relation_failure_contract(
+            launch_error
+        ),
         "artifact_recipe": artifact_recipe,
     }
     report_dir = blend.parent / "reports"
@@ -750,6 +758,82 @@ def _persist_cluster_relation_failure(
     finally:
         temporary.unlink(missing_ok=True)
     return destination
+
+
+def _cluster_relation_failure_contract(error):
+    """Return structured remediation data without guessing asset culpability."""
+    if isinstance(error, ClusterSourceBuildRequiredError):
+        return {
+            "failure_kind": "process_precondition",
+            "reason": error.reason,
+            "canonical_spm": str(error.canonical_spm),
+            "source_blend": str(error.blend),
+            "source_report": str(error.report_path),
+            "remediation": "automatic_cluster_source_rebuild",
+        }
+    if isinstance(error, ClusterSourcePreparationError):
+        return {
+            "failure_kind": "cluster_source_preparation_failed",
+            "stage": error.stage,
+            "log_file": (
+                str(error.log_file) if error.log_file is not None else None
+            ),
+            "report_file": (
+                str(error.report_file)
+                if error.report_file is not None
+                else None
+            ),
+            "stage_report": error.report,
+        }
+    return None
+
+
+def _resolve_normalization_recipe_with_source_rebuild(
+    blend,
+    targets,
+    *,
+    blender_exe,
+    unit_probe_path,
+    capture_resolution,
+    progress_callback,
+):
+    """Resolve once, rebuilding a proven-stale source and reusing validation."""
+    try:
+        recipe = resolve_normalization_recipe(
+            blend,
+            targets,
+            canonical_spm=Path(blend).with_suffix(".spm"),
+            unit_probe_path=unit_probe_path,
+            capture_resolution=capture_resolution,
+        )
+        return recipe, None
+    except ClusterSourceBuildRequiredError as required:
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "cluster_source_rebuild",
+            "Canonical Cluster SPM changed; rebuilding its source blend...",
+        )
+        preparation = prepare_cluster_source_if_required(
+            blend,
+            targets,
+            blender_exe=blender_exe,
+            unit_probe_path=unit_probe_path,
+            capture_resolution=capture_resolution,
+            progress_callback=progress_callback,
+            known_required=required,
+        )
+        recipe = preparation.pop(
+            "validated_normalization_recipe",
+            None,
+        )
+        if not isinstance(recipe, dict):
+            raise ClusterSourcePreparationError(
+                "source_contract_validation",
+                "Cluster source rebuild did not return its validated "
+                "normalization recipe.",
+                report=preparation,
+            )
+        return recipe, preparation
 
 
 def _sha256_file(path):
@@ -1451,22 +1535,35 @@ def run_cluster_relation_transaction(
             f"Blender executable does not exist: {blender}"
         )
     normalization_recipe = None
+    source_preparation = None
     if enabled and auto_normalize:
         try:
-            normalization_recipe = resolve_normalization_recipe(
+            (
+                normalization_recipe,
+                source_preparation,
+            ) = _resolve_normalization_recipe_with_source_rebuild(
                 blend,
                 effective_targets,
-                canonical_spm=blend.with_suffix(".spm"),
+                blender_exe=blender,
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
+                progress_callback=progress_callback,
             )
-        except ClusterNormalizationSyncError as exc:
+        except (
+            ClusterNormalizationSyncError,
+            ClusterSourcePreparationError,
+        ) as exc:
+            phase = (
+                "source_preparation_failed"
+                if isinstance(exc, ClusterSourcePreparationError)
+                else "normalization_recipe_failed"
+            )
             try:
                 diagnostic = _persist_cluster_relation_failure(
                     blend=blend,
                     targets=effective_targets,
                     enabled=enabled,
-                    phase="normalization_recipe_failed",
+                    phase=phase,
                     command=[],
                     snapshots=[],
                     artifact_recipe=None,
@@ -1733,6 +1830,8 @@ def run_cluster_relation_transaction(
                 ) from exc
             if runtime_receipt is not None:
                 report["repair_runtime_receipt"] = str(runtime_receipt)
+        if source_preparation is not None:
+            report["source_preparation"] = source_preparation
         return report
 
 

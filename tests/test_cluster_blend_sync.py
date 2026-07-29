@@ -854,6 +854,80 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 str(caught.exception),
             )
 
+    def test_stale_source_is_rebuilt_once_and_reuses_validated_recipe(self):
+        blend = Path(r"D:\Trees\Tree\Cluster\SK_branch_01.blend")
+        target = Path(r"D:\Trees\Tree\SK_Tree_01.spm")
+        required = cluster_sync.ClusterSourceBuildRequiredError(
+            "stale source",
+            blend=blend,
+            canonical_spm=blend.with_suffix(".spm"),
+            report_path=blend.parent / "reports" / "source.json",
+            reason="source_identity_stale",
+        )
+        validated = {"normalization_required": True}
+
+        with mock.patch.object(
+            cluster_sync,
+            "resolve_normalization_recipe",
+            side_effect=required,
+        ) as resolve, mock.patch.object(
+            cluster_sync,
+            "prepare_cluster_source_if_required",
+            return_value={
+                "status": "rebuilt",
+                "reason": "source_identity_stale",
+                "validated_normalization_recipe": validated,
+            },
+        ) as prepare:
+            recipe, preparation = (
+                cluster_sync._resolve_normalization_recipe_with_source_rebuild(
+                    blend,
+                    [target],
+                    blender_exe=Path(r"C:\Blender\blender.exe"),
+                    unit_probe_path=Path(r"C:\probe.json"),
+                    capture_resolution=1024,
+                    progress_callback=None,
+                )
+            )
+
+        self.assertEqual(recipe, validated)
+        self.assertEqual(
+            preparation,
+            {
+                "status": "rebuilt",
+                "reason": "source_identity_stale",
+            },
+        )
+        self.assertEqual(resolve.call_count, 1)
+        prepare.assert_called_once_with(
+            blend,
+            [target],
+            blender_exe=Path(r"C:\Blender\blender.exe"),
+            unit_probe_path=Path(r"C:\probe.json"),
+            capture_resolution=1024,
+            progress_callback=None,
+            known_required=required,
+        )
+
+    def test_stale_source_failure_contract_is_process_precondition(self):
+        blend = Path(r"D:\Trees\Tree\Cluster\SK_branch_01.blend")
+        required = cluster_sync.ClusterSourceBuildRequiredError(
+            "stale source",
+            blend=blend,
+            canonical_spm=blend.with_suffix(".spm"),
+            report_path=blend.parent / "reports" / "source.json",
+            reason="source_identity_stale",
+        )
+
+        contract = cluster_sync._cluster_relation_failure_contract(required)
+
+        self.assertEqual(contract["failure_kind"], "process_precondition")
+        self.assertEqual(contract["reason"], "source_identity_stale")
+        self.assertEqual(
+            contract["remediation"],
+            "automatic_cluster_source_rebuild",
+        )
+
     def test_successful_sync_commits_shared_repair_runtime_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"

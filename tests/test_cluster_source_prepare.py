@@ -78,6 +78,58 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             build.call_args.kwargs["cfg"]["blender_exe"],
             str(Path(r"C:\Blender\blender.exe").absolute()),
         )
+        self.assertEqual(
+            result["validated_normalization_recipe"],
+            {"normalization_required": True},
+        )
+
+    def test_known_required_skips_duplicate_stale_source_preflight(self):
+        blend = Path(r"D:\Trees\Tree\Cluster\SK_branch_01.blend")
+        spm = blend.with_suffix(".spm")
+        target = Path(r"D:\Trees\Tree\SK_Tree_01.spm")
+        required = ClusterSourceBuildRequiredError(
+            "stale",
+            blend=blend,
+            canonical_spm=spm,
+            report_path=blend.parent / "reports" / "report.json",
+            reason="source_identity_stale",
+        )
+
+        with mock.patch.object(
+            source_prepare,
+            "resolve_normalization_recipe",
+            return_value={"normalization_required": True},
+        ) as resolve, mock.patch.object(
+            source_prepare,
+            "prepare_cluster_spm_pair_for_job",
+            return_value={"canonical_spm": spm},
+        ), mock.patch.object(
+            source_prepare,
+            "load_config",
+            return_value={"blender_exe": "old"},
+        ), mock.patch.object(
+            source_prepare,
+            "_build_cluster_source",
+            return_value={
+                "status": "rebuilt",
+                "spm": str(spm),
+                "blend": str(blend),
+            },
+        ):
+            result = source_prepare.prepare_cluster_source_if_required(
+                blend,
+                [target],
+                blender_exe=Path(r"C:\Blender\blender.exe"),
+                unit_probe_path=Path(r"C:\probe.json"),
+                known_required=required,
+            )
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(result["reason"], "source_identity_stale")
+        self.assertEqual(
+            result["validated_normalization_recipe"],
+            {"normalization_required": True},
+        )
 
     def test_build_runs_bone_setup_before_material_and_blender(self):
         with tempfile.TemporaryDirectory() as temporary:

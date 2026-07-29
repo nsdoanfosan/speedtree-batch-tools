@@ -391,26 +391,52 @@ def prepare_cluster_source_if_required(
     unit_probe_path,
     capture_resolution=1024,
     progress_callback=None,
+    known_required=None,
 ):
-    """Return immediately when current; otherwise rebuild and revalidate once."""
+    """Return immediately when current; otherwise rebuild and revalidate once.
+
+    ``known_required`` lets the relation transaction hand off the exact
+    preflight failure it already observed.  That avoids re-hashing and
+    re-parsing a large SPM merely to rediscover the same stale-source result.
+    """
     blend = Path(blend).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]
     canonical_spm = blend.with_suffix(".spm")
-    try:
-        resolve_normalization_recipe(
-            blend,
-            targets,
-            canonical_spm=canonical_spm,
-            unit_probe_path=unit_probe_path,
-            capture_resolution=capture_resolution,
-        )
-        return {
-            "status": "current",
-            "spm": str(canonical_spm),
-            "blend": str(blend),
-        }
-    except ClusterSourceBuildRequiredError as required:
-        rebuild_reason = required.reason
+    if known_required is not None:
+        if not isinstance(known_required, ClusterSourceBuildRequiredError):
+            raise TypeError(
+                "known_required must be a ClusterSourceBuildRequiredError"
+            )
+        if (
+            known_required.blend != blend
+            or known_required.canonical_spm != canonical_spm
+        ):
+            raise ClusterSourcePreparationError(
+                "source_contract",
+                "The handed-off stale-source failure does not belong to the "
+                f"requested Cluster pair: {blend}",
+                report={
+                    "required_blend": str(known_required.blend),
+                    "required_spm": str(known_required.canonical_spm),
+                },
+            )
+        rebuild_reason = known_required.reason
+    else:
+        try:
+            resolve_normalization_recipe(
+                blend,
+                targets,
+                canonical_spm=canonical_spm,
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+            )
+            return {
+                "status": "current",
+                "spm": str(canonical_spm),
+                "blend": str(blend),
+            }
+        except ClusterSourceBuildRequiredError as required:
+            rebuild_reason = required.reason
 
     pair = prepare_cluster_spm_pair_for_job(canonical_spm)
     canonical_spm = Path(pair.get("canonical_spm") or canonical_spm).resolve()
@@ -439,7 +465,7 @@ def prepare_cluster_source_if_required(
         f"Cluster 기준 Blend 계약 재검사 · {canonical_blend.name}",
     )
     try:
-        resolve_normalization_recipe(
+        recipe = resolve_normalization_recipe(
             canonical_blend,
             targets,
             canonical_spm=canonical_spm,
@@ -452,6 +478,7 @@ def prepare_cluster_source_if_required(
             str(exc),
             report=result,
         ) from exc
+    result["validated_normalization_recipe"] = recipe
     return result
 
 
