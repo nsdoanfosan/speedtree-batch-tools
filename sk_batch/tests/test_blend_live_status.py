@@ -3799,7 +3799,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             str(raised.exception),
         )
 
-    def test_receipt_self_stale_after_clean_audit_uses_live_contract(self):
+    def test_receipt_ambiguity_after_clean_audit_uses_live_contract(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
@@ -3831,8 +3831,10 @@ class BlendLiveStatusTests(unittest.TestCase):
                 gui,
                 "cluster_assembly_receipt_resolution",
                 side_effect=[
-                    gui.ClusterAssemblyReceiptStaleError("old"),
-                    gui.ClusterAssemblyReceiptStaleError("self-stale"),
+                    gui.ClusterAssemblyReceiptAmbiguityError("old ambiguity"),
+                    gui.ClusterAssemblyReceiptAmbiguityError(
+                        "self-ambiguity"
+                    ),
                 ],
             ):
                 resolution = app._refresh_stale_cluster_receipt(
@@ -3848,7 +3850,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("_jobadhoc_20260725_120000_", report_name)
             self.assertTrue(report_name.endswith(".json"))
             self.assertIn(
-                "self-stale",
+                "self-ambiguity",
                 resolution["receipt_persistence_warning"],
             )
 
@@ -4984,7 +4986,7 @@ class ClusterBarkRepairSkipGateTests(unittest.TestCase):
         )
         self.assertFalse(
             gui.cluster_receipt_resolution_uses_live_audit({
-                "policy": "newest_hash_current_receipt",
+                "policy": "equivalent_hash_current_receipts",
                 "selected_receipt": "C:/reports/cache.json",
             })
         )

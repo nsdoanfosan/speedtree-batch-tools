@@ -25,6 +25,9 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
 )
+from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (  # noqa: E402
+    ClusterAssemblyReceiptAmbiguityError,
+)
 
 
 class FakeMaterial:
@@ -283,6 +286,18 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 resolution["policy"],
                 "embedded_live_audit_authoritative",
             )
+
+    def test_divergent_persisted_receipts_fail_closed_without_live_audit(self):
+        spm = Path("C:/Trees/SK_Tree_elm_01.spm")
+        with mock.patch(
+            "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+            "locate_cluster_assembly_receipt",
+            side_effect=ClusterAssemblyReceiptAmbiguityError(
+                "divergent current receipts"
+            ),
+        ):
+            with self.assertRaises(ClusterAssemblyReceiptAmbiguityError):
+                resolve_cluster_receipt_path(spm)
 
     def test_embedded_cluster_contract_remains_a_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:

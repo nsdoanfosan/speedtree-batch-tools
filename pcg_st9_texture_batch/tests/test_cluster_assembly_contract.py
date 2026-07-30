@@ -15,6 +15,7 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_cluster_assembly_contract import (
+    ClusterAssemblyReceiptAmbiguityError,
     ClusterAssemblyReceiptError,
     ClusterAssemblyReceiptStaleError,
     DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
@@ -1892,7 +1893,96 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     list(range(1, 13)),
                 )
 
-    def test_latest_current_overlapping_receipt_wins_and_history_is_reported(self):
+    def test_equivalent_current_receipts_ignore_mtime_and_use_stable_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_dir = root / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            target.write_bytes(b"target")
+            source.write_bytes(b"source")
+            contract = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [],
+                "handoff": {"cluster_dependencies": []},
+            }
+            persisted = persist_cluster_assembly_receipt(
+                contract,
+                receipt_dir=receipt_dir,
+            )
+            duplicate = receipt_dir / "cluster_assembly_duplicate.json"
+            shutil.copy2(persisted, duplicate)
+            duplicate_payload = json.loads(
+                duplicate.read_text(encoding="utf-8")
+            )
+
+            def replace_observation_times(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key == "mtime_ns" and item is not None:
+                            value[key] = int(item) + 1
+                        else:
+                            replace_observation_times(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        replace_observation_times(item)
+
+            replace_observation_times(duplicate_payload["cluster_assembly"])
+            duplicate.write_text(
+                json.dumps(duplicate_payload),
+                encoding="utf-8",
+            )
+            expected = min(
+                (persisted, duplicate),
+                key=lambda path: (
+                    os.path.normcase(os.path.abspath(str(path))),
+                    str(path),
+                ),
+            )
+
+            os.utime(persisted, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(duplicate, ns=(1_000_000_000, 1_000_000_000))
+            first = cluster_assembly_receipt_resolution(target, receipt_dir)
+            os.utime(persisted, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(duplicate, ns=(2_000_000_000, 2_000_000_000))
+            second = cluster_assembly_receipt_resolution(target, receipt_dir)
+
+            self.assertEqual(
+                first["policy"],
+                "equivalent_hash_current_receipts",
+            )
+            self.assertEqual(Path(first["selected_receipt"]), expected)
+            self.assertEqual(
+                first["selected_receipt"],
+                second["selected_receipt"],
+            )
+            self.assertEqual(
+                first["contract_sha256"],
+                second["contract_sha256"],
+            )
+            self.assertEqual(
+                first["equivalent_current_receipts"],
+                [
+                    str(path)
+                    for path in sorted(
+                        (persisted, duplicate),
+                        key=lambda path: (
+                            os.path.normcase(os.path.abspath(str(path))),
+                            str(path),
+                        ),
+                    )[1:]
+                ],
+            )
+            self.assertEqual(
+                locate_cluster_assembly_receipt(target, receipt_dir),
+                expected,
+            )
+
+    def test_divergent_current_overlapping_receipts_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             receipt_dir = root / "receipts"
@@ -1936,17 +2026,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             os.utime(first, ns=(1_000_000_000, 1_000_000_000))
             os.utime(second, ns=(2_000_000_000, 2_000_000_000))
 
-            resolution = cluster_assembly_receipt_resolution(
-                target, receipt_dir
-            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptAmbiguityError,
+                "run a live Cluster Assembly audit",
+            ):
+                cluster_assembly_receipt_resolution(target, receipt_dir)
 
-            self.assertEqual(Path(resolution["selected_receipt"]), second)
-            self.assertEqual(
-                resolution["superseded_current_receipts"], [str(first)]
-            )
-            self.assertEqual(
-                locate_cluster_assembly_receipt(target, receipt_dir), second
-            )
+            os.utime(first, ns=(3_000_000_000, 3_000_000_000))
+            os.utime(second, ns=(1_000_000_000, 1_000_000_000))
+            with self.assertRaises(ClusterAssemblyReceiptAmbiguityError):
+                locate_cluster_assembly_receipt(target, receipt_dir)
 
     def test_persisted_receipt_tracks_nested_physical_source_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

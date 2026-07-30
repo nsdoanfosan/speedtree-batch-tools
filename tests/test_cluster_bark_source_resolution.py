@@ -20,6 +20,10 @@ from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES
 from pcg_st9_texture_batch.pcg_texture_audit import (
     extract_material_image_refs,
 )
+from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+    ClusterAssemblyReceiptAmbiguityError,
+    ClusterAssemblyReceiptStaleError,
+)
 
 
 def _map(name, texture):
@@ -404,6 +408,45 @@ def test_live_owner_contract_overrides_missing_or_stale_receipt_cache():
         assert (
             resolved["target_receipts"][0]["required_material_count"] == 1
         )
+
+
+@pytest.mark.parametrize(
+    "authority_error",
+    [
+        FileNotFoundError("missing receipt"),
+        ClusterAssemblyReceiptStaleError("stale receipt"),
+        ClusterAssemblyReceiptAmbiguityError("divergent receipts"),
+    ],
+)
+def test_persisted_authority_failure_without_live_audit_fails_closed(
+    authority_error,
+):
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "Tree_elm"
+        source = root / "Cluster" / "SK_leaf_elm_01.spm"
+        target = root / "SK_Tree_elm_01.spm"
+        _write_spm(source, "M_bark_common_end_01", [])
+        _write_spm(target, "M_bark_elm_01", [])
+
+        with (
+            mock.patch(
+                "cluster_bark_source_resolution."
+                "locate_cluster_assembly_receipt",
+                side_effect=authority_error,
+            ),
+            mock.patch(
+                "cluster_bark_source_resolution."
+                "prepare_isolated_bark_source",
+            ) as prepare,
+            pytest.raises(
+                ClusterBarkSourceResolutionError,
+                match="run a live Cluster Assembly audit",
+            ),
+        ):
+            resolve_cluster_bark_source_spm(source, [target])
+
+        prepare.assert_not_called()
+
 
 def test_validated_isolated_capture_remains_the_provider_runtime_source():
     with tempfile.TemporaryDirectory() as temporary:

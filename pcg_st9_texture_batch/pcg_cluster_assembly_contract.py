@@ -70,6 +70,10 @@ class ClusterAssemblyReceiptStaleError(ClusterAssemblyReceiptError):
     """A receipt identity or artifact hash no longer matches disk."""
 
 
+class ClusterAssemblyReceiptAmbiguityError(ClusterAssemblyReceiptError):
+    """Current receipts disagree about the same requested SPM."""
+
+
 def normalize_export_name(value):
     """Normalize only exporter wrappers, not authored role identity."""
     name = display_export_name(value)
@@ -4041,17 +4045,41 @@ def load_cluster_assembly_receipt(path, requested_spm=None):
     return payload
 
 
+def _cluster_assembly_contract_semantic_projection(value):
+    """Remove filesystem observation time from a complete contract value."""
+    if isinstance(value, dict):
+        return {
+            key: _cluster_assembly_contract_semantic_projection(item)
+            for key, item in value.items()
+            if key != "mtime_ns"
+        }
+    if isinstance(value, list):
+        return [
+            _cluster_assembly_contract_semantic_projection(item)
+            for item in value
+        ]
+    return value
+
+
+def _cluster_assembly_contract_digest(contract):
+    """Return a deterministic semantic digest of the complete contract."""
+    projection = _cluster_assembly_contract_semantic_projection(contract)
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
-    """Resolve the newest hash-current receipt and retain the candidate audit.
+    """Resolve one semantically unambiguous hash-current receipt.
 
-    Repeated PCG audits can legitimately persist overlapping folder snapshots
-    (for example, four selected Tree SPMs followed by six).  Those snapshots
-    have different stable receipt names but can all identify the same SK SPM.
-    Treating that history as an ambiguity permanently blocked Blender Repair.
-
-    Stale snapshots are never selected.  When several hash-current snapshots
-    remain, the newest tool-owned receipt is authoritative and the older paths
-    are returned as explicit, non-destructive audit history.
+    Persisted receipts are cache evidence, so filesystem time and discovery
+    order cannot make one current contract authoritative over another.  Exact
+    full-contract duplicates may share one deterministic I/O representative;
+    divergent current contracts require a new live audit.
     """
     requested = _normalized_identity_path(spm_path)
     directory = Path(receipt_dir) if receipt_dir else DEFAULT_RECEIPT_DIR
@@ -4072,15 +4100,17 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
     stale = []
     for path, payload in matches:
         try:
-            validate_cluster_assembly_receipt(payload, requested_spm=spm_path)
+            contract = validate_cluster_assembly_receipt(
+                payload,
+                requested_spm=spm_path,
+            )
         except ClusterAssemblyReceiptError as exc:
             stale.append({"path": str(path), "error": str(exc)})
             continue
-        try:
-            mtime_ns = path.stat().st_mtime_ns
-        except OSError:
-            mtime_ns = -1
-        current.append({"path": path, "mtime_ns": mtime_ns})
+        current.append({
+            "path": path,
+            "contract_sha256": _cluster_assembly_contract_digest(contract),
+        })
 
     if not current:
         details = "; ".join(
@@ -4092,21 +4122,45 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
         )
 
     current.sort(
-        key=lambda row: (row["mtime_ns"], str(row["path"]).casefold())
+        key=lambda row: (
+            _normalized_identity_path(row["path"]),
+            str(row["path"]),
+        )
     )
-    selected = current[-1]
     current_rows = [
-        {"path": str(row["path"]), "mtime_ns": row["mtime_ns"]}
+        {
+            "path": str(row["path"]),
+            "contract_sha256": row["contract_sha256"],
+        }
         for row in current
     ]
+    digests = {row["contract_sha256"] for row in current}
+    if len(digests) != 1:
+        details = "; ".join(
+            f"{Path(row['path']).name}={row['contract_sha256'][:16]}"
+            for row in current_rows
+        )
+        raise ClusterAssemblyReceiptAmbiguityError(
+            "hash-current Cluster Assembly receipts disagree for "
+            f"{spm_path}: {details}; run a live Cluster Assembly audit"
+        )
+
+    selected = current[0]
+    equivalent_paths = [
+        row["path"] for row in current_rows[1:]
+    ]
     return {
-        "policy": "newest_hash_current_receipt",
+        "policy": (
+            "unique_hash_current_receipt"
+            if len(current) == 1
+            else "equivalent_hash_current_receipts"
+        ),
         "requested_spm": str(spm_path),
         "selected_receipt": str(selected["path"]),
+        "contract_sha256": selected["contract_sha256"],
         "current_candidates": current_rows,
-        "superseded_current_receipts": [
-            row["path"] for row in current_rows[:-1]
-        ],
+        "equivalent_current_receipts": equivalent_paths,
+        "superseded_current_receipts": [],
         "ignored_stale_candidates": stale,
     }
 

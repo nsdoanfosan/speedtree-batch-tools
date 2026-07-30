@@ -122,6 +122,7 @@ from send2ue_manifest_contract import (
     is_actionable_cluster_assembly_manifest,
 )
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+    ClusterAssemblyReceiptAmbiguityError,
     ClusterAssemblyReceiptStaleError,
     cluster_assembly_receipt_resolution,
     load_cluster_assembly_receipt,
@@ -6090,7 +6091,10 @@ class App:
                     f"Cluster Assembly 영수증 탐색: {spm.name} "
                     "(저장된 영수증 없음; 현재 폴더 감사)"
                 )
-            except ClusterAssemblyReceiptStaleError:
+            except (
+                ClusterAssemblyReceiptStaleError,
+                ClusterAssemblyReceiptAmbiguityError,
+            ):
                 self.log(
                     f"Cluster Assembly 영수증 갱신: {spm.name} "
                     f"(현재 산출물 해시 재감사)"
@@ -6448,6 +6452,7 @@ class App:
         except (
             FileNotFoundError,
             ClusterAssemblyReceiptStaleError,
+            ClusterAssemblyReceiptAmbiguityError,
         ) as exc:
             cache_resolution_error = str(exc)
             ignored_stale.append({

@@ -22,9 +22,7 @@ import time
 from pathlib import Path
 
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
-    DEFAULT_RECEIPT_DIR,
     ClusterAssemblyReceiptError,
-    ClusterAssemblyReceiptStaleError,
     load_cluster_assembly_receipt,
     locate_cluster_assembly_receipt,
     normalize_export_name,
@@ -242,95 +240,6 @@ def _dependency_for_source(contract, source_spm):
         if any(_path_key(value) == wanted for value in values):
             return dependency
     return None
-
-
-def _fingerprint_is_current(record, expected_path):
-    if not isinstance(record, dict):
-        return False
-    path = Path(str(record.get("path") or ""))
-    expected = Path(expected_path)
-    return (
-        path.is_file()
-        and _path_key(path) == _path_key(expected)
-        and bool(record.get("sha256"))
-        and str(record["sha256"]).casefold()
-        == _sha256_file(path).casefold()
-    )
-
-
-def _stale_receipt_bark_contract(target_spm, source_spm):
-    """Recover only current source facts from a stale derivative receipt.
-
-    Normalizer/Atlas FBX or blend outputs can become stale precisely because
-    SK Batch is rebuilding this provider.  That derivative staleness must not
-    hide a still-current Tree/provider/canonical-texture normalization input.
-    """
-    target = Path(target_spm).resolve()
-    source = Path(source_spm).resolve()
-    candidates = []
-    for receipt in DEFAULT_RECEIPT_DIR.glob("*.json"):
-        try:
-            payload = json.loads(receipt.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        contract = payload.get("cluster_assembly") or {}
-        dependency = _dependency_for_source(contract, source)
-        if dependency is None:
-            continue
-        target_rows = [
-            row.get("target_spm") or {}
-            for row in contract.get("tree_source_identities") or []
-        ]
-        if not any(
-            _fingerprint_is_current(row, target)
-            for row in target_rows
-        ):
-            continue
-        source_records = [
-            dependency.get(field)
-            for field in (
-                "spm_fingerprint",
-                "authoring_spm_fingerprint",
-                "output_spm_fingerprint",
-            )
-            if isinstance(dependency.get(field), dict)
-            and _path_key(dependency[field].get("path") or "")
-            == _path_key(source)
-        ]
-        if not any(
-            _fingerprint_is_current(row, source)
-            for row in source_records
-        ):
-            continue
-        required_rows = _required_bark_rows(contract, dependency)
-        if not required_rows:
-            continue
-        # This also verifies the current canonical source SPM and every
-        # canonical texture before the candidate can be selected.
-        try:
-            signature, _identity = _normalization_identity(
-                contract, source, required_rows
-            )
-        except ClusterBarkSourceResolutionError:
-            continue
-        candidates.append({
-            "mtime_ns": receipt.stat().st_mtime_ns,
-            "receipt": receipt,
-            "contract": contract,
-            "required_rows": required_rows,
-            "signature": signature,
-        })
-    if not candidates:
-        return None
-    candidates.sort(key=lambda row: row["mtime_ns"], reverse=True)
-    selected = candidates[0]
-    return {
-        "receipt": selected["receipt"],
-        "contract": selected["contract"],
-        "required_rows": selected["required_rows"],
-        "signature": selected["signature"],
-        "policy": "stale_derivative_receipt_current_source_slice",
-    }
 
 
 def _required_bark_rows(contract, dependency):
@@ -1436,28 +1345,20 @@ def resolve_cluster_bark_source_spm(
                     if dependency is not None
                     else []
                 )
-            except (FileNotFoundError, ClusterAssemblyReceiptStaleError):
-                fallback = _stale_receipt_bark_contract(target, source)
-                if fallback is None:
-                    continue
-                receipt = fallback["receipt"]
-                contract = fallback["contract"]
-                dependency = _dependency_for_source(contract, source)
-                required_rows = fallback["required_rows"]
-                receipt_policy = fallback["policy"]
-            except ClusterAssemblyReceiptError as exc:
+            except (FileNotFoundError, ClusterAssemblyReceiptError) as exc:
                 raise ClusterBarkSourceResolutionError(
-                    f"Cluster Assembly receipt is invalid for {target}: {exc}"
+                    "No unambiguous hash-current Cluster Assembly authority "
+                    f"exists for {target}; run a live Cluster Assembly audit: "
+                    f"{exc}"
                 ) from exc
         if dependency is None:
-            if live_row is not None:
-                receipt_rows.append({
-                    "target_spm": str(target),
-                    "receipt": str(receipt),
-                    "policy": receipt_policy,
-                    "dependency_matched": False,
-                    "required_material_count": 0,
-                })
+            receipt_rows.append({
+                "target_spm": str(target),
+                "receipt": str(receipt),
+                "policy": receipt_policy,
+                "dependency_matched": False,
+                "required_material_count": 0,
+            })
             continue
         receipt_rows.append({
             "target_spm": str(target),
