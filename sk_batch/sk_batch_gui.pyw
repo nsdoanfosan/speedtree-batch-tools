@@ -3880,8 +3880,6 @@ class App:
         affinity=True,
         progress_callback=None,
         env=None,
-        timeout_start_marker=None,
-        wait_timeout=None,
     ):
         log_file = LOG_DIR / log_name
         proc = launch_limited(
@@ -3895,10 +3893,8 @@ class App:
             self.active_procs.add(proc)
         try:
             started = time.monotonic()
-            phase_started = None
-            runtime_deadline = started + timeout
-            wait_deadline = started + (
-                wait_timeout if wait_timeout is not None else timeout
+            deadline = (
+                None if timeout is None else started + timeout
             )
             next_progress = 0.0
             while proc.poll() is None:
@@ -3908,42 +3904,13 @@ class App:
                     raise RuntimeError("사용자 중지" + detail)
                 now = time.monotonic()
                 latest_line = ""
-                if (
-                    timeout_start_marker is not None
-                    or progress_callback is not None
-                ):
+                if progress_callback is not None:
                     latest_line = self._latest_log_line(log_file)
-                if (
-                    phase_started is None
-                    and timeout_start_marker
-                    and timeout_start_marker in latest_line
-                ):
-                    phase_started = now
-                    runtime_deadline = phase_started + timeout
-                deadline = (
-                    runtime_deadline
-                    if phase_started is not None or not timeout_start_marker
-                    else wait_deadline
-                )
-                if now > deadline:
+                if deadline is not None and now > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
-                    phase = (
-                        "실행"
-                        if phase_started is not None or not timeout_start_marker
-                        else "대기"
-                    )
-                    limit = (
-                        timeout
-                        if phase == "실행"
-                        else (
-                            wait_timeout
-                            if wait_timeout is not None
-                            else timeout
-                        )
-                    )
                     timeout_error = RuntimeError(
-                        f"{phase} 시간 초과({limit}s){detail} — 로그: {log_file}"
+                        f"시간 초과({timeout}s){detail} — 로그: {log_file}"
                     )
                     timeout_error.log_file = log_file
                     raise timeout_error
@@ -4939,14 +4906,13 @@ class App:
         material_code, material_log = self._run_limited(
             material_cmd,
             material_log_name,
-            self.cfg.get("speedtree_material_preflight_timeout", 900) + 30,
+            # speedtree_cli starts its own export timeout only after it owns
+            # the machine-wide Modeler gate. A second absolute parent timeout
+            # would incorrectly subtract queue time from that execution
+            # budget. This supervisor still owns Stop/Job cleanup.
+            None,
             affinity=False,
             progress_callback=report_material_progress,
-            timeout_start_marker=SPEEDTREE_SLOT_ACQUIRED_MARKER,
-            wait_timeout=self.cfg.get(
-                "speedtree_material_preflight_queue_timeout",
-                3600,
-            ),
         )
         material_result = load_job_report(material_report)
         return {

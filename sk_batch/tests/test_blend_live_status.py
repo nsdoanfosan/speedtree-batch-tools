@@ -2216,9 +2216,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             speedtree_cli.write_text("# test", encoding="utf-8")
             app.log = mock.Mock()
             commands = []
+            timeouts = []
 
             def fake_run(cmd, log_name, _timeout, **_kwargs):
                 commands.append(list(cmd))
+                timeouts.append(_timeout)
                 report = Path(cmd[cmd.index("--report") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
                 payload = {"status": "ok", "warnings": []}
@@ -2244,6 +2246,8 @@ class BlendLiveStatusTests(unittest.TestCase):
                 app._job_blender(str(spm), spm, item)
 
             self.assertEqual(len(commands), 2)
+            self.assertIsNone(timeouts[0])
+            self.assertEqual(timeouts[1], 3600)
             self.assertIn("speedtree_material_preflight.py", commands[0][1])
             self.assertTrue(any(
                 str(value).endswith("bwr_headless_job.py")

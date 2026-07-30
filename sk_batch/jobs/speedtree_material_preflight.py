@@ -68,6 +68,18 @@ SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
 MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
 
 
+def emit_progress_marker(marker, **fields):
+    """Best-effort observer output that never changes export behavior."""
+    payload = " ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+    )
+    try:
+        print(f"{marker} {payload}".rstrip(), flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spm", required=True)
@@ -446,25 +458,32 @@ def run_export(args, speedtree_cli):
     )
     original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
     if not callable(original_gate):
-        raise RuntimeError(
-            "SpeedTree export helper does not expose its shared export gate"
+        return speedtree_cli.export_target(
+            exe=Path(args.speedtree_exe),
+            spm=spm,
+            options=Path(args.fbx_ini),
+            kind="fbx",
+            target=target,
+            timeout_seconds=max(1, int(args.timeout)),
         )
 
     @contextmanager
     def reported_gate():
-        print(
-            f"{SPEEDTREE_SLOT_WAIT_MARKER} spm={spm.name}",
-            flush=True,
+        emit_progress_marker(
+            SPEEDTREE_SLOT_WAIT_MARKER,
+            spm=spm.name,
         )
         with original_gate():
-            print(
-                f"{SPEEDTREE_SLOT_ACQUIRED_MARKER} spm={spm.name}",
-                flush=True,
+            emit_progress_marker(
+                SPEEDTREE_SLOT_ACQUIRED_MARKER,
+                spm=spm.name,
             )
             yield
 
     # The helper still owns the one machine-wide mutex. This process-local
     # wrapper only exposes the exact wait/acquire boundary to the parent GUI.
+    # The material-preflight child is single-threaded and runs one export, so
+    # the temporary module binding cannot overlap another call in this process.
     speedtree_cli.speedtree_export_gate = reported_gate
     try:
         return speedtree_cli.export_target(
@@ -728,9 +747,9 @@ def main():
     args = parse_args()
     speedtree_spm = Path(args.spm).resolve()
     canonical_spm = Path(getattr(args, "canonical_spm", "") or args.spm).resolve()
-    print(
-        f"{MATERIAL_PREFLIGHT_START_MARKER} spm={canonical_spm.name}",
-        flush=True,
+    emit_progress_marker(
+        MATERIAL_PREFLIGHT_START_MARKER,
+        spm=canonical_spm.name,
     )
     report = {
         "status": "failed",
@@ -921,10 +940,10 @@ def main():
         report["error"] = report.get("error") or str(exc)
         report.setdefault("traceback", traceback.format_exc())
     write_report(args.report, report)
-    print(
-        f"{MATERIAL_PREFLIGHT_DONE_MARKER} "
-        f"spm={canonical_spm.name} status={report.get('status', 'failed')}",
-        flush=True,
+    emit_progress_marker(
+        MATERIAL_PREFLIGHT_DONE_MARKER,
+        spm=canonical_spm.name,
+        status=report.get("status", "failed"),
     )
     if report["status"] != "ok":
         raise SystemExit(1)

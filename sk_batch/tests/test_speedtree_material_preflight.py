@@ -198,6 +198,17 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertIn(preflight.SPEEDTREE_SLOT_WAIT_MARKER, text)
             self.assertIn(preflight.SPEEDTREE_SLOT_ACQUIRED_MARKER, text)
 
+            events.clear()
+            with mock.patch.object(
+                preflight,
+                "require_texture_skip_writing",
+            ), mock.patch("builtins.print", side_effect=OSError("closed log")):
+                result = preflight.run_export(args, helper)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
+            self.assertIs(helper.speedtree_export_gate, original_gate)
+
     def test_raw_source_is_structured_provisional_until_pcg_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

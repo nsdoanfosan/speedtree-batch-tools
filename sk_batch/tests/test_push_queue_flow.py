@@ -211,26 +211,20 @@ class PushQueueFlowTests(unittest.TestCase):
         close_job.assert_called_once_with(proc)
         self.assertNotIn(proc, app.active_procs)
 
-    def test_process_runner_starts_runtime_timeout_after_log_marker(self):
+    def test_process_runner_accepts_child_authoritative_timeout(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.cfg = {"process_poll_interval": 0.05}
-        marker = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
 
         class TimedProcess:
-            def __init__(self, log_file):
-                self.log_file = Path(log_file)
+            def __init__(self):
                 self.started = gui.time.monotonic()
-                self.marker_written = False
                 self.returncode = None
                 self.sk_log_handle = None
 
             def poll(self):
                 elapsed = gui.time.monotonic() - self.started
-                if elapsed >= 0.10 and not self.marker_written:
-                    self.log_file.write_text(marker + "\n", encoding="utf-8")
-                    self.marker_written = True
-                if elapsed >= 0.20:
+                if elapsed >= 0.15:
                     self.returncode = 0
                 return self.returncode
 
@@ -239,9 +233,7 @@ class PushQueueFlowTests(unittest.TestCase):
         ), mock.patch.object(
             gui,
             "launch_limited",
-            side_effect=lambda *_args, **kwargs: TimedProcess(
-                kwargs["log_file"]
-            ),
+            return_value=TimedProcess(),
         ), mock.patch.object(
             gui, "terminate_process_tree"
         ) as terminate, mock.patch.object(
@@ -250,18 +242,17 @@ class PushQueueFlowTests(unittest.TestCase):
             code, _log_file = app._run_limited(
                 ["worker.exe"],
                 "worker.log",
-                timeout=0.12,
-                timeout_start_marker=marker,
-                wait_timeout=0.5,
+                timeout=None,
             )
 
         self.assertEqual(code, 0)
         terminate.assert_not_called()
 
-    def test_process_runner_reports_queue_timeout_before_runtime_marker(self):
+    def test_process_runner_none_timeout_still_honors_stop(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.cfg = {"process_poll_interval": 0.05}
+        app.stop_flag.set()
         proc = mock.Mock()
         proc.poll.return_value = None
         proc.sk_log_handle = None
@@ -275,15 +266,11 @@ class PushQueueFlowTests(unittest.TestCase):
         ), mock.patch.object(
             gui, "close_process_kill_job", return_value=True
         ):
-            with self.assertRaisesRegex(RuntimeError, "대기 시간 초과"):
+            with self.assertRaisesRegex(RuntimeError, "사용자 중지"):
                 app._run_limited(
                     ["worker.exe"],
                     "worker.log",
-                    timeout=1,
-                    timeout_start_marker=(
-                        "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
-                    ),
-                    wait_timeout=0.05,
+                    timeout=None,
                 )
 
     @staticmethod

@@ -105,9 +105,6 @@ DEFAULT_CONFIG = {
     "spm_job_timeout": 7200,
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
-    # This bounds only the queue for the one machine-wide SpeedTree export
-    # slot. The 900-second export timer starts after the slot is acquired.
-    "speedtree_material_preflight_queue_timeout": 3600,
     "cluster_receipt_refresh_timeout": 600,
     "cluster_unit_probe": (
         r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
