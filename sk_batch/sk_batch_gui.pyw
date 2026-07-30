@@ -100,6 +100,7 @@ from spm_leaf_handoff_contract import (
     inspect_all_speedtree_material_export,
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
+    inspect_spm_mesh_file_references,
     leaf_contract_user_message,
     save_leaf_contract_cache,
     speedtree_stmat_path,
@@ -165,8 +166,82 @@ TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS = True
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
+MATERIAL_PREFLIGHT_START_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_START"
+MATERIAL_PREFLIGHT_STATIC_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_STATIC_DONE"
+)
 SPEEDTREE_SLOT_WAIT_MARKER = "SK_BATCH_SPEEDTREE_SLOT_WAIT"
 SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
+MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_EXPORT_DONE"
+)
+MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_INSPECTION_DONE"
+)
+MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_CONTRACT_DONE"
+)
+MATERIAL_PREFLIGHT_FAILED_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_FAILED"
+MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
+CLUSTER_LIVE_AUDIT_START_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_START"
+CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REVISION_OK"
+)
+CLUSTER_LIVE_AUDIT_REPORT_START_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REPORT_START"
+)
+CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_FOLDER_DONE"
+)
+CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REPORT_DONE"
+)
+CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_RECEIPT_START"
+)
+CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_RECEIPT_DONE"
+)
+CLUSTER_LIVE_AUDIT_FAILED_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_FAILED"
+CLUSTER_LIVE_AUDIT_DONE_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_DONE"
+
+
+def material_preflight_mesh_reference_block(spm):
+    """Return a read-only early block for a referenced missing external mesh."""
+    contract = inspect_spm_mesh_file_references(spm)
+    missing = list(contract.get("missing") or [])
+    if not missing:
+        return None
+    names = ", ".join(
+        str(row.get("filename") or "?")
+        for row in missing[:8]
+    )
+    if len(missing) > 8:
+        names += f" 외 {len(missing) - 8}개"
+    return {
+        "status": "blocked",
+        "stage": "speedtree_material_static_preflight",
+        "classification": "asset_external_mesh_path_missing",
+        "error": (
+            "SPM이 참조하는 외부 메시 FBX "
+            f"{len(missing)}개가 디스크에 없음 — {names}. "
+            "이 상태의 SpeedTree 익스포트는 타임아웃까지 멈추므로 "
+            "Cluster live audit와 재질 익스포트 전에 차단했습니다."
+        ),
+        "remediation": (
+            "SK Batch performs no source mutation. The item remains blocked "
+            "until every authored external Mesh Asset reference resolves."
+        ),
+        "mesh_file_reference_contract": contract,
+        "missing_external_meshes": [
+            {
+                "filename": str(row.get("filename") or ""),
+                "resolved_path": str(row.get("resolved_path") or ""),
+                "mesh_name": str(row.get("mesh_name") or ""),
+            }
+            for row in missing
+        ],
+    }
 
 
 def is_cluster_source_spm(spm):
@@ -2981,6 +3056,9 @@ class App:
             and not self.pending_batch_jobs
         ):
             self.batch_job_failures = []
+            # One queue drain owns one validated live-audit memo generation.
+            # Every lookup still re-fingerprints the production inputs.
+            self._reset_cluster_receipt_refresh_memo()
         self.batch_job_sequence += 1
         job = dict(job)
         job["id"] = self.batch_job_sequence
@@ -3044,7 +3122,7 @@ class App:
         self.active_push_transport = job["push_transport"]
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
-        self._reset_cluster_receipt_refresh_memo()
+        self._ensure_cluster_receipt_refresh_memo()
         self.stop_flag.clear()
         self.batch_progress.configure(value=0)
         pending = len(self.pending_batch_jobs)
@@ -3283,15 +3361,12 @@ class App:
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
             "_phase_failed_items",
-            "_cluster_receipt_refresh_memo_lock",
-            "_cluster_receipt_refresh_memo",
-            "_cluster_receipt_refresh_flights",
-            "_cluster_receipt_owner_locks",
         ):
             self.__dict__.pop(key, None)
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
+        self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
         if status == "stopped":
@@ -3837,10 +3912,13 @@ class App:
                     self._batch_done += 1
                     done = self._batch_done
                     active = self._batch_active
+                    failed = len(failed_items)
                 self.ui_queue.put(("batch_progress", (done, total)))
-                self.ui_queue.put(
-                    ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
-                )
+                self.ui_queue.put((
+                    "progress",
+                    f"{title} {done}/{total} · 실행 중 {active}개 "
+                    f"· 실패/차단 {failed}개",
+                ))
 
         # Independent jobs overlap inside a wave. Blender keeps a barrier
         # between Cluster sources and root assemblies so saved input hashes
@@ -3958,6 +4036,35 @@ class App:
         except OSError:
             return ""
 
+    @staticmethod
+    def _read_log_lines_since(log_file, offset=0, remainder=b""):
+        """Read each flushed child line exactly once without PIPE semantics."""
+        try:
+            with Path(log_file).open("rb") as handle:
+                size = handle.seek(0, 2)
+                if size < offset:
+                    offset = 0
+                    remainder = b""
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+        except OSError:
+            return offset, remainder, []
+        payload = remainder + chunk
+        if not payload:
+            return offset, b"", []
+        pieces = payload.splitlines(keepends=True)
+        if pieces and not pieces[-1].endswith((b"\n", b"\r")):
+            remainder = pieces.pop()
+        else:
+            remainder = b""
+        lines = [
+            piece.decode("utf-8", errors="replace").strip()
+            for piece in pieces
+            if piece.strip()
+        ]
+        return offset, remainder, lines
+
     def _run_limited(
         self,
         cmd,
@@ -3966,6 +4073,8 @@ class App:
         affinity=True,
         progress_callback=None,
         env=None,
+        inactivity_timeout=None,
+        inactivity_timeout_by_marker=None,
     ):
         log_file = LOG_DIR / log_name
         proc = launch_limited(
@@ -3982,6 +4091,31 @@ class App:
             deadline = (
                 None if timeout is None else started + timeout
             )
+            current_inactivity_timeout = (
+                None
+                if inactivity_timeout is None
+                else float(inactivity_timeout)
+            )
+            inactivity_deadline = (
+                None
+                if current_inactivity_timeout is None
+                else started + current_inactivity_timeout
+            )
+            last_progress = started
+            current_progress_marker = "process_start"
+            progress_rules = tuple(
+                (
+                    str(marker),
+                    None if limit is None else float(limit),
+                )
+                for marker, limit in (
+                    inactivity_timeout_by_marker or {}
+                ).items()
+            )
+            log_offset = 0
+            log_remainder = b""
+            latest_line = ""
+            latest_progress_line = ""
             next_progress = 0.0
             while proc.poll() is None:
                 if self.stop_flag.is_set():
@@ -3989,9 +4123,31 @@ class App:
                     detail = "" if tree_stopped else " (자식 프로세스 종료 확인 실패)"
                     raise RuntimeError("사용자 중지" + detail)
                 now = time.monotonic()
-                latest_line = ""
-                if progress_callback is not None:
-                    latest_line = self._latest_log_line(log_file)
+                if progress_callback is not None or progress_rules:
+                    (
+                        log_offset,
+                        log_remainder,
+                        new_lines,
+                    ) = self._read_log_lines_since(
+                        log_file,
+                        log_offset,
+                        log_remainder,
+                    )
+                    for line in new_lines:
+                        latest_line = line
+                        for marker, marker_timeout in progress_rules:
+                            if not line.startswith(marker):
+                                continue
+                            current_progress_marker = marker
+                            latest_progress_line = line
+                            current_inactivity_timeout = marker_timeout
+                            last_progress = now
+                            inactivity_deadline = (
+                                None
+                                if marker_timeout is None
+                                else now + marker_timeout
+                            )
+                            break
                 if deadline is not None and now > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
@@ -4000,10 +4156,32 @@ class App:
                     )
                     timeout_error.log_file = log_file
                     raise timeout_error
+                if (
+                    inactivity_deadline is not None
+                    and now > inactivity_deadline
+                ):
+                    tree_stopped = terminate_process_tree(proc)
+                    detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
+                    idle_seconds = int(max(0.0, now - last_progress))
+                    timeout_error = RuntimeError(
+                        "진행 없음 시간 초과("
+                        f"{current_inactivity_timeout:g}s) — 단계: "
+                        f"{current_progress_marker} · 마지막 진행 "
+                        f"{idle_seconds}s 전{detail} — 로그: {log_file}"
+                    )
+                    timeout_error.kind = "internal_error"
+                    timeout_error.timeout_kind = "child_progress_inactivity"
+                    timeout_error.progress_marker = current_progress_marker
+                    timeout_error.log_file = log_file
+                    raise timeout_error
                 if progress_callback is not None and now >= next_progress:
                     progress_callback(
                         now - started,
-                        latest_line,
+                        (
+                            latest_progress_line
+                            if progress_rules
+                            else latest_line
+                        ),
                     )
                     next_progress = now + 1.0
                 interval = float(self.cfg.get("process_poll_interval", 0.2))
@@ -4955,6 +5133,18 @@ class App:
             f"{spm.stem}_material_preflight_{stamp}.json"
         )
         material_log_name = f"{spm.stem}_material_preflight_{stamp}.log"
+        export_timeout = max(1, int(
+            self.cfg.get("speedtree_material_preflight_timeout", 900)
+        ))
+        stage_timeout = max(1, int(
+            self.cfg.get("child_stage_inactivity_timeout", 180)
+        ))
+        queue_timeout = max(1, int(
+            self.cfg.get("speedtree_material_preflight_queue_timeout", 3600)
+        ))
+        timeout_grace = max(1, int(
+            self.cfg.get("child_timeout_grace", 60)
+        ))
         material_cmd = [
             sys.executable,
             str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
@@ -4964,41 +5154,78 @@ class App:
             "--fbx-ini", str(fbx_ini),
             "--speedtree-cli", str(speedtree_cli),
             "--report", str(material_report),
-            "--timeout", str(
-                self.cfg.get("speedtree_material_preflight_timeout", 900)
-            ),
+            "--timeout", str(export_timeout),
         ]
-        last_progress = {"bucket": -1, "phase": ""}
+        last_progress = {
+            "bucket": -1,
+            "phase": "프로세스 시작",
+            "failure_logged": False,
+        }
+        phase_markers = (
+            (MATERIAL_PREFLIGHT_FAILED_MARKER, "실패 보고서 정리 중"),
+            (MATERIAL_PREFLIGHT_DONE_MARKER, "완료 처리 중"),
+            (MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER, "보고서 저장 중"),
+            (MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER, "계약 봉투 생성 중"),
+            (MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER, "재질/텍스처 검사 중"),
+            (SPEEDTREE_SLOT_ACQUIRED_MARKER, "SpeedTree 실행 중"),
+            (SPEEDTREE_SLOT_WAIT_MARKER, "SpeedTree 단일 슬롯 대기 중"),
+            (MATERIAL_PREFLIGHT_STATIC_DONE_MARKER, "정적 계약 완료"),
+            (MATERIAL_PREFLIGHT_START_MARKER, "정적 계약 검사 중"),
+        )
 
         def report_material_progress(elapsed, latest_line):
-            if SPEEDTREE_SLOT_ACQUIRED_MARKER in latest_line:
-                phase = "SpeedTree 실행 중"
-            elif SPEEDTREE_SLOT_WAIT_MARKER in latest_line:
-                phase = "SpeedTree 단일 슬롯 대기 중"
-            else:
-                phase = "계약 검사/캐시 확인 중"
+            for marker, label in phase_markers:
+                if latest_line.startswith(marker):
+                    last_progress["phase"] = label
+                    if (
+                        marker == MATERIAL_PREFLIGHT_FAILED_MARKER
+                        and not last_progress["failure_logged"]
+                    ):
+                        self.log(
+                            "재질 사전검사 child 실패 단계 보고: "
+                            f"{spm.name} · {latest_line}"
+                        )
+                        last_progress["failure_logged"] = True
+                    break
+            phase = last_progress["phase"]
             bucket = int(elapsed // 30)
             if (
                 bucket == last_progress["bucket"]
-                and phase == last_progress["phase"]
+                and phase == last_progress.get("reported_phase")
             ):
                 return
-            last_progress.update(bucket=bucket, phase=phase)
+            last_progress.update(
+                bucket=bucket,
+                reported_phase=phase,
+            )
             self.log(
-                f"재질 사전검사 진행: {spm.name} · {phase} "
+                f"재질 사전검사 heartbeat: {spm.name} · {phase} "
                 f"· 총 {int(elapsed)}초"
             )
 
         material_code, material_log = self._run_limited(
             material_cmd,
             material_log_name,
-            # speedtree_cli starts its own export timeout only after it owns
-            # the machine-wide Modeler gate. A second absolute parent timeout
-            # would incorrectly subtract queue time from that execution
-            # budget. This supervisor still owns Stop/Job cleanup.
+            # The child export timeout starts only after the machine-wide gate.
+            # Parent safety is therefore phase inactivity, never one combined
+            # queue+execution wall-clock deadline.
             None,
             affinity=False,
             progress_callback=report_material_progress,
+            inactivity_timeout=stage_timeout,
+            inactivity_timeout_by_marker={
+                MATERIAL_PREFLIGHT_START_MARKER: stage_timeout,
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER: stage_timeout,
+                SPEEDTREE_SLOT_WAIT_MARKER: queue_timeout,
+                SPEEDTREE_SLOT_ACQUIRED_MARKER: (
+                    export_timeout + timeout_grace
+                ),
+                MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER: stage_timeout,
+                MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER: stage_timeout,
+                MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER: stage_timeout,
+                MATERIAL_PREFLIGHT_FAILED_MARKER: stage_timeout,
+                MATERIAL_PREFLIGHT_DONE_MARKER: stage_timeout,
+            },
         )
         material_result = load_job_report(material_report)
         return {
@@ -5276,9 +5503,9 @@ class App:
     def _reset_cluster_receipt_refresh_memo(self):
         """Start one process-local Cluster audit memo generation.
 
-        A queued GUI job owns exactly one generation. Nothing is written to
-        disk, and starting the next queued job discards every successful
-        result and in-flight handle from the previous one.
+        One local queue drain owns one generation.  A hit is never trusted by
+        age alone: every caller re-fingerprints the production inputs and live
+        artifacts before reuse, and the memo is discarded when the queue drains.
         """
         self._cluster_receipt_refresh_memo_lock = threading.Lock()
         self._cluster_receipt_refresh_memo = {}
@@ -5299,6 +5526,8 @@ class App:
             )
 
     def _wait_cluster_receipt_refresh_flight(self, flight, spm):
+        started = time.monotonic()
+        next_heartbeat = started + 30.0
         while True:
             stop_flag = getattr(self, "stop_flag", None)
             if stop_flag is not None and stop_flag.is_set():
@@ -5310,7 +5539,13 @@ class App:
             try:
                 return flight.result(timeout=0.2)
             except FutureTimeoutError:
-                continue
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    self.log(
+                        "Cluster Assembly live audit shared-flight heartbeat: "
+                        f"{Path(spm).name} · {int(now - started)}초"
+                    )
+                    next_heartbeat = now + 30.0
 
     @staticmethod
     def _cluster_receipt_refresh_scope(spm):
@@ -5585,7 +5820,7 @@ class App:
         spm,
         stamp,
     ):
-        """Reuse one hash-current live audit inside the active GUI batch.
+        """Reuse one hash-current live audit inside the active queue drain.
 
         Successful raw audits only are memoized. Concurrent callers for the
         same owner/input share one Future; an execution exception reaches all
@@ -5885,7 +6120,12 @@ class App:
             expected_production_source_revision = str(
                 expected_manifest.content_hash
             ).casefold()
-            timeout = int(self.cfg.get("cluster_receipt_refresh_timeout", 600))
+            audit_timeout = max(1, int(
+                self.cfg.get("cluster_receipt_refresh_timeout", 600)
+            ))
+            stage_timeout = max(1, int(
+                self.cfg.get("child_stage_inactivity_timeout", 180)
+            ))
             audit_command = [
                 sys.executable,
                 str(audit_script),
@@ -5901,11 +6141,75 @@ class App:
             ]
             if not _persist_receipt:
                 audit_command.append("--no-receipt")
+            audit_progress = {
+                "bucket": -1,
+                "phase": "프로세스 시작",
+                "completed": "",
+            }
+            phase_markers = (
+                (CLUSTER_LIVE_AUDIT_FAILED_MARKER, "실패 보고서 정리 중"),
+                (CLUSTER_LIVE_AUDIT_DONE_MARKER, "완료 처리 중"),
+                (CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER, "보고서 저장 중"),
+                (CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER, "영수증 검증/기록 중"),
+                (CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER, "production revision 재검증 중"),
+                (CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER, "에셋 폴더 감사 중"),
+                (CLUSTER_LIVE_AUDIT_REPORT_START_MARKER, "live evidence 감사 중"),
+                (CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER, "설정/대상 로드 중"),
+                (CLUSTER_LIVE_AUDIT_START_MARKER, "production revision 검사 중"),
+            )
+
+            def report_live_audit_progress(elapsed, latest_line):
+                for marker, label in phase_markers:
+                    if latest_line.startswith(marker):
+                        audit_progress["phase"] = label
+                        if marker == CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER:
+                            fields = dict(
+                                token.split("=", 1)
+                                for token in latest_line.split()
+                                if "=" in token
+                            )
+                            audit_progress["completed"] = (
+                                f" · {fields.get('completed', '?')}/"
+                                f"{fields.get('total', '?')}"
+                            )
+                        break
+                bucket = int(elapsed // 30)
+                if (
+                    bucket == audit_progress["bucket"]
+                    and audit_progress["phase"]
+                    == audit_progress.get("reported_phase")
+                ):
+                    return
+                audit_progress.update(
+                    bucket=bucket,
+                    reported_phase=audit_progress["phase"],
+                )
+                self.log(
+                    "Cluster Assembly live audit heartbeat: "
+                    f"{spm.name} · {audit_progress['phase']}"
+                    f"{audit_progress['completed']} · 총 {int(elapsed)}초"
+                )
+
             code, log_file = self._run_limited(
                 audit_command,
                 f"{run_identity}.log",
-                timeout,
+                # A multi-folder audit may run longer than one folder budget as
+                # long as the child keeps publishing real progress.
+                None,
                 affinity=False,
+                progress_callback=report_live_audit_progress,
+                inactivity_timeout=stage_timeout,
+                inactivity_timeout_by_marker={
+                    CLUSTER_LIVE_AUDIT_START_MARKER: stage_timeout,
+                    CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER: stage_timeout,
+                    CLUSTER_LIVE_AUDIT_REPORT_START_MARKER: audit_timeout,
+                    CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER: audit_timeout,
+                    CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER: stage_timeout,
+                    CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER: audit_timeout,
+                    CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER: stage_timeout,
+                    CLUSTER_LIVE_AUDIT_FAILED_MARKER: stage_timeout,
+                    CLUSTER_LIVE_AUDIT_DONE_MARKER: stage_timeout,
+                },
             )
 
             payload_error = None
@@ -6460,15 +6764,32 @@ class App:
                     "leaf_reference_contract": contract,
                 },
             )
-        cluster_receipt_resolution = None
-        if not cluster_source:
-            # A current blend is not enough for an owner Tree.  Refresh the
-            # live Cluster relationship first so a missing Assembly manifest
-            # invalidates the early Repair skip instead of being silently
-            # treated as a completed non-Assembly asset.
-            cluster_receipt_resolution = (
-                self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
+        mesh_block = material_preflight_mesh_reference_block(speedtree_spm)
+        if mesh_block is not None:
+            self.log(
+                f"  [② 조기 차단] {spm.name}: {mesh_block['error']}"
             )
+            raise BatchItemError(
+                mesh_block["error"],
+                kind="data_error",
+                report=mesh_block,
+            )
+        cluster_receipt_resolution = None
+        cluster_receipt_resolved = False
+
+        def resolve_cluster_receipt_once():
+            nonlocal cluster_receipt_resolution, cluster_receipt_resolved
+            if not cluster_receipt_resolved:
+                cluster_receipt_resolution = (
+                    self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
+                )
+                cluster_receipt_resolved = True
+            return cluster_receipt_resolution
+
+        if not cluster_source:
+            # A current blend is not enough for an owner Tree.  Resolve the
+            # live Cluster relationship before authorizing an early Repair skip.
+            resolve_cluster_receipt_once()
         if not self.force_rerun:
             live_contract = cluster_receipt_resolution_uses_live_audit(
                 cluster_receipt_resolution
@@ -6658,13 +6979,10 @@ class App:
                 log_file=material_log,
                 report_file=material_report,
             )
-        if not cluster_receipt_resolution_uses_live_audit(
-            cluster_receipt_resolution
-        ):
-            cluster_receipt_resolution = self._refresh_stale_cluster_receipt(
-                speedtree_spm,
-                stamp,
-            )
+        # Cluster sources resolve here; owner Trees reuse the result that
+        # was already required for the Repair-current decision.  The local
+        # resolver guarantees one runtime live-audit resolution per item.
+        cluster_receipt_resolution = resolve_cluster_receipt_once()
         if cluster_receipt_resolution_uses_live_audit(
             cluster_receipt_resolution
         ):

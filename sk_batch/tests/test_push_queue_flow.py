@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections import deque
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
@@ -272,6 +273,189 @@ class PushQueueFlowTests(unittest.TestCase):
                     "worker.log",
                     timeout=None,
                 )
+
+    def test_process_runner_resets_inactivity_only_on_progress_marker(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"process_poll_interval": 0.05}
+        clock = {"now": 0.0}
+
+        class TimedProcess:
+            def __init__(self, log_file):
+                self.log_file = Path(log_file)
+                self.returncode = None
+                self.sk_log_handle = None
+                self.wrote_progress = False
+
+            def poll(self):
+                if clock["now"] >= 0.06 and not self.wrote_progress:
+                    self.log_file.write_text("PHASE_TWO\n", encoding="utf-8")
+                    self.wrote_progress = True
+                if clock["now"] >= 0.14:
+                    self.returncode = 0
+                return self.returncode
+
+        def launch(_cmd, _cfg, **kwargs):
+            return TimedProcess(kwargs["log_file"])
+
+        def sleep(seconds):
+            clock["now"] += seconds
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir)
+        ), mock.patch.object(
+            gui, "launch_limited", side_effect=launch
+        ), mock.patch.object(
+            gui.time, "monotonic", side_effect=lambda: clock["now"]
+        ), mock.patch.object(
+            gui.time, "sleep", side_effect=sleep
+        ), mock.patch.object(
+            gui, "terminate_process_tree"
+        ) as terminate, mock.patch.object(
+            gui, "close_process_kill_job", return_value=True
+        ):
+            code, _log_file = app._run_limited(
+                ["worker.exe"],
+                "worker.log",
+                timeout=None,
+                inactivity_timeout=0.08,
+                inactivity_timeout_by_marker={"PHASE_TWO": 0.08},
+            )
+
+        self.assertEqual(code, 0)
+        terminate.assert_not_called()
+
+    def test_process_runner_heartbeat_text_does_not_reset_inactivity(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"process_poll_interval": 0.05}
+        clock = {"now": 0.0}
+
+        class StalledProcess:
+            def __init__(self, log_file):
+                self.log_file = Path(log_file)
+                self.returncode = None
+                self.sk_log_handle = None
+                self.sequence = 0
+
+            def poll(self):
+                if self.returncode is None:
+                    self.sequence += 1
+                    with self.log_file.open("a", encoding="utf-8") as handle:
+                        handle.write(f"HEARTBEAT REAL_PROGRESS {self.sequence}\n")
+                return self.returncode
+
+        process_holder = {}
+
+        def launch(_cmd, _cfg, **kwargs):
+            process_holder["value"] = StalledProcess(kwargs["log_file"])
+            return process_holder["value"]
+
+        def sleep(seconds):
+            clock["now"] += seconds
+
+        def terminate(process):
+            process.returncode = -9
+            return True
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir)
+        ), mock.patch.object(
+            gui, "launch_limited", side_effect=launch
+        ), mock.patch.object(
+            gui.time, "monotonic", side_effect=lambda: clock["now"]
+        ), mock.patch.object(
+            gui.time, "sleep", side_effect=sleep
+        ), mock.patch.object(
+            gui, "terminate_process_tree", side_effect=terminate
+        ), mock.patch.object(
+            gui, "close_process_kill_job", return_value=True
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "진행 없음 시간 초과.*process_start",
+            ) as raised:
+                app._run_limited(
+                    ["worker.exe"],
+                    "worker.log",
+                    timeout=None,
+                    inactivity_timeout=0.08,
+                    inactivity_timeout_by_marker={"REAL_PROGRESS": 0.08},
+                )
+
+        self.assertEqual(
+            raised.exception.timeout_kind,
+            "child_progress_inactivity",
+        )
+
+    def test_blender_job_has_one_live_audit_call_after_static_mesh_gate(self):
+        tree = ast.parse(
+            (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(encoding="utf-8")
+        )
+        app_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "App"
+        )
+        job = next(
+            node
+            for node in app_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_job_blender"
+        )
+        refresh_calls = [
+            node
+            for node in ast.walk(job)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_refresh_stale_cluster_receipt"
+        ]
+        mesh_calls = [
+            node
+            for node in ast.walk(job)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "material_preflight_mesh_reference_block"
+        ]
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertEqual(len(mesh_calls), 1)
+        self.assertLess(mesh_calls[0].lineno, refresh_calls[0].lineno)
+
+    def test_next_queued_job_keeps_live_audit_memo_generation(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.pending_batch_jobs = deque()
+        app.active_batch_job = None
+        app.batch_progress = mock.Mock()
+        app.batch_progress_var = mock.Mock()
+        app._set_batch_queue_controls = mock.Mock()
+        app.spm_calibration_signature = None
+        app.legacy_spm_calibration_signature = None
+        app._reset_cluster_receipt_refresh_memo()
+        app._cluster_receipt_refresh_memo["validated"] = {"result": True}
+        app.pending_batch_jobs.append({
+            "id": 2,
+            "cfg": {},
+            "force_rerun": False,
+            "push_transport": "rpc",
+            "inventory": {},
+            "targets": [],
+            "label": "queued",
+        })
+
+        class FakeThread:
+            def start(self):
+                return None
+
+        with mock.patch.object(
+            gui, "calibration_settings_signature", return_value="current"
+        ), mock.patch.object(
+            gui, "legacy_calibration_settings_signature", return_value=None
+        ), mock.patch.object(
+            gui.threading, "Thread", return_value=FakeThread()
+        ):
+            app._start_next_batch_job()
+
+        self.assertIn("validated", app._cluster_receipt_refresh_memo)
 
     @staticmethod
     def targets(*names):

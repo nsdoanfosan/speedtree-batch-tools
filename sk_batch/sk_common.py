@@ -105,6 +105,11 @@ DEFAULT_CONFIG = {
     "spm_job_timeout": 7200,
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
+    # These are inactivity budgets, not one queue+runtime wall-clock budget.
+    # A child progress marker resets the applicable phase budget.
+    "speedtree_material_preflight_queue_timeout": 3600,
+    "child_stage_inactivity_timeout": 180,
+    "child_timeout_grace": 60,
     "cluster_receipt_refresh_timeout": 600,
     "cluster_unit_probe": (
         r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"

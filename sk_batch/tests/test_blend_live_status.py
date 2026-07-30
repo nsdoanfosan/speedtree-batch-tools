@@ -2336,7 +2336,22 @@ class BlendLiveStatusTests(unittest.TestCase):
                 command[command.index("--target-mesh") + 1],
                 "Tree_elm_01",
             )
-            self.assertEqual(app._run_limited.call_args.args[2], 321)
+            self.assertIsNone(app._run_limited.call_args.args[2])
+            progress_limits = app._run_limited.call_args.kwargs[
+                "inactivity_timeout_by_marker"
+            ]
+            self.assertEqual(
+                progress_limits[gui.CLUSTER_LIVE_AUDIT_REPORT_START_MARKER],
+                321,
+            )
+            self.assertEqual(
+                progress_limits[gui.CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER],
+                321,
+            )
+            self.assertEqual(
+                progress_limits[gui.CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER],
+                321,
+            )
             self.assertTrue(any(
                 "live contract 검증 완료" in call.args[0]
                 for call in app.log.call_args_list

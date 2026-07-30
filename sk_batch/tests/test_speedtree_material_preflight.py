@@ -735,10 +735,23 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
             )
 
-            exited, export_mock = self.run_preflight(spm, report_path)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exited, export_mock = self.run_preflight(spm, report_path)
 
             self.assertTrue(exited)
             export_mock.assert_not_called()
+            progress = output.getvalue()
+            self.assertIn(preflight.MATERIAL_PREFLIGHT_START_MARKER, progress)
+            self.assertIn(
+                preflight.MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                progress,
+            )
+            self.assertIn(
+                preflight.MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER,
+                progress,
+            )
+            self.assertIn(preflight.MATERIAL_PREFLIGHT_DONE_MARKER, progress)
             report = json.loads(report_path.read_text(encoding="utf-8"))
             envelope = report["speedtree_pipeline_contract"]
             self.assertEqual(report["status"], "blocked")

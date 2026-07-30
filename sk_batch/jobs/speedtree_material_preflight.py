@@ -63,8 +63,21 @@ from speedtree_pipeline_contract import (  # noqa: E402
 )
 
 MATERIAL_PREFLIGHT_START_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_START"
+MATERIAL_PREFLIGHT_STATIC_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_STATIC_DONE"
+)
 SPEEDTREE_SLOT_WAIT_MARKER = "SK_BATCH_SPEEDTREE_SLOT_WAIT"
 SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
+MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_EXPORT_DONE"
+)
+MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_INSPECTION_DONE"
+)
+MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER = (
+    "SK_BATCH_MATERIAL_PREFLIGHT_CONTRACT_DONE"
+)
+MATERIAL_PREFLIGHT_FAILED_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_FAILED"
 MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
 STMAT_MAP_INDEX_SPACE = "stmat_xml_map_order_v1"
 SOURCE_SPM_MAP_INDEX_SPACE = "source_spm_map_order_v1"
@@ -536,6 +549,14 @@ def run_export(args, speedtree_cli):
     )
     original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
     if not callable(original_gate):
+        # Older helpers do not expose the shared gate.  Preserve their existing
+        # execution behavior, but still tell the parent that the child has
+        # entered the child-authoritative export timeout phase.
+        emit_progress_marker(
+            SPEEDTREE_SLOT_ACQUIRED_MARKER,
+            spm=spm.name,
+            gate="unavailable",
+        )
         return speedtree_cli.export_target(
             exe=Path(args.speedtree_exe),
             spm=spm,
@@ -837,7 +858,9 @@ def main():
         "contract_kind": PREFLIGHT_CONTRACT_KIND,
         "schema_version": PREFLIGHT_SCHEMA_VERSION,
     }
+    progress_stage = "startup"
     try:
+        progress_stage = "static_contract"
         # Invalid Tree User data is a real authoring error.  Material labels
         # such as Green/Yellow/Dead never substitute for this model-wide key.
         report["instance_profile"] = read_tree_instance_profile(speedtree_spm)
@@ -851,6 +874,11 @@ def main():
         if not leaf_ok:
             report["status"] = "blocked"
             report["error"] = leaf_message
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="blocked",
+            )
         elif missing_mesh_files:
             names = ", ".join(
                 str(row.get("filename") or "?")
@@ -884,8 +912,25 @@ def main():
                 }
                 for row in missing_mesh_files
             ]
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="blocked",
+            )
         else:
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="ok",
+            )
+            progress_stage = "speedtree_export"
             report["speedtree_export"] = run_export(args, speedtree_cli)
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="ok",
+            )
+            progress_stage = "material_inspection"
             material = inspect_speedtree_material_export(
                 speedtree_spm, leaf_contract
             )
@@ -1006,17 +1051,41 @@ def main():
                         "SpeedTree 텍스처 사전검사 실패 — "
                         + str(textures.get("status") or "unknown")
                     )
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER,
+                spm=canonical_spm.name,
+                status=report.get("status", "failed"),
+            )
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = str(exc)
         report["traceback"] = traceback.format_exc()
+        emit_progress_marker(
+            MATERIAL_PREFLIGHT_FAILED_MARKER,
+            spm=canonical_spm.name,
+            stage=progress_stage,
+            error=type(exc).__name__,
+        )
     try:
+        progress_stage = "pipeline_contract"
         attach_pipeline_contract(report, speedtree_spm)
+        emit_progress_marker(
+            MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER,
+            spm=canonical_spm.name,
+            status=report.get("status", "failed"),
+        )
     except Exception as exc:
         report["status"] = "failed"
         report["pipeline_contract_error"] = str(exc)
         report["error"] = report.get("error") or str(exc)
         report.setdefault("traceback", traceback.format_exc())
+        emit_progress_marker(
+            MATERIAL_PREFLIGHT_FAILED_MARKER,
+            spm=canonical_spm.name,
+            stage=progress_stage,
+            error=type(exc).__name__,
+        )
+    progress_stage = "report_write"
     write_report(args.report, report)
     emit_progress_marker(
         MATERIAL_PREFLIGHT_DONE_MARKER,

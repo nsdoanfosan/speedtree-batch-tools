@@ -183,6 +183,39 @@ COMMON_BARK_END_RE = re.compile(
     r"^m_bark_common_(?!end_).+_end_0*(\d+)$", re.IGNORECASE)
 GENERIC_MATERIAL_NAME_RE = re.compile(
     r"^(?:m_)?material(?:\s+copy)?(?:\s*\d+)?$", re.IGNORECASE)
+CLUSTER_LIVE_AUDIT_START_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_START"
+CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REVISION_OK"
+)
+CLUSTER_LIVE_AUDIT_REPORT_START_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REPORT_START"
+)
+CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_FOLDER_DONE"
+)
+CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_REPORT_DONE"
+)
+CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_RECEIPT_START"
+)
+CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER = (
+    "SK_BATCH_CLUSTER_LIVE_AUDIT_RECEIPT_DONE"
+)
+CLUSTER_LIVE_AUDIT_FAILED_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_FAILED"
+CLUSTER_LIVE_AUDIT_DONE_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_DONE"
+
+
+def emit_progress_marker(marker, **fields):
+    """Best-effort stdout protocol for the supervising SK Batch process."""
+    payload = " ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+    )
+    try:
+        print(f"{marker} {payload}".rstrip(), flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def read_maybe_gzip_text(path):
@@ -6319,6 +6352,11 @@ def main():
         ),
     )
     args = parser.parse_args()
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_START_MARKER,
+        target_count=len(args.target or []),
+        target_mesh_count=len(args.target_mesh or []),
+    )
     expected_revision = str(
         args.expected_production_source_revision or ""
     ).strip().casefold()
@@ -6330,6 +6368,11 @@ def main():
         revision_started,
     )
     if expected_revision and not revision_state["matches_expected"]:
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
+            stage="production_source_revision",
+            error="revision_mismatch",
+        )
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "status": "failed",
@@ -6345,18 +6388,52 @@ def main():
         }
         write_report_outputs(report, args.json_path, args.csv_path)
         raise SystemExit(2)
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER,
+        revision=revision_started.content_hash,
+    )
     cfg = load_config()
     if args.prepare_sk:
         results = [prepare_sk(path, args.prepare_target_mesh, dry_run=args.dry_run) for path in args.prepare_sk]
         print(json.dumps({"prepare_sk": results}, indent=2, ensure_ascii=False))
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_DONE_MARKER,
+            status="prepare_sk",
+        )
         return
     pcg_targets = load_pcg_targets(args.pcg_targets) if args.pcg_targets else None
-    report = make_report(
-        cfg,
-        args.target,
-        include_refs=args.include_refs,
-        pcg_targets=pcg_targets,
-        target_mesh_names=args.target_mesh,
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_REPORT_START_MARKER,
+        target_count=len(args.target or []),
+    )
+
+    def report_progress(completed, total, folder):
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER,
+            completed=completed,
+            total=total,
+            folder=Path(folder).name,
+        )
+
+    try:
+        report = make_report(
+            cfg,
+            args.target,
+            include_refs=args.include_refs,
+            pcg_targets=pcg_targets,
+            target_mesh_names=args.target_mesh,
+            progress_callback=report_progress,
+        )
+    except Exception as exc:
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
+            stage="asset_audit",
+            error=type(exc).__name__,
+        )
+        raise
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER,
+        total=(report.get("summary") or {}).get("total", 0),
     )
     revision_finished = production_source_manifest(BATCH_TOOLS_DIR)
     revision_state = production_source_revision_state(
@@ -6369,6 +6446,11 @@ def main():
         not revision_state["matches_expected"]
         or not revision_state["stable"]
     ):
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
+            stage="production_source_revision",
+            error="revision_changed",
+        )
         report["status"] = "failed"
         report["stage"] = "production_source_revision"
         report["error"] = (
@@ -6384,6 +6466,10 @@ def main():
     # receipt self-validation failure must not turn clean source data into a
     # failed audit.  Callers can continue with the live contract embedded in
     # this report and retry persistence on a later run.
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_RECEIPT_START_MARKER,
+        requested=not args.no_receipt,
+    )
     if args.no_receipt:
         report["cluster_assembly_receipt_persistence"] = {
             "status": "not_requested",
@@ -6396,8 +6482,17 @@ def main():
         }
     else:
         persist_cluster_assembly_receipts_safely(report)
+    persistence = report.get("cluster_assembly_receipt_persistence") or {}
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER,
+        status=persistence.get("status", "unknown"),
+    )
     save_spm_analysis_cache()
     write_report_outputs(report, args.json_path, args.csv_path)
+    emit_progress_marker(
+        CLUSTER_LIVE_AUDIT_DONE_MARKER,
+        status=report.get("status", "ok"),
+    )
 
 
 if __name__ == "__main__":

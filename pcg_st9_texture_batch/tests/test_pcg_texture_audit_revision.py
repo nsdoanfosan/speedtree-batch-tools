@@ -1,7 +1,9 @@
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -154,6 +156,65 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 finished.content_hash,
             )
             self.assertFalse(revision["stable"])
+
+    def test_cli_publishes_folder_progress_and_stage_markers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "audit.json"
+            expected = (
+                audit._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+            )
+            report = {
+                "generated_at": "test",
+                "config": {},
+                "summary": {"total": 2, "by_status": {"ok": 2}},
+                "items": [
+                    {"name": "tree_a", "status": "ok"},
+                    {"name": "tree_b", "status": "ok"},
+                ],
+            }
+
+            def make_report(*_args, **kwargs):
+                progress = kwargs["progress_callback"]
+                progress(1, 2, Path("Tree_A"))
+                progress(2, 2, Path("Tree_B"))
+                return report
+
+            output = io.StringIO()
+            with mock.patch.object(
+                audit, "load_config", return_value={}
+            ), mock.patch.object(
+                audit, "make_report", side_effect=make_report
+            ), mock.patch.object(
+                audit, "save_spm_analysis_cache"
+            ), redirect_stdout(output):
+                self._run_main(
+                    "--expected-production-source-revision",
+                    expected,
+                    "--no-receipt",
+                    "--json",
+                    str(report_path),
+                )
+
+            progress = output.getvalue()
+            self.assertIn(audit.CLUSTER_LIVE_AUDIT_START_MARKER, progress)
+            self.assertIn(
+                audit.CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER,
+                progress,
+            )
+            self.assertIn(
+                audit.CLUSTER_LIVE_AUDIT_REPORT_START_MARKER,
+                progress,
+            )
+            self.assertIn(
+                f"{audit.CLUSTER_LIVE_AUDIT_FOLDER_DONE_MARKER} "
+                "completed=1 total=2 folder=Tree_A",
+                progress,
+            )
+            self.assertIn(
+                audit.CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER,
+                progress,
+            )
+            self.assertIn(audit.CLUSTER_LIVE_AUDIT_DONE_MARKER, progress)
 
 
 if __name__ == "__main__":
