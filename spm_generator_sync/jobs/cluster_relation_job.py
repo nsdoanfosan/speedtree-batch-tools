@@ -120,26 +120,26 @@ def load_normalization_recipe(path, blend, requested):
     return payload
 
 
-def validate_recipe_registry_contract(recipe, registered_paths):
-    """Require one explicit material binding for every effective ON target."""
+def validate_recipe_registry_contract(recipe, effective_paths):
+    """Return bindings for exactly the requested live relation slice."""
     if not recipe:
         raise RuntimeError(
             "Cluster relationship Sync requires a normalization recipe."
         )
-    registered = [key(path) for path in registered_paths]
+    effective = [key(path) for path in effective_paths]
     recipe_targets = [key(path) for path in recipe.get("target_spms") or []]
     bindings = recipe.get("target_material_bindings") or []
     binding_targets = [key(row.get("target_spm")) for row in bindings]
     if (
-        len(registered) != len(set(registered))
+        len(effective) != len(set(effective))
         or len(recipe_targets) != len(set(recipe_targets))
         or len(binding_targets) != len(set(binding_targets))
-        or set(recipe_targets) != set(registered)
-        or set(binding_targets) != set(registered)
+        or set(recipe_targets) != set(binding_targets)
+        or not set(effective).issubset(set(recipe_targets))
     ):
         raise RuntimeError(
-            "Cluster normalization recipe, material bindings, and Atlas "
-            "target registry must describe the same effective ON target set."
+            "Cluster normalization recipe must contain one material binding "
+            "for every requested live relation target."
         )
     for binding in bindings:
         if binding.get("connect_generators") not in {True, False}:
@@ -147,7 +147,8 @@ def validate_recipe_registry_contract(recipe, registered_paths):
                 "Cluster normalization material binding must declare "
                 "connect_generators as an explicit boolean."
             )
-    return {key(row["target_spm"]): row for row in bindings}
+    by_target = {key(row["target_spm"]): row for row in bindings}
+    return {target: by_target[target] for target in effective}
 
 
 def normalize_cluster_blend(recipe):
@@ -335,7 +336,12 @@ def normalize_cluster_blend(recipe):
     }
 
 
-def configure_cluster_export_properties(props, recipe):
+def configure_cluster_export_properties(
+    props,
+    recipe,
+    *,
+    first_target_spm=None,
+):
     """Rehydrate Atlas writer settings from the content-addressed recipe.
 
     A current normalization receipt can skip the Blender rebuild, so relying on
@@ -373,7 +379,9 @@ def configure_cluster_export_properties(props, recipe):
 
     unit_probe_path = Path(recipe["unit_probe"]).expanduser().absolute()
     unit_probe = json.loads(unit_probe_path.read_text(encoding="utf-8"))
-    first_target = str(recipe["first_target_spm"])
+    first_target = str(
+        first_target_spm or recipe["first_target_spm"]
+    )
     first_binding = next(
         (
             row
@@ -420,7 +428,12 @@ def configure_cluster_export_properties(props, recipe):
     }
 
 
-def apply_recipe_source_material_mappings(props, recipe):
+def apply_recipe_source_material_mappings(
+    props,
+    recipe,
+    *,
+    effective_targets=None,
+):
     if not recipe:
         return {"applied": [], "preserved": []}
     raw_text = str(
@@ -432,6 +445,11 @@ def apply_recipe_source_material_mappings(props, recipe):
             "Source material mapping JSON must be an object keyed by target SPM path."
         )
     existing_by_key = {key(path): path for path in mapping}
+    effective_keys = (
+        {key(path) for path in effective_targets}
+        if effective_targets is not None
+        else None
+    )
     applied = []
     preserved = []
     assets_only = []
@@ -441,6 +459,11 @@ def apply_recipe_source_material_mappings(props, recipe):
             raise RuntimeError(
                 "Cluster normalization material binding has no target SPM."
             )
+        if (
+            effective_keys is not None
+            and key(target) not in effective_keys
+        ):
+            continue
         previous_key = existing_by_key.get(key(target))
         if binding.get("connect_generators") is not True:
             if previous_key is not None:
@@ -491,72 +514,17 @@ def apply_recipe_source_material_mappings(props, recipe):
     }
 
 
-def relation_manifest_requires_pre_export_cleanup(manifest):
-    """Return whether a manifest records an actual relationship to detach.
-
-    A scope manifest can also describe a plain Atlas/Cluster material export
-    with no Generator relationship yet.  Removing that scope before an
-    in-place source-material adoption deletes the very Material_v8 that the
-    adoption must snapshot and reuse.
-    """
-    if not isinstance(manifest, dict):
-        return False
-    adoption = manifest.get("source_material_adoption")
-    if isinstance(adoption, dict) and adoption:
-        return True
-    connection = manifest.get("generator_connection")
-    if not isinstance(connection, dict):
-        return False
-    return bool(
-        connection.get("requested") is True
-        or connection.get("complete") is True
-        or connection.get("bindings")
-    )
-
-
-def cleanup_existing_relation_for_rebuild(
-    blend,
-    target,
-    *,
-    target_scope_manifests_for_blend,
-    remove_blend_target_from_spm,
-):
-    """Detach a prior relationship, while preserving a plain export baseline."""
-    manifests = target_scope_manifests_for_blend(target, blend)
-    if not any(
-        relation_manifest_requires_pre_export_cleanup(manifest)
-        for manifest in manifests
-    ):
-        return {
-            "status": "not_required_no_active_relation",
-            "spm": str(target),
-            "backup": None,
-            "scope_manifests": [
-                str(manifest.get("_scope_manifest_path") or "")
-                for manifest in manifests
-            ],
-        }
-    return remove_blend_target_from_spm(
-        blend,
-        target,
-        preserve_scope_history=True,
-    )
-
-
 def sync_targets(blend, requested, normalization_recipe=None):
     if key(bpy.data.filepath) != key(blend):
         raise RuntimeError(
             f"Loaded blend differs from requested Cluster blend: {bpy.data.filepath}"
         )
     from atlas_leaf_mesh_builder.props import (
-        save_spm_target_registry,
         sync_spm_target_registry,
     )
     from atlas_leaf_mesh_builder.speedtree import (
         export_or_update_speedtree_spm_targets,
         extend_source_material_adoptions_for_targets,
-        remove_blend_target_from_spm,
-        target_scope_manifests_for_blend,
     )
     from atlas_leaf_mesh_builder.target_registry import load_target_registry
 
@@ -565,6 +533,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
     export_configuration = configure_cluster_export_properties(
         props,
         normalization_recipe,
+        first_target_spm=requested[0],
     )
     registry = load_target_registry(blend)
     if registry is None:
@@ -583,15 +552,16 @@ def sync_targets(blend, requested, normalization_recipe=None):
         raise RuntimeError("Blender Atlas target list did not match the external JSON")
     bindings_by_key = validate_recipe_registry_contract(
         normalization_recipe,
-        registered_paths,
+        requested,
     )
     recipe_mapping_update = apply_recipe_source_material_mappings(
         props,
         normalization_recipe,
+        effective_targets=requested,
     )
     connection_targets = [
         path
-        for path in registered_paths
+        for path in requested
         if bindings_by_key[key(path)].get("connect_generators") is True
     ]
     if connection_targets:
@@ -608,30 +578,31 @@ def sync_targets(blend, requested, normalization_recipe=None):
             "added": [],
             "preserved": [],
             "skipped_assets_only": [
-                str(path) for path in registered_paths
+                str(path) for path in requested
             ],
         }
-    # Rebuild existing same-blend connections from their recorded authored
-    # baseline before exporting the new output set.  Otherwise an adopted
-    # material refresh can transiently combine Generator slots that still
-    # point at the previous generated Mesh IDs with the original source
-    # cutout ordinal list, failing before the exact persisted bindings have a
-    # chance to retarget them.  Removal is receipt-scoped and fails closed on
-    # drift; the host transaction snapshots every effective target first.
-    pre_export_relation_cleanup = [
-        cleanup_existing_relation_for_rebuild(
-            blend,
-            path,
-            target_scope_manifests_for_blend=target_scope_manifests_for_blend,
-            remove_blend_target_from_spm=remove_blend_target_from_spm,
+    # Normalize each requested relation in place. The previous manifest and
+    # Generator bindings are the migration input; detaching a valid relation
+    # first destroys that input and turns an idempotent refresh into a second,
+    # incompatible bootstrap path.
+    #
+    # The external registry remains the persistent ON/OFF authority. Stage only
+    # this transaction's exact live relation targets in Blender so the addon
+    # cannot widen execution back to unrelated registered rows.
+    props.speedtree_spm_items.clear()
+    for path in requested:
+        item = props.speedtree_spm_items.add()
+        item.path = str(path)
+    try:
+        results = export_or_update_speedtree_spm_targets(
+            props,
+            preserve_explicit_material_name=True,
         )
-        for path in connection_targets
-    ]
-    save_spm_target_registry(props)
-    results = export_or_update_speedtree_spm_targets(
-        props,
-        preserve_explicit_material_name=True,
-    )
+    finally:
+        props.speedtree_spm_items.clear()
+        for path in registered_paths:
+            item = props.speedtree_spm_items.add()
+            item.path = str(path)
     completed = {key(result.get("spm_path")): result for result in results}
     unresolved = [str(path) for path in requested if key(path) not in completed]
     if unresolved:
@@ -647,7 +618,6 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "cluster_export_configuration": export_configuration,
         "recipe_source_material_mapping_update": recipe_mapping_update,
         "source_material_mapping_update": mapping_update,
-        "pre_export_relation_cleanup": pre_export_relation_cleanup,
         "cluster_source_pipeline": cluster_source_pipeline,
         "results": results,
     }

@@ -131,6 +131,9 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         }]
         app.refresh = mock.Mock()
         app.status_var = mock.Mock()
+        app._start_job = lambda _label, work, done, **_kwargs: done(
+            work(lambda *_args: None)
+        )
 
         result = {"color_updates": 7}
         with mock.patch.object(GUI.engine, "promote_master", return_value=result) as promote:
@@ -467,6 +470,15 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             "target_spms": [current, unrelated],
             "all_synced": False,
         }]
+        app._connected_scope_from_board = mock.Mock(return_value={
+            "groups": [],
+            "cluster_rows": [{
+                "blend": blend,
+                "folder_relation": "on",
+                "on_target_spms": [current],
+            }],
+            "skipped": [],
+        })
 
         def run_now(_label, work, done, **_kwargs):
             done(work(lambda *_args: None))
@@ -486,7 +498,9 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             return_value={"status": "ok", "mode": "sync"},
         ) as refresh, mock.patch.object(
             GUI, "run_cluster_folder_relation_transaction"
-        ) as normalize:
+        ) as normalize, mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ):
             app.refresh_selected_cluster_relation()
 
         refresh.assert_called_once_with(
@@ -548,6 +562,22 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 "all_synced": False,
             },
         ]
+        app._connected_scope_from_board = mock.Mock(return_value={
+            "groups": [],
+            "cluster_rows": [
+                {
+                    "blend": branch_blend,
+                    "folder_relation": "on",
+                    "on_target_spms": [tree_01, tree_02],
+                },
+                {
+                    "blend": leaf_blend,
+                    "folder_relation": "on",
+                    "on_target_spms": [tree_01],
+                },
+            ],
+            "skipped": [],
+        })
 
         def run_now(_label, work, done, **_kwargs):
             done(work(lambda *_args: None))
@@ -570,7 +600,9 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             ],
         ) as refresh, mock.patch.object(
             GUI, "run_cluster_folder_relation_transaction"
-        ) as normalize:
+        ) as normalize, mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ):
             app.refresh_selected_cluster_relation()
 
         self.assertEqual(
@@ -635,6 +667,278 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertEqual(
             showinfo.call_args.args[0],
             "Cluster 관계 불일치",
+        )
+
+    def test_connected_board_scope_uses_confirmed_followers_and_on_clusters(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        master = "SK_Tree_elm_01.spm"
+        app = GUI.App.__new__(GUI.App)
+        app.board = [{
+            "folder": str(owner),
+            "manifest": {
+                "groups": [{
+                    "master": master,
+                    "followers": [
+                        {
+                            "file": "SK_Tree_elm_02.spm",
+                            "base_map_confirmed": True,
+                        },
+                        {
+                            "file": "SK_Tree_elm_03.spm",
+                            "base_map_confirmed": False,
+                        },
+                        {
+                            "file": "SK_Tree_elm_04.spm",
+                            "base_map_confirmed": True,
+                        },
+                    ],
+                }],
+                "independent": ["SK_Tree_elm_05.spm"],
+            },
+            "cluster_blends": [
+                {
+                    "folder_relation": "on",
+                    "blend": str(
+                        owner / "Cluster" / "SK_branch_elm_01.blend"
+                    ),
+                    "targets": [{
+                        "owner_target": True,
+                        "relation_on": True,
+                        "target_spm": str(
+                            owner / "SK_Tree_elm_01.spm"
+                        ),
+                    }],
+                },
+                {
+                    "folder_relation": "off",
+                    "blend": str(
+                        owner / "Cluster" / "SK_leaf_elm_01.blend"
+                    ),
+                    "targets": [{
+                        "owner_target": True,
+                        "relation_on": False,
+                        "target_spm": str(
+                            owner / "SK_Tree_elm_01.spm"
+                        ),
+                    }],
+                },
+                {
+                    "folder_relation": "partial",
+                    "blend": str(
+                        owner / "Cluster" / "SK_leaf_elm_02.blend"
+                    ),
+                    "targets": [{
+                        "owner_target": True,
+                        "relation_on": True,
+                        "target_spm": str(
+                            owner / "SK_Tree_elm_01.spm"
+                        ),
+                    }],
+                },
+            ],
+        }]
+
+        scope = app.connected_board_scope()
+
+        self.assertEqual(len(scope["groups"]), 1)
+        self.assertEqual(
+            scope["groups"][0]["names"],
+            ["SK_Tree_elm_02.spm", "SK_Tree_elm_04.spm"],
+        )
+        self.assertEqual(len(scope["cluster_rows"]), 1)
+        self.assertEqual(
+            Path(scope["cluster_rows"][0]["blend"]).name,
+            "SK_branch_elm_01.blend",
+        )
+        self.assertEqual(
+            {entry["reason"] for entry in scope["skipped"]},
+            {"Base 매핑 미확정"},
+        )
+
+    def test_connected_board_batch_continues_to_cluster_after_sync_failure(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        target = owner / "SK_Tree_elm_01.spm"
+        scope = {
+            "groups": [{
+                "folder": owner,
+                "master": "SK_Tree_elm_01.spm",
+                "names": ["SK_Tree_elm_02.spm"],
+            }],
+            "cluster_rows": [{
+                "kind": "cluster_relation",
+                "folder_relation": "on",
+                "blend": blend,
+                "on_target_spms": [target],
+                "target_spms": [target],
+            }],
+            "skipped": [],
+        }
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.verify_var = mock.Mock()
+        app.verify_var.get.return_value = False
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = str(owner)
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app._show_job_info = mock.Mock()
+        app.connected_board_scope = mock.Mock(return_value=scope)
+        app._connected_scope_from_board = mock.Mock(return_value=scope)
+        captured = {}
+
+        def run_now(_label, work, done, **_kwargs):
+            result = work(lambda *_args: None)
+            captured.update(result)
+            done(result)
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ), mock.patch.object(
+            GUI.engine,
+            "apply_group_transaction",
+            side_effect=RuntimeError("generator failed"),
+        ) as sync, mock.patch.object(
+            GUI,
+            "prepare_cluster_source_if_required",
+            return_value={"status": "current"},
+        ) as prepare, mock.patch.object(
+            GUI,
+            "run_cluster_relation_transaction",
+            return_value={"status": "ok", "mode": "sync"},
+        ) as refresh, mock.patch.object(
+            GUI,
+            "write_connected_run_report",
+            return_value=Path(r"C:\reports\connected.json"),
+        ):
+            app.apply_connected_board()
+
+        sync.assert_called_once()
+        self.assertTrue(
+            sync.call_args.kwargs["skip_blocked_scale"]
+        )
+        prepare.assert_called_once()
+        refresh.assert_called_once_with(
+            blend,
+            [target],
+            enabled=True,
+            blender_exe=Path(r"C:\Blender\blender.exe"),
+            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
+            capture_resolution=1024,
+            repair_runtime_config=app.config,
+            force_refresh=True,
+            progress_callback=mock.ANY,
+        )
+        self.assertEqual(captured["status"], "partial")
+        self.assertEqual(len(captured["failures"]), 1)
+        self.assertEqual(len(captured["cluster_refresh"]), 1)
+        app.refresh.assert_called_once()
+        self.assertIn(
+            "실패 1",
+            app.status_var.set.call_args.args[0],
+        )
+
+    def test_connected_board_batch_rechecks_scope_when_its_queue_turn_starts(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        old_blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        initial_scope = {
+            "groups": [],
+            "cluster_rows": [{
+                "blend": old_blend,
+                "folder_relation": "on",
+                "on_target_spms": [owner / "SK_Tree_elm_01.spm"],
+            }],
+            "skipped": [],
+        }
+        runtime_scope = {
+            "groups": [],
+            "cluster_rows": [],
+            "skipped": [],
+        }
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"sk_only": True}
+        app.verify_var = mock.Mock()
+        app.verify_var.get.return_value = False
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = str(owner)
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app._show_job_info = mock.Mock()
+        app.connected_board_scope = mock.Mock(return_value=initial_scope)
+        app._connected_scope_from_board = mock.Mock(
+            return_value=runtime_scope
+        )
+        captured = {}
+
+        def run_now(_label, work, done, **_kwargs):
+            result = work(lambda *_args: None)
+            captured.update(result)
+            done(result)
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ) as scan, mock.patch.object(
+            GUI, "run_cluster_relation_transaction"
+        ) as refresh, mock.patch.object(
+            GUI,
+            "write_connected_run_report",
+            return_value=Path(r"C:\reports\connected.json"),
+        ):
+            app.apply_connected_board()
+
+        scan.assert_called_once_with(
+            owner,
+            sk_only=True,
+            verify_physical=False,
+        )
+        refresh.assert_not_called()
+        self.assertEqual(
+            captured["queued_scope"]["cluster_relation_count"],
+            1,
+        )
+        self.assertEqual(
+            captured["scope"]["cluster_relation_count"],
+            0,
+        )
+
+    def test_connected_board_batch_can_queue_behind_relation_change(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.active_job = {"id": 1}
+        app.pending_jobs = []
+        app.config = {"sk_only": True}
+        app.verify_var = mock.Mock()
+        app.verify_var.get.return_value = False
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = str(owner)
+        app.connected_board_scope = mock.Mock(return_value={
+            "groups": [],
+            "cluster_rows": [],
+            "skipped": [],
+        })
+        app._start_job = mock.Mock()
+
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ) as confirm, mock.patch.object(
+            GUI.messagebox, "showinfo"
+        ) as showinfo:
+            app.apply_connected_board()
+
+        showinfo.assert_not_called()
+        app._start_job.assert_called_once()
+        self.assertIn(
+            "실제 시작 시 연결 범위를 다시 검사",
+            confirm.call_args.args[1],
         )
 
     def test_clipboard_rows_are_deduplicated_and_folder_rows_are_supported(self):

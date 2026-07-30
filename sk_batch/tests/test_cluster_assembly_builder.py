@@ -40,6 +40,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _partition_normalized_render_components,
     _role_material_polygons,
     _strip_fbx_scene_textures,
+    _validate_role_component_claims,
     _vertex_descriptors,
     validate_binding_hierarchy,
     validate_manifest_artifacts,
@@ -554,44 +555,29 @@ def fake_unreal_mesh_from_blender_bounds(
 
 
 class ContentDecisionTests(unittest.TestCase):
-    def test_ready_handoff_cannot_disappear_before_assembly_build(self):
+    def test_missing_final_material_uses_normalized_topology_fallback(self):
         handoff = ready_handoff()
-        handoff["pcg_receipt"] = {
-            "path": "C:/receipt.json",
-            "exists": True,
-            "size": 10,
-            "sha256": "receipt-sha",
-        }
+        role = handoff["assembly"]["part_builder_inputs"][0]
+        role["assignments"][0]["used_polygon_count"] = 1
         merged = SimpleNamespace(
-            type="MESH",
             data=SimpleNamespace(
                 materials=[SimpleNamespace(name="M_Bark_densiflora_01")],
-                polygons=[SimpleNamespace(index=0, material_index=0)],
+                polygons=[
+                    SimpleNamespace(index=0, material_index=0),
+                    SimpleNamespace(index=1, material_index=0),
+                ],
             ),
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            full = Path(temporary) / "SK_tree_densiflora_01.fbx"
-            full.write_bytes(b"full")
-            output = Path(temporary) / "assembly"
-            with mock.patch.dict(sys.modules, {"bpy": SimpleNamespace()}), \
-                    mock.patch(
-                        "cluster_assembly_builder.snapshot_blender_armature",
-                        return_value=skeleton_snapshot(),
-                    ):
-                with self.assertRaisesRegex(
-                    ClusterAssemblyBuildError,
-                    "requested rendered roles that disappeared",
-                ):
-                    build_blender_assembly_inputs(
-                        handoff,
-                        SimpleNamespace(),
-                        merged,
-                        output,
-                        full,
-                        Path(temporary) / "wind.json",
-                    )
 
-        self.assertFalse(output.exists())
+        rendered, unused = _role_material_polygons(merged, [role])
+
+        self.assertEqual(unused, {})
+        self.assertEqual(rendered["branch"]["material_slots"], [])
+        self.assertEqual(rendered["branch"]["polygon_indices"], [0, 1])
+        self.assertEqual(
+            rendered["branch"]["selection_basis"],
+            "normalized_topology_fallback",
+        )
 
     def test_builder_matches_handoff_alias_and_assignment_material(self):
         merged = SimpleNamespace(
@@ -655,6 +641,156 @@ class ContentDecisionTests(unittest.TestCase):
                     },
                 ],
             )
+
+    def test_topology_fallback_does_not_reconsider_exact_role_polygons(self):
+        merged = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[
+                    SimpleNamespace(name="M_branch_tree_01"),
+                    SimpleNamespace(name="M_Bark_tree_01"),
+                ],
+                polygons=[
+                    SimpleNamespace(index=0, material_index=0),
+                    SimpleNamespace(index=1, material_index=1),
+                ],
+            ),
+        )
+        normalized = {
+            "status": "ready",
+            "variants": [{"ordinal": 1}],
+        }
+
+        rendered, unused = _role_material_polygons(
+            merged,
+            [
+                {
+                    "role": "branch",
+                    "role_identity": "M_branch_tree_01",
+                    "assignments": [{"used_polygon_count": 1}],
+                    "normalized_variants": normalized,
+                },
+                {
+                    "role": "cluster",
+                    "role_identity": "M_cluster_tree_01",
+                    "assignments": [{"used_polygon_count": 1}],
+                    "normalized_variants": normalized,
+                },
+            ],
+        )
+
+        self.assertEqual(unused, {})
+        self.assertEqual(rendered["branch"]["polygon_indices"], [0])
+        self.assertEqual(rendered["cluster"]["polygon_indices"], [1])
+
+    def test_topology_fallback_blocks_cross_role_component_claims(self):
+        role_build_plans = {
+            "cluster": {
+                "matched": {
+                    "cluster_signature": {
+                        "instances": [{"polygons": [4, 5]}],
+                    }
+                }
+            },
+            "leaf": {
+                "matched": {
+                    "leaf_signature": {
+                        "instances": [{"polygons": [5, 6]}],
+                    }
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "matched multiple normalized Assembly roles",
+        ):
+            _validate_role_component_claims(role_build_plans)
+
+    def test_topology_fallback_zero_match_fails_before_publishing_outputs(self):
+        handoff = ready_handoff()
+        for role in handoff["assembly"]["part_builder_inputs"]:
+            role["assignments"][0]["used_polygon_count"] = 1
+        merged = SimpleNamespace(
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[
+                    SimpleNamespace(name="M_branch_elm_01"),
+                    SimpleNamespace(name="M_Bark_elm_01"),
+                ],
+                polygons=[
+                    SimpleNamespace(index=0, material_index=0),
+                    SimpleNamespace(index=1, material_index=1),
+                ],
+            ),
+        )
+        fake_bpy = SimpleNamespace(
+            context=SimpleNamespace(
+                scene=SimpleNamespace(
+                    unit_settings=SimpleNamespace(
+                        system="METRIC",
+                        scale_length=1.0,
+                    )
+                )
+            ),
+            data=SimpleNamespace(
+                objects={},
+                armatures={},
+                meshes={},
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            full = root / "SK_tree_elm_01.fbx"
+            full.write_bytes(b"full")
+            output = root / "assembly"
+            partition_results = [
+                (
+                    {
+                        "branch_signature": {
+                            "prototype": {},
+                            "instances": [{"polygons": [0]}],
+                        }
+                    },
+                    [],
+                ),
+                ({}, [{"polygons": [1]}]),
+            ]
+
+            with mock.patch.dict(sys.modules, {"bpy": fake_bpy}), \
+                    mock.patch(
+                        "cluster_assembly_builder.snapshot_blender_armature",
+                        return_value=skeleton_snapshot(),
+                    ), mock.patch(
+                        "cluster_assembly_builder.validate_file_fingerprint",
+                        return_value={},
+                    ), mock.patch(
+                        "cluster_assembly_builder._import_normalized_plan_prototypes",
+                        return_value=([{}], []),
+                    ), mock.patch(
+                        "cluster_assembly_builder._component_groups",
+                        side_effect=lambda _mesh, polygons: [
+                            {"polygons": list(polygons)}
+                        ],
+                    ), mock.patch(
+                        "cluster_assembly_builder._partition_normalized_render_components",
+                        side_effect=partition_results,
+                    ):
+                with self.assertRaisesRegex(
+                    ClusterAssemblyBuildError,
+                    "matched zero normalized prototype components: leaf",
+                ):
+                    build_blender_assembly_inputs(
+                        handoff,
+                        SimpleNamespace(),
+                        merged,
+                        output,
+                        full,
+                        root / "wind.json",
+                    )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(list(root.glob("**/*cluster_assembly_bindings.json")))
 
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")

@@ -909,6 +909,12 @@ class IntegratedApp:
         if self.find_dialog is not None and self.find_dialog.winfo_exists():
             self.find_dialog.destroy()
         for app in self.apps.values():
+            shutdown_queue = getattr(app, "shutdown_shared_queue", None)
+            if callable(shutdown_queue):
+                try:
+                    shutdown_queue()
+                except Exception:
+                    pass
             persist = getattr(app, "persist_config", None)
             if callable(persist):
                 try:

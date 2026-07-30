@@ -12,6 +12,12 @@ weed_black_locast
 
 `SPM_Generator_Sync.bat`을 더블클릭해 실행합니다.
 
+적용·동기화·Cluster 관계 변경/갱신은 PCG와 SK Batch가 공유하는 프로세스 간
+FIFO에 클릭 즉시 등록된다. 같은 창의 로컬 대기열뿐 아니라 다른 BAT 창의 작업도
+같은 순서를 사용하며 실제 변경은 한 번에 하나만 실행한다. Cluster 갱신은 자기
+차례가 왔을 때 registry와 manifest를 다시 읽고, 그 시점에도 완전한 ON인 대상만
+처리한다.
+
 ## 무엇을 동기화하는가
 
 - 마스터 Base 아래 공통 Generator 속성과 곡선
@@ -88,6 +94,17 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
      단계를 확인할 수 있습니다.
    - 실제 SpeedTree 계산 중에도 경과 시간이 계속 갱신되므로 작업이 멈춘 것인지 기다리는 중인지
      구분할 수 있습니다.
+7. 보드 전체의 확정된 연결을 한 번에 처리하려면
+   `연결 전체 동기화 + Cluster 갱신`을 사용합니다.
+   - Base 매핑이 확인된 `마스터 → 자식` 그룹을 먼저 동기화한 뒤, 관계가 정확히 `ON`인
+     Cluster만 현재 연결 대상에 재적용합니다.
+   - 독립·미지정 SPM과 `OFF`·`PARTIAL` Cluster는 변경하지 않습니다. Base 매핑 미확정이나
+     크기 폭증 위험 자식도 제외 사유로 남깁니다.
+   - 한 그룹 또는 Cluster가 실패해도 나머지는 계속 처리하며, 실행별 결과는
+     `spm_generator_sync/reports/connected_sync_cluster_refresh_*.json`에 기록합니다.
+   - 다른 작업이 진행 중이면 기존 FIFO 대기열에 들어갑니다. 실제 차례가 시작될 때 계보
+     manifest와 Cluster registry를 다시 읽으므로, 앞 작업에서 OFF가 된 관계를 오래된
+     화면 스냅샷으로 다시 ON 처리하지 않습니다.
 
 파일명의 `_01`은 화면에서 `MASTER 후보`로만 제안합니다. 이름만으로 관계를 확정하거나 파일을
 수정하지 않습니다. 확정한 관계는 나무 폴더의 `spm_generator_sync.json`에 상대 파일명으로 저장됩니다.

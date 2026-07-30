@@ -1276,7 +1276,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertIn("blender_worker_running", stages)
             self.assertIn("blender_worker_finished", stages)
 
-    def test_on_failure_restores_every_spm_the_job_half_wrote(self):
+    def test_on_failure_never_includes_an_unrequested_registered_spm(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
             cluster = owner / "Cluster"
@@ -1293,9 +1293,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             registry_before = blend.with_suffix(".atlas_leaf_targets.json").read_bytes()
 
             def half_write(*_args, **_kwargs):
-                # The addon rewrites every registered target, not just the
-                # selected one, before the failing target aborts the run.
-                already_on.write_bytes(b"half-written-01")
+                # Only the requested live relation is part of the transaction.
                 selected.write_bytes(b"half-written-02")
                 return SimpleNamespace(
                     returncode=1, stdout="", stderr="expected failure"

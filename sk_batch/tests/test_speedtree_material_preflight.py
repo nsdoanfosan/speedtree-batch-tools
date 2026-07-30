@@ -1,11 +1,13 @@
 import argparse
 import gzip
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -153,6 +155,49 @@ def write_stmat(spm, material_names):
 
 
 class SpeedTreeMaterialPreflightTests(unittest.TestCase):
+    def test_export_reports_shared_slot_boundary_and_restores_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_test.spm"
+            options = root / "Options.ini"
+            spm.write_bytes(b"spm")
+            options.write_text("[Export]", encoding="utf-8")
+            args = argparse.Namespace(
+                spm=str(spm),
+                fbx_ini=str(options),
+                speedtree_exe=str(root / "SpeedTree.exe"),
+                timeout=900,
+            )
+            helper = mock.Mock()
+            events = []
+
+            @contextmanager
+            def original_gate():
+                events.append("gate_enter")
+                yield
+                events.append("gate_exit")
+
+            def export_target(**kwargs):
+                with helper.speedtree_export_gate():
+                    events.append("export")
+                return {"status": "ok", "kwargs": kwargs}
+
+            helper.speedtree_export_gate = original_gate
+            helper.export_target = export_target
+            output = io.StringIO()
+            with mock.patch.object(
+                preflight,
+                "require_texture_skip_writing",
+            ), redirect_stdout(output):
+                result = preflight.run_export(args, helper)
+
+            self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
+            self.assertIs(helper.speedtree_export_gate, original_gate)
+            self.assertEqual(result["status"], "ok")
+            text = output.getvalue()
+            self.assertIn(preflight.SPEEDTREE_SLOT_WAIT_MARKER, text)
+            self.assertIn(preflight.SPEEDTREE_SLOT_ACQUIRED_MARKER, text)
+
     def test_raw_source_is_structured_provisional_until_pcg_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -4512,6 +4512,18 @@ def material_texture_items(
                 }
                 for row in aliases
             ],
+            "_material_current_refs": [
+                {
+                    "spm": str(row["spm"]),
+                    "material_id": (
+                        str(row["material_id"])
+                        if row.get("material_id") not in {None, ""}
+                        else None),
+                    "material_name": row["name"],
+                    "refs": list(row["current_refs"]),
+                }
+                for row in aliases
+            ],
             "atlas_base": base,
             "texture_base": texture_base,
             "is_atlas": any(row.get("leaf_source") for row in aliases)
@@ -4544,7 +4556,11 @@ def material_texture_items(
             provisional_declarations,
         )
         items.append(entry)
-    return items
+    return _merge_canonical_manifest_consumers(
+        items,
+        folder,
+        graphs,
+    )
 
 
 _PROVISIONAL_ARTIFACT_COMPONENTS = {
@@ -4978,6 +4994,239 @@ def _canonical_manifest_output(asset_root, texture_base):
         if output is not None:
             return output, None
     return None, None
+
+
+def _canonical_manifest_consumer_bindings(asset_root):
+    """Index exact material consumers declared by the canonical output manifest.
+
+    Atlas Auto Split material names such as ``*_green`` and ``*_stem`` are
+    geometry/material group identities.  Once a verified canonical manifest
+    binds those exact SPM material targets to one suffix-free ``T_*`` output,
+    their group suffixes must not create additional Substance graphs or output
+    sets on a later audit.
+    """
+    asset_root = Path(asset_root).resolve()
+    for manifest_path in canonical_manifest_candidates(asset_root):
+        if not manifest_path.is_file():
+            continue
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            validate_canonical_manifest(
+                payload,
+                manifest_path,
+                require_files=True,
+            )
+        except Exception:
+            return {}, None
+
+        by_name = {}
+        by_id = {}
+
+        def register(index, key, output):
+            existing = index.get(key)
+            if existing is None:
+                index[key] = output
+            elif (
+                existing is not False
+                and str(existing.get("texture_base") or "").casefold()
+                != str(output.get("texture_base") or "").casefold()
+            ):
+                # Conflicting declarations are never guessed.
+                index[key] = False
+
+        for output in payload.get("outputs") or []:
+            texture_base = str(output.get("texture_base") or "")
+            if not texture_base:
+                continue
+            for target in output.get("material_targets") or []:
+                if not isinstance(target, dict):
+                    continue
+                target_spm = Path(str(target.get("spm") or ""))
+                if not target_spm.is_absolute():
+                    target_spm = asset_root / target_spm
+                spm_key = _path_identity(target_spm)
+                material_name = str(
+                    target.get("material_name") or ""
+                ).strip().casefold()
+                material_id = str(
+                    target.get("material_id") or ""
+                ).strip().casefold()
+                if material_name:
+                    register(
+                        by_name,
+                        (spm_key, material_name),
+                        output,
+                    )
+                if material_id:
+                    register(
+                        by_id,
+                        (spm_key, material_id),
+                        output,
+                    )
+        return {
+            "by_name": by_name,
+            "by_id": by_id,
+        }, manifest_path
+    return {}, None
+
+
+def _merge_canonical_manifest_consumers(items, asset_root, graphs):
+    """Collapse manifest-bound material aliases to their declared T_* owner."""
+    indexes, manifest_path = _canonical_manifest_consumer_bindings(asset_root)
+    if not indexes or manifest_path is None:
+        for item in items:
+            item.pop("_material_current_refs", None)
+        return items
+
+    by_name = indexes["by_name"]
+    by_id = indexes["by_id"]
+    grouped = {}
+    passthrough = []
+
+    for ordinal, item in enumerate(items):
+        matches = []
+        for target in item.get("material_targets") or []:
+            if not isinstance(target, dict):
+                continue
+            spm_key = _path_identity(target.get("spm") or "")
+            name_key = (
+                spm_key,
+                str(target.get("material_name") or "").strip().casefold(),
+            )
+            id_key = (
+                spm_key,
+                str(target.get("material_id") or "").strip().casefold(),
+            )
+            output = (
+                by_name.get(name_key)
+                if name_key[1]
+                else None
+            )
+            if output is None and id_key[1]:
+                output = by_id.get(id_key)
+            if output is not None and output is not False:
+                matches.append(output)
+        texture_bases = {
+            str(output.get("texture_base") or "").casefold()
+            for output in matches
+            if output.get("texture_base")
+        }
+        if len(texture_bases) != 1:
+            passthrough.append((ordinal, item))
+            continue
+        texture_key = next(iter(texture_bases))
+        group = grouped.setdefault(texture_key, {
+            "ordinal": ordinal,
+            "output": matches[0],
+            "items": [],
+        })
+        group["ordinal"] = min(group["ordinal"], ordinal)
+        group["items"].append(item)
+
+    collapsed = []
+    for group in grouped.values():
+        output = group["output"]
+        texture_base = str(output["texture_base"])
+        material_base = (
+            "M_" + texture_base[2:]
+            if texture_base.casefold().startswith("t_")
+            else texture_base
+        )
+
+        def owner_rank(item):
+            graph_name = str(item.get("m_graph") or "").casefold()
+            return (
+                str(item.get("texture_base") or "").casefold()
+                == texture_base.casefold(),
+                graph_name == texture_base.casefold(),
+                bool(item.get("m_graph")),
+                not bool(item.get("missing_export_maps")),
+            )
+
+        owner = max(group["items"], key=owner_rank)
+        merged = dict(owner)
+        merged["name"] = material_base
+        merged["atlas_base"] = material_base
+        merged["texture_base"] = texture_base
+        merged["canonical_manifest_consumer_binding"] = True
+        merged["canonical_manifest_path"] = str(manifest_path)
+
+        for field in (
+            "material_names",
+            "material_aliases",
+            "material_spms",
+            "atlas_blends",
+        ):
+            merged[field] = unique(
+                value
+                for row in group["items"]
+                for value in row.get(field) or []
+            )
+
+        targets = []
+        seen_targets = set()
+        for row in group["items"]:
+            for target in row.get("material_targets") or []:
+                key = (
+                    _path_identity(target.get("spm") or ""),
+                    str(target.get("material_id") or "").casefold(),
+                    str(target.get("material_name") or "").casefold(),
+                )
+                if key not in seen_targets:
+                    seen_targets.add(key)
+                    targets.append(dict(target))
+        merged["material_targets"] = targets
+
+        merged["connection_materials"] = unique(
+            current.get("material_name")
+            for row in group["items"]
+            for current in row.get("_material_current_refs") or []
+            if current.get("material_name")
+            and not _managed_connection_matches(
+                current.get("refs") or [],
+                texture_base,
+                REQUIRED_ROLES,
+            )
+        )
+        merged["connection_update_needed"] = bool(
+            merged["connection_materials"]
+        )
+        merged.pop("_material_current_refs", None)
+
+        graph = _graph_for_materials(
+            graphs,
+            material_base,
+            merged["material_names"],
+        )
+        if graph:
+            merged["m_graph"], merged["m_graph_sbs"] = graph
+            merged["legacy_m_graph"] = graph[0].casefold().startswith("m_")
+
+        export_maps = {
+            role: str((manifest_path.parent / relative).resolve())
+            for role, relative in (output.get("files") or {}).items()
+            if role in REQUIRED_ROLES
+        }
+        merged["texture_dir"] = str(manifest_path.parent)
+        merged["export_maps"] = export_maps
+        merged["missing_export_maps"] = [
+            role for role in REQUIRED_ROLES if role not in export_maps
+        ]
+        merged["texture_contract_state"] = (
+            "canonical"
+            if not merged["missing_export_maps"]
+            else "canonical_manifest_invalid"
+        )
+        collapsed.append((group["ordinal"], merged))
+
+    result = []
+    for _ordinal, item in sorted(
+        passthrough + collapsed,
+        key=lambda row: row[0],
+    ):
+        item.pop("_material_current_refs", None)
+        result.append(item)
+    return result
 
 
 def _entry_source_values(entry):
@@ -5970,8 +6219,12 @@ def persist_cluster_assembly_receipts_safely(report):
     authoritative state, so a stale physical-normalization snapshot must be
     reported as a warning instead of making the PCG GUI unusable.
     """
+    unchanged = []
     try:
-        written = persist_cluster_assembly_receipts(report)
+        written = persist_cluster_assembly_receipts(
+            report,
+            unchanged_out=unchanged,
+        )
     except Exception as exc:
         state = {
             "status": "warning",
@@ -5979,15 +6232,23 @@ def persist_cluster_assembly_receipts_safely(report):
             "code": "RECEIPT_PERSISTENCE_FAILED",
             "live_audit_complete": True,
             "written": [],
+            "unchanged": [],
             "error": f"{type(exc).__name__}: {exc}",
         }
     else:
+        if written:
+            code = "RECEIPT_PERSISTED"
+        elif unchanged:
+            code = "RECEIPT_UNCHANGED"
+        else:
+            code = "RECEIPT_NOT_APPLICABLE"
         state = {
             "status": "ok",
             "stage": "receipt_persistence",
-            "code": "RECEIPT_PERSISTED",
+            "code": code,
             "live_audit_complete": True,
             "written": written,
+            "unchanged": unchanged,
             "error": "",
         }
     report["cluster_assembly_receipt_persistence"] = state
@@ -6021,6 +6282,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Plan prepare actions without writing files")
     parser.add_argument("--include-refs", action="store_true", help="Read embedded source texture references")
     parser.add_argument("--pcg-targets", help="pcg_targets.json from refresh_pcg_targets.py")
+    parser.add_argument(
+        "--no-receipt",
+        action="store_true",
+        help=(
+            "Observe the live contract without publishing a Cluster Assembly "
+            "receipt; used by producer normalization input/output validation"
+        ),
+    )
     args = parser.parse_args()
     cfg = load_config()
     if args.prepare_sk:
@@ -6040,7 +6309,18 @@ def main():
     # receipt self-validation failure must not turn clean source data into a
     # failed audit.  Callers can continue with the live contract embedded in
     # this report and retry persistence on a later run.
-    persist_cluster_assembly_receipts_safely(report)
+    if args.no_receipt:
+        report["cluster_assembly_receipt_persistence"] = {
+            "status": "not_requested",
+            "stage": "receipt_persistence",
+            "code": "RECEIPT_NOT_REQUESTED",
+            "live_audit_complete": True,
+            "written": [],
+            "unchanged": [],
+            "error": "",
+        }
+    else:
+        persist_cluster_assembly_receipts_safely(report)
     save_spm_analysis_cache()
     if args.json_path:
         Path(args.json_path).parent.mkdir(parents=True, exist_ok=True)

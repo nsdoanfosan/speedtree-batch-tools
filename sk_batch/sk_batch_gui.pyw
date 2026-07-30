@@ -47,6 +47,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
+from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
@@ -105,12 +106,20 @@ from speedtree_texture_contract import (
 )
 from push_dependency_schedule import (
     PushDependencyError,
+    exact_dependency_contract_from_validated_manifest,
     expand_push_targets,
+)
+from send2ue_manifest_contract import (
+    is_actionable_cluster_assembly_manifest,
 )
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
     ClusterAssemblyReceiptStaleError,
     cluster_assembly_receipt_resolution,
     load_cluster_assembly_receipt,
+)
+from pcg_st9_texture_batch.pcg_canonical_outputs import (
+    CanonicalOutputManifestError,
+    refresh_atlas_manifests_for_spm,
 )
 from repair_runtime_contract import (
     REPAIR_OUTPUT_CONTRACT_VERSION,
@@ -142,9 +151,14 @@ BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
+# Temporary production drain mode: select only owner rows that already have
+# cluster/*.spm providers but do not yet have a local Assembly output.
+TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS = True
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
+SPEEDTREE_SLOT_WAIT_MARKER = "SK_BATCH_SPEEDTREE_SLOT_WAIT"
+SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
 
 
 def is_cluster_source_spm(spm):
@@ -153,6 +167,11 @@ def is_cluster_source_spm(spm):
         path.suffix.casefold() == ".spm"
         and path.parent.name.casefold() == "cluster"
     )
+
+
+def should_refresh_canonical_atlas_manifests(spm):
+    """Return whether this SPM is an Atlas-producing Cluster source."""
+    return is_cluster_source_spm(spm)
 
 
 def current_cluster_root_postcondition(spm):
@@ -205,6 +224,47 @@ def repair_pipeline_report_path(spm):
     return (
         spm.parent / "reports" /
         f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+
+
+def owner_cluster_spm_paths(spm):
+    """Return direct cluster/*.spm providers belonging to one owner row."""
+    spm = Path(spm)
+    if is_cluster_source_spm(spm):
+        return ()
+    try:
+        cluster_dirs = (
+            child
+            for child in spm.parent.iterdir()
+            if child.is_dir() and child.name.casefold() == "cluster"
+        )
+        return tuple(sorted(
+            candidate
+            for cluster_dir in cluster_dirs
+            for candidate in cluster_dir.iterdir()
+            if (
+                candidate.is_file()
+                and candidate.suffix.casefold() == ".spm"
+                and not candidate.name.startswith("~")
+            )
+        ))
+    except OSError:
+        return ()
+
+
+def is_cluster_without_assembly_push_row(spm):
+    """Return whether an owner has cluster sources but no local Assembly."""
+    spm = Path(spm)
+    if is_cluster_source_spm(spm) or not owner_cluster_spm_paths(spm):
+        return False
+    try:
+        report = _read_repair_pipeline_json(
+            repair_pipeline_report_path(spm)
+        )
+    except (OSError, ValueError):
+        return True
+    return not is_actionable_cluster_assembly_manifest(
+        report.get("cluster_assembly_manifest")
     )
 
 
@@ -784,14 +844,14 @@ def normalized_folder_key(path):
 
 
 def cluster_relation_output_targets(cluster_spm, referenced_by_spms):
-    """Return only explicit ON targets from the provider's Atlas registry.
+    """Return canonical targets where registry intent and live use agree.
 
-    ``referenced_by_spms`` is retained for call compatibility and diagnostic
-    provenance only. A texture/source reference is not proof that an owner
-    Tree was built from this Cluster provider; promoting every reference to an
-    ON relation made unrelated raw Cluster assets block ordinary Tree Repair.
+    The Atlas registry is the explicit ON/OFF authority, while
+    ``referenced_by_spms`` is the current content dependency discovered from
+    export-participating SPM materials.  Either source alone is too broad:
+    registry-only scheduling rebuilds unused providers, and reference-only
+    scheduling revives relations that were explicitly switched OFF.
     """
-    del referenced_by_spms
     from atlas_target_registry import (
         TargetRegistryError,
         load_target_registry,
@@ -803,6 +863,22 @@ def cluster_relation_output_targets(cluster_spm, referenced_by_spms):
     registry = load_target_registry(blend_path_for(cluster_spm))
     if registry is None:
         return []
+
+    referenced_keys = set()
+    for value in referenced_by_spms or ():
+        reference = Path(value).expanduser().absolute()
+        if (
+            normalized_folder_key(reference.parent) != owner_key
+            or reference.suffix.casefold() != ".spm"
+        ):
+            continue
+        if not reference.name.casefold().startswith("sk_"):
+            canonical = reference.with_name(f"SK_{reference.name}")
+            if canonical.is_file():
+                reference = canonical
+        if reference.name.casefold().startswith("sk_"):
+            referenced_keys.add(normalized_folder_key(reference))
+
     targets = []
     seen = set()
     for value in registry.get("target_spms") or ():
@@ -825,11 +901,38 @@ def cluster_relation_output_targets(cluster_spm, referenced_by_spms):
                 f"SPM target for {cluster_spm.name}: {target}"
             )
         key = normalized_folder_key(target)
-        if key in seen:
+        if key in seen or key not in referenced_keys:
             continue
         seen.add(key)
         targets.append(target)
     return targets
+
+
+def cluster_contract_dependency_for_spm(contract, spm):
+    """Return the exact canonical provider dependency from one owner contract."""
+    wanted = normalized_folder_key(spm)
+    for dependency in (contract or {}).get("dependencies") or ():
+        if not isinstance(dependency, dict):
+            continue
+        for field in ("spm", "source_spm", "authoring_spm", "output_spm"):
+            value = dependency.get(field)
+            if value and normalized_folder_key(value) == wanted:
+                return dependency
+    return None
+
+
+def cluster_contract_issues(contract):
+    """Return one stable issue list from the selected owner handoff."""
+    handoff = (contract or {}).get("handoff") or {}
+    return [
+        issue
+        for issue in (
+            handoff.get("errors")
+            or handoff.get("issues")
+            or ()
+        )
+        if isinstance(issue, dict)
+    ]
 
 
 def cluster_relation_refresh_state(cluster_spm, target_spms):
@@ -976,11 +1079,12 @@ def blender_repair_schedule_waves(targets):
 
 
 def expand_blender_repair_targets(selected_targets, all_items):
-    """Add only Cluster rows with an explicit ON relation to selected SPMs.
+    """Add only Cluster rows selected by both registry intent and live use.
 
-    Source/texture references remain discovery evidence only. The Atlas target
-    registry is the explicit relationship contract; relation-OFF providers
-    must not block a standalone owner Repair or export.
+    The Atlas target registry supplies the explicit ON/OFF intent, and current
+    SPM material references supply the actual dependency. A provider must
+    satisfy both sides of that contract; registry-only, reference-only, and
+    relation-OFF providers cannot block a standalone owner Repair or export.
     """
     selected_targets = list(selected_targets)
     values = all_items.values() if isinstance(all_items, dict) else all_items
@@ -1067,12 +1171,16 @@ def expand_blender_repair_targets(selected_targets, all_items):
 def should_calibrate_spm(item):
     """Return whether stage ① may normalize this row's SPM bone contract.
 
-    Cluster rows are calibration targets too, but ``spm_audit`` routes them to
-    the dedicated first-renderable-root Absolute/1 policy instead of the normal
-    whole-tree density solver.  Its backup/marker recovery is the same as every
-    other stage-① write, so an interrupted run restores the source safely.
+    Only Cluster providers require the dedicated first-renderable-root
+    Absolute/1 contract. Owner Tree rows pass directly to later stages instead
+    of spending batch time in the whole-tree density solver.
     """
-    return not item.get("source_read_only")
+    spm = item.get("spm")
+    return (
+        not item.get("source_read_only")
+        and spm is not None
+        and is_cluster_source_spm(spm)
+    )
 
 
 def sk_batch_folder_chain(root, spm):
@@ -1303,6 +1411,7 @@ class App:
         self.active_batch_job = None
         self.batch_job_sequence = 0
         self.batch_job_failures = []
+        self.shared_queue_runtime = SharedQueueRuntime("sk_batch")
         self.cell_editor = None
         self.stop_flag = threading.Event()
         self.active_procs = set()          # all running child procs (serial or parallel)
@@ -2133,6 +2242,8 @@ class App:
                 ),
             )
             self.row_copy_paths[iid] = [spm]
+        if TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS:
+            self._set_temporary_cluster_without_assembly_push_rows()
         self.checked_rows.sync_after_reload()
         save_state(self.state)
         cache_count = sum(
@@ -2470,6 +2581,22 @@ class App:
     def _set_all(self, checked):
         self.checked_rows.set_all(checked)
 
+    def _set_temporary_cluster_without_assembly_push_rows(self):
+        """Check only owners that have cluster sources but no Assembly output."""
+        checked_count = 0
+        for iid, item in self.items.items():
+            checked = is_cluster_without_assembly_push_row(item["spm"])
+            item["checked"] = checked
+            checked_count += int(checked)
+            if callable(getattr(self.tree, "item", None)):
+                self._redraw_checked_row(iid, item)
+        self.checked_rows.armed = False
+        self.log(
+            "[임시 선택] cluster는 있고 Assembly가 없는 Tree 행 "
+            f"{checked_count}개만 Unreal Push 대상으로 체크"
+        )
+        return checked_count
+
     def _set_recent_modified(self, hours=24, now_ns=None):
         """Check only rows whose authoritative SPM changed within ``hours``."""
         now_ns = time.time_ns() if now_ns is None else int(now_ns)
@@ -2517,29 +2644,135 @@ class App:
             self.progress_var.set("복사할 폴더 또는 SPM 행을 먼저 클릭하세요")
         return "break"
 
+    def _start_shared_setting_job(
+            self, label, payload, work, on_success):
+        """Queue a short marker/state mutation with the long batch jobs."""
+
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is None:
+            on_success(work())
+            return
+        try:
+            record = runtime.enqueue(
+                str(label),
+                {"tool": "sk_batch", **dict(payload or {})},
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "공용 대기열 등록 실패",
+                (
+                    "다른 창과 동시에 변경되지 않도록 설정을 적용하지 "
+                    f"않았습니다.\n\n{exc}"
+                ),
+                parent=self.root,
+            )
+            return
+        self.progress_var.set(
+            f"공용 대기열 등록 · {label} · #{record['sequence']}"
+        )
+
+        def run():
+            lease = None
+            try:
+                lease = runtime.wait_for_turn(
+                    record["id"],
+                    on_wait=lambda state: self.ui_queue.put((
+                        "progress",
+                        (
+                            f"공용 대기열 대기 · 전체 "
+                            f"{state.get('position') or '?'}번째"
+                        ),
+                    )),
+                )
+                result = work()
+                lease.finish(
+                    success=True,
+                    result={
+                        "tool": "sk_batch",
+                        "label": str(label),
+                        "outcome": "completed",
+                    },
+                )
+                self.root.after(
+                    0,
+                    lambda value=result: on_success(value),
+                )
+            except WaitCancelled:
+                return
+            except Exception as exc:
+                if lease is not None and not lease.finished:
+                    try:
+                        lease.finish(
+                            success=False,
+                            result={
+                                "tool": "sk_batch",
+                                "label": str(label),
+                                "outcome": "failed",
+                                "error": str(exc),
+                            },
+                        )
+                    except Exception:
+                        pass
+                self.root.after(
+                    0,
+                    lambda error=exc: messagebox.showerror(
+                        "설정 적용 실패",
+                        str(error),
+                        parent=self.root,
+                    ),
+                )
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _set_bone_mode(self, iid, mode):
         if iid not in self.items or mode not in {"auto", "manual"}:
             return
         item = self.items[iid]
         locked = mode == "manual"
-        marker = set_manual_bones_marker(item["spm"], locked)
-        item["bone_mode"] = mode
-        item["manual_bones_locked"] = locked
-        entry = self.state.setdefault(iid, {})
-        if locked:
-            entry["manual_bones_locked"] = True
-            entry["spm_status"] = manual_bone_status_text(item["spm"])
-        else:
-            entry.pop("manual_bones_locked", None)
-            entry["spm_status"] = "자동 계산 대상"
-            entry.pop("spm_summary", None)
-        self.tree.item(iid, text=self._item_label(iid))
-        self.tree.set(iid, "bone_mode", self._bone_mode_label(iid))
-        self._set_table_cell(iid, "spm_status", entry["spm_status"])
-        save_state(self.state)
-        self.log(
-            f"{'수동 본 유지 설정' if locked else '자동 계산 복귀'}: "
-            f"{item['spm'].name} ({marker})"
+        spm = Path(item["spm"])
+
+        def apply():
+            marker = set_manual_bones_marker(spm, locked)
+            state_lock = getattr(
+                self, "state_lock", threading.RLock()
+            )
+            with state_lock:
+                entry = self.state.setdefault(iid, {})
+                if locked:
+                    entry["manual_bones_locked"] = True
+                    entry["spm_status"] = manual_bone_status_text(spm)
+                else:
+                    entry.pop("manual_bones_locked", None)
+                    entry["spm_status"] = "자동 계산 대상"
+                    entry.pop("spm_summary", None)
+                save_state(self.state)
+                status = entry["spm_status"]
+            return marker, status
+
+        def done(result):
+            marker, status = result
+            current = self.items.get(iid)
+            if current is None:
+                return
+            current["bone_mode"] = mode
+            current["manual_bones_locked"] = locked
+            self.tree.item(iid, text=self._item_label(iid))
+            self.tree.set(iid, "bone_mode", self._bone_mode_label(iid))
+            self._set_table_cell(iid, "spm_status", status)
+            self.log(
+                f"{'수동 본 유지 설정' if locked else '자동 계산 복귀'}: "
+                f"{spm.name} ({marker})"
+            )
+
+        self._start_shared_setting_job(
+            f"본 모드 · {spm.name}",
+            {
+                "operation": "bone_mode",
+                "spm": str(spm),
+                "mode": mode,
+            },
+            apply,
+            done,
         )
 
     def _set_wind_override(self, iid, value):
@@ -2547,11 +2780,38 @@ class App:
         if iid not in self.items or value not in valid_values:
             return
         item = self.items[iid]
-        item["wind_override"] = value
-        self.state.setdefault(iid, {})["wind_override"] = value
-        save_state(self.state)
-        self.tree.set(iid, "wind", self._wind_label(iid))
-        self.log(f"Wind 설정: {item['spm'].name} → {self._wind_label(iid).replace('  ▼', '')}")
+        spm = Path(item["spm"])
+
+        def apply():
+            state_lock = getattr(
+                self, "state_lock", threading.RLock()
+            )
+            with state_lock:
+                self.state.setdefault(iid, {})["wind_override"] = value
+                save_state(self.state)
+            return value
+
+        def done(applied):
+            current = self.items.get(iid)
+            if current is None:
+                return
+            current["wind_override"] = applied
+            self.tree.set(iid, "wind", self._wind_label(iid))
+            self.log(
+                f"Wind 설정: {spm.name} → "
+                f"{self._wind_label(iid).replace('  ▼', '')}"
+            )
+
+        self._start_shared_setting_job(
+            f"Wind 설정 · {spm.name}",
+            {
+                "operation": "wind_override",
+                "spm": str(spm),
+                "value": value,
+            },
+            apply,
+            done,
+        )
 
     # ------------------------------------------------------------------ batch
     def _collect_cfg(self):
@@ -2716,6 +2976,38 @@ class App:
         self.batch_job_sequence += 1
         job = dict(job)
         job["id"] = self.batch_job_sequence
+        shared_runtime = getattr(self, "shared_queue_runtime", None)
+        if shared_runtime is not None:
+            try:
+                shared = shared_runtime.enqueue(
+                    str(job["label"]),
+                    {
+                        "tool": "sk_batch",
+                        "local_job_id": job["id"],
+                        "label": str(job["label"]),
+                        "mode": str(job.get("mode") or ""),
+                        "phase": str(job.get("phase") or ""),
+                        "target_spms": [
+                            str(item.get("spm") or "")
+                            for item in job.get("targets") or []
+                        ],
+                    },
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "공용 대기열 등록 실패",
+                    (
+                        "다른 창과 동시에 실행되지 않도록 작업을 시작하지 "
+                        f"않았습니다.\n\n{exc}"
+                    ),
+                    parent=self.root,
+                )
+                self.progress_var.set(
+                    "공용 대기열 등록 실패 · 실행하지 않음"
+                )
+                return None
+            job["shared_queue_job_id"] = shared["id"]
+            job["shared_queue_sequence"] = shared["sequence"]
         self.pending_batch_jobs.append(job)
         if self.active_batch_job is not None:
             pending = len(self.pending_batch_jobs)
@@ -2765,7 +3057,35 @@ class App:
         error = None
         status = "completed"
         failed_count = 0
+        lease = None
         try:
+            shared_job_id = job.get("shared_queue_job_id")
+            shared_runtime = getattr(
+                self, "shared_queue_runtime", None
+            )
+            if shared_job_id and shared_runtime is not None:
+                def report_wait(wait_state):
+                    position = wait_state.get("position")
+                    queued = wait_state.get("queued_count", 0)
+                    text = (
+                        "공용 대기열 대기"
+                        + (
+                            f" · 전체 {position}번째"
+                            if position else ""
+                        )
+                        + f" · 대기 {queued}개"
+                    )
+                    self.ui_queue.put(("progress", text))
+
+                lease = shared_runtime.wait_for_turn(
+                    shared_job_id,
+                    on_wait=report_wait,
+                    cancel_event=self.stop_flag,
+                )
+                self.ui_queue.put((
+                    "progress",
+                    "공용 대기열 진입 · 단독 실행",
+                ))
             if job["mode"] == "pipeline":
                 completed = self._run_full_pipeline(
                     job["targets"],
@@ -2795,6 +3115,9 @@ class App:
                     getattr(self, "_phase_abort_reason", None)
                     or "작업이 완료되지 않음"
                 )
+        except WaitCancelled:
+            error = "공용 대기열 대기 중 취소됨"
+            status = "stopped"
         except Exception as exc:
             error = compact_error_message(exc)
             status = "failed"
@@ -2803,6 +3126,25 @@ class App:
                 f"{job['label']}: {error}"
             )
         finally:
+            if lease is not None and not lease.finished:
+                try:
+                    lease.finish(
+                        success=(status == "completed"),
+                        result={
+                            "tool": "sk_batch",
+                            "local_job_id": job["id"],
+                            "outcome": status,
+                            "failed_count": failed_count,
+                            "error": error,
+                        },
+                    )
+                except Exception as queue_exc:
+                    error = compact_error_message(queue_exc)
+                    status = "failed"
+                    self.log(
+                        f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
+                        f"{job['label']}: {error}"
+                    )
             self.ui_queue.put((
                 "batch_job_done",
                 {
@@ -2849,7 +3191,8 @@ class App:
             "_active_batch_inventory",
             "_active_batch_items",
             "_active_blender_dependency_map",
-            "_active_blender_planned_cluster_producers_by_owner",
+            "_active_pipeline_terminal_phase",
+            "_active_repair_stage_contracts",
             "_pipeline_upstream_failed_items",
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
@@ -2936,6 +3279,31 @@ class App:
         self._enqueue_batch_job(job)
 
     def _run_full_pipeline(
+        self,
+        targets,
+        terminal_phase="push",
+        selected_scope=False,
+        emit_done=True,
+    ):
+        self._active_pipeline_terminal_phase = terminal_phase
+        self._active_repair_stage_contracts = {}
+        try:
+            return self._run_full_pipeline_stages(
+                targets,
+                terminal_phase=terminal_phase,
+                selected_scope=selected_scope,
+                emit_done=emit_done,
+            )
+        finally:
+            for key in (
+                "_active_blender_dependency_map",
+                "_active_pipeline_terminal_phase",
+                "_active_repair_stage_contracts",
+                "_pipeline_upstream_failed_items",
+            ):
+                self.__dict__.pop(key, None)
+
+    def _run_full_pipeline_stages(
         self,
         targets,
         terminal_phase="push",
@@ -3071,7 +3439,24 @@ class App:
 
     def stop_batch(self):
         self._ensure_batch_queue_state()
-        pending = len(self.pending_batch_jobs)
+        pending_jobs = list(self.pending_batch_jobs)
+        pending = len(pending_jobs)
+        shared_runtime = getattr(self, "shared_queue_runtime", None)
+        if shared_runtime is not None:
+            for job in pending_jobs:
+                shared_job_id = job.get("shared_queue_job_id")
+                if not shared_job_id:
+                    continue
+                try:
+                    shared_runtime.cancel(
+                        shared_job_id,
+                        reason="sk_batch_local_queue_cancelled",
+                    )
+                except Exception:
+                    # A job that acquired its lease between the snapshot and
+                    # this cancellation is owned by the worker and is released
+                    # only after its child processes have stopped.
+                    pass
         self.pending_batch_jobs.clear()
         self.stop_flag.set()
         # Worker polling performs the tree kill. Keeping it in one place avoids
@@ -3081,6 +3466,11 @@ class App:
             "중지 요청됨 — 실행 중인 작업과 SpeedTree 자식을 종료합니다."
             + suffix
         )
+
+    def shutdown_shared_queue(self):
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is not None:
+            runtime.shutdown()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
@@ -3122,6 +3512,24 @@ class App:
             targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
             try:
+                stage_dependency_contracts = {}
+                repair_contracts = getattr(
+                    self,
+                    "_active_repair_stage_contracts",
+                    None,
+                )
+                if isinstance(repair_contracts, dict):
+                    with self.state_lock:
+                        for root, repair_contract in repair_contracts.items():
+                            if not isinstance(repair_contract, dict):
+                                continue
+                            dependency_contract = repair_contract.get(
+                                "push_dependency_contract"
+                            )
+                            if isinstance(dependency_contract, dict):
+                                stage_dependency_contracts[root] = (
+                                    copy.deepcopy(dependency_contract)
+                                )
                 (
                     targets,
                     self._active_push_dependency_map,
@@ -3130,6 +3538,9 @@ class App:
                     targets,
                     self._batch_job_inventory()
                     or {str(item["spm"]): item for item in targets},
+                    stage_dependency_contracts=(
+                        stage_dependency_contracts or None
+                    ),
                 )
             except (
                 PushDependencyError,
@@ -3226,28 +3637,6 @@ class App:
                 or {str(item["spm"]): item for item in targets},
             )
         blender_dependency_map = blender_dependency_map or {}
-        planned_cluster_producers_by_owner = {}
-        if phase == "blender":
-            for planned_item in targets:
-                planned_spm = planned_item.get("spm")
-                if not planned_spm or not is_cluster_source_spm(planned_spm):
-                    continue
-                planned_output = speedtree_output_spm_for(planned_spm)
-                for planned_target in cluster_relation_output_targets(
-                    planned_spm,
-                    planned_item.get("referenced_by_spms") or (),
-                ):
-                    owner_key = normalized_folder_key(planned_target)
-                    planned_cluster_producers_by_owner.setdefault(
-                        owner_key,
-                        [],
-                    ).append(planned_output)
-        self._active_blender_planned_cluster_producers_by_owner = {
-            owner_key: tuple(dict.fromkeys(producers))
-            for owner_key, producers in (
-                planned_cluster_producers_by_owner.items()
-            )
-        }
         upstream_failed_items = set(
             getattr(self, "_pipeline_upstream_failed_items", set())
         )
@@ -3315,6 +3704,13 @@ class App:
             except Exception as exc:
                 reason = compact_error_message(exc)
                 kind = getattr(exc, "kind", "data_error")
+                if phase == "blender":
+                    self._publish_repair_stage_contract(
+                        spm,
+                        ready=False,
+                        reason=reason,
+                        kind=kind,
+                    )
                 if phase == "push" and kind == "data_error" and "시간 초과" in reason:
                     kind = "push_timeout"
                     reason = "Push 작업 시간 초과 — Unreal/RPC 상태 확인 필요"
@@ -3387,19 +3783,49 @@ class App:
         for wave_index, wave in enumerate(waves):
             if self.stop_flag.is_set() or phase_abort.is_set():
                 break
-            wave_workers = max(1, min(workers, len(wave)))
+            cluster_owner_groups = []
+            if (
+                phase == "blender"
+                and wave
+                and all(
+                    is_cluster_source_spm(item.get("spm"))
+                    for item in wave
+                )
+            ):
+                grouped = {}
+                for item in wave:
+                    owner_key = normalized_folder_key(
+                        Path(item["spm"]).parent.parent
+                    )
+                    grouped.setdefault(owner_key, []).append(item)
+                cluster_owner_groups = list(grouped.values())
+
+            execution_units = cluster_owner_groups or [
+                [item] for item in wave
+            ]
+            wave_workers = max(
+                1,
+                min(workers, len(execution_units)),
+            )
+
+            def run_unit(unit):
+                for unit_item in unit:
+                    if self.stop_flag.is_set() or phase_abort.is_set():
+                        break
+                    run_one(unit_item)
+
             if wave_workers > 1:
                 self.log(
                     f"{title}: {wave_workers}개 동시 실행 "
                     f"(wave {wave_index + 1}/{len(waves)})"
                 )
                 with ThreadPoolExecutor(max_workers=wave_workers) as pool:
-                    list(pool.map(run_one, wave))
+                    list(pool.map(run_unit, execution_units))
             else:
-                for item in wave:
+                for unit in execution_units:
                     if self.stop_flag.is_set() or phase_abort.is_set():
                         break
-                    run_one(item)
+                    run_unit(unit)
         if phase_abort.is_set():
             deferred_reason = f"Unreal/RPC 중단으로 미실행 — {self._phase_abort_reason}"
             for item in targets:
@@ -3420,10 +3846,6 @@ class App:
             self._phase_failed_items = set(failed_items)
             if phase != "check":
                 save_state(self.state)
-        self.__dict__.pop(
-            "_active_blender_planned_cluster_producers_by_owner",
-            None,
-        )
         if emit_done:
             progress = (
                 f"{title} 중단 — {self._phase_abort_reason}"
@@ -3451,7 +3873,15 @@ class App:
             return ""
 
     def _run_limited(
-        self, cmd, log_name, timeout, affinity=True, progress_callback=None, env=None
+        self,
+        cmd,
+        log_name,
+        timeout,
+        affinity=True,
+        progress_callback=None,
+        env=None,
+        timeout_start_marker=None,
+        wait_timeout=None,
     ):
         log_file = LOG_DIR / log_name
         proc = launch_limited(
@@ -3465,26 +3895,62 @@ class App:
             self.active_procs.add(proc)
         try:
             started = time.monotonic()
-            deadline = time.time() + timeout
+            phase_started = None
+            runtime_deadline = started + timeout
+            wait_deadline = started + (
+                wait_timeout if wait_timeout is not None else timeout
+            )
             next_progress = 0.0
             while proc.poll() is None:
                 if self.stop_flag.is_set():
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " (자식 프로세스 종료 확인 실패)"
                     raise RuntimeError("사용자 중지" + detail)
-                if time.time() > deadline:
+                now = time.monotonic()
+                latest_line = ""
+                if (
+                    timeout_start_marker is not None
+                    or progress_callback is not None
+                ):
+                    latest_line = self._latest_log_line(log_file)
+                if (
+                    phase_started is None
+                    and timeout_start_marker
+                    and timeout_start_marker in latest_line
+                ):
+                    phase_started = now
+                    runtime_deadline = phase_started + timeout
+                deadline = (
+                    runtime_deadline
+                    if phase_started is not None or not timeout_start_marker
+                    else wait_deadline
+                )
+                if now > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
+                    phase = (
+                        "실행"
+                        if phase_started is not None or not timeout_start_marker
+                        else "대기"
+                    )
+                    limit = (
+                        timeout
+                        if phase == "실행"
+                        else (
+                            wait_timeout
+                            if wait_timeout is not None
+                            else timeout
+                        )
+                    )
                     timeout_error = RuntimeError(
-                        f"시간 초과({timeout}s){detail} — 로그: {log_file}"
+                        f"{phase} 시간 초과({limit}s){detail} — 로그: {log_file}"
                     )
                     timeout_error.log_file = log_file
                     raise timeout_error
-                now = time.monotonic()
                 if progress_callback is not None and now >= next_progress:
                     progress_callback(
                         now - started,
-                        self._latest_log_line(log_file),
+                        latest_line,
                     )
                     next_progress = now + 1.0
                 interval = float(self.cfg.get("process_poll_interval", 0.2))
@@ -3524,7 +3990,10 @@ class App:
             return False
 
     @staticmethod
-    def _cluster_assembly_inputs_current(spm):
+    def _cluster_assembly_inputs_current(
+        spm,
+        dependency_contract_out=None,
+    ):
         """Validate every external Cluster artifact captured by BWR."""
         from cluster_assembly_builder import (
             MANIFEST_KIND,
@@ -3562,7 +4031,7 @@ class App:
             f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
         )
         try:
-            pipeline = json.loads(report_path.read_text(encoding="utf-8"))
+            pipeline = _read_repair_pipeline_json(report_path)
             embedded = pipeline.get("cluster_assembly_manifest")
             pipeline_resolution = (
                 pipeline.get("cluster_assembly_receipt_resolution") or {}
@@ -3664,6 +4133,13 @@ class App:
                             "current Cluster relationship receipt is actionable, "
                             "but the Repair report recorded Assembly pass_through"
                         )
+                if isinstance(dependency_contract_out, dict):
+                    dependency_contract_out.update(
+                        exact_dependency_contract_from_validated_manifest(
+                            spm,
+                            embedded,
+                        )
+                    )
                 return True, ""
             manifest_record = embedded.get("manifest") or {}
             manifest_path = Path(str(manifest_record.get("path") or ""))
@@ -3698,6 +4174,13 @@ class App:
                         "the receipt captured by Blender Repair"
                     )
             validate_manifest_artifacts(manifest)
+            if isinstance(dependency_contract_out, dict):
+                dependency_contract_out.update(
+                    exact_dependency_contract_from_validated_manifest(
+                        spm,
+                        manifest,
+                    )
+                )
             return True, ""
         except (OSError, ValueError, RuntimeError) as exc:
             return False, (
@@ -3813,9 +4296,22 @@ class App:
                 )
         return True, ""
 
-    def _repair_output_state(self, spm):
+    def _repair_output_state(self, spm, pipeline_projection_out=None):
         with repair_report_read_scope():
-            return self._repair_output_state_scoped(spm)
+            state = self._repair_output_state_scoped(spm)
+            if isinstance(pipeline_projection_out, dict):
+                try:
+                    pipeline = _read_repair_pipeline_json(
+                        repair_pipeline_report_path(spm)
+                    )
+                except (OSError, TypeError, ValueError):
+                    pipeline = {}
+                manifest = pipeline.get("cluster_assembly_manifest")
+                if isinstance(manifest, dict):
+                    pipeline_projection_out["cluster_assembly_manifest"] = (
+                        copy.deepcopy(manifest)
+                    )
+            return state
 
     def _repair_output_state_scoped(self, spm):
         """One semantic decision shared by row status and the ② queue gate."""
@@ -3846,10 +4342,20 @@ class App:
                 "reason": runtime_reason,
             }
         receipt_current = self._repair_contract_current(spm)
+        assembly_state = None
+        assembly_dependency_contract = {}
+
+        def assembly_inputs():
+            nonlocal assembly_state
+            if assembly_state is None:
+                assembly_state = self._cluster_assembly_inputs_current(
+                    spm,
+                    dependency_contract_out=assembly_dependency_contract,
+                )
+            return assembly_state
+
         if receipt_current:
-            assembly_current, assembly_reason = (
-                self._cluster_assembly_inputs_current(spm)
-            )
+            assembly_current, assembly_reason = assembly_inputs()
             if not assembly_current:
                 return {
                     "current": False,
@@ -3879,13 +4385,18 @@ class App:
             except (OSError, ValueError, RuntimeError):
                 receipt_current = False
             if handoff_status == "source_review":
-                return {
+                state = {
                     "current": True,
                     "push_ready": False,
                     "kind": "source_review",
                     "reason": "원본/재질 검토 필요 — Unreal Push 차단",
                     "texture_reason": "",
                 }
+                if assembly_dependency_contract:
+                    state["push_dependency_contract"] = copy.deepcopy(
+                        assembly_dependency_contract
+                    )
+                return state
 
         material_ok, material_reason = self._material_export_ready(
             spm, content_receipt_current=receipt_current
@@ -3928,9 +4439,7 @@ class App:
                 "kind": "texture",
                 "reason": texture_reason,
             }
-        assembly_current, assembly_reason = (
-            self._cluster_assembly_inputs_current(spm)
-        )
+        assembly_current, assembly_reason = assembly_inputs()
         if not assembly_current:
             return {
                 "current": False,
@@ -3938,18 +4447,61 @@ class App:
                 "kind": "assembly_stale",
                 "reason": assembly_reason,
             }
-        return {
+        state = {
             "current": True,
             "push_ready": True,
             "kind": "ready",
             "reason": "준비됨 ✓",
             "texture_reason": texture_reason,
         }
+        if assembly_dependency_contract:
+            state["push_dependency_contract"] = copy.deepcopy(
+                assembly_dependency_contract
+            )
+        return state
 
-    def _handoff_ready(self, spm):
+    def _handoff_ready(self, spm, state_out=None):
         """Return Unreal handoff readiness from the shared Repair decision."""
         state = self._repair_output_state(spm)
+        if isinstance(state_out, dict):
+            state_out.update(copy.deepcopy(state))
         return bool(state["current"] and state["push_ready"]), state["reason"]
+
+    def _publish_repair_stage_contract(
+        self,
+        spm,
+        *,
+        ready,
+        reason,
+        kind=None,
+        push_dependency_contract=None,
+    ):
+        """Publish ②'s final result for ③ in the same pipeline only."""
+        contracts = getattr(self, "_active_repair_stage_contracts", None)
+        if not isinstance(contracts, dict):
+            return
+        value = {
+            "ready": bool(ready),
+            "reason": str(reason or ("준비됨 ✓" if ready else "준비 안 됨")),
+            "kind": str(kind or ("ready" if ready else "not_ready")),
+        }
+        if isinstance(push_dependency_contract, dict):
+            value["push_dependency_contract"] = copy.deepcopy(
+                push_dependency_contract
+            )
+        key = _normalized_path(speedtree_output_spm_for(spm))
+        with self.state_lock:
+            contracts[key] = value
+
+    def _repair_stage_contract(self, spm):
+        """Read a job-scoped ② result without accepting persisted state."""
+        contracts = getattr(self, "_active_repair_stage_contracts", None)
+        if not isinstance(contracts, dict):
+            return None
+        key = _normalized_path(speedtree_output_spm_for(spm))
+        with self.state_lock:
+            value = contracts.get(key)
+            return copy.deepcopy(value) if isinstance(value, dict) else None
 
     @staticmethod
     def _leaf_reference_ready(spm):
@@ -4136,12 +4688,9 @@ class App:
             )
         return True, "텍스처 정규화 완료"
 
-    def _blend_status_text(self, spm):
-        """Return the live SK handoff status; never trust a saved UI label."""
-        try:
-            state = self._repair_output_state(spm)
-        except OSError as exc:
-            return f"확인 실패 — {exc}"
+    @staticmethod
+    def _blend_status_from_repair_state(state):
+        """Format one already-computed Repair state for the overview table."""
         if state["kind"] == "missing_blend":
             return "생성 필요 — blend 없음 · ② Blender Repair 실행"
         if state["kind"] == "stale_content":
@@ -4160,8 +4709,26 @@ class App:
             )
         return "최신 ✓"
 
-    def _record_live_blend_status(self, iid, spm, persist=True):
-        text = self._blend_status_text(spm)
+    def _blend_status_text(self, spm):
+        """Return the live SK handoff status; never trust a saved UI label."""
+        try:
+            state = self._repair_output_state(spm)
+        except OSError as exc:
+            return f"확인 실패 — {exc}"
+        return self._blend_status_from_repair_state(state)
+
+    def _record_live_blend_status(
+        self,
+        iid,
+        spm,
+        persist=True,
+        repair_state=None,
+    ):
+        text = (
+            self._blend_status_from_repair_state(repair_state)
+            if isinstance(repair_state, dict)
+            else self._blend_status_text(spm)
+        )
         self.ui_queue.put(("cell", (iid, "blend_status", text)))
         if persist:
             with self.state_lock:
@@ -4272,6 +4839,123 @@ class App:
             )
         return Path(result.get("canonical_spm") or spm)
 
+    def _refresh_canonical_atlas_manifests(self, spm):
+        """Synchronize canonical PCG output into Atlas before Blender starts."""
+        spm = Path(spm)
+        if not should_refresh_canonical_atlas_manifests(spm):
+            return {
+                "status": "not_applicable",
+                "reason": "owner_spm_is_not_an_atlas_producer",
+                "target_spm": str(spm),
+                "canonical_manifest": None,
+                "updated": [],
+                "current": [],
+                "pending": [],
+            }
+        try:
+            result = refresh_atlas_manifests_for_spm(
+                spm,
+                require_complete=True,
+            )
+        except CanonicalOutputManifestError as exc:
+            raise BatchItemError(
+                "Canonical PCG → Atlas manifest preflight failed: "
+                + str(exc),
+                kind="data_error",
+                report={
+                    "status": "failed",
+                    "stage": "canonical_atlas_manifest_preflight",
+                    "spm": str(spm),
+                    "error": str(exc),
+                },
+            ) from exc
+        if result["updated"]:
+            self.log(
+                "Canonical PCG → Atlas manifest regenerated before Blender: "
+                f"{Path(spm).name} · {len(result['updated'])} file(s)"
+            )
+        return result
+
+    def _execute_material_preflight(
+        self,
+        spm,
+        speedtree_spm,
+        stamp,
+    ):
+        """Run the existing fast pre-Blender material contract check."""
+        spm = Path(spm)
+        speedtree_spm = Path(speedtree_spm)
+        fbx_ini = Path(self.cfg["fbx_ini"]).resolve()
+        try:
+            speedtree_cli = fbx_ini.parents[2] / "speedtree_cli.py"
+        except IndexError as exc:
+            raise BatchItemError(
+                f"SpeedTree export helper 경로를 찾을 수 없음: {fbx_ini}",
+                kind="data_error",
+            ) from exc
+        if not speedtree_cli.is_file():
+            raise BatchItemError(
+                f"SpeedTree export helper 없음: {speedtree_cli}",
+                kind="data_error",
+            )
+        material_report = LOG_DIR / (
+            f"{spm.stem}_material_preflight_{stamp}.json"
+        )
+        material_log_name = f"{spm.stem}_material_preflight_{stamp}.log"
+        material_cmd = [
+            sys.executable,
+            str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
+            "--spm", str(speedtree_spm),
+            "--canonical-spm", str(spm),
+            "--speedtree-exe", str(self.cfg["speedtree_exe"]),
+            "--fbx-ini", str(fbx_ini),
+            "--speedtree-cli", str(speedtree_cli),
+            "--report", str(material_report),
+            "--timeout", str(
+                self.cfg.get("speedtree_material_preflight_timeout", 900)
+            ),
+        ]
+        last_progress = {"bucket": -1, "phase": ""}
+
+        def report_material_progress(elapsed, latest_line):
+            if SPEEDTREE_SLOT_ACQUIRED_MARKER in latest_line:
+                phase = "SpeedTree 실행 중"
+            elif SPEEDTREE_SLOT_WAIT_MARKER in latest_line:
+                phase = "SpeedTree 단일 슬롯 대기 중"
+            else:
+                phase = "계약 검사/캐시 확인 중"
+            bucket = int(elapsed // 30)
+            if (
+                bucket == last_progress["bucket"]
+                and phase == last_progress["phase"]
+            ):
+                return
+            last_progress.update(bucket=bucket, phase=phase)
+            self.log(
+                f"재질 사전검사 진행: {spm.name} · {phase} "
+                f"· 총 {int(elapsed)}초"
+            )
+
+        material_code, material_log = self._run_limited(
+            material_cmd,
+            material_log_name,
+            self.cfg.get("speedtree_material_preflight_timeout", 900) + 30,
+            affinity=False,
+            progress_callback=report_material_progress,
+            timeout_start_marker=SPEEDTREE_SLOT_ACQUIRED_MARKER,
+            wait_timeout=self.cfg.get(
+                "speedtree_material_preflight_queue_timeout",
+                3600,
+            ),
+        )
+        material_result = load_job_report(material_report)
+        return {
+            "code": material_code,
+            "report": material_report,
+            "log": material_log,
+            "result": material_result,
+        }
+
     def _refresh_cluster_source_relations(self, spm, item):
         """Regenerate stale provider outputs without rebuilding current BWR."""
         from cluster_blend_sync import (
@@ -4332,17 +5016,24 @@ class App:
         return result
 
     def _job_spm(self, iid, spm):
-        spm = self._prepare_pair_for_job(spm)
+        spm = Path(spm)
         entry = self.state.setdefault(iid, {})
         item = self._batch_job_item(iid)
         if not should_calibrate_spm(item):
-            summary = "건너뜀 · 읽기 전용 SPM"
+            read_only = item.get("source_read_only")
+            summary = (
+                "건너뜀 · 읽기 전용 SPM"
+                if read_only
+                else "건너뜀 · 일반 SPM 본 세팅 제외"
+            )
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
                 save_state(self.state)
-            self.log(f"SPM 본 보정 건너뜀 (source read-only): {spm.name}")
+            reason = "source read-only" if read_only else "Cluster 전용 정책"
+            self.log(f"SPM 본 보정 건너뜀 ({reason}): {spm.name}")
             return
+        spm = self._prepare_pair_for_job(spm)
         if item.get("manual_bones_locked", False):
             summary = f"{manual_bone_status_text(spm)} · ① 전체 건너뜀"
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
@@ -4493,6 +5184,15 @@ class App:
             self.log(f"  [캐시 경고] 최종 SPM 지문 계산 실패: {spm.name}: {exc}")
         validate_spm_audit_result(spm, rep, final_snapshot)
         cacheable = status in {"calibrated", "already-ok", "manual-required", "not-sk-ready"}
+        chained_repair = (
+            getattr(self, "_active_pipeline_terminal_phase", None)
+            in {"blender", "push"}
+        )
+        blend_status = (
+            "② 대기 · ① 완료"
+            if chained_repair
+            else self._blend_status_text(spm)
+        )
         with self.state_lock:
             if cacheable and final_snapshot:
                 entry["calibration_cache"] = {
@@ -4508,7 +5208,7 @@ class App:
             entry["spm_last_duration_seconds"] = round(duration, 3)
             entry["spm_status"] = f"{summary}{warn}"
             entry["spm_summary"] = summary
-            entry["blend_status"] = self._blend_status_text(spm)
+            entry["blend_status"] = blend_status
             save_state(self.state)
         self.ui_queue.put(("cell", (iid, "blend_status", entry["blend_status"])))
         if status == "not-sk-ready":
@@ -4709,15 +5409,12 @@ class App:
         """Discover only contract inputs, never BWR/runtime report JSON."""
         spm = Path(spm).resolve()
         owner = spm.parent
-        paths = {
-            spm,
-            Path(__file__).resolve(),
-            (
-                REPO_DIR
-                / "pcg_st9_texture_batch"
-                / "pcg_texture_audit.py"
-            ).resolve(),
-        }
+        # Runtime source files are launch-time code, not asset inputs. The
+        # compile gate validates them before the GUI starts and every queued
+        # job owns one in-memory generation. Including source mtimes here made
+        # a developer edit during a long wave look like asset churn and forced
+        # an unrelated live-audit retry.
+        paths = {spm}
 
         def is_temporary_contract_path(candidate):
             try:
@@ -4835,15 +5532,8 @@ class App:
         self,
         spm,
         stamp,
-        *,
-        producer_spm=None,
-        allowed_producer_spms=(),
     ):
         """Reuse one hash-current live audit inside the active GUI batch.
-
-        The memo stores only the raw live-audit observation. Producer bootstrap
-        tolerance is evaluated after reuse for each caller, so a producer call
-        cannot turn the same owner's data error into a cached success.
 
         Successful raw audits only are memoized. Concurrent callers for the
         same owner/input share one Future; an execution exception reaches all
@@ -4855,8 +5545,6 @@ class App:
             return self._refresh_stale_cluster_receipt_uncached(
                 spm,
                 stamp,
-                producer_spm=producer_spm,
-                allowed_producer_spms=allowed_producer_spms,
             )
 
         self._ensure_cluster_receipt_refresh_memo()
@@ -4936,8 +5624,6 @@ class App:
             return self._evaluate_cluster_receipt_live_audit(
                 spm,
                 copy.deepcopy(cached_raw_audit),
-                producer_spm=producer_spm,
-                allowed_producer_spms=allowed_producer_spms,
             )
         if not owns_flight:
             raw_audit = copy.deepcopy(
@@ -4946,8 +5632,6 @@ class App:
             return self._evaluate_cluster_receipt_live_audit(
                 spm,
                 raw_audit,
-                producer_spm=producer_spm,
-                allowed_producer_spms=allowed_producer_spms,
             )
 
         completion_error = None
@@ -5015,9 +5699,15 @@ class App:
                         break
                     artifact_errors = final_artifact_errors
                 if attempt == 0:
+                    retry_reason = (
+                        "; ".join(artifact_errors[:3])
+                        if artifact_errors
+                        else "asset SPM/manifest content changed"
+                    )
                     self.log(
-                        "Cluster Assembly live audit input changed during "
-                        f"audit; retrying once: {spm.name}"
+                        "Cluster Assembly live audit asset input changed "
+                        f"during audit; retrying once: {spm.name} · "
+                        f"{retry_reason}"
                     )
                     attempt_pre_fingerprint = (
                         self._cluster_receipt_refresh_input_fingerprint(spm)
@@ -5072,8 +5762,6 @@ class App:
         return self._evaluate_cluster_receipt_live_audit(
             spm,
             raw_audit,
-            producer_spm=producer_spm,
-            allowed_producer_spms=allowed_producer_spms,
         )
 
     def _refresh_stale_cluster_receipt_uncached(
@@ -5081,9 +5769,8 @@ class App:
         spm,
         stamp,
         *,
-        producer_spm=None,
-        allowed_producer_spms=(),
         _raw_only=False,
+        _persist_receipt=True,
     ):
         """Run the live PCG audit before launching Blender for owner Trees.
 
@@ -5103,10 +5790,7 @@ class App:
                 cached_resolution = cluster_assembly_receipt_resolution(spm)
                 if not owner_has_cluster:
                     return cached_resolution
-                self.log(
-                    f"Cluster Assembly live audit: {spm.name} "
-                    "(hash-current receipt is cache evidence only)"
-                )
+                self.log(f"Cluster Assembly live contract 확인: {spm.name}")
             except FileNotFoundError:
                 # Only an owner Tree with a real Cluster child can be missing
                 # an actionable receipt. Ordinary vegetation and the Cluster
@@ -5144,18 +5828,21 @@ class App:
                 / "pcg_texture_audit.py"
             )
             timeout = int(self.cfg.get("cluster_receipt_refresh_timeout", 600))
+            audit_command = [
+                sys.executable,
+                str(audit_script),
+                "--target", str(spm.parent),
+                "--target-mesh", (
+                    spm.stem[3:]
+                    if spm.stem.casefold().startswith("sk_")
+                    else spm.stem
+                ),
+                "--json", str(audit_report),
+            ]
+            if not _persist_receipt:
+                audit_command.append("--no-receipt")
             code, log_file = self._run_limited(
-                [
-                    sys.executable,
-                    str(audit_script),
-                    "--target", str(spm.parent),
-                    "--target-mesh", (
-                        spm.stem[3:]
-                        if spm.stem.casefold().startswith("sk_")
-                        else spm.stem
-                    ),
-                    "--json", str(audit_report),
-                ],
+                audit_command,
                 f"{run_identity}.log",
                 timeout,
                 affinity=False,
@@ -5252,19 +5939,14 @@ class App:
             return self._evaluate_cluster_receipt_live_audit(
                 spm,
                 raw_audit,
-                producer_spm=producer_spm,
-                allowed_producer_spms=allowed_producer_spms,
             )
 
     def _evaluate_cluster_receipt_live_audit(
         self,
         spm,
         raw_audit,
-        *,
-        producer_spm=None,
-        allowed_producer_spms=(),
     ):
-        """Apply caller policy to one reusable, successful live observation."""
+        """Require one reusable live observation to be fully ready."""
         spm = Path(spm).resolve()
         raw_audit = raw_audit if isinstance(raw_audit, dict) else {}
         payload = raw_audit.get("payload") or {}
@@ -5317,57 +5999,13 @@ class App:
             failures.append(" ".join(fields))
         actual_failure = " | ".join(failures[:5])
 
-        def same_file(left, right):
-            if not left or not right:
-                return False
-            try:
-                return (
-                    str(Path(left).expanduser().resolve()).casefold()
-                    == str(Path(right).expanduser().resolve()).casefold()
-                )
-            except OSError:
-                return (
-                    str(Path(left).expanduser().absolute()).casefold()
-                    == str(Path(right).expanduser().absolute()).casefold()
-                )
-
-        allowed_producers = [
-            Path(value).expanduser().resolve()
-            for value in (
-                tuple(allowed_producer_spms or ())
-                + ((producer_spm,) if producer_spm else ())
-            )
-            if value
-        ]
-        allowed_producers = list(dict.fromkeys(allowed_producers))
-        producer_repair_only_failure = bool(
-            producer_spm
-            and allowed_producers
-            and live_issues
-            and all(
-                str(issue.get("code") or "")
-                == "NORMALIZED_VARIANTS_REQUIRED"
-                and any(
-                    same_file(issue.get("spm"), allowed)
-                    for allowed in allowed_producers
-                )
-                for issue in live_issues
-            )
-        )
-        if actual_failure and not producer_repair_only_failure:
+        if actual_failure:
             raise BatchItemError(
                 "Cluster Assembly actual data audit failed: "
                 + actual_failure,
                 kind="data_error",
                 log_file=log_file,
                 report_file=audit_report,
-            )
-        if producer_repair_only_failure:
-            self.log(
-                "Cluster Assembly producer bootstrap allowed: "
-                + ", ".join(path.name for path in allowed_producers)
-                + " require the normalized variants planned in this "
-                "Blender Repair wave"
             )
 
         live_contract = copy.deepcopy(raw_audit.get("selected_contract"))
@@ -5452,8 +6090,7 @@ class App:
             )
         else:
             self.log(
-                "Cluster Assembly live audit 완료 · 캐시 영수증 갱신: "
-                f"{Path(persisted_resolution['selected_receipt']).name}"
+                f"Cluster Assembly live contract 검증 완료: {spm.name}"
             )
 
         return {
@@ -5483,17 +6120,140 @@ class App:
             "receipt_persistence_warning": (
                 persistence_error or cache_resolution_error
             ),
-            "producer_repair_issue_tolerated": (
-                producer_repair_only_failure
+        }
+
+    def _cluster_normalization_stage_observation(
+        self,
+        target_spm,
+        stamp,
+        producer_spm,
+        *,
+        require_normalized,
+    ):
+        """Inspect one producer-owned slice without declaring the Tree ready.
+
+        A Tree contract may contain several independent Cluster providers.
+        Producer work owns only the issue rows bound to its exact canonical
+        SPM.  Other providers remain separate scheduled jobs; global issues
+        remain blockers.  This is a stage input/output contract, not a
+        successful Assembly audit and never substitutes for the strict Tree
+        audit that runs after all dependencies complete.
+        """
+        target = Path(target_spm).resolve()
+        producer = Path(producer_spm).resolve()
+        raw_audit = self._refresh_stale_cluster_receipt_uncached(
+            target,
+            stamp,
+            _raw_only=True,
+            _persist_receipt=False,
+        )
+        contract = copy.deepcopy(raw_audit.get("selected_contract"))
+        dependency = cluster_contract_dependency_for_spm(contract, producer)
+        audit_report = Path(raw_audit.get("audit_report") or "")
+        log_value = raw_audit.get("log_file")
+        log_file = Path(log_value) if log_value else None
+        if dependency is None:
+            raise BatchItemError(
+                "Cluster relation/content mismatch: "
+                f"{producer.name} is registered for {target.name} but is not "
+                "a live content dependency",
+                kind="data_error",
+                log_file=log_file,
+                report_file=audit_report,
+            )
+
+        owned_issues = []
+        global_issues = []
+        dependency_keys = {
+            normalized_folder_key(value)
+            for row in (contract or {}).get("dependencies") or ()
+            if isinstance(row, dict)
+            for field in ("spm", "source_spm", "authoring_spm", "output_spm")
+            for value in (row.get(field),)
+            if value
+        }
+        for issue in cluster_contract_issues(contract):
+            issue_spm = issue.get("spm")
+            if not issue_spm:
+                global_issues.append(issue)
+            elif (
+                normalized_folder_key(issue_spm)
+                == normalized_folder_key(producer)
+            ):
+                owned_issues.append(issue)
+            elif normalized_folder_key(issue_spm) not in dependency_keys:
+                global_issues.append(issue)
+
+        normalizable_codes = {
+            "NORMALIZED_VARIANTS_REQUIRED",
+            "NORMALIZED_VARIANTS_STALE",
+        }
+        unexpected_owned = [
+            issue
+            for issue in owned_issues
+            if str(issue.get("code") or "") not in normalizable_codes
+        ]
+        blocking = (
+            global_issues + owned_issues
+            if require_normalized
+            else global_issues + unexpected_owned
+        )
+        normalized_variants = dependency.get("normalized_variants")
+        variants_required = bool(
+            dependency.get("normalized_variants_required")
+        )
+        if (
+            require_normalized
+            and variants_required
+            and not normalized_variants
+            and not owned_issues
+        ):
+            blocking.append({
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "spm": str(producer),
+            })
+        if blocking:
+            summary = " | ".join(
+                " ".join(
+                    value
+                    for value in (
+                        str(issue.get("code") or "CLUSTER_DATA_INVALID"),
+                        (
+                            f"role={issue.get('role')}"
+                            if issue.get("role")
+                            else ""
+                        ),
+                    )
+                    if value
+                )
+                for issue in blocking[:5]
+            )
+            stage = "output" if require_normalized else "input"
+            raise BatchItemError(
+                f"Cluster normalization {stage} validation failed: {summary}",
+                kind="data_error",
+                log_file=log_file,
+                report_file=audit_report,
+            )
+
+        return {
+            "status": (
+                "normalized"
+                if require_normalized
+                else (
+                    "normalization_required"
+                    if owned_issues
+                    else "current"
+                )
             ),
-            "producer_spm": (
-                str(Path(producer_spm).resolve())
-                if producer_spm
-                else None
+            "target_spm": str(target),
+            "producer_spm": str(producer),
+            "live_audit_report": str(audit_report),
+            "live_audit_payload": copy.deepcopy(
+                raw_audit.get("payload") or {}
             ),
-            "allowed_producer_spms": [
-                str(path) for path in allowed_producers
-            ],
+            "selected_contract": contract,
+            "owned_work_items": copy.deepcopy(owned_issues),
         }
 
     def _job_blender(self, iid, spm, item):
@@ -5501,7 +6261,9 @@ class App:
 
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
-        speedtree_spm = speedtree_output_spm_for(spm)
+        self._refresh_canonical_atlas_manifests(spm)
+        producer_spm = speedtree_output_spm_for(spm)
+        speedtree_spm = producer_spm
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         bark_source_resolution = None
         relation_targets = ()
@@ -5515,61 +6277,30 @@ class App:
                     ClusterBarkSourceResolutionError,
                     resolve_cluster_bark_source_spm,
                 )
-                from cluster_assembly_handoff_contract import (
-                    select_cluster_contract,
-                )
 
                 try:
                     live_target_contracts = []
                     for target in relation_targets:
-                        planned_producers = getattr(
-                            self,
-                            (
-                                "_active_blender_planned_cluster_"
-                                "producers_by_owner"
-                            ),
-                            {},
-                        ).get(
-                            normalized_folder_key(target),
-                            (speedtree_spm,),
-                        )
                         live_resolution = (
-                            self._refresh_stale_cluster_receipt(
+                            self._cluster_normalization_stage_observation(
                                 target,
-                                stamp,
-                                producer_spm=speedtree_spm,
-                                allowed_producer_spms=planned_producers,
+                                f"{stamp}_normalization_input",
+                                producer_spm,
+                                require_normalized=False,
                             )
                         )
-                        live_report = (
-                            (live_resolution or {}).get(
-                                "live_audit_report"
-                            )
-                            if isinstance(live_resolution, dict)
-                            else None
+                        live_report = live_resolution.get(
+                            "live_audit_report"
                         )
                         contract = copy.deepcopy(
-                            (live_resolution or {}).get(
+                            live_resolution.get(
                                 "selected_contract"
                             )
                         )
-                        if contract is None and live_report:
-                            payload = json.loads(
-                                Path(live_report).read_text(
-                                    encoding="utf-8"
-                                )
-                            )
-                            contract = select_cluster_contract(
-                                payload,
-                                target,
-                            )
                         live_target_contracts.append({
                             "target_spm": str(target),
                             "report": str(live_report or ""),
-                            "policy": (
-                                (live_resolution or {}).get("policy")
-                                or "live_audit_authoritative_pass_through"
-                            ),
+                            "policy": "normalization_stage_input",
                             "contract": contract,
                         })
                     bark_source_resolution = (
@@ -5672,7 +6403,16 @@ class App:
                 self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
             )
         if not self.force_rerun:
-            repair_state = self._repair_output_state(spm)
+            live_contract = cluster_receipt_resolution_uses_live_audit(
+                cluster_receipt_resolution
+            )
+            saved_pipeline = {}
+            repair_state = self._repair_output_state(
+                spm,
+                pipeline_projection_out=(
+                    saved_pipeline if live_contract else None
+                ),
+            )
             if (
                 cluster_source
                 and cluster_bark_resolution_requires_repair(
@@ -5694,31 +6434,12 @@ class App:
                     f"{spm.name} · 기존 blend 최신 판정 무효화"
                 )
             if repair_state["current"]:
-                live_contract = (
-                    cluster_receipt_resolution_uses_live_audit(
-                        cluster_receipt_resolution
-                    )
-                )
                 if live_contract:
                     # A clean live contract with no persisted receipt may skip
                     # only when a prior Repair actually captured an Assembly
                     # manifest.  Otherwise run BWR once and embed the live
                     # contract instead of treating the receipt warning as an
                     # error or silently degrading to non-Assembly.
-                    report_path = (
-                        Path(spm).parent
-                        / "reports"
-                        / (
-                            f"{Path(spm).stem}_"
-                            "speedtree_repair_pipeline_report_codex.json"
-                        )
-                    )
-                    try:
-                        saved_pipeline = json.loads(
-                            report_path.read_text(encoding="utf-8")
-                        )
-                    except (OSError, TypeError, ValueError):
-                        saved_pipeline = {}
                     saved_manifest = saved_pipeline.get(
                         "cluster_assembly_manifest"
                     )
@@ -5770,15 +6491,50 @@ class App:
                             repair_state["current"] = False
                 if repair_state["current"]:
                     if cluster_source:
-                        self._refresh_cluster_source_relations(spm, item)
-                    self._record_live_blend_status(iid, spm)
-                    suffix = (
-                        " · Unreal Push 차단 상태 유지"
-                        if not repair_state["push_ready"]
-                        else ""
+                        relation_refresh = (
+                            self._refresh_cluster_source_relations(spm, item)
+                        )
+                        for target in relation_targets:
+                            self._cluster_normalization_stage_observation(
+                                target,
+                                f"{stamp}_normalization_output",
+                                producer_spm,
+                                require_normalized=True,
+                            )
+                        relation_outputs_changed = bool(
+                            isinstance(relation_refresh, dict)
+                            and not relation_refresh.get("no_change")
+                            and relation_refresh.get("status")
+                            != "pass_through"
+                        )
+                        if relation_outputs_changed:
+                            repair_state = self._repair_output_state(spm)
+                    if repair_state["current"]:
+                        self._record_live_blend_status(
+                            iid,
+                            spm,
+                            repair_state=repair_state,
+                        )
+                        suffix = (
+                            " · Unreal Push 차단 상태 유지"
+                            if not repair_state["push_ready"]
+                            else ""
+                        )
+                        self._publish_repair_stage_contract(
+                            spm,
+                            ready=repair_state["push_ready"],
+                            reason=repair_state["reason"],
+                            kind=repair_state.get("kind"),
+                            push_dependency_contract=repair_state.get(
+                                "push_dependency_contract"
+                            ),
+                        )
+                        self.log(f"건너뜀 (blend 최신{suffix}): {spm.name}")
+                        return
+                    self.log(
+                        "Cluster 관계 산출물 갱신 후 Repair 상태가 변경되어 "
+                        f"②를 계속 실행: {spm.name}"
                     )
-                    self.log(f"건너뜀 (blend 최신{suffix}): {spm.name}")
-                    return
         open_windows = blender_open_file_window_titles(blend)
         if open_windows:
             raise BatchItemError(
@@ -5805,45 +6561,25 @@ class App:
                 raise RuntimeError(f"SK 미제작: {readiness['error']}")
         entry = self.state.setdefault(iid, {})
         self.log(f"재질 사전검사 시작: {spm.name} (Blender 실행 전)")
-        self.ui_queue.put(("cell", (iid, "blend_status", "재질 사전검사 중...")))
-        fbx_ini = Path(self.cfg["fbx_ini"]).resolve()
-        try:
-            speedtree_cli = fbx_ini.parents[2] / "speedtree_cli.py"
-        except IndexError as exc:
-            raise BatchItemError(
-                f"SpeedTree export helper 경로를 찾을 수 없음: {fbx_ini}",
-                kind="data_error",
-            ) from exc
-        if not speedtree_cli.is_file():
-            raise BatchItemError(
-                f"SpeedTree export helper 없음: {speedtree_cli}",
-                kind="data_error",
+        self.ui_queue.put((
+            "cell",
+            (iid, "blend_status", "재질 사전검사 중..."),
+        ))
+        artifact = self._execute_material_preflight(
+            spm,
+            speedtree_spm,
+            stamp,
+        )
+        material_report = artifact["report"]
+        material_log = artifact["log"]
+        material_result = artifact["result"]
+        if (
+            artifact["code"] != 0
+            or material_result.get("status") != "ok"
+        ):
+            reason = summarize_job_failure(
+                material_result, material_log
             )
-        material_report = LOG_DIR / (
-            f"{spm.stem}_material_preflight_{stamp}.json"
-        )
-        material_cmd = [
-            sys.executable,
-            str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
-            "--spm", str(speedtree_spm),
-            "--canonical-spm", str(spm),
-            "--speedtree-exe", str(self.cfg["speedtree_exe"]),
-            "--fbx-ini", str(fbx_ini),
-            "--speedtree-cli", str(speedtree_cli),
-            "--report", str(material_report),
-            "--timeout", str(
-                self.cfg.get("speedtree_material_preflight_timeout", 900)
-            ),
-        ]
-        material_code, material_log = self._run_limited(
-            material_cmd,
-            f"{spm.stem}_material_preflight_{stamp}.log",
-            self.cfg.get("speedtree_material_preflight_timeout", 900) + 30,
-            affinity=False,
-        )
-        material_result = load_job_report(material_report)
-        if material_code != 0 or material_result.get("status") != "ok":
-            reason = summarize_job_failure(material_result, material_log)
             self.log(
                 f"  [Blender 실행 전 차단] {spm.name}: {reason} — "
                 f"상세 보고서: {material_report}"
@@ -6099,6 +6835,15 @@ class App:
                     result["source_review_required"] = bool(
                         final_pipeline.get("source_review_required")
                     )
+                    result["cluster_normalization_verification"] = [
+                        self._cluster_normalization_stage_observation(
+                            target,
+                            f"{stamp}_normalization_output",
+                            producer_spm,
+                            require_normalized=True,
+                        )
+                        for target in relation_targets
+                    ]
                 except Exception as exc:
                     try:
                         restored = restore_cluster_repair_outputs()
@@ -6136,8 +6881,16 @@ class App:
         # outputs against the code now installed, whether or not it had to
         # rewrite the .blend.
         self._write_repair_runtime_receipt(spm)
-        handoff_ok, handoff_reason = self._handoff_ready(spm)
-        blend_status = self._blend_status_text(spm)
+        handoff_state = {}
+        handoff_ok, handoff_reason = self._handoff_ready(
+            spm,
+            state_out=handoff_state,
+        )
+        blend_status = (
+            self._blend_status_from_repair_state(handoff_state)
+            if handoff_state
+            else self._blend_status_text(spm)
+        )
         self.ui_queue.put(("cell", (iid, "blend_status", blend_status)))
         with self.state_lock:
             entry["blend_status"] = blend_status
@@ -6146,6 +6899,24 @@ class App:
             result.get("source_review_required")
             or (result.get("handoff_preflight") or {}).get("status")
             == "source_review"
+        )
+        repair_contract_reason = (
+            "원본/재질 검토 필요 — Unreal Push 차단"
+            if source_review
+            else handoff_reason
+        )
+        self._publish_repair_stage_contract(
+            spm,
+            ready=handoff_ok and not source_review,
+            reason=repair_contract_reason,
+            kind=(
+                "source_review"
+                if source_review
+                else handoff_state.get("kind")
+            ),
+            push_dependency_contract=handoff_state.get(
+                "push_dependency_contract"
+            ),
         )
         if not handoff_ok and not source_review:
             if cluster_source:
@@ -6232,6 +7003,7 @@ class App:
                 save_state(self.state)
             return [], reason
         ready = []
+        reused_repair_contracts = 0
         for item in targets:
             spm = item["spm"]
             dirty_windows = [
@@ -6256,7 +7028,13 @@ class App:
                 )
                 self.log(f"[준비 제외] {spm.name}: {why}")
                 continue
-            ok, why = self._handoff_ready(spm)
+            repair_contract = self._repair_stage_contract(spm)
+            if repair_contract is None:
+                ok, why = self._handoff_ready(spm)
+            else:
+                ok = bool(repair_contract["ready"])
+                why = str(repair_contract["reason"])
+                reused_repair_contracts += 1
             if ok:
                 ready.append(item)
             else:
@@ -6265,14 +7043,30 @@ class App:
                     str(spm),
                     "push_status",
                     status_text,
-                    "preflight_skip",
+                    (
+                        "source_review"
+                        if (
+                            repair_contract is not None
+                            and repair_contract.get("kind")
+                            == "source_review"
+                        )
+                        else "preflight_skip"
+                    ),
                     why,
                     persist=False,
                 )
                 self.log(f"[준비 안 됨] {spm.name}: {why}")
         with self.state_lock:
             save_state(self.state)
-        self.log(f"준비 검사: {len(ready)}/{len(targets)}개 push 가능.")
+        reuse_suffix = (
+            f" · ② 결과 재사용 {reused_repair_contracts}개"
+            if reused_repair_contracts
+            else ""
+        )
+        self.log(
+            f"준비 검사: {len(ready)}/{len(targets)}개 push 가능."
+            + reuse_suffix
+        )
         return ready, None
 
     @staticmethod
@@ -7182,7 +7976,14 @@ def main():
         ttk.Style().theme_use("vista")
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+
+    def close():
+        app.stop_batch()
+        app.shutdown_shared_queue()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
 
 

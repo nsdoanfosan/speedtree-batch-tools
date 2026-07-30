@@ -271,3 +271,197 @@ def test_relation_dependencies_replace_unusable_stale_assembly_contract(
 
     assert [item["spm"] for item in ordered] == [source_spm, root_spm]
     assert dependencies[str(root_spm)] == (str(source_spm),)
+
+
+def test_same_pipeline_contract_skips_persisted_and_relation_discovery(
+    tmp_path,
+):
+    owner = tmp_path / "Tree_stage"
+    cluster_dir = owner / "Cluster"
+    cluster_dir.mkdir(parents=True)
+    root_spm = owner / "SK_Tree_stage_01.spm"
+    source_spm = cluster_dir / "SK_leaf_stage_01.spm"
+    root_spm.write_bytes(b"root")
+    source_spm.write_bytes(b"cluster")
+    source_blend = source_spm.with_suffix(".blend")
+    source_blend.write_bytes(b"blend")
+    contract = schedule.exact_dependency_contract_from_validated_manifest(
+        root_spm,
+        {
+            "kind": schedule.MANIFEST_KIND,
+            "status": "ready",
+            "parts": [{
+                "prototype_id": "rendered-1",
+                "external_source": {
+                    "source_blend": {"path": str(source_blend)}
+                },
+            }],
+        },
+    )
+    items = {
+        str(path): {"spm": path, "checked": path == root_spm}
+        for path in (root_spm, source_spm)
+    }
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        side_effect=AssertionError("same-job manifest must not be reloaded"),
+    ), mock.patch.object(
+        schedule,
+        "discover_cluster_blend_relations",
+        side_effect=AssertionError("same-job relations must not be rediscovered"),
+    ):
+        ordered, dependencies, auto_added = schedule.expand_push_targets(
+            [items[str(root_spm)]],
+            items,
+            stage_dependency_contracts={str(root_spm): contract},
+        )
+
+    assert [item["spm"] for item in ordered] == [source_spm, root_spm]
+    assert dependencies[str(root_spm)] == (str(source_spm),)
+    assert auto_added == {str(source_spm)}
+
+
+def test_incomplete_stage_contract_uses_existing_manifest_fallback(tmp_path):
+    root_spm = tmp_path / "Tree_fallback" / "SK_Tree_fallback_01.spm"
+    root_spm.parent.mkdir(parents=True)
+    root_spm.write_bytes(b"root")
+    item = {"spm": root_spm, "checked": True}
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        return_value={
+            "kind": schedule.MANIFEST_KIND,
+            "status": "pass_through",
+            "parts": [],
+        },
+    ) as load_manifest, mock.patch.object(
+        schedule,
+        "discover_cluster_blend_relations",
+    ) as discover:
+        ordered, dependencies, auto_added = schedule.expand_push_targets(
+            [item],
+            {str(root_spm): item},
+            stage_dependency_contracts={
+                str(root_spm): {
+                    "kind": schedule.STAGE_DEPENDENCY_CONTRACT_KIND,
+                    "schema_version": schedule.STAGE_DEPENDENCY_CONTRACT_VERSION,
+                },
+            },
+        )
+
+    assert ordered == [item]
+    assert dependencies[str(root_spm)] == ()
+    assert auto_added == set()
+    load_manifest.assert_called_once_with(root_spm)
+    discover.assert_not_called()
+
+
+def test_complete_stage_contract_missing_dependency_fails_closed(tmp_path):
+    owner = tmp_path / "Tree_missing_stage"
+    owner.mkdir()
+    root_spm = owner / "SK_Tree_missing_stage_01.spm"
+    root_spm.write_bytes(b"root")
+    missing_spm = owner / "Cluster" / "SK_missing_stage_01.spm"
+    contract = {
+        "kind": schedule.STAGE_DEPENDENCY_CONTRACT_KIND,
+        "schema_version": schedule.STAGE_DEPENDENCY_CONTRACT_VERSION,
+        "root_spm": str(root_spm.resolve()),
+        "assembly_status": "ready",
+        "dependency_spms": [str(missing_spm.resolve())],
+        "evidence": "validated_cluster_assembly_manifest",
+    }
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        side_effect=AssertionError("complete stage evidence must not fallback"),
+    ), mock.patch.object(
+        schedule,
+        "discover_cluster_blend_relations",
+        side_effect=AssertionError("complete stage evidence must not fallback"),
+    ), pytest.raises(
+        schedule.PushDependencyError,
+        match="verified Cluster dependency SPM is missing",
+    ):
+        schedule.expand_push_targets(
+            [{"spm": root_spm, "checked": True}],
+            {str(root_spm): {"spm": root_spm, "checked": True}},
+            stage_dependency_contracts={str(root_spm): contract},
+        )
+
+
+def test_stage_contract_inventory_mismatch_fails_without_fallback(tmp_path):
+    owner = tmp_path / "Tree_inventory"
+    cluster_dir = owner / "Cluster"
+    cluster_dir.mkdir(parents=True)
+    root_spm = owner / "SK_Tree_inventory_01.spm"
+    source_spm = cluster_dir / "SK_leaf_inventory_01.spm"
+    root_spm.write_bytes(b"root")
+    source_spm.write_bytes(b"cluster")
+    contract = {
+        "kind": schedule.STAGE_DEPENDENCY_CONTRACT_KIND,
+        "schema_version": schedule.STAGE_DEPENDENCY_CONTRACT_VERSION,
+        "root_spm": str(root_spm.resolve()),
+        "assembly_status": "ready",
+        "dependency_spms": [str(source_spm.resolve())],
+        "evidence": "validated_cluster_assembly_manifest",
+    }
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        side_effect=AssertionError("complete stage evidence must not fallback"),
+    ), mock.patch.object(
+        schedule,
+        "discover_cluster_blend_relations",
+        side_effect=AssertionError("complete stage evidence must not fallback"),
+    ), pytest.raises(
+        schedule.PushDependencyError,
+        match="current SK Batch scan",
+    ):
+        schedule.expand_push_targets(
+            [{"spm": root_spm, "checked": True}],
+            {str(root_spm): {"spm": root_spm, "checked": True}},
+            stage_dependency_contracts={str(root_spm): contract},
+        )
+
+
+def test_pass_through_stage_contract_is_root_bound_and_skips_disk(tmp_path):
+    roots = [
+        tmp_path / "Tree_bound" / "SK_Tree_bound_A.spm",
+        tmp_path / "Tree_bound" / "SK_Tree_bound_B.spm",
+    ]
+    roots[0].parent.mkdir(parents=True)
+    for root in roots:
+        root.write_bytes(b"root")
+    contract = schedule.exact_dependency_contract_from_validated_manifest(
+        roots[0],
+        {
+            "kind": schedule.MANIFEST_KIND,
+            "status": "pass_through",
+            "parts": [],
+        },
+    )
+    item = {"spm": roots[1], "checked": True}
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        return_value={
+            "kind": schedule.MANIFEST_KIND,
+            "status": "pass_through",
+            "parts": [],
+        },
+    ) as load_manifest:
+        ordered, dependencies, _auto_added = schedule.expand_push_targets(
+            [item],
+            {str(roots[1]): item},
+            stage_dependency_contracts={str(roots[1]): contract},
+        )
+
+    assert ordered == [item]
+    assert dependencies[str(roots[1])] == ()
+    load_manifest.assert_called_once_with(roots[1])

@@ -3285,6 +3285,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
     result = {}
     prepared_unused = {}
     claimed_slots = {}
+    missing_slot_rows = []
     for row in role_inputs:
         role = str(row["role"]).casefold()
         identity_values = [
@@ -3319,7 +3320,10 @@ def _role_material_polygons(merged_mesh, role_inputs):
             for polygon in merged_mesh.data.polygons
             if int(polygon.material_index) in slots
         ]
-        if not slots or not polygons:
+        if not slots:
+            missing_slot_rows.append((role, row, identities))
+            continue
+        if not polygons:
             normalized = deepcopy(row.get("normalized_variants"))
             variants = list((normalized or {}).get("variants") or [])
             prepared_unused[role] = {
@@ -3330,11 +3334,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 ),
                 "matched_material_identities": identities,
                 "status": "prepared_unused",
-                "reason": (
-                    "material_absent_from_rendered_mesh"
-                    if not slots
-                    else "material_has_no_rendered_polygons"
-                ),
+                "reason": "material_has_no_rendered_polygons",
                 "material_slots": sorted(slots),
                 "normalized_variants": normalized,
                 "prepared_variant_count": len(variants),
@@ -3355,8 +3355,101 @@ def _role_material_polygons(merged_mesh, role_inputs):
             "material_slots": sorted(slots),
             "polygon_indices": polygons,
             "normalized_variants": deepcopy(row.get("normalized_variants")),
+            "selection_basis": "material_identity",
+        }
+
+    # BWR can legally consolidate the final rendered mesh onto a canonical
+    # material while preserving the role geometry and UV topology.  The PCG
+    # handoff has already proven the role on its authoritative source FBX, so
+    # absence of that *name* on the merged mesh is not evidence that the
+    # geometry disappeared.  Let the existing normalized-prototype topology
+    # matcher inspect only polygons not already claimed by an exact material
+    # role.  It will still fail closed later when no normalized prototype
+    # actually matches.
+    claimed_polygons = {
+        polygon
+        for role_row in result.values()
+        for polygon in role_row["polygon_indices"]
+    }
+    topology_candidates = [
+        int(polygon.index)
+        for polygon in merged_mesh.data.polygons
+        if int(polygon.index) not in claimed_polygons
+    ]
+    for role, row, identities in missing_slot_rows:
+        normalized = deepcopy(row.get("normalized_variants"))
+        variants = list((normalized or {}).get("variants") or [])
+        assignments = [
+            assignment
+            for assignment in (row.get("assignments") or [])
+            if (
+                isinstance(assignment, dict)
+                and int(assignment.get("used_polygon_count") or 0) > 0
+            )
+        ]
+        if topology_candidates and variants and assignments:
+            result[role] = {
+                "role": role,
+                "role_identity": row.get("role_identity"),
+                "role_identity_aliases": deepcopy(
+                    row.get("role_identity_aliases") or []
+                ),
+                "matched_material_identities": identities,
+                "material_slots": [],
+                "polygon_indices": list(topology_candidates),
+                "normalized_variants": normalized,
+                "selection_basis": "normalized_topology_fallback",
+            }
+            continue
+        prepared_unused[role] = {
+            "role": role,
+            "role_identity": row.get("role_identity"),
+            "role_identity_aliases": deepcopy(
+                row.get("role_identity_aliases") or []
+            ),
+            "matched_material_identities": identities,
+            "status": "prepared_unused",
+            "reason": "material_absent_from_rendered_mesh",
+            "material_slots": [],
+            "normalized_variants": normalized,
+            "prepared_variant_count": len(variants),
+            "prepared_skeletal_assets": [
+                str(variant.get("skeletal_asset_name") or "")
+                for variant in variants
+                if str(variant.get("skeletal_asset_name") or "")
+            ],
         }
     return result, prepared_unused
+
+
+def _validate_role_component_claims(role_build_plans):
+    claimed_polygons = {}
+    unmatched_roles = []
+    for role, plan in role_build_plans.items():
+        matched_component_count = 0
+        for matched in (plan.get("matched") or {}).values():
+            instances = list(matched.get("instances") or [])
+            matched_component_count += len(instances)
+            for component in instances:
+                for polygon in component.get("polygons") or []:
+                    polygon = int(polygon)
+                    owner = claimed_polygons.get(polygon)
+                    if owner is not None and owner != role:
+                        raise ClusterAssemblyBuildError(
+                            "one rendered mesh component matched multiple "
+                            "normalized Assembly roles: "
+                            f"polygon={polygon}, roles={owner},{role}"
+                        )
+                    claimed_polygons[polygon] = role
+        if matched_component_count == 0:
+            unmatched_roles.append(str(role))
+    if unmatched_roles:
+        raise ClusterAssemblyBuildError(
+            "requested rendered Assembly roles matched zero normalized "
+            "prototype components: "
+            + ", ".join(sorted(unmatched_roles))
+        )
+    return claimed_polygons
 
 
 def build_blender_assembly_inputs(
@@ -3415,7 +3508,6 @@ def build_blender_assembly_inputs(
             + _canonical_json(details)
         )
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     stem = Path(str((handoff.get("spm") or {}).get("path") or full_fbx_path)).stem
     base_asset_name = _public_base_name(stem)
     base_export_stem = base_asset_name
@@ -3483,6 +3575,10 @@ def build_blender_assembly_inputs(
                     "role_identity": role_row["role_identity"],
                     **row,
                 })
+        _validate_role_component_claims(role_build_plans)
+        # No public Assembly artifact may exist until every requested rendered
+        # role has proven at least one normalized prototype/component match.
+        output.mkdir(parents=True, exist_ok=True)
         excluded_polygons = sorted({
             polygon_index
             for plan in role_build_plans.values()

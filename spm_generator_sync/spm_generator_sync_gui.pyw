@@ -28,6 +28,7 @@ from cluster_blend_sync import (
     run_cluster_relation_transaction,
 )
 from cluster_source_prepare import prepare_cluster_source_if_required
+from shared_queue_runtime import SharedQueueRuntime
 
 
 def _load_sibling_engine():
@@ -57,6 +58,7 @@ engine = _load_sibling_engine()
 
 CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
+REPORT_DIR = TOOL_DIR / "reports"
 CACHE_VERSION = 4
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
@@ -116,6 +118,28 @@ def save_config(config: dict) -> None:
         json.dumps(config, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def write_connected_run_report(payload: dict) -> Path:
+    """Persist one run-specific connected sync/Cluster refresh report."""
+
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    path = REPORT_DIR / (
+        f"connected_sync_cluster_refresh_{stamp}_{os.getpid()}_"
+        f"{time.time_ns()}.json"
+    )
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return path
 
 
 def load_analysis_cache() -> dict:
@@ -437,6 +461,9 @@ class App:
         self._job_has_followup = False
         self.job_started_at = None
         self.job_stage = "대기"
+        self.shared_queue_runtime = SharedQueueRuntime(
+            "spm_generator_sync"
+        )
         self.drag_source_iids = ()
         self.drag_start = None
         self.drag_active = False
@@ -518,6 +545,12 @@ class App:
         self.apply_button.pack(side="left", padx=5)
         self.apply_all_button = ttk.Button(actions, text="마스터의 모든 자식 동기화", command=self.apply_all_children)
         self.apply_all_button.pack(side="left")
+        self.apply_connected_button = ttk.Button(
+            actions,
+            text="연결 전체 동기화 + Cluster 갱신",
+            command=self.apply_connected_board,
+        )
+        self.apply_connected_button.pack(side="left", padx=(5, 0))
         self.verify_var = tk.BooleanVar(value=bool(self.config.get("verify_speedtree", True)))
         ttk.Checkbutton(actions, text="SpeedTree 10.1 실제 검증", variable=self.verify_var,
                         command=self.persist_config).pack(side="left", padx=12)
@@ -1367,15 +1400,23 @@ class App:
         folder = item["folder"]
         if item.get("role") == "master":
             return
-        try:
-            result = engine.promote_master(folder, item["file"])
-        except Exception as exc:
-            messagebox.showerror("마스터 지정 실패", str(exc), parent=self.root)
-            return
-        self.refresh(reveal=(folder, item["file"]))
-        self.status_var.set(
-            f"마스터 지정 완료 · {item['file']} · "
-            f"Base 색상 {result['color_updates']}개 적용"
+
+        def apply(report):
+            report("마스터 관계 적용 중...", 35)
+            return engine.promote_master(folder, item["file"])
+
+        def done(result):
+            self.refresh(reveal=(folder, item["file"]))
+            self.status_var.set(
+                f"마스터 지정 완료 · {item['file']} · "
+                f"Base 색상 {result['color_updates']}개 적용"
+            )
+
+        self._start_job(
+            "마스터 관계 적용 중...",
+            apply,
+            done,
+            queue_label=f"마스터 지정 · {item['file']}",
         )
 
     def choose_master(self, folder: Path, manifest: dict):
@@ -1414,13 +1455,17 @@ class App:
                 parent=self.root,
             )
             return
-        if promote_master:
-            engine.promote_master(folder, master)
         source_doc = engine.SPMDocument.from_path(folder / master, full=False)
         manifest = engine.load_manifest(folder)
-        group = engine.find_group(manifest, master)
-        categories = group.get("base_categories") or engine.source_base_categories(source_doc)
-        group["base_categories"] = categories
+        try:
+            group = engine.find_group(manifest, master)
+        except Exception:
+            group = {}
+        categories = (
+            group.get("base_categories")
+            or engine.source_base_categories(source_doc)
+        )
+        assignments = []
         for item in items:
             if item["file"] == master:
                 continue
@@ -1431,15 +1476,46 @@ class App:
             )
             mapping = dialog.result
             if mapping is None:
-                engine.assign_follower(
-                    manifest, master, item["file"], suggestion, confirmed=False
+                assignments.append(
+                    (item["file"], suggestion, False)
                 )
             else:
+                assignments.append((item["file"], mapping, True))
+        if not assignments and not promote_master:
+            return
+
+        def apply(report):
+            report("자식 관계 manifest 다시 확인 중...", 15)
+            if promote_master:
+                engine.promote_master(folder, master)
+            live_manifest = engine.load_manifest(folder)
+            live_group = engine.find_group(live_manifest, master)
+            live_group["base_categories"] = categories
+            for name, mapping, confirmed in assignments:
                 engine.assign_follower(
-                    manifest, master, item["file"], mapping, confirmed=True
+                    live_manifest,
+                    master,
+                    name,
+                    mapping,
+                    confirmed=confirmed,
                 )
-        engine.save_manifest(folder, manifest)
-        self.refresh()
+            engine.save_manifest(folder, live_manifest)
+            return {
+                "status": "completed",
+                "followers": len(assignments),
+            }
+
+        def done(_result):
+            self.refresh()
+
+        self._start_job(
+            "자식 관계 적용 중...",
+            apply,
+            done,
+            queue_label=(
+                f"자식 연결 · {master} → {len(assignments)}개"
+            ),
+        )
 
     def set_selected_independent(self):
         items = self.selected_items()
@@ -1448,14 +1524,99 @@ class App:
         by_folder = {}
         for item in items:
             by_folder.setdefault(item["folder"], []).append(item["file"])
-        for folder, names in by_folder.items():
-            manifest = engine.load_manifest(folder)
-            engine.set_independent(manifest, names)
-            engine.save_manifest(folder, manifest)
-        self.refresh()
+        def apply(report):
+            total = len(by_folder)
+            for index, (folder, names) in enumerate(
+                    by_folder.items(), start=1):
+                report(
+                    f"독립 관계 적용 {index}/{total}",
+                    int(90 * index / max(1, total)),
+                )
+                manifest = engine.load_manifest(folder)
+                engine.set_independent(manifest, names)
+                engine.save_manifest(folder, manifest)
+            return {"status": "completed", "folders": total}
+
+        self._start_job(
+            "독립 관계 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=(
+                f"독립 관계 · SPM {sum(len(v) for v in by_folder.values())}개"
+            ),
+        )
 
     def refresh_selected_cluster_relation(self):
         self.set_selected_cluster_relation(True, refresh_only=True)
+
+    def _execute_cluster_refresh_rows(self, rows, job_config, report):
+        """Refresh exact ON relation rows without widening their target scope."""
+
+        rows = list(rows)
+        cluster_count = len(rows)
+        if not cluster_count:
+            return {
+                "status": "ok",
+                "mode": "sync",
+                "cluster_count": 0,
+                "results": [],
+            }
+        results = []
+        for index, row in enumerate(rows, start=1):
+            blend_path = Path(row["blend"])
+            on_targets = list(row.get("on_target_spms") or [])
+            blender_path = Path(
+                job_config.get("blender_exe") or DEFAULT_BLENDER
+            )
+            unit_probe_path = Path(
+                job_config.get("cluster_unit_probe")
+                or DEFAULT_CLUSTER_UNIT_PROBE
+            )
+            capture_resolution = int(
+                job_config.get("cluster_capture_resolution") or 1024
+            )
+            report(
+                f"Cluster 갱신 {index}/{cluster_count} · {blend_path.name}",
+                10 + int(80 * (index - 1) / cluster_count),
+            )
+            preparation = prepare_cluster_source_if_required(
+                blend_path,
+                on_targets,
+                blender_exe=blender_path,
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+                progress_callback=lambda _stage, message, i=index: report(
+                    f"Cluster 갱신 {i}/{cluster_count} · {message}",
+                    10 + int(80 * (i - 0.5) / cluster_count),
+                ),
+            )
+            relation_result = run_cluster_relation_transaction(
+                blend_path,
+                on_targets,
+                enabled=True,
+                blender_exe=blender_path,
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+                repair_runtime_config=job_config,
+                force_refresh=True,
+                progress_callback=(
+                    lambda _stage, message, i=index: report(
+                        f"Cluster refresh {i}/{cluster_count} · {message}",
+                        10 + int(80 * (i - 0.5) / cluster_count),
+                    )
+                ),
+            )
+            relation_result["source_preparation"] = preparation
+            results.append(relation_result)
+        report("Cluster SPM 메시/Generator 검증 완료", 95)
+        if cluster_count == 1:
+            return results[0]
+        return {
+            "status": "ok",
+            "mode": "sync",
+            "cluster_count": cluster_count,
+            "results": results,
+        }
 
     def set_selected_cluster_relation(self, enabled, *, refresh_only=False):
         # ON/OFF is a folder-wide contract just like refresh.  Expand a
@@ -1535,6 +1696,8 @@ class App:
         ]
         job_config = dict(self.config)
         blend = Path(changes[0]["blend"])
+        requested_blend_keys = set(blend_keys)
+        board_root = str(job_config.get("tree_root") or "")
         cluster_count = len(changes)
         if refresh_only:
             target_binding_count = sum(
@@ -1598,66 +1761,36 @@ class App:
             )
             report(f"{stage} 준비", 10)
             if refresh_only:
-                results = []
-                for index, row in enumerate(changes, start=1):
-                    blend_path = Path(row["blend"])
-                    on_targets = row.get("on_target_spms") or []
-                    blender_path = Path(
-                        job_config.get("blender_exe") or DEFAULT_BLENDER
+                # A shared queue turn may begin long after the click. Re-scan
+                # the registry/manifest contract now and refresh only blends
+                # that are still fully ON; never replay captured target paths.
+                runtime_board = engine.scan_tree_folders(
+                    Path(board_root),
+                    sk_only=bool(job_config.get("sk_only", True)),
+                    verify_physical=False,
+                )
+                runtime_scope = self._connected_scope_from_board(
+                    runtime_board
+                )
+                live_changes = [
+                    row
+                    for row in runtime_scope["cluster_rows"]
+                    if (
+                        os.path.normcase(
+                            str(Path(row["blend"]).absolute())
+                        ).casefold()
+                        in requested_blend_keys
                     )
-                    unit_probe_path = Path(
-                        job_config.get("cluster_unit_probe")
-                        or DEFAULT_CLUSTER_UNIT_PROBE
+                ]
+                if not live_changes:
+                    raise RuntimeError(
+                        "실행 차례에 Cluster 관계를 다시 확인했지만 "
+                        "선택한 blend가 더 이상 완전한 ON 상태가 아닙니다."
                     )
-                    capture_resolution = int(
-                        job_config.get("cluster_capture_resolution") or 1024
-                    )
-                    report(
-                        f"Cluster 갱신 {index}/{cluster_count} · "
-                        f"{blend_path.name}",
-                        10 + int(80 * (index - 1) / cluster_count),
-                    )
-                    preparation = prepare_cluster_source_if_required(
-                        blend_path,
-                        on_targets,
-                        blender_exe=blender_path,
-                        unit_probe_path=unit_probe_path,
-                        capture_resolution=capture_resolution,
-                        progress_callback=lambda _stage, message, i=index: report(
-                            f"Cluster 갱신 {i}/{cluster_count} · {message}",
-                            10 + int(80 * (i - 0.5) / cluster_count),
-                        ),
-                    )
-                    relation_result = run_cluster_relation_transaction(
-                        blend_path,
-                        on_targets,
-                        enabled=True,
-                        blender_exe=blender_path,
-                        unit_probe_path=unit_probe_path,
-                        capture_resolution=capture_resolution,
-                        repair_runtime_config=job_config,
-                        force_refresh=True,
-                        progress_callback=(
-                            lambda _stage, message, i=index: report(
-                                f"Cluster refresh {i}/{cluster_count} · "
-                                f"{message}",
-                                10 + int(
-                                    80 * (i - 0.5) / cluster_count
-                                ),
-                            )
-                        ),
-                    )
-                    relation_result["source_preparation"] = preparation
-                    results.append(relation_result)
-                result = (
-                    results[0]
-                    if cluster_count == 1
-                    else {
-                        "status": "ok",
-                        "mode": "sync",
-                        "cluster_count": cluster_count,
-                        "results": results,
-                    }
+                result = self._execute_cluster_refresh_rows(
+                    live_changes,
+                    job_config,
+                    report,
                 )
             else:
                 result = run_cluster_folder_relation_transaction(
@@ -1679,7 +1812,7 @@ class App:
                         55,
                     ),
                 )
-            report("Cluster SPM 메시/Generator 검증 완료", 95)
+                report("Cluster SPM 메시/Generator 검증 완료", 95)
             return result
 
         def done(result):
@@ -1739,15 +1872,30 @@ class App:
         )
         if dialog.result is None:
             return
-        manifest = engine.load_manifest(item["folder"])
-        group = engine.find_group(manifest, item["master"])
-        follower = next(row for row in group["followers"] if row.get("file") == item["file"])
-        follower["base_map"] = dialog.result
-        follower["base_map_confirmed"] = True
-        follower["last_master_hash"] = None
-        follower["last_target_hash"] = None
-        engine.save_manifest(item["folder"], manifest)
-        self.refresh()
+        mapping = dict(dialog.result)
+
+        def apply(report):
+            report("Base 매핑 manifest 다시 확인 중...", 25)
+            manifest = engine.load_manifest(item["folder"])
+            group = engine.find_group(manifest, item["master"])
+            follower = next(
+                row
+                for row in group["followers"]
+                if row.get("file") == item["file"]
+            )
+            follower["base_map"] = mapping
+            follower["base_map_confirmed"] = True
+            follower["last_master_hash"] = None
+            follower["last_target_hash"] = None
+            engine.save_manifest(item["folder"], manifest)
+            return {"status": "completed"}
+
+        self._start_job(
+            "Base 매핑 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=f"Base 매핑 · {item['file']}",
+        )
 
     def edit_selected_categories(self):
         items = self.selected_items()
@@ -1760,14 +1908,25 @@ class App:
         )
         if dialog.result is None:
             return
-        manifest = engine.load_manifest(item["folder"])
-        group = engine.find_group(manifest, item["file"])
-        group["base_categories"] = dialog.result
-        for follower in group.get("followers", []):
-            follower["last_master_hash"] = None
-            follower["last_target_hash"] = None
-        engine.save_manifest(item["folder"], manifest)
-        self.refresh()
+        categories = dict(dialog.result)
+
+        def apply(report):
+            report("Base 분류 manifest 다시 확인 중...", 25)
+            manifest = engine.load_manifest(item["folder"])
+            group = engine.find_group(manifest, item["file"])
+            group["base_categories"] = categories
+            for follower in group.get("followers", []):
+                follower["last_master_hash"] = None
+                follower["last_target_hash"] = None
+            engine.save_manifest(item["folder"], manifest)
+            return {"status": "completed"}
+
+        self._start_job(
+            "Base 분류 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=f"Base 분류 · {item['file']}",
+        )
 
     def followers_from_selection(self, require_same_group=True):
         items = self.selected_items()
@@ -1795,6 +1954,429 @@ class App:
             return []
         return followers
 
+    @staticmethod
+    def _connected_scope_from_board(board):
+        """Build a connected scope from one disk-scan board snapshot."""
+
+        grouped = {}
+        skipped = []
+        seen_followers = set()
+        cluster_rows = []
+        seen_blends = set()
+        for folder_item in board:
+            folder = Path(folder_item["folder"])
+            manifest = folder_item.get("manifest") or {}
+            for group in manifest.get("groups") or ():
+                if not isinstance(group, dict):
+                    continue
+                master = str(group.get("master") or "").strip()
+                if not master:
+                    continue
+                for follower in group.get("followers") or ():
+                    if not isinstance(follower, dict):
+                        skipped.append({
+                            "stage": "generator_sync",
+                            "folder": str(folder),
+                            "master": master,
+                            "target": "",
+                            "reason": "자식 관계 메타데이터 형식 오류",
+                        })
+                        continue
+                    name = str(follower.get("file") or "").strip()
+                    if not name:
+                        continue
+                    follower_key = (
+                        os.path.normcase(
+                            str(folder.absolute())
+                        ).casefold(),
+                        master.casefold(),
+                        name.casefold(),
+                    )
+                    if follower_key in seen_followers:
+                        continue
+                    seen_followers.add(follower_key)
+                    if not follower.get("base_map_confirmed"):
+                        skipped.append({
+                            "stage": "generator_sync",
+                            "folder": str(folder),
+                            "master": master,
+                            "target": name,
+                            "reason": "Base 매핑 미확정",
+                        })
+                        continue
+                    group_key = (follower_key[0], follower_key[1])
+                    scope_group = grouped.setdefault(group_key, {
+                        "folder": folder,
+                        "master": master,
+                        "names": [],
+                    })
+                    scope_group["names"].append(name)
+
+            for row in folder_item.get("cluster_blends") or ():
+                if (
+                    not isinstance(row, dict)
+                    or row.get("folder_relation") != "on"
+                ):
+                    continue
+                targets = [
+                    target
+                    for target in row.get("targets") or ()
+                    if (
+                        isinstance(target, dict)
+                        and target.get("owner_target")
+                    )
+                ]
+                on_target_spms = [
+                    Path(target["target_spm"])
+                    for target in targets
+                    if target.get("relation_on") and target.get("target_spm")
+                ]
+                if not on_target_spms or not row.get("blend"):
+                    continue
+                blend = Path(row["blend"])
+                blend_key = os.path.normcase(
+                    str(blend.absolute())
+                ).casefold()
+                if blend_key in seen_blends:
+                    continue
+                seen_blends.add(blend_key)
+                cluster_rows.append({
+                    **row,
+                    "kind": "cluster_relation",
+                    "blend": blend,
+                    "on_target_spms": on_target_spms,
+                    "target_spms": [
+                        Path(target["target_spm"])
+                        for target in targets
+                        if target.get("target_spm")
+                    ],
+                })
+
+        groups = list(grouped.values())
+        for group in groups:
+            group["names"].sort(key=str.casefold)
+        groups.sort(key=lambda group: (
+            str(group["folder"]).casefold(),
+            group["master"].casefold(),
+        ))
+        cluster_rows.sort(
+            key=lambda row: str(row["blend"]).casefold()
+        )
+        return {
+            "groups": groups,
+            "cluster_rows": cluster_rows,
+            "skipped": skipped,
+        }
+
+    def connected_board_scope(self):
+        """Return the currently displayed board's executable connections."""
+
+        return self._connected_scope_from_board(self.board)
+
+    @staticmethod
+    def _connected_result_summary(result):
+        """Keep reports useful without serializing full SPM patch documents."""
+
+        return {
+            key: result.get(key)
+            for key in (
+                "status",
+                "mode",
+                "changed_files",
+                "backup_dir",
+                "master_hash",
+                "cluster_count",
+                "scale_skipped",
+            )
+            if result.get(key) is not None
+        }
+
+    def apply_connected_board(self):
+        """Sync all confirmed board relations, then refresh all exact ON Clusters."""
+
+        self._ensure_job_queue_state()
+        queue_busy = self.active_job is not None or bool(self.pending_jobs)
+        scope = self.connected_board_scope()
+        groups = scope["groups"]
+        cluster_rows = scope["cluster_rows"]
+        skipped = scope["skipped"]
+        follower_count = sum(len(group["names"]) for group in groups)
+        cluster_target_keys = {
+            os.path.normcase(str(Path(path).absolute())).casefold()
+            for row in cluster_rows
+            for path in row.get("on_target_spms") or ()
+        }
+        if not groups and not cluster_rows and not queue_busy:
+            messagebox.showinfo(
+                "연결 전체 처리",
+                "현재 보드에 실행 가능한 연결이 없습니다.\n"
+                "확정된 마스터→자식 또는 ON Cluster 관계를 먼저 설정하세요.",
+                parent=self.root,
+            )
+            return
+
+        verify = bool(self.verify_var.get())
+        if groups and verify:
+            if not Path(self.config.get("speedtree_exe", "")).is_file():
+                messagebox.showerror(
+                    "SpeedTree 경로",
+                    "SpeedTree 실행 파일이 없습니다:\n"
+                    f"{self.config.get('speedtree_exe', '')}",
+                    parent=self.root,
+                )
+                return
+            if not Path(self.config.get("xml_ini", "")).is_file():
+                messagebox.showerror(
+                    "XML 검증 설정",
+                    "XML export 설정 파일이 없습니다:\n"
+                    f"{self.config.get('xml_ini', '')}",
+                    parent=self.root,
+                )
+                return
+
+        message = (
+            "현재 보드의 확정된 연결만 일괄 처리합니다.\n\n"
+            f"Generator Sync: 마스터 {len(groups)}개 · 자식 {follower_count}개\n"
+            f"Cluster 갱신: ON 관계 {len(cluster_rows)}개 · "
+            f"대상 SK {len(cluster_target_keys)}개\n"
+            f"사전 제외: {len(skipped)}개\n\n"
+            "순서: 마스터→자식 데이터 동기화 후 ON Cluster 결과를 재적용합니다.\n"
+            "독립·미지정·OFF·PARTIAL 관계는 변경하지 않습니다. "
+            "개별 실패는 보고서에 기록하고 나머지 연결은 계속 처리합니다."
+        )
+        if verify and groups:
+            message += "\nGenerator Sync 대상은 SpeedTree 10.1 사전검사를 수행합니다."
+        if queue_busy:
+            message += (
+                "\n현재 작업 뒤에 대기하며, 실제 시작 시 연결 범위를 다시 검사합니다."
+            )
+        if not messagebox.askyesno(
+            "연결 전체 동기화 + Cluster 갱신",
+            message,
+            parent=self.root,
+        ):
+            return
+
+        job_config = dict(self.config)
+        speedtree_exe = Path(job_config.get("speedtree_exe") or "")
+        xml_ini = Path(job_config.get("xml_ini") or "")
+        board_root = self.root_var.get().strip()
+
+        def apply(report):
+            started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            report("실행 시점 연결 관계 다시 검사 중", 1)
+            runtime_board = engine.scan_tree_folders(
+                Path(board_root),
+                sk_only=bool(job_config.get("sk_only", True)),
+                verify_physical=False,
+            )
+            runtime_scope = self._connected_scope_from_board(runtime_board)
+            runtime_groups = runtime_scope["groups"]
+            runtime_cluster_rows = runtime_scope["cluster_rows"]
+            runtime_skipped = runtime_scope["skipped"]
+            runtime_follower_count = sum(
+                len(group["names"]) for group in runtime_groups
+            )
+            runtime_cluster_target_keys = {
+                os.path.normcase(
+                    str(Path(path).absolute())
+                ).casefold()
+                for row in runtime_cluster_rows
+                for path in row.get("on_target_spms") or ()
+            }
+            total_units = (
+                len(runtime_groups) + len(runtime_cluster_rows)
+            )
+            payload = {
+                "schema_version": 1,
+                "started_at": started_at,
+                "root": board_root,
+                "verify_speedtree": verify,
+                "queued_scope": {
+                    "generator_group_count": len(groups),
+                    "generator_follower_count": follower_count,
+                    "cluster_relation_count": len(cluster_rows),
+                    "cluster_target_count": len(cluster_target_keys),
+                },
+                "scope": {
+                    "generator_group_count": len(runtime_groups),
+                    "generator_follower_count": runtime_follower_count,
+                    "cluster_relation_count": len(runtime_cluster_rows),
+                    "cluster_target_count": len(
+                        runtime_cluster_target_keys
+                    ),
+                },
+                "skipped": list(runtime_skipped),
+                "generator_sync": [],
+                "cluster_refresh": [],
+                "failures": [],
+            }
+
+            def unit_report(unit_index, label, stage, percent):
+                overall = 2 + int(
+                    94 * (
+                        unit_index + max(0, min(100, int(percent))) / 100
+                    ) / max(1, total_units)
+                )
+                report(f"{label} · {stage}", overall)
+
+            unit_index = 0
+            for group in runtime_groups:
+                label = (
+                    f"Generator {unit_index + 1}/{total_units} · "
+                    f"{group['master']}"
+                )
+                try:
+                    result = engine.apply_group_transaction(
+                        group["folder"],
+                        group["master"],
+                        group["names"],
+                        verify_speedtree=verify,
+                        speedtree_exe=speedtree_exe,
+                        xml_ini=xml_ini,
+                        skip_blocked_scale=True,
+                        progress_callback=(
+                            lambda stage, percent, i=unit_index, text=label:
+                            unit_report(i, text, stage, percent)
+                        ),
+                    )
+                    for entry in result.get("scale_skipped") or ():
+                        risk = entry.get("scale_risk") or {}
+                        payload["skipped"].append({
+                            "stage": "generator_sync",
+                            "folder": str(group["folder"]),
+                            "master": group["master"],
+                            "target": Path(
+                                entry.get("target") or ""
+                            ).name,
+                            "reason": (
+                                entry.get("reason")
+                                or "크기 폭증 위험"
+                            ),
+                            "scale_risk": risk,
+                        })
+                    payload["generator_sync"].append({
+                        "folder": str(group["folder"]),
+                        "master": group["master"],
+                        "followers": list(group["names"]),
+                        "result": self._connected_result_summary(result),
+                    })
+                except Exception as exc:
+                    payload["failures"].append({
+                        "stage": "generator_sync",
+                        "folder": str(group["folder"]),
+                        "master": group["master"],
+                        "targets": list(group["names"]),
+                        "reason": str(exc),
+                    })
+                unit_index += 1
+
+            for row in runtime_cluster_rows:
+                blend = Path(row["blend"])
+                label = (
+                    f"Cluster {unit_index + 1}/{total_units} · {blend.name}"
+                )
+                try:
+                    result = self._execute_cluster_refresh_rows(
+                        [row],
+                        job_config,
+                        lambda stage, percent, i=unit_index, text=label:
+                        unit_report(i, text, stage, percent),
+                    )
+                    payload["cluster_refresh"].append({
+                        "blend": str(blend),
+                        "targets": [
+                            str(path)
+                            for path in row.get("on_target_spms") or ()
+                        ],
+                        "result": self._connected_result_summary(result),
+                    })
+                except Exception as exc:
+                    payload["failures"].append({
+                        "stage": "cluster_refresh",
+                        "blend": str(blend),
+                        "targets": [
+                            str(path)
+                            for path in row.get("on_target_spms") or ()
+                        ],
+                        "reason": str(exc),
+                    })
+                unit_index += 1
+
+            success_count = (
+                len(payload["generator_sync"])
+                + len(payload["cluster_refresh"])
+            )
+            payload["status"] = (
+                "ok"
+                if not payload["failures"]
+                else "partial"
+                if success_count
+                else "failed"
+            )
+            payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            report("실행 보고서 저장 중", 98)
+            try:
+                payload["report_path"] = str(
+                    write_connected_run_report(payload)
+                )
+            except Exception as exc:
+                payload["report_error"] = str(exc)
+            return payload
+
+        def done(result):
+            self.refresh()
+            sync_ok = len(result["generator_sync"])
+            cluster_ok = len(result["cluster_refresh"])
+            failure_count = len(result["failures"])
+            runtime_group_count = int(
+                result["scope"]["generator_group_count"]
+            )
+            runtime_cluster_count = int(
+                result["scope"]["cluster_relation_count"]
+            )
+            report_path = result.get("report_path") or (
+                f"저장 실패: {result.get('report_error', '알 수 없음')}"
+            )
+            self.status_var.set(
+                f"연결 전체 처리 완료 · Generator "
+                f"{sync_ok}/{runtime_group_count} · "
+                f"Cluster {cluster_ok}/{runtime_cluster_count} · "
+                f"실패 {failure_count}"
+            )
+            failure_lines = [
+                f"· {failure.get('master') or Path(failure.get('blend', '')).name}: "
+                f"{failure['reason']}"
+                for failure in result["failures"][:8]
+            ]
+            detail = (
+                f"Generator Sync 성공: {sync_ok}/{runtime_group_count} 그룹\n"
+                f"Cluster 갱신 성공: {cluster_ok}/{runtime_cluster_count} 관계\n"
+                f"사전 제외: {len(result['skipped'])}개\n"
+                f"실패: {failure_count}개\n\n"
+                f"보고서: {report_path}"
+            )
+            if failure_lines:
+                detail += "\n\n실패 요약:\n" + "\n".join(failure_lines)
+            self._show_job_info(
+                (
+                    "연결 전체 처리 완료"
+                    if not failure_count
+                    else "연결 전체 처리 완료 · 실패 있음"
+                ),
+                detail,
+            )
+
+        self._start_job(
+            "연결 데이터 동기화 및 Cluster 갱신 중...",
+            apply,
+            done,
+            queue_label=(
+                f"연결 전체 처리 · 자식 {follower_count}개 · "
+                f"Cluster {len(cluster_rows)}개"
+            ),
+        )
+
     def _ensure_job_queue_state(self):
         """Initialize queue fields for normal startup and lightweight tests."""
         if not hasattr(self, "pending_jobs"):
@@ -1820,20 +2402,45 @@ class App:
         messagebox.showinfo(title, message, parent=self.root)
 
     def _start_job(self, label, func, on_success, *, queue_label=None):
-        """Capture one job request and run all requests in FIFO order."""
+        """Capture one request in both the window and process-global FIFO."""
         self._ensure_job_queue_state()
         if self.active_job is None and not self.pending_jobs:
             self.job_failures = []
             self.queue_run_total = 0
             self.queue_run_completed = 0
         self.job_sequence += 1
+        display_label = str(queue_label or label)
         job = {
             "id": self.job_sequence,
             "label": str(label),
-            "queue_label": str(queue_label or label),
+            "queue_label": display_label,
             "func": func,
             "on_success": on_success,
         }
+        shared_runtime = getattr(self, "shared_queue_runtime", None)
+        if shared_runtime is not None:
+            try:
+                shared = shared_runtime.enqueue(
+                    display_label,
+                    {
+                        "tool": "spm_generator_sync",
+                        "local_job_id": job["id"],
+                        "label": display_label,
+                    },
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "공용 대기열 등록 실패",
+                    (
+                        "다른 창과 동시에 실행되지 않도록 작업을 시작하지 "
+                        f"않았습니다.\n\n{exc}"
+                    ),
+                    parent=self.root,
+                )
+                self.status_var.set("공용 대기열 등록 실패 · 실행하지 않음")
+                return None
+            job["shared_queue_job_id"] = shared["id"]
+            job["shared_queue_sequence"] = shared["sequence"]
         self.pending_jobs.append(job)
         self.queue_run_total += 1
         if self.active_job is None:
@@ -1881,10 +2488,71 @@ class App:
             ))
 
         def run():
+            lease = None
             try:
+                shared_job_id = job.get("shared_queue_job_id")
+                shared_runtime = getattr(
+                    self, "shared_queue_runtime", None
+                )
+                if shared_job_id and shared_runtime is not None:
+                    def report_wait(wait_state):
+                        position = wait_state.get("position")
+                        queued = wait_state.get("queued_count", 0)
+                        report(
+                            (
+                                "공용 대기열 대기"
+                                + (
+                                    f" · 전체 {position}번째"
+                                    if position else ""
+                                )
+                                + f" · 대기 {queued}개"
+                            ),
+                            0,
+                        )
+
+                    lease = shared_runtime.wait_for_turn(
+                        shared_job_id,
+                        on_wait=report_wait,
+                    )
+                    report("공용 대기열 진입 · 단독 실행", 1)
                 payload = job["func"](report)
+                queue_success = not (
+                    isinstance(payload, dict)
+                    and (
+                        payload.get("failures")
+                        or str(payload.get("status") or "").casefold()
+                        in {"failed", "error", "partial"}
+                    )
+                )
+                if lease is not None:
+                    lease.finish(
+                        success=queue_success,
+                        result={
+                            "tool": "spm_generator_sync",
+                            "local_job_id": job["id"],
+                            "outcome": (
+                                "completed"
+                                if queue_success else "failed"
+                            ),
+                        },
+                    )
                 self.job_queue.put(("done", job["id"], True, payload))
             except Exception as exc:
+                if lease is not None and not lease.finished:
+                    try:
+                        lease.finish(
+                            success=False,
+                            result={
+                                "tool": "spm_generator_sync",
+                                "local_job_id": job["id"],
+                                "outcome": "failed",
+                                "error": str(exc),
+                            },
+                        )
+                    except Exception as queue_exc:
+                        exc = RuntimeError(
+                            f"{exc}; 공용 대기열 종료 기록 실패: {queue_exc}"
+                        )
                 self.job_queue.put(("done", job["id"], False, exc))
 
         self.worker = threading.Thread(target=run, daemon=True)
@@ -2116,11 +2784,22 @@ class App:
             return
         self._apply_followers(self.followers_from_selection())
 
+    def shutdown_shared_queue(self):
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is not None:
+            runtime.shutdown()
+
 
 def main():
     root = tk.Tk()
     app = App(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.persist_config(), root.destroy()))
+
+    def close():
+        app.shutdown_shared_queue()
+        app.persist_config()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
 
 

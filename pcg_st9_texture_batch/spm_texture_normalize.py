@@ -216,7 +216,9 @@ def _source_material_block(source_spm, canonical_name):
         f"{Path(source_spm).name}: source material is missing: {canonical_name}")
 
 
-def build_spm_patch(spm, material_outputs, require_outputs=True):
+def build_spm_patch(
+        spm, material_outputs, require_outputs=True,
+        allow_partial_materials=False):
     """Return a verified in-memory patch for one SPM.
 
     ``material_outputs`` can be keyed by exact ``@id:<Material_v8 ID>`` or by
@@ -272,7 +274,11 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         if output is None:
             output = material_outputs.get(canonical.lower())
         if not output:
-            missing.append(f"{canonical}: no managed output mapping")
+            missing.append({
+                "material_id": material_id,
+                "material_name": canonical,
+                "reason": "no managed output mapping",
+            })
             continue
         matched_count += 1
         if output.get("mode") == "preserve_source":
@@ -312,7 +318,11 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             and (role != "subsurface" or subsurface_enabled)
         ]
         if absent:
-            missing.append(f"{canonical}: missing outputs: {', '.join(absent)}")
+            missing.append({
+                "material_id": material_id,
+                "material_name": canonical,
+                "reason": f"missing outputs: {', '.join(absent)}",
+            })
             continue
         refs = {
             role: (_relative_texture_ref(spm, path) if path.is_file() else "")
@@ -333,14 +343,21 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             "subsurface_enabled": subsurface_enabled,
         })
 
-    if missing:
-        raise RuntimeError(f"{spm.name}: " + " | ".join(missing))
+    if missing and not allow_partial_materials:
+        raise RuntimeError(
+            f"{spm.name}: "
+            + " | ".join(
+                f"{entry['material_name']}: {entry['reason']}"
+                for entry in missing
+            )
+        )
     if not matched_count:
         raise RuntimeError(f"{spm.name}: no active materials were normalized")
     if not changed:
         return {
             "spm": str(spm), "text": text, "materials": [],
             "changed": False,
+            "skipped_materials": missing,
         }
     chunks.append(text[cursor:])
     patched_text = "".join(chunks)
@@ -348,11 +365,13 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         return {
             "spm": str(spm), "text": text, "materials": [],
             "changed": False,
+            "skipped_materials": missing,
         }
     verify_spm_text(spm, patched_text, changed)
     return {
         "spm": str(spm), "text": patched_text, "materials": changed,
         "changed": True,
+        "skipped_materials": missing,
     }
 
 
@@ -427,8 +446,9 @@ def _write_spm(path, text, compressed):
         path.write_text(text, encoding="utf-8")
 
 
-def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
-                                   skip_unbuildable=False):
+def normalize_spms_transactionally(
+        jobs, backup_root=None, require_outputs=True, skip_unbuildable=False,
+        allow_partial_materials=False):
     """Preflight, back up, write, and verify all SPMs as one transaction.
 
     With skip_unbuildable, an SPM whose patch cannot even be built (e.g. a
@@ -438,11 +458,18 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
     patches = []
     unchanged_spms = []
     skipped = []
+    skipped_materials = []
     for job in jobs:
         try:
             patch = build_spm_patch(
                 job["spm"], job["materials"],
-                require_outputs=require_outputs)
+                require_outputs=require_outputs,
+                allow_partial_materials=allow_partial_materials,
+            )
+            skipped_materials.extend({
+                "spm": str(job["spm"]),
+                **entry,
+            } for entry in patch.get("skipped_materials") or [])
             if patch.get("changed") is False:
                 unchanged_spms.append(patch["spm"])
             else:
@@ -460,6 +487,7 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
         return {
             "spms": [], "materials": 0, "backup_dir": None,
             "skipped": skipped, "unchanged_spms": unchanged_spms,
+            "skipped_materials": skipped_materials,
         }
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -488,6 +516,7 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True,
         "materials": sum(len(patch["materials"]) for patch in patches),
         "backup_dir": str(backup_dir),
         "skipped": skipped,
+        "skipped_materials": skipped_materials,
         "unchanged_spms": unchanged_spms,
     }
 

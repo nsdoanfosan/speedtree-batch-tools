@@ -13,6 +13,7 @@ from pcg_canonical_outputs import (
     MANIFEST_NAME,
     REQUIRED_ROLES,
     CanonicalOutputManifestError,
+    refresh_atlas_manifests_for_spm,
     record_canonical_output,
     validate_manifest,
 )
@@ -28,7 +29,7 @@ from spm_texture_normalize import cleanup_preserved_cluster_outputs
 class CanonicalOutputManifestTests(unittest.TestCase):
     def _outputs(self, asset, texture_base="T_leaf_test"):
         texture = asset / "texture"
-        texture.mkdir(parents=True)
+        texture.mkdir(parents=True, exist_ok=True)
         paths = []
         for role in REQUIRED_ROLES:
             path = texture / f"{texture_base}_{role}.tga"
@@ -135,6 +136,174 @@ class CanonicalOutputManifestTests(unittest.TestCase):
             self.assertEqual(output["producer"]["tool"], "PCG ST9 Texture")
             validate_manifest(payload, manifest)
             self.assertFalse(any(manifest.parent.glob(f".{MANIFEST_NAME}.*.tmp")))
+
+    def test_canonical_commit_regenerates_complete_atlas_scope_before_consumer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_cluster_test.spm"
+            spm.write_bytes(b"spm")
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / "scope__SK_cluster_test.json"
+            fallback_status = "source_fallback_needs_pcg_generation"
+            fallback = {
+                "texture_contract_status": fallback_status,
+                "material": "M_leaf_test",
+                "source_paths": {
+                    "albedo": str(asset / "source" / "leaf.tif"),
+                },
+            }
+            scope.write_text(json.dumps({
+                "spm": str(spm),
+                "texture_contract_status": fallback_status,
+                "canonical_texture_outputs": [],
+                "source_texture_fallbacks": [fallback],
+                "source_texture_origins": {
+                    "M_leaf_test": "atlas_mesh_build_source",
+                },
+                "material_groups": [{
+                    "material": "M_leaf_test",
+                    "material_id": 17,
+                    "texture_contract_status": fallback_status,
+                    "source_texture_fallback": fallback,
+                    "texture_warning": "canonical output is absent",
+                }],
+                "speedtree_material_groups": [{
+                    "material": "M_leaf_test",
+                    "material_id": 17,
+                    "texture_contract_status": fallback_status,
+                    "texture_provisional_receipt": {"status": fallback_status},
+                }],
+                "notes": [
+                    "keep this note",
+                    "WARNING: canonical T_* output is absent.",
+                ],
+            }), encoding="utf-8")
+
+            manifest = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_leaf_test",
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": "17",
+                        "material_name": "M_leaf_test",
+                    }],
+                },
+                self._outputs(asset),
+                producer_source="test.sbs#T_leaf_test",
+            )
+
+            promoted = json.loads(scope.read_text(encoding="utf-8"))
+            self.assertEqual(
+                promoted["texture_contract_status"],
+                "canonical_pcg_output",
+            )
+            self.assertEqual(promoted["source_texture_fallbacks"], [])
+            self.assertEqual(promoted["source_texture_origins"], {})
+            self.assertEqual(
+                promoted["canonical_texture_outputs"][0]["manifest"],
+                str(manifest),
+            )
+            self.assertEqual(
+                promoted["canonical_texture_outputs"][0]["files"]["color"],
+                str(asset / "texture" / "T_leaf_test_color.tga"),
+            )
+            self.assertEqual(
+                promoted["material_groups"][0]["texture_contract_status"],
+                "canonical_pcg_output",
+            )
+            self.assertNotIn(
+                "source_texture_fallback",
+                promoted["material_groups"][0],
+            )
+            self.assertEqual(promoted["notes"], ["keep this note"])
+            second = refresh_atlas_manifests_for_spm(
+                spm,
+                manifest,
+                require_complete=True,
+            )
+            self.assertEqual(second["status"], "current")
+            self.assertEqual(second["updated"], [])
+
+    def test_atlas_scope_is_not_partially_promoted_between_texture_sets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_cluster_test.spm"
+            spm.write_bytes(b"spm")
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / "scope__SK_cluster_test.json"
+            fallback_status = "source_fallback_needs_pcg_generation"
+            groups = [
+                {
+                    "material": "M_leaf_a",
+                    "material_id": 8,
+                    "texture_contract_status": fallback_status,
+                },
+                {
+                    "material": "M_leaf_b",
+                    "material_id": 9,
+                    "texture_contract_status": fallback_status,
+                },
+            ]
+            original = {
+                "spm": str(spm),
+                "texture_contract_status": fallback_status,
+                "material_groups": groups,
+                "speedtree_material_groups": groups,
+                "source_texture_fallbacks": [{"material": "M_leaf_a"}],
+            }
+            scope.write_text(json.dumps(original), encoding="utf-8")
+
+            record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_leaf_a",
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": "8",
+                        "material_name": "M_leaf_a",
+                    }],
+                },
+                self._outputs(asset, "T_leaf_a"),
+                producer_source="test.sbs#T_leaf_a",
+            )
+            after_first = json.loads(scope.read_text(encoding="utf-8"))
+            self.assertEqual(
+                after_first["texture_contract_status"],
+                fallback_status,
+            )
+
+            record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_leaf_b",
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": "9",
+                        "material_name": "M_leaf_b",
+                    }],
+                },
+                self._outputs(asset, "T_leaf_b"),
+                producer_source="test.sbs#T_leaf_b",
+            )
+            promoted = json.loads(scope.read_text(encoding="utf-8"))
+            self.assertEqual(
+                promoted["texture_contract_status"],
+                "canonical_pcg_output",
+            )
+            self.assertEqual(
+                {
+                    row["texture_base"]
+                    for row in promoted["canonical_texture_outputs"]
+                },
+                {"T_leaf_a", "T_leaf_b"},
+            )
 
     def test_records_only_generated_ao_below_generated_directory(self):
         with tempfile.TemporaryDirectory() as temporary:

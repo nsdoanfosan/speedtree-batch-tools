@@ -116,7 +116,7 @@ class ManualBonesTests(unittest.TestCase):
 
     def test_locked_spm_job_returns_before_launching_any_process(self):
         gui = load_gui_module()
-        spm = Path("SK_manual_test.spm")
+        spm = Path("Tree_test/Cluster/SK_manual_test.spm")
         iid = str(spm)
         app = gui.App.__new__(gui.App)
         app.items = {iid: {"spm": spm, "manual_bones_locked": True}}
@@ -126,12 +126,51 @@ class ManualBonesTests(unittest.TestCase):
         app.log = lambda _message: None
 
         with mock.patch.object(gui, "save_state"), mock.patch.object(
+            app,
+            "_prepare_pair_for_job",
+            return_value=spm,
+        ), mock.patch.object(
             app, "_run_limited", side_effect=AssertionError("process must not launch")
         ):
             app._job_spm(iid, spm)
 
         self.assertIn("① 전체 건너뜀", app.state[iid]["spm_status"])
         self.assertEqual(app.state[iid]["spm_summary"], "본 282 / 가지 90")
+
+    def test_owner_spm_job_skips_before_pair_normalization_or_process_launch(self):
+        gui = load_gui_module()
+        spm = Path("Tree_test") / "SK_tree_test_01.spm"
+        iid = str(spm)
+        app = gui.App.__new__(gui.App)
+        app.items = {
+            iid: {
+                "spm": spm,
+                "source_read_only": False,
+                "manual_bones_locked": False,
+            }
+        }
+        app.state = {iid: {}}
+        app.state_lock = threading.Lock()
+        app.ui_queue = queue.Queue()
+        app.log = mock.Mock()
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            app,
+            "_prepare_pair_for_job",
+            side_effect=AssertionError("pair normalization must not run"),
+        ) as prepare, mock.patch.object(
+            app,
+            "_run_limited",
+            side_effect=AssertionError("process must not launch"),
+        ) as run:
+            app._job_spm(iid, spm)
+
+        self.assertIn(
+            "일반 SPM 본 세팅 제외",
+            app.state[iid]["spm_status"],
+        )
+        prepare.assert_not_called()
+        run.assert_not_called()
 
     def test_manual_check_uses_verified_count_and_does_not_persist_or_touch_spm(self):
         gui = load_gui_module()
@@ -220,7 +259,8 @@ class ManualBonesTests(unittest.TestCase):
     def test_unchanged_cached_spm_returns_before_launching_any_process(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as tmp:
-            spm = Path(tmp) / "SK_cached_test.spm"
+            spm = Path(tmp) / "Tree_test" / "Cluster" / "SK_cached_test.spm"
+            spm.parent.mkdir(parents=True)
             spm.write_bytes(b"stable-spm")
             snapshot = file_content_snapshot(spm)
             iid = str(spm)
@@ -251,6 +291,10 @@ class ManualBonesTests(unittest.TestCase):
             app.spm_calibration_signature = signature
 
             with mock.patch.object(gui, "save_state"), mock.patch.object(
+                gui,
+                "current_cluster_root_postcondition",
+                return_value={"ok": True},
+            ), mock.patch.object(
                 app, "_run_limited", side_effect=AssertionError("process must not launch")
             ):
                 app._job_spm(iid, spm)
@@ -261,7 +305,10 @@ class ManualBonesTests(unittest.TestCase):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            spm = root / "SK_cache_write_test.spm"
+            spm = (
+                root / "Tree_test" / "Cluster" / "SK_cache_write_test.spm"
+            )
+            spm.parent.mkdir(parents=True)
             spm.write_bytes(b"stable-spm")
             iid = str(spm)
             app = gui.App.__new__(gui.App)
@@ -296,6 +343,9 @@ class ManualBonesTests(unittest.TestCase):
                                 "final_spm_fingerprint": (
                                     file_content_snapshot(spm)["fingerprint"]
                                 ),
+                                "cluster_root_logical_postcondition": {
+                                    "ok": True,
+                                },
                                 "calibration": {
                                     "total_branches": 4,
                                     "capped": False,
@@ -310,6 +360,10 @@ class ManualBonesTests(unittest.TestCase):
 
             with mock.patch.object(gui, "LOG_DIR", root), mock.patch.object(
                 gui, "save_state"
+            ), mock.patch.object(
+                gui,
+                "current_cluster_root_postcondition",
+                return_value={"ok": True},
             ), mock.patch.object(app, "_run_limited", side_effect=fake_run) as run_mock:
                 app._job_spm(iid, spm)
                 self.assertEqual(run_mock.call_count, 1)

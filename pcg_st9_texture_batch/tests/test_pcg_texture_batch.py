@@ -21,6 +21,7 @@ sys.path.insert(0, str(TOOL_DIR))
 import sbs_auto
 import pcg_texture_audit
 import migrate_current_sk_textures
+from pcg_canonical_outputs import record_canonical_output
 from pcg_texture_common import is_backup_path
 from export_texture_plan import build_texture_plan_from_report, extract_material_image_refs
 from pcg_texture_audit import (
@@ -90,6 +91,29 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_unchanged_receipt_is_not_reported_as_written(self):
+        report = {"items": []}
+
+        def unchanged_receipt(_report, receipt_dir=None, unchanged_out=None):
+            self.assertIsNone(receipt_dir)
+            unchanged_out.append("receipt.json")
+            return []
+
+        with mock.patch.object(
+            pcg_texture_audit,
+            "persist_cluster_assembly_receipts",
+            side_effect=unchanged_receipt,
+        ):
+            state = (
+                pcg_texture_audit
+                .persist_cluster_assembly_receipts_safely(report)
+            )
+
+        self.assertEqual(state["status"], "ok")
+        self.assertEqual(state["code"], "RECEIPT_UNCHANGED")
+        self.assertEqual(state["written"], [])
+        self.assertEqual(state["unchanged"], ["receipt.json"])
+
     def test_receipt_persistence_failure_does_not_fail_clean_live_audit(self):
         with tempfile.TemporaryDirectory() as temp:
             report_path = Path(temp) / "audit.json"
@@ -128,6 +152,41 @@ class TargetCollectionTests(unittest.TestCase):
             ]
             self.assertEqual(persistence["status"], "warning")
             self.assertIn("read-only receipt directory", persistence["error"])
+
+    def test_no_receipt_live_observation_never_publishes_cache_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "observation.json"
+            argv = [
+                "pcg_texture_audit.py",
+                "--target",
+                temp,
+                "--json",
+                str(report_path),
+                "--no-receipt",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                pcg_texture_audit,
+                "load_config",
+                return_value={},
+            ), mock.patch.object(
+                pcg_texture_audit,
+                "make_report",
+                return_value={"summary": {"total": 0}, "items": []},
+            ), mock.patch.object(
+                pcg_texture_audit,
+                "persist_cluster_assembly_receipts_safely",
+            ) as persist, mock.patch.object(
+                pcg_texture_audit,
+                "save_spm_analysis_cache",
+            ):
+                pcg_texture_audit.main()
+
+            persist.assert_not_called()
+            written = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                written["cluster_assembly_receipt_persistence"]["status"],
+                "not_requested",
+            )
 
     def test_physical_cluster_capture_receipt_tracks_color_opacity_and_resolution(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -178,6 +237,11 @@ class TargetCollectionTests(unittest.TestCase):
         )
         self.assertTrue(
             is_backup_path(".__spm_pass_repair_token_SK_Tree_elm_01.spm")
+        )
+        self.assertTrue(
+            is_backup_path(
+                "SK_cluster_elm_01.texture_slot_backup_20260730_120000.spm"
+            )
         )
         self.assertFalse(is_backup_path("SK_Tree_elm_01.spm"))
 
@@ -1533,6 +1597,105 @@ class SourceSelectionTests(unittest.TestCase):
             )
             self.assertEqual(len({tuple(item["source_signature"]) for item in items}), 2)
 
+    def test_canonical_manifest_consumers_do_not_spawn_group_suffix_outputs(self):
+        def material(material_id, name, prefix):
+            return (
+                f'<Material_v8 ID="{material_id}" Name="{name}">'
+                f'<TexFilename>{prefix}_albedo.png</TexFilename>'
+                f'<TexFilename>{prefix}_opacity.png</TexFilename>'
+                "</Material_v8>"
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            texture = root / "texture"
+            source = root / "source"
+            texture.mkdir()
+            source.mkdir()
+            for family in ("green", "stem"):
+                self._image(source / f"{family}_albedo.png")
+                self._image(source / f"{family}_opacity.png")
+
+            spm = root / "SK_cluster_test_01.spm"
+            xml = (
+                "<SpeedTree><Materials>"
+                + material(
+                    "8",
+                    "M_cluster_test_atlas_01_green",
+                    "source/green",
+                )
+                + material(
+                    "9",
+                    "M_cluster_test_atlas_01_stem",
+                    "source/stem",
+                )
+                + "</Materials><Generators>"
+                  "<Generator><Property><Name>Leaves:Material</Name>"
+                  "<Value>8</Value></Property></Generator>"
+                  "<Generator><Property><Name>Leaves:Material</Name>"
+                  "<Value>9</Value></Property></Generator>"
+                  "</Generators></SpeedTree>"
+            ).encode()
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+
+            texture_base = "T_cluster_test_atlas_01"
+            output_files = []
+            for role in sbs_auto.RENDER_MAPS:
+                path = texture / f"{texture_base}_{role}.tga"
+                path.write_bytes(role.encode("ascii"))
+                output_files.append(path)
+            record_canonical_output(
+                {
+                    "folder": str(root),
+                    "texture_base": texture_base,
+                    "material_targets": [
+                        {
+                            "spm": str(spm),
+                            "material_id": "8",
+                            "material_name":
+                                "M_cluster_test_atlas_01_green",
+                        },
+                        {
+                            "spm": str(spm),
+                            "material_id": "9",
+                            "material_name":
+                                "M_cluster_test_atlas_01_stem",
+                        },
+                    ],
+                },
+                output_files,
+                producer_source="test.sbs#T_cluster_test_atlas_01",
+            )
+
+            items = material_texture_items(
+                root,
+                {
+                    "atlas_root": str(root / "atlas"),
+                    "required_export_maps": list(sbs_auto.RENDER_MAPS),
+                },
+                [texture],
+                {},
+            )
+
+            self.assertEqual(len(items), 1)
+            row = items[0]
+            self.assertEqual(row["atlas_base"], "M_cluster_test_atlas_01")
+            self.assertEqual(row["texture_base"], texture_base)
+            self.assertEqual(
+                set(row["material_names"]),
+                {
+                    "M_cluster_test_atlas_01_green",
+                    "M_cluster_test_atlas_01_stem",
+                },
+            )
+            self.assertTrue(row["canonical_manifest_consumer_binding"])
+            self.assertEqual(row["missing_export_maps"], [])
+            self.assertEqual(
+                set(row["connection_materials"]),
+                set(row["material_names"]),
+            )
+
     def test_auto_split_managed_alias_recovers_suffix_free_leaf_source(self):
         xml = b'''<SpeedTree><Materials>
 <Material_v8 ID="1" Name="M_leaf_nothofagus_atlas_01_green">
@@ -2087,6 +2250,78 @@ class SourceSelectionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 normalize_spms_transactionally(
                     jobs[:1], backup_root=root / "backups", skip_unbuildable=True)
+
+    def test_partial_spm_normalization_updates_mapped_material_only(self):
+        map_template = '''<Map Name="{name}"><ColorX>1</ColorX><ColorY>1</ColorY><ColorZ>1</ColorZ>
+<TexFilename>old_{name}.png</TexFilename><TexSource>0</TexSource>
+<TexInvert>false</TexInvert><TexInvertRed>false</TexInvertRed>
+<TexInvertGreen>false</TexInvertGreen><TexInvertBlue>false</TexInvertBlue>
+<TexEnabled>true</TexEnabled></Map>'''
+        maps = "".join(
+            map_template.format(name=name)
+            for name in ("Color", "Opacity", "Normal", "Custom")
+        )
+        xml = f'''<SpeedTree><Materials>
+<Material_v8 ID="1" Name="M_leaf_good">{maps}</Material_v8>
+<Material_v8 ID="2" Name="M_leaf_failed">{maps}</Material_v8>
+</Materials><Generators><Generator><Properties>
+<Property><Name>Leaves:Type:0:Material</Name><Value>1</Value></Property>
+<Property><Name>Leaves:Type:1:Material</Name><Value>2</Value></Property>
+</Properties></Generator></Generators></SpeedTree>'''.encode()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = root / "SK_partial.spm"
+            texture_dir = root / "texture"
+            texture_dir.mkdir()
+            for role in (
+                "color", "normal", "extra", "height", "opacity",
+                "subsurface",
+            ):
+                (texture_dir / f"T_leaf_good_{role}.tga").write_bytes(
+                    role.encode()
+                )
+            with gzip.open(spm, "wb") as handle:
+                handle.write(xml)
+            outputs = {
+                "@id:1": {
+                    "texture_dir": str(texture_dir),
+                    "texture_base": "T_leaf_good",
+                    "subsurface_enabled": False,
+                },
+            }
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "no managed output mapping"):
+                build_spm_patch(spm, outputs)
+
+            result = normalize_spms_transactionally(
+                [{"spm": str(spm), "materials": outputs}],
+                backup_root=root / "backups",
+                allow_partial_materials=True,
+            )
+
+            self.assertEqual(result["spms"], [str(spm)])
+            self.assertEqual(result["materials"], 1)
+            self.assertEqual(len(result["skipped_materials"]), 1)
+            self.assertEqual(
+                result["skipped_materials"][0]["material_id"],
+                "2",
+            )
+            self.assertEqual(
+                result["skipped_materials"][0]["reason"],
+                "no managed output mapping",
+            )
+            slots = inspect_material_slots(
+                gzip.open(spm, "rt", encoding="utf-8").read()
+            )
+            self.assertIn(
+                "T_leaf_good_color.tga",
+                slots["1"]["slots"]["color"]["filename"],
+            )
+            self.assertEqual(
+                slots["2"]["slots"]["color"]["filename"],
+                "old_Color.png",
+            )
 
     def test_non_square_source_keeps_ratio_with_long_edge_capped_to_4k(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2696,6 +2931,84 @@ class GuiLabelTests(unittest.TestCase):
 
         self.assertEqual(self.gui.checked_step3_spms(entries), [full_sk])
 
+    def test_step3_normalizes_selected_canonical_cluster_sk_provider(self):
+        folder = r"D:\Trees\bush_blackgum"
+        full_sk = folder + r"\SK_bush_blackgum_01.spm"
+        canonical_cluster_sk = (
+            folder + r"\cluster\SK_cluster_blackgum_01.spm"
+        )
+        raw_cluster = folder + r"\cluster\cluster_blackgum_01.spm"
+        item = {
+            "folder": folder,
+            "target_spm_statuses": [{"sk_spm": full_sk}],
+        }
+        entries = {
+            "blackgum": {
+                "checked": True,
+                "item": item,
+            },
+        }
+        selected_rows = [(
+            item,
+            {
+                "atlas_base": "M_cluster_blackgum_atlas_01",
+                "material_targets": [
+                    {
+                        "spm": canonical_cluster_sk,
+                        "material_id": "8",
+                    },
+                    {
+                        "spm": raw_cluster,
+                        "material_id": "8",
+                    },
+                ],
+            },
+        )]
+
+        result = self.gui.checked_step3_spms(
+            entries,
+            selected_texture_rows=selected_rows,
+        )
+
+        self.assertEqual(
+            {value.lower() for value in result},
+            {full_sk.lower(), canonical_cluster_sk.lower()},
+        )
+        self.assertNotIn(raw_cluster.lower(), {
+            value.lower() for value in result
+        })
+
+    def test_step3_never_normalizes_texture_slot_backup_provider(self):
+        folder = r"D:\Trees\tree_scotspine"
+        canonical = folder + r"\cluster\SK_cluster_scotspine_01.spm"
+        backup = (
+            canonical[:-4]
+            + ".texture_slot_backup_20260730_120000.spm"
+        )
+        item = {"folder": folder}
+        entries = {
+            "scotspine": {
+                "checked": True,
+                "item": item,
+            },
+        }
+
+        result = self.gui.checked_step3_spms(
+            entries,
+            selected_texture_rows=[(
+                item,
+                {
+                    "atlas_base": "M_cluster_scotspine_01",
+                    "material_targets": [
+                        {"spm": canonical, "material_id": "5"},
+                        {"spm": backup, "material_id": "5"},
+                    ],
+                },
+            )],
+        )
+
+        self.assertEqual(result, [canonical])
+
     def test_initial_refresh_runs_in_worker_and_applies_via_root_after(self):
         class FakeRoot:
             def __init__(self):
@@ -2751,10 +3064,16 @@ class GuiLabelTests(unittest.TestCase):
         with mock.patch.object(self.gui, "save_config") as save_config, \
                 mock.patch.object(self.gui, "load_pcg_targets", return_value={"meshes": []}), \
                 mock.patch.object(self.gui, "make_report", return_value=report) as make_report, \
-                mock.patch.object(self.gui, "save_spm_analysis_cache"), \
+                mock.patch.object(
+                    self.gui, "write_board_display_snapshot"
+                ) as write_snapshot, \
+                mock.patch.object(
+                    self.gui, "save_spm_analysis_cache"
+                ) as save_analysis, \
                 mock.patch.object(
                     self.gui, "load_sync_state",
-                    return_value={"migration_complete": True, "entries": {}}), \
+                    return_value={"migration_complete": True, "entries": {}}
+                ) as load_sync, \
                 mock.patch.object(self.gui.threading, "Thread", FakeThread):
             app._start_initial_refresh()
             self.assertEqual(len(threads), 1)
@@ -2779,15 +3098,36 @@ class GuiLabelTests(unittest.TestCase):
             self.assertEqual(delay, 0)
             callback()
 
-            # The refresh that arrived mid-initial-scan must run after the
-            # initial result lands instead of being silently dropped (race:
-            # target-refresh buttons finishing during the first audit).
+            # The primary live table paints before Blender relation rows,
+            # cache persistence, and sync-state loading finish.
             self.assertEqual(make_report.call_count, 1)
             self.assertEqual(len(threads), 2)
             self.assertTrue(threads[1].started)
-            self.assertFalse(app._pending_refresh)
+            self.assertTrue(app._pending_refresh)
+            self.assertIs(app.report, report)
+            app.populate.assert_called_once_with()
+            self.assertTrue(app._initial_refreshing)
+            write_snapshot.assert_not_called()
+            save_analysis.assert_not_called()
+            load_sync.assert_not_called()
 
+            # Finishing relation enrichment releases the queued refresh.
             threads[1].target()
+            write_snapshot.assert_called_once_with(
+                report,
+                {"tree_root": "new"},
+                pcg_targets={"meshes": []},
+            )
+            save_analysis.assert_called_once_with()
+            load_sync.assert_called_once_with(migrate=False)
+            self.assertEqual(len(app.root.callbacks), 1)
+            delay, callback = app.root.callbacks.pop()
+            self.assertEqual(delay, 0)
+            callback()
+            self.assertFalse(app._pending_refresh)
+            self.assertEqual(len(threads), 3)
+
+            threads[2].target()
             self.assertEqual(make_report.call_count, 2)
             self.assertEqual(len(app.root.callbacks), 1)
             delay, callback = app.root.callbacks.pop()
@@ -2800,9 +3140,56 @@ class GuiLabelTests(unittest.TestCase):
             mock.call(True), mock.call(False),
             mock.call(True), mock.call(False),
         ])
-        self.assertEqual(app.populate.call_count, 2)
-        self.assertEqual(app._update_summary.call_count, 2)
+        self.assertEqual(app.populate.call_count, 3)
+        self.assertEqual(app._update_summary.call_count, 3)
         self.assertIsNone(app.worker)
+
+    def test_initial_snapshot_paints_display_only_before_live_audit(self):
+        report = {"items": [{"name": "tree_elm", "folder": "D:/Tree/elm"}]}
+        app = self.gui.App.__new__(self.gui.App)
+        app.cfg = {"tree_root": "D:/Tree"}
+        app.report = None
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+        app._initial_pcg_targets = mock.Mock(return_value=None)
+        app.status_var = mock.Mock()
+        app.log = mock.Mock()
+
+        with mock.patch.object(
+            self.gui,
+            "read_board_display_snapshot",
+            return_value={
+                "can_display": True,
+                "cache_state": "stale_inputs",
+                "display_report": report,
+            },
+        ):
+            displayed = app._load_initial_display_snapshot()
+
+        self.assertTrue(displayed)
+        self.assertIs(app.report, report)
+        self.assertTrue(app._display_only_snapshot)
+        self.assertTrue(
+            report["items"][0]["_gui_blender_connection_pending"]
+        )
+        app.populate.assert_called_once_with()
+        app._update_summary.assert_called_once_with()
+        self.assertIn(
+            "변경 작업 잠김",
+            app.status_var.set.call_args.args[0],
+        )
+
+    def test_pending_relation_rows_never_resolve_on_the_tk_thread(self):
+        item = {
+            "_gui_blender_connection_pending": True,
+            "leaf_mesh_sources": [{"blend": "D:/huge.blend"}],
+        }
+
+        self.assertEqual(self.gui.blender_connection_rows(item), [])
+        self.assertEqual(
+            self.gui.blender_connection_overview(item),
+            "연결 계산 중…",
+        )
 
     def test_initial_refresh_keeps_live_report_when_receipt_persistence_warns(self):
         report = {
@@ -2895,6 +3282,9 @@ class GuiLabelTests(unittest.TestCase):
                     self.gui, "load_pcg_targets", return_value={"meshes": []}), \
                 mock.patch.object(
                     self.gui, "make_report", return_value=report) as make_report, \
+                mock.patch.object(
+                    self.gui, "write_board_display_snapshot"
+                ) as write_snapshot, \
                 mock.patch.object(self.gui, "save_spm_analysis_cache"), \
                 mock.patch.object(
                     self.gui, "load_sync_state", return_value=sync_state), \
@@ -2908,6 +3298,11 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+            )
+            write_snapshot.assert_called_once_with(
+                report,
+                {"tree_root": "new"},
+                pcg_targets={"meshes": []},
             )
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3092,6 +3487,116 @@ class GuiLabelTests(unittest.TestCase):
         )
         self.assertEqual(build_jobs.call_args.kwargs["allowed_spms"], [selected])
         self.assertIs(cleanup.call_args.args[0], exact_plan)
+
+    def test_step3_normalizes_successful_rows_after_other_render_failure(self):
+        folder = r"D:\Trees\dogwood"
+        target = folder + r"\cluster\SK_cluster_dogwood_01.spm"
+        good_key = (
+            self.gui.os.path.normcase(
+                self.gui.os.path.abspath(folder)
+            ),
+            "m_leaf_dogwood_atlas_01",
+        )
+        bad_key = (
+            self.gui.os.path.normcase(
+                self.gui.os.path.abspath(folder)
+            ),
+            "m_branch_dogwood_atlas_01",
+        )
+        app = self.gui.App.__new__(self.gui.App)
+        app.cfg = {
+            "tree_root": r"D:\Trees",
+            "sbsrender_timeout": 10,
+            "unreal_texture_sync_enabled": False,
+        }
+        app.status_var = mock.Mock()
+        app.tree = mock.Mock()
+        app.log = mock.Mock()
+        app._ui = lambda callback: callback()
+        app._step3_finished = mock.Mock()
+        jobs = [
+            {
+                "base": good_key[1],
+                "texture_base": "T_leaf_dogwood_atlas_01",
+                "item": {"folder": folder},
+                "step3_consumer_row_keys": (good_key,),
+            },
+            {
+                "base": bad_key[1],
+                "texture_base": "T_branch_dogwood_atlas_01",
+                "item": {"folder": folder},
+                "step3_consumer_row_keys": (bad_key,),
+            },
+        ]
+        plan = {
+            "items": [
+                {
+                    "folder": folder,
+                    "atlas_base": good_key[1],
+                },
+                {
+                    "folder": folder,
+                    "atlas_base": bad_key[1],
+                },
+            ],
+            "preserved_cluster_materials": [],
+        }
+        success = {
+            "texture_base": "T_leaf_dogwood_atlas_01",
+            "files": [Path(folder) / "texture" / "leaf_color.tga"],
+        }
+
+        with mock.patch.object(
+                self.gui,
+                "run_texture_job",
+                side_effect=[success, RuntimeError("render failed")],
+        ), mock.patch.object(
+                self.gui,
+                "make_report",
+                return_value={},
+        ) as make_report, mock.patch.object(
+                self.gui,
+                "persist_cluster_assembly_receipts_safely",
+        ), mock.patch.object(
+                self.gui,
+                "save_spm_analysis_cache",
+        ), mock.patch.object(
+                self.gui,
+                "build_texture_plan_from_report",
+                return_value=plan,
+        ), mock.patch.object(
+                self.gui,
+                "jobs_from_texture_plan",
+                return_value=[],
+        ) as build_jobs, mock.patch.object(
+                self.gui,
+                "normalize_spms_transactionally",
+                return_value={
+                    "spms": [target],
+                    "materials": 1,
+                    "backup_dir": r"D:\Trees\_spm_backups\run",
+                    "skipped": [],
+                },
+        ) as normalize, mock.patch.object(
+                self.gui,
+                "cleanup_preserved_cluster_outputs",
+                return_value={"cleaned": [], "conflicts": []},
+        ):
+            app._run_step3(jobs, [target], sync_files=[])
+
+        make_report.assert_called_once_with(
+            app.cfg,
+            targets=[folder],
+        )
+        exact_plan = build_jobs.call_args.args[0]
+        self.assertEqual(
+            [row["atlas_base"] for row in exact_plan["items"]],
+            [good_key[1]],
+        )
+        normalize.assert_called_once()
+        self.assertTrue(
+            normalize.call_args.kwargs["allow_partial_materials"]
+        )
 
     def test_atlas_generation_loads_user_startup_with_clean_preferences(self):
         with tempfile.TemporaryDirectory() as temp:

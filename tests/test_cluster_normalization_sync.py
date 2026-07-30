@@ -41,6 +41,38 @@ def write_spm_with_frond_material(path, material_name, material_id):
     )
 
 
+def write_spm_with_managed_duplicate(
+    path,
+    material_name,
+    source_material_id,
+    managed_material_id,
+):
+    marker = json.dumps(
+        {
+            "generator": "Atlas Leaf Mesh Builder",
+            "scope": "legacy-output-scope",
+            "kind": "material",
+            "group": "Atlas_Cluster_Cards",
+        }
+    )
+    path.write_text(
+        (
+            "<SpeedTree><Assets>"
+            f'<Material_v8 ID="{source_material_id}" '
+            f'Name="{material_name}" />'
+            f'<Material_v8 ID="{managed_material_id}" '
+            f'Name="{material_name}"><UserData>{marker}</UserData>'
+            "</Material_v8>"
+            "</Assets><Generators><Generator Type=\"Frond\">"
+            "<Name>Frond</Name><Hidden>false</Hidden><Properties><Property>"
+            "<Name>Material:Frond:0:Material</Name>"
+            f"<Value>{source_material_id}</Value>"
+            "</Property></Properties></Generator></Generators></SpeedTree>"
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_spm_with_frond_binding(
     path,
     material_name,
@@ -424,6 +456,67 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 "M_Leaf_elm_01",
             )
             self.assertTrue(recipe["adopt_source_material"])
+
+    def test_managed_unreferenced_same_name_duplicate_migrates_to_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            write_spm_with_managed_duplicate(
+                target,
+                "M_leaf_elm_01",
+                6,
+                19,
+            )
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            binding = recipe["target_material_bindings"][0]
+            self.assertEqual(binding["source_material_id"], 6)
+            self.assertTrue(binding["adopt_source_material"])
+            self.assertTrue(binding["connect_generators"])
+            self.assertEqual(
+                binding["legacy_managed_duplicate"],
+                {
+                    "material_id": 19,
+                    "material_name": "M_leaf_elm_01",
+                    "atlas_scope": "legacy-output-scope",
+                    "resolution": (
+                        "migrate_managed_output_into_connected_source"
+                    ),
+                },
+            )
+
+    def test_unowned_same_name_duplicate_remains_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            target.write_text(
+                (
+                    "<SpeedTree><Assets>"
+                    '<Material_v8 ID="6" Name="M_leaf_elm_01" />'
+                    '<Material_v8 ID="19" Name="M_leaf_elm_01" />'
+                    "</Assets><Generators><Generator Type=\"Frond\">"
+                    "<Name>Frond</Name><Hidden>false</Hidden><Properties>"
+                    "<Property><Name>Material:Frond:0:Material</Name>"
+                    "<Value>6</Value></Property></Properties></Generator>"
+                    "</Generators></SpeedTree>"
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ClusterNormalizationSyncError,
+                "ambiguous duplicate output materials",
+            ):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
 
     def test_missing_output_material_uses_existing_family_source_and_creates_output(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -9,6 +9,25 @@
 PCG_ST9_Texture_Batch.bat
 ```
 
+①/②/③과 Atlas 대상 해제는 SK Batch·SPM Generator Sync와 같은 프로세스 간
+공용 FIFO에 들어간다. 다른 BAT 창에서 실행해도 실제 변경 작업은 겹치지 않는다.
+일반 ③과 `③ 전체 다시 뽑기`의 무거운 대상 계획은 공용 실행 차례가 온 뒤
+백그라운드에서 최신 상태로 다시 계산하므로, 대기 중 GUI가 멈추거나 오래된
+렌더 계획을 그대로 재생하지 않는다.
+
+## 시작 시 표 갱신
+
+보드는 마지막으로 성공한 live 감사 결과를
+`reports\_cache\board_snapshot_v1.json`에 표시 전용으로 저장한다. 다음 실행에서는
+이전 표를 먼저 보여 주고 `live 검증 중` 상태에서 모든 변경 버튼을 잠근다. 이
+스냅샷은 완료 영수증이나 실행 허가로 사용하지 않는다. 설정, Tree root 또는 PCG
+대상이 달라도 이전 표라는 사실을 표시할 뿐 작업 성공으로 판정하지 않는다.
+
+새 live 기본 감사가 끝나면 ①–③ 상태 열을 먼저 교체한다. 비용이 큰
+`Blend ↔ SPM` 관계 열 계산과 분석 캐시 저장은 그 뒤 백그라운드에서 완료하며,
+모든 live 단계가 끝난 뒤에만 변경 버튼을 다시 연다. 따라서 전체 관계 계산 때문에
+첫 표가 늦게 나타나는 구조로 되돌아가지 않는다.
+
 ## 화면 구성
 
 - **표**: 나무 폴더는 공유 작업 그룹이고, 바로 아래에 실제 또는 생성 예정
@@ -144,6 +163,9 @@ DynamicWind 데이터는 그 Skeleton 기준으로 재생성·bone index·bindin
 GUI의 초기 검사·새로고침과 ①–③ 완료 후 재검사는 이 계약을
 `reports\cluster_assembly\cluster_assembly_{폴더}_{source-path-hash}.json`에
 atomic write한다. 동일 내용은 다시 쓰지 않으며 원본 SPM/TGA에는 쓰지 않는다.
+감사 상태도 실제 디스크 동작을 그대로 구분한다. 새 bytes를 쓴 경우만
+`RECEIPT_PERSISTED/written`이고, 동일 내용으로 mtime을 보존한 경우는
+`RECEIPT_UNCHANGED/unchanged`이다.
 후속 파이프라인은 `locate_cluster_assembly_receipt(spm_path)`로 SK SPM 또는 일반
 source SPM에 해당하는 receipt를 정확히 하나만 선택할 수 있다. 선택 시 Tree/Cluster
 SPM과 Cluster TGA SHA-256을 다시 확인하므로 변경된 stale receipt는 거부된다.
@@ -169,6 +191,9 @@ SPM과 Cluster TGA SHA-256을 다시 확인하므로 변경된 stale receipt는 
 
 - 일반 `③ 실행`은 누락·불완전한 세트만 처리한다. `Cluster_System_01.sbsar`를
   수정해 완성된 결과까지 갱신해야 할 때는 별도 `③ 전체 다시 뽑기` 버튼을 사용한다.
+  일반 버튼 클릭 자체를 실행 승인으로 보므로 긴 대상 계산 뒤에 다시 확인을 묻지 않는다.
+  계획·이름 오류 항목은 자동 제외하고 정상 항목을 끝까지 처리한 뒤, 완료 상태와 실행별
+  `reports/step3_run_*.json`에 제외 대상과 사유를 기록한다.
   이 수동 실행은 체크 여부와 무관하게 현재 표의 완성 세트도 세트당 6장 전부 다시 렌더하며, 절차형
   SBS 그래프의 기존 쿡 캐시도 재사용하지 않고 현재 Cluster_System으로 다시 쿡한다.
   자동 변경 감지는 하지 않으며, 모든 렌더가 성공하면 결과 전체를 모아 Unreal 동기화를

@@ -3221,8 +3221,13 @@ def apply_group_transaction(
     xml_ini: Path | None = None,
     verify_callback=None,
     progress_callback=None,
+    skip_blocked_scale: bool = False,
 ) -> dict:
-    """Preflight, backup, write, verify, and rollback a whole master group."""
+    """Preflight, backup, write, verify, and rollback a whole master group.
+
+    Batch callers may set ``skip_blocked_scale`` so one oversized follower is
+    reported in ``scale_skipped`` without suppressing safe siblings.
+    """
     prepared = build_group_sync_plans(
         folder,
         master_name,
@@ -3247,7 +3252,12 @@ def apply_group_transaction(
         progress_callback("크기 위험과 XML 무결성 확인 중", 38)
 
     blocked = [plan for plan in plans if plan.scale_risk.get("level") == "blocked"]
-    if blocked:
+    scale_skipped = [{
+        "target": str(plan.target),
+        "reason": "크기 차이로 노드·폴리곤 폭증 위험",
+        "scale_risk": dict(plan.scale_risk),
+    } for plan in blocked]
+    if blocked and not skip_blocked_scale:
         details = []
         for plan in blocked:
             risk = plan.scale_risk
@@ -3259,6 +3269,39 @@ def apply_group_transaction(
             "크기 차이로 노드·폴리곤 폭증 위험이 있어 원본을 수정하지 않았습니다. "
             "큰 나무용 Base를 별도 마스터로 사용하세요.\n" + "\n".join(details)
         )
+    if blocked:
+        blocked_targets = {
+            os.path.normcase(str(Path(plan.target).absolute())).casefold()
+            for plan in blocked
+        }
+        plans = [
+            plan for plan in plans
+            if os.path.normcase(
+                str(Path(plan.target).absolute())
+            ).casefold() not in blocked_targets
+        ]
+        selected = [Path(plan.target).name for plan in plans]
+        plan_fingerprints = {
+            path: fingerprint
+            for path, fingerprint in plan_fingerprints.items()
+            if (
+                Path(path) == master_path
+                or os.path.normcase(
+                    str(Path(path).absolute())
+                ).casefold() not in blocked_targets
+            )
+        }
+        if not plans:
+            if progress_callback is not None:
+                progress_callback("크기 폭증 위험 자식 제외 완료", 100)
+            return {
+                "status": "skipped_scale_risk",
+                "changed_files": [],
+                "backup_dir": None,
+                "plans": [],
+                "master_hash": master_hash,
+                "scale_skipped": scale_skipped,
+            }
 
     patches: list[tuple[Path, str, bool]] = []
     for plan in plans:
@@ -3291,6 +3334,7 @@ def apply_group_transaction(
         return {
             "status": "up_to_date", "changed_files": [], "backup_dir": None,
             "plans": plans, "master_hash": master_hash,
+            "scale_skipped": scale_skipped,
         }
 
     # All in-memory patches must be valid before the first filesystem mutation.
@@ -3406,6 +3450,7 @@ def apply_group_transaction(
         "backup_dir": str(backup_dir),
         "plans": plans,
         "master_hash": master_hash,
+        "scale_skipped": scale_skipped,
     }
 
 

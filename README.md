@@ -11,6 +11,22 @@ SpeedTree 식생 변환 작업을 위한 독립형 Windows 배치 도구 모음�
 
 각 도구의 상세 사용법은 해당 폴더의 `README.md`를 참고합니다.
 
+## 프로세스 간 공용 실행 대기열
+
+세 GUI의 **변경 작업**은 창마다 따로 실행되지 않고
+`%LOCALAPPDATA%\SpeedTreeBatchTools\shared_job_queue.json`의 공용 FIFO에
+등록된다. 통합 창의 다른 탭, 별도 BAT 창, 같은 도구를 두 번 연 창도 등록 순서를
+공유하며 실제 에셋 작업은 한 번에 하나만 실행한다.
+
+- SPM Generator Sync의 관계 적용·동기화·Cluster 갱신
+- PCG ①/②/③, 전체 재추출, Atlas 대상 해제
+- SK Batch의 SPM·Blender·Unreal·전체 자동 작업
+
+대기 중인 창은 `공용 대기열 대기 · 전체 N번째`를 표시하며 UI 이벤트 루프를
+막지 않는다. 실행 작업은 heartbeat lease를 유지한다. 실행 프로세스가 종료되면
+해당 비멱등 작업을 자동 재실행하지 않고 `owner_lost` 실패로 기록한 뒤 다음
+작업을 진행한다. 읽기 전용 검사와 표 갱신은 대기열 밖에서 계속 사용할 수 있다.
+
 ## 공통 GUI 편의성
 
 세 GUI의 행 활성화와 Everything용 경로 복사는 `batch_ui_common` 패키지를
@@ -43,6 +59,13 @@ GitHub/
 개인 PC 경로가 들어가는 설정 JSON, 실행 상태, 로그, 생성 리포트는 로컬에는 유지되지만 Git에는 포함되지 않습니다.
 
 ## 테스트
+
+통합 GUI와 SK Batch 직접 GUI는 실제 창을 import하기 전에 다음 빠른 코드·계약
+게이트를 자동 실행합니다. 에셋, Blender, SpeedTree, Unreal은 실행하지 않습니다.
+
+```powershell
+python .\sk_batch\code_compile_gate.py
+```
 
 ```powershell
 python -m unittest discover -s .\tests -v

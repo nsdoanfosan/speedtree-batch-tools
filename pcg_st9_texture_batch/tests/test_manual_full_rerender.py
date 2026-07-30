@@ -94,6 +94,53 @@ class ManualFullRerenderTests(unittest.TestCase):
             "state": "normal",
         })
 
+    def test_force_plan_normalizes_root_and_canonical_cluster_sk(self):
+        app = self.gui.App.__new__(self.gui.App)
+        folder = r"D:\Trees\bush_dogwood"
+        root_sk = folder + r"\SK_bush_dogwood_01.spm"
+        cluster_sk = folder + r"\cluster\SK_cluster_dogwood_01.spm"
+        item = {
+            "name": "bush_dogwood",
+            "folder": folder,
+            "target_spm_statuses": [{"sk_spm": root_sk}],
+        }
+        row = {
+            "atlas_base": "M_leaf_dogwood_atlas_01",
+            "texture_base": "T_leaf_dogwood_atlas_01",
+            "material_targets": [
+                {"spm": cluster_sk, "material_id": "6"},
+            ],
+        }
+        app.items = {
+            "dogwood": {
+                "checked": False,
+                "item": item,
+            },
+        }
+        app._all_texplan_rows = lambda: [(item, row)]
+        app._step3_jobs = mock.Mock(return_value=([{
+            "base": row["atlas_base"],
+            "texture_base": row["texture_base"],
+            "item": item,
+        }], []))
+        app._step3_unreal_name_skips = mock.Mock(return_value=[])
+
+        plan = app._build_step3_force_execution_plan()
+
+        self.assertEqual(
+            {value.lower() for value in plan["exact_step3_spms"]},
+            {root_sk.lower(), cluster_sk.lower()},
+        )
+        self.assertEqual(
+            plan["eligible_row_keys"],
+            {
+                self.gui.step3_texture_row_key(
+                    item,
+                    row["atlas_base"],
+                ),
+            },
+        )
+
     def test_force_worker_syncs_once_after_all_renders_without_spm_processing(self):
         app = self.gui.App.__new__(self.gui.App)
         app.cfg = {

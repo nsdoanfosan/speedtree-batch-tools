@@ -23,28 +23,19 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
 
-    def test_existing_relation_is_detached_before_idempotent_rebuild(self):
+    def test_existing_relation_is_normalized_in_place(self):
         source = JOB_PATH.read_text(encoding="utf-8")
-        cleanup = source.index("pre_export_relation_cleanup = [")
-        export = source.index("export_or_update_speedtree_spm_targets(", cleanup)
-        self.assertIn(
-            "cleanup_existing_relation_for_rebuild(",
-            source[cleanup:export],
-        )
-
-    def test_plain_export_scope_is_not_removed_before_first_adoption(self):
-        source = JOB_PATH.read_text(encoding="utf-8")
-        helper = source[
-            source.index("def relation_manifest_requires_pre_export_cleanup("):
-            source.index("\ndef sync_targets(", source.index(
-                "def relation_manifest_requires_pre_export_cleanup("
-            ))
+        sync_source = source[
+            source.index("def sync_targets("):
+            source.index("\ndef remove_targets(")
         ]
-        self.assertIn('manifest.get("source_material_adoption")', helper)
-        self.assertIn('manifest.get("generator_connection")', helper)
-        self.assertIn('connection.get("requested") is True', helper)
-        self.assertIn('"not_required_no_active_relation"', helper)
-        self.assertIn("preserve_scope_history=True", helper)
+        self.assertIn(
+            "Normalize each requested relation in place.",
+            sync_source,
+        )
+        self.assertNotIn("pre_export_relation_cleanup", sync_source)
+        self.assertNotIn("cleanup_existing_relation_for_rebuild", sync_source)
+        self.assertNotIn("remove_blend_target_from_spm", sync_source)
 
     def test_current_receipt_rehydrates_the_plan_collection_before_export(self):
         source = JOB_PATH.read_text(encoding="utf-8")
@@ -61,12 +52,23 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
 
-    def test_effective_registry_requires_one_explicit_binding_per_target(self):
+    def test_requested_live_slice_requires_one_explicit_binding_per_target(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn("validate_recipe_registry_contract(", source)
-        self.assertIn("set(binding_targets) != set(registered)", source)
+        self.assertIn(
+            "not set(effective).issubset(set(recipe_targets))",
+            source,
+        )
         self.assertIn(
             'binding.get("connect_generators") not in {True, False}',
+            source,
+        )
+        self.assertIn(
+            "for path in requested",
+            source[source.index("props.speedtree_spm_items.clear()"):],
+        )
+        self.assertNotIn(
+            "save_spm_target_registry(props)",
             source,
         )
         self.assertNotIn(

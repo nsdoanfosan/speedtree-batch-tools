@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -24,6 +25,13 @@ def run_guard(*args, cwd=None):
         cwd=str(cwd or REPO_DIR),
         env=env,
         timeout=120,
+    )
+
+
+def load_guard_module():
+    return runpy.run_path(
+        str(GUARD),
+        run_name="_speedtree_batch_launch_guard_under_test",
     )
 
 
@@ -101,6 +109,59 @@ class LaunchGuardTests(unittest.TestCase):
             result = run_guard(target)
             self.assertEqual(result.returncode, 0)
             self.assertIn("entered main", result.stdout)
+
+    def test_integrated_and_direct_sk_batch_launches_run_compile_gate_first(self):
+        for target in (
+            REPO_DIR / "speedtree_batch_tools_gui.pyw",
+            REPO_DIR / "sk_batch" / "sk_batch_gui.pyw",
+        ):
+            with self.subTest(target=target.name):
+                module = load_guard_module()
+                calls = []
+
+                def fake_run_path(path, run_name):
+                    calls.append((Path(path), run_name))
+                    if Path(path) == module["CODE_COMPILE_GATE"]:
+                        return {"run_gate": lambda: calls.append(("gate", "ran"))}
+                    return {}
+
+                with mock.patch.object(
+                    module["runpy"], "run_path", side_effect=fake_run_path
+                ):
+                    result = module["main"](["launch_guard.pyw", str(target)])
+
+                self.assertEqual(result, 0)
+                self.assertEqual(calls[0][0], module["CODE_COMPILE_GATE"])
+                self.assertEqual(calls[1], ("gate", "ran"))
+                self.assertEqual(calls[2][0], target)
+
+    def test_non_sk_batch_gui_skips_compile_gate(self):
+        module = load_guard_module()
+        target = REPO_DIR / "pcg_st9_texture_batch" / "pcg_texture_gui.pyw"
+        with mock.patch.object(module["runpy"], "run_path", return_value={}) as run:
+            result = module["main"](["launch_guard.pyw", str(target)])
+
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(str(target), run_name="__main__")
+
+    def test_compile_gate_failure_uses_existing_launch_error_reporter(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        failure = RuntimeError("contract regression")
+        with mock.patch.object(
+            module["runpy"],
+            "run_path",
+            return_value={"run_gate": mock.Mock(side_effect=failure)},
+        ), mock.patch.dict(
+            module["main"].__globals__,
+            {"report": (reporter := mock.Mock())},
+        ):
+            result = module["main"](["launch_guard.pyw", str(target)])
+
+        self.assertEqual(result, 1)
+        reporter.assert_called_once()
+        self.assertIn("코드 컴파일 검사를 통과하지 못했습니다", reporter.call_args.args[1])
+        self.assertIn("RuntimeError: contract regression", reporter.call_args.args[2])
 
 
 class LauncherModuleTests(unittest.TestCase):

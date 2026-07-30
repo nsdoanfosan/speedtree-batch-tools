@@ -1,0 +1,408 @@
+"""Fast, side-effect-free compile gate for the SK Batch pipeline.
+
+This gate intentionally does not import production modules or inspect assets.
+It compiles Python source in memory, then checks the few orchestration
+contracts whose violation otherwise appears only after a long batch run.
+"""
+
+from __future__ import annotations
+
+import ast
+import copy
+import os
+import sys
+import time
+import tokenize
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+GUI_PATH = Path(__file__).resolve().with_name("sk_batch_gui.pyw")
+SOURCE_SUFFIXES = {".py", ".pyw"}
+IGNORED_DIRECTORY_NAMES = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "logs",
+    "node_modules",
+    "work",
+}
+RUNTIME_COMPILE_NAMES = {
+    "_batch_compile_enabled",
+    "_compile_blender_wave",
+    "_compiled_material_preflight_for",
+    "_initialize_compiled_plan",
+}
+
+
+class CompileGateError(RuntimeError):
+    """Raised when syntax or an SK Batch orchestration contract is invalid."""
+
+
+@dataclass(frozen=True)
+class CompileGateResult:
+    source_count: int
+    contract_count: int
+    elapsed_seconds: float
+
+
+def _read_python_source(path: Path) -> str:
+    with tokenize.open(path) as handle:
+        return handle.read()
+
+
+def _production_sources(repo_root: Path):
+    for current_root, directories, filenames in os.walk(repo_root):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name.casefold() not in IGNORED_DIRECTORY_NAMES
+        )
+        current = Path(current_root)
+        for filename in sorted(filenames):
+            path = current / filename
+            if path.suffix.casefold() in SOURCE_SUFFIXES:
+                yield path
+
+
+def compile_repository_sources(repo_root=REPO_ROOT) -> int:
+    """Compile repository Python sources in memory without importing them."""
+    repo_root = Path(repo_root).resolve()
+    source_count = 0
+    for path in _production_sources(repo_root):
+        source = _read_python_source(path)
+        try:
+            compile(source, str(path), "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as exc:
+            relative = path.relative_to(repo_root)
+            raise CompileGateError(f"Python compile failed: {relative}: {exc}") from exc
+        source_count += 1
+    if source_count == 0:
+        raise CompileGateError(f"No Python sources found under {repo_root}")
+    return source_count
+
+
+def _function(module: ast.Module, name: str) -> ast.FunctionDef:
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise CompileGateError(f"Required function is missing: {name}")
+
+
+def _app_methods(module: ast.Module):
+    for node in module.body:
+        if isinstance(node, ast.ClassDef) and node.name == "App":
+            return {
+                child.name: child
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    raise CompileGateError("Required class is missing: App")
+
+
+def _call_name(call: ast.Call):
+    function = call.func
+    if isinstance(function, ast.Name):
+        return function.id
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    return None
+
+
+def _calls(node: ast.AST, name: str):
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and _call_name(child) == name
+    ]
+
+
+def _compile_isolated_function(function: ast.FunctionDef, namespace):
+    isolated = ast.Module(body=[copy.deepcopy(function)], type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    scope = dict(namespace)
+    exec(compile(isolated, "<contract-probe>", "exec"), scope)
+    return scope[function.name]
+
+
+def _require_owner_atlas_scope(module: ast.Module, methods) -> None:
+    policy = _function(module, "should_refresh_canonical_atlas_manifests")
+    probe = _compile_isolated_function(
+        policy,
+        {"is_cluster_source_spm": lambda value: value == "cluster"},
+    )
+    if probe("owner") is not False or probe("cluster") is not True:
+        raise CompileGateError(
+            "Atlas scope contract failed: owner SPM must be excluded and "
+            "Cluster SPM must be included"
+        )
+
+    refresh = methods.get("_refresh_canonical_atlas_manifests")
+    if refresh is None:
+        raise CompileGateError(
+            "Atlas scope contract failed: App._refresh_canonical_atlas_manifests "
+            "is missing"
+        )
+    producer_calls = _calls(refresh, "refresh_atlas_manifests_for_spm")
+    if not producer_calls:
+        raise CompileGateError(
+            "Atlas scope contract failed: canonical Atlas producer call is missing"
+        )
+    first_producer_line = min(call.lineno for call in producer_calls)
+    guarded_return = False
+    for node in ast.walk(refresh):
+        if not isinstance(node, ast.If):
+            continue
+        if not _calls(node.test, "should_refresh_canonical_atlas_manifests"):
+            continue
+        if not isinstance(node.test, ast.UnaryOp) or not isinstance(
+            node.test.op, ast.Not
+        ):
+            continue
+        if node.lineno >= first_producer_line:
+            continue
+        if any(isinstance(statement, ast.Return) for statement in node.body):
+            guarded_return = True
+            break
+    if not guarded_return:
+        raise CompileGateError(
+            "Atlas scope contract failed: non-Cluster rows must return before "
+            "refresh_atlas_manifests_for_spm"
+        )
+
+
+def _require_cluster_only_calibration(module: ast.Module) -> None:
+    policy = _function(module, "should_calibrate_spm")
+    probe = _compile_isolated_function(
+        policy,
+        {"is_cluster_source_spm": lambda value: value == "cluster"},
+    )
+    cases = (
+        ({"spm": "owner"}, False, "owner"),
+        ({"spm": "cluster"}, True, "cluster"),
+        ({"spm": "cluster", "source_read_only": True}, False, "read-only cluster"),
+        ({"spm": None}, False, "missing SPM"),
+    )
+    for item, expected, label in cases:
+        if bool(probe(item)) is not expected:
+            raise CompileGateError(
+                "Bone calibration contract failed: "
+                f"{label} expected {expected}"
+            )
+
+
+def _is_none_test(node: ast.AST, variable: str) -> bool:
+    return (
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == variable
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Is)
+        and len(node.comparators) == 1
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value is None
+    )
+
+
+def _reads_mapping_key(node: ast.AST, variable: str, key: str) -> bool:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Subscript):
+            continue
+        if not isinstance(child.value, ast.Name) or child.value.id != variable:
+            continue
+        slice_node = child.slice
+        if isinstance(slice_node, ast.Constant) and slice_node.value == key:
+            return True
+    return False
+
+
+def _require_repair_push_reuse(methods) -> None:
+    required = {
+        "_run_full_pipeline",
+        "_publish_repair_stage_contract",
+        "_repair_stage_contract",
+        "_job_blender",
+        "_push_preflight",
+    }
+    missing = sorted(required.difference(methods))
+    if missing:
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: missing " + ", ".join(missing)
+        )
+
+    pipeline = methods["_run_full_pipeline"]
+    initialized = any(
+        isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Dict)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_active_repair_stage_contracts"
+            for target in node.targets
+        )
+        for node in ast.walk(pipeline)
+    )
+    if not initialized:
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: full pipeline does not "
+            "initialize its job-scoped Repair result store"
+        )
+    cleanup_found = False
+    for node in ast.walk(pipeline):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        constants = {
+            child.value
+            for statement in node.finalbody
+            for child in ast.walk(statement)
+            if isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+        }
+        if (
+            "_active_repair_stage_contracts" in constants
+            and any(_calls(statement, "pop") for statement in node.finalbody)
+        ):
+            cleanup_found = True
+            break
+    if not cleanup_found:
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: full pipeline does not "
+            "clear its job-scoped Repair result in finally"
+        )
+    if not _calls(methods["_job_blender"], "_publish_repair_stage_contract"):
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: Blender Repair does not "
+            "publish its final result"
+        )
+    handoff_calls = _calls(methods["_job_blender"], "_handoff_ready")
+    if not any(
+        any(keyword.arg == "state_out" for keyword in call.keywords)
+        for call in handoff_calls
+    ):
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: Blender Repair repeats "
+            "the final Repair state instead of sharing one computed result"
+        )
+    if _calls(methods["_job_blender"], "_read_repair_pipeline_json"):
+        raise CompileGateError(
+            "Repair status efficiency contract failed: Blender job must "
+            "reuse the Repair report projection instead of reading it again"
+        )
+
+    push_preflight = methods["_push_preflight"]
+    if not _calls(push_preflight, "_repair_stage_contract"):
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: Push does not read the "
+            "job-scoped Repair result"
+        )
+    reuse_branch = None
+    for node in ast.walk(push_preflight):
+        if isinstance(node, ast.If) and _is_none_test(node.test, "repair_contract"):
+            reuse_branch = node
+            break
+    if reuse_branch is None:
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: persisted handoff fallback "
+            "is not isolated to a missing job-scoped result"
+        )
+    if not any(_calls(statement, "_handoff_ready") for statement in reuse_branch.body):
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: missing standalone Push "
+            "handoff fallback"
+        )
+    if not reuse_branch.orelse:
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: Push has no branch that "
+            "reuses the Repair result"
+        )
+    if not all(
+        any(
+            _reads_mapping_key(statement, "repair_contract", key)
+            for statement in reuse_branch.orelse
+        )
+        for key in ("ready", "reason")
+    ):
+        raise CompileGateError(
+            "Repair-to-Push reuse contract failed: Push does not consume "
+            "Repair ready/reason values"
+        )
+
+    repair_state = methods.get("_repair_output_state_scoped")
+    if repair_state is None:
+        raise CompileGateError(
+            "Repair status efficiency contract failed: "
+            "_repair_output_state_scoped is missing"
+        )
+    if len(_calls(repair_state, "_cluster_assembly_inputs_current")) != 1:
+        raise CompileGateError(
+            "Repair status efficiency contract failed: Cluster Assembly "
+            "inputs must be validated exactly once per decision"
+        )
+    assembly_inputs = methods.get("_cluster_assembly_inputs_current")
+    if assembly_inputs is None or not _calls(
+        assembly_inputs,
+        "_read_repair_pipeline_json",
+    ):
+        raise CompileGateError(
+            "Repair status efficiency contract failed: the large Repair "
+            "report must use the scoped JSON reader"
+        )
+
+
+def validate_gui_contracts(source: str, filename=str(GUI_PATH)) -> int:
+    """Validate orchestration contracts against GUI source held in memory."""
+    try:
+        module = ast.parse(source, filename=filename)
+    except SyntaxError as exc:
+        raise CompileGateError(f"Python compile failed: {filename}: {exc}") from exc
+    methods = _app_methods(module)
+
+    present_runtime_compile_names = sorted(
+        RUNTIME_COMPILE_NAMES.intersection(methods)
+    )
+    if present_runtime_compile_names:
+        raise CompileGateError(
+            "Runtime asset-wave compiler is forbidden: "
+            + ", ".join(present_runtime_compile_names)
+        )
+
+    _require_owner_atlas_scope(module, methods)
+    _require_cluster_only_calibration(module)
+    _require_repair_push_reuse(methods)
+    return 3
+
+
+def run_gate(repo_root=REPO_ROOT, gui_path=GUI_PATH) -> CompileGateResult:
+    started = time.perf_counter()
+    source_count = compile_repository_sources(repo_root)
+    contract_count = validate_gui_contracts(
+        _read_python_source(Path(gui_path)),
+        filename=str(gui_path),
+    )
+    return CompileGateResult(
+        source_count=source_count,
+        contract_count=contract_count,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def main() -> int:
+    try:
+        result = run_gate()
+    except CompileGateError as exc:
+        print(f"SK Batch code compile gate FAILED: {exc}", file=sys.stderr)
+        return 1
+    print(
+        "SK Batch code compile gate OK: "
+        f"{result.source_count} Python sources, "
+        f"{result.contract_count} contract groups, "
+        f"{result.elapsed_seconds:.3f}s"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

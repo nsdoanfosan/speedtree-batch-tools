@@ -23,6 +23,10 @@ class PushDependencyError(RuntimeError):
     """The saved Blender Repair dependency contract cannot be scheduled."""
 
 
+STAGE_DEPENDENCY_CONTRACT_KIND = "sk_batch_verified_push_dependencies"
+STAGE_DEPENDENCY_CONTRACT_VERSION = 1
+
+
 def normalized_path_key(path):
     try:
         value = Path(path).resolve()
@@ -94,12 +98,10 @@ def load_current_cluster_assembly_manifest(spm):
         ) from exc
 
 
-def _manifest_dependency_spms(root_spm):
-    """Resolve exact Cluster SPM inputs from rendered-part source blends."""
-    manifest = load_current_cluster_assembly_manifest(root_spm)
-    if manifest is None:
-        return None
-    if manifest.get("status") == "pass_through":
+def _dependency_spms_from_manifest(manifest):
+    """Resolve exact Cluster SPM inputs from a validated Assembly manifest."""
+    status = str(manifest.get("status") or "")
+    if status == "pass_through":
         return []
 
     dependencies = []
@@ -131,6 +133,110 @@ def _manifest_dependency_spms(root_spm):
             seen.add(key)
             dependencies.append(dependency)
     return dependencies
+
+
+def exact_dependency_contract_from_validated_manifest(root_spm, manifest):
+    """Publish exact dependencies already proven by the Repair live audit.
+
+    This does not validate the Assembly artifacts itself.  It is deliberately
+    called only after Repair has validated the manifest in the same job.
+    """
+    if not isinstance(manifest, dict):
+        raise PushDependencyError(
+            "validated Cluster Assembly manifest is unavailable"
+        )
+    status = str(manifest.get("status") or "")
+    if status not in {"ready", "pass_through"}:
+        raise PushDependencyError(
+            "validated Cluster Assembly manifest has unsupported status: "
+            + (status or "<missing>")
+        )
+    if manifest.get("kind") != MANIFEST_KIND:
+        raise PushDependencyError(
+            "unsupported BWR Cluster Assembly manifest kind"
+        )
+    dependencies = _dependency_spms_from_manifest(manifest)
+    return {
+        "kind": STAGE_DEPENDENCY_CONTRACT_KIND,
+        "schema_version": STAGE_DEPENDENCY_CONTRACT_VERSION,
+        "root_spm": str(Path(root_spm).resolve()),
+        "assembly_status": status,
+        "dependency_spms": [
+            str(Path(dependency).resolve())
+            for dependency in dependencies
+        ],
+        "evidence": "validated_cluster_assembly_manifest",
+    }
+
+
+def _stage_dependency_spms(root_spm, contract):
+    """Use one complete root-bound stage contract, otherwise request fallback."""
+    if not isinstance(contract, dict):
+        return None
+    required = {
+        "kind",
+        "schema_version",
+        "root_spm",
+        "assembly_status",
+        "dependency_spms",
+        "evidence",
+    }
+    if not required.issubset(contract):
+        return None
+    contract_root = contract.get("root_spm")
+    if (
+        not isinstance(contract_root, (str, os.PathLike))
+        or not str(contract_root).strip()
+    ):
+        return None
+    if (
+        contract.get("kind") != STAGE_DEPENDENCY_CONTRACT_KIND
+        or contract.get("schema_version") != STAGE_DEPENDENCY_CONTRACT_VERSION
+        or contract.get("evidence") != "validated_cluster_assembly_manifest"
+        or normalized_path_key(contract_root)
+        != normalized_path_key(root_spm)
+    ):
+        return None
+    status = str(contract.get("assembly_status") or "")
+    dependency_values = contract.get("dependency_spms")
+    if status not in {"ready", "pass_through"} or not isinstance(
+        dependency_values, (list, tuple)
+    ):
+        return None
+    if status == "pass_through" and dependency_values:
+        return None
+
+    dependencies = []
+    seen = set()
+    for dependency_value in dependency_values:
+        if not isinstance(dependency_value, (str, os.PathLike)):
+            return None
+        dependency = Path(dependency_value)
+        if not str(dependency_value).strip():
+            return None
+        if not is_cluster_source_spm(dependency):
+            raise PushDependencyError(
+                "verified Cluster dependency source is outside a Cluster "
+                "folder: " + str(dependency)
+            )
+        if not dependency.is_file():
+            raise PushDependencyError(
+                "verified Cluster dependency SPM is missing: "
+                + str(dependency)
+            )
+        key = normalized_path_key(dependency)
+        if key not in seen:
+            seen.add(key)
+            dependencies.append(dependency)
+    return dependencies
+
+
+def _manifest_dependency_spms(root_spm):
+    """Resolve exact Cluster SPM inputs from rendered-part source blends."""
+    manifest = load_current_cluster_assembly_manifest(root_spm)
+    if manifest is None:
+        return None
+    return _dependency_spms_from_manifest(manifest)
 
 
 def _relation_dependency_spms(root_spm, relation_cache=None):
@@ -185,8 +291,19 @@ def _relation_dependency_spms(root_spm, relation_cache=None):
     return dependencies
 
 
-def cluster_dependency_spms(root_spm, relation_cache=None):
+def cluster_dependency_spms(
+    root_spm,
+    relation_cache=None,
+    stage_dependency_contract=None,
+):
     """Prefer current content receipts; use relations only before first receipt."""
+    stage_dependencies = _stage_dependency_spms(
+        root_spm,
+        stage_dependency_contract,
+    )
+    if stage_dependencies is not None:
+        return stage_dependencies
+
     manifest_error = None
     try:
         manifest_dependencies = _manifest_dependency_spms(root_spm)
@@ -226,7 +343,11 @@ def _item_path_lookup(all_items):
     return lookup
 
 
-def expand_push_targets(selected_targets, all_items):
+def expand_push_targets(
+    selected_targets,
+    all_items,
+    stage_dependency_contracts=None,
+):
     """Add exact Cluster dependencies and return them before downstream roots.
 
     Returns ``(ordered_targets, dependencies_by_root, auto_added_ids)``.
@@ -241,6 +362,16 @@ def expand_push_targets(selected_targets, all_items):
     dependencies_by_root = {}
     auto_added_ids = set()
     relation_cache = {}
+    stage_dependency_contracts = (
+        stage_dependency_contracts
+        if isinstance(stage_dependency_contracts, dict)
+        else {}
+    )
+    stage_contracts_by_root = {}
+    for root, contract in stage_dependency_contracts.items():
+        if not isinstance(root, (str, os.PathLike)) or not str(root).strip():
+            continue
+        stage_contracts_by_root[normalized_path_key(root)] = contract
     selected_ids = {
         normalized_path_key(item["spm"])
         for item in selected_targets
@@ -253,9 +384,11 @@ def expand_push_targets(selected_targets, all_items):
             continue
         downstream_items.append(item)
         dependency_ids = []
+        stage_contract = stage_contracts_by_root.get(normalized_path_key(spm))
         for dependency_spm in cluster_dependency_spms(
             spm,
             relation_cache=relation_cache,
+            stage_dependency_contract=stage_contract,
         ):
             dependency = lookup.get(normalized_path_key(dependency_spm))
             if dependency is None:

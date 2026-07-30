@@ -869,11 +869,23 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(receipt_path.stat().st_mtime_ns, first_mtime)
 
             report = {"items": [{"cluster_assembly": contract}]}
-            persisted = persist_cluster_assembly_receipts(report, receipt_dir)
-            self.assertEqual(persisted, [str(receipt_path)])
+            unchanged = []
+            persisted = persist_cluster_assembly_receipts(
+                report,
+                receipt_dir,
+                unchanged_out=unchanged,
+            )
+            self.assertEqual(persisted, [])
+            self.assertEqual(unchanged, [str(receipt_path)])
             self.assertEqual(
                 report["items"][0]["cluster_assembly_receipt"],
                 str(receipt_path),
+            )
+            self.assertEqual(
+                report["items"][0][
+                    "cluster_assembly_receipt_write_status"
+                ],
+                "unchanged",
             )
 
             with assembly_source.open("ab") as handle:

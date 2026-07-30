@@ -22,6 +22,11 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent
 ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
 MB_ICONERROR = 0x10
+CODE_COMPILE_GATE = REPO_DIR / "sk_batch" / "code_compile_gate.py"
+CODE_COMPILE_GATE_TARGETS = {
+    (REPO_DIR / "speedtree_batch_tools_gui.pyw").resolve(),
+    (REPO_DIR / "sk_batch" / "sk_batch_gui.pyw").resolve(),
+}
 
 
 def record_error(label, text):
@@ -57,6 +62,22 @@ def report(label, headline, detail):
     )
 
 
+def run_code_compile_gate(target):
+    """Run the fast SK Batch source/contract gate for launchers that load it."""
+    if target.resolve() not in CODE_COMPILE_GATE_TARGETS:
+        return None
+    gate_module = runpy.run_path(
+        str(CODE_COMPILE_GATE),
+        run_name="_speedtree_batch_code_compile_gate",
+    )
+    run_gate = gate_module.get("run_gate")
+    if not callable(run_gate):
+        raise RuntimeError(
+            f"Code compile gate does not expose run_gate(): {CODE_COMPILE_GATE}"
+        )
+    return run_gate()
+
+
 def main(argv):
     if len(argv) < 2:
         report(
@@ -73,6 +94,17 @@ def main(argv):
     if not target.is_file():
         report(label, f"GUI 파일을 찾을 수 없습니다:\n{target}", f"{target}\n")
         return 2
+
+    try:
+        run_code_compile_gate(target)
+    except BaseException as exc:  # noqa: BLE001 - launch must stop on gate failure
+        report(
+            label,
+            f"{label} 코드 컴파일 검사를 통과하지 못했습니다.\n\n"
+            f"{type(exc).__name__}: {exc}",
+            "".join(traceback.format_exception(exc)),
+        )
+        return 1
 
     # The GUI expects the same argv/cwd it would get from a direct launch.
     sys.argv = [str(target), *argv[2:]]

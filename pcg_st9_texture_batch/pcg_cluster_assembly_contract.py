@@ -3290,7 +3290,11 @@ def _atomic_write_json(path, payload):
     return True
 
 
-def persist_cluster_assembly_receipt(contract, receipt_dir=None):
+def persist_cluster_assembly_receipt(
+    contract,
+    receipt_dir=None,
+    write_state_out=None,
+):
     """Atomically persist one self-consistent snapshot under tool reports.
 
     The live audit contract remains authoritative for data errors.  A receipt
@@ -3314,20 +3318,42 @@ def persist_cluster_assembly_receipt(contract, receipt_dir=None):
     # startup CPU-bound. Consumers still validate the persisted snapshot when
     # they load it; persistence only hashes the few receipt-owned artifacts
     # above and writes the snapshot atomically.
-    _atomic_write_json(path, payload)
+    written = _atomic_write_json(path, payload)
+    if isinstance(write_state_out, dict):
+        write_state_out.update({
+            "path": str(path),
+            "written": bool(written),
+            "status": "written" if written else "unchanged",
+        })
     return path
 
 
-def persist_cluster_assembly_receipts(report, receipt_dir=None):
+def persist_cluster_assembly_receipts(
+    report,
+    receipt_dir=None,
+    unchanged_out=None,
+):
     """Persist every actionable Cluster contract in one existing audit report."""
     written = []
+    unchanged = []
     for item in (report or {}).get("items") or []:
         contract = item.get("cluster_assembly") or {}
         if not (contract.get("dependencies") and contract.get("tree_source_identities")):
             continue
-        path = persist_cluster_assembly_receipt(contract, receipt_dir)
+        write_state = {}
+        path = persist_cluster_assembly_receipt(
+            contract,
+            receipt_dir,
+            write_state_out=write_state,
+        )
         item["cluster_assembly_receipt"] = str(path)
-        written.append(str(path))
+        item["cluster_assembly_receipt_write_status"] = write_state["status"]
+        if write_state["written"]:
+            written.append(str(path))
+        else:
+            unchanged.append(str(path))
+    if isinstance(unchanged_out, list):
+        unchanged_out.extend(unchanged)
     return written
 
 

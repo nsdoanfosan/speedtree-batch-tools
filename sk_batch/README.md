@@ -3,6 +3,19 @@
 WPO/마스크 방식 식생을 스켈레탈 메시(SK_*.spm)로 교체하는 반복 작업을
 단계별 버튼으로 자동화하는 도구. `SK_Batch.bat` 더블클릭으로 실행.
 
+검사·SPM·Blender·Unreal·전체 자동 요청은 창 내부 FIFO와 동시에 프로세스 간
+공용 FIFO에도 등록된다. 별도 PCG/SPM Generator Sync 창에서 먼저 등록한 작업이
+있으면 `공용 대기열 대기 · 전체 N번째`로 표시하고, 해당 작업이 끝난 뒤에만
+SpeedTree·Blender·Unreal 단계를 시작한다. 대기 중에도 다음 선택 작업을 로컬
+대기열에 계속 추가할 수 있다.
+
+GUI를 시작할 때는 에셋을 열지 않는 코드 컴파일 게이트가 먼저 약 1초 동안
+저장소 Python 구문과 SK Batch 역할 계약을 검사한다. 일반 owner SPM을 Atlas
+생산자나 본 보정 대상으로 잘못 넣는 변경, ② 결과를 무시하고 ③에서 전체 감사를
+되풀이하는 변경, 런타임 에셋 컴파일 웨이브의 재도입은 창이 열리기 전에 차단되어
+공용 오류 로그와 메시지로 표시된다. 개발 중에는
+`python sk_batch\code_compile_gate.py`로 같은 검사를 직접 실행할 수 있다.
+
 트리의 G(trunk/branch 감쇠)와 R(leaf 근접도)이 SpeedTree부터 Unreal까지 갖는
 정확한 의미와 보존 규칙은 [Tree Vertex Color 계약](docs/tree_vertex_color_contract.md)을
 기준으로 한다.
@@ -147,8 +160,13 @@ skin deformer를 완전히 생략한 경우에만, 실제 imported deform bone �
 목록은 Blender를 띄우기 전에 가벼운 SpeedTree FBX 사전 export로 먼저 검사한다.
 이 검사를 통과한 항목만 무거운 Blender Repair로 넘어간다. 실제 생성 Node가 쓰는
 재질이 FBX에서 빠졌다면 정확한 Generator 이름/GUID를 보고하고 차단하되 SPM은
-수정하지 않는다. 구형 `Cluster` 렌더 텍스처를 참조하는 Generator의 전경 자홍색
-표시는 PCG ①에서 새 SK SPM을 생성한 직후에만 1회 기록한다. 기존 SK 데이터는
+수정하지 않는다.
+SpeedTree 단일 export 슬롯 대기와 실제 FBX export 실행은 별도 시간 계약이다.
+로그에는 `슬롯 대기 중`/`실행 중`이 구분되어 표시되며, 실제 900초 제한은 슬롯을
+획득한 뒤부터 시작한다. 앞 작업을 기다린 시간 때문에 뒤 작업의 실행 시간이
+줄어들지 않는다.
+구형 `Cluster` 렌더 텍스처를 참조하는 Generator의 전경 자홍색 표시는 PCG ①에서
+새 SK SPM을 생성한 직후에만 1회 기록한다. 기존 SK 데이터는
 `migrate_legacy_cluster_markers.py --apply`로 1회 이관하며, SPM별 백업과 영구
 receipt를 남긴다. 이후 판정은 공용 `speedtree_legacy_cluster_contract.py`가
 receipt의 최초 Generator GUID를 읽어 담당한다. 현재 재질 경로나 표시색이 바뀌어도
@@ -167,6 +185,11 @@ blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비
 headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
 안전하게 순차 실행한다. Blender 오브젝트 이름에 충돌 방지 숫자가 붙더라도 wind
 JSON은 오브젝트명이 아니라 선택한 SPM의 정규 이름으로 연결한다.
+같은 ①→②→③ 자동 실행에서는 ②가 이미 확정한 Repair·재질·Assembly 준비 결과를
+job 내부 계약으로 ③에 직접 전달하므로 동일한 전체 감사를 다시 하지 않는다.
+Unreal 실행 상태와 대화형 Blender의 미저장 변경은 ③ 직전에 계속 확인한다.
+③만 단독으로 실행하거나 ③에서 새로 자동 포함된 항목은 ② 결과 계약이 없으므로
+기존 전체 준비 검사를 그대로 수행한다.
 Cluster Assembly가 있는 Tree만 선택해도 BWR manifest의 실제
 `parts[].external_source.source_blend`를 따라 필요한 Cluster SPM을 자동 포함한다.
 이때 이름이나 개수를 추측하지 않으며, Cluster source/export fingerprint가 최신이면

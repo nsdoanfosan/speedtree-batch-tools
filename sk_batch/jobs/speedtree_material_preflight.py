@@ -10,6 +10,7 @@ import importlib.util
 import json
 import sys
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -60,6 +61,11 @@ from speedtree_pipeline_contract import (  # noqa: E402
     shared_contract_api,
     speedtree_stmat_path as contract_stmat_path,
 )
+
+MATERIAL_PREFLIGHT_START_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_START"
+SPEEDTREE_SLOT_WAIT_MARKER = "SK_BATCH_SPEEDTREE_SLOT_WAIT"
+SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
+MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
 
 
 def parse_args():
@@ -438,14 +444,39 @@ def run_export(args, speedtree_cli):
         args.fbx_ini,
         purpose=f"{spm.name} material-preflight FBX export",
     )
-    return speedtree_cli.export_target(
-        exe=Path(args.speedtree_exe),
-        spm=spm,
-        options=Path(args.fbx_ini),
-        kind="fbx",
-        target=target,
-        timeout_seconds=max(1, int(args.timeout)),
-    )
+    original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
+    if not callable(original_gate):
+        raise RuntimeError(
+            "SpeedTree export helper does not expose its shared export gate"
+        )
+
+    @contextmanager
+    def reported_gate():
+        print(
+            f"{SPEEDTREE_SLOT_WAIT_MARKER} spm={spm.name}",
+            flush=True,
+        )
+        with original_gate():
+            print(
+                f"{SPEEDTREE_SLOT_ACQUIRED_MARKER} spm={spm.name}",
+                flush=True,
+            )
+            yield
+
+    # The helper still owns the one machine-wide mutex. This process-local
+    # wrapper only exposes the exact wait/acquire boundary to the parent GUI.
+    speedtree_cli.speedtree_export_gate = reported_gate
+    try:
+        return speedtree_cli.export_target(
+            exe=Path(args.speedtree_exe),
+            spm=spm,
+            options=Path(args.fbx_ini),
+            kind="fbx",
+            target=target,
+            timeout_seconds=max(1, int(args.timeout)),
+        )
+    finally:
+        speedtree_cli.speedtree_export_gate = original_gate
 
 
 def _issue(code, scope, entity, message, severity="error", details=None):
@@ -697,6 +728,10 @@ def main():
     args = parse_args()
     speedtree_spm = Path(args.spm).resolve()
     canonical_spm = Path(getattr(args, "canonical_spm", "") or args.spm).resolve()
+    print(
+        f"{MATERIAL_PREFLIGHT_START_MARKER} spm={canonical_spm.name}",
+        flush=True,
+    )
     report = {
         "status": "failed",
         "stage": "speedtree_material_preflight",
@@ -886,6 +921,11 @@ def main():
         report["error"] = report.get("error") or str(exc)
         report.setdefault("traceback", traceback.format_exc())
     write_report(args.report, report)
+    print(
+        f"{MATERIAL_PREFLIGHT_DONE_MARKER} "
+        f"spm={canonical_spm.name} status={report.get('status', 'failed')}",
+        flush=True,
+    )
     if report["status"] != "ok":
         raise SystemExit(1)
 

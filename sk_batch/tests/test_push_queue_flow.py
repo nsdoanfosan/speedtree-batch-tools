@@ -93,6 +93,53 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(first, third)
         self.assertEqual(reads, [report, report])
 
+    def test_repair_state_projection_reuses_the_scoped_report_read(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "repair.json"
+            report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {"status": "ready"},
+                }),
+                encoding="utf-8",
+            )
+            original_read_text = gui.Path.read_text
+            reads = []
+
+            def tracked_read_text(path, *args, **kwargs):
+                reads.append(path)
+                return original_read_text(path, *args, **kwargs)
+
+            app._repair_output_state_scoped = mock.Mock(
+                side_effect=lambda _spm: (
+                    gui._read_repair_pipeline_json(report)
+                    and {
+                        "current": True,
+                        "push_ready": True,
+                        "kind": "ready",
+                        "reason": "준비됨 ✓",
+                    }
+                )
+            )
+            projection = {}
+            with mock.patch.object(
+                gui,
+                "repair_pipeline_report_path",
+                return_value=report,
+            ), mock.patch.object(gui.Path, "read_text", tracked_read_text):
+                state = app._repair_output_state(
+                    Path(temporary) / "SK_tree_test_01.spm",
+                    pipeline_projection_out=projection,
+                )
+
+        self.assertTrue(state["current"])
+        self.assertEqual(
+            projection,
+            {"cluster_assembly_manifest": {"status": "ready"}},
+        )
+        self.assertEqual(reads, [report])
+
     def test_unreal_process_probe_uses_locale_independent_bytes(self):
         gui = load_gui_module()
         completed = mock.Mock(
@@ -163,6 +210,81 @@ class PushQueueFlowTests(unittest.TestCase):
         terminate.assert_not_called()
         close_job.assert_called_once_with(proc)
         self.assertNotIn(proc, app.active_procs)
+
+    def test_process_runner_starts_runtime_timeout_after_log_marker(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"process_poll_interval": 0.05}
+        marker = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
+
+        class TimedProcess:
+            def __init__(self, log_file):
+                self.log_file = Path(log_file)
+                self.started = gui.time.monotonic()
+                self.marker_written = False
+                self.returncode = None
+                self.sk_log_handle = None
+
+            def poll(self):
+                elapsed = gui.time.monotonic() - self.started
+                if elapsed >= 0.10 and not self.marker_written:
+                    self.log_file.write_text(marker + "\n", encoding="utf-8")
+                    self.marker_written = True
+                if elapsed >= 0.20:
+                    self.returncode = 0
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir)
+        ), mock.patch.object(
+            gui,
+            "launch_limited",
+            side_effect=lambda *_args, **kwargs: TimedProcess(
+                kwargs["log_file"]
+            ),
+        ), mock.patch.object(
+            gui, "terminate_process_tree"
+        ) as terminate, mock.patch.object(
+            gui, "close_process_kill_job", return_value=True
+        ):
+            code, _log_file = app._run_limited(
+                ["worker.exe"],
+                "worker.log",
+                timeout=0.12,
+                timeout_start_marker=marker,
+                wait_timeout=0.5,
+            )
+
+        self.assertEqual(code, 0)
+        terminate.assert_not_called()
+
+    def test_process_runner_reports_queue_timeout_before_runtime_marker(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"process_poll_interval": 0.05}
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.sk_log_handle = None
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir)
+        ), mock.patch.object(
+            gui, "launch_limited", return_value=proc
+        ), mock.patch.object(
+            gui, "terminate_process_tree", return_value=True
+        ), mock.patch.object(
+            gui, "close_process_kill_job", return_value=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "대기 시간 초과"):
+                app._run_limited(
+                    ["worker.exe"],
+                    "worker.log",
+                    timeout=1,
+                    timeout_start_marker=(
+                        "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
+                    ),
+                    wait_timeout=0.05,
+                )
 
     @staticmethod
     def targets(*names):
@@ -299,6 +421,62 @@ class PushQueueFlowTests(unittest.TestCase):
             )
         )
 
+    def test_cluster_producers_are_serial_per_owner_and_parallel_across_owners(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"blender_parallel_jobs": 2}
+        owner_a_started = threading.Event()
+        owner_a_first_done = threading.Event()
+        owner_b_started = threading.Event()
+        order = []
+        lock = threading.Lock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cluster_a = root / "Tree_a" / "Cluster"
+            cluster_b = root / "Tree_b" / "Cluster"
+            a_first = cluster_a / "SK_cluster_a_01.spm"
+            a_second = cluster_a / "SK_cluster_a_02.spm"
+            b_first = cluster_b / "SK_cluster_b_01.spm"
+            targets = [
+                {"spm": a_first, "checked": True},
+                {"spm": a_second, "checked": True},
+                {"spm": b_first, "checked": True},
+            ]
+
+            def fake_blender(_iid, spm, _item):
+                if spm == a_first:
+                    with lock:
+                        order.append("a1_start")
+                    owner_a_started.set()
+                    self.assertTrue(owner_b_started.wait(5))
+                    owner_a_first_done.set()
+                    with lock:
+                        order.append("a1_done")
+                elif spm == a_second:
+                    self.assertTrue(owner_a_first_done.is_set())
+                    with lock:
+                        order.append("a2")
+                else:
+                    self.assertTrue(owner_a_started.wait(5))
+                    owner_b_started.set()
+                    with lock:
+                        order.append("b1")
+
+            app._job_blender = mock.Mock(side_effect=fake_blender)
+            with mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_batch(
+                    "blender", targets, emit_done=False
+                )
+
+        self.assertTrue(result)
+        self.assertLess(order.index("a1_done"), order.index("a2"))
+        self.assertIn("b1", order)
+
     def test_failed_cluster_repair_blocks_only_its_dependent_roots(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -402,6 +580,212 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(
             app.state[str(spm)]["push_status_kind"], "manual_required"
         )
+
+    def test_push_preflight_consumes_same_pipeline_repair_contract(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "headless"
+        app._unreal_running = mock.Mock(return_value=False)
+        app._active_repair_stage_contracts = {}
+        spm = Path("D:/asset/SK_tree_test_01.spm")
+        target = {"spm": spm, "checked": True}
+        app._handoff_ready = mock.Mock(
+            side_effect=AssertionError(
+                "same-pipeline Push must not repeat the ② handoff audit"
+            )
+        )
+        app._publish_repair_stage_contract(
+            spm,
+            ready=True,
+            reason="준비됨 ✓",
+        )
+
+        with mock.patch.object(
+            gui,
+            "blender_open_file_window_titles",
+            return_value=[],
+        ), mock.patch.object(gui, "save_state"):
+            ready, fatal = app._push_preflight([target])
+
+        self.assertEqual(ready, [target])
+        self.assertIsNone(fatal)
+        app._handoff_ready.assert_not_called()
+        self.assertIn("② 결과 재사용 1개", app.log.call_args.args[0])
+
+    def test_standalone_push_still_runs_full_handoff_preflight(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "headless"
+        app._unreal_running = mock.Mock(return_value=False)
+        spm = Path("D:/asset/SK_tree_test_01.spm")
+        target = {"spm": spm, "checked": True}
+        app._handoff_ready = mock.Mock(
+            return_value=(True, "준비됨 ✓")
+        )
+
+        with mock.patch.object(
+            gui,
+            "blender_open_file_window_titles",
+            return_value=[],
+        ), mock.patch.object(gui, "save_state"):
+            ready, fatal = app._push_preflight([target])
+
+        self.assertEqual(ready, [target])
+        self.assertIsNone(fatal)
+        app._handoff_ready.assert_called_once_with(spm)
+
+    def test_same_pipeline_source_review_contract_blocks_without_reaudit(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "headless"
+        app._unreal_running = mock.Mock(return_value=False)
+        app._active_repair_stage_contracts = {}
+        spm = Path("D:/asset/SK_tree_review_01.spm")
+        target = {"spm": spm, "checked": True}
+        app._handoff_ready = mock.Mock(
+            side_effect=AssertionError("source review must not be re-audited")
+        )
+        app._publish_repair_stage_contract(
+            spm,
+            ready=False,
+            reason="원본/재질 검토 필요 — Unreal Push 차단",
+            kind="source_review",
+        )
+
+        with mock.patch.object(
+            gui,
+            "blender_open_file_window_titles",
+            return_value=[],
+        ), mock.patch.object(gui, "save_state"):
+            ready, fatal = app._push_preflight([target])
+
+        self.assertEqual(ready, [])
+        self.assertIsNone(fatal)
+        app._handoff_ready.assert_not_called()
+        self.assertEqual(
+            app.state[str(spm)]["push_status_kind"],
+            "source_review",
+        )
+
+    def test_full_pipeline_keeps_repair_contract_until_push_then_clears_it(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("D:/asset/SK_tree_test_01.spm")
+        targets = [{"spm": spm, "checked": True}]
+        app._batch_job_inventory = mock.Mock(
+            return_value={str(spm): targets[0]}
+        )
+
+        def run_phase(phase, _targets, emit_done=False):
+            self.assertFalse(emit_done)
+            app._phase_failed_items = set()
+            app._phase_abort_reason = None
+            if phase == "blender":
+                app._publish_repair_stage_contract(
+                    spm,
+                    ready=True,
+                    reason="준비됨 ✓",
+                )
+            if phase == "push":
+                self.assertEqual(
+                    app._repair_stage_contract(spm),
+                    {
+                        "ready": True,
+                        "reason": "준비됨 ✓",
+                        "kind": "ready",
+                    },
+                )
+            return True
+
+        app._run_batch = mock.Mock(side_effect=run_phase)
+        with mock.patch.object(
+            gui,
+            "expand_blender_repair_targets",
+            return_value=(targets, {}, set()),
+        ):
+            completed = app._run_full_pipeline(
+                targets,
+                terminal_phase="push",
+                selected_scope=True,
+                emit_done=False,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.args[0] for call in app._run_batch.call_args_list],
+            ["spm", "blender", "push"],
+        )
+        self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
+
+    def test_repair_stage_contract_uses_canonical_cluster_pair_key(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._active_repair_stage_contracts = {}
+        mirror = Path(
+            "D:/asset/Tree_test/cluster/branch_tree_test_01.spm"
+        )
+        canonical = mirror.with_name("SK_" + mirror.name)
+
+        app._publish_repair_stage_contract(
+            canonical,
+            ready=True,
+            reason="준비됨 ✓",
+        )
+
+        self.assertEqual(
+            app._repair_stage_contract(mirror),
+            {
+                "ready": True,
+                "reason": "준비됨 ✓",
+                "kind": "ready",
+            },
+        )
+
+    def test_repair_stage_contract_preserves_verified_push_dependencies(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._active_repair_stage_contracts = {}
+        spm = Path("D:/asset/Tree_test/SK_tree_test_01.spm")
+        dependency_contract = {
+            "kind": "sk_batch_verified_push_dependencies",
+            "schema_version": 1,
+            "root_spm": str(spm),
+            "assembly_status": "ready",
+            "dependency_spms": [
+                "D:/asset/Tree_test/Cluster/SK_cluster_test_01.spm"
+            ],
+            "evidence": "validated_cluster_assembly_manifest",
+        }
+
+        app._publish_repair_stage_contract(
+            spm,
+            ready=True,
+            reason="ready",
+            push_dependency_contract=dependency_contract,
+        )
+        dependency_contract["dependency_spms"].clear()
+
+        published = app._repair_stage_contract(spm)
+        self.assertEqual(
+            published["push_dependency_contract"]["dependency_spms"],
+            ["D:/asset/Tree_test/Cluster/SK_cluster_test_01.spm"],
+        )
+
+    def test_full_pipeline_clears_repair_contract_after_unexpected_error(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = {
+            "spm": Path("D:/asset/SK_tree_test_01.spm"),
+            "checked": True,
+        }
+        app._run_full_pipeline_stages = mock.Mock(
+            side_effect=RuntimeError("unexpected")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected"):
+            app._run_full_pipeline([target], emit_done=False)
+
+        self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
 
     def test_push_contract_wrapper_requires_and_preserves_current_envelope(self):
         gui = load_gui_module()
@@ -534,11 +918,17 @@ class PushQueueFlowTests(unittest.TestCase):
             self.assertIn("--material-contract", strings)
             self.assertIn("--dependency-orchestrated", strings)
 
-        blender_job_strings = {
-            node.value
-            for node in ast.walk(gui_functions["_job_blender"])
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        }
+        blender_job_strings = set()
+        for function_name in (
+            "_job_blender",
+            "_execute_material_preflight",
+        ):
+            blender_job_strings.update(
+                node.value
+                for node in ast.walk(gui_functions[function_name])
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+            )
         self.assertIn("--speedtree-spm", blender_job_strings)
         self.assertIn("--canonical-spm", blender_job_strings)
 
@@ -676,6 +1066,47 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(app.state["SK_bad.spm"]["push_status_kind"], "data_error")
         self.assertEqual(
             app.state["SK_manual.spm"]["push_status_kind"], "manual_required"
+        )
+
+    def test_push_scheduler_receives_same_pipeline_dependency_contract(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        root = Path("Tree_elm") / "SK_Tree_elm.spm"
+        target = {"spm": root, "checked": True}
+        dependency_contract = {
+            "kind": "sk_batch_verified_push_dependencies",
+            "schema_version": 1,
+            "root_spm": str(root),
+            "assembly_status": "pass_through",
+            "dependency_spms": [],
+            "evidence": "validated_cluster_assembly_manifest",
+        }
+        app.items = {str(root): target}
+        app._active_repair_stage_contracts = {}
+        app._publish_repair_stage_contract(
+            root,
+            ready=True,
+            reason="ready",
+            push_dependency_contract=dependency_contract,
+        )
+
+        with mock.patch.object(
+            gui,
+            "expand_push_targets",
+            return_value=([target], {str(root): ()}, set()),
+        ) as expand, mock.patch.object(
+            app, "_push_preflight", return_value=([target], None)
+        ), mock.patch.object(
+            app, "_job_push"
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch("push", [target], emit_done=False)
+
+        self.assertTrue(result)
+        forwarded = expand.call_args.kwargs["stage_dependency_contracts"]
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(
+            next(iter(forwarded.values())),
+            dependency_contract,
         )
 
     def test_rpc_push_blocks_only_roots_whose_auto_cluster_failed(self):

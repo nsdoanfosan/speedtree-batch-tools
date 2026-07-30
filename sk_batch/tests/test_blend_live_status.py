@@ -159,7 +159,16 @@ class FakeCheckedRows:
 
 
 class BlendLiveStatusTests(unittest.TestCase):
+    def setUp(self):
+        self._isolated_logs = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._isolated_logs.cleanup()
+
     def make_app(self, gui):
+        # No test in this class may publish fixture reports into the live
+        # SK Batch log directory while a real asset wave is running.
+        gui.LOG_DIR = Path(self._isolated_logs.name) / "logs"
         app = gui.App.__new__(gui.App)
         app.state = {}
         app.state_lock = threading.RLock()
@@ -1108,6 +1117,68 @@ class BlendLiveStatusTests(unittest.TestCase):
 
         self.assertFalse(ready)
         self.assertEqual(reason, "Cluster Assembly input changed")
+
+    def test_cluster_assembly_audit_publishes_exact_push_dependencies(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        from cluster_assembly_builder import MANIFEST_KIND, file_fingerprint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_Tree_elm_01.spm"
+            cluster_dir = root / "Cluster"
+            report = root / "reports" / (
+                "SK_Tree_elm_01_speedtree_repair_pipeline_report_codex.json"
+            )
+            manifest_path = root / "assembly" / "manifest.json"
+            source_spm = cluster_dir / "SK_cluster_elm_01.spm"
+            source_blend = source_spm.with_suffix(".blend")
+            for directory in (cluster_dir, report.parent, manifest_path.parent):
+                directory.mkdir(parents=True, exist_ok=True)
+            write_empty_spm(spm)
+            write_empty_spm(source_spm)
+            source_blend.write_bytes(b"blend")
+            manifest_path.write_text(
+                json.dumps({
+                    "kind": MANIFEST_KIND,
+                    "status": "ready",
+                    "parts": [{
+                        "prototype_id": "rendered-1",
+                        "external_source": {
+                            "source_blend": {"path": str(source_blend)}
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {
+                        "status": "ready",
+                        "manifest": file_fingerprint(manifest_path),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            dependency_contract = {}
+
+            with mock.patch(
+                "cluster_assembly_builder.validate_manifest_artifacts"
+            ):
+                ready, reason = app._cluster_assembly_inputs_current(
+                    spm,
+                    dependency_contract_out=dependency_contract,
+                )
+
+        self.assertTrue(ready, reason)
+        self.assertEqual(
+            dependency_contract["dependency_spms"],
+            [str(source_spm.resolve())],
+        )
+        self.assertEqual(
+            dependency_contract["root_spm"],
+            str(spm.resolve()),
+        )
 
     def test_current_cluster_receipt_requires_embedded_assembly_manifest(self):
         gui = load_gui_module()
@@ -2167,6 +2238,8 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
                 "spm_audit.sk_readiness", return_value={"ready": True}
+            ), mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
 
@@ -2249,7 +2322,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             self.assertEqual(app._run_limited.call_args.args[2], 321)
             self.assertTrue(any(
-                "live audit 완료" in call.args[0]
+                "live contract 검증 완료" in call.args[0]
                 for call in app.log.call_args_list
             ))
 
@@ -2462,6 +2535,40 @@ class BlendLiveStatusTests(unittest.TestCase):
             "retrying once" in call.args[0]
             for call in app.log.call_args_list
         ))
+
+    def test_cluster_live_audit_fingerprint_contains_assets_not_runtime_code(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            producer = cluster / "SK_cluster_elm_01.spm"
+            manifest = (
+                cluster
+                / "SK_cluster_elm_01.atlas_leaf_targets.json"
+            )
+            spm.write_bytes(b"tree")
+            producer.write_bytes(b"cluster")
+            manifest.write_text('{"version": 1}', encoding="utf-8")
+
+            inputs = app._cluster_receipt_discovery_input_paths(spm)
+
+        self.assertIn(spm.resolve(), inputs)
+        self.assertIn(producer.resolve(), inputs)
+        self.assertIn(manifest.resolve(), inputs)
+        self.assertNotIn(Path(gui.__file__).resolve(), inputs)
+        self.assertNotIn(
+            (
+                gui.REPO_DIR
+                / "pcg_st9_texture_batch"
+                / "pcg_texture_audit.py"
+            ).resolve(),
+            inputs,
+        )
 
     def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
         gui = load_gui_module()
@@ -2938,7 +3045,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
         self.assertEqual(len(resolutions), 2)
 
-    def test_cluster_live_audit_single_flight_keeps_caller_policy_separate(
+    def test_cluster_live_audit_single_flight_is_strict_for_every_caller(
         self,
     ):
         gui = load_gui_module()
@@ -3006,35 +3113,31 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "Future",
                 ObservableFuture,
             ), ThreadPoolExecutor(max_workers=2) as pool:
-                producer_future = pool.submit(
+                first_future = pool.submit(
                     app._refresh_stale_cluster_receipt,
                     spm,
                     "20260729_035101",
-                    producer_spm=producer,
                 )
                 self.assertTrue(started.wait(5))
-                owner_future = pool.submit(
+                second_future = pool.submit(
                     app._refresh_stale_cluster_receipt,
                     spm,
                     "20260729_035102",
                 )
                 self.assertTrue(waiter_started.wait(5))
                 release.set()
-                producer_resolution = producer_future.result(timeout=5)
-                with self.assertRaises(gui.BatchItemError) as raised:
-                    owner_future.result(timeout=5)
+                with self.assertRaises(gui.BatchItemError) as first_raised:
+                    first_future.result(timeout=5)
+                with self.assertRaises(gui.BatchItemError) as second_raised:
+                    second_future.result(timeout=5)
 
         self.assertEqual(app._run_limited.call_count, 1)
-        self.assertTrue(
-            producer_resolution["producer_repair_issue_tolerated"]
-        )
-        self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn(
-            "NORMALIZED_VARIANTS_REQUIRED",
-            str(raised.exception),
-        )
+        self.assertEqual(first_raised.exception.kind, "data_error")
+        self.assertEqual(second_raised.exception.kind, "data_error")
+        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(first_raised.exception))
+        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(second_raised.exception))
 
-    def test_cluster_live_audit_allows_planned_producers_but_owner_is_strict(
+    def test_cluster_normalization_stage_partitions_producer_owned_work(
         self,
     ):
         gui = load_gui_module()
@@ -3053,25 +3156,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             producer_b = cluster / "SK_cluster_elm_02.spm"
             producer_a.write_bytes(b"a")
             producer_b.write_bytes(b"b")
-            started = threading.Event()
-            release = threading.Event()
-            waiters_ready = threading.Event()
-            waiter_count = {"value": 0}
-            waiter_lock = threading.Lock()
-
-            class ObservableFuture(gui.Future):
-                def result(self, *args, **kwargs):
-                    with waiter_lock:
-                        waiter_count["value"] += 1
-                        if waiter_count["value"] == 2:
-                            waiters_ready.set()
-                    return super().result(*args, **kwargs)
-
             def run_audit(command, *_args, **_kwargs):
                 report = Path(command[command.index("--json") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
-                started.set()
-                self.assertTrue(release.wait(5))
                 report.write_text(
                     json.dumps({"items": [{"cluster_assembly": {
                         "tree_source_identities": [{
@@ -3102,7 +3189,6 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return 0, Path(temporary) / "refresh.log"
 
             app._run_limited = mock.Mock(side_effect=run_audit)
-            allowed = (producer_a, producer_b)
             with mock.patch.object(
                 gui,
                 "cluster_assembly_receipt_resolution",
@@ -3111,41 +3197,46 @@ class BlendLiveStatusTests(unittest.TestCase):
                         Path(temporary) / "receipt.json"
                     )
                 },
-            ), mock.patch.object(
-                gui,
-                "Future",
-                ObservableFuture,
-            ), ThreadPoolExecutor(max_workers=3) as pool:
-                future_a = pool.submit(
-                    app._refresh_stale_cluster_receipt,
-                    spm,
-                    "20260729_036101",
-                    producer_spm=producer_a,
-                    allowed_producer_spms=allowed,
+            ):
+                resolution_a = (
+                    app._cluster_normalization_stage_observation(
+                        spm,
+                        "20260729_036101",
+                        producer_a,
+                        require_normalized=False,
+                    )
                 )
-                self.assertTrue(started.wait(5))
-                future_b = pool.submit(
-                    app._refresh_stale_cluster_receipt,
-                    spm,
-                    "20260729_036102",
-                    producer_spm=producer_b,
-                    allowed_producer_spms=allowed,
+                resolution_b = (
+                    app._cluster_normalization_stage_observation(
+                        spm,
+                        "20260729_036102",
+                        producer_b,
+                        require_normalized=False,
+                    )
                 )
-                owner_future = pool.submit(
-                    app._refresh_stale_cluster_receipt,
-                    spm,
-                    "20260729_036103",
-                )
-                self.assertTrue(waiters_ready.wait(5))
-                release.set()
-                resolution_a = future_a.result(timeout=5)
-                resolution_b = future_b.result(timeout=5)
                 with self.assertRaises(gui.BatchItemError) as raised:
-                    owner_future.result(timeout=5)
+                    app._refresh_stale_cluster_receipt(
+                        spm,
+                        "20260729_036103",
+                    )
 
-        self.assertEqual(app._run_limited.call_count, 1)
-        self.assertTrue(resolution_a["producer_repair_issue_tolerated"])
-        self.assertTrue(resolution_b["producer_repair_issue_tolerated"])
+        self.assertEqual(app._run_limited.call_count, 3)
+        self.assertEqual(resolution_a["status"], "normalization_required")
+        self.assertEqual(resolution_b["status"], "normalization_required")
+        self.assertEqual(
+            {
+                row["spm"]
+                for row in resolution_a["owned_work_items"]
+            },
+            {str(producer_a)},
+        )
+        self.assertEqual(
+            {
+                row["spm"]
+                for row in resolution_b["owned_work_items"]
+            },
+            {str(producer_b)},
+        )
         self.assertEqual(raised.exception.kind, "data_error")
 
     def test_cluster_live_audit_bookkeeping_error_releases_waiter(self):
@@ -3430,7 +3521,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             self.assertIn("missing.tga", str(raised.exception))
 
-    def _run_producer_variant_receipt_refresh(
+    def _run_producer_normalization_stage(
         self,
         gui,
         *,
@@ -3453,7 +3544,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             producer.write_bytes(b"cluster")
             other_producer = cluster / "SK_cluster_elm_03.spm"
             other_producer.write_bytes(b"other cluster")
-            selected = Path(temporary) / "receipt.json"
             issue_spm = (
                 producer
                 if issue_spm_kind == "producer"
@@ -3494,48 +3584,43 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(
                 gui,
                 "cluster_assembly_receipt_resolution",
-                side_effect=[
-                    gui.ClusterAssemblyReceiptStaleError("stale"),
-                    {"selected_receipt": str(selected)},
-                ],
+                side_effect=gui.ClusterAssemblyReceiptStaleError("stale"),
             ):
-                resolution = app._refresh_stale_cluster_receipt(
+                resolution = app._cluster_normalization_stage_observation(
                     spm,
                     "20260725_120000",
-                    producer_spm=producer,
+                    producer,
+                    require_normalized=False,
                 )
 
             return app, resolution, producer
 
-    def test_receipt_refresh_allows_exact_producer_variant_bootstrap(self):
+    def test_normalization_stage_owns_exact_producer_work(self):
         gui = load_gui_module()
         app, resolution, producer = (
-            self._run_producer_variant_receipt_refresh(
+            self._run_producer_normalization_stage(
                 gui,
                 exit_code=0,
             )
         )
 
         self.assertEqual(
-            resolution["policy"],
-            "live_audit_authoritative",
-        )
-        self.assertTrue(
-            resolution["producer_repair_issue_tolerated"]
+            resolution["status"],
+            "normalization_required",
         )
         self.assertEqual(
             Path(resolution["producer_spm"]),
             producer.resolve(),
         )
-        self.assertTrue(any(
-            "producer bootstrap allowed" in call.args[0]
-            for call in app.log.call_args_list
-        ))
+        self.assertEqual(
+            [row["code"] for row in resolution["owned_work_items"]],
+            ["NORMALIZED_VARIANTS_REQUIRED"],
+        )
 
-    def test_producer_variant_bootstrap_nonzero_exit_is_internal_error(self):
+    def test_normalization_stage_nonzero_audit_is_internal_error(self):
         gui = load_gui_module()
         with self.assertRaises(gui.BatchItemError) as raised:
-            self._run_producer_variant_receipt_refresh(
+            self._run_producer_normalization_stage(
                 gui,
                 exit_code=1,
             )
@@ -3543,10 +3628,10 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(raised.exception.kind, "internal_error")
         self.assertIn("live audit process failed", str(raised.exception))
 
-    def test_producer_variant_bootstrap_rejects_mixed_data_issues(self):
+    def test_normalization_stage_rejects_non_normalizable_data_issues(self):
         gui = load_gui_module()
         with self.assertRaises(gui.BatchItemError) as raised:
-            self._run_producer_variant_receipt_refresh(
+            self._run_producer_normalization_stage(
                 gui,
                 exit_code=0,
                 extra_issues=[{
@@ -3565,10 +3650,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             str(raised.exception),
         )
 
-    def test_producer_variant_bootstrap_rejects_wrong_producer(self):
+    def test_normalization_stage_rejects_issue_outside_contract(self):
         gui = load_gui_module()
         with self.assertRaises(gui.BatchItemError) as raised:
-            self._run_producer_variant_receipt_refresh(
+            self._run_producer_normalization_stage(
                 gui,
                 exit_code=0,
                 issue_spm_kind="other",
@@ -4006,6 +4091,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = owner / "SK_Tree_elm_01.spm"
             write_empty_spm(spm)
             app.force_rerun = True
+            app._active_repair_stage_contracts = {}
             app.cfg = {
                 "speedtree_exe": "SpeedTree.exe",
                 "fbx_ini": str(
@@ -4059,6 +4145,8 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
                 "spm_audit.sk_readiness", return_value={"ready": True}
+            ), mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
 
@@ -4066,6 +4154,14 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "Unreal Push 차단" in call.args[0]
                 for call in app.log.call_args_list
             ))
+            self.assertEqual(
+                app._repair_stage_contract(spm),
+                {
+                    "ready": False,
+                    "reason": "원본/재질 검토 필요 — Unreal Push 차단",
+                    "kind": "source_review",
+                },
+            )
 
     def test_cluster_blender_job_builds_raw_then_runs_normalizer_transaction(self):
         gui = load_gui_module()
@@ -4154,15 +4250,18 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return {"status": "ok"}
 
             app._run_limited = fake_run
-            app._refresh_stale_cluster_receipt = mock.Mock(
-                return_value=None
+            app._cluster_normalization_stage_observation = mock.Mock(
+                return_value={
+                    "status": "current",
+                    "live_audit_report": str(
+                        Path(temporary) / "normalization.json"
+                    ),
+                    "selected_contract": {
+                        "dependencies": [{"spm": str(spm)}],
+                        "handoff": {"errors": []},
+                    },
+                }
             )
-            app._active_blender_planned_cluster_producers_by_owner = {
-                gui.normalized_folder_key(target): (
-                    spm,
-                    other_producer,
-                )
-            }
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
             app._handoff_ready = mock.Mock(return_value=(True, "ready"))
             app._blend_status_text = mock.Mock(return_value="latest")
@@ -4184,7 +4283,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             ), mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
                 side_effect=fake_relation,
-            ) as relation, mock.patch.object(gui, "save_state"):
+            ) as relation, mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
+            ), mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
 
             bwr_command = next(
@@ -4201,21 +4302,19 @@ class BlendLiveStatusTests(unittest.TestCase):
                 relation.call_args.args[1],
                 [target.absolute()],
             )
-            refresh_kwargs = next(
-                call.kwargs
-                for call in (
-                    app._refresh_stale_cluster_receipt.call_args_list
-                )
-                if call.kwargs.get("producer_spm")
+            self.assertEqual(
+                app._cluster_normalization_stage_observation.call_count,
+                2,
+            )
+            input_call, output_call = (
+                app._cluster_normalization_stage_observation.call_args_list
             )
             self.assertEqual(
-                refresh_kwargs["producer_spm"],
+                input_call.args[2],
                 spm.resolve(),
             )
-            self.assertEqual(
-                tuple(refresh_kwargs["allowed_producer_spms"]),
-                (spm, other_producer),
-            )
+            self.assertFalse(input_call.kwargs["require_normalized"])
+            self.assertTrue(output_call.kwargs["require_normalized"])
 
     def test_relation_off_cluster_runs_standalone_final_handoff(self):
         gui = load_gui_module()
@@ -4414,8 +4513,15 @@ class BlendLiveStatusTests(unittest.TestCase):
                 raise RuntimeError("atlas transaction failed")
 
             app._run_limited = fake_run
-            app._refresh_stale_cluster_receipt = mock.Mock(
-                return_value=None
+            app._cluster_normalization_stage_observation = mock.Mock(
+                return_value={
+                    "status": "normalization_required",
+                    "live_audit_report": str(root / "normalization.json"),
+                    "selected_contract": {
+                        "dependencies": [{"spm": str(spm)}],
+                        "handoff": {"errors": []},
+                    },
+                }
             )
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
             app._handoff_ready = mock.Mock(return_value=(False, "stale"))
@@ -4435,6 +4541,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             ), mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
                 side_effect=fake_relation,
+            ), mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"):
                 with self.assertRaises(gui.BatchItemError):
                     app._job_blender(str(spm), spm, item)
@@ -4501,6 +4609,8 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
                 "spm_audit.sk_readiness", return_value={"ready": True}
+            ), mock.patch.object(
+                gui, "LOG_DIR", root / "logs"
             ):
                 with self.assertRaises(gui.BatchItemError):
                     app._job_blender(str(spm), spm, item)
@@ -4611,8 +4721,17 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._run_limited = mock.Mock(
                 side_effect=AssertionError("BWR must not run")
             )
-            app._refresh_stale_cluster_receipt = mock.Mock(
-                return_value=None
+            app._cluster_normalization_stage_observation = mock.Mock(
+                return_value={
+                    "status": "current",
+                    "live_audit_report": str(
+                        Path(temporary) / "normalization.json"
+                    ),
+                    "selected_contract": {
+                        "dependencies": [{"spm": str(spm)}],
+                        "handoff": {"errors": []},
+                    },
+                }
             )
             states = [
                 {
@@ -4644,6 +4763,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(refresh_state.call_count, 2)
             relation.assert_called_once()
             self.assertEqual(relation.call_args.args[1], [target.absolute()])
+            self.assertEqual(app._repair_output_state.call_count, 2)
             app._run_limited.assert_not_called()
 
 

@@ -677,6 +677,61 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), originals[target])
             self.assertFalse((folder / sync.BACKUP_SUBDIR).exists())
 
+    def test_batch_scale_skip_keeps_safe_sibling_sync_running(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            safe = folder / "tree_02.spm"
+            blocked = folder / "tree_03.spm"
+            write_spm(master, with_tree_radius(make_master(), 2))
+            write_spm(safe, with_tree_radius(make_target(), 3))
+            write_spm(blocked, with_tree_radius(make_target(), 10))
+
+            source = sync.SPMDocument.from_path(master, full=False)
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = sync.source_base_categories(source)
+            for target in (safe, blocked):
+                follower = sync.SPMDocument.from_path(target, full=False)
+                mapping = sync.suggest_base_map(
+                    source,
+                    follower,
+                    group["base_categories"],
+                )
+                sync.assign_follower(
+                    manifest,
+                    master.name,
+                    target.name,
+                    mapping,
+                    confirmed=True,
+                )
+            sync.save_manifest(folder, manifest)
+            blocked_before = blocked.read_bytes()
+
+            result = sync.apply_group_transaction(
+                folder,
+                master.name,
+                verify_speedtree=False,
+                skip_blocked_scale=True,
+            )
+
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual(
+                [Path(entry["target"]).name for entry in result["scale_skipped"]],
+                [blocked.name],
+            )
+            self.assertEqual(blocked.read_bytes(), blocked_before)
+            self.assertIn(str(safe), result["changed_files"])
+            saved = sync.load_manifest(folder)
+            saved_group = sync.find_group(saved, master.name)
+            followers = {
+                entry["file"]: entry
+                for entry in saved_group["followers"]
+            }
+            self.assertIsNotNone(followers[safe.name]["last_sync"])
+            self.assertIsNone(followers[blocked.name]["last_sync"])
+
     def test_speedtree_preflight_uses_temp_copy_and_preserves_original(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

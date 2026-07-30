@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
+from shared_queue_runtime import SharedQueueRuntime
 from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
@@ -42,7 +43,8 @@ from atlas_target_registry import (
 from cluster_blend_sync import discover_cluster_blend_relations
 
 from pcg_texture_common import (
-    TARGETS_PATH, load_config, load_pcg_targets, save_config,
+    REPORT_DIR, TARGETS_PATH, is_backup_path, load_config, load_pcg_targets,
+    save_config,
 )
 from pcg_texture_audit import (
     _unsafe_provisional_source,
@@ -52,6 +54,10 @@ from pcg_texture_audit import (
     prepare_sk,
     register_blend_source_images,
     save_spm_analysis_cache,
+)
+from pcg_board_snapshot import (
+    read_board_display_snapshot,
+    write_board_display_snapshot,
 )
 from export_review_queue import GENERIC_MATERIAL_RE
 from export_texture_plan import bucket_refs, build_texture_plan_from_report
@@ -336,6 +342,33 @@ def step3_texture_row_key(item, atlas_base):
     return folder, str(atlas_base or "").strip().casefold()
 
 
+def step3_row_key_json(key):
+    """Return a JSON-friendly stable Step 3 row identity."""
+    return {
+        "folder": str(key[0]),
+        "atlas_base": str(key[1]),
+    }
+
+
+def write_step3_run_report(path, payload):
+    """Atomically persist a run-specific Step 3 diagnostic snapshot."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return path
+
+
 def step3_job_dependency_paths(job):
     """Return current SBS/bitmap inputs whose changes invalidate old outputs."""
     paths = []
@@ -420,8 +453,16 @@ def step3_existing_output_freshness(job):
     }
 
 
-def checked_step3_spms(entries, allowed_folders=None):
-    """Return exact selected final-SK paths, preserving PCG target identity."""
+def checked_step3_spms(
+        entries, allowed_folders=None, selected_texture_rows=None,
+        include_unchecked=False):
+    """Return exact selected final and canonical provider SK paths.
+
+    Final PCG targets come from the checked tree entries.  A selected texture
+    row can additionally own an exact canonical ``cluster/SK_*.spm`` material
+    target; include that target so the T_* set rendered for the row is wired
+    back into its authoring SPM.  Raw non-SK counterparts remain excluded.
+    """
     allowed = (
         {
             os.path.normcase(os.path.abspath(str(folder)))
@@ -433,7 +474,7 @@ def checked_step3_spms(entries, allowed_folders=None):
     result = []
     seen = set()
     for entry in entries.values():
-        if not entry.get("checked"):
+        if not include_unchecked and not entry.get("checked"):
             continue
         item = entry.get("item") or {}
         folder_key = os.path.normcase(
@@ -443,7 +484,30 @@ def checked_step3_spms(entries, allowed_folders=None):
             continue
         for value in spm_paths_for_item(item):
             path = Path(value)
-            if not path.name.lower().startswith("sk_"):
+            if (
+                not path.name.lower().startswith("sk_")
+                or is_backup_path(path)
+            ):
+                continue
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(str(path))
+    for item, row in selected_texture_rows or []:
+        folder_key = os.path.normcase(
+            os.path.abspath(str(item.get("folder") or ""))
+        )
+        if allowed is not None and folder_key not in allowed:
+            continue
+        for target in row.get("material_targets") or []:
+            if not isinstance(target, dict) or not target.get("spm"):
+                continue
+            path = Path(target["spm"])
+            if (
+                not path.name.lower().startswith("sk_")
+                or is_backup_path(path)
+            ):
                 continue
             key = os.path.normcase(os.path.abspath(str(path)))
             if key in seen:
@@ -451,6 +515,14 @@ def checked_step3_spms(entries, allowed_folders=None):
             seen.add(key)
             result.append(str(path))
     return sorted(result, key=lambda value: os.path.normcase(value))
+
+
+def step3_audit_folder_for_spm(spm):
+    """Return the asset owner folder for a final or Cluster canonical SK."""
+    parent = Path(spm).expanduser().absolute().parent
+    if parent.name.casefold() == "cluster":
+        return parent.parent
+    return parent
 
 
 def cluster_hierarchy_rows(item):
@@ -642,6 +714,8 @@ def blender_connection_rows(item):
     mention the same blend, so current inventory has the final say for an
     explicit per-SPM connection result.
     """
+    if item.get("_gui_blender_connection_pending"):
+        return []
     cached = item.get("_gui_blender_connection_rows")
     if isinstance(cached, list):
         return cached
@@ -788,6 +862,8 @@ def cache_blender_connection_rows(report, progress_callback=None):
     items = list((report or {}).get("items") or [])
     if not items:
         return report
+    for item in items:
+        item.pop("_gui_blender_connection_pending", None)
     with ThreadPoolExecutor(
         max_workers=min(4, len(items)),
         thread_name_prefix="pcg-gui-relations",
@@ -803,6 +879,14 @@ def cache_blender_connection_rows(report, progress_callback=None):
             completed += 1
             if progress_callback is not None:
                 progress_callback(completed, len(items), item)
+    return report
+
+
+def mark_blender_connection_rows_pending(report):
+    """Keep relation discovery off the Tk thread until its worker finishes."""
+    for item in (report or {}).get("items") or []:
+        item.pop("_gui_blender_connection_rows", None)
+        item["_gui_blender_connection_pending"] = True
     return report
 
 
@@ -853,6 +937,8 @@ def blender_connection_summary(row):
 
 def blender_connection_overview(item):
     """Summarize active blend/SPM connections for the fourth board column."""
+    if item.get("_gui_blender_connection_pending"):
+        return "연결 계산 중…"
     rows = blender_connection_rows(item)
     if not rows:
         return "blend 없음"
@@ -1200,6 +1286,9 @@ class App:
         self._sync_state_migrating = False
         self.worker = None
         self._busy = False
+        self.shared_queue_runtime = SharedQueueRuntime(
+            "pcg_st9_texture_batch"
+        )
         self._initial_refreshing = True
         self._manual_refreshing = False
         self._target_refresh_active = False
@@ -1209,7 +1298,8 @@ class App:
         root.geometry("1320x820")
         self._build_ui()
         self._set_busy(True)
-        self.status_var.set("초기 검사 중...")
+        if not self._load_initial_display_snapshot():
+            self.status_var.set("초기 검사 중...")
         self.root.after(0, self._start_initial_refresh)
 
     # ------------------------------------------------------------------ UI
@@ -1387,7 +1477,7 @@ class App:
             "체크 여부와 무관하게 현재 표의 모든 세트를 세트당 T_ 6장씩 다시 렌더합니다.\n"
             "절차형 SBS 그래프도 기존 쿡 캐시를 재사용하지 않고 현재 Cluster_System을 다시 쿡합니다.\n"
             "모든 렌더가 성공하면 결과 전체를 모아 Unreal 동기화를 한 번만 실행합니다.\n"
-            "SPM 연결 정리는 실행하지 않습니다.\n"
+            "성공한 세트는 루트 SK와 canonical Cluster SK까지 SPM 연결을 정규화합니다.\n"
             "기존 출력은 일반 ③ 실행과 같이 안전하게 백업합니다.",
         )
         registry_actions = ttk.Frame(self.root, padding=(6, 0, 6, 6))
@@ -1648,23 +1738,69 @@ class App:
         )
         if not selected:
             return
+        selected_path = Path(selected).absolute()
         try:
-            targets = self._current_targets_for_blend(blend)
-            selected_path = Path(selected).absolute()
-            keys = {
-                os.path.normcase(str(path.absolute())).casefold()
-                for path in targets
-            }
-            selected_key = os.path.normcase(str(selected_path)).casefold()
-            if selected_key not in keys:
-                targets.append(selected_path)
-            payload = save_target_registry(blend, targets)
-        except (OSError, TargetRegistryError) as exc:
-            messagebox.showerror("대상 SPM 추가 실패", str(exc), parent=self.root)
+            shared = self._enqueue_shared_execution(
+                f"Atlas 대상 추가 · {blend.name}",
+                {
+                    "operation": "atlas_target_add",
+                    "blend": str(blend),
+                    "target_spm": str(selected_path),
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
             return
+        self._set_busy(True)
+        self.status_var.set(f"Atlas 대상 추가 대기 · {selected_path.name}")
+        self.worker = threading.Thread(
+            target=self._run_shared_execution,
+            args=(
+                shared,
+                f"Atlas 대상 추가 · {blend.name}",
+                self._run_add_blend_target_spm,
+                (blend, selected_path),
+            ),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _run_add_blend_target_spm(self, blend, selected_path):
+        targets = self._current_targets_for_blend(blend)
+        keys = {
+            os.path.normcase(str(path.absolute())).casefold()
+            for path in targets
+        }
+        selected_key = os.path.normcase(
+            str(selected_path.absolute())
+        ).casefold()
+        if selected_key not in keys:
+            targets.append(selected_path)
+        payload = save_target_registry(blend, targets)
+        self._ui(
+            lambda source=blend, target=selected_path, result=payload:
+            self._add_blend_target_done(source, target, result)
+        )
+        return {
+            "shared_queue_success": True,
+            "shared_queue_result": {
+                "operation": "atlas_target_add",
+                "blend": str(blend),
+                "target_spm": str(selected_path),
+            },
+        }
+
+    def _add_blend_target_done(self, blend, selected_path, payload):
+        self.worker = None
+        self._set_busy(False)
         self.populate()
-        self.status_var.set(f"Atlas 대상 추가 · {selected_path.name} · 총 {len(payload['target_spms'])}개")
-        self.log(f"Atlas 대상 JSON 추가: {blend.name} → {selected_path}")
+        self.status_var.set(
+            f"Atlas 대상 추가 · {selected_path.name} · "
+            f"총 {len(payload['target_spms'])}개"
+        )
+        self.log(
+            f"Atlas 대상 JSON 추가: {blend.name} → {selected_path}"
+        )
 
     def remove_blend_target_spms(self):
         rows = [row for row in self._selected_blend_connection_rows() if row.get("spm")]
@@ -1701,11 +1837,28 @@ class App:
             return
         if getattr(self, "_busy", False):
             return
+        try:
+            shared = self._enqueue_shared_execution(
+                f"Atlas 대상 해제 · {blend.name}",
+                {
+                    "operation": "atlas_target_remove",
+                    "blend": str(blend),
+                    "target_spms": [str(path) for path in remove_paths],
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
+            return
         self._set_busy(True)
         self.status_var.set(f"Atlas 대상 해제 중 · {len(remove_paths)}개")
         self.worker = threading.Thread(
-            target=self._run_remove_blend_target_spms,
-            args=(blend, remove_paths),
+            target=self._run_shared_execution,
+            args=(
+                shared,
+                f"Atlas 대상 해제 · {blend.name}",
+                self._run_remove_blend_target_spms,
+                (blend, remove_paths),
+            ),
             daemon=True,
         )
         self.worker.start()
@@ -1756,6 +1909,15 @@ class App:
             lambda result=data, failure=error, source=blend, paths=remove_paths:
                 self._remove_blend_targets_done(source, paths, result, failure)
         )
+        return {
+            "shared_queue_success": error is None,
+            "shared_queue_result": {
+                "operation": "atlas_target_remove",
+                "blend": str(blend),
+                "target_count": len(remove_paths),
+                "error": str(error) if error is not None else None,
+            },
+        }
 
     def _remove_blend_targets_done(self, blend, remove_paths, data, error):
         self.worker = None
@@ -1780,6 +1942,40 @@ class App:
         )
 
     # ------------------------------------------------------------------ scan
+    def _initial_pcg_targets(self):
+        if not bool(self.use_pcg_targets_var.get()):
+            return None
+        return load_pcg_targets()
+
+    def _load_initial_display_snapshot(self):
+        """Paint the previous board immediately, never as execution evidence."""
+        try:
+            pcg_targets = self._initial_pcg_targets()
+            snapshot = read_board_display_snapshot(
+                self.cfg,
+                pcg_targets=pcg_targets,
+            )
+        except Exception as exc:
+            self.log(f"[표시 캐시 경고] 이전 표를 읽지 못함: {exc}")
+            return False
+        if not snapshot.get("can_display"):
+            return False
+        report = snapshot.get("display_report")
+        if not isinstance(report, dict):
+            return False
+        mark_blender_connection_rows_pending(report)
+        self.report = report
+        self._display_only_snapshot = True
+        self.populate()
+        self._update_summary()
+        stale = snapshot.get("cache_state") != "matching_inputs"
+        suffix = " · 입력 변경 감지" if stale else ""
+        self.status_var.set(
+            "저장된 표 표시 중 · live 검증 중"
+            f"{suffix} · 변경 작업 잠김"
+        )
+        return True
+
     def _start_initial_refresh(self):
         """Run only the first read-only audit off the Tk main thread."""
         self._initial_refreshing = True
@@ -1793,6 +1989,7 @@ class App:
         def worker():
             report = None
             error = None
+            pcg_targets = None
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
 
@@ -1810,6 +2007,56 @@ class App:
                     cfg,
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
+                )
+            except Exception as exc:
+                error = exc
+            self.root.after(
+                0,
+                lambda result=report, targets=pcg_targets, failure=error:
+                    self._initial_primary_refresh_done(
+                        result,
+                        cfg,
+                        targets,
+                        failure,
+                    ),
+            )
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
+    def _initial_primary_refresh_done(
+        self,
+        report,
+        cfg,
+        pcg_targets,
+        error=None,
+    ):
+        """Paint live primary columns before resolving Blender relations."""
+        if error is not None:
+            self._initial_refresh_done(report, error)
+            return
+        mark_blender_connection_rows_pending(report)
+        self.report = report
+        self._display_only_snapshot = False
+        self.texplan_cache.clear()
+        if not hasattr(self, "texplan_errors"):
+            self.texplan_errors = {}
+        self.texplan_errors.clear()
+        self.populate()
+        self._update_summary()
+        self.status_var.set(
+            "기본 live 검사 완료 · Blender 연결 계산 중… · 변경 작업 잠김"
+        )
+
+        def relation_worker():
+            failure = None
+            try:
+                # Persist only a display snapshot.  It can paint the next
+                # launch but can never authorize a mutation.
+                write_board_display_snapshot(
+                    report,
+                    cfg,
+                    pcg_targets=pcg_targets,
                 )
 
                 def relation_progress(completed, total, item):
@@ -1832,14 +2079,14 @@ class App:
                 save_spm_analysis_cache()
                 self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
-                error = exc
+                failure = exc
             self.root.after(
                 0,
-                lambda result=report, failure=error:
-                    self._initial_refresh_done(result, failure),
+                lambda result=report, relation_error=failure:
+                    self._initial_refresh_done(result, relation_error),
             )
 
-        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker = threading.Thread(target=relation_worker, daemon=True)
         self.worker.start()
 
     def _initial_refresh_done(self, report, error=None):
@@ -1848,10 +2095,15 @@ class App:
         self._initial_refreshing = False
         if error is not None:
             messagebox.showerror("검사 실패", str(error))
-            self.status_var.set("검사 실패")
+            self.status_var.set(
+                "live 검사 실패 · 저장/기본 표는 표시 전용 · 다시 검사 필요"
+            )
             self._set_busy(False)
+            self._display_only_snapshot = True
+            self._lock_mutation_controls()
         else:
             self.report = report
+            self._display_only_snapshot = False
             persistence = (
                 report.get("cluster_assembly_receipt_persistence") or {}
             )
@@ -1875,6 +2127,20 @@ class App:
         if getattr(self, "_pending_refresh", False):
             self._pending_refresh = False
             self.refresh()
+
+    def _lock_mutation_controls(self):
+        """Leave read-only refresh available while cached display is visible."""
+        for name in (
+            "btn_prepare",
+            "btn_step2",
+            "btn_step3",
+            "btn_step3_force",
+            "btn_add_target",
+            "btn_remove_target",
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.configure(state="disabled")
 
     def _start_sync_state_migration(self):
         """Verify legacy success reports without delaying the first table paint."""
@@ -1972,6 +2238,11 @@ class App:
                     cfg,
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
+                )
+                write_board_display_snapshot(
+                    report,
+                    cfg,
+                    pcg_targets=pcg_targets,
                 )
 
                 def relation_progress(completed, total, item):
@@ -3098,9 +3369,35 @@ class App:
                 "step1",
                 "⚠ 건너뜀 (로그 참조)",
             )
+        try:
+            shared = self._enqueue_shared_execution(
+                f"PCG ① SK/재질 정규화 · {len(doable)}개",
+                {
+                    "operation": "step1_prepare",
+                    "targets": [
+                        {
+                            "folder": str(row["item"].get("folder") or ""),
+                            "mesh": str(row.get("mesh") or ""),
+                        }
+                        for row in doable
+                    ],
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
+            return
         self._set_busy(True)
         self.status_var.set(f"① 적용 중... ({len(doable)}개)")
-        self.worker = threading.Thread(target=self._run_prepare, args=(doable,), daemon=True)
+        self.worker = threading.Thread(
+            target=self._run_shared_execution,
+            args=(
+                shared,
+                f"PCG ① SK/재질 정규화 · {len(doable)}개",
+                self._run_prepare,
+                (doable,),
+            ),
+            daemon=True,
+        )
         self.worker.start()
 
     def _run_prepare(self, rows):
@@ -3150,9 +3447,180 @@ class App:
                 failed += 1
                 self._ui(lambda lb=label, e=exc: self.log(f"[① 실패] {lb}: {e}"))
         self._ui(lambda: self._prepare_finished(done, failed))
+        return {
+            "shared_queue_success": failed == 0,
+            "shared_queue_result": {
+                "operation": "step1_prepare",
+                "completed": done,
+                "failed": failed,
+            },
+        }
 
     def _ui(self, fn):
         self.root.after(0, fn)
+
+    def _enqueue_shared_execution(self, label, payload):
+        """Register one mutating request before any asset worker starts."""
+
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is None:
+            # Lightweight unit-test App instances deliberately omit the
+            # production cross-process runtime.
+            return None
+        record = runtime.enqueue(
+            str(label),
+            {
+                "tool": "pcg_st9_texture_batch",
+                **dict(payload or {}),
+            },
+        )
+        self.log(
+            f"[공용 대기열 등록 #{record['sequence']}] {label}"
+        )
+        return record
+
+    def _wait_for_shared_execution(self, record):
+        if record is None:
+            return None
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is None:
+            return None
+
+        def on_wait(wait_state):
+            position = wait_state.get("position")
+            queued = wait_state.get("queued_count", 0)
+            text = (
+                "공용 대기열 대기"
+                + (f" · 전체 {position}번째" if position else "")
+                + f" · 대기 {queued}개"
+            )
+            self._ui(lambda value=text: self.status_var.set(value))
+
+        lease = runtime.wait_for_turn(
+            record["id"],
+            on_wait=on_wait,
+        )
+        self._ui(
+            lambda: self.status_var.set(
+                "공용 대기열 진입 · 단독 실행"
+            )
+        )
+        return lease
+
+    def _shared_execution_enqueue_failed(self, exc):
+        self.status_var.set("공용 대기열 등록 실패 · 실행하지 않음")
+        messagebox.showerror(
+            "공용 대기열 등록 실패",
+            (
+                "다른 창과 동시에 실행되지 않도록 작업을 시작하지 "
+                f"않았습니다.\n\n{exc}"
+            ),
+        )
+
+    def _run_shared_execution(
+            self, record, label, target, args=(), kwargs=None):
+        """Wait for the global turn, run one callback, and release safely."""
+
+        lease = None
+        try:
+            lease = self._wait_for_shared_execution(record)
+            result = target(*(args or ()), **dict(kwargs or {}))
+            queue_success = not (
+                isinstance(result, dict)
+                and result.get("shared_queue_success") is False
+            )
+            queue_result = (
+                dict(result.get("shared_queue_result") or {})
+                if isinstance(result, dict) else {}
+            )
+            if lease is not None:
+                lease.finish(
+                    success=queue_success,
+                    result={
+                        "tool": "pcg_st9_texture_batch",
+                        "label": str(label),
+                        "outcome": (
+                            "completed" if queue_success else "failed"
+                        ),
+                        **queue_result,
+                    },
+                )
+            return result
+        except Exception as exc:
+            if lease is not None and not lease.finished:
+                try:
+                    lease.finish(
+                        success=False,
+                        result={
+                            "tool": "pcg_st9_texture_batch",
+                            "label": str(label),
+                            "outcome": "failed",
+                            "error": str(exc),
+                        },
+                    )
+                except Exception as queue_exc:
+                    exc = RuntimeError(
+                        f"{exc}; 공용 대기열 종료 기록 실패: {queue_exc}"
+                    )
+            self._ui(
+                lambda error=exc, action=str(label):
+                self._shared_execution_failed(action, error)
+            )
+            return None
+
+    def _run_claimed_shared_execution(
+            self, lease, label, target, args=(), kwargs=None):
+        """Continue a job whose lease was acquired during live planning."""
+
+        try:
+            result = target(*(args or ()), **dict(kwargs or {}))
+            queue_success = not (
+                isinstance(result, dict)
+                and result.get("shared_queue_success") is False
+            )
+            queue_result = (
+                dict(result.get("shared_queue_result") or {})
+                if isinstance(result, dict) else {}
+            )
+            lease.finish(
+                success=queue_success,
+                result={
+                    "tool": "pcg_st9_texture_batch",
+                    "label": str(label),
+                    "outcome": (
+                        "completed" if queue_success else "failed"
+                    ),
+                    **queue_result,
+                },
+            )
+            return result
+        except Exception as exc:
+            if not lease.finished:
+                try:
+                    lease.finish(
+                        success=False,
+                        result={
+                            "tool": "pcg_st9_texture_batch",
+                            "label": str(label),
+                            "outcome": "failed",
+                            "error": str(exc),
+                        },
+                    )
+                except Exception as queue_exc:
+                    exc = RuntimeError(
+                        f"{exc}; 공용 대기열 종료 기록 실패: {queue_exc}"
+                    )
+            self._ui(
+                lambda error=exc, action=str(label):
+                self._shared_execution_failed(action, error)
+            )
+            return None
+
+    def _shared_execution_failed(self, label, exc):
+        self.log(f"[공용 대기열 작업 실패] {label}: {exc}")
+        self.status_var.set(f"{label} 실패")
+        self._set_busy(False)
+        messagebox.showerror("작업 실패", str(exc))
 
     def _set_busy(self, busy):
         self._busy = bool(busy)
@@ -3402,8 +3870,37 @@ class App:
         if not messagebox.askyesno("② 실행", "\n".join(msg)):
             self.status_var.set("대기")
             return
+        try:
+            shared = self._enqueue_shared_execution(
+                f"PCG ② Atlas/Cluster · {len(jobs)}개",
+                {
+                    "operation": "step2_atlas",
+                    "push_spm": bool(push_spm),
+                    "blend_outputs": [
+                        str(job.get("blend_out") or "")
+                        for job in jobs
+                    ],
+                    "target_spms": [
+                        str(path)
+                        for job in jobs
+                        for path in job.get("target_spms") or []
+                    ],
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
+            return
         self._set_busy(True)
-        self.worker = threading.Thread(target=self._run_step2, args=(jobs, push_spm), daemon=True)
+        self.worker = threading.Thread(
+            target=self._run_shared_execution,
+            args=(
+                shared,
+                f"PCG ② Atlas/Cluster · {len(jobs)}개",
+                self._run_step2,
+                (jobs, push_spm),
+            ),
+            daemon=True,
+        )
         self.worker.start()
 
     def _run_step2(self, jobs, push_spm):
@@ -3473,23 +3970,117 @@ class App:
                 failed += 1
                 self._ui(lambda b=base, e=exc: self.log(f"[② 실패] {b}: {e}"))
         self._ui(lambda: self._batch_finished("②", done, failed))
+        return {
+            "shared_queue_success": failed == 0,
+            "shared_queue_result": {
+                "operation": "step2_atlas",
+                "completed": done,
+                "failed": failed,
+            },
+        }
 
     # ------------------------------------------------------------- ③ 실행
+    @staticmethod
+    def _step3_rows_share_owner(selected_row, owner_row):
+        """Return whether an explicit shared row belongs to this owner row."""
+        selected_base = str(
+            selected_row.get("atlas_base") or ""
+        ).strip().casefold()
+        owner_base = str(owner_row.get("atlas_base") or "").strip().casefold()
+        if not selected_base or selected_base != owner_base:
+            return False
+        selected_signature = tuple(
+            str(value).casefold()
+            for value in selected_row.get("source_signature") or ()
+        )
+        owner_signature = tuple(
+            str(value).casefold()
+            for value in owner_row.get("source_signature") or ()
+        )
+        return (
+            not selected_signature
+            or not owner_signature
+            or selected_signature == owner_signature
+        )
+
+    def _step3_shared_owner_candidates(self, selected_row):
+        """Resolve a shared row's real render owner even when it is unchecked."""
+        owner_name = str(selected_row.get("shared_from") or "").strip()
+        if not owner_name:
+            return []
+        candidates = []
+        for entry in self.items.values():
+            owner_item = entry.get("item") or {}
+            if str(owner_item.get("name") or "").casefold() != owner_name.casefold():
+                continue
+            for owner_row in self._texplan_rows(owner_item):
+                if owner_row.get("shared_from"):
+                    continue
+                if self._step3_rows_share_owner(selected_row, owner_row):
+                    candidates.append((owner_item, owner_row))
+        return candidates
+
     def _step3_jobs(self, force_rerender=False, all_rows=False):
         jobs, skipped = [], []
         self._step3_render_required_row_keys = set()
         self._step3_existing_output_row_keys = set()
-        scoped_rows = (
-            self._all_texplan_rows() if all_rows else self._checked_texplan_rows()
+        self._step3_effective_output_rows = {}
+        scoped_rows = list(
+            self._all_texplan_rows()
+            if all_rows else self._checked_texplan_rows()
         )
+        execution_groups = {}
         for item, row in scoped_rows:
             base = row["atlas_base"]
-            row_key = step3_texture_row_key(item, base)
             if row.get("shared_from"):
-                continue  # 다른 폴더에서 관리 — 그쪽 행에서 처리
+                owners = self._step3_shared_owner_candidates(row)
+                if len(owners) != 1:
+                    owner_name = row.get("shared_from") or "unknown"
+                    reason = (
+                        f"shared texture render owner not found: {owner_name}"
+                        if not owners else
+                        f"shared texture render owner is ambiguous: {owner_name}"
+                    )
+                    skipped.append((item, base, reason))
+                    continue
+                owner_item, owner_row = owners[0]
+            else:
+                owner_item, owner_row = item, row
+            owner_key = step3_texture_row_key(
+                owner_item, owner_row.get("atlas_base")
+            )
+            group = execution_groups.setdefault(owner_key, {
+                "owner_item": owner_item,
+                "owner_row": owner_row,
+                "consumers": [],
+            })
+            consumer_key = step3_texture_row_key(item, base)
+            if all(
+                current_key != consumer_key
+                for _current_item, _current_row, current_key
+                in group["consumers"]
+            ):
+                group["consumers"].append((item, row, consumer_key))
+
+        for group in execution_groups.values():
+            owner_item = group["owner_item"]
+            owner_row = group["owner_row"]
+            base = owner_row["atlas_base"]
+            consumer_keys = {
+                consumer_key
+                for _item, _row, consumer_key in group["consumers"]
+            }
+            for consumer_key in consumer_keys:
+                self._step3_effective_output_rows[consumer_key] = (
+                    owner_item,
+                    owner_row,
+                )
             try:
-                job = build_texture_job(row)
-                job["item"] = item
+                job = build_texture_job(owner_row)
+                job["item"] = owner_item
+                job["step3_consumer_row_keys"] = tuple(
+                    sorted(consumer_keys)
+                )
                 job["size_log2"] = expected_job_size(job)
                 expected_pixels = sbs_auto.size_log2_pixels(job["size_log2"])
                 graph_needs_update = False
@@ -3504,7 +4095,7 @@ class App:
                     or job.get("rename_graph_to")
                     or job.get("repair_resources")
                 )
-                canonical_row = dict(row)
+                canonical_row = dict(owner_row)
                 canonical_row["texture_dir"] = job["out_dir"]
                 complete = complete_output_set(
                     canonical_row, expected_pixels=expected_pixels)
@@ -3527,12 +4118,17 @@ class App:
                 if force_rerender:
                     job["force_cluster_recook"] = True
                 if not render_required:
-                    self._step3_existing_output_row_keys.add(row_key)
+                    self._step3_existing_output_row_keys.update(consumer_keys)
                     continue
-                self._step3_render_required_row_keys.add(row_key)
+                self._step3_render_required_row_keys.update(consumer_keys)
                 jobs.append(job)
             except Exception as exc:
-                skipped.append((item, base, str(exc)))
+                for consumer_item, consumer_row, _key in group["consumers"]:
+                    skipped.append((
+                        consumer_item,
+                        consumer_row["atlas_base"],
+                        str(exc),
+                    ))
         already_reported = {item["folder"] for item, _base, _reason in skipped}
         for entry in self.items.values():
             item = entry["item"]
@@ -3548,18 +4144,19 @@ class App:
 
     def _step3_sync_files(self, excluded_row_keys=None):
         """Collect only complete sets proven current by the preceding preflight."""
-        excluded = set(excluded_row_keys or ())
         current_existing = getattr(
             self, "_step3_existing_output_row_keys", None
         )
         files = []
         seen = set()
+        seen_manifests = set()
         manifest_rows = []
         for item, row in self._checked_texplan_rows():
             row_key = step3_texture_row_key(
                 item, row.get("atlas_base")
             )
-            if row_key in excluded:
+            if self._step3_row_is_excluded(
+                    item, row.get("atlas_base"), excluded_row_keys):
                 continue
             # start_step3 always calls _step3_jobs first.  Only rows that
             # passed that live SBS/input freshness check may turn pre-existing
@@ -3567,21 +4164,36 @@ class App:
             # calls backward compatible while the real GUI remains fail-safe.
             if current_existing is not None and row_key not in current_existing:
                 continue
+            _output_item, output_row = getattr(
+                self, "_step3_effective_output_rows", {}
+            ).get(row_key, (item, row))
             texture_dir = (
-                canonical_texture_root(row["folder"])
-                if row.get("folder")
-                else row.get("texture_dir")
+                canonical_texture_root(output_row["folder"])
+                if output_row.get("folder")
+                else output_row.get("texture_dir")
             )
-            texture_base = row.get("texture_base") or row.get("atlas_base")
+            texture_base = (
+                output_row.get("texture_base")
+                or output_row.get("atlas_base")
+            )
             if not texture_dir or not texture_base:
                 continue
             paths = output_paths(texture_dir, texture_base)
             selected = [paths[role] for role in sbs_auto.RENDER_MAPS]
-            canonical_row = dict(row)
+            canonical_row = dict(output_row)
             canonical_row["texture_dir"] = str(texture_dir)
             if not complete_output_set(canonical_row):
                 continue
-            manifest_rows.append((row, [str(path) for path in selected]))
+            manifest_key = step3_texture_row_key(
+                output_row,
+                output_row.get("atlas_base"),
+            )
+            if manifest_key not in seen_manifests:
+                seen_manifests.add(manifest_key)
+                manifest_rows.append((
+                    output_row,
+                    [str(path) for path in selected],
+                ))
             for path in selected:
                 key = os.path.normcase(os.path.abspath(str(path)))
                 if key not in seen:
@@ -3593,18 +4205,61 @@ class App:
     @staticmethod
     def _step3_exclusion_keys(skipped):
         return {
-            step3_texture_row_key(item, base)
+            step3_texture_row_key(
+                item,
+                None if base == "텍스처 계획" else base,
+            )
             for item, base, _reason in skipped
         }
 
-    def _step3_eligible_row_keys(self, excluded_row_keys):
+    @staticmethod
+    def _step3_key_is_excluded(key, excluded_row_keys):
+        folder_wildcard = (key[0], "")
         excluded = set(excluded_row_keys or ())
+        return key in excluded or folder_wildcard in excluded
+
+    @classmethod
+    def _step3_row_is_excluded(
+            cls, item, atlas_base, excluded_row_keys):
+        return cls._step3_key_is_excluded(
+            step3_texture_row_key(item, atlas_base),
+            excluded_row_keys,
+        )
+
+    @classmethod
+    def _step3_jobs_excluding(cls, jobs, excluded_row_keys):
+        """Drop excluded consumers without discarding a shared valid owner."""
+        result = []
+        for job in jobs:
+            consumer_keys = tuple(
+                job.get("step3_consumer_row_keys") or (
+                    step3_texture_row_key(
+                        job.get("item") or {},
+                        job.get("base"),
+                    ),
+                )
+            )
+            allowed_keys = tuple(
+                key for key in consumer_keys
+                if not cls._step3_key_is_excluded(
+                    key, excluded_row_keys
+                )
+            )
+            if not allowed_keys:
+                continue
+            job["step3_consumer_row_keys"] = allowed_keys
+            result.append(job)
+        return result
+
+    def _step3_eligible_row_keys(self, excluded_row_keys):
         return {
             step3_texture_row_key(item, row.get("atlas_base"))
             for item, row in self._checked_texplan_rows()
-            if step3_texture_row_key(
-                item, row.get("atlas_base")
-            ) not in excluded
+            if not self._step3_row_is_excluded(
+                item,
+                row.get("atlas_base"),
+                excluded_row_keys,
+            )
         }
 
     @staticmethod
@@ -3612,7 +4267,7 @@ class App:
             skipped, render_count, sync_file_count, *, force=False):
         operation = "③ 전체 재추출" if force else "③ 실행"
         lines = [
-            f"텍스처 계획 오류 {len(skipped)}개를 제외하고 "
+            f"오류 항목 {len(skipped)}개를 제외하고 "
             f"나머지 {operation} 대상을 처리할 수 있습니다.",
             "",
             f"정상 렌더 대상: {render_count}세트",
@@ -3633,6 +4288,142 @@ class App:
             lines.append(f"· ... 외 {len(skipped) - 8}개")
         lines.extend(["", "오류 항목을 제외하고 계속 실행하시겠습니까?"])
         return "\n".join(lines)
+
+    def _new_step3_run_report(
+            self, jobs, skipped, affected_spms, sync_files,
+            *, force_unreal_verify=False, selected_rows=None):
+        """Create and persist the immutable Step 3 preflight boundary."""
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        report_path = (
+            Path(REPORT_DIR)
+            / f"step3_run_{stamp}_{os.getpid()}.json"
+        )
+        selected = []
+        for item, row in (
+                self._checked_texplan_rows()
+                if selected_rows is None else selected_rows):
+            selected.append({
+                "item": item.get("name") or Path(item["folder"]).name,
+                "row_key": step3_row_key_json(step3_texture_row_key(
+                    item, row.get("atlas_base")
+                )),
+                "texture_base": (
+                    row.get("texture_base") or row.get("atlas_base")
+                ),
+                "shared_from": row.get("shared_from"),
+            })
+        excluded = [{
+            "item": item.get("name") or Path(item["folder"]).name,
+            "row_key": step3_row_key_json(step3_texture_row_key(
+                item,
+                None if base == "텍스처 계획" else base,
+            )),
+            "display_base": base,
+            "reason": reason,
+            "scopes": [
+                "render",
+                "existing_output",
+                "canonical_manifest",
+                "spm_normalization",
+                "unreal_sync",
+            ],
+        } for item, base, reason in skipped]
+        render_rows = []
+        for job in jobs:
+            render_rows.append({
+                "owner": step3_row_key_json(step3_texture_row_key(
+                    job.get("item") or {}, job.get("base")
+                )),
+                "consumer_row_keys": [
+                    step3_row_key_json(key)
+                    for key in job.get("step3_consumer_row_keys") or ()
+                ],
+                "texture_base": job.get("texture_base"),
+                "mode": job.get("mode"),
+                "status": "planned",
+                "files": [],
+            })
+        existing_reuse = [{
+            "owner": step3_row_key_json(step3_texture_row_key(
+                row, row.get("atlas_base")
+            )),
+            "texture_base": (
+                row.get("texture_base") or row.get("atlas_base")
+            ),
+            "files": [str(path) for path in files],
+            "manifest_status": "planned",
+        } for row, files in (
+            getattr(self, "_pending_step3_manifest_rows", []) or []
+        )]
+        payload = {
+            "kind": "pcg_step3_run_report",
+            "schema_version": 1,
+            "run_id": report_path.stem,
+            "started_at": datetime.now().astimezone().isoformat(),
+            "finished_at": None,
+            "status": "queued",
+            "preflight": {
+                "selected": selected,
+                "excluded": excluded,
+                "render_jobs": [
+                    {
+                        **row,
+                        "consumer_row_keys": list(
+                            row["consumer_row_keys"]
+                        ),
+                        "files": list(row["files"]),
+                    }
+                    for row in render_rows
+                ],
+                "existing_reuse": existing_reuse,
+                "spms": [str(path) for path in affected_spms],
+                "sync_candidates": [str(path) for path in sync_files],
+                "force_unreal_verify": bool(force_unreal_verify),
+            },
+            "render": render_rows,
+            "normalization": {"status": "not_run"},
+            "unreal_sync": {"status": "not_run"},
+            "failures": [],
+            "counts": {
+                "selected": len(selected),
+                "excluded": len(excluded),
+                "render_planned": len(render_rows),
+                "render_succeeded": 0,
+                "render_failed": 0,
+                "existing_reused": len(existing_reuse),
+                "manifests_recorded": 0,
+                "spms_normalized": 0,
+                "spms_skipped": 0,
+                "materials_skipped": 0,
+                "sync_candidates": len(sync_files),
+                "sync_latest": 0,
+                "sync_changed": 0,
+                "sync_failed": 0,
+            },
+        }
+        write_step3_run_report(report_path, payload)
+        self.log(f"[③ 실행 리포트] {report_path}")
+        return str(report_path), payload
+
+    def _save_step3_run_report(
+            self, report_path, payload, *, stage):
+        if not report_path or payload is None:
+            return False
+        try:
+            write_step3_run_report(report_path, payload)
+            return True
+        except Exception as exc:
+            self._ui(lambda e=exc, s=stage: self.log(
+                f"[③ 실행 리포트 기록 실패] {s}: {e}"
+            ))
+            return False
+
+    def _begin_step3_run_report(self, *args, **kwargs):
+        try:
+            return self._new_step3_run_report(*args, **kwargs)
+        except Exception as exc:
+            self.log(f"[③ 실행 리포트 생성 실패] {exc}")
+            return None, None
 
     def _sync_pending_texture_files(
             self, files, progress=None, force_verify=False):
@@ -3690,116 +4481,278 @@ class App:
                 errors.append((asset_name, str(exc)))
         return errors
 
-    def start_step3_force(self):
+    def _step3_unreal_name_skips(
+            self, jobs, sync_files, *, selected_rows=None):
+        """Turn invalid Unreal output names into row-scoped exclusions."""
+        if not self._step3_unreal_name_errors(jobs, sync_files):
+            return []
+        scoped_rows = list(
+            self._checked_texplan_rows()
+            if selected_rows is None else selected_rows
+        )
+        rows_by_key = {
+            step3_texture_row_key(item, row.get("atlas_base")): (item, row)
+            for item, row in scoped_rows
+        }
+        skips = []
+        seen = set()
+
+        def add_skips(row_keys, fallback_item, fallback_base, errors):
+            reason = "Unreal 출력 이름 오류: " + "; ".join(
+                f"{name}: {message}" for name, message in errors
+            )
+            keys = tuple(row_keys) or (
+                step3_texture_row_key(fallback_item, fallback_base),
+            )
+            for key in keys:
+                item, row = rows_by_key.get(
+                    key,
+                    (
+                        fallback_item,
+                        {"atlas_base": fallback_base},
+                    ),
+                )
+                identity = (key, reason)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                skips.append((
+                    item,
+                    row.get("atlas_base") or fallback_base,
+                    reason,
+                ))
+
+        for job in jobs:
+            errors = self._step3_unreal_name_errors([job], [])
+            if not errors:
+                continue
+            add_skips(
+                job.get("step3_consumer_row_keys") or (),
+                job.get("item") or {},
+                job.get("base"),
+                errors,
+            )
+
+        sync_keys = {
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in sync_files or []
+        }
+        effective_rows = getattr(
+            self, "_step3_effective_output_rows", {}
+        )
+        for output_row, files in (
+                getattr(self, "_pending_step3_manifest_rows", []) or []):
+            selected_files = [
+                path for path in files
+                if os.path.normcase(os.path.abspath(str(path))) in sync_keys
+            ]
+            errors = self._step3_unreal_name_errors([], selected_files)
+            if not errors:
+                continue
+            output_key = step3_texture_row_key(
+                output_row,
+                output_row.get("atlas_base"),
+            )
+            consumer_keys = [
+                consumer_key
+                for consumer_key, (_item, effective_row)
+                in effective_rows.items()
+                if step3_texture_row_key(
+                    effective_row,
+                    effective_row.get("atlas_base"),
+                ) == output_key
+            ]
+            add_skips(
+                consumer_keys or (output_key,),
+                output_row,
+                output_row.get("atlas_base"),
+                errors,
+            )
+        return skips
+
+    def _build_step3_force_execution_plan(self):
+        """Build the force-rerender plan after the shared FIFO grants it."""
+
         self._pending_step3_manifest_rows = []
+        selected_rows = self._all_texplan_rows()
+        jobs, skipped = self._step3_jobs(force_rerender=True, all_rows=True)
+        excluded_row_keys = self._step3_exclusion_keys(skipped)
+        if excluded_row_keys:
+            jobs = self._step3_jobs_excluding(
+                jobs,
+                excluded_row_keys,
+            )
+        unreal_name_skips = self._step3_unreal_name_skips(
+            jobs,
+            [],
+            selected_rows=selected_rows,
+        )
+        if unreal_name_skips:
+            skipped.extend(unreal_name_skips)
+            excluded_row_keys = self._step3_exclusion_keys(skipped)
+            jobs = self._step3_jobs_excluding(
+                jobs,
+                excluded_row_keys,
+            )
+        eligible_rows = [
+            (item, row)
+            for item, row in selected_rows
+            if not self._step3_row_is_excluded(
+                item,
+                row.get("atlas_base"),
+                excluded_row_keys,
+            )
+        ]
+        eligible_row_keys = {
+            step3_texture_row_key(
+                item,
+                row.get("atlas_base"),
+            )
+            for item, row in eligible_rows
+        }
+        exact_step3_spms = checked_step3_spms(
+            self.items,
+            allowed_folders={
+                key[0] for key in eligible_row_keys
+            },
+            selected_texture_rows=eligible_rows,
+            include_unchecked=True,
+        )
+        return {
+            "jobs": jobs,
+            "skipped": skipped,
+            "sync_files": [],
+            "force_unreal_verify": False,
+            "eligible_row_keys": eligible_row_keys,
+            "exact_step3_spms": exact_step3_spms,
+            "selected_rows": selected_rows,
+            "require_all_renders_for_sync": True,
+            "operation_label": "PCG ③ 전체 재추출",
+        }
+
+    def start_step3_force(self):
         if not self.report:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 전체 재추출을 다시 실행하세요.")
             return
-        self.status_var.set("③ 전체 재추출 대상 확인 중...")
-        self.root.update_idletasks()
-        jobs, skipped = self._step3_jobs(force_rerender=True, all_rows=True)
-        for item, base, reason in skipped:
-            self.log(f"[③ 전체 재추출 건너뜀] {item['name']} / {base}: {reason}")
-        if skipped:
-            lines = [
-                "선택 항목의 텍스처 계획을 완성하지 못해 전체 재추출을 중단합니다.",
-                "일부 항목만 새 결과로 바뀌지 않도록 시작 전에 차단했습니다.",
-                "",
-            ]
-            for item, base, reason in skipped[:8]:
-                lines.append(f"· {item['name']} / {base}: {reason}")
-            if len(skipped) > 8:
-                lines.append(f"· ... 외 {len(skipped) - 8}개")
-            messagebox.showerror("③ 전체 재추출 차단", "\n".join(lines))
-            self.status_var.set(f"③ 전체 재추출 차단 · 계획 오류 {len(skipped)}개")
-            return
-        if not jobs:
-            messagebox.showinfo(
-                "③ 전체 다시 뽑기",
-                "현재 표에서 전체 재추출할 로컬 텍스처 세트를 찾지 못했습니다.",
+        if getattr(self, "_busy", False):
+            self.status_var.set(
+                "현재 작업이 끝난 뒤 전체 재추출을 다시 누르세요."
             )
+            return
+        if not messagebox.askyesno(
+            "③ 전체 다시 뽑기",
+            (
+                "현재 표의 연결 텍스처를 실행 차례에 다시 검사한 뒤 "
+                "T_ 6장을 전부 재추출합니다.\n"
+                "오류 항목은 제외하고 정상 항목만 계속하며, 모든 렌더가 "
+                "성공하면 Unreal 동기화를 한 번 실행합니다.\n"
+                "성공한 세트는 루트 SK와 canonical Cluster SK까지 SPM 연결을 정규화합니다.\n\n"
+                "공용 대기열에 등록할까요?"
+            ),
+        ):
             self.status_var.set("대기")
             return
-
-        message = (
-            f"현재 표의 연결 텍스처 {len(jobs)}세트에서 T_ 6장을 전부 다시 뽑습니다.\n"
-            f"총 출력: {len(jobs) * len(sbs_auto.RENDER_MAPS)}장\n\n"
-            f"Cluster: {sbs_auto.cluster_sbsar(self.cfg)}\n\n"
-            "모든 렌더가 성공하면 Unreal 동기화를 한 번만 실행합니다.\n"
-            "SPM 연결 정리는 실행하지 않습니다.\n"
-            "계속할까요?"
-        )
-        if not messagebox.askyesno("③ 전체 다시 뽑기", message):
-            self.status_var.set("대기")
+        try:
+            shared = self._enqueue_shared_execution(
+                "PCG ③ 전체 재추출",
+                {
+                    "operation": "step3_force",
+                    "force_rerender": True,
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
             return
         self._set_busy(True)
-        self.status_var.set(f"③ 전체 재추출 시작 · {len(jobs)}세트")
+        self.status_var.set(
+            "③ 전체 재추출 공용 대기열 등록 · 실행 차례에 재검사"
+        )
         self.root.update_idletasks()
         self.worker = threading.Thread(
-            target=self._run_step3,
-            args=(jobs, [], [], False, True),
+            target=self._run_step3_force_planning,
+            args=(shared,),
             daemon=True,
         )
         self.worker.start()
 
-    def start_step3(self):
+    def _run_step3_force_planning(self, shared_record):
+        plan = None
+        error = None
+        lease = None
+        try:
+            lease = self._wait_for_shared_execution(shared_record)
+            self._ui(
+                lambda: self.status_var.set(
+                    "③ 전체 재추출 차례 도착 · 최신 대상 계획 계산 중..."
+                )
+            )
+            plan = self._build_step3_force_execution_plan()
+        except Exception as exc:
+            error = exc
+        self._ui(
+            lambda result=plan, failure=error, claimed=lease:
+            self._step3_planning_done(result, failure, claimed)
+        )
+
+    def _build_step3_execution_plan(self):
+        """Perform the expensive Step 3 preflight without touching Tk."""
+
         self._pending_step3_manifest_rows = []
-        if not self.report:
-            self.refresh()
-            self.status_var.set("검사가 끝난 뒤 ③을 다시 실행하세요.")
-            return
-        self.status_var.set("③ 대상 확인 중...")
-        self.root.update_idletasks()
         jobs, skipped = self._step3_jobs()
         excluded_row_keys = self._step3_exclusion_keys(skipped)
+        if excluded_row_keys:
+            jobs = self._step3_jobs_excluding(
+                jobs,
+                excluded_row_keys,
+            )
         sync_files = (
             self._step3_sync_files(excluded_row_keys)
             if excluded_row_keys
             else self._step3_sync_files()
         )
+        unreal_name_skips = self._step3_unreal_name_skips(
+            jobs,
+            sync_files,
+        )
+        if unreal_name_skips:
+            skipped.extend(unreal_name_skips)
+            excluded_row_keys = self._step3_exclusion_keys(skipped)
+            jobs = self._step3_jobs_excluding(
+                jobs,
+                excluded_row_keys,
+            )
+            sync_files = self._step3_sync_files(excluded_row_keys)
         selection_state = step3_selection_state(getattr(self, "items", {}))
         force_unreal_verify = bool(
             selection_state.get("force_unreal_verify")
         ) and not skipped
-        for item, base, reason in skipped:
-            self.log(f"[③ 건너뜀] {item['name']} / {base}: {reason}")
         if skipped and not jobs and not sync_files:
-            lines = [
-                "텍스처 계획 오류를 제외하면 ③에서 실행할 정상 대상이 없습니다.",
-                "",
-            ]
-            for item, base, reason in skipped[:8]:
-                lines.append(f"· {item['name']} / {base}: {reason}")
-            if len(skipped) > 8:
-                lines.append(f"· ... 외 {len(skipped) - 8}개")
-            messagebox.showerror("③ 실행 불가", "\n".join(lines))
-            self.status_var.set(f"③ 실행 차단 · 계획 오류 {len(skipped)}개")
-            self._pending_step3_manifest_rows = []
-            return
-        invalid_names = self._step3_unreal_name_errors(jobs, sync_files)
-        if invalid_names:
-            lines = [
-                "Unreal에서 사용할 수 없는 텍스처 이름이 있어 ③ 실행을 중단합니다.",
-                "로컬 렌더·SBS·SPM을 변경하기 전에 이름을 먼저 수정하세요.",
-                "",
-            ]
-            lines.extend(
-                f"· {name}: {reason}" for name, reason in invalid_names[:8]
-            )
-            if len(invalid_names) > 8:
-                lines.append(f"· ... 외 {len(invalid_names) - 8}개")
-            messagebox.showerror("③ 실행 차단 · Unreal 이름 오류", "\n".join(lines))
-            self.status_var.set(
-                f"③ 실행 차단 · Unreal 이름 오류 {len(invalid_names)}개"
-            )
-            self._pending_step3_manifest_rows = []
-            return
+            return {
+                "jobs": [],
+                "skipped": skipped,
+                "sync_files": [],
+                "force_unreal_verify": False,
+                "eligible_row_keys": set(),
+                "exact_step3_spms": [],
+                "selected_rows": [],
+            }
+        selected_rows = list(self._checked_texplan_rows())
         eligible_row_keys = (
             self._step3_eligible_row_keys(excluded_row_keys)
             if excluded_row_keys
             else None
         )
+        normalization_rows = selected_rows
+        if eligible_row_keys is not None:
+            normalization_rows = [
+                (item, row)
+                for item, row in selected_rows
+                if step3_texture_row_key(
+                    item,
+                    row.get("atlas_base"),
+                ) in eligible_row_keys
+            ]
         exact_step3_spms = checked_step3_spms(
             self.items,
             allowed_folders=(
@@ -3807,56 +4760,171 @@ class App:
                 if eligible_row_keys is not None
                 else None
             ),
+            selected_texture_rows=normalization_rows,
         )
-        exclusions_confirmed = False
-        if skipped:
-            exclusions_confirmed = messagebox.askyesno(
-                "③ 오류 항목 제외 후 실행",
-                self._step3_exclusion_message(
-                    skipped,
-                    len(jobs),
-                    len(sync_files),
-                ),
-            )
-            if not exclusions_confirmed:
-                self.status_var.set(
-                    f"③ 실행 취소 · 계획 오류 {len(skipped)}개"
+        return {
+            "jobs": jobs,
+            "skipped": skipped,
+            "sync_files": sync_files,
+            "force_unreal_verify": force_unreal_verify,
+            "eligible_row_keys": eligible_row_keys,
+            "exact_step3_spms": exact_step3_spms,
+            "selected_rows": selected_rows,
+        }
+
+    def _run_step3_planning(self, shared_record=None):
+        plan = None
+        error = None
+        lease = None
+        try:
+            lease = self._wait_for_shared_execution(shared_record)
+            if lease is not None:
+                self._ui(
+                    lambda: self.status_var.set(
+                        "③ 실행 차례 도착 · 최신 대상 계획 계산 중..."
+                    )
                 )
-                self._pending_step3_manifest_rows = []
-                return
+            plan = self._build_step3_execution_plan()
+        except Exception as exc:
+            error = exc
+        self._ui(
+            lambda result=plan, failure=error, claimed=lease:
+            self._step3_planning_done(result, failure, claimed)
+        )
+
+    def start_step3(self):
+        if not self.report:
+            self.refresh()
+            self.status_var.set("검사가 끝난 뒤 ③을 다시 실행하세요.")
+            return
+        if getattr(self, "_busy", False):
+            self.status_var.set("현재 작업이 끝난 뒤 ③ 실행을 다시 누르세요.")
+            return
+        try:
+            shared = self._enqueue_shared_execution(
+                "PCG ③ 텍스처 생성/정규화/Unreal 동기화",
+                {
+                    "operation": "step3",
+                    "selected_folders": [
+                        str(folder)
+                        for folder, entry in self.items.items()
+                        if entry.get("checked")
+                    ],
+                },
+            )
+        except Exception as exc:
+            self._shared_execution_enqueue_failed(exc)
+            return
+        self._set_busy(True)
+        self.status_var.set(
+            "③ 공용 대기열 등록 · 실행 차례에 최신 계획을 계산합니다."
+        )
+        self.root.update_idletasks()
+        self.worker = threading.Thread(
+            target=self._run_step3_planning,
+            args=(shared,),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _step3_planning_done(self, plan, error=None, shared_lease=None):
+        """Launch the prepared Step 3 worker on the Tk thread."""
+
+        self.worker = None
+        if error is not None:
+            if shared_lease is not None and not shared_lease.finished:
+                try:
+                    shared_lease.finish(
+                        success=False,
+                        result={
+                            "tool": "pcg_st9_texture_batch",
+                            "operation": "step3_planning",
+                            "outcome": "failed",
+                            "error": str(error),
+                        },
+                    )
+                except Exception as queue_exc:
+                    error = RuntimeError(
+                        f"{error}; 공용 대기열 종료 기록 실패: {queue_exc}"
+                    )
+            self._pending_step3_manifest_rows = []
+            self._set_busy(False)
+            self.status_var.set("③ 대상 계획 실패")
+            messagebox.showerror("③ 실행 계획 실패", str(error))
+            self.log(f"[③ 실행 계획 실패] {error}")
+            return
+
+        jobs = plan["jobs"]
+        skipped = plan["skipped"]
+        sync_files = plan["sync_files"]
+        force_unreal_verify = plan["force_unreal_verify"]
+        eligible_row_keys = plan["eligible_row_keys"]
+        exact_step3_spms = plan["exact_step3_spms"]
+        selected_rows = plan["selected_rows"]
+        require_all_renders_for_sync = bool(
+            plan.get("require_all_renders_for_sync", False)
+        )
+        operation_label = str(
+            plan.get("operation_label")
+            or "PCG ③ 텍스처 생성/정규화/Unreal 동기화"
+        )
+
+        for item, base, reason in skipped:
+            self.log(f"[③ 건너뜀] {item['name']} / {base}: {reason}")
+        if skipped and not jobs and not sync_files:
+            lines = [
+                "오류 항목을 제외하면 ③에서 실행할 정상 대상이 없습니다.",
+                "",
+            ]
+            for item, base, reason in skipped[:8]:
+                lines.append(f"· {item['name']} / {base}: {reason}")
+            if len(skipped) > 8:
+                lines.append(f"· ... 외 {len(skipped) - 8}개")
+            messagebox.showerror("③ 실행 불가", "\n".join(lines))
+            self.status_var.set(f"③ 실행 차단 · 제외 대상 {len(skipped)}개")
+            self._pending_step3_manifest_rows = []
+            self._set_busy(False)
+            if shared_lease is not None and not shared_lease.finished:
+                shared_lease.finish(
+                    success=True,
+                    result={
+                        "tool": "pcg_st9_texture_batch",
+                        "operation": "step3",
+                        "outcome": "no_eligible_rows",
+                        "excluded": len(skipped),
+                    },
+                )
+            return
         if not jobs:
             if not sync_files:
                 messagebox.showinfo(
                     "③ 실행",
                     "체크된 항목에서 완성된 TGA 6장 세트나 생성 작업을 찾지 못했습니다.\n"
-                    "③ 컬럼의 누락 파일 또는 텍스처 계획 오류를 먼저 확인하세요.",
+                    "③ 컬럼의 누락 파일 또는 제외 사유를 확인하세요.",
                 )
                 self.status_var.set("대기")
                 self._pending_step3_manifest_rows = []
+                self._set_busy(False)
+                if shared_lease is not None and not shared_lease.finished:
+                    shared_lease.finish(
+                        success=True,
+                        result={
+                            "tool": "pcg_st9_texture_batch",
+                            "operation": "step3",
+                            "outcome": "nothing_to_do",
+                        },
+                    )
                 return
-            if force_unreal_verify:
-                confirm_message = (
-                    "선택한 텍스처는 마지막 성공 기록상 모두 최신입니다.\n\n"
-                    "receipt 캐시를 무시하고 Unreal에서 에셋 존재·MD5·"
-                    "텍스처 설정을 전체 재확인할까요?\n"
-                    "로컬 렌더·SBS·SPM은 변경하지 않습니다."
-                )
-            else:
-                confirm_message = (
-                    "6장 출력은 이미 있습니다.\n"
-                    "체크된 SK SPM의 머티리얼 슬롯을 정리하고 Unreal의 T_ 에셋도\n"
-                    "내용 해시 기준으로 확인·동기화할까요?"
-                )
-            if (
-                not exclusions_confirmed
-                and not messagebox.askyesno("③ 실행", confirm_message)
-            ):
-                self.status_var.set("대기")
-                self._pending_step3_manifest_rows = []
-                return
-            self._set_busy(True)
+            run_report_path, run_report = self._begin_step3_run_report(
+                [],
+                skipped,
+                [] if force_unreal_verify else exact_step3_spms,
+                sync_files,
+                force_unreal_verify=force_unreal_verify,
+                selected_rows=selected_rows,
+            )
             exclusion_status = (
-                f" · 계획 오류 제외 {len(skipped)}개"
+                f" · 오류 항목 제외 {len(skipped)}개"
                 if skipped else ""
             )
             self.status_var.set(
@@ -3864,69 +4932,58 @@ class App:
                 f"{exclusion_status}"
             )
             self.root.update_idletasks()
-            worker_options = {}
-            if skipped:
-                worker_options["kwargs"] = {
+            worker_kwargs = {}
+            if skipped and eligible_row_keys is not None:
+                worker_kwargs.update({
                     "planned_skipped": len(skipped),
-                    "allowed_step3_row_keys": tuple(
-                        sorted(eligible_row_keys)
-                    ),
-                }
-            self.worker = threading.Thread(
-                target=self._run_step3,
-                args=(
-                    [],
-                    [] if force_unreal_verify else exact_step3_spms,
-                    sync_files,
-                    force_unreal_verify,
-                ),
-                daemon=True,
-                **worker_options,
+                    "allowed_step3_row_keys": tuple(sorted(
+                        eligible_row_keys
+                    )),
+                })
+            if run_report_path:
+                worker_kwargs.update({
+                    "step3_run_report_path": run_report_path,
+                    "step3_run_report": run_report,
+                })
+            step3_args = (
+                [],
+                [] if force_unreal_verify else exact_step3_spms,
+                sync_files,
+                force_unreal_verify,
             )
+            if require_all_renders_for_sync:
+                step3_args += (True,)
+            if shared_lease is None:
+                self.worker = threading.Thread(
+                    target=self._run_step3,
+                    args=step3_args,
+                    daemon=True,
+                    **({"kwargs": worker_kwargs} if worker_kwargs else {}),
+                )
+            else:
+                self.worker = threading.Thread(
+                    target=self._run_claimed_shared_execution,
+                    args=(
+                        shared_lease,
+                        operation_label,
+                        self._run_step3,
+                        step3_args,
+                        worker_kwargs,
+                    ),
+                    daemon=True,
+                )
             self.worker.start()
             return
-        n_render = sum(1 for j in jobs if j["mode"] == "render")
-        n_insert = sum(1 for j in jobs if j["mode"] == "insert")
-        n_nosbs = sum(1 for j in jobs if j["mode"] == "render_only")
-        n_direct = sum(1 for j in jobs if j["mode"] == "direct")
-        n_cluster_normalize = sum(
-            1 for j in jobs if j.get("normalize_cluster"))
-        msg = ["③ 연결 텍스처 세트 만들기 (sbsrender, 원본 비율·최대 축 4K)\n"]
-        msg.append(f"렌더할 텍스처 세트 {len(jobs)}개 · 출력 {len(jobs) * len(sbs_auto.RENDER_MAPS)}장:")
-        msg.append(f" · SBS의 T_ 그래프 설정 사용 (기존 M_은 T_로 이름 변경): {n_render}개")
-        if n_insert:
-            msg.append(f" · SBS에 T_ 그래프 새로 넣고 렌더: {n_insert}개 (수정 전 SBS 백업 저장)")
-        if n_nosbs:
-            msg.append(f" · SBS 파일이 없어 텍스처만 생성: {n_nosbs}개")
-        if n_direct:
-            msg.append(
-                f" · 절차형 SBS 그래프 자체를 렌더: {n_direct}개"
-                + (f" (Cluster_System 연결·정규화 {n_cluster_normalize}개)"
-                   if n_cluster_normalize else ""))
-        for j in jobs[:10]:
-            mode_txt = {"render": "기존 그래프", "insert": "그래프 삽입",
-                        "render_only": "SBS 없음", "direct": "절차형 그래프"}[j["mode"]]
-            if j.get("normalize_cluster"):
-                mode_txt += " → Cluster 정규화"
-            msg.append(
-                f" · {j['base']} → {j['texture_base']} × {len(sbs_auto.RENDER_MAPS)} ({mode_txt})")
-        if len(jobs) > 10:
-            msg.append(f" · ... 외 {len(jobs) - 10}개")
-        if force_unreal_verify:
-            msg.append(
-                "\nUnreal은 receipt 캐시를 무시하고 전체 재확인합니다."
-            )
-        msg.append("\n묶음당 ~1분 걸립니다. 계속할까요?")
-        if (
-            not exclusions_confirmed
-            and not messagebox.askyesno("③ 실행", "\n".join(msg))
-        ):
-            self.status_var.set("대기")
-            self._pending_step3_manifest_rows = []
-            return
-        self._set_busy(True)
+        run_report_path, run_report = self._begin_step3_run_report(
+            jobs,
+            skipped,
+            exact_step3_spms,
+            sync_files,
+            force_unreal_verify=force_unreal_verify,
+            selected_rows=selected_rows,
+        )
         exclusion_status = (
-            f" · 계획 오류 제외 {len(skipped)}개" if skipped else ""
+            f" · 오류 항목 제외 {len(skipped)}개" if skipped else ""
         )
         self.status_var.set(
             f"③ 작업 시작 · 렌더 {len(jobs)}세트 · "
@@ -3936,42 +4993,75 @@ class App:
         # Shared texture owners can render on behalf of another checked row,
         # but only the exact checked/PCG-target SK paths may be normalized.
         # A folder can contain sibling variants that were not selected.
-        worker_options = {}
+        worker_kwargs = {}
         if skipped:
-            worker_options["kwargs"] = {
-                "planned_skipped": len(skipped),
-                "allowed_step3_row_keys": tuple(
-                    sorted(eligible_row_keys)
-                ),
-            }
-        self.worker = threading.Thread(
-            target=self._run_step3,
-            args=(
-                jobs,
-                exact_step3_spms,
-                sync_files,
-                force_unreal_verify,
-            ),
-            daemon=True,
-            **worker_options,
+            worker_kwargs["planned_skipped"] = len(skipped)
+        if skipped and eligible_row_keys is not None:
+            worker_kwargs.update({
+                "allowed_step3_row_keys": tuple(sorted(
+                    eligible_row_keys
+                )),
+            })
+        if run_report_path:
+            worker_kwargs.update({
+                "step3_run_report_path": run_report_path,
+                "step3_run_report": run_report,
+            })
+        step3_args = (
+            jobs,
+            exact_step3_spms,
+            sync_files,
+            force_unreal_verify,
         )
+        if require_all_renders_for_sync:
+            step3_args += (True,)
+        if shared_lease is None:
+            self.worker = threading.Thread(
+                target=self._run_step3,
+                args=step3_args,
+                daemon=True,
+                **({"kwargs": worker_kwargs} if worker_kwargs else {}),
+            )
+        else:
+            self.worker = threading.Thread(
+                target=self._run_claimed_shared_execution,
+                args=(
+                    shared_lease,
+                    operation_label,
+                    self._run_step3,
+                    step3_args,
+                    worker_kwargs,
+                ),
+                daemon=True,
+            )
         self.worker.start()
 
     def _run_step3(
             self, jobs, affected_spms, sync_files=None,
             force_unreal_verify=False, require_all_renders_for_sync=False,
-            planned_skipped=0, allowed_step3_row_keys=None):
+            planned_skipped=0, allowed_step3_row_keys=None,
+            step3_run_report_path=None, step3_run_report=None):
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
         sync_deferred = None
         sync_candidates = []
+        normalization_failed_row_keys = set()
+        run_report = step3_run_report
+        if run_report is not None:
+            run_report["status"] = "running"
+            self._save_step3_run_report(
+                step3_run_report_path,
+                run_report,
+                stage="worker_start",
+            )
         pending_manifest_rows = list(
             getattr(self, "_pending_step3_manifest_rows", []) or []
         )
         self._pending_step3_manifest_rows = []
         if pending_manifest_rows:
-            for row, files in pending_manifest_rows:
+            for manifest_index, (row, files) in enumerate(
+                    pending_manifest_rows):
                 try:
                     manifest = record_canonical_output(
                         row,
@@ -3985,8 +5075,68 @@ class App:
                     self._ui(lambda path=manifest: self.log(
                         f"[③ canonical manifest] {path}"
                     ))
+                    if run_report is not None:
+                        reuse_rows = (
+                            run_report.get("preflight", {})
+                            .get("existing_reuse", [])
+                        )
+                        if manifest_index < len(reuse_rows):
+                            reuse_rows[manifest_index].update({
+                                "manifest_status": "recorded",
+                                "manifest": str(manifest),
+                            })
+                        run_report["counts"]["manifests_recorded"] += 1
+                        self._save_step3_run_report(
+                            step3_run_report_path,
+                            run_report,
+                            stage="existing_manifest",
+                        )
                 except Exception as exc:
                     failed += 1
+                    failed_output_key = step3_texture_row_key(
+                        row,
+                        row.get("atlas_base"),
+                    )
+                    consumer_keys = [
+                        consumer_key
+                        for consumer_key, (_item, effective_row)
+                        in getattr(
+                            self,
+                            "_step3_effective_output_rows",
+                            {},
+                        ).items()
+                        if step3_texture_row_key(
+                            effective_row,
+                            effective_row.get("atlas_base"),
+                        ) == failed_output_key
+                    ]
+                    normalization_failed_row_keys.update(
+                        consumer_keys or (failed_output_key,)
+                    )
+                    if run_report is not None:
+                        reuse_rows = (
+                            run_report.get("preflight", {})
+                            .get("existing_reuse", [])
+                        )
+                        if manifest_index < len(reuse_rows):
+                            reuse_rows[manifest_index].update({
+                                "manifest_status": "failed",
+                                "error": str(exc),
+                            })
+                        run_report["failures"].append({
+                            "stage": "canonical_manifest",
+                            "row": step3_row_key_json(
+                                step3_texture_row_key(
+                                    row, row.get("atlas_base")
+                                )
+                            ),
+                            "reason": str(exc),
+                        })
+                        self._save_step3_run_report(
+                            step3_run_report_path,
+                            run_report,
+                            stage="existing_manifest_failed",
+                        )
                     self._ui(lambda e=exc: self.log(
                         f"[③ canonical manifest 실패] {e}"
                     ))
@@ -3997,6 +5147,17 @@ class App:
         for index, job in enumerate(jobs, 1):
             base = job["base"]
             texture_base = job["texture_base"]
+            render_row = None
+            if run_report is not None:
+                render_rows = run_report.get("render") or []
+                if index - 1 < len(render_rows):
+                    render_row = render_rows[index - 1]
+                    render_row["status"] = "running"
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="render_start",
+                    )
             self._ui(lambda i=index, b=base, t=texture_base: self.status_var.set(
                 f"③ {i}/{total}: {b} → {t} 렌더 중..."))
             self._ui(lambda it=job["item"]: self.tree.set(it["folder"], "step3", "렌더 중..."))
@@ -4004,14 +5165,83 @@ class App:
                 result = run_texture_job(job, self.cfg, timeout)
                 sync_candidates.extend(result.get("files") or [])
                 done += 1
+                if render_row is not None:
+                    render_row.update({
+                        "status": "succeeded",
+                        "files": [
+                            str(path)
+                            for path in result.get("files") or []
+                        ],
+                        "canonical_manifest": (
+                            str(result["canonical_manifest"])
+                            if result.get("canonical_manifest") else None
+                        ),
+                    })
+                    run_report["counts"]["render_succeeded"] += 1
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="render_succeeded",
+                    )
                 self._ui(lambda b=base, r=result: self.log(
                     f"[③ 완료] {b} → {r['texture_base']} — "
                     f"{len(r['files'])}장 / {Path(r['files'][0]).parent}"))
                 continue
             except Exception as exc:
                 failed += 1
+                normalization_failed_row_keys.update(
+                    tuple(key)
+                    for key in job.get("step3_consumer_row_keys") or (
+                        step3_texture_row_key(
+                            job.get("item") or {},
+                            job.get("base"),
+                        ),
+                    )
+                )
+                if render_row is not None:
+                    render_row.update({
+                        "status": "failed",
+                        "error": str(exc),
+                    })
+                    run_report["counts"]["render_failed"] += 1
+                    run_report["failures"].append({
+                        "stage": "render",
+                        "owner": render_row.get("owner"),
+                        "reason": str(exc),
+                    })
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="render_failed",
+                    )
                 self._ui(lambda b=base, e=exc: self.log(f"[③ 실패] {b}: {e}"))
-        if failed == 0 and affected_spms:
+        if run_report is not None:
+            if affected_spms:
+                run_report["normalization"] = {
+                    "status": (
+                        "running_partial"
+                        if normalization_failed_row_keys
+                        else "running"
+                    ),
+                    "targets": [str(path) for path in affected_spms],
+                    "excluded_failed_rows": [
+                        step3_row_key_json(key)
+                        for key in sorted(
+                            normalization_failed_row_keys
+                        )
+                    ],
+                }
+                self._save_step3_run_report(
+                    step3_run_report_path,
+                    run_report,
+                    stage="normalization_start",
+                )
+            else:
+                run_report["normalization"] = {
+                    "status": "no_targets",
+                    "targets": [],
+                }
+        if affected_spms:
             try:
                 self._ui(lambda: self.status_var.set("③ SK SPM 머티리얼 슬롯 정리 중..."))
                 affected_keys = {
@@ -4019,23 +5249,40 @@ class App:
                     for path in affected_spms
                 }
                 affected_folders = sorted({
-                    str(Path(path).parent) for path in affected_spms
+                    str(step3_audit_folder_for_spm(path))
+                    for path in affected_spms
                 }, key=os.path.normcase)
                 report = make_report(self.cfg, targets=affected_folders)
                 persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
                 exact_plan = dict(plan)
-                if allowed_step3_row_keys is not None:
-                    allowed_rows = {
+                allowed_rows = (
+                    {
                         tuple(key) for key in allowed_step3_row_keys
                     }
+                    if allowed_step3_row_keys is not None
+                    else None
+                )
+                if (
+                    allowed_rows is not None
+                    or normalization_failed_row_keys
+                ):
                     exact_plan["items"] = [
                         row for row in plan.get("items") or []
-                        if step3_texture_row_key(
-                            {"folder": row.get("folder")},
-                            row.get("atlas_base"),
-                        ) in allowed_rows
+                        if (
+                            (
+                                allowed_rows is None
+                                or step3_texture_row_key(
+                                    {"folder": row.get("folder")},
+                                    row.get("atlas_base"),
+                                ) in allowed_rows
+                            )
+                            and step3_texture_row_key(
+                                {"folder": row.get("folder")},
+                                row.get("atlas_base"),
+                            ) not in normalization_failed_row_keys
+                        )
                     ]
                 exact_plan["preserved_cluster_materials"] = [
                     row for row in plan.get("preserved_cluster_materials") or []
@@ -4049,19 +5296,96 @@ class App:
                     spm_jobs,
                     backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
                     skip_unbuildable=True,
+                    allow_partial_materials=True,
                 )
                 cleanup = cleanup_preserved_cluster_outputs(exact_plan)
+                if run_report is not None:
+                    normalized_spms = [
+                        str(path) for path in normalized.get("spms") or []
+                    ]
+                    skipped_spms = [{
+                        "spm": str(entry.get("spm") or ""),
+                        "reason": str(entry.get("reason") or ""),
+                    } for entry in normalized.get("skipped") or []]
+                    skipped_materials = [{
+                        "spm": str(entry.get("spm") or ""),
+                        "material_id": str(
+                            entry.get("material_id") or ""
+                        ),
+                        "material_name": str(
+                            entry.get("material_name") or ""
+                        ),
+                        "reason": str(entry.get("reason") or ""),
+                    } for entry in normalized.get("skipped_materials") or []]
+                    run_report["normalization"] = {
+                        "status": (
+                            "partial_success"
+                            if (
+                                normalization_failed_row_keys
+                                or skipped_spms
+                                or skipped_materials
+                            )
+                            else "succeeded"
+                        ),
+                        "normalized_spms": normalized_spms,
+                        "materials": int(normalized.get("materials", 0)),
+                        "backup_dir": normalized.get("backup_dir"),
+                        "skipped": skipped_spms,
+                        "skipped_materials": skipped_materials,
+                        "excluded_failed_rows": [
+                            step3_row_key_json(key)
+                            for key in sorted(
+                                normalization_failed_row_keys
+                            )
+                        ],
+                    }
+                    run_report["counts"]["spms_normalized"] = len(
+                        normalized_spms
+                    )
+                    run_report["counts"]["spms_skipped"] = len(
+                        skipped_spms
+                    )
+                    run_report["counts"]["materials_skipped"] = len(
+                        skipped_materials
+                    )
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="normalization_succeeded",
+                    )
                 self._ui(lambda r=normalized: self.log(
                     f"[③ SK SPM 정리] {len(r['spms'])}개 SPM / "
                     f"{r['materials']}개 머티리얼 — 백업: {r['backup_dir']}"))
                 for entry in normalized.get("skipped", []):
                     self._ui(lambda e=entry: self.log(
                         f"[③ SK SPM 정리 건너뜀] {Path(e['spm']).name}: {e['reason']}"))
+                for entry in normalized.get("skipped_materials", []):
+                    self._ui(lambda e=entry: self.log(
+                        "[③ SK SPM 머티리얼 건너뜀] "
+                        f"{Path(e['spm']).name} / "
+                        f"{e.get('material_name') or e.get('material_id')}: "
+                        f"{e['reason']}"
+                    ))
                 if cleanup["cleaned"]:
                     self._ui(lambda r=cleanup: self.log(
                         f"[③ Cluster 원본 보존] {len(r['cleaned'])}개 머티리얼 복원"))
             except Exception as exc:
                 failed += 1
+                if run_report is not None:
+                    run_report["normalization"] = {
+                        "status": "failed",
+                        "targets": [str(path) for path in affected_spms],
+                        "error": str(exc),
+                    }
+                    run_report["failures"].append({
+                        "stage": "spm_normalization",
+                        "reason": str(exc),
+                    })
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="normalization_failed",
+                    )
                 self._ui(lambda e=exc: self.log(
                     f"[③ SK SPM 정리 실패] 출력 파일은 보존됨, SPM은 변경하지 않음: {e}"))
         sync_allowed = not require_all_renders_for_sync or failed == 0
@@ -4069,6 +5393,16 @@ class App:
             self._ui(lambda count=failed: self.log(
                 f"[③ Unreal 동기화 건너뜀] 렌더 실패 {count}개 — "
                 "전체 재추출 성공 후 한 번에 동기화합니다."))
+        if run_report is not None:
+            if not self.cfg.get("unreal_texture_sync_enabled", True):
+                run_report["unreal_sync"] = {"status": "disabled"}
+            elif not sync_candidates:
+                run_report["unreal_sync"] = {"status": "no_candidates"}
+            elif not sync_allowed:
+                run_report["unreal_sync"] = {
+                    "status": "skipped_due_render_failure",
+                    "candidate_count": len(sync_candidates),
+                }
         if (sync_allowed and sync_candidates
                 and self.cfg.get("unreal_texture_sync_enabled", True)):
             try:
@@ -4080,6 +5414,20 @@ class App:
                     if key not in seen_candidates:
                         seen_candidates.add(key)
                         unique_candidates.append(absolute)
+                if run_report is not None:
+                    run_report["unreal_sync"] = {
+                        "status": "running",
+                        "candidates": list(unique_candidates),
+                        "force_verify": bool(force_unreal_verify),
+                    }
+                    run_report["counts"]["sync_candidates"] = len(
+                        unique_candidates
+                    )
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="unreal_sync_start",
+                    )
                 status_text = (
                     "③ Unreal 전체 재확인 중..."
                     if force_unreal_verify else
@@ -4136,6 +5484,32 @@ class App:
                     len(errors), int(counts.get("error", 0)))
                 failed += sync_summary["failed"]
                 sync_report_path = sync_report.get("report_path")
+                if run_report is not None:
+                    run_report["counts"].update({
+                        "sync_latest": sync_summary["latest"],
+                        "sync_changed": sync_summary["changed"],
+                        "sync_failed": sync_summary["failed"],
+                    })
+                    run_report["unreal_sync"].update({
+                        "status": (
+                            "failed"
+                            if sync_summary["failed"] else "succeeded"
+                        ),
+                        "mode": mode,
+                        "counts": dict(counts),
+                        "errors": errors,
+                        "report_path": sync_report_path,
+                    })
+                    for error in errors:
+                        run_report["failures"].append({
+                            "stage": "unreal_sync",
+                            "reason": str(error),
+                        })
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="unreal_sync_finished",
+                    )
                 self._ui(lambda c=counts, m=mode: self.log(
                     "[③ Unreal 동기화] "
                     f"방식={m} · 동일 {c.get('unchanged', 0)} · "
@@ -4161,13 +5535,66 @@ class App:
                 failed += 1
                 sync_summary["failed"] += 1
                 sync_deferred = str(exc)
+                if run_report is not None:
+                    run_report["counts"]["sync_failed"] += 1
+                    run_report["unreal_sync"].update({
+                        "status": "deferred",
+                        "error": str(exc),
+                    })
+                    run_report["failures"].append({
+                        "stage": "unreal_sync_deferred",
+                        "reason": str(exc),
+                    })
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="unreal_sync_deferred",
+                    )
                 self._ui(lambda e=exc: self.log(
                     f"[③ Unreal 동기화 보류] 로컬 TGA/SPM은 완료됨: {e}"))
             except Exception as exc:
                 failed += 1
                 sync_summary["failed"] += 1
+                if run_report is not None:
+                    run_report["counts"]["sync_failed"] += 1
+                    run_report["unreal_sync"].update({
+                        "status": "failed",
+                        "error": str(exc),
+                    })
+                    run_report["failures"].append({
+                        "stage": "unreal_sync",
+                        "reason": str(exc),
+                    })
+                    self._save_step3_run_report(
+                        step3_run_report_path,
+                        run_report,
+                        stage="unreal_sync_failed",
+                    )
                 self._ui(lambda e=exc: self.log(
                     f"[③ Unreal 동기화 실패] 로컬 TGA/SPM은 보존됨: {e}"))
+        if run_report is not None:
+            run_report["status"] = (
+                "failed"
+                if failed else
+                "partial_success"
+                if planned_skipped else
+                "success"
+            )
+            run_report["finished_at"] = datetime.now().astimezone().isoformat()
+            run_report["final"] = {
+                "render_succeeded": done,
+                "failed": failed,
+                "planned_skipped": planned_skipped,
+                "sync": dict(sync_summary),
+            }
+            self._save_step3_run_report(
+                step3_run_report_path,
+                run_report,
+                stage="final",
+            )
+            self._ui(lambda path=step3_run_report_path: self.log(
+                f"[③ 실행 리포트 완료] {path}"
+            ))
         self._ui(lambda: self._step3_finished(
             done,
             failed,
@@ -4176,6 +5603,16 @@ class App:
             sync_deferred,
             planned_skipped,
         ))
+        return {
+            "shared_queue_success": failed == 0,
+            "shared_queue_result": {
+                "operation": "step3",
+                "render_completed": done,
+                "failed": failed,
+                "planned_skipped": planned_skipped,
+                "sync": dict(sync_summary),
+            },
+        }
 
     def _step3_finished(self, render_done, failed, sync_summary,
                         report_path=None, deferred=None,
@@ -4198,7 +5635,9 @@ class App:
                 "③ 부분 완료:",
                 1,
             )
-            summary += f" · 계획 오류 제외 {planned_skipped}개"
+            summary += f" · 오류 항목 제외 {planned_skipped}개"
+            if failed == 0:
+                summary += " · 나머지 완료"
         self.log(summary)
         if report_path:
             self.log(f"③ 결과 리포트: {report_path}")
@@ -4298,6 +5737,11 @@ class App:
             return
         subprocess.Popen(["explorer", item["folder"]])
 
+    def shutdown_shared_queue(self):
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is not None:
+            runtime.shutdown()
+
 
 def main():
     root = tk.Tk()
@@ -4305,7 +5749,13 @@ def main():
         ttk.Style().theme_use("vista")
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+
+    def close():
+        app.shutdown_shared_queue()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
 
 

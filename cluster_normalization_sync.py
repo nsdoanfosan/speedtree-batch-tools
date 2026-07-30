@@ -119,6 +119,22 @@ def _material_record(node, target_spm):
     }
 
 
+def _atlas_managed_material_scope(node):
+    """Return the owning Atlas scope for an explicitly managed material."""
+    try:
+        marker = json.loads(str(node.findtext("UserData") or "").strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(marker, dict):
+        return ""
+    if (
+        str(marker.get("generator") or "") != "Atlas Leaf Mesh Builder"
+        or str(marker.get("kind") or "") != "material"
+    ):
+        return ""
+    return str(marker.get("scope") or "").strip()
+
+
 def _material_mesh_ids(node):
     values = []
     primary = _integer_text(node.findtext("CutoutMeshID"))
@@ -452,15 +468,52 @@ def _resolve_target_role_material(target_spm, generated_material_name):
         if str(node.get("Name") or "").casefold()
         == generated_material_name.casefold()
     ]
+    legacy_managed_duplicate = None
     if len(exact) > 1:
-        raise ClusterNormalizationSyncError(
-            "Automatic Cluster normalization found duplicate output materials "
-            f"{generated_material_name!r}: {target_spm}"
-        )
+        referenced_exact = [
+            node
+            for node in exact
+            if _integer_text(node.get("ID")) in referenced_ids
+        ]
+        managed_unreferenced = [
+            node
+            for node in exact
+            if _integer_text(node.get("ID")) not in referenced_ids
+            and _atlas_managed_material_scope(node)
+        ]
+        # Older Atlas runs could inject a separate, unconnected output using
+        # the same name as the authored Tree material.  That state is
+        # unambiguous when exactly one material is live on a Generator and the
+        # only other material carries an explicit Atlas ownership marker.  The
+        # Atlas adoption transaction can then absorb the managed output into
+        # the connected source material without a per-asset exception.
+        if (
+            len(exact) == 2
+            and len(referenced_exact) == 1
+            and len(managed_unreferenced) == 1
+        ):
+            exact = referenced_exact
+            managed = managed_unreferenced[0]
+            legacy_managed_duplicate = {
+                "material_id": _integer_text(managed.get("ID")),
+                "material_name": str(managed.get("Name") or ""),
+                "atlas_scope": _atlas_managed_material_scope(managed),
+                "resolution": "migrate_managed_output_into_connected_source",
+            }
+        else:
+            duplicate_ids = [
+                _integer_text(node.get("ID"))
+                for node in exact
+            ]
+            raise ClusterNormalizationSyncError(
+                "Automatic Cluster normalization found ambiguous duplicate "
+                f"output materials {generated_material_name!r} "
+                f"(IDs {duplicate_ids}): {target_spm}"
+            )
     if exact:
         record = _material_record(exact[0], target_spm)
         connect_generators = record["material_id"] in referenced_ids
-        return {
+        resolved = {
             "target_spm": str(Path(target_spm).expanduser().absolute()),
             # SpeedTree name matching above is intentionally case-insensitive,
             # but Atlas in-place adoption is exact.  Once an existing output
@@ -483,6 +536,11 @@ def _resolve_target_role_material(target_spm, generated_material_name):
                 else []
             ),
         }
+        if legacy_managed_duplicate is not None:
+            resolved["legacy_managed_duplicate"] = (
+                legacy_managed_duplicate
+            )
+        return resolved
 
     family = _material_family_name(generated_material_name)
     family_candidates = [

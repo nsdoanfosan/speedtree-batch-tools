@@ -109,6 +109,134 @@ class FakeTree:
 
 
 class SkBatchUiConvenienceTests(unittest.TestCase):
+    def test_temporary_push_selection_requires_cluster_without_assembly(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ordinary = root / "tree_oak" / "SK_tree_oak_01.spm"
+            pass_through = (
+                root / "tree_pine" / "SK_tree_pine_01.spm"
+            )
+            missing = root / "tree_fir" / "SK_tree_fir_01.spm"
+            assembly = root / "tree_elm" / "SK_tree_elm_01.spm"
+            provider = (
+                root / "tree_elm" / "cluster" /
+                "SK_cluster_elm_01.spm"
+            )
+            pass_provider = (
+                root / "tree_pine" / "Cluster" /
+                "SK_cluster_pine_01.spm"
+            )
+            missing_provider = (
+                root / "tree_fir" / "cluster" /
+                "SK_cluster_fir_01.spm"
+            )
+            for spm in (
+                ordinary,
+                pass_through,
+                missing,
+                assembly,
+                provider,
+                pass_provider,
+                missing_provider,
+            ):
+                spm.parent.mkdir(parents=True, exist_ok=True)
+                spm.write_bytes(b"spm")
+
+            pass_report = gui.repair_pipeline_report_path(pass_through)
+            pass_report.parent.mkdir(parents=True, exist_ok=True)
+            pass_report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {
+                        "status": "pass_through",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            assembly_report = gui.repair_pipeline_report_path(assembly)
+            assembly_report.parent.mkdir(parents=True, exist_ok=True)
+            assembly_report.write_text(
+                json.dumps({
+                    "cluster_assembly_manifest": {
+                        "status": "ready",
+                        "manifest": {"path": "assembly.json"},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                gui.is_cluster_without_assembly_push_row(ordinary)
+            )
+            self.assertTrue(
+                gui.is_cluster_without_assembly_push_row(pass_through)
+            )
+            self.assertTrue(
+                gui.is_cluster_without_assembly_push_row(missing)
+            )
+            self.assertFalse(
+                gui.is_cluster_without_assembly_push_row(assembly)
+            )
+            self.assertFalse(
+                gui.is_cluster_without_assembly_push_row(provider)
+            )
+            self.assertFalse(
+                gui.is_cluster_without_assembly_push_row(pass_provider)
+            )
+
+            app = gui.App.__new__(gui.App)
+            app.tree = FakeTree()
+            app.log = mock.Mock()
+            app.items = {
+                str(ordinary): {
+                    "spm": ordinary,
+                    "display_name": ordinary.name,
+                    "checked": False,
+                    "manual_bones_locked": False,
+                },
+                str(missing): {
+                    "spm": missing,
+                    "display_name": missing.name,
+                    "checked": False,
+                    "manual_bones_locked": False,
+                },
+                str(assembly): {
+                    "spm": assembly,
+                    "display_name": assembly.name,
+                    "checked": True,
+                    "manual_bones_locked": False,
+                },
+                str(provider): {
+                    "spm": provider,
+                    "display_name": provider.name,
+                    "checked": True,
+                    "manual_bones_locked": False,
+                },
+            }
+            app.checked_rows = gui.CheckedRowController(
+                app.items, app._redraw_checked_row
+            )
+
+            count = app._set_temporary_cluster_without_assembly_push_rows()
+
+            self.assertEqual(count, 1)
+            self.assertFalse(app.items[str(ordinary)]["checked"])
+            self.assertTrue(app.items[str(missing)]["checked"])
+            self.assertFalse(app.items[str(assembly)]["checked"])
+            self.assertFalse(app.items[str(provider)]["checked"])
+            self.assertTrue(
+                app.tree.labels[str(ordinary)].startswith(gui.CHECK_OFF)
+            )
+            self.assertTrue(
+                app.tree.labels[str(missing)].startswith(gui.CHECK_ON)
+            )
+            self.assertTrue(
+                app.tree.labels[str(assembly)].startswith(gui.CHECK_OFF)
+            )
+            self.assertTrue(
+                app.tree.labels[str(provider)].startswith(gui.CHECK_OFF)
+            )
+
     def test_blender_repair_adds_and_blocks_only_exact_cluster_dependencies(self):
         gui = load_gui_module()
         owner = Path(r"D:\Trees\Birch")
@@ -186,6 +314,63 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             (str(cluster),),
         )
         self.assertEqual(auto_added, {str(cluster)})
+
+    def test_blender_dependencies_intersect_registry_with_live_spm_usage(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_densiflora"
+            cluster_dir = owner / "Cluster"
+            cluster_dir.mkdir(parents=True)
+            roots = [
+                owner / f"SK_tree_densiflora_{index:02d}.spm"
+                for index in range(1, 7)
+            ]
+            clusters = [
+                cluster_dir / f"SK_cluster_densiflora_{index:02d}.spm"
+                for index in range(1, 4)
+            ]
+            for path in roots + clusters:
+                path.touch()
+            from atlas_target_registry import save_target_registry
+
+            save_target_registry(clusters[0].with_suffix(".blend"), roots)
+            save_target_registry(clusters[1].with_suffix(".blend"), roots)
+            save_target_registry(
+                clusters[2].with_suffix(".blend"),
+                roots[4:],
+            )
+            items = [{"spm": root} for root in roots]
+            items.extend([
+                {
+                    "spm": clusters[0],
+                    "referenced_by_spms": tuple(roots[:4]),
+                },
+                {
+                    "spm": clusters[1],
+                    "referenced_by_spms": tuple(roots[:4]),
+                },
+                {
+                    "spm": clusters[2],
+                    "referenced_by_spms": tuple(roots[4:]),
+                },
+            ])
+
+            ordered, dependencies, auto_added = (
+                gui.expand_blender_repair_targets(
+                    [{"spm": roots[4]}],
+                    items,
+                )
+            )
+
+        self.assertEqual(
+            [item["spm"] for item in ordered],
+            [clusters[2], roots[4]],
+        )
+        self.assertEqual(
+            dependencies[str(roots[4])],
+            (str(clusters[2]),),
+        )
+        self.assertEqual(auto_added, {str(clusters[2])})
 
     def test_recent_24_hours_checks_only_recent_authoritative_spms(self):
         gui = load_gui_module()
@@ -413,7 +598,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         # Cluster rows use the dedicated one-root-per-piece stage-① policy.
         self.assertTrue(gui.should_calibrate_spm(app.items[iid]))
 
-    def test_cluster_authoring_spm_uses_dedicated_root_only_calibration(self):
+    def test_only_cluster_authoring_spm_uses_root_only_calibration(self):
         # Canonical and legacy Cluster row names both route through stage ①;
         # spm_audit selects the first renderable structural roots and writes
         # Absolute/1 instead of using the normal tree density solver.
@@ -438,7 +623,50 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             "source_read_only": False,
             "manual_bones_locked": False,
         }
-        self.assertTrue(gui.should_calibrate_spm(tree_item))
+        self.assertFalse(gui.should_calibrate_spm(tree_item))
+
+    def test_canonical_atlas_manifest_preflight_runs_before_blender(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        result = {
+            "status": "updated",
+            "updated": ["scope.json"],
+            "current": [],
+            "pending": [],
+        }
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            return_value=result,
+        ) as refresh:
+            actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual, result)
+        refresh.assert_called_once_with(spm, require_complete=True)
+        app.log.assert_called_once()
+
+    def test_canonical_atlas_manifest_preflight_skips_owner_spm(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/SK_tree_elm_01.spm")
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+        ) as refresh:
+            actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual["status"], "not_applicable")
+        self.assertEqual(
+            actual["reason"],
+            "owner_spm_is_not_an_atlas_producer",
+        )
+        refresh.assert_not_called()
+        app.log.assert_not_called()
 
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()

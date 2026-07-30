@@ -1450,10 +1450,15 @@ def run_cluster_relation_transaction(
     if not targets:
         raise ClusterBlendSyncError("No Cluster relationship target was selected")
     registered_before = _registry_target_spms(blend)
-    effective_targets = (
+    # Registry ON/OFF is persistent user intent, not the execution scope.
+    # The caller already selected the exact live content relations owned by
+    # this producer. Expanding the worker back to every registered target
+    # makes an unused/stale registry entry mutate or block an unrelated Tree.
+    effective_targets = list(targets)
+    registered_contract = (
         _merge_target_spms(registered_before, targets)
         if enabled
-        else list(targets)
+        else list(registered_before)
     )
     requested_keys = {normalized_path_key(path) for path in targets}
     registered_keys = {
@@ -1660,16 +1665,16 @@ def run_cluster_relation_transaction(
                 if {
                     normalized_path_key(path) for path in registered_after
                 } != {
-                    normalized_path_key(path) for path in effective_targets
+                    normalized_path_key(path) for path in registered_contract
                 }:
                     raise ClusterBlendSyncError(
-                        "Cluster target registry changed while the effective "
-                        "ON target contract was being prepared."
+                        "Cluster target registry changed outside the requested "
+                        "ON relation update."
                     )
 
-            # The Blender job rebuilds every registered target, not only the
-            # selected ones, so the whole registry is at risk - not just
-            # ``targets``.
+            # The Blender job owns exactly the requested live relation slice.
+            # Registered-but-unrequested targets are persistent intent only
+            # and must remain outside this transaction.
             snapshots = _snapshot_spm_files(
                 at_risk.values(), Path(temporary) / "spm_snapshots"
             )
