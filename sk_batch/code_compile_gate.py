@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
+import io
+import json
 import os
 import sys
 import time
@@ -31,6 +34,7 @@ IGNORED_DIRECTORY_NAMES = {
     "node_modules",
     "work",
 }
+PRODUCTION_SOURCE_MANIFEST_VERSION = 1
 RUNTIME_COMPILE_NAMES = {
     "_batch_compile_enabled",
     "_compile_blender_wave",
@@ -44,10 +48,41 @@ class CompileGateError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ProductionSourceFile:
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ProductionSourceManifest:
+    schema_version: int
+    source_count: int
+    content_hash: str
+    files: tuple
+
+    def as_dict(self):
+        return {
+            "schema_version": self.schema_version,
+            "source_count": self.source_count,
+            "content_hash": self.content_hash,
+            "files": [
+                {
+                    "path": record.path,
+                    "size": record.size,
+                    "sha256": record.sha256,
+                }
+                for record in self.files
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class CompileGateResult:
     source_count: int
     contract_count: int
     elapsed_seconds: float
+    production_source_manifest: ProductionSourceManifest
 
 
 def _read_python_source(path: Path) -> str:
@@ -69,21 +104,234 @@ def _production_sources(repo_root: Path):
                 yield path
 
 
-def compile_repository_sources(repo_root=REPO_ROOT) -> int:
-    """Compile repository Python sources in memory without importing them."""
+def _decode_python_source(payload: bytes, path: Path) -> str:
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(payload).readline)
+        return payload.decode(encoding)
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise CompileGateError(
+            f"Python source decode failed: {path}: {exc}"
+        ) from exc
+
+
+def _manifest_hash(schema_version, records):
+    payload = {
+        "schema_version": schema_version,
+        "source_count": len(records),
+        "files": [
+            {
+                "path": record.path,
+                "size": record.size,
+                "sha256": record.sha256,
+            }
+            for record in records
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _production_source_snapshot(repo_root):
     repo_root = Path(repo_root).resolve()
-    source_count = 0
+    snapshots = []
+    records = []
     for path in _production_sources(repo_root):
-        source = _read_python_source(path)
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise CompileGateError(
+                f"Python source read failed: {path.relative_to(repo_root)}: {exc}"
+            ) from exc
+        relative = path.relative_to(repo_root).as_posix()
+        snapshots.append((path, _decode_python_source(payload, Path(relative))))
+        records.append(
+            ProductionSourceFile(
+                path=relative,
+                size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
+        )
+    if not records:
+        raise CompileGateError(f"No Python sources found under {repo_root}")
+    records = tuple(records)
+    return tuple(snapshots), ProductionSourceManifest(
+        schema_version=PRODUCTION_SOURCE_MANIFEST_VERSION,
+        source_count=len(records),
+        content_hash=_manifest_hash(
+            PRODUCTION_SOURCE_MANIFEST_VERSION,
+            records,
+        ),
+        files=records,
+    )
+
+
+def _compile_repository_sources(repo_root=REPO_ROOT):
+    repo_root = Path(repo_root).resolve()
+    snapshots, manifest = _production_source_snapshot(repo_root)
+    for path, source in snapshots:
         try:
             compile(source, str(path), "exec", dont_inherit=True)
         except (SyntaxError, ValueError) as exc:
-            relative = path.relative_to(repo_root)
-            raise CompileGateError(f"Python compile failed: {relative}: {exc}") from exc
-        source_count += 1
-    if source_count == 0:
-        raise CompileGateError(f"No Python sources found under {repo_root}")
-    return source_count
+            raise CompileGateError(
+                f"Python compile failed: {path.relative_to(repo_root)}: {exc}"
+            ) from exc
+    return manifest
+
+
+def production_source_manifest(repo_root=REPO_ROOT):
+    """Return the exact path/content manifest used as the worker revision."""
+    return _production_source_snapshot(repo_root)[1]
+
+
+def compile_repository_sources(repo_root=REPO_ROOT) -> int:
+    """Compile the exact byte snapshot represented by the source manifest."""
+    return _compile_repository_sources(repo_root).source_count
+
+
+def _manifest_from_payload(payload, label):
+    if isinstance(payload, ProductionSourceManifest):
+        return payload
+    try:
+        schema_version = int(payload["schema_version"])
+        source_count = int(payload["source_count"])
+        content_hash = str(payload["content_hash"]).casefold()
+        records = tuple(
+            ProductionSourceFile(
+                path=str(row["path"]),
+                size=int(row["size"]),
+                sha256=str(row["sha256"]).casefold(),
+            )
+            for row in payload["files"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompileGateError(f"{label} is malformed") from exc
+    if (
+        schema_version != PRODUCTION_SOURCE_MANIFEST_VERSION
+        or source_count != len(records)
+        or not records
+        or len({record.path for record in records}) != len(records)
+        or any(
+            not record.path
+            or record.size < 0
+            or len(record.sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in record.sha256
+            )
+            for record in records
+        )
+        or content_hash != _manifest_hash(schema_version, records)
+    ):
+        raise CompileGateError(f"{label} content hash is invalid")
+    return ProductionSourceManifest(
+        schema_version=schema_version,
+        source_count=source_count,
+        content_hash=content_hash,
+        files=records,
+    )
+
+
+def validate_production_source_manifest(
+    expected,
+    actual,
+    label="Production source",
+):
+    expected = _manifest_from_payload(expected, "Expected production manifest")
+    actual = _manifest_from_payload(actual, label)
+    if expected != actual:
+        expected_files = {record.path: record for record in expected.files}
+        actual_files = {record.path: record for record in actual.files}
+        changed = [
+            path
+            for path in sorted(set(expected_files) | set(actual_files))
+            if expected_files.get(path) != actual_files.get(path)
+        ]
+        detail = ", ".join(changed[:5]) or "manifest metadata"
+        if len(changed) > 5:
+            detail += f" and {len(changed) - 5} more"
+        raise CompileGateError(
+            f"{label} revision mismatch: expected {expected.content_hash}, "
+            f"actual {actual.content_hash}; changed: {detail}"
+        )
+    return actual
+
+
+def production_source_revision_state(
+    expected_content_hash,
+    started_manifest,
+    finished_manifest=None,
+):
+    expected = str(expected_content_hash or "").strip().casefold()
+    started = _manifest_from_payload(
+        started_manifest,
+        "Started production manifest",
+    )
+    finished = _manifest_from_payload(
+        finished_manifest or started,
+        "Finished production manifest",
+    )
+    return {
+        "manifest_schema_version": PRODUCTION_SOURCE_MANIFEST_VERSION,
+        "expected_content_hash": expected,
+        "started": started.as_dict(),
+        "finished": finished.as_dict(),
+        "matches_expected": bool(
+            expected
+            and started.content_hash == expected
+            and finished.content_hash == expected
+        ),
+        "stable": started == finished,
+    }
+
+
+def validate_production_source_revision_report(report, expected_manifest):
+    expected = _manifest_from_payload(
+        expected_manifest,
+        "Expected production manifest",
+    )
+    state = (
+        report.get("production_source_revision")
+        if isinstance(report, dict)
+        else None
+    )
+    if not isinstance(state, dict):
+        raise CompileGateError(
+            "Child report has no production_source_revision assertion"
+        )
+    if (
+        state.get("manifest_schema_version")
+        != PRODUCTION_SOURCE_MANIFEST_VERSION
+        or str(state.get("expected_content_hash") or "").casefold()
+        != expected.content_hash
+    ):
+        raise CompileGateError(
+            "Child production source revision metadata differs from batch"
+        )
+    started = validate_production_source_manifest(
+        expected,
+        state.get("started"),
+        label="Child-start production source",
+    )
+    finished = validate_production_source_manifest(
+        expected,
+        state.get("finished"),
+        label="Child-finish production source",
+    )
+    if (
+        state.get("matches_expected") is not True
+        or state.get("stable") is not True
+        or started != finished
+    ):
+        raise CompileGateError(
+            "Child production source revision assertion is not stable"
+        )
+    return state
 
 
 def _function(module: ast.Module, name: str) -> ast.FunctionDef:
@@ -377,15 +625,22 @@ def validate_gui_contracts(source: str, filename=str(GUI_PATH)) -> int:
 
 def run_gate(repo_root=REPO_ROOT, gui_path=GUI_PATH) -> CompileGateResult:
     started = time.perf_counter()
-    source_count = compile_repository_sources(repo_root)
+    repo_root = Path(repo_root).resolve()
+    manifest = _compile_repository_sources(repo_root)
     contract_count = validate_gui_contracts(
         _read_python_source(Path(gui_path)),
         filename=str(gui_path),
     )
+    validate_production_source_manifest(
+        manifest,
+        production_source_manifest(repo_root),
+        label="Compile-gate final production source",
+    )
     return CompileGateResult(
-        source_count=source_count,
+        source_count=manifest.source_count,
         contract_count=contract_count,
         elapsed_seconds=time.perf_counter() - started,
+        production_source_manifest=manifest,
     )
 
 
@@ -399,6 +654,8 @@ def main() -> int:
         "SK Batch code compile gate OK: "
         f"{result.source_count} Python sources, "
         f"{result.contract_count} contract groups, "
+        "revision "
+        f"{result.production_source_manifest.content_hash[:16]}, "
         f"{result.elapsed_seconds:.3f}s"
     )
     return 0

@@ -515,8 +515,54 @@ def _role_identity(role, receipt_row, contract=None):
     return f"{role}_{species}_01"
 
 
-def _normalized_variants_ready(value):
+def _normalized_delivery_for_target(value, spm_path=None, contract=None):
+    if not isinstance(value, dict):
+        return None
+    rows = [
+        row for row in value.get("target_deliveries") or []
+        if isinstance(row, dict)
+    ]
+    if rows and spm_path is not None:
+        target_paths = {_normalized_path(spm_path)}
+        if contract is not None:
+            target_paths.add(
+                _normalized_path(
+                    _authoritative_spm_for_requested(contract, spm_path)
+                )
+            )
+        matches = [
+            row for row in rows
+            if _normalized_path(row.get("spm")) in target_paths
+        ]
+        return matches[0] if len(matches) == 1 else None
+    if rows and len(rows) == 1:
+        return rows[0]
+    return {
+        "delivery_mode": value.get("delivery_mode"),
+        "generator_bindings": list(
+            value.get("generator_bindings") or []
+        ),
+        "binding_mismatches": list(
+            value.get("binding_mismatches") or []
+        ),
+    }
+
+
+def _normalized_variants_ready(value, spm_path=None, contract=None):
     if not isinstance(value, dict) or value.get("status") != "ready":
+        return False
+    delivery = _normalized_delivery_for_target(
+        value,
+        spm_path=spm_path,
+        contract=contract,
+    )
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("delivery_mode") != "render_connected"
+        or not list(delivery.get("generator_bindings") or [])
+        or list(delivery.get("missing_live_bindings") or [])
+        or list(delivery.get("binding_mismatches") or [])
+    ):
         return False
     variants = list(value.get("variants") or [])
     if not variants:
@@ -1048,6 +1094,19 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             identities[1:],
         )
         decision, evidence = _reconcile_role(receipt_row, actual)
+        normalized_variants = (
+            deepcopy(receipt_row.get("normalized_variants"))
+            if receipt_row and receipt_row.get("normalized_variants")
+            else None
+        )
+        delivery = _normalized_delivery_for_target(
+            normalized_variants,
+            spm_path=spm_path,
+            contract=contract,
+        )
+        delivery_mode = str(
+            (delivery or {}).get("delivery_mode") or ""
+        )
         row = {
             **actual,
             "decision": decision,
@@ -1055,14 +1114,23 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 str(receipt_row.get("decision") or "") if receipt_row else "absent"
             ),
             "reconciliation": evidence,
-            "normalized_variants": (
-                deepcopy(receipt_row.get("normalized_variants"))
-                if receipt_row and receipt_row.get("normalized_variants")
-                else None
-            ),
+            "normalized_variants": normalized_variants,
+            "normalized_delivery_mode": delivery_mode or None,
         }
-        if decision == "normalize_part" and not _normalized_variants_ready(
-            row.get("normalized_variants")
+        if delivery_mode == "asset_registration_only":
+            row["decision"] = "pass_through"
+            row["reconciliation"] = "asset_registration_only"
+            decision = "pass_through"
+            evidence = "asset_registration_only"
+        elif delivery_mode == "connection_incomplete":
+            row["decision"] = "blocked"
+            row["reconciliation"] = "generator_connection_incomplete"
+            decision = "blocked"
+            evidence = "generator_connection_incomplete"
+        elif decision == "normalize_part" and not _normalized_variants_ready(
+            row.get("normalized_variants"),
+            spm_path=spm_path,
+            contract=contract,
         ):
             row["decision"] = "blocked"
             row["reconciliation"] = "normalized_variants_required"

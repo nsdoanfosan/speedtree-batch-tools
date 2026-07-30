@@ -46,6 +46,14 @@ REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
+from code_compile_gate import (
+    CompileGateError,
+    production_source_manifest,
+    run_gate as run_code_compile_gate,
+    validate_production_source_manifest,
+    validate_production_source_revision_report,
+)
+_PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(REPO_DIR)
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 
@@ -3053,6 +3061,82 @@ class App:
         )
         self.worker.start()
 
+    def _freeze_batch_production_source_manifest(self):
+        gate_result = run_code_compile_gate(
+            REPO_DIR,
+            TOOL_DIR / "sk_batch_gui.pyw",
+        )
+        manifest = gate_result.production_source_manifest
+        try:
+            validate_production_source_manifest(
+                _PROCESS_PRODUCTION_SOURCE_MANIFEST,
+                manifest,
+                label="Batch-start production source",
+            )
+        except CompileGateError as exc:
+            raise BatchItemError(
+                "Production sources changed after the GUI process loaded; "
+                "restart SK Batch before running another batch: " + str(exc),
+                kind="internal_error",
+            ) from exc
+        self._active_production_source_manifest = manifest
+        self.log(
+            "Production source revision 고정: "
+            f"{manifest.content_hash} · {manifest.source_count} files"
+        )
+        return manifest
+
+    def _assert_active_production_source_manifest(self):
+        expected = getattr(
+            self,
+            "_active_production_source_manifest",
+            None,
+        )
+        if expected is None:
+            if getattr(self, "active_batch_job", None) is not None:
+                raise BatchItemError(
+                    "Active batch has no pinned production source manifest",
+                    kind="internal_error",
+                )
+            expected = _PROCESS_PRODUCTION_SOURCE_MANIFEST
+        try:
+            current = production_source_manifest(REPO_DIR)
+            validate_production_source_manifest(
+                expected,
+                current,
+                label="Parent production source",
+            )
+        except CompileGateError as exc:
+            raise BatchItemError(
+                "Production source revision changed during the active batch: "
+                + str(exc),
+                kind="internal_error",
+            ) from exc
+        return expected
+
+    @staticmethod
+    def _require_child_production_source_manifest(
+        payload,
+        expected_manifest,
+        *,
+        report_file,
+        log_file,
+    ):
+        try:
+            return validate_production_source_revision_report(
+                payload,
+                expected_manifest,
+            )
+        except CompileGateError as exc:
+            raise BatchItemError(
+                "Cluster Assembly live audit worker revision mismatch: "
+                + str(exc),
+                kind="internal_error",
+                report=payload if isinstance(payload, dict) else None,
+                log_file=log_file,
+                report_file=report_file,
+            ) from exc
+
     def _run_queued_batch_job(self, job):
         error = None
         status = "completed"
@@ -3086,6 +3170,7 @@ class App:
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
                 ))
+            self._freeze_batch_production_source_manifest()
             if job["mode"] == "pipeline":
                 completed = self._run_full_pipeline(
                     job["targets"],
@@ -3190,6 +3275,7 @@ class App:
         for key in (
             "_active_batch_inventory",
             "_active_batch_items",
+            "_active_production_source_manifest",
             "_active_blender_dependency_map",
             "_active_pipeline_terminal_phase",
             "_active_repair_stage_contracts",
@@ -5507,6 +5593,7 @@ class App:
         retry.
         """
         spm = Path(spm).resolve()
+        self._assert_active_production_source_manifest()
         if not (spm.parent / "Cluster").is_dir():
             return self._refresh_stale_cluster_receipt_uncached(
                 spm,
@@ -5654,6 +5741,7 @@ class App:
                         and final_artifacts_match
                     )
                     if stable:
+                        self._assert_active_production_source_manifest()
                         cache_entry = {
                             "input_fingerprint": post_cache_fingerprint,
                             "discovery_fingerprint": (
@@ -5793,6 +5881,10 @@ class App:
                 / "pcg_st9_texture_batch"
                 / "pcg_texture_audit.py"
             )
+            expected_manifest = self._assert_active_production_source_manifest()
+            expected_production_source_revision = str(
+                expected_manifest.content_hash
+            ).casefold()
             timeout = int(self.cfg.get("cluster_receipt_refresh_timeout", 600))
             audit_command = [
                 sys.executable,
@@ -5803,6 +5895,8 @@ class App:
                     if spm.stem.casefold().startswith("sk_")
                     else spm.stem
                 ),
+                "--expected-production-source-revision",
+                expected_production_source_revision,
                 "--json", str(audit_report),
             ]
             if not _persist_receipt:
@@ -5822,6 +5916,13 @@ class App:
             except (OSError, TypeError, ValueError) as exc:
                 payload = None
                 payload_error = exc
+            self._require_child_production_source_manifest(
+                payload,
+                expected_manifest,
+                report_file=audit_report,
+                log_file=log_file,
+            )
+            self._assert_active_production_source_manifest()
             persistence = (
                 payload.get("cluster_assembly_receipt_persistence") or {}
                 if isinstance(payload, dict)

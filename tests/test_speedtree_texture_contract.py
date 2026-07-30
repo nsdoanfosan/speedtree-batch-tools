@@ -369,6 +369,10 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
                 [row["sources"][0]["map"] for row in parsed["materials"]],
                 ["Color", "Normal"],
             )
+            self.assertEqual(
+                [row["sources"][0]["map_index"] for row in parsed["materials"]],
+                [0, 0],
+            )
 
     def test_non_managed_speedtree_sources_remain_legacy_not_applicable(self):
         with tempfile.TemporaryDirectory() as temporary:

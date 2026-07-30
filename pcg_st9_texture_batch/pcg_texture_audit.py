@@ -23,6 +23,13 @@ from pathlib import Path
 BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
+from sk_batch.code_compile_gate import (
+    production_source_manifest,
+    production_source_revision_state,
+)
+_PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(
+    BATCH_TOOLS_DIR
+)
 from speedtree_texture_contract import (
     inspect_spm_texture_slots,
     parse_managed_texture_path,
@@ -6255,10 +6262,31 @@ def persist_cluster_assembly_receipts_safely(report):
     return state
 
 
+def write_report_outputs(report, json_path=None, csv_path=None):
+    if json_path:
+        Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(json_path).write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if csv_path:
+        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+        write_csv(report, csv_path)
+    if not json_path and not csv_path:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", dest="json_path")
     parser.add_argument("--csv", dest="csv_path")
+    parser.add_argument(
+        "--expected-production-source-revision",
+        help=(
+            "Batch-pinned code_compile_gate production source content hash; "
+            "the audit fails before asset evaluation when it differs"
+        ),
+    )
     parser.add_argument(
         "--target", action="append",
         help="Vegetation folder to audit; repeatable",
@@ -6291,6 +6319,32 @@ def main():
         ),
     )
     args = parser.parse_args()
+    expected_revision = str(
+        args.expected_production_source_revision or ""
+    ).strip().casefold()
+    revision_started = _PROCESS_PRODUCTION_SOURCE_MANIFEST
+    if not expected_revision:
+        expected_revision = revision_started.content_hash
+    revision_state = production_source_revision_state(
+        expected_revision,
+        revision_started,
+    )
+    if expected_revision and not revision_state["matches_expected"]:
+        report = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "failed",
+            "stage": "production_source_revision",
+            "error": (
+                "Production source revision changed before PCG audit start: "
+                f"expected {expected_revision}, "
+                f"worker {revision_state['started']['content_hash']}"
+            ),
+            "production_source_revision": revision_state,
+            "summary": {"total": 0, "by_status": {}},
+            "items": [],
+        }
+        write_report_outputs(report, args.json_path, args.csv_path)
+        raise SystemExit(2)
     cfg = load_config()
     if args.prepare_sk:
         results = [prepare_sk(path, args.prepare_target_mesh, dry_run=args.dry_run) for path in args.prepare_sk]
@@ -6304,6 +6358,27 @@ def main():
         pcg_targets=pcg_targets,
         target_mesh_names=args.target_mesh,
     )
+    revision_finished = production_source_manifest(BATCH_TOOLS_DIR)
+    revision_state = production_source_revision_state(
+        expected_revision,
+        revision_started,
+        revision_finished,
+    )
+    report["production_source_revision"] = revision_state
+    if expected_revision and (
+        not revision_state["matches_expected"]
+        or not revision_state["stable"]
+    ):
+        report["status"] = "failed"
+        report["stage"] = "production_source_revision"
+        report["error"] = (
+            "Production source revision changed during PCG audit: "
+            f"expected {expected_revision}, "
+            f"start {revision_state['started']['content_hash']}, "
+            f"final {revision_state['finished']['content_hash']}"
+        )
+        write_report_outputs(report, args.json_path, args.csv_path)
+        raise SystemExit(2)
     # Receipt persistence is a cache/audit-trail concern.  The live report
     # above is the authoritative data validation result, so a filesystem or
     # receipt self-validation failure must not turn clean source data into a
@@ -6322,14 +6397,7 @@ def main():
     else:
         persist_cluster_assembly_receipts_safely(report)
     save_spm_analysis_cache()
-    if args.json_path:
-        Path(args.json_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.json_path).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    if args.csv_path:
-        Path(args.csv_path).parent.mkdir(parents=True, exist_ok=True)
-        write_csv(report, args.csv_path)
-    if not args.json_path and not args.csv_path:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    write_report_outputs(report, args.json_path, args.csv_path)
 
 
 if __name__ == "__main__":

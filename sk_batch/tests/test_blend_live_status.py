@@ -173,6 +173,18 @@ class BlendLiveStatusTests(unittest.TestCase):
         app.state = {}
         app.state_lock = threading.RLock()
         app.ui_queue = queue.Queue()
+        manifest = gui._PROCESS_PRODUCTION_SOURCE_MANIFEST
+        app._active_production_source_manifest = manifest
+        app._assert_active_production_source_manifest = mock.Mock(
+            return_value=manifest,
+        )
+        app._require_child_production_source_manifest = mock.Mock(
+            return_value={
+                "expected_content_hash": manifest.content_hash,
+                "matches_expected": True,
+                "stable": True,
+            },
+        )
         return app
 
     @staticmethod
@@ -2573,6 +2585,109 @@ class BlendLiveStatusTests(unittest.TestCase):
             ).resolve(),
             inputs,
         )
+
+    def test_cluster_live_audit_worker_revision_mismatch_is_not_asset_retry(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui,
+            "LOG_DIR",
+            Path(temporary) / "logs",
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+
+            expected_root = Path(temporary) / "expected_code"
+            actual_root = Path(temporary) / "actual_code"
+            expected_root.mkdir()
+            actual_root.mkdir()
+            (expected_root / "worker.py").write_text(
+                "revision = 1\n",
+                encoding="utf-8",
+            )
+            (actual_root / "worker.py").write_text(
+                "revision = 2\n",
+                encoding="utf-8",
+            )
+            expected = gui.production_source_manifest(expected_root)
+            actual = gui.production_source_manifest(actual_root)
+            app._active_production_source_manifest = expected
+            app._assert_active_production_source_manifest = (
+                gui.App._assert_active_production_source_manifest.__get__(
+                    app,
+                    gui.App,
+                )
+            )
+            app._require_child_production_source_manifest = (
+                gui.App._require_child_production_source_manifest
+            )
+
+            def run_audit(command, *_args, **_kwargs):
+                self.assertEqual(
+                    command[
+                        command.index(
+                            "--expected-production-source-revision"
+                        ) + 1
+                    ],
+                    expected.content_hash,
+                )
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps({
+                        "status": "failed",
+                        "stage": "production_source_revision",
+                        "production_source_revision": {
+                            "manifest_schema_version": expected.schema_version,
+                            "expected_content_hash": expected.content_hash,
+                            "started": actual.as_dict(),
+                            "finished": actual.as_dict(),
+                            "matches_expected": False,
+                            "stable": True,
+                        },
+                        "items": [],
+                    }),
+                    encoding="utf-8",
+                )
+                return 2, Path(temporary) / "revision_mismatch.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "production_source_manifest",
+                return_value=expected,
+            ), mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ), self.assertRaises(gui.BatchItemError) as raised:
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260730_120000",
+                )
+
+        self.assertEqual(raised.exception.kind, "internal_error")
+        self.assertIn(
+            "revision mismatch",
+            str(raised.exception).casefold(),
+        )
+        self.assertEqual(app._run_limited.call_count, 1)
+        self.assertFalse(app._cluster_receipt_refresh_memo)
+        self.assertFalse(any(
+            "retrying once" in call.args[0]
+            for call in app.log.call_args_list
+        ))
 
     def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
         gui = load_gui_module()

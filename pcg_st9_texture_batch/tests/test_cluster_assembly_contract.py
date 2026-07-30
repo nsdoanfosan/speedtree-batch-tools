@@ -17,6 +17,9 @@ sys.path.insert(0, str(TOOL_DIR))
 from pcg_cluster_assembly_contract import (
     ClusterAssemblyReceiptError,
     ClusterAssemblyReceiptStaleError,
+    DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+    DELIVERY_MODE_CONNECTION_INCOMPLETE,
+    DELIVERY_MODE_RENDER_CONNECTED,
     build_cluster_assembly_contract,
     classify_fbx_role,
     cluster_assembly_receipt_resolution,
@@ -29,6 +32,7 @@ from pcg_cluster_assembly_contract import (
     dependency_role,
     _atlas_normalized_variants,
     _canonical_bark_contract,
+    _normalized_generator_delivery,
     _validate_normalized_source_dependency,
 )
 import pcg_texture_audit as audit_module
@@ -347,6 +351,113 @@ class FbxRoleContractTests(unittest.TestCase):
 
 
 class ClusterAssemblyContractTests(unittest.TestCase):
+    def test_generator_delivery_distinguishes_registration_render_and_incomplete(self):
+        class FakeAudit:
+            @staticmethod
+            def _binding_slot_identity(binding):
+                return (
+                    "index",
+                    str(binding.get("generator_index")),
+                    str(binding.get("slot_prefix") or "").lower(),
+                )
+
+            @staticmethod
+            def leaf_generator_bindings(_spm, visible_only=False):
+                self.assertTrue(visible_only)
+                return [{
+                    "generator_index": 2,
+                    "slot_prefix": "Material:Frond:0",
+                    "material_id": "7",
+                    "mesh_id": "63",
+                    "visible": True,
+                    "export_participates": True,
+                }]
+
+            @staticmethod
+            def mesh_asset_ids(_spm):
+                return ["63"]
+
+        group = {"material_id": 7}
+        variants = [{"target_mesh_id": 63}]
+        registration = _normalized_generator_delivery(
+            FakeAudit,
+            "target.spm",
+            {
+                "generator_connection": {
+                    "requested": False,
+                    "complete": False,
+                    "bindings": [],
+                },
+            },
+            group,
+            variants,
+        )
+        self.assertEqual(
+            registration["delivery_mode"],
+            DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+        )
+
+        binding = {
+            "generator_index": 2,
+            "slot_prefix": "Material:Frond:0",
+            "target_material_id": 7,
+            "target_mesh_id": 63,
+        }
+        render = _normalized_generator_delivery(
+            FakeAudit,
+            "target.spm",
+            {
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "generator_variant_policy":
+                        "ensure_all_material_cutouts",
+                    "bindings": [binding],
+                },
+            },
+            group,
+            variants,
+        )
+        self.assertEqual(
+            render["delivery_mode"],
+            DELIVERY_MODE_RENDER_CONNECTED,
+        )
+        self.assertEqual(
+            render["normalized_target_mesh_ids"],
+            render["declared_target_mesh_ids"],
+        )
+        self.assertEqual(
+            render["declared_target_mesh_ids"],
+            render["live_export_participating_target_mesh_ids"],
+        )
+
+        incomplete = _normalized_generator_delivery(
+            FakeAudit,
+            "target.spm",
+            {
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "generator_variant_policy":
+                        "ensure_all_material_cutouts",
+                    "bindings": [{
+                        **binding,
+                        "target_mesh_id": 64,
+                    }],
+                },
+            },
+            group,
+            variants,
+        )
+        self.assertEqual(
+            incomplete["delivery_mode"],
+            DELIVERY_MODE_CONNECTION_INCOMPLETE,
+        )
+        self.assertIn(
+            "normalized_and_declared_target_mesh_sets_differ",
+            incomplete["errors"],
+        )
+
     def test_no_content_driven_cluster_dependency_does_not_require_bark(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "weed_common_grass"

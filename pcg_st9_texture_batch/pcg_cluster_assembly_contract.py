@@ -42,6 +42,9 @@ from speedtree_pipeline_contract import (
 SCHEMA_VERSION = 1
 PERSISTED_RECEIPT_KIND = "pcg_cluster_assembly_receipt"
 DEFAULT_RECEIPT_DIR = Path(__file__).resolve().parent / "reports" / "cluster_assembly"
+DELIVERY_MODE_ASSET_REGISTRATION_ONLY = "asset_registration_only"
+DELIVERY_MODE_RENDER_CONNECTED = "render_connected"
+DELIVERY_MODE_CONNECTION_INCOMPLETE = "connection_incomplete"
 FBX_BINARY_HEADER = b"Kaydara FBX Binary  \x00\x1a\x00"
 ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 ROLE_PREFIX_RE = re.compile(
@@ -1680,6 +1683,280 @@ def _normalized_variant_contract(
     return result
 
 
+def _positive_asset_id(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _delivery_binding_slot_identity(binding):
+    """Prefer stable Generator GUIDs inside the new delivery schema."""
+    prefix = str(
+        binding.get("slot_prefix")
+        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
+    ).casefold()
+    guid = str(binding.get("generator_guid") or "").casefold()
+    if guid and prefix:
+        return "guid", guid, prefix
+    index = binding.get("generator_index")
+    if index is not None and prefix:
+        return "index", str(index), prefix
+    return (
+        "named",
+        str(binding.get("generator_type") or "").casefold(),
+        str(binding.get("generator_name") or "").casefold(),
+        prefix,
+    )
+
+
+def _normalized_generator_delivery(
+    audit,
+    production_spm,
+    payload,
+    group,
+    variants,
+):
+    """Classify one target SPM from declared and current Generator evidence."""
+    connection = payload.get("generator_connection")
+    bindings = [
+        dict(row)
+        for row in (
+            connection.get("bindings") if isinstance(connection, dict) else []
+        ) or []
+        if isinstance(row, dict)
+    ]
+    requested = (
+        connection.get("requested")
+        if isinstance(connection, dict)
+        and isinstance(connection.get("requested"), bool)
+        else None
+    )
+    declared_complete = (
+        connection.get("complete")
+        if isinstance(connection, dict)
+        and isinstance(connection.get("complete"), bool)
+        else None
+    )
+    variant_policy = (
+        str(connection.get("generator_variant_policy") or "")
+        if isinstance(connection, dict)
+        else ""
+    )
+    expected_material_id = _positive_asset_id(group.get("material_id"))
+    normalized_mesh_ids = sorted({
+        _positive_asset_id(row.get("target_mesh_id"))
+        for row in variants or []
+        if _positive_asset_id(row.get("target_mesh_id")) is not None
+    })
+    declared_mesh_ids = sorted({
+        _positive_asset_id(row.get("target_mesh_id"))
+        for row in bindings
+        if _positive_asset_id(row.get("target_mesh_id")) is not None
+    })
+    evidence = {
+        "schema_version": 1,
+        "spm": str(Path(production_spm).resolve(strict=False)),
+        "delivery_mode": DELIVERY_MODE_CONNECTION_INCOMPLETE,
+        "delivery_decision": "blocked",
+        "delivery_reason": "generator_connection_contract_incomplete",
+        "generator_connection_requested": requested,
+        "generator_connection_complete": declared_complete,
+        "generator_variant_policy": variant_policy or None,
+        "target_material_id": expected_material_id,
+        "normalized_target_mesh_ids": normalized_mesh_ids,
+        "declared_target_mesh_ids": declared_mesh_ids,
+        "live_export_participating_target_mesh_ids": [],
+        "generator_bindings": bindings,
+        "live_generator_bindings": [],
+        "missing_live_bindings": [],
+        "binding_mismatches": [],
+        "errors": [],
+    }
+    if (
+        requested is False
+        and declared_complete is False
+        and not bindings
+    ):
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = "generator_connection_not_requested"
+        return evidence
+    if not isinstance(connection, dict):
+        evidence["errors"].append("generator_connection_missing")
+        return evidence
+    if requested is not True:
+        evidence["errors"].append(
+            "generator_connection_not_explicitly_requested"
+        )
+        return evidence
+    if declared_complete is not True:
+        evidence["errors"].append(
+            "generator_connection_not_declared_complete"
+        )
+    if variant_policy != "ensure_all_material_cutouts":
+        evidence["errors"].append(
+            "generator_variant_policy_mismatch"
+        )
+    if not bindings:
+        evidence["errors"].append("generator_bindings_missing")
+    if evidence["errors"]:
+        return evidence
+    if audit is None:
+        evidence["errors"].append("production_spm_live_audit_unavailable")
+        return evidence
+
+    try:
+        live_bindings = audit.leaf_generator_bindings(
+            production_spm,
+            visible_only=True,
+        )
+        live_asset_mesh_ids = sorted({
+            _positive_asset_id(value)
+            for value in audit.mesh_asset_ids(production_spm)
+            if _positive_asset_id(value) is not None
+        })
+    except (OSError, RuntimeError, ValueError) as exc:
+        evidence["errors"].append(
+            "production_spm_live_audit_failed:" + str(exc)
+        )
+        return evidence
+    slot_identity = _delivery_binding_slot_identity
+    relevant_live_bindings = [
+        dict(row)
+        for row in live_bindings
+        if _positive_asset_id(row.get("material_id"))
+        == expected_material_id
+    ]
+    evidence["live_generator_bindings"] = relevant_live_bindings
+    live_mesh_ids = sorted({
+        _positive_asset_id(row.get("mesh_id"))
+        for row in relevant_live_bindings
+        if _positive_asset_id(row.get("mesh_id")) is not None
+    })
+    evidence[
+        "live_export_participating_target_mesh_ids"
+    ] = live_mesh_ids
+    if normalized_mesh_ids != declared_mesh_ids:
+        evidence["errors"].append(
+            "normalized_and_declared_target_mesh_sets_differ"
+        )
+    if normalized_mesh_ids != live_mesh_ids:
+        evidence["errors"].append(
+            "normalized_and_live_target_mesh_sets_differ"
+        )
+    missing_assets = sorted(
+        set(normalized_mesh_ids).difference(live_asset_mesh_ids)
+    )
+    if missing_assets:
+        evidence["errors"].append("target_mesh_asset_missing")
+        evidence["binding_mismatches"].append({
+            "reason": "target_mesh_asset_missing",
+            "target_mesh_ids": missing_assets,
+        })
+
+    live_by_slot = {}
+    for row in relevant_live_bindings:
+        live_by_slot.setdefault(tuple(slot_identity(row)), []).append(row)
+    declared_by_slot = {}
+    for row in bindings:
+        declared_by_slot.setdefault(
+            tuple(slot_identity(row)), []
+        ).append(row)
+
+    for declared in bindings:
+        errors = []
+        target_material_id = _positive_asset_id(
+            declared.get("target_material_id")
+        )
+        target_mesh_id = _positive_asset_id(declared.get("target_mesh_id"))
+        declared_slot = tuple(slot_identity(declared))
+        current_rows = live_by_slot.get(declared_slot) or []
+        current = current_rows[0] if len(current_rows) == 1 else None
+        if target_material_id != expected_material_id:
+            errors.append("target_material_not_normalized_material")
+        if target_mesh_id not in set(normalized_mesh_ids):
+            errors.append("target_mesh_not_normalized_variant")
+        if target_mesh_id not in set(live_asset_mesh_ids):
+            errors.append("target_mesh_asset_missing")
+        if not current_rows:
+            errors.append("visible_generator_slot_missing")
+        elif len(current_rows) != 1:
+            errors.append("visible_generator_slot_ambiguous")
+        else:
+            if (
+                _positive_asset_id(current.get("material_id"))
+                != target_material_id
+            ):
+                errors.append("visible_generator_material_mismatch")
+            if _positive_asset_id(current.get("mesh_id")) != target_mesh_id:
+                errors.append("visible_generator_mesh_mismatch")
+            if not (
+                current.get("export_participates") is True
+                or current.get("visible") is True
+            ):
+                errors.append("generator_not_export_participating")
+        verified = {
+            "slot_identity": list(declared_slot),
+            "target_material_id": target_material_id,
+            "target_mesh_id": target_mesh_id,
+            "current": dict(current) if current is not None else None,
+            "errors": errors,
+            "complete": not errors,
+        }
+        if errors:
+            evidence["binding_mismatches"].append(verified)
+        if "visible_generator_slot_missing" in errors:
+            evidence["missing_live_bindings"].append(dict(declared))
+        evidence["errors"].extend(errors)
+
+    for live_slot, current_rows in live_by_slot.items():
+        declared_rows = declared_by_slot.get(live_slot) or []
+        if len(declared_rows) != 1:
+            evidence["errors"].append(
+                "live_generator_slot_not_declared_exactly_once"
+            )
+            evidence["binding_mismatches"].append({
+                "slot_identity": list(live_slot),
+                "reason": "live_generator_slot_not_declared_exactly_once",
+                "declared_count": len(declared_rows),
+                "live_count": len(current_rows),
+            })
+
+    evidence["errors"] = sorted(set(evidence["errors"]))
+    if (
+        bindings
+        and not evidence["errors"]
+    ):
+        evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
+        evidence["delivery_decision"] = "normalize_part"
+        evidence["delivery_reason"] = (
+            "generator_connection_matches_live_export"
+        )
+    return evidence
+
+
+def _aggregate_target_deliveries(rows):
+    modes = {
+        str(row.get("delivery_mode") or "")
+        for row in rows or []
+        if isinstance(row, dict)
+    }
+    if (
+        not modes
+        or DELIVERY_MODE_CONNECTION_INCOMPLETE in modes
+        or modes.difference({
+            DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+            DELIVERY_MODE_RENDER_CONNECTED,
+        })
+    ):
+        return DELIVERY_MODE_CONNECTION_INCOMPLETE
+    if DELIVERY_MODE_RENDER_CONNECTED in modes:
+        return DELIVERY_MODE_RENDER_CONNECTED
+    return DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+
+
 def _physical_target_registry_contract(source_blend):
     """Return the explicit ON-target contract for one physical source blend."""
     blend = Path(source_blend).expanduser().absolute()
@@ -1807,6 +2084,13 @@ def _atlas_normalized_variants(
                 group,
                 physical_receipt_cache=physical_receipt_cache,
             )
+            delivery = _normalized_generator_delivery(
+                audit,
+                allowed_spms[manifest_spm],
+                payload,
+                group,
+                contract["variants"],
+            )
         except ClusterAssemblyReceiptStaleError:
             # A normalized receipt is a cache of a previously validated
             # delivery.  Staleness cannot decide the current content
@@ -1880,15 +2164,27 @@ def _atlas_normalized_variants(
                 identity,
                 contract,
                 _normalized_identity_path(manifest_spm),
+                delivery,
             )
         )
     distinct = {}
-    for _manifest, identity, contract, target_key in sorted(candidates):
+    for (
+        _manifest,
+        identity,
+        contract,
+        target_key,
+        delivery,
+    ) in sorted(candidates):
         selected = distinct.setdefault(
             identity,
-            {"contract": contract, "delivered_target_keys": set()},
+            {
+                "contract": contract,
+                "delivered_target_keys": set(),
+                "target_deliveries": {},
+            },
         )
         selected["delivered_target_keys"].add(target_key)
+        selected["target_deliveries"][target_key] = delivery
     if len(distinct) > 1:
         raise ClusterAssemblyReceiptError(
             "Atlas normalized role has multiple current receipts: "
@@ -1897,6 +2193,25 @@ def _atlas_normalized_variants(
     if distinct:
         selected = next(iter(distinct.values()))
         contract = selected["contract"]
+        target_deliveries = [
+            selected["target_deliveries"][key]
+            for key in sorted(selected["target_deliveries"])
+        ]
+        contract["target_deliveries"] = target_deliveries
+        contract["delivery_mode"] = _aggregate_target_deliveries(
+            target_deliveries
+        )
+        contract["generator_bindings"] = [
+            binding
+            for row in target_deliveries
+            if row.get("delivery_mode") == DELIVERY_MODE_RENDER_CONNECTED
+            for binding in row.get("generator_bindings") or []
+        ]
+        contract["delivery_errors"] = sorted({
+            error
+            for row in target_deliveries
+            for error in row.get("errors") or []
+        })
         if contract.get("production_normalization") is not None:
             registered = {
                 _normalized_identity_path(path): Path(path)
@@ -2834,7 +3149,33 @@ def build_cluster_assembly_contract(
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
         )
-        if normalized_variants_missing:
+        normalized_delivery_mode = str(
+            (normalized_variants or {}).get("delivery_mode") or ""
+        )
+        normalized_delivery_blocked = False
+        if (
+            normalized_variants
+            and normalized_delivery_mode
+            == DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        ):
+            decision = "pass_through"
+            normalized_variants_required = False
+            normalized_variants_missing = False
+        elif (
+            normalized_variants
+            and normalized_delivery_mode
+            == DELIVERY_MODE_CONNECTION_INCOMPLETE
+        ):
+            decision = "blocked"
+            normalized_delivery_blocked = True
+        elif (
+            normalized_variants
+            and normalized_delivery_mode
+            not in {DELIVERY_MODE_RENDER_CONNECTED}
+        ):
+            decision = "blocked"
+            normalized_delivery_blocked = True
+        elif normalized_variants_missing:
             decision = "blocked"
         capture_texture_refs = _normalized_capture_texture_refs(
             normalized_variants
@@ -2926,6 +3267,8 @@ def build_cluster_assembly_contract(
             "normalized_variants_stale": normalized_variants_stale,
             "normalized_variants_required": normalized_variants_required,
             "normalized_variants_missing": normalized_variants_missing,
+            "normalized_delivery_mode": normalized_delivery_mode or None,
+            "normalized_delivery_blocked": normalized_delivery_blocked,
             "target_relation": copy.deepcopy(pair_row["target_relation"]),
         })
 
@@ -3043,6 +3386,18 @@ def build_cluster_assembly_contract(
                 "spm": str(dependency["spm"]),
                 **dependency["normalized_variants_stale"],
             })
+        if dependency.get("normalized_delivery_blocked"):
+            issues.append({
+                "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+                "role": dependency["role"],
+                "spm": str(dependency["spm"]),
+                "delivery_mode": dependency.get(
+                    "normalized_delivery_mode"
+                ),
+                "errors": (
+                    dependency.get("normalized_variants") or {}
+                ).get("delivery_errors") or [],
+            })
         tga_validation = dependency.get("tga_basename_validation") or {}
         if tga_validation.get("status") not in {"ok", "not_applicable"}:
             issues.append({
@@ -3120,6 +3475,12 @@ def build_cluster_assembly_contract(
             ),
             "normalized_variants_missing": row.get(
                 "normalized_variants_missing", False
+            ),
+            "normalized_delivery_mode": row.get(
+                "normalized_delivery_mode"
+            ),
+            "normalized_delivery_blocked": row.get(
+                "normalized_delivery_blocked", False
             ),
             "target_relation": row.get("target_relation"),
         }

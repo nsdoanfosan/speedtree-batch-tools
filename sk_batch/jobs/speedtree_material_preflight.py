@@ -66,6 +66,8 @@ MATERIAL_PREFLIGHT_START_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_START"
 SPEEDTREE_SLOT_WAIT_MARKER = "SK_BATCH_SPEEDTREE_SLOT_WAIT"
 SPEEDTREE_SLOT_ACQUIRED_MARKER = "SK_BATCH_SPEEDTREE_SLOT_ACQUIRED"
 MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
+STMAT_MAP_INDEX_SPACE = "stmat_xml_map_order_v1"
+SOURCE_SPM_MAP_INDEX_SPACE = "source_spm_map_order_v1"
 
 
 def emit_progress_marker(marker, **fields):
@@ -186,6 +188,89 @@ def _is_cluster_capture_source_set(paths):
     )
 
 
+def _cluster_bake_receipt_with_explicit_index_space(
+    receipt,
+    spm_slots,
+    stmat_sources,
+):
+    """Keep SPM order as provenance and publish STMat order only when proven."""
+    receipt = dict(receipt or {})
+    supplied = [
+        dict(row)
+        for row in receipt.get("slot_files") or []
+        if isinstance(row, dict)
+    ]
+    stmat_rows = [
+        dict(row)
+        for row in stmat_sources or []
+        if isinstance(row, dict)
+        and row.get("map_index") is not None
+        and str(row.get("map") or "").strip()
+        and str(row.get("resolved_source") or "").strip()
+    ]
+    stmat_name_counts = {}
+    for row in stmat_rows:
+        key = str(row.get("map") or "").strip().casefold()
+        stmat_name_counts[key] = stmat_name_counts.get(key, 0) + 1
+
+    normalized = []
+    all_stmat_indexes_proven = bool(spm_slots)
+    for slot in spm_slots:
+        spm_index = int(slot.get("map_index", -1))
+        map_name = str(slot.get("map") or "").strip()
+        slot_path = str(
+            slot.get("resolved_ref")
+            or slot.get("path")
+            or ""
+        ).strip()
+        supplied_matches = [
+            row
+            for row in supplied
+            if (
+                int(row.get("map_index", -1)) == spm_index
+                and str(row.get("map") or "").strip() == map_name
+            )
+        ]
+        base = dict(supplied_matches[0]) if len(supplied_matches) == 1 else {}
+        base.update({
+            "map_index": spm_index,
+            "spm_map_index": spm_index,
+            "map": map_name,
+            "role": str(slot.get("role") or base.get("role") or ""),
+            "path": str(base.get("path") or slot_path),
+        })
+
+        stmat_matches = [
+            row
+            for row in stmat_rows
+            if (
+                str(row.get("map") or "").strip() == map_name
+                and _path_key(row.get("resolved_source"))
+                == _path_key(base["path"])
+            )
+        ]
+        name_key = map_name.casefold()
+        if (
+            len(stmat_matches) == 1
+            and stmat_name_counts.get(name_key) == 1
+        ):
+            stmat_index = int(stmat_matches[0]["map_index"])
+            base["map_index"] = stmat_index
+            base["stmat_map_index"] = stmat_index
+        else:
+            all_stmat_indexes_proven = False
+            base.pop("stmat_map_index", None)
+        normalized.append(base)
+
+    receipt["slot_index_space"] = (
+        STMAT_MAP_INDEX_SPACE
+        if all_stmat_indexes_proven
+        else SOURCE_SPM_MAP_INDEX_SPACE
+    )
+    receipt["slot_files"] = normalized
+    return receipt
+
+
 def augment_texture_readiness_contract(
     readiness,
     stmat_path,
@@ -287,28 +372,21 @@ def augment_texture_readiness_contract(
                     )
                 )
                 if bake_receipt:
-                    bake_receipt = {
-                        **bake_receipt,
+                    bake_receipt = (
+                        _cluster_bake_receipt_with_explicit_index_space(
+                            bake_receipt,
+                            spm_slots,
+                            sources,
+                        )
+                    )
+                    bake_receipt.update({
                         "material_id": str(
                             spm_material.get("material_id") or ""
                         ),
                         "material_name": str(
                             spm_material.get("material_name") or ""
                         ),
-                        "slot_files": [
-                            {
-                                "map_index": int(
-                                    slot.get("map_index", -1)
-                                ),
-                                "map": str(slot.get("map") or ""),
-                                "role": str(slot.get("role") or ""),
-                                "path": str(
-                                    slot.get("resolved_ref") or ""
-                                ),
-                            }
-                            for slot in spm_slots
-                        ],
-                    }
+                    })
         if bake_receipt:
             binding.update({
                 "texture_contract_status": "blender_cluster_bake",

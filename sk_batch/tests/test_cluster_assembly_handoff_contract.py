@@ -92,6 +92,35 @@ def write_receipt(
     assembly_spm = Path(assembly_spm or spm)
     contract_roles = []
     for role, identity, decision in roles:
+        normalized = (normalized_by_role or {}).get(role)
+        if (
+            isinstance(normalized, dict)
+            and normalized.get("status") == "ready"
+            and normalized.get("variants")
+            and not normalized.get("delivery_mode")
+        ):
+            normalized = dict(normalized)
+            binding = {
+                "generator_index": 0,
+                "slot_prefix": "Material:Frond:0",
+                "target_material_id": 1,
+                "target_mesh_id": 1,
+            }
+            normalized.update({
+                "delivery_mode": "render_connected",
+                "generator_bindings": [binding],
+                "target_deliveries": [{
+                    "schema_version": 1,
+                    "spm": str(assembly_spm),
+                    "delivery_mode": "render_connected",
+                    "delivery_decision": "normalize_part",
+                    "delivery_reason":
+                        "generator_connection_matches_live_export",
+                    "generator_bindings": [binding],
+                    "missing_live_bindings": [],
+                    "binding_mismatches": [],
+                }],
+            })
         target = {
             "spm": str(assembly_spm),
             "export_bundle": {"fbx": fingerprint},
@@ -111,9 +140,7 @@ def write_receipt(
             "name": identity,
             "decision": decision,
             "spm": str(spm),
-            "normalized_variants": (
-                (normalized_by_role or {}).get(role)
-            ),
+            "normalized_variants": normalized,
             "targets": [target],
         })
     payload = {
@@ -696,6 +723,94 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertIn(
                 "normalized_variants_required",
                 [row.get("reason") for row in handoff["issues"]],
+            )
+
+    def test_asset_registration_only_is_pass_through_before_bwr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+                normalized_by_role={
+                    "branch": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "asset_registration_only",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode":
+                                "asset_registration_only",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            branch = next(
+                row for row in handoff["roles"]
+                if row["role"] == "branch"
+            )
+            self.assertEqual(branch["decision"], "pass_through")
+            self.assertEqual(
+                branch["reconciliation"],
+                "asset_registration_only",
+            )
+
+    def test_incomplete_generator_connection_is_blocked_before_bwr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+                normalized_by_role={
+                    "branch": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "connection_incomplete",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode": "connection_incomplete",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(handoff["status"], "blocked")
+            branch = next(
+                row for row in handoff["roles"]
+                if row["role"] == "branch"
+            )
+            self.assertEqual(branch["decision"], "blocked")
+            self.assertEqual(
+                branch["reconciliation"],
+                "generator_connection_incomplete",
             )
 
     def test_bark_block_identifies_exact_provider_and_material(self):

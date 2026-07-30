@@ -402,6 +402,137 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 ])
             )
 
+    def test_cluster_bake_receipt_records_proven_stmat_index_space(self):
+        root = Path("C:/asset")
+        color = root / "cluster" / "color.tga"
+        normal = root / "cluster" / "normal.tga"
+        receipt = {
+            "slot_files": [
+                {
+                    "map_index": 0,
+                    "map": "Color",
+                    "path": str(color),
+                    "sha256": "a" * 64,
+                },
+                {
+                    "map_index": 1,
+                    "map": "Normal",
+                    "path": str(normal),
+                    "sha256": "b" * 64,
+                },
+            ],
+        }
+        spm_slots = [
+            {
+                "map_index": 0,
+                "map": "Color",
+                "role": "color",
+                "resolved_ref": str(color),
+            },
+            {
+                "map_index": 1,
+                "map": "Normal",
+                "role": "normal",
+                "resolved_ref": str(normal),
+            },
+        ]
+        stmat_sources = [
+            {
+                "map_index": 4,
+                "map": "Normal",
+                "resolved_source": str(normal),
+            },
+            {
+                "map_index": 7,
+                "map": "Color",
+                "resolved_source": str(color),
+            },
+        ]
+
+        normalized = (
+            preflight._cluster_bake_receipt_with_explicit_index_space(
+                receipt,
+                spm_slots,
+                stmat_sources,
+            )
+        )
+
+        self.assertEqual(
+            normalized["slot_index_space"],
+            preflight.STMAT_MAP_INDEX_SPACE,
+        )
+        self.assertEqual(
+            [
+                (
+                    row["map"],
+                    row["map_index"],
+                    row["stmat_map_index"],
+                    row["spm_map_index"],
+                    row["sha256"],
+                )
+                for row in normalized["slot_files"]
+            ],
+            [
+                ("Color", 7, 7, 0, "a" * 64),
+                ("Normal", 4, 4, 1, "b" * 64),
+            ],
+        )
+
+    def test_duplicate_stmat_map_name_keeps_source_spm_index_space(self):
+        root = Path("C:/asset")
+        color = root / "cluster" / "color.tga"
+        receipt = {
+            "slot_files": [{
+                "map_index": 2,
+                "map": "Color",
+                "path": str(color),
+                "sha256": "a" * 64,
+            }],
+        }
+        spm_slots = [{
+            "map_index": 2,
+            "map": "Color",
+            "role": "color",
+            "resolved_ref": str(color),
+        }]
+        stmat_sources = [
+            {
+                "map_index": 0,
+                "map": "Color",
+                "resolved_source": str(color),
+            },
+            {
+                "map_index": 1,
+                "map": "Color",
+                "resolved_source": str(color),
+            },
+        ]
+
+        normalized = (
+            preflight._cluster_bake_receipt_with_explicit_index_space(
+                receipt,
+                spm_slots,
+                stmat_sources,
+            )
+        )
+
+        self.assertEqual(
+            normalized["slot_index_space"],
+            preflight.SOURCE_SPM_MAP_INDEX_SPACE,
+        )
+        self.assertEqual(
+            normalized["slot_files"][0]["map_index"],
+            2,
+        )
+        self.assertEqual(
+            normalized["slot_files"][0]["spm_map_index"],
+            2,
+        )
+        self.assertNotIn(
+            "stmat_map_index",
+            normalized["slot_files"][0],
+        )
+
     @staticmethod
     def _write_raw_stmat(path, material_name, maps):
         root = ET.Element("SpeedTreeMaterials")

@@ -1,4 +1,5 @@
 import ast
+import os
 import sys
 import tempfile
 import unittest
@@ -12,9 +13,13 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 from code_compile_gate import (  # noqa: E402
     CompileGateError,
     GUI_PATH,
+    PRODUCTION_SOURCE_MANIFEST_VERSION,
     compile_repository_sources,
+    production_source_manifest,
+    production_source_revision_state,
     run_gate,
     validate_gui_contracts,
+    validate_production_source_revision_report,
 )
 
 
@@ -55,6 +60,14 @@ class CodeCompileGateTests(unittest.TestCase):
         result = run_gate(REPO_ROOT, GUI_PATH)
         self.assertGreater(result.source_count, 0)
         self.assertEqual(result.contract_count, 3)
+        self.assertEqual(
+            result.source_count,
+            result.production_source_manifest.source_count,
+        )
+        self.assertEqual(
+            len(result.production_source_manifest.content_hash),
+            64,
+        )
         self.assertGreaterEqual(result.elapsed_seconds, 0.0)
 
     def test_compile_scope_ignores_diagnostic_work_but_checks_production(self):
@@ -78,6 +91,76 @@ class CodeCompileGateTests(unittest.TestCase):
                 "Python compile failed: broken.py",
             ):
                 compile_repository_sources(root)
+
+    def test_production_source_manifest_hashes_exact_compile_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app.py"
+            app.write_text("answer = 42\n", encoding="utf-8")
+            work = root / "work"
+            work.mkdir()
+            (work / "diagnostic.py").write_text(
+                "answer = 99\n",
+                encoding="utf-8",
+            )
+
+            first = production_source_manifest(root)
+            self.assertEqual(
+                first.schema_version,
+                PRODUCTION_SOURCE_MANIFEST_VERSION,
+            )
+            self.assertEqual(first.source_count, 1)
+            self.assertEqual(
+                [record.path for record in first.files],
+                ["app.py"],
+            )
+            self.assertEqual(first.files[0].size, app.stat().st_size)
+            original_mtime = app.stat().st_mtime_ns
+
+            app.write_text("answer = 43\n", encoding="utf-8")
+            os.utime(app, ns=(original_mtime, original_mtime))
+            second = production_source_manifest(root)
+            self.assertNotEqual(first.content_hash, second.content_hash)
+            self.assertNotEqual(first.files[0].sha256, second.files[0].sha256)
+
+    def test_production_source_revision_report_requires_exact_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app.py"
+            app.write_text("answer = 42\n", encoding="utf-8")
+            started = production_source_manifest(root)
+            state = production_source_revision_state(
+                started.content_hash,
+                started,
+                started,
+            )
+            report = {"production_source_revision": state}
+            validated = validate_production_source_revision_report(
+                report,
+                started,
+            )
+            self.assertEqual(
+                validated["started"]["content_hash"],
+                started.content_hash,
+            )
+
+            app.write_text("answer = 43\n", encoding="utf-8")
+            finished = production_source_manifest(root)
+            report["production_source_revision"] = (
+                production_source_revision_state(
+                    started.content_hash,
+                    started,
+                    finished,
+                )
+            )
+            with self.assertRaisesRegex(
+                CompileGateError,
+                "Child-finish production source revision mismatch",
+            ):
+                validate_production_source_revision_report(
+                    report,
+                    started,
+                )
 
     def test_owner_atlas_guard_regression_fails_at_compile_gate(self):
         source = gui_source()

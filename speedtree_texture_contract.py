@@ -1548,15 +1548,18 @@ def read_stmat_material_sources(stmat_path):
             continue
         material_name = _attribute(node, "Name")
         sources = []
+        map_index = -1
         for map_node in node.iter():
             if map_node is node or _local_name(map_node.tag).casefold() != "map":
                 continue
+            map_index += 1
             source = _attribute(map_node, "Source")
             if not source:
                 continue
             resolved = _absolute_path(source, stmat.parent)
             sources.append(
                 {
+                    "map_index": map_index,
                     "map": _attribute(map_node, "Name"),
                     "source": source,
                     "resolved_source": str(resolved),
