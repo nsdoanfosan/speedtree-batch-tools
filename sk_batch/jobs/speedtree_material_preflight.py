@@ -665,6 +665,56 @@ def preflight_contract_issues(report):
                 },
             )
         )
+    atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
+    if atlas_integrity.get("blocking"):
+        issues.append(
+            _issue(
+                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
+                "atlas_builder",
+                report.get("spm"),
+                atlas_integrity.get("receipt_resolution_error")
+                or "Atlas builder-managed superseded or ambiguous assets remain in the SPM",
+                details={
+                    "classification_counts": atlas_integrity.get(
+                        "classification_counts"
+                    )
+                    or {},
+                    "managed_orphan_mesh_count": atlas_integrity.get(
+                        "managed_orphan_mesh_count"
+                    )
+                    or 0,
+                    "managed_orphan_material_count": atlas_integrity.get(
+                        "managed_orphan_material_count"
+                    )
+                    or 0,
+                    "integrity_issues": atlas_integrity.get(
+                        "integrity_issues"
+                    )
+                    or [],
+                    "receipt_resolution": atlas_integrity.get(
+                        "receipt_resolution"
+                    )
+                    or "",
+                    "current_manifest_path": atlas_integrity.get(
+                        "current_manifest_path"
+                    )
+                    or "",
+                    "selected_manifest_paths": atlas_integrity.get(
+                        "selected_manifest_paths"
+                    )
+                    or [],
+                    "selected_scope_ids": atlas_integrity.get(
+                        "selected_scope_ids"
+                    )
+                    or [],
+                    "selected_authorities": atlas_integrity.get(
+                        "selected_authorities"
+                    )
+                    or [],
+                    "repair_input": atlas_integrity.get("repair_input") or {},
+                },
+            )
+        )
 
     material = report.get("material_export_contract") or {}
     material_status = str(material.get("status") or "")
@@ -871,6 +921,7 @@ def main():
         mesh_files = inspect_spm_mesh_file_references(speedtree_spm)
         report["mesh_file_reference_contract"] = mesh_files
         missing_mesh_files = list(mesh_files.get("missing") or [])
+        atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
         if not leaf_ok:
             report["status"] = "blocked"
             report["error"] = leaf_message
@@ -912,6 +963,32 @@ def main():
                 }
                 for row in missing_mesh_files
             ]
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="blocked",
+            )
+        elif atlas_integrity.get("blocking"):
+            stale_count = int(
+                atlas_integrity.get("managed_orphan_mesh_count") or 0
+            )
+            report["status"] = "blocked"
+            report["classification"] = (
+                "atlas_managed_asset_integrity_stale"
+            )
+            report["error"] = (
+                "Atlas consumer integrity audit found "
+                f"{stale_count} builder-managed Mesh asset(s) that are "
+                "superseded or ambiguous despite having no missing file."
+            )
+            report["remediation"] = (
+                "Review the content-addressed Atlas repair input, then run "
+                "the separately approved recovery workflow. This preflight "
+                "does not delete or repair SPM assets."
+            )
+            report["atlas_consumer_repair_input"] = (
+                atlas_integrity.get("repair_input") or {}
+            )
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
                 spm=canonical_spm.name,
