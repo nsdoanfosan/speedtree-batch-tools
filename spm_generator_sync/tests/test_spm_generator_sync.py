@@ -338,6 +338,29 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual([Path(row["folder"]) for row in board], [owner])
             discover.assert_any_call(owner, verify_physical=False)
 
+    def test_scan_reports_folder_progress_without_changing_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            owner = root / "Tree_elm"
+            owner.mkdir()
+            write_spm(owner / "SK_Tree_elm_01.spm", make_master())
+            progress = []
+
+            board = sync.scan_tree_folders(
+                root,
+                sk_only=True,
+                verify_physical=False,
+                progress_callback=lambda stage, percent: progress.append(
+                    (stage, percent)
+                ),
+            )
+
+            self.assertEqual([Path(row["folder"]) for row in board], [owner])
+            self.assertTrue(progress)
+            self.assertEqual(progress[-1][1], 100)
+            self.assertIn("2/2", progress[-1][0])
+            self.assertTrue(any("Tree_elm" in stage for stage, _ in progress))
+
     def test_cloned_and_previously_wrong_leaf_material_ids_are_remapped_by_asset_name(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

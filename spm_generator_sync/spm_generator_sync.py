@@ -2803,6 +2803,7 @@ def scan_tree_folders(
     sk_only: bool = False,
     *,
     verify_physical: bool = True,
+    progress_callback=None,
 ) -> list[dict]:
     root = Path(root)
     if not root.is_dir():
@@ -2821,10 +2822,17 @@ def scan_tree_folders(
         )
     except OSError as exc:
         raise SyncError(f"나무 루트를 읽을 수 없습니다: {root}") from exc
-    for folder in sorted(
+    scan_candidates = sorted(
         candidates,
         key=lambda path: (path != root, path.name.casefold()),
-    ):
+    )
+    total_candidates = len(scan_candidates)
+    for index, folder in enumerate(scan_candidates, start=1):
+        if progress_callback:
+            progress_callback(
+                f"폴더 검사 {index}/{total_candidates} · {folder.name}",
+                int(100 * (index - 1) / max(1, total_candidates)),
+            )
         try:
             files = [path.name for path in folder.iterdir() if path.is_file()]
         except OSError:
@@ -2861,6 +2869,11 @@ def scan_tree_folders(
             "master_candidates": candidates,
             "cluster_blends": cluster_blends,
         })
+    if progress_callback:
+        progress_callback(
+            f"폴더 검사 완료 · {total_candidates}/{total_candidates}",
+            100,
+        )
     return folders
 
 
