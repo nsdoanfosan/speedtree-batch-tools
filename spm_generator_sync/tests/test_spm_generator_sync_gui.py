@@ -60,20 +60,28 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         app.sk_only_var.get.return_value = True
         app.render_board = mock.Mock()
         app.status_var = mock.Mock()
+        app._start_job = mock.Mock(return_value=17)
 
         with mock.patch.object(
             GUI.engine,
             "scan_tree_folders",
             return_value=[],
         ) as scan:
-            app.refresh(fast=True)
-
-        scan.assert_called_once_with(
-            Path(r"D:\Trees"),
-            sk_only=True,
-            verify_physical=False,
-        )
+            job_id = app.refresh(fast=True)
+            self.assertEqual(job_id, 17)
+            scan.assert_not_called()
+            _label, work, done = app._start_job.call_args.args
+            report = mock.Mock()
+            board = work(report)
+            scan.assert_called_once_with(
+                Path(r"D:\Trees"),
+                sk_only=True,
+                verify_physical=False,
+                progress_callback=report,
+            )
+        done(board)
         app.render_board.assert_called_once_with(fast=True)
+        self.assertFalse(app._start_job.call_args.kwargs["shared_queue"])
 
     def test_gui_uses_full_sibling_engine_module(self):
         self.assertEqual(
@@ -988,6 +996,88 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertTrue(app.progress_text_var.get().startswith("완료 · "))
             self.assertEqual(str(app.apply_button.cget("state")), "normal")
         finally:
+            root.destroy()
+
+    def test_slow_refresh_runs_off_tk_thread_and_keeps_events_flowing(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            entered = threading.Event()
+            release = threading.Event()
+            tk_event = threading.Event()
+            worker_thread_ids = []
+
+            def slow_scan(
+                _root,
+                *,
+                sk_only,
+                verify_physical,
+                progress_callback,
+            ):
+                self.assertTrue(sk_only)
+                self.assertTrue(verify_physical)
+                worker_thread_ids.append(threading.get_ident())
+                progress_callback("폴더 검사 1/2 · Tree_elm", 10)
+                entered.set()
+                release.wait(2)
+                return []
+
+            with mock.patch.object(
+                GUI.engine,
+                "scan_tree_folders",
+                side_effect=slow_scan,
+            ):
+                app.refresh()
+                root.after(0, tk_event.set)
+                deadline = time.monotonic() + 2
+                while (
+                    (not entered.is_set() or not tk_event.is_set())
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+                self.assertTrue(entered.is_set())
+                self.assertTrue(tk_event.is_set())
+                self.assertNotEqual(
+                    worker_thread_ids,
+                    [threading.get_ident()],
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    "마지막 진행" not in app.progress_text_var.get()
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+                self.assertIn("마지막 진행", app.progress_text_var.get())
+                release.set()
+                deadline = time.monotonic() + 2
+                while (
+                    app.active_job is not None
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertIsNone(app.active_job)
+            app.render_board.assert_called_once_with(fast=False)
+        finally:
+            release.set()
             root.destroy()
 
     def test_background_jobs_queue_fifo_and_continue_after_failure(self):

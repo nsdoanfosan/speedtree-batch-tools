@@ -460,7 +460,9 @@ class App:
         self.job_failures = []
         self._job_has_followup = False
         self.job_started_at = None
+        self.job_last_progress_at = None
         self.job_stage = "대기"
+        self.refresh_generation = 0
         self.shared_queue_runtime = SharedQueueRuntime(
             "spm_generator_sync"
         )
@@ -477,7 +479,7 @@ class App:
         root.geometry("1460x880")
         root.minsize(1120, 680)
         self._build_ui()
-        self.refresh(fast=True)
+        self.root.after_idle(lambda: self.refresh(fast=True))
 
     def _build_ui(self):
         style = ttk.Style(self.root)
@@ -743,35 +745,62 @@ class App:
 
     def refresh(self, reveal=None, *, fast=False):
         self.persist_config()
-        try:
-            self.board = engine.scan_tree_folders(
-                Path(self.root_var.get().strip()),
-                sk_only=bool(self.sk_only_var.get()),
-                verify_physical=not fast,
+        board_root = Path(self.root_var.get().strip())
+        sk_only = bool(self.sk_only_var.get())
+        verify_physical = not fast
+        self.refresh_generation = getattr(
+            self, "refresh_generation", 0
+        ) + 1
+        generation = self.refresh_generation
+
+        def scan(report):
+            return engine.scan_tree_folders(
+                board_root,
+                sk_only=sk_only,
+                verify_physical=verify_physical,
+                progress_callback=report,
             )
-        except Exception as exc:
-            messagebox.showerror("검사 실패", str(exc), parent=self.root)
-            return
-        self.render_board(fast=fast)
-        folder_count = len(self.board)
-        spm_count = sum(len(item["spms"]) for item in self.board)
-        cluster_count = sum(len(item.get("cluster_blends") or ()) for item in self.board)
-        self.status_var.set(
-            f"{folder_count}개 폴더 · {spm_count}개 SPM · Cluster blend {cluster_count}개"
+
+        def done(board):
+            if generation != self.refresh_generation:
+                return
+            self.board = board
+            self.render_board(fast=fast)
+            folder_count = len(self.board)
+            spm_count = sum(len(item["spms"]) for item in self.board)
+            cluster_count = sum(
+                len(item.get("cluster_blends") or ())
+                for item in self.board
+            )
+            self.status_var.set(
+                f"{folder_count}개 폴더 · {spm_count}개 SPM · "
+                f"Cluster blend {cluster_count}개"
+            )
+            if reveal:
+                reveal_folder, reveal_file = reveal
+                for iid, meta in self.item_meta.items():
+                    if (
+                        meta.get("kind") == "spm"
+                        and meta.get("folder") == Path(reveal_folder)
+                        and meta.get("file") == reveal_file
+                    ):
+                        self.tree.selection_set(iid)
+                        self.tree.focus(iid)
+                        self.tree.see(iid)
+                        self.update_details()
+                        break
+
+        return self._start_job(
+            "폴더 검사 중...",
+            scan,
+            done,
+            queue_label=(
+                "빠른 폴더 검사"
+                if fast
+                else "폴더 검사 및 물리 Cluster 검증"
+            ),
+            shared_queue=False,
         )
-        if reveal:
-            reveal_folder, reveal_file = reveal
-            for iid, meta in self.item_meta.items():
-                if (
-                    meta.get("kind") == "spm"
-                    and meta.get("folder") == Path(reveal_folder)
-                    and meta.get("file") == reveal_file
-                ):
-                    self.tree.selection_set(iid)
-                    self.tree.focus(iid)
-                    self.tree.see(iid)
-                    self.update_details()
-                    break
 
     def master_status(
         self,
@@ -2393,15 +2422,28 @@ class App:
             self.queue_run_completed = 0
         if not hasattr(self, "_job_has_followup"):
             self._job_has_followup = False
+        if not hasattr(self, "job_last_progress_at"):
+            self.job_last_progress_at = None
 
     def _show_job_info(self, title, message):
         """Do not let a completion popup hold the next queued job."""
-        if getattr(self, "_job_has_followup", False):
+        if (
+            getattr(self, "_job_has_followup", False)
+            or bool(getattr(self, "pending_jobs", ()))
+        ):
             self.status_var.set(f"{title} · 다음 대기 작업 시작")
             return
         messagebox.showinfo(title, message, parent=self.root)
 
-    def _start_job(self, label, func, on_success, *, queue_label=None):
+    def _start_job(
+        self,
+        label,
+        func,
+        on_success,
+        *,
+        queue_label=None,
+        shared_queue=True,
+    ):
         """Capture one request in both the window and process-global FIFO."""
         self._ensure_job_queue_state()
         if self.active_job is None and not self.pending_jobs:
@@ -2416,9 +2458,10 @@ class App:
             "queue_label": display_label,
             "func": func,
             "on_success": on_success,
+            "shared_queue": bool(shared_queue),
         }
         shared_runtime = getattr(self, "shared_queue_runtime", None)
-        if shared_runtime is not None:
+        if shared_queue and shared_runtime is not None:
             try:
                 shared = shared_runtime.enqueue(
                     display_label,
@@ -2469,6 +2512,7 @@ class App:
             )
         )
         self.job_started_at = time.monotonic()
+        self.job_last_progress_at = self.job_started_at
         self.job_stage = job["label"]
         self.progress_bar.configure(value=1)
         self.progress_text_var.set(
@@ -2575,6 +2619,7 @@ class App:
                 ):
                     continue
                 self.job_stage = stage
+                self.job_last_progress_at = time.monotonic()
                 self.progress_bar.configure(value=percent)
                 self.status_var.set(
                     stage
@@ -2593,8 +2638,16 @@ class App:
 
         elapsed = max(0, int(time.monotonic() - (self.job_started_at or time.monotonic())))
         elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        heartbeat_age = max(
+            0,
+            int(
+                time.monotonic()
+                - (self.job_last_progress_at or time.monotonic())
+            ),
+        )
         self.progress_text_var.set(
-            f"{self.job_stage} · {elapsed_text}"
+            f"{self.job_stage} · {elapsed_text} · "
+            f"마지막 진행 {heartbeat_age}초 전"
             + (
                 f" · 대기 {len(self.pending_jobs)}개"
                 if self.pending_jobs else ""
