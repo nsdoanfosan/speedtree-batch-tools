@@ -41,7 +41,10 @@ from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
-from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from speedtree_legacy_cluster_contract import (
+    inspect_legacy_cluster_state,
+    peek_generator_foregrounds,
+)
 from sk_batch.sk_common import scan_cluster_spm_sources
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -182,6 +185,9 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
+# See _take_pending_decoded_text(): (cache_key, text) for the most recent
+# cold SPM parse, or None. Single slot on purpose -- see _spm_analysis().
+_PENDING_DECODED_TEXT = None
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
@@ -786,9 +792,15 @@ def _spm_analysis(path):
     path_key, size, mtime_ns = cache_key
     persistent = _persistent_spm_analysis()
     disk_entry = persistent.get(path_key)
+    # Schema 4 lacks only the two node-table-staleness keys added to each
+    # binding row (export_evidence/node_table_stale, issue #4). Rejecting it
+    # outright forces a full re-decode of every previously-cached SPM the
+    # moment this file bumps schema -- confirmed to blow a warm ~11s scan past
+    # 124s on a 431-file cache. Reuse it; those two keys are simply absent
+    # until the SPM's stat next changes and it gets a fresh parse.
     if disk_entry and disk_entry.get("size") == size \
             and disk_entry.get("mtime_ns") == mtime_ns \
-            and disk_entry.get("leaf_binding_schema") == 5:
+            and disk_entry.get("leaf_binding_schema") in (4, 5):
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
@@ -797,6 +809,8 @@ def _spm_analysis(path):
             "leaf_generator_bindings": disk_entry.get(
                 "leaf_generator_bindings", []),
             "mesh_asset_ids": set(disk_entry.get("mesh_asset_ids", [])),
+            "generator_foregrounds_snapshot": _disk_generator_foregrounds(
+                disk_entry),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
         return analysis
@@ -846,6 +860,15 @@ def _spm_analysis(path):
         "visible_material_ids": visible,
         "leaf_generator_bindings": leaf_bindings,
         "mesh_asset_ids": mesh_assets,
+        # Not computed here: only ~40% of SPMs in a typical folder carry a
+        # valid legacy Cluster marker receipt, and the Generator-foreground
+        # scan is only worth its cost for those. Eagerly running it for every
+        # SPM regressed a synthetic 103-file/41-receipt profile from 3.96s to
+        # 4.52s. leaf_generator_bindings() below hands the decoded text to
+        # inspect_legacy_cluster_state(), which scans it lazily -- only when
+        # a valid receipt makes that worthwhile -- and only ever reads this
+        # SPM once either way.
+        "generator_foregrounds_snapshot": None,
     }
     # A modified file receives a new stat key. Drop only stale entries for
     # this exact path so long-running GUI refreshes do not grow indefinitely.
@@ -867,7 +890,62 @@ def _spm_analysis(path):
             "leaf_binding_schema": 5,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+    # Single-slot, single-use hand-off: leaf_generator_bindings(), called
+    # immediately after for every SPM a scan touches, consumes this to share
+    # the decode with the legacy-marker audit. A single slot (rather than a
+    # dict keyed by every SPM ever parsed) bounds the extra memory to at most
+    # one decoded document -- which can be hundreds of MB -- regardless of
+    # whether some other, rarer caller of _spm_analysis never consumes it.
+    global _PENDING_DECODED_TEXT
+    _PENDING_DECODED_TEXT = (cache_key, text)
     return analysis
+
+
+def _take_pending_decoded_text(cache_key):
+    global _PENDING_DECODED_TEXT
+    pending = _PENDING_DECODED_TEXT
+    if pending is not None and pending[0] == cache_key:
+        _PENDING_DECODED_TEXT = None
+        return pending[1]
+    return None
+
+
+def _disk_generator_foregrounds(disk_entry):
+    """Reconstruct the shared foregrounds snapshot from a persisted entry.
+
+    Returns ``None`` when the entry predates the legacy-marker snapshot (any
+    pre-existing schema-4 or schema-5 cache), so the caller falls back to a
+    lazy, single, narrowed read instead of silently treating "not persisted
+    yet" as "no markers".
+    """
+    if disk_entry.get("legacy_marker_schema") != 1:
+        return None
+    foregrounds = disk_entry.get("generator_foregrounds")
+    if foregrounds is None:
+        return None
+    return foregrounds, set(disk_entry.get("duplicate_generator_guids", []))
+
+
+def _backfill_generator_foregrounds_cache(cache_key, snapshot):
+    """Persist a lazily-computed legacy-marker snapshot onto its SPM's entry.
+
+    Called only when a disk hit for material/leaf data existed without a
+    legacy-marker snapshot (pre-existing schema-4/5 cache) and something
+    downstream needed one anyway (speedtree_legacy_cluster_contract already
+    paid for a fresh, narrowed read/decode). Enrich the existing entry in
+    place rather than forcing a full material re-parse.
+    """
+    global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    path_key, size, mtime_ns = cache_key
+    persistent = _persistent_spm_analysis()
+    entry = persistent.get(path_key)
+    if not entry or entry.get("size") != size or entry.get("mtime_ns") != mtime_ns:
+        return
+    foregrounds, duplicate_guids = snapshot
+    entry["legacy_marker_schema"] = 1
+    entry["generator_foregrounds"] = foregrounds
+    entry["duplicate_generator_guids"] = sorted(duplicate_guids)
+    _PERSISTENT_SPM_ANALYSIS_DIRTY = True
 
 
 def canonical_material_name(name):
@@ -1088,8 +1166,27 @@ def visible_material_names(path):
 
 def leaf_generator_bindings(path, visible_only=False):
     """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
-    bindings = _spm_analysis(path)["leaf_generator_bindings"]
-    legacy_state = inspect_legacy_cluster_state(path)
+    cache_key = _file_cache_key(path)
+    analysis = _spm_analysis(path)
+    bindings = analysis["leaf_generator_bindings"]
+    snapshot = analysis.get("generator_foregrounds_snapshot")
+    pending_text = None
+    if snapshot is None:
+        # Either a fresh cold parse just above (the common case -- take the
+        # decoded text so a valid receipt costs one scan, not one read plus
+        # one scan) or a pre-existing schema-4/5 disk cache entry with no
+        # persisted legacy-marker snapshot yet (nothing to hand off; a valid
+        # receipt then costs its own single, narrowed read below).
+        pending_text = _take_pending_decoded_text(cache_key)
+    legacy_state = inspect_legacy_cluster_state(
+        path, foregrounds_snapshot=snapshot, decoded_text=pending_text)
+    if snapshot is None:
+        # If the legacy audit above actually scanned (only happens when the
+        # SPM holds a valid receipt), backfill so it is never read again.
+        computed = peek_generator_foregrounds(path)
+        if computed is not None:
+            analysis["generator_foregrounds_snapshot"] = computed
+            _backfill_generator_foregrounds_cache(cache_key, computed)
     legacy_guids = set(legacy_state["classified_generator_guids"])
     drift_guids = set(legacy_state["marker_drift_guids"])
     evidence = legacy_state.get("evidence_by_guid") or {}

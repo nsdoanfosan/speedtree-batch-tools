@@ -59,6 +59,85 @@ FOREGROUND_TAG_RE = {
 GENERATORS_OPEN_BYTES_RE = re.compile(rb"<Generators\b[^>]*>", re.IGNORECASE)
 GENERATORS_CLOSE_BYTES_RE = re.compile(rb"</Generators\s*>", re.IGNORECASE)
 GENERATOR_CLOSE_BYTES = b"</Generator>"
+# str-level equivalents of the byte patterns above, for callers that already
+# hold the fully decoded document (e.g. pcg_texture_audit's per-SPM analysis)
+# and only need the cheap narrowing, not another read/decompress/decode.
+GENERATORS_OPEN_RE = re.compile(r"<Generators\b[^>]*>", re.IGNORECASE)
+GENERATORS_CLOSE_RE = re.compile(r"</Generators\s*>", re.IGNORECASE)
+GENERATOR_CLOSE_TAG = "</Generator>"
+
+# In-process snapshots of {guid: {tag: value}} + duplicate GUIDs, keyed by the
+# same (resolved path, size, mtime_ns) tuple as ``_stat_key``.  A caller that
+# already decoded an SPM (pcg_texture_audit's ``_spm_analysis``) shares the
+# parsed result here so ``_generator_foregrounds`` never re-reads/decompresses
+# the same file.  Keying on the exact stat means a changed file is always a
+# miss, never a stale hit.
+_SHARED_GENERATOR_SNAPSHOTS = {}
+
+# Transient, single-use hand-off of an already-decoded document, keyed the
+# same way.  Unlike ``_SHARED_GENERATOR_SNAPSHOTS`` (a handful of GUID->tag
+# dicts per SPM, cheap to keep around), a decoded SPM document can be
+# hundreds of MB, so this is popped the instant ``_generator_foregrounds``
+# consumes it -- never held onto for more than the one call that primed it.
+_SHARED_DECODED_TEXT = {}
+
+
+def _store_generator_snapshot(key, foregrounds, duplicate_guids):
+    path_key = key[0]
+    for old_key in [
+        existing for existing in _SHARED_GENERATOR_SNAPSHOTS
+        if existing[0] == path_key and existing != key
+    ]:
+        del _SHARED_GENERATOR_SNAPSHOTS[old_key]
+    result = (dict(foregrounds), set(duplicate_guids))
+    _SHARED_GENERATOR_SNAPSHOTS[key] = result
+    return result
+
+
+def _prime_generator_snapshot(spm, snapshot):
+    """Register a (foregrounds, duplicate_guids) pair computed elsewhere."""
+    if snapshot is None:
+        return
+    foregrounds, duplicate_guids = snapshot
+    _store_generator_snapshot(_stat_key(spm), foregrounds, duplicate_guids)
+
+
+def peek_generator_foregrounds(spm_path):
+    """Return a previously shared/computed (foregrounds, duplicates) pair.
+
+    Returns ``None`` if nothing has been computed for the SPM's current stat
+    in this process yet -- used by callers that want to opportunistically
+    persist a snapshot they did not compute themselves.
+    """
+    snapshot = _SHARED_GENERATOR_SNAPSHOTS.get(_stat_key(spm_path))
+    if snapshot is None:
+        return None
+    foregrounds, duplicate_guids = snapshot
+    return dict(foregrounds), set(duplicate_guids)
+
+
+def generator_foregrounds_from_decoded_text(text):
+    """Same result as ``_generator_foregrounds``, from text decoded elsewhere.
+
+    Sharing the already-decoded document removes the redundant read and
+    gzip/UTF-8 decode; the boundary-only regex walk still runs once, over the
+    same narrowed ``<Generators>`` section a fresh read would have used.
+    """
+    return _generator_foregrounds_from_text(_generator_section_text(text))
+
+
+def _generator_section_text(text):
+    """String-level narrowing mirror of ``_generator_section_bytes``."""
+    open_match = GENERATORS_OPEN_RE.search(text)
+    if open_match is None:
+        return text
+    close_match = GENERATORS_CLOSE_RE.search(text, open_match.end())
+    section = text[
+        open_match.end(): close_match.start() if close_match else len(text)
+    ]
+    if section.count(GENERATOR_CLOSE_TAG) != text.count(GENERATOR_CLOSE_TAG):
+        return text
+    return section
 
 
 def marker_receipt_path(spm_path):
@@ -159,12 +238,26 @@ def _generator_section_bytes(raw):
 
 
 def _generator_foregrounds(spm):
+    key = _stat_key(spm)
+    shared = _SHARED_GENERATOR_SNAPSHOTS.get(key)
+    if shared is not None:
+        return shared
+    # A caller that just decoded this exact SPM (pcg_texture_audit's
+    # per-SPM analysis) may have handed the text over instead of the
+    # already-parsed result -- this is the only place that ever reads it,
+    # and only when a valid receipt makes the regex walk worth running.
+    text = _SHARED_DECODED_TEXT.pop(key, None)
+    if text is not None:
+        foregrounds, duplicate_guids = generator_foregrounds_from_decoded_text(
+            text)
+        return _store_generator_snapshot(key, foregrounds, duplicate_guids)
     raw = Path(spm).read_bytes()
     if raw.startswith(b"\x1f\x8b"):
         raw = gzip.decompress(raw)
-    return _generator_foregrounds_from_text(
+    foregrounds, duplicate_guids = _generator_foregrounds_from_text(
         _generator_section_bytes(raw).decode("utf-8")
     )
+    return _store_generator_snapshot(key, foregrounds, duplicate_guids)
 
 
 def _problem_marker_guids(spm):
@@ -262,14 +355,42 @@ def _inspect_cached(spm_key, receipt_key, problem_key):
     return result
 
 
-def inspect_legacy_cluster_state(spm_path):
-    """Return the immutable GUID lineage plus current marker drift, read-only."""
+def inspect_legacy_cluster_state(
+        spm_path, foregrounds_snapshot=None, decoded_text=None):
+    """Return the immutable GUID lineage plus current marker drift, read-only.
+
+    Two independent, optional hand-offs let a caller who already touched this
+    exact SPM (pcg_texture_audit's per-SPM analysis) avoid a second
+    read/decompress here, without ever running the Generator-foreground scan
+    for an SPM that turns out not to need it:
+
+    ``foregrounds_snapshot``
+        An already-*derived* ``(foregrounds, duplicate_guids)`` pair (see
+        ``generator_foregrounds_from_decoded_text``) -- typically a snapshot
+        persisted on a previous run. No scan runs at all; it is used as-is.
+    ``decoded_text``
+        An already-decoded document, when nothing has been derived from it
+        yet (e.g. a fresh cold parse). It is scanned here, and only here,
+        the moment a valid receipt makes that worthwhile -- never eagerly,
+        and never for longer than this one call.
+
+    Both are ignored whenever the ``(spm, receipt, problem_receipt)`` stat
+    triple is already cached -- lru_cache reuse alone then makes either
+    unnecessary.
+    """
     spm = Path(spm_path)
-    result = _inspect_cached(
-        _stat_key(spm),
-        _stat_key(marker_receipt_path(spm)),
-        _stat_key(problem_marker_receipt_path(spm)),
-    )
+    key = _stat_key(spm)
+    _prime_generator_snapshot(spm, foregrounds_snapshot)
+    if foregrounds_snapshot is None and decoded_text is not None:
+        _SHARED_DECODED_TEXT[key] = decoded_text
+    try:
+        result = _inspect_cached(
+            key,
+            _stat_key(marker_receipt_path(spm)),
+            _stat_key(problem_marker_receipt_path(spm)),
+        )
+    finally:
+        _SHARED_DECODED_TEXT.pop(key, None)
     return copy.deepcopy(result)
 
 
@@ -284,8 +405,10 @@ __all__ = [
     "LEGACY_CLUSTER_MARKER_VALUES",
     "RECEIPT_KIND",
     "RECEIPT_VERSION",
+    "generator_foregrounds_from_decoded_text",
     "inspect_legacy_cluster_state",
     "legacy_cluster_generator_guids",
     "marker_receipt_path",
+    "peek_generator_foregrounds",
     "problem_marker_receipt_path",
 ]
