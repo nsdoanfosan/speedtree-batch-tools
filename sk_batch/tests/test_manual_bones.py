@@ -45,7 +45,7 @@ class FakeTree:
 
 
 class ManualBonesTests(unittest.TestCase):
-    def test_full_pipeline_runs_three_phases_in_order_and_emits_one_done(self):
+    def test_full_pipeline_skips_tree_bone_wave_and_emits_one_done(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         app.stop_flag = threading.Event()
@@ -59,7 +59,6 @@ class ManualBonesTests(unittest.TestCase):
         self.assertEqual(
             app._run_batch.call_args_list,
             [
-                mock.call("spm", targets, emit_done=False),
                 mock.call("blender", targets, emit_done=False),
                 mock.call("push", targets, emit_done=False),
             ],
@@ -70,7 +69,7 @@ class ManualBonesTests(unittest.TestCase):
         self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
         self.assertIn(("progress", "전체 자동 완료"), queued)
 
-    def test_blender_button_chain_stops_after_spm_and_blender(self):
+    def test_blender_button_chain_runs_only_tree_blender(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         app.stop_flag = threading.Event()
@@ -88,7 +87,6 @@ class ManualBonesTests(unittest.TestCase):
         self.assertEqual(
             app._run_batch.call_args_list,
             [
-                mock.call("spm", targets, emit_done=False),
                 mock.call("blender", targets, emit_done=False),
             ],
         )
