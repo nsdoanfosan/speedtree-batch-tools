@@ -507,7 +507,13 @@ def run_streaming_process(
             args=(stream, channel, events),
             kwargs={"encoding": encoding, "max_line_chars": max_line_chars},
             name=f"process-{channel}-{getattr(process, 'pid', 'unknown')}",
-            daemon=False,
+            # A reader parked in read() on a pipe whose write end is held
+            # outside the owned tree is already reported as
+            # process_pipe_eof_timeout; it must not additionally block
+            # interpreter shutdown.  A non-daemon reader kept pythonw.exe alive
+            # after its window closed, which also keeps the shared queue's
+            # liveness probe returning True so the lease never recovers.
+            daemon=True,
         )
         for channel, stream in (
             ("stdout", process.stdout),
@@ -595,6 +601,21 @@ def run_streaming_process(
                             },
                         )
                     cleanup_state = "process_tree_forced_after_root_exit"
+                elif time.monotonic() - root_exit_observed_at >= max(
+                    0.0, float(exit_pipe_grace)
+                ):
+                    # Root gone, nothing left in the tree to terminate, but a
+                    # pipe still has no EOF: the write end is held outside the
+                    # owned tree, or there is no tree to own (POSIX, or an
+                    # injected popen_factory).  Without this the loop spins on
+                    # `continue` forever -- the timeout and cancellation checks
+                    # below are unreachable once the root has exited -- so a
+                    # finished export never returns and cannot be cancelled.
+                    # Stop waiting for the missing EOF and let the cleanup
+                    # block raise process_pipe_eof_timeout if a reader is still
+                    # parked after kill_grace.
+                    cleanup_state = "process_pipe_open_after_root_exit"
+                    break
                 continue
 
             if requested():

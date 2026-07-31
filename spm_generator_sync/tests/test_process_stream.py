@@ -102,6 +102,42 @@ class _NeverDiesProcess(_ForcedKillProcess):
         self.kill_calls += 1
 
 
+class _BlockingStream:
+    """A pipe whose write end is held open outside the owned tree."""
+
+    def __init__(self):
+        self.released = threading.Event()
+
+    def read(self, _size):
+        self.released.wait()
+        return b""
+
+    def close(self):
+        self.released.set()
+
+
+class _RootExitedWithOpenPipeProcess:
+    """Root already exited; one channel never reaches EOF."""
+
+    pid = 4747
+
+    def __init__(self, *_args, **_kwargs):
+        self.stdout = io.BytesIO(b"")
+        self.stderr = _BlockingStream()
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
 def _windows_process_is_alive(pid):
     if os.name != "nt":
         return False
@@ -124,6 +160,83 @@ def _windows_process_is_alive(pid):
         return exit_code.value == still_active
     finally:
         kernel32.CloseHandle(handle)
+
+
+class RootExitedWithOpenPipeTests(unittest.TestCase):
+    """A missing EOF after root exit must not disable timeout or cancellation.
+
+    Both checks used to sit below the `continue` taken on every post-exit
+    iteration, so a finished export whose pipe stayed open never returned and
+    could not be cancelled.  Reproduced with the module's own popen_factory
+    seam; each case must finish well inside its own wait budget.
+    """
+
+    def _run_in_thread(self, **kwargs):
+        outcome = {}
+        finished = threading.Event()
+
+        def run():
+            try:
+                outcome["result"] = run_streaming_process(
+                    ["fake.exe"],
+                    popen_factory=_RootExitedWithOpenPipeProcess,
+                    terminate_grace=0.2,
+                    kill_grace=0.2,
+                    exit_pipe_grace=0.2,
+                    **kwargs,
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertion
+                outcome["error"] = exc
+            finished.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.assertTrue(
+            finished.wait(15.0),
+            "run_streaming_process never returned after root exit",
+        )
+        return outcome
+
+    def test_timeout_still_fires_when_a_pipe_never_reaches_eof(self):
+        outcome = self._run_in_thread(timeout=0.3)
+        error = outcome.get("error")
+        self.assertIsInstance(error, ProcessTerminationError)
+        self.assertEqual(error.reason_token, "process_pipe_eof_timeout")
+
+    def test_cancellation_after_root_exit_is_still_observed(self):
+        started = time.monotonic()
+        outcome = self._run_in_thread(
+            timeout=None,
+            cancel_requested=lambda: time.monotonic() - started > 0.1,
+        )
+        error = outcome.get("error")
+        self.assertIsInstance(error, ProcessTerminationError)
+        self.assertEqual(error.reason_token, "process_pipe_eof_timeout")
+
+    def test_readers_do_not_block_interpreter_shutdown(self):
+        process = _RootExitedWithOpenPipeProcess()
+        try:
+            run_streaming_process(
+                ["fake.exe"],
+                popen_factory=lambda *_a, **_k: process,
+                timeout=0.3,
+                terminate_grace=0.2,
+                kill_grace=0.2,
+                exit_pipe_grace=0.2,
+            )
+        except ProcessTerminationError:
+            pass
+        parked = [
+            thread for thread in threading.enumerate()
+            if thread.name.startswith("process-stderr-")
+        ]
+        self.assertTrue(parked, "expected the blocked reader to still exist")
+        for thread in parked:
+            self.assertTrue(
+                thread.daemon,
+                f"{thread.name} is non-daemon and would hang shutdown",
+            )
+        process.stderr.close()
 
 
 class ProcessStreamTests(unittest.TestCase):
