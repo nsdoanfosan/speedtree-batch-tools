@@ -115,6 +115,8 @@ TEX_FILENAME_RE = re.compile(
     re.IGNORECASE | re.DOTALL)
 GENERATOR_BLOCK_RE = re.compile(
     r"<Generator\b[^>]*>.*?</Generator>", re.IGNORECASE | re.DOTALL)
+# Open/close tags only, for walks that do not need each block's body.
+GENERATOR_BOUNDARY_RE = re.compile(r"<(/?)Generator\b[^>]*>", re.IGNORECASE)
 GENERATOR_TYPE_RE = re.compile(
     r'<Generator\b[^>]*\bType="([^"]*)"', re.IGNORECASE)
 GENERATOR_NAME_RE = re.compile(
@@ -418,6 +420,58 @@ def _export_node_counts_from_text(text):
     return counts, total_nodes
 
 
+def _generator_guid_keys_from_text(text):
+    """GUID keys of every Generator in the document.
+
+    Matches only block boundaries, so this stays cheap next to the walks that
+    have to read each block's properties.
+    """
+    keys = set()
+    body_start = None
+    for match in GENERATOR_BOUNDARY_RE.finditer(text):
+        if match.group(1):  # </Generator>
+            if body_start is None:
+                continue
+            guid_match = ELEMENT_GUID_RE.search(text, body_start, match.start())
+            key = _generator_guid_key(
+                guid_match.group(1) if guid_match else ""
+            )
+            if key:
+                keys.add(key)
+            body_start = None
+        elif body_start is None:
+            body_start = match.end()
+    return keys
+
+
+def _node_table_state(export_node_counts, total_nodes, generator_guid_keys):
+    """Report whether the saved ``<Node>`` table still describes this graph.
+
+    SpeedTree serializes generated nodes next to the Generator graph.  A table
+    that still attributes nodes to Generators the document no longer contains is
+    a leftover from an earlier graph, and then "this Generator owns zero nodes"
+    is no longer evidence that it produces no geometry -- it only proves the
+    table was never regenerated for it.
+
+    Production evidence for why this matters: ``SK_bush_blackgum_02.spm`` keeps
+    4197 nodes of which 3784 (90%) belong to 19 GUIDs that have no Generator,
+    while its five attached, non-hidden leaf Generators own zero nodes each.
+    """
+    counts = export_node_counts or {}
+    known = set(generator_guid_keys or ())
+    orphan_guids = sorted(set(counts) - known)
+    orphan_node_count = sum(int(counts.get(guid) or 0) for guid in orphan_guids)
+    return {
+        "total_node_count": int(total_nodes or 0),
+        "generator_count": len(known),
+        "node_table_generator_count": len(counts),
+        "orphan_generator_guids": orphan_guids,
+        "orphan_node_count": orphan_node_count,
+        # A coherent saved table cannot attribute nodes to a deleted Generator.
+        "stale": bool(orphan_node_count),
+    }
+
+
 def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0):
     """Material IDs referenced by generators that would actually export.
 
@@ -607,19 +661,28 @@ def _leaf_generator_bindings_from_text(
             guid = parent.get(guid, "")
         return False
 
+    node_table = _node_table_state(
+        export_node_counts, total_nodes, hidden_by_guid
+    )
     bindings = []
     for generator in generators:
         graph_visible = not effectively_hidden(generator)
         generated_node_count = int(
             (export_node_counts or {}).get(generator["guid_key"], 0)
         )
-        export_participates = bool(
-            graph_visible
-            and (
-                not total_nodes
-                or not generator["guid_key"]
-                or generated_node_count > 0
-            )
+        counted_by_node_table = bool(
+            not total_nodes
+            or not generator["guid_key"]
+            or generated_node_count > 0
+        )
+        export_participates = bool(graph_visible and counted_by_node_table)
+        # A zero count read out of a stale table proves nothing either way.
+        # Keep failing closed, but say which of the two it is so an operator is
+        # not sent to fix a Generator connection that is already correct.
+        export_evidence = (
+            "node_table"
+            if counted_by_node_table or not node_table["stale"]
+            else "node_table_stale"
         )
         by_name = {name.lower(): (name, value)
                    for name, value in generator["properties"]}
@@ -645,6 +708,8 @@ def _leaf_generator_bindings_from_text(
                 "graph_visible": graph_visible,
                 "generated_node_count": generated_node_count,
                 "export_participates": export_participates,
+                "export_evidence": export_evidence,
+                "node_table_stale": bool(node_table["stale"]),
             })
     return bindings
 
@@ -679,6 +744,13 @@ def live_generator_delivery_snapshot(path):
         "total_node_count": total_nodes,
         "leaf_generator_bindings": [dict(row) for row in bindings],
         "mesh_asset_ids": mesh_asset_ids,
+        # Lets a consumer tell "this Generator exports nothing" apart from
+        # "the saved node table cannot answer that question".
+        "node_table": _node_table_state(
+            export_node_counts,
+            total_nodes,
+            _generator_guid_keys_from_text(text),
+        ),
     }
 
 

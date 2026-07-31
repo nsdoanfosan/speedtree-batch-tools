@@ -1446,6 +1446,65 @@ def spm_check_status_parts(audit):
     return parts
 
 
+def cluster_issue_summary(issues, limit=5):
+    """Render Cluster audit issues so the cause and the fix are both visible.
+
+    A bare ``CODE role=cluster`` line told an operator that something was wrong
+    but not what to do about it, and for a stale node table it named the wrong
+    subject entirely.  Any ``remedy`` the contract published is carried through.
+    """
+    lines = []
+    for issue in list(issues or ())[:limit]:
+        if not isinstance(issue, dict):
+            lines.append(str(issue))
+            continue
+        fields = [str(issue.get("code") or "CLUSTER_DATA_INVALID")]
+        role = str(issue.get("role") or "")
+        if role:
+            fields.append(f"role={role}")
+        details = issue.get("details") or {}
+        status = str(details.get("status") or "")
+        if status:
+            fields.append(f"status={status}")
+        missing = [str(value) for value in details.get("missing") or []]
+        if missing:
+            fields.append("missing=" + ", ".join(missing[:3]))
+        errors = [
+            str(value).split(":", 1)[0]
+            for value in issue.get("errors") or []
+            if str(value).strip()
+        ]
+        if errors:
+            fields.append("errors=" + ", ".join(errors[:3]))
+        targets = [
+            Path(str(row.get("spm"))).name
+            for row in issue.get("blocked_targets") or ()
+            if isinstance(row, dict) and row.get("spm")
+        ]
+        if targets:
+            fields.append("targets=" + ", ".join(targets[:3]))
+        # A block can be partly explained by a stale node table even when
+        # an independent fault keeps the overall code generic. Surface that
+        # subset and its fix instead of only the file that failed.
+        stale_targets = [
+            Path(str(row.get("spm"))).name
+            for row in issue.get("stale_node_table_targets") or ()
+            if isinstance(row, dict) and row.get("spm")
+        ]
+        if stale_targets:
+            fields.append(
+                "stale_node_table=" + ", ".join(stale_targets[:3])
+            )
+        remedy = str(issue.get("remedy") or "").strip()
+        if remedy:
+            fields.append("→ " + remedy)
+        stale_remedy = str(issue.get("stale_node_table_remedy") or "").strip()
+        if stale_remedy:
+            fields.append("→ " + stale_remedy)
+        lines.append(" ".join(fields))
+    return " | ".join(lines)
+
+
 class BatchItemError(RuntimeError):
     """One item failed, with a machine-readable queue-impact classification."""
 
@@ -3478,6 +3537,110 @@ class App:
             if str(item["spm"]) not in excluded
         ]
 
+    def _recorded_failure_reason(self, spm, max_chars=180, _seen=None):
+        """Return the recorded failure text for one already-failed row.
+
+        A ``dependency_blocked`` column has no cause of its own -- it only
+        records which upstream rows it was blocked by. Stopping there just
+        repeats "차단: required Cluster stage failed" one hop away from the
+        actual error, so walk ``blocked_by`` to the real failure instead.
+        """
+        seen = _seen if _seen is not None else set()
+        columns = ("blend", "push", "spm")
+
+        def new_frame(value):
+            key = str(value)
+            if key in seen:
+                return None
+            seen.add(key)
+            with self.state_lock:
+                entry = self.state.get(key)
+                entry = dict(entry) if isinstance(entry, dict) else {}
+            return {
+                "entry": entry,
+                "column_index": 0,
+                "waiting": None,
+            }
+
+        first = new_frame(spm)
+        if first is None:
+            return ""
+        stack = [first]
+
+        def finish_frame(result):
+            stack.pop()
+            if not stack:
+                return True, result
+            waiting = stack[-1]["waiting"]
+            if result:
+                waiting["nested"].append(result)
+            waiting["index"] += 1
+            return False, ""
+
+        while stack:
+            frame = stack[-1]
+            waiting = frame["waiting"]
+            if waiting is not None:
+                if waiting["index"] < len(waiting["blocked_by"]):
+                    child = new_frame(
+                        waiting["blocked_by"][waiting["index"]]
+                    )
+                    if child is None:
+                        waiting["index"] += 1
+                    else:
+                        stack.append(child)
+                    continue
+                nested = sorted(set(waiting["nested"]))
+                frame["waiting"] = None
+                if nested:
+                    result = compact_error_message(
+                        " | ".join(nested), max_chars
+                    )
+                    done, result = finish_frame(result)
+                    if done:
+                        return result
+                continue
+
+            if frame["column_index"] >= len(columns):
+                done, result = finish_frame("")
+                if done:
+                    return result
+                continue
+
+            column = columns[frame["column_index"]]
+            frame["column_index"] += 1
+            entry = frame["entry"]
+            kind = entry.get(f"{column}_status_kind")
+            if kind in {None, "ok", "skipped"}:
+                continue
+            error_entry = entry.get(f"{column}_status_error")
+            if kind == "dependency_blocked":
+                blocked_by = (
+                    error_entry.get("blocked_by")
+                    if isinstance(error_entry, dict)
+                    else None
+                )
+                if not isinstance(blocked_by, (list, tuple, set)):
+                    blocked_by = ()
+                frame["waiting"] = {
+                    "blocked_by": list(blocked_by),
+                    "index": 0,
+                    "nested": [],
+                }
+                continue
+            recorded = error_entry
+            if isinstance(recorded, dict):
+                recorded = recorded.get("message")
+            if not isinstance(recorded, str) or not recorded.strip():
+                recorded = entry.get(f"{column}_status")
+            if not isinstance(recorded, str) or not recorded.strip():
+                continue
+            result = compact_error_message(recorded.strip(), max_chars)
+            done, result = finish_frame(result)
+            if done:
+                return result
+        return ""
+
     def _record_pipeline_dependency_block(
         self,
         item,
@@ -3492,6 +3655,19 @@ class App:
             sorted(Path(value).name for value in blocked_sources)
         )
         reason = f"required Cluster stage failed: {names}"
+        # Name the root cause on the consumer row too.  Without it a blocked
+        # asset only says which file failed, so an operator cannot tell an asset
+        # data problem from a tool problem without hunting for the other row.
+        root_causes = sorted({
+            text
+            for text in (
+                self._recorded_failure_reason(value)
+                for value in blocked_sources
+            )
+            if text
+        })
+        if root_causes:
+            reason = f"{reason} — 원인: {' | '.join(root_causes)}"
         self._record_phase_status(
             iid,
             column,
@@ -6558,27 +6734,7 @@ class App:
                 or []
             )
 
-        failures = []
-        for issue in live_issues:
-            code_value = str(
-                issue.get("code") or "CLUSTER_DATA_INVALID"
-            )
-            role = str(issue.get("role") or "")
-            details = issue.get("details") or {}
-            status = str(details.get("status") or "")
-            missing = [
-                str(value)
-                for value in details.get("missing") or []
-            ]
-            fields = [code_value]
-            if role:
-                fields.append(f"role={role}")
-            if status:
-                fields.append(f"status={status}")
-            if missing:
-                fields.append("missing=" + ", ".join(missing[:3]))
-            failures.append(" ".join(fields))
-        actual_failure = " | ".join(failures[:5])
+        actual_failure = cluster_issue_summary(live_issues)
 
         if actual_failure:
             raise BatchItemError(
@@ -6795,21 +6951,7 @@ class App:
                 "spm": str(producer),
             })
         if blocking:
-            summary = " | ".join(
-                " ".join(
-                    value
-                    for value in (
-                        str(issue.get("code") or "CLUSTER_DATA_INVALID"),
-                        (
-                            f"role={issue.get('role')}"
-                            if issue.get("role")
-                            else ""
-                        ),
-                    )
-                    if value
-                )
-                for issue in blocking[:5]
-            )
+            summary = cluster_issue_summary(blocking)
             stage = "output" if require_normalized else "input"
             raise BatchItemError(
                 f"Cluster normalization {stage} validation failed: {summary}",

@@ -1552,7 +1552,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "ready": False,
                 "reason": (
                     "required Cluster stage failed: "
-                    f"{failed_cluster.name}"
+                    f"{failed_cluster.name} — 원인: cluster SPM failed"
                 ),
                 "kind": "dependency_blocked",
             }],

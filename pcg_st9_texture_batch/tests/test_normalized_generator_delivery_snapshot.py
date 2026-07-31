@@ -281,6 +281,75 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         self.assertEqual(delivery["live_snapshot_total_node_count"], 1)
         self.assertEqual(len(delivery["live_snapshot_sha256"]), 64)
 
+    def test_schema4_warm_cache_survives_while_live_stale_table_is_uncached(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_bush_blackgum_02.spm"
+            write_blackgum_delivery_spm(
+                target,
+                connected=True,
+                node_guid="removed-generator-guid",
+            )
+            cache_key = audit_module._file_cache_key(target)
+            path_key, size, mtime_ns = cache_key
+            cached_binding = {
+                "generator_guid": "cached-schema-4-generator",
+                "material_id": "1",
+                "mesh_id": "10",
+            }
+            audit_module._PERSISTENT_SPM_ANALYSIS[path_key] = {
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "material_rows": [],
+                "material_names": ["cached-schema-4-material"],
+                "referenced_material_ids": ["1"],
+                "visible_material_ids": [],
+                "leaf_generator_bindings": [cached_binding],
+                "mesh_asset_ids": ["10"],
+                "leaf_binding_schema": 4,
+            }
+
+            with mock.patch.object(
+                audit_module,
+                "read_maybe_gzip_text",
+                side_effect=AssertionError("schema-4 warm cache was invalidated"),
+            ):
+                warm = audit_module._spm_analysis(target)
+
+            self.assertEqual(
+                warm["leaf_generator_bindings"],
+                [cached_binding],
+            )
+            self.assertFalse(audit_module._PERSISTENT_SPM_ANALYSIS_DIRTY)
+
+            with mock.patch.object(
+                audit_module,
+                "_spm_analysis",
+                side_effect=AssertionError("live snapshot consulted audit cache"),
+            ), mock.patch.object(
+                audit_module,
+                "read_pipeline_spm_text",
+                wraps=audit_module.read_pipeline_spm_text,
+            ) as read_spm:
+                snapshot = audit_module.live_generator_delivery_snapshot(
+                    target
+                )
+
+            read_spm.assert_called_once_with(target)
+            self.assertIs(audit_module._SPM_ANALYSIS_CACHE[cache_key], warm)
+            self.assertTrue(snapshot["node_table"]["stale"])
+            self.assertEqual(
+                snapshot["node_table"]["orphan_generator_guids"],
+                ["removed-generator-guid"],
+            )
+            self.assertEqual(snapshot["node_table"]["orphan_node_count"], 1)
+            live_binding = snapshot["leaf_generator_bindings"][0]
+            self.assertEqual(live_binding["generator_guid"], GENERATOR_GUID)
+            self.assertEqual(live_binding["generated_node_count"], 0)
+            self.assertEqual(
+                live_binding["export_evidence"],
+                "node_table_stale",
+            )
+
     def test_guid_case_slot_case_and_manifest_index_share_one_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
