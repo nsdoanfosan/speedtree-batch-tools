@@ -52,6 +52,10 @@ BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
 AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 3
 TARGET_BINDING_PROJECTION_VERSION = 2
+TARGET_REQUIREMENTS_VERSION = 1
+TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
+TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
+TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
 _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS = frozenset({
     "thumbnail",
     "thumbnailsize",
@@ -66,18 +70,42 @@ _AUTHORING_GRAPH_CORE_IGNORED_ROOT_TAGS = frozenset({
     # Modeler-derived/session state rewritten by a no-edit Save.
     "treeinfo",
     "window",
-    "light",
-    "fan",
 })
-_MATERIAL_AUTHORING_GEOMETRY_TAGS = frozenset({
-    "cutoutmeshid",
-    "supplementalcutoutmeshids",
-    "uvareas",
-    "width",
-    "height",
-    "unwrapscale",
-    "atlasmaker",
+_MATERIAL_AUTHORING_IGNORED_DIRECT_CHILD_TAGS = frozenset({
+    # Rebuilt binary/display caches observed to change during a no-edit Save.
+    "preview",
+    "streamplaceholder",
 })
+_DEFAULT_MATERIAL_MAP_SCALARS = {
+    "specular": {
+        "colorx": "0.75",
+        "colory": "0.75",
+        "colorz": "0.75",
+        "texsource": "0",
+        "textolinear": "true",
+    },
+    "metallic": {
+        "colorx": "0",
+        "colory": "0",
+        "colorz": "0",
+        "texsource": "1",
+        "textolinear": "false",
+    },
+    "custom": {
+        "colorx": "0",
+        "colory": "0",
+        "colorz": "0",
+        "texsource": "0",
+        "textolinear": "true",
+    },
+    "custom2": {
+        "colorx": "0",
+        "colory": "0",
+        "colorz": "0",
+        "texsource": "0",
+        "textolinear": "false",
+    },
+}
 
 
 class StaleNodeTableRecoveryError(RuntimeError):
@@ -131,6 +159,54 @@ def _mesh_id(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _normalized_mesh_ids(values):
+    return sorted({_mesh_id(value) for value in (values or ())} - {None})
+
+
+def _resolve_target_scopes(
+    expected_mesh_ids=(),
+    *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
+):
+    legacy_values = tuple(expected_mesh_ids or ())
+    if any(_mesh_id(value) is None for value in legacy_values):
+        return None, "expected_target_mesh_ids_invalid"
+    legacy_expected = _normalized_mesh_ids(expected_mesh_ids)
+    explicit_requested = bool(
+        authoring_mesh_ids is not None or required_live_mesh_ids is not None
+    )
+    if legacy_expected and explicit_requested:
+        return None, "target_scope_mode_mixed"
+    if legacy_expected:
+        return {
+            "mode": TARGET_SCOPE_MODE_STRICT_LEGACY,
+            "authoring_mesh_ids": legacy_expected,
+            "required_live_mesh_ids": list(legacy_expected),
+        }, None
+    if authoring_mesh_ids is None:
+        return None, "authoring_mesh_ids_missing"
+    if required_live_mesh_ids is None:
+        return None, "required_live_mesh_ids_missing"
+    authoring_values = tuple(authoring_mesh_ids or ())
+    required_live_values = tuple(required_live_mesh_ids or ())
+    if any(_mesh_id(value) is None for value in authoring_values):
+        return None, "authoring_mesh_ids_invalid"
+    if any(_mesh_id(value) is None for value in required_live_values):
+        return None, "required_live_mesh_ids_invalid"
+    authoring = _normalized_mesh_ids(authoring_values)
+    required_live = _normalized_mesh_ids(required_live_values)
+    if not authoring:
+        return None, "authoring_mesh_ids_missing"
+    if not set(required_live).issubset(authoring):
+        return None, "required_live_scope_not_authoring_subset"
+    return {
+        "mode": TARGET_SCOPE_MODE_EXPLICIT,
+        "authoring_mesh_ids": authoring,
+        "required_live_mesh_ids": required_live,
+    }, None
 
 
 def _source_identity(spm):
@@ -277,6 +353,207 @@ def _default_modeler_lod(element):
     )
 
 
+def _modeler_scalar_equal(observed, expected):
+    observed = str(observed or "").strip()
+    expected = str(expected or "").strip()
+    try:
+        observed32 = struct.unpack("!f", struct.pack("!f", float(observed)))[0]
+        expected32 = struct.unpack("!f", struct.pack("!f", float(expected)))[0]
+        return observed32 == expected32
+    except (TypeError, ValueError):
+        return observed.casefold() == expected.casefold()
+
+
+def _default_modeler_map_spline(element, length):
+    if (
+        _local_name(element.tag).casefold() != "spline"
+        or {
+            _local_name(name).casefold(): str(value).strip().casefold()
+            for name, value in element.attrib.items()
+        } != {"drawmode": "false"}
+        or len(element) != 2
+    ):
+        return False
+    expected = (
+        ("0", "0", "1", "0", length),
+        ("1", "1", "1", "0", length),
+    )
+    for point, values in zip(element, expected):
+        if _local_name(point.tag).casefold() != "controlpoint":
+            return False
+        children = list(point)
+        if [_local_name(child.tag).casefold() for child in children] != [
+            "x",
+            "y",
+            "tangentx",
+            "tangenty",
+            "length",
+        ]:
+            return False
+        if any(
+            child.attrib
+            or list(child)
+            or not _modeler_scalar_equal(child.text, expected_value)
+            for child, expected_value in zip(children, values)
+        ):
+            return False
+    return True
+
+
+def _default_modeler_map_generate(element):
+    attributes = {
+        _local_name(name).casefold(): str(value).strip()
+        for name, value in element.attrib.items()
+    }
+    if attributes != {"type": "0"}:
+        return False
+    expected = {
+        "file": (
+            {"colorhigh": "ffffffff", "colorlow": "ff000000", "remap": "0"},
+            "0",
+        ),
+        "linear": (
+            {
+                "angle": "90",
+                "centerx": "0",
+                "centery": "0",
+                "colorhigh": "ffffffff",
+                "colorlow": "ff000000",
+                "distance": "1",
+            },
+            "0.45",
+        ),
+        "radial": (
+            {
+                "centerx": "0.5",
+                "centery": "0.5",
+                "colorhigh": "ffffffff",
+                "colorlow": "ff000000",
+                "distance": "0.5",
+            },
+            "0.45",
+        ),
+        "noise": (
+            {
+                "centerx": "0.5",
+                "centery": "0.5",
+                "colorhigh": "ffffffff",
+                "colorlow": "ff000000",
+                "scale": "1",
+            },
+            "0.45",
+        ),
+    }
+    children = list(element)
+    if [_local_name(child.tag).casefold() for child in children] != list(expected):
+        return False
+    for child in children:
+        child_key = _local_name(child.tag).casefold()
+        expected_attributes, length = expected[child_key]
+        observed_attributes = {
+            _local_name(name).casefold(): str(value).strip()
+            for name, value in child.attrib.items()
+            if not (child_key == "noise" and _local_name(name).casefold() == "seed")
+        }
+        if set(observed_attributes) != set(expected_attributes) or any(
+            not _modeler_scalar_equal(
+                observed_attributes[name],
+                expected_attributes[name],
+            )
+            for name in expected_attributes
+        ):
+            return False
+        if child_key == "noise":
+            seed_values = [
+                value for name, value in child.attrib.items()
+                if _local_name(name).casefold() == "seed"
+            ]
+            if len(seed_values) != 1:
+                return False
+            try:
+                int(str(seed_values[0]).strip())
+            except (TypeError, ValueError):
+                return False
+        if len(child) != 1 or not _default_modeler_map_spline(child[0], length):
+            return False
+    return True
+
+
+def _default_modeler_material_map(element):
+    """Recognize only the four absent defaults materialized by Modeler Save."""
+    if (
+        _local_name(element.tag).casefold() != "map"
+        or set(_local_name(name).casefold() for name in element.attrib) != {"name"}
+    ):
+        return False
+    map_name = str(element.attrib.get("Name") or "").strip().casefold()
+    specific = _DEFAULT_MATERIAL_MAP_SCALARS.get(map_name)
+    if specific is None:
+        return False
+    common = {
+        "texfilename": "",
+        "texbrightness": "0",
+        "texcontrast": "0",
+        "texsaturation": "0",
+        "texred": "0",
+        "texgreen": "0",
+        "texblue": "0",
+        "texmin": "0",
+        "texmax": "1",
+        "texenabled": "true",
+        "texinvert": "false",
+        "texinvertred": "false",
+        "texinvertgreen": "false",
+        "texinvertblue": "false",
+        "normalize": "false",
+        "texsizex": "0",
+        "texsizey": "0",
+    }
+    expected = {**common, **specific}
+    scalar_children = []
+    generate_children = []
+    for child in element:
+        if _local_name(child.tag).casefold() == "generate":
+            generate_children.append(child)
+        else:
+            scalar_children.append(child)
+    if len(generate_children) != 1 or len(scalar_children) != len(expected):
+        return False
+    observed = {}
+    for child in scalar_children:
+        key = _local_name(child.tag).casefold()
+        if key in observed or child.attrib or list(child):
+            return False
+        observed[key] = str(child.text or "").strip()
+    return bool(
+        set(observed) == set(expected)
+        and all(
+            _modeler_scalar_equal(observed[name], expected[name])
+            for name in expected
+        )
+        and _default_modeler_map_generate(generate_children[0])
+    )
+
+
+def _material_v8_core_subtree(element):
+    projected = copy.deepcopy(element)
+    retained = []
+    maps = []
+    for child in list(projected):
+        child_key = _local_name(child.tag).casefold()
+        if child_key in _MATERIAL_AUTHORING_IGNORED_DIRECT_CHILD_TAGS:
+            continue
+        if child_key == "map" and _default_modeler_material_map(child):
+            continue
+        if child_key == "map":
+            maps.append(child)
+        else:
+            retained.append(child)
+    maps.sort(key=lambda child: str(child.attrib.get("Name") or "").casefold())
+    projected[:] = retained + maps
+    return _authoring_graph_core_subtree(projected, depth=1)
+
+
 def _semantic_spline_subtree(element):
     return {
         "tag": _local_name(element.tag),
@@ -353,7 +630,7 @@ def _authoring_graph_core_subtree(
             continue
         if tag_key == "generator" and child_key == "extra":
             continue
-        if tag_key in {"force", "rulescript"} and child_key == "guid":
+        if tag_key in {"force", "rulescript", "fan", "light"} and child_key == "guid":
             continue
         if tag_key == "mesh" and (
             child_key == "userdata"
@@ -399,11 +676,13 @@ def _authoring_graph_core_subtree(
 def _authoring_graph_core_projection(text):
     """Hash durable authored semantics across an ordinary Modeler Save.
 
-    The projection retains stable global/settings subtrees, complete Generator
-    properties, Link endpoints, Material geometry, and complete Mesh geometry.
+    The projection retains stable global/settings subtrees, complete Generator,
+    Force, RuleScript, Fan, and Light properties, Link endpoints, complete
+    authored Material parameters, and complete Mesh geometry.
     It normalizes only representations observed to change on a no-edit Save:
     generated/session root blocks, graph-editor identities, rebuilt collection
-    labels, float spellings, redundant defaults, and generated asset caches.
+    labels, float spellings, redundant defaults, and proven preview/stream
+    caches.
     """
     root = ET.fromstring(text)
     global_settings = []
@@ -430,16 +709,12 @@ def _authoring_graph_core_projection(text):
                 child_tag = _local_name(child.tag).casefold()
                 if child_tag in {"name", "guid", "hidden", "properties"}:
                     continue
-                projected = child
                 if child_tag == "material_v8":
-                    projected = copy.deepcopy(child)
-                    for material_child in list(projected):
-                        if (
-                            _local_name(material_child.tag).casefold()
-                            not in _MATERIAL_AUTHORING_GEOMETRY_TAGS
-                        ):
-                            projected.remove(material_child)
-                assets.append(_authoring_graph_core_subtree(projected, depth=1))
+                    assets.append(_material_v8_core_subtree(child))
+                else:
+                    assets.append(
+                        _authoring_graph_core_subtree(child, depth=1)
+                    )
         else:
             global_settings.append(
                 _authoring_graph_core_subtree(element, depth=1)
@@ -461,6 +736,126 @@ def _authoring_graph_core_projection(text):
         "link_count": len(links),
         "asset_identity_count": len(assets),
         "global_setting_count": len(global_settings),
+        "fingerprint": _json_fingerprint(rows),
+        "_rows": rows,
+    }
+
+
+def _legacy_authoring_graph_core_v2_subtree(
+    element,
+    *,
+    depth=0,
+    spline_context=False,
+    truthy_value=False,
+):
+    """Reproduce the sealed v2 projection without widening current policy."""
+    tag = _local_name(element.tag)
+    tag_key = tag.casefold()
+    spline_context = spline_context or tag_key == "splineproperty"
+    text = str(element.text or "").strip()
+    if tag_key.endswith("guid"):
+        text = generator_guid_key(text)
+    elif truthy_value and tag_key == "value":
+        try:
+            text = "0" if float(text) == 0 else "1"
+        except (TypeError, ValueError):
+            pass
+    elif spline_context:
+        text = _normalized_spline_number(text)
+
+    attributes = []
+    for name, value in element.attrib.items():
+        name_key = _local_name(name).casefold()
+        if name_key == "m_nordervalue":
+            continue
+        normalized = str(value).strip()
+        if name_key.endswith("guid"):
+            normalized = generator_guid_key(normalized)
+        elif spline_context:
+            normalized = _normalized_spline_number(normalized)
+        attributes.append((_local_name(name), normalized))
+
+    property_name = (
+        _child_text(element, "Name")
+        if tag_key in {"property", "splineproperty"}
+        else ""
+    )
+    child_truthy_value = property_name.casefold() == "random seeds:style"
+    children = []
+    for child in element:
+        child_key = _local_name(child.tag).casefold()
+        if depth == 0 and child_key == "nodes":
+            continue
+        if child_key in _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS:
+            continue
+        if child_key == "m_nordervalue":
+            continue
+        if child_key in {"property", "splineproperty"} and _child_text(
+            child, "Name"
+        ).casefold().startswith("generation:collections:"):
+            continue
+        if (
+            spline_context
+            and child_key == "compoundparentspline"
+            and _default_or_empty_parent_spline(child)
+        ):
+            continue
+        children.append(_legacy_authoring_graph_core_v2_subtree(
+            child,
+            depth=depth + 1,
+            spline_context=spline_context,
+            truthy_value=child_truthy_value,
+        ))
+    return {
+        "tag": tag,
+        "attributes": sorted(attributes),
+        "text": text,
+        "children": children,
+    }
+
+
+def _legacy_authoring_graph_core_v2_projection(text):
+    root = ET.fromstring(text)
+    generators = []
+    links = []
+    assets = []
+    for element in root.iter():
+        tag = _local_name(element.tag).casefold()
+        if tag == "generator":
+            generator = copy.deepcopy(element)
+            for child in list(generator):
+                if _local_name(child.tag).casefold() == "extra":
+                    generator.remove(child)
+            generators.append(
+                _legacy_authoring_graph_core_v2_subtree(generator, depth=1)
+            )
+        elif tag == "link":
+            links.append({
+                "source": generator_guid_key(_child_text(element, "SourceGUID")),
+                "target": generator_guid_key(_child_text(element, "TargetGUID")),
+            })
+        elif tag in {"material_v8", "mesh"}:
+            assets.append({
+                "tag": _local_name(element.tag),
+                "id": str(element.attrib.get("ID") or "").strip(),
+                "name": str(
+                    element.attrib.get("Name") or _child_text(element, "Name")
+                ).strip(),
+            })
+    generators.sort(key=_canonical_json_bytes)
+    links.sort(key=_canonical_json_bytes)
+    assets.sort(key=_canonical_json_bytes)
+    rows = {
+        "generators": generators,
+        "links": links,
+        "assets": assets,
+    }
+    return {
+        "contract": "speedtree_spm_authoring_graph_core_projection",
+        "version": 2,
+        "generator_count": len(generators),
+        "link_count": len(links),
+        "asset_identity_count": len(assets),
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
     }
@@ -546,9 +941,11 @@ def _target_binding_projection(snapshot, expected_mesh_ids):
     rows.sort(key=lambda row: _canonical_json_bytes(row))
     live_rows.sort(key=lambda row: _canonical_json_bytes(row))
     graph_visible_rows.sort(key=lambda row: _canonical_json_bytes(row))
-    authoring = sorted({row["mesh_id"] for row in rows})
+    all_authoring = sorted({row["mesh_id"] for row in rows})
+    authoring = sorted({row["mesh_id"] for row in graph_visible_rows})
     live = sorted({row["mesh_id"] for row in live_rows})
     missing = sorted(set(requested) - set(authoring))
+    missing_authoring = sorted(set(requested) - set(all_authoring))
     return {
         "version": TARGET_BINDING_PROJECTION_VERSION,
         "requested_mesh_ids": requested,
@@ -556,9 +953,12 @@ def _target_binding_projection(snapshot, expected_mesh_ids):
         "observed_target_mesh_ids": authoring,
         "live_export_target_mesh_ids": live,
         "missing_requested_mesh_ids": missing,
+        "all_binding_target_mesh_ids": all_authoring,
+        "missing_authoring_mesh_ids": missing_authoring,
         "binding_count": len(rows),
         "live_binding_count": len(live_rows),
         "complete": bool(requested and authoring == requested),
+        "authoring_complete": bool(requested and all_authoring == requested),
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
         "_live_rows": live_rows,
@@ -704,6 +1104,28 @@ def _normalization_evidence(snapshot, target_projection):
     }
 
 
+def _required_live_normalization(snapshot, required_live_mesh_ids):
+    required_live = _normalized_mesh_ids(required_live_mesh_ids)
+    if not required_live:
+        return {
+            "applicable": False,
+            "status": "not_required",
+            "delivery_mode": "binding_continuity_only",
+            "delivery_decision": "not_required",
+            "delivery_reason": "sealed_policy_has_no_required_live_targets",
+            "live_snapshot_sha256": snapshot.get("spm_text_sha256"),
+            "errors": [],
+            "material_scope_count": 0,
+        }
+    return {
+        "applicable": True,
+        **_normalization_evidence(
+        snapshot,
+        _target_binding_projection(snapshot, required_live),
+        ),
+    }
+
+
 def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
     """Capture stat+bytes+parse evidence without re-reading for sub-audits."""
     spm = Path(spm_path)
@@ -779,9 +1201,19 @@ def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
     }
 
 
-def validate_repaired_snapshot(snapshot, expected_mesh_ids=()):
-    """Return a fail-closed target/Node-table verdict for frozen evidence."""
-    expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
+def validate_repaired_snapshot(
+    snapshot,
+    expected_mesh_ids=(),
+    required_live_mesh_ids=None,
+):
+    """Validate coherent Nodes plus sealed authoring and live scopes."""
+    expected = _normalized_mesh_ids(expected_mesh_ids)
+    required_live = (
+        list(expected)
+        if required_live_mesh_ids is None
+        else _normalized_mesh_ids(required_live_mesh_ids)
+    )
+    required_live_is_subset = set(required_live).issubset(expected)
     errors = []
     node_table = snapshot.get("node_table") or {}
     if node_table.get("stale") is not False:
@@ -792,13 +1224,20 @@ def validate_repaired_snapshot(snapshot, expected_mesh_ids=()):
         errors.append("orphan_owners_remain")
 
     expected_set = set(expected)
-    target_rows = [
+    authoring_rows = [
         dict(row)
         for row in snapshot.get("leaf_generator_bindings") or []
         if _mesh_id(row.get("mesh_id")) in expected_set
+    ]
+    observed = sorted({
+        _mesh_id(row.get("mesh_id")) for row in authoring_rows
+    } - {None})
+    required_live_set = set(required_live)
+    target_rows = [
+        row for row in authoring_rows
+        if _mesh_id(row.get("mesh_id")) in required_live_set
         and row.get("graph_visible") is True
     ]
-    observed = sorted({_mesh_id(row.get("mesh_id")) for row in target_rows} - {None})
     live = sorted({
         _mesh_id(row.get("mesh_id"))
         for row in target_rows
@@ -806,9 +1245,11 @@ def validate_repaired_snapshot(snapshot, expected_mesh_ids=()):
     } - {None})
     if not expected:
         errors.append("expected_target_mesh_ids_missing")
+    if not required_live_is_subset:
+        errors.append("required_live_scope_not_authoring_subset")
     if observed != expected:
         errors.append("required_target_binding_missing")
-    if live != expected:
+    if live != required_live:
         errors.append("live_target_mesh_set_incomplete")
     for row in target_rows:
         if row.get("graph_visible") is not True:
@@ -837,10 +1278,25 @@ def validate_repaired_snapshot(snapshot, expected_mesh_ids=()):
             "stale": node_table.get("stale"),
         },
         "expected_target_mesh_ids": expected,
+        "required_live_target_mesh_ids": required_live,
         "observed_target_mesh_ids": observed,
         "live_export_participating_target_mesh_ids": live,
-        "target_binding_count": len(target_rows),
+        "target_binding_count": len(authoring_rows),
+        "required_live_binding_count": len(target_rows),
     }
+
+
+def _preimage_target_scopes_complete(snapshot, target_scopes):
+    if snapshot["target_projection"]["authoring_complete"] is not True:
+        return False
+    required_live = target_scopes["required_live_mesh_ids"]
+    return bool(
+        not required_live
+        or _target_binding_projection(
+            snapshot["delivery"],
+            required_live,
+        )["complete"]
+    )
 
 
 def _sealed_target_requirements(preimage_receipt, preimage_snapshot):
@@ -849,12 +1305,13 @@ def _sealed_target_requirements(preimage_receipt, preimage_snapshot):
         version = int(receipt_target.get("version") or 1)
     except (TypeError, ValueError):
         version = 0
+    sealed_scopes = _receipt_target_scopes(preimage_receipt)
+    if sealed_scopes is None:
+        return None
     if version == TARGET_BINDING_PROJECTION_VERSION:
         return {
             "version": version,
-            "requested_mesh_ids": sorted(
-                receipt_target.get("requested_mesh_ids") or []
-            ),
+            **sealed_scopes,
             "authoring_fingerprint": receipt_target.get("fingerprint"),
         }
     if (
@@ -866,7 +1323,7 @@ def _sealed_target_requirements(preimage_receipt, preimage_snapshot):
     target = preimage_snapshot["target_projection"]
     return {
         "version": version,
-        "requested_mesh_ids": target["requested_mesh_ids"],
+        **sealed_scopes,
         "authoring_fingerprint": target["fingerprint"],
     }
 
@@ -874,27 +1331,44 @@ def _sealed_target_requirements(preimage_receipt, preimage_snapshot):
 def _snapshot_gate(
     snapshot,
     preimage_receipt,
-    expected_mesh_ids,
+    expected_mesh_ids=(),
     *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
     preimage_snapshot=None,
 ):
     sealed_target = _sealed_target_requirements(
         preimage_receipt,
         preimage_snapshot,
     )
+    caller_scopes, caller_scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
     if sealed_target is None:
-        sealed_required_mesh_ids = []
+        sealed_authoring_mesh_ids = []
+        sealed_required_live_mesh_ids = []
         expected_target_fingerprint = None
         errors = ["sealed_target_projection_preimage_unavailable"]
     else:
-        sealed_required_mesh_ids = sealed_target["requested_mesh_ids"]
+        sealed_authoring_mesh_ids = sealed_target["authoring_mesh_ids"]
+        sealed_required_live_mesh_ids = sealed_target[
+            "required_live_mesh_ids"
+        ]
         expected_target_fingerprint = sealed_target["authoring_fingerprint"]
         errors = list(validate_repaired_snapshot(
             snapshot["delivery"],
-            sealed_required_mesh_ids,
+            sealed_authoring_mesh_ids,
+            sealed_required_live_mesh_ids,
         )["errors"])
-    caller_expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
-    if sealed_required_mesh_ids != caller_expected:
+    if caller_scope_error:
+        errors.append(caller_scope_error)
+    elif (
+        sealed_authoring_mesh_ids != caller_scopes["authoring_mesh_ids"]
+        or sealed_required_live_mesh_ids
+        != caller_scopes["required_live_mesh_ids"]
+    ):
         errors.append("sealed_target_scope_differs_from_caller")
     if snapshot["regex_elementtree_parity"] is not True:
         errors.append("regex_elementtree_node_evidence_mismatch")
@@ -937,9 +1411,16 @@ def _snapshot_gate(
     )
     if not target_binding_continuity:
         errors.append("required_target_bindings_changed_during_resave")
-    if snapshot["target_projection"]["complete"] is not True:
+    if snapshot["target_projection"]["authoring_complete"] is not True:
         errors.append("required_target_manifest_incomplete_after_resave")
-    if snapshot["normalization"]["complete"] is not True:
+    normalization = _required_live_normalization(
+        snapshot["delivery"],
+        sealed_required_live_mesh_ids,
+    )
+    if (
+        sealed_required_live_mesh_ids
+        and normalization.get("complete") is not True
+    ):
         errors.append("normalization_evidence_not_complete")
     return {
         "valid": not errors,
@@ -959,11 +1440,14 @@ def _snapshot_gate(
         "required_target_binding_continuity": (
             target_binding_continuity
         ),
-        "sealed_required_delivery_mesh_ids": sealed_required_mesh_ids,
+        "sealed_authoring_mesh_ids": sealed_authoring_mesh_ids,
+        "sealed_required_delivery_mesh_ids": sealed_required_live_mesh_ids,
         "target_delivery": validate_repaired_snapshot(
-            snapshot["delivery"], sealed_required_mesh_ids
+            snapshot["delivery"],
+            sealed_authoring_mesh_ids,
+            sealed_required_live_mesh_ids,
         ),
-        "normalization": dict(snapshot["normalization"]),
+        "normalization": normalization,
     }
 
 
@@ -1016,11 +1500,21 @@ def _release_session_lock(lock, token):
         pass
 
 
-def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
+def _preimage_receipt(
+    snapshot,
+    target_scopes,
+    backup_name,
+):
     target = snapshot["target_projection"]
+    authoring = list(target_scopes["authoring_mesh_ids"])
+    required_live = list(target_scopes["required_live_mesh_ids"])
+    required_live_projection = _target_binding_projection(
+        snapshot["delivery"],
+        required_live,
+    )
     return {
         "kind": PREIMAGE_RECEIPT_KIND,
-        "schema_version": 4,
+        "schema_version": 5,
         "recovery_contract": RECOVERY_CONTRACT,
         **snapshot["source_identity"],
         "exact_preimage": {
@@ -1058,14 +1552,18 @@ def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
         "required_target_bindings": {
             "contract": "speedtree_required_target_binding_projection",
             "version": TARGET_BINDING_PROJECTION_VERSION,
-            "requested_mesh_ids": sorted(expected_mesh_ids),
+            "requested_mesh_ids": authoring,
             "expected_mesh_ids": target["expected_target_mesh_ids"],
-            "delivery_scope_rule": (
-                "all_requested_graph_visible_bindings_must_export_after_save"
-            ),
             "binding_count": target["binding_count"],
             "fingerprint": target["fingerprint"],
             "missing_requested_mesh_ids": target["missing_requested_mesh_ids"],
+        },
+        "target_requirements": {
+            "contract": "speedtree_stale_node_target_requirements",
+            "version": TARGET_REQUIREMENTS_VERSION,
+            "policy": TARGET_REQUIREMENTS_POLICY,
+            "authoring_mesh_ids": authoring,
+            "required_live_mesh_ids": required_live,
         },
         "same_preimage_evidence": {
             "regex_elementtree_parity": snapshot["regex_elementtree_parity"],
@@ -1075,8 +1573,14 @@ def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
                 for key, value in snapshot["elementtree"].items()
                 if not key.startswith("_")
             },
-            "target_manifest_complete": target["complete"],
-            "normalization": dict(snapshot["normalization"]),
+            "authoring_manifest_complete": target["authoring_complete"],
+            "required_live_manifest_complete": bool(
+                not required_live or required_live_projection["complete"]
+            ),
+            "normalization": _required_live_normalization(
+                snapshot["delivery"],
+                required_live,
+            ),
         },
         "safety_boundary": {
             "modeler_save_automation": False,
@@ -1087,6 +1591,175 @@ def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
             "stale_false_alone_allows_continuation": False,
         },
     }
+
+
+def _receipt_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _receipt_requested_mesh_ids(receipt_targets):
+    if not isinstance(receipt_targets, dict):
+        return None
+    values = receipt_targets.get(
+        "requested_mesh_ids",
+        receipt_targets.get("expected_mesh_ids"),
+    )
+    if not isinstance(values, (list, tuple)):
+        return None
+    parsed = [_mesh_id(value) for value in values]
+    if any(value is None for value in parsed) or len(set(parsed)) != len(parsed):
+        return None
+    return sorted(parsed)
+
+
+def _receipt_target_scopes(receipt):
+    targets = receipt.get("required_target_bindings")
+    requested = _receipt_requested_mesh_ids(targets)
+    if not requested:
+        return None
+    schema_version = _receipt_int(receipt.get("schema_version"))
+    requirements = receipt.get("target_requirements")
+    if schema_version in {2, 3, 4}:
+        if requirements is not None:
+            return None
+        return {
+            "mode": TARGET_SCOPE_MODE_STRICT_LEGACY,
+            "authoring_mesh_ids": requested,
+            "required_live_mesh_ids": list(requested),
+        }
+    if schema_version != 5 or not isinstance(requirements, dict):
+        return None
+    authoring = _receipt_requested_mesh_ids({
+        "requested_mesh_ids": requirements.get("authoring_mesh_ids")
+    })
+    required_values = requirements.get("required_live_mesh_ids")
+    if not isinstance(required_values, (list, tuple)):
+        return None
+    required_live = [_mesh_id(value) for value in required_values]
+    if (
+        any(value is None for value in required_live)
+        or len(set(required_live)) != len(required_live)
+    ):
+        return None
+    required_live = sorted(required_live)
+    if not (
+        requirements.get("contract")
+        == "speedtree_stale_node_target_requirements"
+        and _receipt_int(requirements.get("version"))
+        == TARGET_REQUIREMENTS_VERSION
+        and requirements.get("policy") == TARGET_REQUIREMENTS_POLICY
+        and authoring == requested
+        and set(required_live).issubset(authoring)
+    ):
+        return None
+    return {
+        "mode": TARGET_SCOPE_MODE_EXPLICIT,
+        "authoring_mesh_ids": authoring,
+        "required_live_mesh_ids": required_live,
+    }
+
+
+def _supported_receipt_projection_versions(receipt):
+    schema_version = _receipt_int(receipt.get("schema_version"))
+    targets = receipt.get("required_target_bindings")
+    if not isinstance(targets, dict):
+        return False
+    if targets.get("contract") != "speedtree_required_target_binding_projection":
+        return False
+    target_version = _receipt_int(targets.get("version"))
+    if _receipt_target_scopes(receipt) is None:
+        return False
+    core = receipt.get("authoring_graph_core_projection")
+    if schema_version == 2:
+        return target_version == 1 and core is None
+    if schema_version == 3:
+        return bool(
+            target_version == 1
+            and isinstance(core, dict)
+            and core.get("contract")
+            == "speedtree_spm_authoring_graph_core_projection"
+            and _receipt_int(core.get("version")) == 2
+        )
+    if schema_version == 4:
+        return bool(
+            target_version == TARGET_BINDING_PROJECTION_VERSION
+            and isinstance(core, dict)
+            and core.get("contract")
+            == "speedtree_spm_authoring_graph_core_projection"
+            and _receipt_int(core.get("version"))
+            == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
+        )
+    if schema_version == 5:
+        return bool(
+            target_version == TARGET_BINDING_PROJECTION_VERSION
+            and isinstance(core, dict)
+            and core.get("contract")
+            == "speedtree_spm_authoring_graph_core_projection"
+            and _receipt_int(core.get("version"))
+            == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
+        )
+    return False
+
+
+def _validate_receipt_binding(
+    receipt,
+    snapshot,
+    backup_path,
+    target_scopes,
+    *,
+    source_identity=None,
+):
+    expected = list(target_scopes["authoring_mesh_ids"])
+    caller_required_live = list(target_scopes["required_live_mesh_ids"])
+    if not isinstance(receipt, dict):
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the receipt is not a supported immutable evidence object",
+            _public_hash_evidence(snapshot),
+        )
+    targets = receipt.get("required_target_bindings")
+    sealed_target_scopes = _receipt_target_scopes(receipt)
+    exact = receipt.get("exact_preimage")
+    authoring_graph = receipt.get("authoring_graph_projection")
+    membership = receipt.get("generator_membership")
+    identity = source_identity or snapshot["source_identity"]
+    valid = bool(
+        receipt.get("kind") == PREIMAGE_RECEIPT_KIND
+        and receipt.get("recovery_contract") == RECOVERY_CONTRACT
+        and _supported_receipt_projection_versions(receipt)
+        and receipt.get("asset_name") == identity["asset_name"]
+        and receipt.get("source_identity_sha256")
+        == identity["source_identity_sha256"]
+        and isinstance(authoring_graph, dict)
+        and authoring_graph.get("contract")
+        == "speedtree_spm_authoring_graph_projection"
+        and _receipt_int(authoring_graph.get("version"))
+        == SPM_AUTHORING_GRAPH_PROJECTION_VERSION
+        and isinstance(membership, dict)
+        and membership.get("contract")
+        == "speedtree_generator_membership_projection"
+        and _receipt_int(membership.get("version")) == 1
+        and isinstance(exact, dict)
+        and exact.get("raw_sha256") == snapshot["raw_sha256"]
+        and exact.get("backup_raw_sha256") == snapshot["raw_sha256"]
+        and exact.get("spm_text_sha256") == snapshot["text_sha256"]
+        and exact.get("size") == snapshot["size"]
+        and exact.get("backup_file") == Path(backup_path).name
+        and _receipt_requested_mesh_ids(targets) == expected
+        and sealed_target_scopes is not None
+        and sealed_target_scopes["authoring_mesh_ids"] == expected
+        and sealed_target_scopes["required_live_mesh_ids"]
+        == caller_required_live
+    )
+    if not valid:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the receipt is not bound to this exact source, backup, target set, and supported projection dialect",
+            _public_hash_evidence(snapshot),
+        )
 
 
 def _verify_preimage_artifacts(artifacts, snapshot=None):
@@ -1158,14 +1831,18 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
             _legacy_target_binding_fingerprints(snapshot, receipt_requested)
         ):
             checks.append((None, receipt_target.get("fingerprint")))
+        receipt_schema_version = _receipt_int(receipt.get("schema_version"))
         receipt_core = receipt.get("authoring_graph_core_projection")
-        if (
-            receipt_core is not None
-            and receipt_core.get("version")
-            == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
-        ):
+        if receipt_schema_version in {4, 5}:
             checks.append((
                 snapshot.get("authoring_graph_core", {}).get("fingerprint"),
+                receipt_core.get("fingerprint"),
+            ))
+        elif receipt_schema_version == 3:
+            checks.append((
+                _legacy_authoring_graph_core_v2_projection(
+                    snapshot["text"]
+                )["fingerprint"],
                 receipt_core.get("fingerprint"),
             ))
         if any(observed != expected for observed, expected in checks):
@@ -1177,11 +1854,29 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
     return receipt_sha256
 
 
-def _ensure_preimage_artifacts(snapshot, expected_mesh_ids, recovery_root):
+def _ensure_preimage_artifacts(
+    snapshot,
+    expected_mesh_ids,
+    recovery_root,
+    *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
+):
+    target_scopes, scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
+    if scope_error:
+        raise StaleNodeTableRecoveryError(
+            scope_error,
+            "preimage target scopes are incomplete or inconsistent",
+            _public_hash_evidence(snapshot),
+        )
     base = f"{Path(snapshot['source_identity']['asset_name']).stem}.{snapshot['raw_sha256']}"
     backup = recovery_root / (base + ".preimage.spm")
     receipt_path = recovery_root / (base + ".receipt.json")
-    expected_receipt = _preimage_receipt(snapshot, expected_mesh_ids, backup.name)
+    expected_receipt = _preimage_receipt(snapshot, target_scopes, backup.name)
 
     if backup.exists():
         if _sha256_bytes(backup.read_bytes()) != snapshot["raw_sha256"]:
@@ -1201,32 +1896,42 @@ def _ensure_preimage_artifacts(snapshot, expected_mesh_ids, recovery_root):
 
     if receipt_path.exists():
         try:
-            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_bytes = receipt_path.read_bytes()
+            sealed_receipt = json.loads(receipt_bytes.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise StaleNodeTableRecoveryError(
                 "preimage_receipt_verification_failed",
                 "the immutable preimage receipt is unreadable",
                 _public_hash_evidence(snapshot),
             ) from exc
-        if existing != expected_receipt:
-            raise StaleNodeTableRecoveryError(
-                "preimage_receipt_verification_failed",
-                "the immutable preimage receipt does not match the exact snapshot",
-                _public_hash_evidence(snapshot),
-            )
     else:
         _atomic_write_new(receipt_path, expected_receipt)
-    receipt_bytes = receipt_path.read_bytes()
-    if json.loads(receipt_bytes.decode("utf-8")) != expected_receipt:
+        receipt_bytes = receipt_path.read_bytes()
+        sealed_receipt = expected_receipt
+    try:
+        receipt_on_disk = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the immutable preimage receipt failed post-write verification",
+            _public_hash_evidence(snapshot),
+        ) from exc
+    if receipt_on_disk != sealed_receipt:
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
             "the immutable preimage receipt failed post-write verification",
             _public_hash_evidence(snapshot),
         )
+    _validate_receipt_binding(
+        sealed_receipt,
+        snapshot,
+        backup,
+        target_scopes,
+    )
     artifacts = {
         "backup_path": backup,
         "receipt_path": receipt_path,
-        "receipt": expected_receipt,
+        "receipt": sealed_receipt,
         "receipt_sha256": _sha256_bytes(receipt_bytes),
     }
     _verify_preimage_artifacts(artifacts, snapshot)
@@ -1238,18 +1943,26 @@ def verify_sealed_resave(
     backup_path,
     receipt_path,
     expected_mesh_ids=(),
+    *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
 ):
     """Re-audit an interrupted Save against its immutable sealed preimage."""
     spm = Path(spm_path).expanduser().resolve(strict=False)
     backup = Path(backup_path).expanduser().resolve(strict=False)
     receipt_file = Path(receipt_path).expanduser().resolve(strict=False)
-    expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
-    if not expected:
+    target_scopes, scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
+    if scope_error:
         raise StaleNodeTableRecoveryError(
-            "expected_target_mesh_ids_missing",
-            "sealed resave verification requires an explicit target Mesh-ID set",
+            scope_error,
+            "sealed resave verification requires one complete target-scope mode",
             _source_identity(spm),
         )
+    authoring = target_scopes["authoring_mesh_ids"]
     try:
         receipt_bytes = receipt_file.read_bytes()
         receipt = json.loads(receipt_bytes.decode("utf-8"))
@@ -1259,71 +1972,31 @@ def verify_sealed_resave(
             "the immutable preimage receipt is missing or unreadable",
             _source_identity(spm),
         ) from exc
-    try:
-        receipt_schema_version = int(receipt.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        receipt_schema_version = 0
-    receipt_targets = receipt.get("required_target_bindings", {})
-    if not isinstance(receipt_targets, dict):
-        receipt_targets = {}
-    try:
-        receipt_target_version = int(receipt_targets.get("version") or 0)
-    except (TypeError, ValueError):
-        receipt_target_version = 0
-    receipt_core = receipt.get("authoring_graph_core_projection")
-    if not isinstance(receipt_core, dict):
-        receipt_core = {}
-    try:
-        receipt_core_version = int(receipt_core.get("version") or 0)
-    except (TypeError, ValueError):
-        receipt_core_version = 0
-    receipt_requested = receipt_targets.get(
-        "requested_mesh_ids",
-        receipt_targets.get("expected_mesh_ids"),
+    preimage = _capture_immutable_snapshot(backup, authoring)
+    _validate_receipt_binding(
+        receipt,
+        preimage,
+        backup,
+        target_scopes,
+        source_identity=_source_identity(spm),
     )
-    if (
-        receipt.get("kind") != PREIMAGE_RECEIPT_KIND
-        or not (
-            (
-                receipt_schema_version in {2, 3}
-                and receipt_target_version == 1
-            )
-            or (
-                receipt_schema_version == 4
-                and receipt_target_version == TARGET_BINDING_PROJECTION_VERSION
-                and receipt_core_version
-                == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
-            )
-        )
-        or receipt.get("asset_name") != spm.name
-        or receipt.get("source_identity_sha256")
-        != _source_identity(spm)["source_identity_sha256"]
-        or receipt.get("exact_preimage", {}).get("backup_file") != backup.name
-        or sorted(receipt_requested or []) != expected
-    ):
-        raise StaleNodeTableRecoveryError(
-            "preimage_receipt_verification_failed",
-            "the receipt is not bound to this source, backup, and target set",
-            _source_identity(spm),
-        )
     artifacts = {
         "backup_path": backup,
         "receipt_path": receipt_file,
         "receipt": receipt,
         "receipt_sha256": _sha256_bytes(receipt_bytes),
     }
-    preimage = _capture_immutable_snapshot(backup, expected)
     receipt_sha256 = _verify_preimage_artifacts(artifacts, preimage)
     if (
         preimage["regex_elementtree_parity"] is not True
-        or preimage["target_projection"]["complete"] is not True
+        or not _preimage_target_scopes_complete(preimage, target_scopes)
     ):
         raise StaleNodeTableRecoveryError(
             "preimage_reaudit_failed",
             "the immutable preimage no longer satisfies its recovery gates",
             _public_hash_evidence(preimage),
         )
-    current = _capture_immutable_snapshot(spm, expected)
+    current = _capture_immutable_snapshot(spm, authoring)
     if current["raw_sha256"] == preimage["raw_sha256"]:
         raise StaleNodeTableRecoveryError(
             "file_content_not_changed",
@@ -1333,7 +2006,9 @@ def verify_sealed_resave(
     verdict = _snapshot_gate(
         current,
         receipt,
-        expected,
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
         preimage_snapshot=preimage,
     )
     if not verdict["valid"]:
@@ -1372,6 +2047,8 @@ def wait_for_valid_resave(
     preimage_receipt,
     expected_mesh_ids=(),
     *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
     timeout=7200,
     poll_interval=2.0,
     stable_reads=3,
@@ -1380,6 +2057,17 @@ def wait_for_valid_resave(
     monotonic_fn=time.monotonic,
 ):
     """Require repeated stat/size/SHA/parse quiescence and every safety gate."""
+    target_scopes, scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
+    if scope_error:
+        raise StaleNodeTableRecoveryError(
+            scope_error,
+            "resave waiting requires one complete target-scope mode",
+            preimage_snapshot["source_identity"],
+        )
     if timeout <= 0 or poll_interval <= 0 or stable_reads < 2:
         raise StaleNodeTableRecoveryError(
             "invalid_quiescence_configuration",
@@ -1393,7 +2081,10 @@ def wait_for_valid_resave(
     last_snapshot = None
     while monotonic_fn() < deadline:
         try:
-            snapshot = capture_fn(spm_path, expected_mesh_ids)
+            snapshot = capture_fn(
+                spm_path,
+                target_scopes["authoring_mesh_ids"],
+            )
         except StaleNodeTableRecoveryError as exc:
             last_errors = [exc.reason_token]
             sleep_fn(poll_interval)
@@ -1414,6 +2105,8 @@ def wait_for_valid_resave(
             snapshot,
             preimage_receipt,
             expected_mesh_ids,
+            authoring_mesh_ids=authoring_mesh_ids,
+            required_live_mesh_ids=required_live_mesh_ids,
             preimage_snapshot=preimage_snapshot,
         )
         last_errors = verdict["errors"]
@@ -1484,11 +2177,24 @@ def _claim_and_resume_once(
     job_generation,
     guards,
     expected_mesh_ids,
+    authoring_mesh_ids,
+    required_live_mesh_ids,
     capture_fn,
 ):
     _check_guards(guards, after["source_identity"])
     _verify_preimage_artifacts(artifacts, after)
-    current = capture_fn(spm, expected_mesh_ids)
+    target_scopes, scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
+    if scope_error:
+        raise StaleNodeTableRecoveryError(
+            scope_error,
+            "continuation target scopes are incomplete or inconsistent",
+            after["source_identity"],
+        )
+    current = capture_fn(spm, target_scopes["authoring_mesh_ids"])
     if (
         current["raw_sha256"] != after["raw_sha256"]
         or current["text_sha256"] != after["text_sha256"]
@@ -1502,6 +2208,8 @@ def _claim_and_resume_once(
         current,
         artifacts["receipt"],
         expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
     )
     if not current_verdict["valid"]:
         raise StaleNodeTableRecoveryError(
@@ -1588,6 +2296,8 @@ def recover_stale_node_table(
     speedtree_exe,
     expected_mesh_ids=(),
     *,
+    authoring_mesh_ids=None,
+    required_live_mesh_ids=None,
     timeout=7200,
     poll_interval=2.0,
     stable_reads=3,
@@ -1617,13 +2327,19 @@ def recover_stale_node_table(
             "the configured SpeedTree Modeler executable is unavailable",
             identity,
         )
-    expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
-    if not expected:
+    target_scopes, scope_error = _resolve_target_scopes(
+        expected_mesh_ids,
+        authoring_mesh_ids=authoring_mesh_ids,
+        required_live_mesh_ids=required_live_mesh_ids,
+    )
+    if scope_error:
         raise StaleNodeTableRecoveryError(
-            "expected_target_mesh_ids_missing",
-            "recovery requires an explicit target Mesh-ID set",
+            scope_error,
+            "recovery requires one complete target-scope mode",
             identity,
         )
+    authoring = target_scopes["authoring_mesh_ids"]
+    required_live = target_scopes["required_live_mesh_ids"]
     _validate_retry_contract(
         retry,
         job_id,
@@ -1641,8 +2357,12 @@ def recover_stale_node_table(
     token = None
     try:
         lock, token = _acquire_session_lock(root, identity)
-        baseline = capture_fn(spm, expected)
-        baseline_verdict = validate_repaired_snapshot(baseline["delivery"], expected)
+        baseline = capture_fn(spm, authoring)
+        baseline_verdict = validate_repaired_snapshot(
+            baseline["delivery"],
+            authoring,
+            required_live,
+        )
         node_table = baseline["delivery"].get("node_table") or {}
         if node_table.get("stale") is not True:
             if not baseline_verdict["valid"]:
@@ -1670,16 +2390,22 @@ def recover_stale_node_table(
                 "the same-byte preimage audits disagree",
                 _public_hash_evidence(baseline),
             )
-        if not baseline["target_projection"]["complete"]:
+        if not _preimage_target_scopes_complete(baseline, target_scopes):
             raise StaleNodeTableRecoveryError(
                 "preimage_target_manifest_incomplete",
                 "the exact preimage does not contain the required target manifest",
                 _public_hash_evidence(baseline),
             )
-        artifacts = _ensure_preimage_artifacts(baseline, expected, root)
+        artifacts = _ensure_preimage_artifacts(
+            baseline,
+            expected_mesh_ids,
+            root,
+            authoring_mesh_ids=authoring_mesh_ids,
+            required_live_mesh_ids=required_live_mesh_ids,
+        )
         # The exact source must still be the sealed preimage before Modeler is
         # opened; receipt creation is not authority if the source raced it.
-        prelaunch = capture_fn(spm, expected)
+        prelaunch = capture_fn(spm, authoring)
         if (
             prelaunch["raw_sha256"] != baseline["raw_sha256"]
             or prelaunch["text_sha256"] != baseline["text_sha256"]
@@ -1696,7 +2422,9 @@ def recover_stale_node_table(
             spm,
             baseline,
             artifacts["receipt"],
-            expected,
+            expected_mesh_ids,
+            authoring_mesh_ids=authoring_mesh_ids,
+            required_live_mesh_ids=required_live_mesh_ids,
             timeout=timeout,
             poll_interval=poll_interval,
             stable_reads=stable_reads,
@@ -1717,7 +2445,9 @@ def recover_stale_node_table(
                 job_id,
                 job_generation,
                 guards,
-                expected,
+                expected_mesh_ids,
+                authoring_mesh_ids,
+                required_live_mesh_ids,
                 capture_fn,
             )
         return {
@@ -1770,12 +2500,42 @@ def build_parser():
         "--speedtree-exe",
         help="Modeler executable; defaults to the existing SK Batch config",
     )
-    parser.add_argument(
+    target_mode = parser.add_mutually_exclusive_group(required=True)
+    target_mode.add_argument(
         "--expected-mesh-id",
         action="append",
         type=int,
-        required=True,
-        help="Required live target Mesh ID; repeat for each target",
+        help=(
+            "Legacy strict target Mesh ID; repeat for each target. Every ID "
+            "is sealed for both authoring continuity and live delivery."
+        ),
+    )
+    target_mode.add_argument(
+        "--authoring-mesh-id",
+        action="append",
+        type=int,
+        help=(
+            "Explicit authoring-binding Mesh ID; repeat for each target and "
+            "also select a required-live mode."
+        ),
+    )
+    live_mode = parser.add_mutually_exclusive_group()
+    live_mode.add_argument(
+        "--required-live-mesh-id",
+        action="append",
+        type=int,
+        help=(
+            "Explicit live/export Mesh ID subset; repeat as needed and use "
+            "only with --authoring-mesh-id."
+        ),
+    )
+    live_mode.add_argument(
+        "--no-required-live-delivery",
+        action="store_true",
+        help=(
+            "Seal explicit authoring continuity with no per-binding live "
+            "delivery requirement."
+        ),
     )
     parser.add_argument("--timeout", type=float, default=7200)
     parser.add_argument("--poll-interval", type=float, default=2.0)
@@ -1791,13 +2551,20 @@ def main(argv=None):
         else configured_speedtree_exe()
     )
     results = []
+    required_live_mesh_ids = (
+        ()
+        if args.no_required_live_delivery
+        else args.required_live_mesh_id
+    )
     try:
         for spm in args.spm:
             results.append(
                 recover_stale_node_table(
                     spm,
                     speedtree_exe,
-                    args.expected_mesh_id,
+                    args.expected_mesh_id or (),
+                    authoring_mesh_ids=args.authoring_mesh_id,
+                    required_live_mesh_ids=required_live_mesh_ids,
                     timeout=args.timeout,
                     poll_interval=args.poll_interval,
                     stable_reads=args.stable_reads,
