@@ -31,6 +31,7 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
+from artifact_content_key import sampled_file_content_snapshot
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     generator_guid_key,
@@ -120,6 +121,26 @@ def _sha256_cached(path_text, size, mtime_ns):
 
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
+    if not hash_content:
+        try:
+            sampled = sampled_file_content_snapshot(candidate)
+        except OSError:
+            return {
+                "path": str(candidate),
+                "exists": False,
+                "size": None,
+                "mtime_ns": None,
+                "sha256": None,
+            }
+        return {
+            "path": str(candidate),
+            "exists": True,
+            "size": sampled["size"],
+            "mtime_ns": sampled["mtime_ns"],
+            "sha256": None,
+            "fingerprint": sampled["fingerprint"],
+            "fingerprint_algorithm": sampled["fingerprint_algorithm"],
+        }
     try:
         stat = candidate.stat()
     except OSError:
@@ -136,10 +157,7 @@ def file_fingerprint(path, hash_content=True):
         "exists": True,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": (
-            _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns)
-            if hash_content else None
-        ),
+        "sha256": _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns),
     }
 
 
@@ -557,10 +575,7 @@ def _export_bundle(spm):
     fbx_report = inspect_fbx_material_mesh_pairs(paths["fbx"])
     return {
         "paths": {
-            # Hashed: App._cluster_receipt_live_artifacts_match() rejects a
-            # record carrying neither sha256 nor fingerprint, so a digest-less
-            # record makes every healthy live audit look unstable (#37).
-            name: file_fingerprint(path)
+            name: file_fingerprint(path, hash_content=False)
             for name, path in paths.items()
         },
         "fbx_contract": fbx_report,
@@ -681,11 +696,7 @@ def _material_rows(audit, spm):
             resolved = _resolve_ref(spm, value)
             refs.append({
                 "authored": value,
-                # Hashed for the same reason as the FBX/XML/STMAT paths above.
-                # _sha256_cached keys on (path, size, mtime_ns), so a repeated audit
-                # in one process pays nothing, and sha256 over a folder's largest
-                # textures measures well under a second next to the folder walk.
-                **file_fingerprint(resolved),
+                **file_fingerprint(resolved, hash_content=False),
             })
         rows.append({
             "material_id": row.get("material_id"),
@@ -3723,10 +3734,7 @@ def build_cluster_assembly_contract(
             "source_materials": _material_rows(audit, cluster),
             "source_mesh_ids": sorted(audit.mesh_asset_ids(cluster)),
             "texture_dependencies": [
-                # This is the exact key the stability check's own regression test
-                # uses to prove a digest-less record is rejected, so it must
-                # carry one.
-                file_fingerprint(value)
+                file_fingerprint(value, hash_content=False)
                 for value in texture_refs
             ],
             "texture_origin_kind": texture_origin_kind,
