@@ -1469,6 +1469,13 @@ def cluster_issue_summary(issues, limit=5):
         missing = [str(value) for value in details.get("missing") or []]
         if missing:
             fields.append("missing=" + ", ".join(missing[:3]))
+        errors = [
+            str(value).split(":", 1)[0]
+            for value in issue.get("errors") or []
+            if str(value).strip()
+        ]
+        if errors:
+            fields.append("errors=" + ", ".join(errors[:3]))
         targets = [
             Path(str(row.get("spm"))).name
             for row in issue.get("blocked_targets") or ()
@@ -3539,14 +3546,70 @@ class App:
         actual error, so walk ``blocked_by`` to the real failure instead.
         """
         seen = _seen if _seen is not None else set()
-        key = str(spm)
-        if key in seen:
+        columns = ("blend", "push", "spm")
+
+        def new_frame(value):
+            key = str(value)
+            if key in seen:
+                return None
+            seen.add(key)
+            with self.state_lock:
+                entry = self.state.get(key)
+                entry = dict(entry) if isinstance(entry, dict) else {}
+            return {
+                "entry": entry,
+                "column_index": 0,
+                "waiting": None,
+            }
+
+        first = new_frame(spm)
+        if first is None:
             return ""
-        seen.add(key)
-        with self.state_lock:
-            entry = self.state.get(key)
-            entry = dict(entry) if isinstance(entry, dict) else {}
-        for column in ("blend", "push", "spm"):
+        stack = [first]
+
+        def finish_frame(result):
+            stack.pop()
+            if not stack:
+                return True, result
+            waiting = stack[-1]["waiting"]
+            if result:
+                waiting["nested"].append(result)
+            waiting["index"] += 1
+            return False, ""
+
+        while stack:
+            frame = stack[-1]
+            waiting = frame["waiting"]
+            if waiting is not None:
+                if waiting["index"] < len(waiting["blocked_by"]):
+                    child = new_frame(
+                        waiting["blocked_by"][waiting["index"]]
+                    )
+                    if child is None:
+                        waiting["index"] += 1
+                    else:
+                        stack.append(child)
+                    continue
+                nested = sorted(set(waiting["nested"]))
+                frame["waiting"] = None
+                if nested:
+                    result = compact_error_message(
+                        " | ".join(nested), max_chars
+                    )
+                    done, result = finish_frame(result)
+                    if done:
+                        return result
+                continue
+
+            if frame["column_index"] >= len(columns):
+                done, result = finish_frame("")
+                if done:
+                    return result
+                continue
+
+            column = columns[frame["column_index"]]
+            frame["column_index"] += 1
+            entry = frame["entry"]
             kind = entry.get(f"{column}_status_kind")
             if kind in {None, "ok", "skipped"}:
                 continue
@@ -3556,19 +3619,14 @@ class App:
                     error_entry.get("blocked_by")
                     if isinstance(error_entry, dict)
                     else None
-                ) or ()
-                nested = sorted({
-                    text
-                    for text in (
-                        self._recorded_failure_reason(
-                            value, max_chars, seen
-                        )
-                        for value in blocked_by
-                    )
-                    if text
-                })
-                if nested:
-                    return " | ".join(nested)
+                )
+                if not isinstance(blocked_by, (list, tuple, set)):
+                    blocked_by = ()
+                frame["waiting"] = {
+                    "blocked_by": list(blocked_by),
+                    "index": 0,
+                    "nested": [],
+                }
                 continue
             recorded = error_entry
             if isinstance(recorded, dict):
@@ -3577,7 +3635,10 @@ class App:
                 recorded = entry.get(f"{column}_status")
             if not isinstance(recorded, str) or not recorded.strip():
                 continue
-            return compact_error_message(recorded.strip(), max_chars)
+            result = compact_error_message(recorded.strip(), max_chars)
+            done, result = finish_frame(result)
+            if done:
+                return result
         return ""
 
     def _record_pipeline_dependency_block(

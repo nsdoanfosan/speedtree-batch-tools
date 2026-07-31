@@ -1789,10 +1789,18 @@ def _normalized_delivery_blocked_issue(dependency):
     """
     variants = dependency.get("normalized_variants") or {}
     blocked_targets = variants.get("delivery_blocked_targets") or []
-    stale_targets = [
+    stale_only_targets = [
         row for row in blocked_targets
         if isinstance(row, dict)
         and row.get("delivery_reason") == STALE_NODE_TABLE_REASON
+    ]
+    stale_evidence_targets = [
+        row for row in blocked_targets
+        if isinstance(row, dict)
+        and (
+            row.get("delivery_reason") == STALE_NODE_TABLE_REASON
+            or bool(row.get("stale_node_table_target_mesh_ids"))
+        )
     ]
     issue = {
         "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
@@ -1801,19 +1809,19 @@ def _normalized_delivery_blocked_issue(dependency):
         "delivery_mode": dependency.get("normalized_delivery_mode"),
         "errors": variants.get("delivery_errors") or [],
     }
-    if stale_targets and len(stale_targets) == len(blocked_targets):
+    if stale_only_targets and len(stale_only_targets) == len(blocked_targets):
         # Every blocked target is blocked only because its saved node
         # table cannot answer the export question.  Still blocked, but
         # the operator now gets the real cause and the fix.
         issue["code"] = "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
         issue["remedy"] = STALE_NODE_TABLE_REMEDY
-        issue["blocked_targets"] = stale_targets
-    elif stale_targets:
-        # Only some blocked targets are explained by a stale node table;
-        # the rest keep their own real cause, so the code stays generic.
-        # The stale subset and its fix still have to reach the operator
-        # instead of being computed and dropped.
-        issue["stale_node_table_targets"] = stale_targets
+        issue["blocked_targets"] = stale_only_targets
+    elif stale_evidence_targets:
+        # Only part of the block is explained by stale node-table evidence.
+        # That can mean separate target SPMs have different causes, or that
+        # one target contains both a stale slot and an independent slot fault.
+        # Keep the generic code while carrying the stale subset and its fix.
+        issue["stale_node_table_targets"] = stale_evidence_targets
         issue["stale_node_table_remedy"] = STALE_NODE_TABLE_REMEDY
     return issue
 

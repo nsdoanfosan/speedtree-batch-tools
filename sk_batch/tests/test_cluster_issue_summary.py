@@ -68,6 +68,54 @@ class ClusterIssueSummaryTests(unittest.TestCase):
         summary = gui.cluster_issue_summary([issue])
         self.assertEqual(summary, "CLUSTER_ROLE_CONFLICT role=leaf")
 
+    def test_generic_delivery_issue_keeps_missing_slot_cause_visible(self):
+        gui = load_gui_module()
+        issue = {
+            "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+            "role": "leaf",
+            "errors": ["visible_generator_slot_missing"],
+        }
+        summary = gui.cluster_issue_summary([issue])
+        self.assertIn("errors=visible_generator_slot_missing", summary)
+
+    def test_generic_delivery_issue_keeps_ambiguous_slot_cause_visible(self):
+        gui = load_gui_module()
+        issue = {
+            "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+            "role": "leaf",
+            "errors": ["visible_generator_slot_ambiguous"],
+        }
+        summary = gui.cluster_issue_summary([issue])
+        self.assertIn("errors=visible_generator_slot_ambiguous", summary)
+
+    def test_generic_delivery_issue_keeps_audit_unavailable_cause_visible(self):
+        gui = load_gui_module()
+        issue = {
+            "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+            "role": "leaf",
+            "errors": ["production_spm_live_audit_unavailable"],
+        }
+        summary = gui.cluster_issue_summary([issue])
+        self.assertIn(
+            "errors=production_spm_live_audit_unavailable",
+            summary,
+        )
+
+    def test_audit_failure_summary_uses_stable_token_without_exception_details(
+        self,
+    ):
+        gui = load_gui_module()
+        issue = {
+            "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+            "role": "leaf",
+            "errors": [
+                "production_spm_live_audit_failed:C:\\private\\tree.spm"
+            ],
+        }
+        summary = gui.cluster_issue_summary([issue])
+        self.assertIn("errors=production_spm_live_audit_failed", summary)
+        self.assertNotIn("C:\\private", summary)
+
 
 class RecordedFailureReasonChainTests(unittest.TestCase):
     def make_app(self, gui):
@@ -126,6 +174,106 @@ class RecordedFailureReasonChainTests(unittest.TestCase):
             app._recorded_failure_reason("A.spm"),
             "Substance bake failed",
         )
+
+    def test_sibling_failures_are_sorted_and_preserved(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.state["B.spm"] = self.real_failure_entry("Zulu failure")
+        app.state["C.spm"] = self.real_failure_entry("Alpha failure")
+        app.state["A.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: B.spm, C.spm",
+            ["B.spm", "C.spm"],
+        )
+        self.assertEqual(
+            app._recorded_failure_reason("A.spm"),
+            "Alpha failure | Zulu failure",
+        )
+
+    def test_diamond_dependency_reports_shared_root_once(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.state["D.spm"] = self.real_failure_entry("Shared root failure")
+        app.state["B.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: D.spm", ["D.spm"]
+        )
+        app.state["C.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: D.spm", ["D.spm"]
+        )
+        app.state["A.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: B.spm, C.spm",
+            ["B.spm", "C.spm"],
+        )
+        self.assertEqual(
+            app._recorded_failure_reason("A.spm"),
+            "Shared root failure",
+        )
+
+    def test_cycle_with_an_escape_path_still_reports_the_root(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.state["Root.spm"] = self.real_failure_entry("Actual failure")
+        app.state["B.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: A.spm, Root.spm",
+            ["A.spm", "Root.spm"],
+        )
+        app.state["A.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: B.spm", ["B.spm"]
+        )
+        self.assertEqual(
+            app._recorded_failure_reason("A.spm"),
+            "Actual failure",
+        )
+
+    def test_combined_sibling_reason_honors_max_chars(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.state["B.spm"] = self.real_failure_entry("B" * 40)
+        app.state["C.spm"] = self.real_failure_entry("C" * 40)
+        app.state["A.spm"] = self.dependency_blocked_entry(
+            "required Cluster stage failed: B.spm, C.spm",
+            ["B.spm", "C.spm"],
+        )
+        reason = app._recorded_failure_reason("A.spm", max_chars=32)
+        self.assertLessEqual(len(reason), 32)
+        self.assertTrue(reason.endswith("…"))
+
+    def test_long_dependency_chain_reports_root_without_recursion(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        depth = 1100
+        for index in range(depth):
+            app.state[f"{index}.spm"] = self.dependency_blocked_entry(
+                f"required Cluster stage failed: {index + 1}.spm",
+                [f"{index + 1}.spm"],
+            )
+        app.state[f"{depth}.spm"] = self.real_failure_entry("Deep root")
+        self.assertEqual(
+            app._recorded_failure_reason("0.spm"),
+            "Deep root",
+        )
+
+    def test_malformed_blocked_by_falls_back_to_local_recorded_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        for malformed in ("B.spm", 7):
+            with self.subTest(blocked_by=malformed):
+                app.state["A.spm"] = {
+                    "blend_status_kind": "dependency_blocked",
+                    "blend_status_error": {
+                        "kind": "dependency_blocked",
+                        "message": "required Cluster stage failed",
+                        "blocked_by": malformed,
+                    },
+                    "spm_status_kind": "data_error",
+                    "spm_status_error": {
+                        "kind": "data_error",
+                        "message": "Local fallback failure",
+                    },
+                }
+                self.assertEqual(
+                    app._recorded_failure_reason("A.spm"),
+                    "Local fallback failure",
+                )
 
     def test_cycle_guard_does_not_hang_or_raise(self):
         gui = load_gui_module()
