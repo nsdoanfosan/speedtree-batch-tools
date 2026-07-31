@@ -28,7 +28,6 @@ from speedtree_pipeline_contract import (
     SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
     canonical_path_key,
     generator_guid_key,
-    spm_authoring_graph_fingerprint,
 )
 
 try:
@@ -56,6 +55,29 @@ TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
 TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
 TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
+_RECEIPT_DIALECTS = {
+    # These tuples are immutable historical contracts.  Do not replace the
+    # literal versions with mutable "current" constants.
+    (2, 1, None, 1, 1, None): "schema2_graph1_target1",
+    (3, 1, 2, 1, 1, None): "schema3_graph1_core2_target1",
+    (4, 1, 3, 1, 2, None): "schema4_graph1_core3_target2",
+    (5, 1, 3, 1, 2, 1): "schema5_graph1_core3_target2_requirements1",
+}
+_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5})
+_KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
+    # A real Lauraceae receipt uses this tuple, but the historical core-v1
+    # implementation is unavailable.  Its sanitized evidence fixture records
+    # the explicit unsupported result; never alias it to v2/v3 or tampering.
+    (3, 1, 1, 1, 1, None),
+})
+_AUTHORING_GRAPH_V1_IGNORED_SUBTREE_TAGS = frozenset({
+    "thumbnail",
+    "thumbnailsize",
+    "preview",
+    "statistics",
+    "quicksavesettings2",
+    "m_stimelinedata",
+})
 _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS = frozenset({
     "thumbnail",
     "thumbnailsize",
@@ -147,6 +169,42 @@ def _sha256_bytes(value):
 
 def _json_fingerprint(value):
     return _sha256_bytes(_canonical_json_bytes(value))
+
+
+def _remove_authoring_graph_v1_volatile(parent, *, depth=0):
+    """Apply the frozen graph-v1 projection policy in place."""
+    for child in list(parent):
+        tag = _local_name(child.tag).casefold()
+        if (
+            (depth == 0 and tag == "nodes")
+            or tag in _AUTHORING_GRAPH_V1_IGNORED_SUBTREE_TAGS
+        ):
+            parent.remove(child)
+            continue
+        _remove_authoring_graph_v1_volatile(child, depth=depth + 1)
+
+
+def _authoring_graph_projection_v1(text):
+    """Reproduce the immutable historical authoring-graph v1 fingerprint."""
+    projected = ET.fromstring(text)
+    _remove_authoring_graph_v1_volatile(projected)
+    payload = ET.tostring(
+        projected,
+        encoding="unicode",
+        short_empty_elements=True,
+    )
+    payload = re.sub(r">\s+<", "><", payload).strip()
+    envelope = {
+        "contract": "speedtree_spm_authoring_graph_projection",
+        "projection_version": 1,
+        "source": payload,
+    }
+    return _sha256_bytes(json.dumps(
+        envelope,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8"))
 
 
 def _local_name(tag):
@@ -1153,7 +1211,7 @@ def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
         elementtree = _elementtree_node_evidence(text)
         target_projection = _target_binding_projection(delivery, expected_mesh_ids)
         normalization = _normalization_evidence(delivery, target_projection)
-        authoring_fingerprint = spm_authoring_graph_fingerprint(text)
+        authoring_fingerprint = _authoring_graph_projection_v1(text)
         authoring_core = _authoring_graph_core_projection(text)
     except (ET.ParseError, OSError, RuntimeError, TypeError, UnicodeError, ValueError) as exc:
         raise StaleNodeTableRecoveryError(
@@ -1593,11 +1651,9 @@ def _preimage_receipt(
     }
 
 
-def _receipt_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+def _strict_receipt_version(value):
+    """Return one sealed positive integer version without coercion."""
+    return value if type(value) is int and value > 0 else None
 
 
 def _receipt_requested_mesh_ids(receipt_targets):
@@ -1620,7 +1676,7 @@ def _receipt_target_scopes(receipt):
     requested = _receipt_requested_mesh_ids(targets)
     if not requested:
         return None
-    schema_version = _receipt_int(receipt.get("schema_version"))
+    schema_version = _strict_receipt_version(receipt.get("schema_version"))
     requirements = receipt.get("target_requirements")
     if schema_version in {2, 3, 4}:
         if requirements is not None:
@@ -1648,7 +1704,7 @@ def _receipt_target_scopes(receipt):
     if not (
         requirements.get("contract")
         == "speedtree_stale_node_target_requirements"
-        and _receipt_int(requirements.get("version"))
+        and _strict_receipt_version(requirements.get("version"))
         == TARGET_REQUIREMENTS_VERSION
         and requirements.get("policy") == TARGET_REQUIREMENTS_POLICY
         and authoring == requested
@@ -1662,46 +1718,110 @@ def _receipt_target_scopes(receipt):
     }
 
 
-def _supported_receipt_projection_versions(receipt):
-    schema_version = _receipt_int(receipt.get("schema_version"))
-    targets = receipt.get("required_target_bindings")
-    if not isinstance(targets, dict):
-        return False
-    if targets.get("contract") != "speedtree_required_target_binding_projection":
-        return False
-    target_version = _receipt_int(targets.get("version"))
-    if _receipt_target_scopes(receipt) is None:
-        return False
+def _receipt_dialect_versions(receipt):
+    graph = receipt.get("authoring_graph_projection")
     core = receipt.get("authoring_graph_core_projection")
-    if schema_version == 2:
-        return target_version == 1 and core is None
-    if schema_version == 3:
-        return bool(
-            target_version == 1
-            and isinstance(core, dict)
-            and core.get("contract")
-            == "speedtree_spm_authoring_graph_core_projection"
-            and _receipt_int(core.get("version")) == 2
+    membership = receipt.get("generator_membership")
+    targets = receipt.get("required_target_bindings")
+    requirements = receipt.get("target_requirements")
+    return (
+        _strict_receipt_version(receipt.get("schema_version")),
+        _strict_receipt_version(graph.get("version"))
+        if isinstance(graph, dict) else None,
+        _strict_receipt_version(core.get("version"))
+        if isinstance(core, dict) else None,
+        _strict_receipt_version(membership.get("version"))
+        if isinstance(membership, dict) else None,
+        _strict_receipt_version(targets.get("version"))
+        if isinstance(targets, dict) else None,
+        _strict_receipt_version(requirements.get("version"))
+        if isinstance(requirements, dict) else None,
+    )
+
+
+def _resolve_receipt_dialect(receipt, snapshot=None):
+    evidence = _public_hash_evidence(snapshot) if snapshot else {}
+    if not isinstance(receipt, dict) or "schema_version" not in receipt:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the immutable receipt is malformed or incomplete",
+            evidence,
         )
-    if schema_version == 4:
-        return bool(
-            target_version == TARGET_BINDING_PROJECTION_VERSION
-            and isinstance(core, dict)
-            and core.get("contract")
-            == "speedtree_spm_authoring_graph_core_projection"
-            and _receipt_int(core.get("version"))
-            == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
+    schema_version = _strict_receipt_version(receipt.get("schema_version"))
+    if schema_version not in _KNOWN_RECEIPT_SCHEMAS:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_schema_unsupported",
+            "the immutable receipt schema is unknown or not a strict integer",
+            evidence,
         )
+    required_blocks = (
+        (
+            "authoring_graph_projection",
+            "speedtree_spm_authoring_graph_projection",
+        ),
+        (
+            "generator_membership",
+            "speedtree_generator_membership_projection",
+        ),
+        (
+            "required_target_bindings",
+            "speedtree_required_target_binding_projection",
+        ),
+    )
+    if schema_version >= 3:
+        required_blocks += ((
+            "authoring_graph_core_projection",
+            "speedtree_spm_authoring_graph_core_projection",
+        ),)
     if schema_version == 5:
-        return bool(
-            target_version == TARGET_BINDING_PROJECTION_VERSION
-            and isinstance(core, dict)
-            and core.get("contract")
-            == "speedtree_spm_authoring_graph_core_projection"
-            and _receipt_int(core.get("version"))
-            == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
+        required_blocks += ((
+            "target_requirements",
+            "speedtree_stale_node_target_requirements",
+        ),)
+    for name, contract in required_blocks:
+        block = receipt.get(name)
+        if not (
+            isinstance(block, dict)
+            and block.get("contract") == contract
+            and "version" in block
+        ):
+            raise StaleNodeTableRecoveryError(
+                "preimage_receipt_verification_failed",
+                "the immutable receipt projection structure is malformed",
+                evidence,
+            )
+    if (
+        (schema_version == 2 and receipt.get("authoring_graph_core_projection") is not None)
+        or (schema_version < 5 and receipt.get("target_requirements") is not None)
+    ):
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the immutable receipt contains fields outside its sealed schema",
+            evidence,
         )
-    return False
+    versions = _receipt_dialect_versions(receipt)
+    if versions in _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_projection_version_unsupported",
+            "the historical receipt projection is known but cannot be reproduced",
+            evidence,
+        )
+    dialect = _RECEIPT_DIALECTS.get(versions)
+    if dialect is None:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_projection_version_unsupported",
+            "the receipt contains an unknown or malformed projection version tuple",
+            evidence,
+        )
+    return dialect
+
+
+def _supported_receipt_projection_versions(receipt):
+    try:
+        _resolve_receipt_dialect(receipt)
+    except StaleNodeTableRecoveryError:
+        return False
+    return _receipt_target_scopes(receipt) is not None
 
 
 def _validate_receipt_binding(
@@ -1720,6 +1840,7 @@ def _validate_receipt_binding(
             "the receipt is not a supported immutable evidence object",
             _public_hash_evidence(snapshot),
         )
+    _resolve_receipt_dialect(receipt, snapshot)
     targets = receipt.get("required_target_bindings")
     sealed_target_scopes = _receipt_target_scopes(receipt)
     exact = receipt.get("exact_preimage")
@@ -1729,19 +1850,17 @@ def _validate_receipt_binding(
     valid = bool(
         receipt.get("kind") == PREIMAGE_RECEIPT_KIND
         and receipt.get("recovery_contract") == RECOVERY_CONTRACT
-        and _supported_receipt_projection_versions(receipt)
         and receipt.get("asset_name") == identity["asset_name"]
         and receipt.get("source_identity_sha256")
         == identity["source_identity_sha256"]
         and isinstance(authoring_graph, dict)
         and authoring_graph.get("contract")
         == "speedtree_spm_authoring_graph_projection"
-        and _receipt_int(authoring_graph.get("version"))
-        == SPM_AUTHORING_GRAPH_PROJECTION_VERSION
+        and _strict_receipt_version(authoring_graph.get("version")) == 1
         and isinstance(membership, dict)
         and membership.get("contract")
         == "speedtree_generator_membership_projection"
-        and _receipt_int(membership.get("version")) == 1
+        and _strict_receipt_version(membership.get("version")) == 1
         and isinstance(exact, dict)
         and exact.get("raw_sha256") == snapshot["raw_sha256"]
         and exact.get("backup_raw_sha256") == snapshot["raw_sha256"]
@@ -1764,9 +1883,20 @@ def _validate_receipt_binding(
 
 def _verify_preimage_artifacts(artifacts, snapshot=None):
     receipt = artifacts["receipt"]
-    expected_raw_sha = receipt["exact_preimage"]["raw_sha256"]
+    exact = receipt.get("exact_preimage") if isinstance(receipt, dict) else None
+    expected_raw_sha = exact.get("raw_sha256") if isinstance(exact, dict) else None
+    if not isinstance(expected_raw_sha, str) or not expected_raw_sha:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the immutable preimage receipt is malformed or incomplete",
+            _public_hash_evidence(snapshot) if snapshot else {},
+        )
     try:
-        backup_bytes = artifacts["backup_path"].read_bytes()
+        backup_bytes = (
+            snapshot["raw_bytes"]
+            if snapshot is not None and "raw_bytes" in snapshot
+            else artifacts["backup_path"].read_bytes()
+        )
         receipt_bytes = artifacts["receipt_path"].read_bytes()
         receipt_on_disk = json.loads(receipt_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1781,6 +1911,7 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
             "the immutable preimage backup no longer matches its receipt",
             _public_hash_evidence(snapshot) if snapshot else {},
         )
+    _resolve_receipt_dialect(receipt, snapshot)
     if receipt_on_disk != receipt:
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
@@ -1812,16 +1943,39 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
                 snapshot.get("generator_membership_fingerprint"),
                 receipt.get("generator_membership", {}).get("fingerprint"),
             ),
+            (
+                snapshot.get("elementtree", {}).get("generator_count"),
+                receipt.get("generator_membership", {}).get("count"),
+            ),
         ]
         receipt_target = receipt.get("required_target_bindings") or {}
-        try:
-            target_version = int(receipt_target.get("version") or 1)
-        except (TypeError, ValueError):
-            target_version = 0
+        target_version = _strict_receipt_version(receipt_target.get("version"))
         receipt_requested = receipt_target.get(
             "requested_mesh_ids",
             receipt_target.get("expected_mesh_ids"),
         ) or []
+        checks.append((
+            snapshot.get("target_projection", {}).get("binding_count"),
+            receipt_target.get("binding_count"),
+        ))
+        if "requested_mesh_ids" in receipt_target:
+            checks.append((
+                snapshot.get("target_projection", {}).get(
+                    "expected_target_mesh_ids"
+                ),
+                _receipt_requested_mesh_ids({
+                    "requested_mesh_ids": receipt_target.get(
+                        "expected_mesh_ids"
+                    )
+                }),
+            ))
+        if target_version == 2:
+            checks.append((
+                snapshot.get("target_projection", {}).get(
+                    "missing_requested_mesh_ids"
+                ),
+                receipt_target.get("missing_requested_mesh_ids"),
+            ))
         if target_version == TARGET_BINDING_PROJECTION_VERSION:
             checks.append((
                 snapshot.get("target_projection", {}).get("fingerprint"),
@@ -1831,20 +1985,39 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
             _legacy_target_binding_fingerprints(snapshot, receipt_requested)
         ):
             checks.append((None, receipt_target.get("fingerprint")))
-        receipt_schema_version = _receipt_int(receipt.get("schema_version"))
+        receipt_schema_version = _strict_receipt_version(
+            receipt.get("schema_version")
+        )
         receipt_core = receipt.get("authoring_graph_core_projection")
         if receipt_schema_version in {4, 5}:
+            observed_core = snapshot.get("authoring_graph_core", {})
             checks.append((
-                snapshot.get("authoring_graph_core", {}).get("fingerprint"),
+                observed_core.get("fingerprint"),
                 receipt_core.get("fingerprint"),
             ))
         elif receipt_schema_version == 3:
+            observed_core = _legacy_authoring_graph_core_v2_projection(
+                snapshot["text"]
+            )
             checks.append((
-                _legacy_authoring_graph_core_v2_projection(
-                    snapshot["text"]
-                )["fingerprint"],
+                observed_core["fingerprint"],
                 receipt_core.get("fingerprint"),
             ))
+        else:
+            observed_core = None
+        if observed_core is not None:
+            core_count_fields = [
+                "generator_count",
+                "link_count",
+                "asset_identity_count",
+            ]
+            if receipt_schema_version in {4, 5}:
+                core_count_fields.append("global_setting_count")
+            for field in core_count_fields:
+                checks.append((
+                    observed_core.get(field),
+                    receipt_core.get(field),
+                ))
         if any(observed != expected for observed, expected in checks):
             raise StaleNodeTableRecoveryError(
                 "preimage_receipt_verification_failed",
@@ -1973,13 +2146,6 @@ def verify_sealed_resave(
             _source_identity(spm),
         ) from exc
     preimage = _capture_immutable_snapshot(backup, authoring)
-    _validate_receipt_binding(
-        receipt,
-        preimage,
-        backup,
-        target_scopes,
-        source_identity=_source_identity(spm),
-    )
     artifacts = {
         "backup_path": backup,
         "receipt_path": receipt_file,
@@ -1987,6 +2153,13 @@ def verify_sealed_resave(
         "receipt_sha256": _sha256_bytes(receipt_bytes),
     }
     receipt_sha256 = _verify_preimage_artifacts(artifacts, preimage)
+    _validate_receipt_binding(
+        receipt,
+        preimage,
+        backup,
+        target_scopes,
+        source_identity=_source_identity(spm),
+    )
     if (
         preimage["regex_elementtree_parity"] is not True
         or not _preimage_target_scopes_complete(preimage, target_scopes)
@@ -2168,6 +2341,7 @@ def _check_guards(guards, identity):
 
 def _claim_and_resume_once(
     spm,
+    preimage_snapshot,
     after,
     verdict,
     artifacts,
@@ -2182,7 +2356,7 @@ def _claim_and_resume_once(
     capture_fn,
 ):
     _check_guards(guards, after["source_identity"])
-    _verify_preimage_artifacts(artifacts, after)
+    _verify_preimage_artifacts(artifacts, preimage_snapshot)
     target_scopes, scope_error = _resolve_target_scopes(
         expected_mesh_ids,
         authoring_mesh_ids=authoring_mesh_ids,
@@ -2210,6 +2384,7 @@ def _claim_and_resume_once(
         expected_mesh_ids,
         authoring_mesh_ids=authoring_mesh_ids,
         required_live_mesh_ids=required_live_mesh_ids,
+        preimage_snapshot=preimage_snapshot,
     )
     if not current_verdict["valid"]:
         raise StaleNodeTableRecoveryError(
@@ -2437,6 +2612,7 @@ def recover_stale_node_table(
         if retry is not None:
             retry_result, claim_name = _claim_and_resume_once(
                 spm,
+                baseline,
                 after,
                 verdict,
                 artifacts,

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "contract": "speedtree_stale_node_receipt_compatibility_fixture_v1",
+  "issue_url": "https://github.com/nsdoanfosan/speedtree-batch-tools/issues/41",
+  "issue_number": 41,
+  "compatibility_matrix": [
+    {
+      "name": "schema2_graph1_target1",
+      "receipt_schema_version": 2,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": null,
+        "generator_membership": 1,
+        "required_target_bindings": 1,
+        "target_requirements": null
+      },
+      "result": "supported"
+    },
+    {
+      "name": "schema3_graph1_core1_target1",
+      "receipt_schema_version": 3,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": 1,
+        "generator_membership": 1,
+        "required_target_bindings": 1,
+        "target_requirements": null
+      },
+      "result": "unsupported",
+      "reason_token": "preimage_receipt_projection_version_unsupported"
+    },
+    {
+      "name": "schema3_graph1_core2_target1",
+      "receipt_schema_version": 3,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": 2,
+        "generator_membership": 1,
+        "required_target_bindings": 1,
+        "target_requirements": null
+      },
+      "result": "supported"
+    },
+    {
+      "name": "schema4_graph1_core3_target2",
+      "receipt_schema_version": 4,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": 3,
+        "generator_membership": 1,
+        "required_target_bindings": 2,
+        "target_requirements": null
+      },
+      "result": "supported"
+    },
+    {
+      "name": "schema5_graph1_core3_target2_requirements1",
+      "receipt_schema_version": 5,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": 3,
+        "generator_membership": 1,
+        "required_target_bindings": 2,
+        "target_requirements": 1
+      },
+      "result": "supported"
+    }
+  ],
+  "sanitized_real_legacy_probe": {
+    "source_alias": "Lauraceae_12",
+    "receipt_schema_version": 3,
+    "projection_versions": [3, 1, 1, 1, 1, null],
+    "receipt_sha256_before": "ba054e6d4d05e779241b1e498e040b7fcc75937603b5a3c540c20068e8673d62",
+    "receipt_sha256_after": "ba054e6d4d05e779241b1e498e040b7fcc75937603b5a3c540c20068e8673d62",
+    "backup_raw_sha256": "141d375f74e3be6289ab28b81b1e40897e58d520e565e7daf53b4cd195f4ae7b",
+    "authoring_graph_fingerprint": "50c8a2959d1a66eef942d194f8fde479261fc700601d87cc3bc9d272b42157d3",
+    "authoring_graph_core_fingerprint": "398ca717fc7e0a63936cda19465e5c89dc5b2606c8e5128b3babc68131799def",
+    "generator_membership_fingerprint": "af00c4a4aaa5d8561ba7dfc90292ab4a19e86a8a6d4bdca109899d1ed7acd659",
+    "required_target_binding_fingerprint": "699d0911cbf9c609fba8dda0dbcca0899bbe27aca80a4d3bb60acfa7d74e3bd5",
+    "generator_count": 31,
+    "link_count": 30,
+    "asset_identity_count": 47,
+    "binding_count": 11,
+    "requested_mesh_ids": [53, 55, 56, 57],
+    "result": "unsupported",
+    "reason_token": "preimage_receipt_projection_version_unsupported",
+    "receipt_bytes_unchanged": true
+  }
+}

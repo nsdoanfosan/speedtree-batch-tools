@@ -341,6 +341,27 @@ omitting the live decision, selecting a live ID outside the authoring scope, or
 changing the caller scope after sealing fails closed before Modeler launch.
 Receipts from schemas 2 through 4 remain strict-all and are never rewritten.
 
+The immutable receipt compatibility matrix is literal and independent of the
+current projection constants:
+
+| Receipt schema | Graph | Core | Membership | Targets | Requirements | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2 | 1 | — | 1 | 1 | — | supported |
+| 3 | 1 | 1 | 1 | 1 | — | known, unsupported |
+| 3 | 1 | 2 | 1 | 1 | — | supported |
+| 4 | 1 | 3 | 1 | 2 | — | supported |
+| 5 | 1 | 3 | 1 | 2 | 1 | supported |
+
+Every supported historical fingerprint and its authoritative counts/Mesh-ID
+lists are recomputed from the exact backup before the current projection is
+derived. A valid sealed receipt is reused byte-for-byte; it is never upgraded
+or rewritten in place. Unknown receipt schemas fail with
+`preimage_receipt_schema_unsupported`; known or unknown unreproducible inner
+projection tuples fail with `preimage_receipt_projection_version_unsupported`;
+malformed content, fake fingerprints, and source/scope mismatches fail with
+`preimage_receipt_verification_failed`. Backup-byte mismatch remains
+`preimage_backup_verification_failed`.
+
 Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
 SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
