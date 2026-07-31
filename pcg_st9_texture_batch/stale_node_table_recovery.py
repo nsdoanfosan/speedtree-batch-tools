@@ -2101,13 +2101,39 @@ def _validate_receipt_binding(
             "the receipt is not a supported immutable evidence object",
             _public_hash_evidence(snapshot),
         )
-    _resolve_receipt_dialect(receipt, snapshot)
+    dialect = _resolve_receipt_dialect_spec(receipt, snapshot)
     targets = receipt.get("required_target_bindings")
     sealed_target_scopes = _receipt_target_scopes(receipt)
     exact = receipt.get("exact_preimage")
     authoring_graph = receipt.get("authoring_graph_projection")
     membership = receipt.get("generator_membership")
     identity = source_identity or snapshot["source_identity"]
+    if dialect.name == "schema3_graph1_core2_target1":
+        # Schema-3 target-v1 sealed only graph-visible projected IDs.  The
+        # caller's strict requested scope can therefore be wider than the
+        # receipt list for an authentic (but recovery-incomplete) preimage.
+        # Validate that historical projection against the exact backup here;
+        # the later preimage completeness gate remains responsible for
+        # rejecting hidden/missing requested targets before launch.
+        historical_target_binding_valid = bool(
+            snapshot.get("target_projection", {}).get("requested_mesh_ids")
+            == expected
+            and caller_required_live == expected
+            and _projection_policy_matches(
+                dialect.targets,
+                receipt,
+                snapshot,
+                expected,
+            )
+        )
+    else:
+        historical_target_binding_valid = bool(
+            _receipt_requested_mesh_ids(targets) == expected
+            and sealed_target_scopes is not None
+            and sealed_target_scopes["authoring_mesh_ids"] == expected
+            and sealed_target_scopes["required_live_mesh_ids"]
+            == caller_required_live
+        )
     valid = bool(
         receipt.get("kind") == PREIMAGE_RECEIPT_KIND
         and receipt.get("recovery_contract") == RECOVERY_CONTRACT
@@ -2128,11 +2154,7 @@ def _validate_receipt_binding(
         and exact.get("spm_text_sha256") == snapshot["text_sha256"]
         and exact.get("size") == snapshot["size"]
         and exact.get("backup_file") == Path(backup_path).name
-        and _receipt_requested_mesh_ids(targets) == expected
-        and sealed_target_scopes is not None
-        and sealed_target_scopes["authoring_mesh_ids"] == expected
-        and sealed_target_scopes["required_live_mesh_ids"]
-        == caller_required_live
+        and historical_target_binding_valid
     )
     if not valid:
         raise StaleNodeTableRecoveryError(
