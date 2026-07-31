@@ -94,12 +94,14 @@ jobs:
         run: |
           $failed = @()
           $total = 0
+          $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
           Get-ChildItem -Recurse -Directory -Filter tests |
             Where-Object {
               # work/ holds the vendored substance-tools checkout, whose own
-              # suites are not this repository's to run or to gate on.
+              # suites are not this repository's to run or to gate on. Compared
+              # as a path prefix rather than a regex so no escaping can slip.
               $_.FullName -notmatch '__pycache__' -and
-              $_.FullName -notmatch '[\/]work[\/]'
+              -not $_.FullName.StartsWith($workRoot, 'OrdinalIgnoreCase')
             } |
             Sort-Object FullName |
             ForEach-Object {
