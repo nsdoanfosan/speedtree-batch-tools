@@ -1044,49 +1044,52 @@ def _legacy_target_binding_fingerprint(snapshot, expected_mesh_ids):
 
 
 def _legacy_target_binding_fingerprints(snapshot, expected_mesh_ids):
-    """Accepted v1 fingerprints from both historical GUID/visibility dialects."""
+    """Return the frozen schema-2 target-v1 fingerprint set."""
     return {
         candidate["fingerprint"]
-        for candidate in _legacy_target_binding_v1_candidates(
+        for candidate in _schema2_target_binding_v1_candidates(
             snapshot,
             expected_mesh_ids,
         )
     }
 
 
-def _legacy_target_binding_v1_candidates(snapshot, expected_mesh_ids):
-    """Return inseparable v1 fingerprint/count/list candidate payloads."""
+def _schema2_target_binding_v1_candidates(snapshot, expected_mesh_ids):
+    """Reproduce schema-2 target-v1: every requested row and raw GUID spelling."""
     snapshot = snapshot.get("delivery", snapshot)
     expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
     expected_set = set(expected)
-    candidates = []
-    seen = set()
-    for visibility in ("all", "graph_visible"):
-        for canonical_guid in (False, True):
-            rows = [
-                _projected_target_binding(row, canonical_guid=canonical_guid)
-                for row in snapshot.get("leaf_generator_bindings") or []
-                if _mesh_id(row.get("mesh_id")) in expected_set
-                and (
-                    visibility == "all"
-                    or row.get("graph_visible") is True
-                )
-            ]
-            rows.sort(key=_canonical_json_bytes)
-            candidate = {
-                "fingerprint": _json_fingerprint(rows),
-                "binding_count": len(rows),
-                "expected_mesh_ids": expected,
-            }
-            key = (
-                candidate["fingerprint"],
-                candidate["binding_count"],
-                tuple(candidate["expected_mesh_ids"]),
-            )
-            if key not in seen:
-                seen.add(key)
-                candidates.append(candidate)
-    return candidates
+    rows = [
+        _projected_target_binding(row, canonical_guid=False)
+        for row in snapshot.get("leaf_generator_bindings") or []
+        if _mesh_id(row.get("mesh_id")) in expected_set
+    ]
+    rows.sort(key=_canonical_json_bytes)
+    return [{
+        "fingerprint": _json_fingerprint(rows),
+        "binding_count": len(rows),
+        "expected_mesh_ids": expected,
+    }]
+
+
+def _schema3_target_binding_v1_candidates(snapshot, expected_mesh_ids):
+    """Reproduce schema-3/core-2 target-v1: visible rows and canonical GUIDs."""
+    snapshot = snapshot.get("delivery", snapshot)
+    requested = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
+    requested_set = set(requested)
+    rows = [
+        _projected_target_binding(row, canonical_guid=True)
+        for row in snapshot.get("leaf_generator_bindings") or []
+        if _mesh_id(row.get("mesh_id")) in requested_set
+        and row.get("graph_visible") is True
+    ]
+    rows.sort(key=_canonical_json_bytes)
+    projected = sorted({row["mesh_id"] for row in rows})
+    return [{
+        "fingerprint": _json_fingerprint(rows),
+        "binding_count": len(rows),
+        "expected_mesh_ids": projected,
+    }]
 
 
 def _generator_membership_projection_v1(snapshot, _expected_mesh_ids=()):
@@ -1095,6 +1098,22 @@ def _generator_membership_projection_v1(snapshot, _expected_mesh_ids=()):
     return [{
         "fingerprint": evidence["generator_membership_fingerprint"],
         "count": evidence["generator_count"],
+    }]
+
+
+def _schema2_generator_membership_projection_v1(snapshot, _expected_mesh_ids=()):
+    """Reproduce schema-2 membership-v1 from raw serialized GUID spelling."""
+    root = ET.fromstring(snapshot["text"])
+    guids = set()
+    for element in root.iter():
+        if _local_name(element.tag).casefold() != "generator":
+            continue
+        raw_guid = str(_child_text(element, "GUID") or "").strip().casefold()
+        if raw_guid:
+            guids.add(raw_guid)
+    return [{
+        "fingerprint": _json_fingerprint(sorted(guids)),
+        "count": len(guids),
     }]
 
 
@@ -1121,7 +1140,11 @@ def _authoring_graph_core_v3_candidates(snapshot, _expected_mesh_ids=()):
 
 
 def _target_binding_v1_candidates(snapshot, expected_mesh_ids):
-    return _legacy_target_binding_v1_candidates(snapshot, expected_mesh_ids)
+    return _schema2_target_binding_v1_candidates(snapshot, expected_mesh_ids)
+
+
+def _target_binding_v1_schema3_candidates(snapshot, expected_mesh_ids):
+    return _schema3_target_binding_v1_candidates(snapshot, expected_mesh_ids)
 
 
 def _target_binding_v2_candidates(snapshot, expected_mesh_ids):
@@ -1539,9 +1562,26 @@ def _snapshot_gate(
     )
     if not authoring_core_continuity:
         errors.append("authoring_graph_changed_during_resave")
-    if snapshot["generator_membership_fingerprint"] != preimage_receipt[
-        "generator_membership"
-    ]["fingerprint"]:
+    if (
+        preimage_snapshot is not None
+        and preimage_snapshot.get("raw_sha256")
+        == preimage_receipt.get("exact_preimage", {}).get("raw_sha256")
+    ):
+        # Historical schema-2 membership-v1 sealed raw serialized GUID
+        # spelling.  Post-save continuity uses the current canonical
+        # membership derived from those exact backup bytes, never the legacy
+        # receipt dialect as a mutable-state baseline.
+        expected_membership_fingerprint = preimage_snapshot[
+            "generator_membership_fingerprint"
+        ]
+    else:
+        expected_membership_fingerprint = preimage_receipt[
+            "generator_membership"
+        ]["fingerprint"]
+    if (
+        snapshot["generator_membership_fingerprint"]
+        != expected_membership_fingerprint
+    ):
         errors.append("generator_membership_changed_during_resave")
     target_binding_continuity = bool(
         expected_target_fingerprint
@@ -1867,9 +1907,19 @@ _MEMBERSHIP_V1_POLICY = _ProjectionPolicy(
     _generator_membership_projection_v1,
     ("fingerprint", "count"),
 )
+_SCHEMA2_MEMBERSHIP_V1_POLICY = _ProjectionPolicy(
+    "generator_membership",
+    _schema2_generator_membership_projection_v1,
+    ("fingerprint", "count"),
+)
 _TARGET_V1_POLICY = _ProjectionPolicy(
     "required_target_bindings",
     _target_binding_v1_candidates,
+    ("fingerprint", "binding_count", "expected_mesh_ids"),
+)
+_SCHEMA3_TARGET_V1_POLICY = _ProjectionPolicy(
+    "required_target_bindings",
+    _target_binding_v1_schema3_candidates,
     ("fingerprint", "binding_count", "expected_mesh_ids"),
 )
 _TARGET_V2_POLICY = _ProjectionPolicy(
@@ -1890,7 +1940,7 @@ _RECEIPT_DIALECTS = MappingProxyType({
         (2, 1, None, 1, 1, None),
         _GRAPH_V1_POLICY,
         None,
-        _MEMBERSHIP_V1_POLICY,
+        _SCHEMA2_MEMBERSHIP_V1_POLICY,
         _TARGET_V1_POLICY,
         "strict_all_v1",
     ),
@@ -1900,7 +1950,7 @@ _RECEIPT_DIALECTS = MappingProxyType({
         _GRAPH_V1_POLICY,
         _CORE_V2_POLICY,
         _MEMBERSHIP_V1_POLICY,
-        _TARGET_V1_POLICY,
+        _SCHEMA3_TARGET_V1_POLICY,
         "strict_all_v1",
     ),
     (4, 1, 3, 1, 2, None): _ReceiptDialect(
@@ -2156,9 +2206,23 @@ def _verify_preimage_artifacts(artifacts, snapshot=None, *, capture_fn=None):
             "the exact backup or immutable receipt is missing or unreadable",
             evidence,
         ) from exc
-    requested = _receipt_requested_mesh_ids(
+    receipt_requested = _receipt_requested_mesh_ids(
         receipt.get("required_target_bindings")
     ) or []
+    # Schema-3 target-v1 sealed the graph-visible projection in
+    # expected_mesh_ids, not the caller's complete requested scope.  When the
+    # caller supplied the exact immutable snapshot, retain its requested scope
+    # for historical projection replay; otherwise the receipt list is the only
+    # safe fail-closed input available.
+    snapshot_projection = (
+        snapshot.get("target_projection") if isinstance(snapshot, dict) else None
+    )
+    requested = (
+        list(snapshot_projection.get("requested_mesh_ids") or [])
+        if isinstance(snapshot_projection, dict)
+        and snapshot.get("raw_sha256") == expected_raw_sha
+        else receipt_requested
+    )
     capture = capture_fn or _capture_immutable_snapshot
     try:
         backup_snapshot = capture(artifacts["backup_path"], requested)
@@ -2553,8 +2617,6 @@ def _claim_and_resume_once(
     required_live_mesh_ids,
     capture_fn,
 ):
-    _check_guards(guards, after["source_identity"])
-    _verify_preimage_artifacts(artifacts, preimage_snapshot)
     target_scopes, scope_error = _resolve_target_scopes(
         expected_mesh_ids,
         authoring_mesh_ids=authoring_mesh_ids,
@@ -2607,6 +2669,11 @@ def _claim_and_resume_once(
         "verified_after_raw_sha256": after["raw_sha256"],
         "preimage_receipt_sha256": artifacts["receipt_sha256"],
     }
+    # All source/gate work is complete before the last lifecycle and immutable
+    # backup checks.  Nothing effectful may intervene between that final backup
+    # verification and publishing the once-only claim.
+    _check_guards(guards, after["source_identity"])
+    _verify_preimage_artifacts(artifacts, preimage_snapshot)
     try:
         _atomic_write_new(claim, claim_payload)
     except FileExistsError as exc:
@@ -2615,7 +2682,6 @@ def _claim_and_resume_once(
             "this job/generation/after-SHA continuation was already claimed",
             _public_hash_evidence(after, job_generation=str(job_generation)),
         ) from exc
-    _check_guards(guards, after["source_identity"])
     continuation = {
         "contract": RECOVERY_CONTRACT,
         "asset_name": after["source_identity"]["asset_name"],
@@ -2788,8 +2854,10 @@ def recover_stale_node_table(
                 "the source changed after preimage sealing and before launch",
                 _public_hash_evidence(prelaunch),
             )
-        _verify_preimage_artifacts(artifacts, prelaunch)
         _check_guards(guards, identity)
+        # This is the final effectful prelaunch check.  Modeler starts
+        # immediately after the exact immutable backup is recaptured.
+        _verify_preimage_artifacts(artifacts, prelaunch)
         process = launch_fn(executable, spm)
         after, verdict = wait_for_valid_resave(
             spm,
