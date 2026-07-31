@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -49,7 +50,8 @@ RECOVERY_CONTRACT = "speedtree_stale_node_table_interactive_recovery_v2"
 PREIMAGE_RECEIPT_KIND = "speedtree_stale_node_table_preimage_receipt"
 BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
-AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 2
+AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 3
+TARGET_BINDING_PROJECTION_VERSION = 2
 _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS = frozenset({
     "thumbnail",
     "thumbnailsize",
@@ -57,6 +59,24 @@ _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS = frozenset({
     "statistics",
     "quicksavesettings2",
     "m_stimelinedata",
+})
+_AUTHORING_GRAPH_CORE_IGNORED_ROOT_TAGS = frozenset({
+    *_AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS,
+    "nodes",
+    # Modeler-derived/session state rewritten by a no-edit Save.
+    "treeinfo",
+    "window",
+    "light",
+    "fan",
+})
+_MATERIAL_AUTHORING_GEOMETRY_TAGS = frozenset({
+    "cutoutmeshid",
+    "supplementalcutoutmeshids",
+    "uvareas",
+    "width",
+    "height",
+    "unwrapscale",
+    "atlasmaker",
 })
 
 
@@ -180,6 +200,21 @@ def _normalized_spline_number(value):
     return f"{rounded:.5f}"
 
 
+def _normalized_float32_number(value):
+    """Canonicalize Modeler's ordinary decimal-to-float32 reserialization."""
+    text = str(value or "").strip()
+    if not re.fullmatch(
+        r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?",
+        text,
+    ):
+        return text
+    number = float(text)
+    if not math.isfinite(number):
+        return text
+    value32 = struct.unpack("!f", struct.pack("!f", number))[0]
+    return format(value32, ".9g")
+
+
 def _default_or_empty_parent_spline(element):
     """Recognize the redundant default parent curve removed by Modeler Save."""
     splines = [
@@ -207,6 +242,39 @@ def _default_or_empty_parent_spline(element):
         ("0.00000", "1.00000", "1.00000", "0.00000", "0.00000"),
         ("1.00000", "1.00000", "1.00000", "0.00000", "0.00000"),
     ]
+
+
+def _default_modeler_atlas_maker(element):
+    expected = {
+        "weight": "0.5",
+        "fullheight": "false",
+        "updatemeshes": "true",
+        "makeuvarea": "false",
+        "translationx": "0",
+        "translationy": "0",
+        "scalex": "1",
+        "scaley": "1",
+        "rotation": "0",
+    }
+    observed = {
+        _local_name(key).casefold(): str(value).strip().casefold()
+        for key, value in element.attrib.items()
+    }
+    return (
+        observed == expected
+        and not list(element)
+        and not str(element.text or "").strip()
+    )
+
+
+def _default_modeler_lod(element):
+    return bool(
+        len(element) == 1
+        and _local_name(element[0].tag).casefold() == "filename"
+        and not element[0].attrib
+        and not list(element[0])
+        and not str(element[0].text or "").strip()
+    )
 
 
 def _semantic_spline_subtree(element):
@@ -253,6 +321,8 @@ def _authoring_graph_core_subtree(
             pass
     elif spline_context:
         text = _normalized_spline_number(text)
+    else:
+        text = _normalized_float32_number(text)
 
     attributes = []
     for name, value in element.attrib.items():
@@ -264,6 +334,8 @@ def _authoring_graph_core_subtree(
             normalized = generator_guid_key(normalized)
         elif spline_context:
             normalized = _normalized_spline_number(normalized)
+        else:
+            normalized = _normalized_float32_number(normalized)
         attributes.append((_local_name(name), normalized))
 
     property_name = (
@@ -275,15 +347,34 @@ def _authoring_graph_core_subtree(
     children = []
     for child in element:
         child_key = _local_name(child.tag).casefold()
-        if depth == 0 and child_key == "nodes":
-            continue
         if child_key in _AUTHORING_GRAPH_CORE_IGNORED_SUBTREE_TAGS:
             continue
         if child_key == "m_nordervalue":
             continue
+        if tag_key == "generator" and child_key == "extra":
+            continue
+        if tag_key in {"force", "rulescript"} and child_key == "guid":
+            continue
+        if tag_key == "mesh" and (
+            child_key == "userdata"
+            or (
+                child_key in {"lod_1", "lod_2"}
+                and _default_modeler_lod(child)
+            )
+        ):
+            continue
+        if (
+            tag_key == "material_v8"
+            and child_key == "atlasmaker"
+            and _default_modeler_atlas_maker(child)
+        ):
+            continue
         if child_key in {"property", "splineproperty"} and _child_text(
             child, "Name"
-        ).casefold().startswith("generation:collections:"):
+        ).casefold().startswith((
+            "generation:collections:",
+            "mesh:collections:",
+        )):
             continue
         if (
             spline_context
@@ -306,45 +397,59 @@ def _authoring_graph_core_subtree(
 
 
 def _authoring_graph_core_projection(text):
-    """Hash durable Generator graph semantics across an ordinary Modeler Save.
+    """Hash durable authored semantics across an ordinary Modeler Save.
 
-    The exact projection remains diagnostic.  This durable gate canonicalizes
-    SpeedTree GUID spellings and the five known ordinary-Save representations,
-    while retaining Generator identity/type/name/visibility/properties, Link
-    endpoints, and Material/Mesh identity.  Scene and graph-editor presentation
-    metadata, regenerated Link object GUIDs, and expanded asset serialization
-    remain covered by the diagnostic exact projection but are not continuity
-    authority because Modeler rewrites them during a no-edit Save.
+    The projection retains stable global/settings subtrees, complete Generator
+    properties, Link endpoints, Material geometry, and complete Mesh geometry.
+    It normalizes only representations observed to change on a no-edit Save:
+    generated/session root blocks, graph-editor identities, rebuilt collection
+    labels, float spellings, redundant defaults, and generated asset caches.
     """
     root = ET.fromstring(text)
+    global_settings = []
     generators = []
     links = []
     assets = []
-    for element in root.iter():
+    for element in root:
         tag = _local_name(element.tag).casefold()
-        if tag == "generator":
-            generator = copy.deepcopy(element)
-            for child in list(generator):
-                if _local_name(child.tag).casefold() == "extra":
-                    generator.remove(child)
-            generators.append(_authoring_graph_core_subtree(generator, depth=1))
-        elif tag == "link":
-            links.append({
-                "source": generator_guid_key(_child_text(element, "SourceGUID")),
-                "target": generator_guid_key(_child_text(element, "TargetGUID")),
-            })
-        elif tag in {"material_v8", "mesh"}:
-            assets.append({
-                "tag": _local_name(element.tag),
-                "id": str(element.attrib.get("ID") or "").strip(),
-                "name": str(
-                    element.attrib.get("Name") or _child_text(element, "Name")
-                ).strip(),
-            })
+        if tag in _AUTHORING_GRAPH_CORE_IGNORED_ROOT_TAGS:
+            continue
+        if tag == "generators":
+            generators.extend(
+                _authoring_graph_core_subtree(child, depth=1)
+                for child in element
+                if _local_name(child.tag).casefold() == "generator"
+            )
+        elif tag == "links":
+            links.extend({
+                "source": generator_guid_key(_child_text(child, "SourceGUID")),
+                "target": generator_guid_key(_child_text(child, "TargetGUID")),
+            } for child in element if _local_name(child.tag).casefold() == "link")
+        elif tag == "assets":
+            for child in element:
+                child_tag = _local_name(child.tag).casefold()
+                if child_tag in {"name", "guid", "hidden", "properties"}:
+                    continue
+                projected = child
+                if child_tag == "material_v8":
+                    projected = copy.deepcopy(child)
+                    for material_child in list(projected):
+                        if (
+                            _local_name(material_child.tag).casefold()
+                            not in _MATERIAL_AUTHORING_GEOMETRY_TAGS
+                        ):
+                            projected.remove(material_child)
+                assets.append(_authoring_graph_core_subtree(projected, depth=1))
+        else:
+            global_settings.append(
+                _authoring_graph_core_subtree(element, depth=1)
+            )
+    global_settings.sort(key=_canonical_json_bytes)
     generators.sort(key=_canonical_json_bytes)
     links.sort(key=_canonical_json_bytes)
     assets.sort(key=_canonical_json_bytes)
     rows = {
+        "global_settings": global_settings,
         "generators": generators,
         "links": links,
         "assets": assets,
@@ -355,6 +460,7 @@ def _authoring_graph_core_projection(text):
         "generator_count": len(generators),
         "link_count": len(links),
         "asset_identity_count": len(assets),
+        "global_setting_count": len(global_settings),
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
     }
@@ -405,44 +511,93 @@ def _elementtree_node_evidence(text):
     }
 
 
+def _projected_target_binding(row, *, canonical_guid=True):
+    guid = str(row.get("generator_guid") or "").strip()
+    return {
+        "generator_guid": (
+            generator_guid_key(guid) if canonical_guid else guid.casefold()
+        ),
+        "generator_type": str(row.get("generator_type") or "").strip(),
+        "generator_name": str(row.get("generator_name") or "").strip(),
+        "slot_prefix": str(row.get("slot_prefix") or "").strip(),
+        "material_property": str(row.get("material_property") or "").strip(),
+        "material_id": _mesh_id(row.get("material_id")),
+        "mesh_property": str(row.get("mesh_property") or "").strip(),
+        "mesh_id": _mesh_id(row.get("mesh_id")),
+    }
+
+
 def _target_binding_projection(snapshot, expected_mesh_ids):
     requested = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
     requested_set = set(requested)
     rows = []
     live_rows = []
+    graph_visible_rows = []
     for row in snapshot.get("leaf_generator_bindings") or []:
         mesh_id = _mesh_id(row.get("mesh_id"))
-        if mesh_id not in requested_set or row.get("graph_visible") is not True:
+        if mesh_id not in requested_set:
             continue
-        projected = {
-            "generator_guid": generator_guid_key(row.get("generator_guid")),
-            "generator_type": str(row.get("generator_type") or "").strip(),
-            "generator_name": str(row.get("generator_name") or "").strip(),
-            "slot_prefix": str(row.get("slot_prefix") or "").strip(),
-            "material_property": str(row.get("material_property") or "").strip(),
-            "material_id": _mesh_id(row.get("material_id")),
-            "mesh_property": str(row.get("mesh_property") or "").strip(),
-            "mesh_id": mesh_id,
-        }
+        projected = _projected_target_binding(row)
         rows.append(projected)
-        if row.get("export_participates") is True:
-            live_rows.append(projected)
+        if row.get("graph_visible") is True:
+            graph_visible_rows.append(projected)
+            if row.get("export_participates") is True:
+                live_rows.append(projected)
     rows.sort(key=lambda row: _canonical_json_bytes(row))
     live_rows.sort(key=lambda row: _canonical_json_bytes(row))
+    graph_visible_rows.sort(key=lambda row: _canonical_json_bytes(row))
     authoring = sorted({row["mesh_id"] for row in rows})
     live = sorted({row["mesh_id"] for row in live_rows})
+    missing = sorted(set(requested) - set(authoring))
     return {
+        "version": TARGET_BINDING_PROJECTION_VERSION,
         "requested_mesh_ids": requested,
         "expected_target_mesh_ids": authoring,
         "observed_target_mesh_ids": authoring,
         "live_export_target_mesh_ids": live,
+        "missing_requested_mesh_ids": missing,
         "binding_count": len(rows),
         "live_binding_count": len(live_rows),
-        "complete": bool(requested and authoring),
+        "complete": bool(requested and authoring == requested),
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
         "_live_rows": live_rows,
+        "_graph_visible_rows": graph_visible_rows,
     }
+
+
+def _legacy_target_binding_fingerprint(snapshot, expected_mesh_ids):
+    snapshot = snapshot.get("delivery", snapshot)
+    expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
+    expected_set = set(expected)
+    rows = [
+        _projected_target_binding(row, canonical_guid=False)
+        for row in snapshot.get("leaf_generator_bindings") or []
+        if _mesh_id(row.get("mesh_id")) in expected_set
+    ]
+    rows.sort(key=_canonical_json_bytes)
+    return _json_fingerprint(rows)
+
+
+def _legacy_target_binding_fingerprints(snapshot, expected_mesh_ids):
+    """Accepted v1 fingerprints from both historical GUID/visibility dialects."""
+    snapshot = snapshot.get("delivery", snapshot)
+    expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
+    expected_set = set(expected)
+    fingerprints = {
+        _legacy_target_binding_fingerprint(snapshot, expected),
+        _target_binding_projection(snapshot, expected)["fingerprint"],
+    }
+    for canonical_guid in (False, True):
+        rows = [
+            _projected_target_binding(row, canonical_guid=canonical_guid)
+            for row in snapshot.get("leaf_generator_bindings") or []
+            if _mesh_id(row.get("mesh_id")) in expected_set
+            and row.get("graph_visible") is True
+        ]
+        rows.sort(key=_canonical_json_bytes)
+        fingerprints.add(_json_fingerprint(rows))
+    return fingerprints
 
 
 class _FrozenAudit:
@@ -459,7 +614,7 @@ def _normalization_evidence(snapshot, target_projection):
     if not rows:
         node_table = snapshot.get("node_table") or {}
         if node_table.get("stale") is True:
-            rows = target_projection["_rows"]
+            rows = target_projection["_graph_visible_rows"]
         else:
             return {
                 "delivery_mode": "CONNECTION_INCOMPLETE",
@@ -688,6 +843,34 @@ def validate_repaired_snapshot(snapshot, expected_mesh_ids=()):
     }
 
 
+def _sealed_target_requirements(preimage_receipt, preimage_snapshot):
+    receipt_target = preimage_receipt.get("required_target_bindings") or {}
+    try:
+        version = int(receipt_target.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 0
+    if version == TARGET_BINDING_PROJECTION_VERSION:
+        return {
+            "version": version,
+            "requested_mesh_ids": sorted(
+                receipt_target.get("requested_mesh_ids") or []
+            ),
+            "authoring_fingerprint": receipt_target.get("fingerprint"),
+        }
+    if (
+        preimage_snapshot is None
+        or preimage_snapshot.get("raw_sha256")
+        != preimage_receipt.get("exact_preimage", {}).get("raw_sha256")
+    ):
+        return None
+    target = preimage_snapshot["target_projection"]
+    return {
+        "version": version,
+        "requested_mesh_ids": target["requested_mesh_ids"],
+        "authoring_fingerprint": target["fingerprint"],
+    }
+
+
 def _snapshot_gate(
     snapshot,
     preimage_receipt,
@@ -695,16 +878,24 @@ def _snapshot_gate(
     *,
     preimage_snapshot=None,
 ):
-    live_target_mesh_ids = snapshot["target_projection"][
-        "live_export_target_mesh_ids"
-    ]
-    errors = list(
-        validate_repaired_snapshot(snapshot["delivery"], live_target_mesh_ids)[
-            "errors"
-        ]
+    sealed_target = _sealed_target_requirements(
+        preimage_receipt,
+        preimage_snapshot,
     )
-    if not live_target_mesh_ids:
-        errors.append("live_export_target_scope_empty")
+    if sealed_target is None:
+        sealed_required_mesh_ids = []
+        expected_target_fingerprint = None
+        errors = ["sealed_target_projection_preimage_unavailable"]
+    else:
+        sealed_required_mesh_ids = sealed_target["requested_mesh_ids"]
+        expected_target_fingerprint = sealed_target["authoring_fingerprint"]
+        errors = list(validate_repaired_snapshot(
+            snapshot["delivery"],
+            sealed_required_mesh_ids,
+        )["errors"])
+    caller_expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
+    if sealed_required_mesh_ids != caller_expected:
+        errors.append("sealed_target_scope_differs_from_caller")
     if snapshot["regex_elementtree_parity"] is not True:
         errors.append("regex_elementtree_node_evidence_mismatch")
     exact_authoring_continuity = bool(
@@ -739,10 +930,15 @@ def _snapshot_gate(
         "generator_membership"
     ]["fingerprint"]:
         errors.append("generator_membership_changed_during_resave")
-    if snapshot["target_projection"]["fingerprint"] != preimage_receipt[
-        "required_target_bindings"
-    ]["fingerprint"]:
+    target_binding_continuity = bool(
+        expected_target_fingerprint
+        and snapshot["target_projection"]["fingerprint"]
+        == expected_target_fingerprint
+    )
+    if not target_binding_continuity:
         errors.append("required_target_bindings_changed_during_resave")
+    if snapshot["target_projection"]["complete"] is not True:
+        errors.append("required_target_manifest_incomplete_after_resave")
     if snapshot["normalization"]["complete"] is not True:
         errors.append("normalization_evidence_not_complete")
     return {
@@ -761,11 +957,11 @@ def _snapshot_gate(
             == preimage_receipt["generator_membership"]["fingerprint"]
         ),
         "required_target_binding_continuity": (
-            snapshot["target_projection"]["fingerprint"]
-            == preimage_receipt["required_target_bindings"]["fingerprint"]
+            target_binding_continuity
         ),
+        "sealed_required_delivery_mesh_ids": sealed_required_mesh_ids,
         "target_delivery": validate_repaired_snapshot(
-            snapshot["delivery"], live_target_mesh_ids
+            snapshot["delivery"], sealed_required_mesh_ids
         ),
         "normalization": dict(snapshot["normalization"]),
     }
@@ -824,7 +1020,7 @@ def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
     target = snapshot["target_projection"]
     return {
         "kind": PREIMAGE_RECEIPT_KIND,
-        "schema_version": 3,
+        "schema_version": 4,
         "recovery_contract": RECOVERY_CONTRACT,
         **snapshot["source_identity"],
         "exact_preimage": {
@@ -861,14 +1057,15 @@ def _preimage_receipt(snapshot, expected_mesh_ids, backup_name):
         },
         "required_target_bindings": {
             "contract": "speedtree_required_target_binding_projection",
-            "version": 1,
+            "version": TARGET_BINDING_PROJECTION_VERSION,
             "requested_mesh_ids": sorted(expected_mesh_ids),
             "expected_mesh_ids": target["expected_target_mesh_ids"],
             "delivery_scope_rule": (
-                "post_save_graph_visible_export_participation"
+                "all_requested_graph_visible_bindings_must_export_after_save"
             ),
             "binding_count": target["binding_count"],
             "fingerprint": target["fingerprint"],
+            "missing_requested_mesh_ids": target["missing_requested_mesh_ids"],
         },
         "same_preimage_evidence": {
             "regex_elementtree_parity": snapshot["regex_elementtree_parity"],
@@ -942,11 +1139,25 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
                 snapshot.get("generator_membership_fingerprint"),
                 receipt.get("generator_membership", {}).get("fingerprint"),
             ),
-            (
-                snapshot.get("target_projection", {}).get("fingerprint"),
-                receipt.get("required_target_bindings", {}).get("fingerprint"),
-            ),
         ]
+        receipt_target = receipt.get("required_target_bindings") or {}
+        try:
+            target_version = int(receipt_target.get("version") or 1)
+        except (TypeError, ValueError):
+            target_version = 0
+        receipt_requested = receipt_target.get(
+            "requested_mesh_ids",
+            receipt_target.get("expected_mesh_ids"),
+        ) or []
+        if target_version == TARGET_BINDING_PROJECTION_VERSION:
+            checks.append((
+                snapshot.get("target_projection", {}).get("fingerprint"),
+                receipt_target.get("fingerprint"),
+            ))
+        elif receipt_target.get("fingerprint") not in (
+            _legacy_target_binding_fingerprints(snapshot, receipt_requested)
+        ):
+            checks.append((None, receipt_target.get("fingerprint")))
         receipt_core = receipt.get("authoring_graph_core_projection")
         if (
             receipt_core is not None
@@ -1053,13 +1264,37 @@ def verify_sealed_resave(
     except (TypeError, ValueError):
         receipt_schema_version = 0
     receipt_targets = receipt.get("required_target_bindings", {})
+    if not isinstance(receipt_targets, dict):
+        receipt_targets = {}
+    try:
+        receipt_target_version = int(receipt_targets.get("version") or 0)
+    except (TypeError, ValueError):
+        receipt_target_version = 0
+    receipt_core = receipt.get("authoring_graph_core_projection")
+    if not isinstance(receipt_core, dict):
+        receipt_core = {}
+    try:
+        receipt_core_version = int(receipt_core.get("version") or 0)
+    except (TypeError, ValueError):
+        receipt_core_version = 0
     receipt_requested = receipt_targets.get(
         "requested_mesh_ids",
         receipt_targets.get("expected_mesh_ids"),
     )
     if (
         receipt.get("kind") != PREIMAGE_RECEIPT_KIND
-        or receipt_schema_version not in {2, 3}
+        or not (
+            (
+                receipt_schema_version in {2, 3}
+                and receipt_target_version == 1
+            )
+            or (
+                receipt_schema_version == 4
+                and receipt_target_version == TARGET_BINDING_PROJECTION_VERSION
+                and receipt_core_version
+                == AUTHORING_GRAPH_CORE_PROJECTION_VERSION
+            )
+        )
         or receipt.get("asset_name") != spm.name
         or receipt.get("source_identity_sha256")
         != _source_identity(spm)["source_identity_sha256"]

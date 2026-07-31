@@ -28,6 +28,7 @@ from stale_node_table_recovery import (  # noqa: E402
     _authoring_graph_core_projection,
     _capture_immutable_snapshot,
     _ensure_preimage_artifacts,
+    _legacy_target_binding_fingerprint,
     _release_session_lock,
     recover_stale_node_table,
     verify_sealed_resave,
@@ -115,6 +116,51 @@ def write_spm(path, text):
     path.write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
 
 
+def legacy_receipt(snapshot, expected_mesh_ids, backup_name, *, schema_version=2):
+    target = snapshot["target_projection"]
+    receipt = {
+        "kind": "speedtree_stale_node_table_preimage_receipt",
+        "schema_version": schema_version,
+        "recovery_contract": RECOVERY_CONTRACT,
+        **snapshot["source_identity"],
+        "exact_preimage": {
+            "raw_sha256": snapshot["raw_sha256"],
+            "spm_text_sha256": snapshot["text_sha256"],
+            "size": snapshot["size"],
+            "backup_file": backup_name,
+            "backup_raw_sha256": snapshot["raw_sha256"],
+        },
+        "authoring_graph_projection": {
+            "contract": "speedtree_spm_authoring_graph_projection",
+            "version": 1,
+            "fingerprint": snapshot["authoring_graph_fingerprint"],
+        },
+        "generator_membership": {
+            "contract": "speedtree_generator_membership_projection",
+            "version": 1,
+            "count": snapshot["elementtree"]["generator_count"],
+            "fingerprint": snapshot["generator_membership_fingerprint"],
+        },
+        "required_target_bindings": {
+            "contract": "speedtree_required_target_binding_projection",
+            "version": 1,
+            "expected_mesh_ids": list(expected_mesh_ids),
+            "binding_count": target["binding_count"],
+            "fingerprint": _legacy_target_binding_fingerprint(
+                snapshot["delivery"],
+                expected_mesh_ids,
+            ),
+        },
+    }
+    if schema_version == 3:
+        receipt["authoring_graph_core_projection"] = {
+            "contract": "speedtree_spm_authoring_graph_core_projection",
+            "version": 1,
+            "fingerprint": "0" * 64,
+        }
+    return receipt
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -166,6 +212,7 @@ class RecoveryTestCase(unittest.TestCase):
         capture_fn=_capture_immutable_snapshot,
         launch_observer=None,
         timeout=10,
+        expected_mesh_ids=TARGET_MESH_IDS,
     ):
         clock = FakeClock()
         after_text = after_text or spm_text(stale=False, volatile="two")
@@ -179,7 +226,7 @@ class RecoveryTestCase(unittest.TestCase):
         return recover_stale_node_table(
             spm,
             executable,
-            TARGET_MESH_IDS,
+            expected_mesh_ids,
             timeout=timeout,
             poll_interval=1,
             stable_reads=2,
@@ -241,6 +288,22 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
             before_property + after_extra,
             1,
         )
+        for marker in ("before", "after"):
+            value = before if marker == "before" else after
+            value = value.replace(
+                "<Generators>",
+                "<GlobalSettings><AuthoredValue>1</AuthoredValue>"
+                "</GlobalSettings><Generators>",
+                1,
+            ).replace(
+                "</Mesh>",
+                "<VertexData><Value>1</Value></VertexData></Mesh>",
+                1,
+            )
+            if marker == "before":
+                before = value
+            else:
+                after = value
 
         self.assertNotEqual(
             spm_authoring_graph_fingerprint(before),
@@ -273,6 +336,16 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
             after.replace(
                 "<Name>mesh-130</Name>",
                 "<Name>mesh-130-changed</Name>",
+                1,
+            ),
+            after.replace(
+                "<AuthoredValue>1</AuthoredValue>",
+                "<AuthoredValue>2</AuthoredValue>",
+                1,
+            ),
+            after.replace(
+                "<VertexData><Value>1</Value></VertexData>",
+                "<VertexData><Value>2</Value></VertexData>",
                 1,
             ),
         ):
@@ -425,15 +498,15 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 self.assertEqual(backups[0].read_bytes(), preimage)
                 receipt_text = receipts[0].read_text(encoding="utf-8")
                 receipt = json.loads(receipt_text)
-                self.assertEqual(receipt["schema_version"], 3)
+                self.assertEqual(receipt["schema_version"], 4)
                 self.assertEqual(
                     receipt["authoring_graph_projection"]["version"], 1
                 )
                 self.assertEqual(
-                    receipt["authoring_graph_core_projection"]["version"], 2
+                    receipt["authoring_graph_core_projection"]["version"], 3
                 )
                 self.assertEqual(receipt["generator_membership"]["version"], 1)
-                self.assertEqual(receipt["required_target_bindings"]["version"], 1)
+                self.assertEqual(receipt["required_target_bindings"]["version"], 2)
                 self.assertNotIn(str(folder), receipt_text)
                 self.assertNotIn("g-130", receipt_text)
 
@@ -453,25 +526,51 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 result["after_sha256"],
             )
 
-    def test_interrupted_v2_receipt_can_verify_without_relaunch_or_resave(self):
+    def test_real_v2_receipt_with_modeler_guid_dialect_reaudits_in_place(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
             root.mkdir()
+            preimage_text = spm_text(stale=True).replace(
+                "<GUID>g-130</GUID>",
+                f"<GUID>{MODELER_GENERATOR_GUID}</GUID>",
+            ).replace(
+                "<TargetGUID>g-130</TargetGUID>",
+                f"<TargetGUID>{MODELER_GENERATOR_GUID}</TargetGUID>",
+            ).replace(
+                "<GeneratorGUID>orphan-guid</GeneratorGUID>",
+                f"<GeneratorGUID>{MINTED_GENERATOR_GUID}</GeneratorGUID>",
+                1,
+            )
+            write_spm(spm, preimage_text)
             baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
             artifacts = _ensure_preimage_artifacts(
                 baseline,
                 TARGET_MESH_IDS,
                 root,
             )
-            legacy_receipt = dict(artifacts["receipt"])
-            legacy_receipt["schema_version"] = 2
-            legacy_receipt.pop("authoring_graph_core_projection")
+            legacy = legacy_receipt(
+                baseline,
+                TARGET_MESH_IDS,
+                artifacts["backup_path"].name,
+                schema_version=2,
+            )
             artifacts["receipt_path"].write_text(
-                json.dumps(legacy_receipt, sort_keys=True),
+                json.dumps(legacy, sort_keys=True),
                 encoding="utf-8",
             )
-            write_spm(spm, spm_text(stale=False, volatile="two"))
+            sealed_receipt_bytes = artifacts["receipt_path"].read_bytes()
+            after_text = spm_text(stale=False, volatile="two").replace(
+                "<GUID>g-130</GUID>",
+                f"<GUID>{MODELER_GENERATOR_GUID}</GUID>",
+            ).replace(
+                "<TargetGUID>g-130</TargetGUID>",
+                f"<TargetGUID>{MODELER_GENERATOR_GUID}</TargetGUID>",
+            ).replace(
+                "<GeneratorGUID>g-130</GeneratorGUID>",
+                f"<GeneratorGUID>{MINTED_GENERATOR_GUID}</GeneratorGUID>",
+            )
+            write_spm(spm, after_text)
 
             result = verify_sealed_resave(
                 spm,
@@ -479,12 +578,16 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 artifacts["receipt_path"],
                 TARGET_MESH_IDS,
             )
+            self.assertEqual(
+                artifacts["receipt_path"].read_bytes(),
+                sealed_receipt_bytes,
+            )
 
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertFalse(result["modeler_launched"])
         self.assertTrue(result["reaudit"]["authoring_graph_continuity"])
 
-    def test_older_core_receipt_can_be_rebuilt_from_its_exact_backup(self):
+    def test_legacy_v3_core_is_rebuilt_from_its_exact_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -495,12 +598,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 TARGET_MESH_IDS,
                 root,
             )
-            receipt = dict(artifacts["receipt"])
-            receipt["authoring_graph_core_projection"] = {
-                "contract": "speedtree_spm_authoring_graph_core_projection",
-                "version": 1,
-                "fingerprint": "0" * 64,
-            }
+            receipt = legacy_receipt(
+                baseline,
+                TARGET_MESH_IDS,
+                artifacts["backup_path"].name,
+                schema_version=3,
+            )
             artifacts["receipt_path"].write_text(
                 json.dumps(receipt, sort_keys=True),
                 encoding="utf-8",
@@ -518,10 +621,135 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertFalse(result["modeler_launched"])
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            2,
+            3,
         )
 
-    def test_zero_node_supplemental_slots_are_authoring_not_delivery_scope(self):
+    def test_legacy_receipt_tamper_and_unknown_version_fail_closed(self):
+        for mutation in ("fingerprint", "version", "core_version"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                folder = Path(temporary)
+                spm, _executable, root = self.make_files(folder)
+                root.mkdir()
+                baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+                artifacts = _ensure_preimage_artifacts(
+                    baseline,
+                    TARGET_MESH_IDS,
+                    root,
+                )
+                receipt = legacy_receipt(
+                    baseline,
+                    TARGET_MESH_IDS,
+                    artifacts["backup_path"].name,
+                    schema_version=2,
+                )
+                if mutation == "fingerprint":
+                    receipt["required_target_bindings"]["fingerprint"] = "f" * 64
+                elif mutation == "version":
+                    receipt["required_target_bindings"]["version"] = 99
+                else:
+                    receipt = artifacts["receipt"]
+                    receipt["authoring_graph_core_projection"]["version"] = 99
+                artifacts["receipt_path"].write_text(
+                    json.dumps(receipt, sort_keys=True),
+                    encoding="utf-8",
+                )
+                write_spm(spm, spm_text(stale=False, volatile="two"))
+
+                with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                    verify_sealed_resave(
+                        spm,
+                        artifacts["backup_path"],
+                        artifacts["receipt_path"],
+                        TARGET_MESH_IDS,
+                    )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_receipt_verification_failed",
+            )
+
+    def test_legacy_hidden_requested_binding_remains_fail_closed(self):
+        hidden = (
+            "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>false</Hidden>"
+        )
+        hidden_replacement = (
+            "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>true</Hidden>"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            write_spm(spm, spm_text(stale=True).replace(
+                hidden,
+                hidden_replacement,
+                1,
+            ))
+            baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+            artifacts = _ensure_preimage_artifacts(
+                baseline,
+                TARGET_MESH_IDS,
+                root,
+            )
+            receipt = legacy_receipt(
+                baseline,
+                TARGET_MESH_IDS,
+                artifacts["backup_path"].name,
+                schema_version=2,
+            )
+            artifacts["receipt_path"].write_text(
+                json.dumps(receipt, sort_keys=True),
+                encoding="utf-8",
+            )
+            write_spm(spm, spm_text(stale=False, volatile="two").replace(
+                hidden,
+                hidden_replacement,
+                1,
+            ))
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                verify_sealed_resave(
+                    spm,
+                    artifacts["backup_path"],
+                    artifacts["receipt_path"],
+                    TARGET_MESH_IDS,
+                )
+
+        self.assertEqual(caught.exception.reason_token, "sealed_resave_reaudit_failed")
+        self.assertIn(
+            "live_target_mesh_set_incomplete",
+            caught.exception.evidence["reason_tokens"],
+        )
+
+    def test_missing_requested_mesh_id_blocks_before_modeler_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            snapshot = _capture_immutable_snapshot(
+                spm,
+                (*TARGET_MESH_IDS, 999),
+            )
+            self.assertFalse(snapshot["target_projection"]["complete"])
+            self.assertEqual(
+                snapshot["target_projection"]["missing_requested_mesh_ids"],
+                [999],
+            )
+            launched = []
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    expected_mesh_ids=(*TARGET_MESH_IDS, 999),
+                    launch_observer=lambda *_args: launched.append(True),
+                )
+
+        self.assertEqual(
+            caught.exception.reason_token,
+            "preimage_target_manifest_incomplete",
+        )
+        self.assertEqual(launched, [])
+
+    def test_zero_node_requested_slots_remain_fail_closed_after_save(self):
         after = spm_text(stale=False, volatile="two")
         for mesh_id in (131, 132, 133):
             after = after.replace(_node(f"g-{mesh_id}"), "", 1)
@@ -529,26 +757,73 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             folder = Path(temporary)
             spm, executable, root = self.make_files(folder)
 
-            result = self.recover_with_save(
-                spm,
-                executable,
-                root,
-                after_text=after,
+            with self.assertRaises(StaleNodeTableRecoveryTimeout) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    after_text=after,
+                    timeout=3,
+                )
+
+        self.assertIn(
+            "target_binding_has_no_eligible_nodes",
+            caught.exception.evidence["last_reason_tokens"],
+        )
+        self.assertIn(
+            "target_binding_not_export_participating",
+            caught.exception.evidence["last_reason_tokens"],
+        )
+
+    def test_same_mesh_one_live_three_dead_siblings_remain_fail_closed(self):
+        baseline = spm_text(stale=True)
+        after = spm_text(stale=False, volatile="two")
+        for mesh_id in (131, 132, 133):
+            old = (
+                "<Property><Name>Leaf:Mesh</Name>"
+                f"<Value>{mesh_id}</Value></Property>"
             )
+            new = (
+                "<Property><Name>Leaf:Mesh</Name>"
+                "<Value>130</Value></Property>"
+            )
+            baseline = baseline.replace(old, new, 1)
+            after = after.replace(old, new, 1)
+            after = after.replace(_node(f"g-{mesh_id}"), "", 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            write_spm(spm, baseline)
+
+            with self.assertRaises(StaleNodeTableRecoveryTimeout) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    after_text=after,
+                    timeout=3,
+                    expected_mesh_ids=(130,),
+                )
             receipt = json.loads(
-                (root / result["preimage_receipt"]).read_text(encoding="utf-8")
+                next(root.glob("*.receipt.json")).read_text(encoding="utf-8")
             )
 
-        bindings = receipt["required_target_bindings"]
-        self.assertEqual(bindings["requested_mesh_ids"], list(TARGET_MESH_IDS))
-        self.assertEqual(bindings["expected_mesh_ids"], list(TARGET_MESH_IDS))
         self.assertEqual(
-            result["reaudit"]["target_delivery"][
-                "live_export_participating_target_mesh_ids"
-            ],
+            receipt["required_target_bindings"]["expected_mesh_ids"],
             [130],
         )
-        self.assertTrue(result["reaudit"]["normalization"]["complete"])
+        self.assertEqual(
+            receipt["required_target_bindings"]["binding_count"],
+            4,
+        )
+        self.assertIn(
+            "target_binding_has_no_eligible_nodes",
+            caught.exception.evidence["last_reason_tokens"],
+        )
+        self.assertIn(
+            "target_binding_not_export_participating",
+            caught.exception.evidence["last_reason_tokens"],
+        )
 
     def test_corrupt_backup_or_receipt_blocks_before_launch(self):
         for corrupt in ("backup", "receipt"):
@@ -641,7 +916,7 @@ class QuiescenceAndGraphGateTests(RecoveryTestCase):
             ),
             (
                 no_live_target,
-                "live_export_target_scope_empty",
+                "live_target_mesh_set_incomplete",
             ),
         ):
             with self.subTest(reason=expected_reason), tempfile.TemporaryDirectory() as temporary:
