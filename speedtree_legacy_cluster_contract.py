@@ -8,11 +8,14 @@ Generator's history.
 from __future__ import annotations
 
 import copy
+import contextvars
 import functools
 import gzip
+import itertools
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -32,6 +35,8 @@ LEGACY_CLUSTER_MARKER_VALUES = {
     "m_vecForegroundIconColor_b": "1",
     "m_vecForegroundIconColor_a": "1",
 }
+HANDOFF_STAT_MISMATCH_REASON = "legacy_snapshot_handoff_stat_mismatch"
+SNAPSHOT_SCAN_FAILED_REASON = "legacy_snapshot_scan_failed"
 GENERATOR_BLOCK_RE = re.compile(
     r"<Generator\b[^>]*>.*?</Generator>", re.IGNORECASE | re.DOTALL
 )
@@ -74,12 +79,29 @@ GENERATOR_CLOSE_TAG = "</Generator>"
 # miss, never a stale hit.
 _SHARED_GENERATOR_SNAPSHOTS = {}
 
-# Transient, single-use hand-off of an already-decoded document, keyed the
-# same way.  Unlike ``_SHARED_GENERATOR_SNAPSHOTS`` (a handful of GUID->tag
-# dicts per SPM, cheap to keep around), a decoded SPM document can be
-# hundreds of MB, so this is popped the instant ``_generator_foregrounds``
-# consumes it -- never held onto for more than the one call that primed it.
-_SHARED_DECODED_TEXT = {}
+# A decoded SPM can be hundreds of MB. Keep it owned by the exact synchronous
+# inspection that received it rather than in a module-global path slot/map.
+# ContextVar isolates both worker threads and re-entrant async contexts; reset
+# in ``inspect_legacy_cluster_state`` bounds the lifetime to that one call.
+_ACTIVE_DECODED_HANDOFF = contextvars.ContextVar(
+    "speedtree_legacy_decoded_handoff", default=None
+)
+_HANDOFF_GENERATIONS = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class DecodedSpmHandoff:
+    """One caller-owned decoded document bound to path/stat/generation."""
+
+    spm_key: tuple
+    generation: int
+    text: str
+
+
+def make_decoded_spm_handoff(spm_path, text, *, size, mtime_ns):
+    """Bind decoded text to the stat observed before its owning cold parse."""
+    key = (str(Path(spm_path).resolve()), int(size), int(mtime_ns))
+    return DecodedSpmHandoff(key, next(_HANDOFF_GENERATIONS), text)
 
 
 def _store_generator_snapshot(key, foregrounds, duplicate_guids):
@@ -242,14 +264,14 @@ def _generator_foregrounds(spm):
     shared = _SHARED_GENERATOR_SNAPSHOTS.get(key)
     if shared is not None:
         return shared
-    # A caller that just decoded this exact SPM (pcg_texture_audit's
-    # per-SPM analysis) may have handed the text over instead of the
-    # already-parsed result -- this is the only place that ever reads it,
-    # and only when a valid receipt makes the regex walk worth running.
-    text = _SHARED_DECODED_TEXT.pop(key, None)
-    if text is not None:
+    # A caller that just decoded this exact SPM may own a handoff in this
+    # execution context. The identity is generation-bound and the path/stat
+    # was validated before the context was activated, so another worker can
+    # neither overwrite nor consume it.
+    handoff = _ACTIVE_DECODED_HANDOFF.get()
+    if handoff is not None and handoff.spm_key == key:
         foregrounds, duplicate_guids = generator_foregrounds_from_decoded_text(
-            text)
+            handoff.text)
         return _store_generator_snapshot(key, foregrounds, duplicate_guids)
     raw = Path(spm).read_bytes()
     if raw.startswith(b"\x1f\x8b"):
@@ -274,11 +296,8 @@ def _problem_marker_guids(spm):
     }
 
 
-@functools.lru_cache(maxsize=2048)
-def _inspect_cached(spm_key, receipt_key, problem_key):
-    spm = Path(spm_key[0])
-    receipt_path = Path(receipt_key[0])
-    result = {
+def _empty_inspection_result(spm, receipt_path):
+    return {
         "spm": str(spm),
         "receipt": str(receipt_path),
         "receipt_valid": False,
@@ -292,8 +311,18 @@ def _inspect_cached(spm_key, receipt_key, problem_key):
         "missing_generator_guids": [],
         "duplicate_generator_guids": [],
         "errors": [],
+        "reason_tokens": [],
+        "handoff_evidence": {},
+        "failure_evidence": {},
         "evidence_by_guid": {},
     }
+
+
+@functools.lru_cache(maxsize=2048)
+def _inspect_cached(spm_key, receipt_key, problem_key):
+    spm = Path(spm_key[0])
+    receipt_path = Path(receipt_key[0])
+    result = _empty_inspection_result(spm, receipt_path)
     receipt = _load_json(receipt_path)
     if receipt is None:
         # Color-only evidence is intentionally non-authoritative, so the hot
@@ -314,6 +343,12 @@ def _inspect_cached(spm_key, receipt_key, problem_key):
         foregrounds, duplicates = _generator_foregrounds(spm)
     except (OSError, UnicodeError, ValueError) as exc:
         result["errors"].append(str(exc))
+        result["reason_tokens"].append(SNAPSHOT_SCAN_FAILED_REASON)
+        result["failure_evidence"] = {
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "spm_key": list(spm_key),
+        }
         return result
     result["duplicate_generator_guids"] = sorted(duplicates)
     current_markers = {
@@ -356,7 +391,7 @@ def _inspect_cached(spm_key, receipt_key, problem_key):
 
 
 def inspect_legacy_cluster_state(
-        spm_path, foregrounds_snapshot=None, decoded_text=None):
+        spm_path, foregrounds_snapshot=None, decoded_handoff=None):
     """Return the immutable GUID lineage plus current marker drift, read-only.
 
     Two independent, optional hand-offs let a caller who already touched this
@@ -368,11 +403,11 @@ def inspect_legacy_cluster_state(
         An already-*derived* ``(foregrounds, duplicate_guids)`` pair (see
         ``generator_foregrounds_from_decoded_text``) -- typically a snapshot
         persisted on a previous run. No scan runs at all; it is used as-is.
-    ``decoded_text``
-        An already-decoded document, when nothing has been derived from it
-        yet (e.g. a fresh cold parse). It is scanned here, and only here,
-        the moment a valid receipt makes that worthwhile -- never eagerly,
-        and never for longer than this one call.
+    ``decoded_handoff``
+        A caller-owned :class:`DecodedSpmHandoff`. Its path/stat must still
+        match the inspected SPM. The generation stays local to this execution
+        context, and the decoded text is released in ``finally`` after this
+        call, whether it succeeds, is interrupted, or hits a cache entry.
 
     Both are ignored whenever the ``(spm, receipt, problem_receipt)`` stat
     triple is already cached -- lru_cache reuse alone then makes either
@@ -380,9 +415,30 @@ def inspect_legacy_cluster_state(
     """
     spm = Path(spm_path)
     key = _stat_key(spm)
+    if decoded_handoff is not None:
+        if not isinstance(decoded_handoff, DecodedSpmHandoff) \
+                or decoded_handoff.spm_key != key:
+            result = _empty_inspection_result(
+                spm, marker_receipt_path(spm))
+            result["errors"].append(
+                "decoded SPM handoff no longer matches the inspected path/stat"
+            )
+            result["reason_tokens"].append(HANDOFF_STAT_MISMATCH_REASON)
+            expected = (
+                decoded_handoff.spm_key
+                if isinstance(decoded_handoff, DecodedSpmHandoff)
+                else None
+            )
+            result["handoff_evidence"] = {
+                "generation": getattr(decoded_handoff, "generation", None),
+                "expected_spm_key": list(expected) if expected else None,
+                "actual_spm_key": list(key),
+            }
+            return result
     _prime_generator_snapshot(spm, foregrounds_snapshot)
-    if foregrounds_snapshot is None and decoded_text is not None:
-        _SHARED_DECODED_TEXT[key] = decoded_text
+    token = None
+    if foregrounds_snapshot is None and decoded_handoff is not None:
+        token = _ACTIVE_DECODED_HANDOFF.set(decoded_handoff)
     try:
         result = _inspect_cached(
             key,
@@ -390,7 +446,8 @@ def inspect_legacy_cluster_state(
             _stat_key(problem_marker_receipt_path(spm)),
         )
     finally:
-        _SHARED_DECODED_TEXT.pop(key, None)
+        if token is not None:
+            _ACTIVE_DECODED_HANDOFF.reset(token)
     return copy.deepcopy(result)
 
 
@@ -402,12 +459,16 @@ def legacy_cluster_generator_guids(spm_path):
 
 __all__ = [
     "FOREGROUND_TAGS",
+    "HANDOFF_STAT_MISMATCH_REASON",
     "LEGACY_CLUSTER_MARKER_VALUES",
     "RECEIPT_KIND",
     "RECEIPT_VERSION",
+    "SNAPSHOT_SCAN_FAILED_REASON",
+    "DecodedSpmHandoff",
     "generator_foregrounds_from_decoded_text",
     "inspect_legacy_cluster_state",
     "legacy_cluster_generator_guids",
+    "make_decoded_spm_handoff",
     "marker_receipt_path",
     "peek_generator_foregrounds",
     "problem_marker_receipt_path",

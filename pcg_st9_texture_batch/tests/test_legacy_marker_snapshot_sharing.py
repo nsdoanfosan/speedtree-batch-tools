@@ -11,7 +11,10 @@ import gzip
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -53,7 +56,8 @@ def generator(guid, material_id, *, marked=False):
     )
 
 
-def write_spm(path, *, legacy_marked=True, extra_generators=""):
+def write_spm(
+        path, *, legacy_marked=True, extra_generators="", padding_size=0):
     payload = (
         "<?xml version=\"1.0\"?><SpeedTree><Materials>"
         + material("1", "M_leaf_cluster", ["leaf_color.tga"])
@@ -61,7 +65,9 @@ def write_spm(path, *, legacy_marked=True, extra_generators=""):
         + generator(LEGACY_GUID, "1", marked=legacy_marked)
         + generator(PLAIN_GUID, "1", marked=False)
         + extra_generators
-        + "</Generators></SpeedTree>"
+        + "</Generators><Nodes>"
+        + ("x" * padding_size)
+        + "</Nodes></SpeedTree>"
     ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(gzip.compress(payload, mtime=0))
@@ -100,29 +106,26 @@ class SharedSnapshotTestCase(unittest.TestCase):
         audit._SPM_ANALYSIS_CACHE = {}
         audit._PERSISTENT_SPM_ANALYSIS = {}
         audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
-        self._old_pending = audit._PENDING_DECODED_TEXT
-        audit._PENDING_DECODED_TEXT = None
+        self._pending_token = audit._PENDING_DECODED_HANDOFF.set(None)
         self._old_shared = contract._SHARED_GENERATOR_SNAPSHOTS
-        self._old_shared_text = contract._SHARED_DECODED_TEXT
         contract._SHARED_GENERATOR_SNAPSHOTS = {}
-        contract._SHARED_DECODED_TEXT = {}
+        self._handoff_token = contract._ACTIVE_DECODED_HANDOFF.set(None)
         contract._inspect_cached.cache_clear()
 
     def tearDown(self):
         audit._SPM_ANALYSIS_CACHE = self._old_memory
         audit._PERSISTENT_SPM_ANALYSIS = self._old_persistent
         audit._PERSISTENT_SPM_ANALYSIS_DIRTY = self._old_dirty
-        audit._PENDING_DECODED_TEXT = self._old_pending
+        audit._PENDING_DECODED_HANDOFF.reset(self._pending_token)
         contract._SHARED_GENERATOR_SNAPSHOTS = self._old_shared
-        contract._SHARED_DECODED_TEXT = self._old_shared_text
+        contract._ACTIVE_DECODED_HANDOFF.reset(self._handoff_token)
         contract._inspect_cached.cache_clear()
 
     def reset_in_process_caches(self):
         """Simulate a brand-new process that only has the disk cache."""
         audit._SPM_ANALYSIS_CACHE = {}
-        audit._PENDING_DECODED_TEXT = None
+        audit._PENDING_DECODED_HANDOFF.set(None)
         contract._SHARED_GENERATOR_SNAPSHOTS = {}
-        contract._SHARED_DECODED_TEXT = {}
         contract._inspect_cached.cache_clear()
 
 
@@ -164,6 +167,105 @@ class ColdPassDedupTests(SharedSnapshotTestCase):
             self.assertEqual(raw_narrow.call_count, 0)
             self.assertFalse(
                 any(row["legacy_cluster_origin"] for row in bindings))
+
+    def test_four_cold_workers_keep_each_decoded_spm_handoff_owned(self):
+        """Reproduce the original module-global single-slot overwrite.
+
+        Hold all four workers immediately after their cold analysis has
+        decoded a different SPM.  A single shared pending slot can retain only
+        the last decode, forcing the other three legacy audits to re-read
+        their files.  The handoff contract must instead keep every decode
+        bound to its owning path/stat and consume all four without fallback.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            original_analysis = audit._spm_analysis
+            for iteration in range(10):
+                spms = []
+                expected_guids = []
+                for index in range(4):
+                    guid = f"round-{iteration}-worker-{index}-only-guid"
+                    spm = Path(temp) / (
+                        f"SK_tree_round_{iteration}_worker_{index}.spm")
+                    write_spm(
+                        spm,
+                        legacy_marked=False,
+                        extra_generators=generator(guid, "1", marked=True),
+                    )
+                    write_marker_receipt(spm, [guid])
+                    spms.append(spm)
+                    expected_guids.append(guid)
+
+                barrier = threading.Barrier(4)
+
+                def synchronized_analysis(*args, **kwargs):
+                    result = original_analysis(*args, **kwargs)
+                    barrier.wait(timeout=10)
+                    return result
+
+                with mock.patch.object(
+                        audit, "_spm_analysis",
+                        side_effect=synchronized_analysis), \
+                    mock.patch.object(
+                        contract, "_generator_section_bytes",
+                        wraps=contract._generator_section_bytes) as raw_narrow, \
+                    ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(
+                        audit.leaf_generator_bindings, spms))
+
+                self.assertEqual(
+                    raw_narrow.call_count,
+                    0,
+                    "a worker lost its owned decode and fell back to an SPM read",
+                )
+                for rows, expected_guid in zip(results, expected_guids):
+                    origins = {
+                        row["generator_guid"]
+                        for row in rows
+                        if row["legacy_cluster_origin"]
+                    }
+                    self.assertEqual(origins, {expected_guid})
+
+    def test_four_material_first_workers_do_not_overwrite_each_other(self):
+        """Mirror the production order: material rows, then legacy bindings."""
+        with tempfile.TemporaryDirectory() as temp:
+            for iteration in range(10):
+                work = []
+                for index in range(4):
+                    guid = f"material-first-{iteration}-{index}"
+                    spm = Path(temp) / (
+                        f"SK_material_first_{iteration}_{index}.spm")
+                    write_spm(
+                        spm,
+                        legacy_marked=False,
+                        extra_generators=generator(guid, "1", marked=True),
+                    )
+                    write_marker_receipt(spm, [guid])
+                    work.append((spm, guid))
+
+                barrier = threading.Barrier(4)
+
+                def material_then_legacy(item):
+                    spm, expected_guid = item
+                    rows = audit.extract_material_image_refs(spm)
+                    self.assertTrue(rows)
+                    barrier.wait(timeout=10)
+                    bindings = audit.leaf_generator_bindings(spm)
+                    origins = {
+                        row["generator_guid"]
+                        for row in bindings
+                        if row["legacy_cluster_origin"]
+                    }
+                    return origins, expected_guid
+
+                with mock.patch.object(
+                        contract, "_generator_section_bytes",
+                        wraps=contract._generator_section_bytes) as raw_narrow, \
+                    ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(material_then_legacy, work))
+
+                self.assertEqual(raw_narrow.call_count, 0)
+                for origins, expected_guid in results:
+                    self.assertEqual(origins, {expected_guid})
 
 
 class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
@@ -244,6 +346,205 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
                 {row["generator_guid"]: row["legacy_cluster_origin"]
                  for row in bindings},
             )
+
+
+class HandoffLifecycleTests(SharedSnapshotTestCase):
+    def test_aborted_folder_task_releases_unconsumed_decode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spm = Path(temp) / "SK_tree_aborted_folder.spm"
+            write_spm(spm)
+
+            def abort_after_material_parse(_folder):
+                audit.extract_material_image_refs(spm)
+                self.assertIsNotNone(
+                    audit._PENDING_DECODED_HANDOFF.get())
+                raise RuntimeError("forced folder cancellation")
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "forced folder cancellation"):
+                audit._audit_report_folders(
+                    [Path(temp)], abort_after_material_parse)
+
+            self.assertIsNone(audit._PENDING_DECODED_HANDOFF.get())
+
+    def test_path_stat_change_rejects_handoff_with_stable_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spm = Path(temp) / "SK_tree_changed_during_handoff.spm"
+            write_spm(spm)
+            write_marker_receipt(spm, [LEGACY_GUID])
+            analysis, handoff = audit._spm_analysis(
+                spm, include_decoded_handoff=True)
+
+            # Simulate an external writer replacing the SPM after analysis but
+            # before legacy inspection. The old decoded text and old binding
+            # rows must not be paired with the new file's stat generation.
+            write_spm(
+                spm,
+                extra_generators=generator(
+                    "replacement-generation-guid", "1", marked=True),
+            )
+
+            state = contract.inspect_legacy_cluster_state(
+                spm, decoded_handoff=handoff)
+            self.assertEqual(
+                state["reason_tokens"],
+                [contract.HANDOFF_STAT_MISMATCH_REASON],
+            )
+            self.assertFalse(state["receipt_valid"])
+            self.assertEqual(state["classified_generator_guids"], [])
+            self.assertEqual(
+                state["handoff_evidence"]["expected_spm_key"],
+                list(handoff.spm_key),
+            )
+            self.assertNotEqual(
+                state["handoff_evidence"]["actual_spm_key"],
+                list(handoff.spm_key),
+            )
+
+            with mock.patch.object(
+                    audit, "_spm_analysis",
+                    return_value=(analysis, handoff)):
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        contract.HANDOFF_STAT_MISMATCH_REASON):
+                    audit.leaf_generator_bindings(spm)
+
+            self.assertIsNone(contract._ACTIVE_DECODED_HANDOFF.get())
+            self.assertIsNone(contract.peek_generator_foregrounds(spm))
+
+    def test_interrupted_scan_releases_text_and_restart_recovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spm = Path(temp) / "SK_tree_interrupted_handoff.spm"
+            write_spm(spm)
+            write_marker_receipt(spm, [LEGACY_GUID])
+            _, handoff = audit._spm_analysis(
+                spm, include_decoded_handoff=True)
+
+            with mock.patch.object(
+                    contract,
+                    "generator_foregrounds_from_decoded_text",
+                    side_effect=ValueError("forced interrupted snapshot scan")):
+                state = contract.inspect_legacy_cluster_state(
+                    spm, decoded_handoff=handoff)
+
+            self.assertEqual(
+                state["reason_tokens"],
+                [contract.SNAPSHOT_SCAN_FAILED_REASON],
+            )
+            self.assertFalse(state["receipt_valid"])
+            self.assertEqual(state["classified_generator_guids"], [])
+            self.assertEqual(
+                state["failure_evidence"]["exception_type"], "ValueError")
+            self.assertIsNone(contract._ACTIVE_DECODED_HANDOFF.get())
+            self.assertIsNone(contract.peek_generator_foregrounds(spm))
+
+            # A restarted process has no transient handoff. Clearing only the
+            # process caches must allow the authoritative file to be read and
+            # classified normally, without inheriting the interrupted result.
+            self.reset_in_process_caches()
+            recovered = contract.inspect_legacy_cluster_state(spm)
+            self.assertTrue(recovered["receipt_valid"])
+            self.assertEqual(
+                recovered["classified_generator_guids"], [LEGACY_GUID])
+            self.assertEqual(recovered["reason_tokens"], [])
+
+
+class WarmCachePerformanceTests(SharedSnapshotTestCase):
+    def test_schema_five_warm_cache_has_zero_reads_and_faster_mean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spm = Path(temp) / "SK_tree_warm_gate.spm"
+            write_spm(spm, padding_size=8 * 1024 * 1024)
+            write_marker_receipt(spm, [LEGACY_GUID])
+
+            cold_started = time.perf_counter()
+            cold_bindings = audit.leaf_generator_bindings(spm)
+            cold_elapsed = time.perf_counter() - cold_started
+
+            path_key, _, _ = audit._file_cache_key(spm)
+            entry = audit._PERSISTENT_SPM_ANALYSIS[path_key]
+            self.assertEqual(entry["leaf_binding_schema"], 5)
+            self.assertEqual(entry["legacy_marker_schema"], 1)
+
+            self.reset_in_process_caches()
+            with mock.patch.object(
+                    audit, "read_maybe_gzip_text",
+                    wraps=audit.read_maybe_gzip_text) as reader, \
+                mock.patch.object(
+                    contract, "_generator_section_bytes",
+                    wraps=contract._generator_section_bytes) as raw_narrow:
+                warm_started = time.perf_counter()
+                warm_results = [
+                    audit.leaf_generator_bindings(spm)
+                    for _ in range(20)
+                ]
+                warm_elapsed = time.perf_counter() - warm_started
+
+            self.assertEqual(reader.call_count, 0)
+            self.assertEqual(raw_narrow.call_count, 0)
+            self.assertTrue(all(result == cold_bindings
+                                for result in warm_results))
+            self.assertLess(
+                warm_elapsed / 20,
+                cold_elapsed,
+                f"warm_mean={warm_elapsed / 20:.6f}s "
+                f"cold={cold_elapsed:.6f}s",
+            )
+
+
+class PersistentCacheExitRaceTests(SharedSnapshotTestCase):
+    def test_interrupted_atomic_replace_preserves_last_restart_authority(self):
+        """Model process exit at the temp-file/replace boundary."""
+        with tempfile.TemporaryDirectory() as temp:
+            cache_path = Path(temp) / "spm_analysis_v5.json"
+            previous_payload = {
+                "version": 1,
+                "entries": {"last-good": {"leaf_binding_schema": 5}},
+            }
+            cache_path.write_text(
+                json.dumps(previous_payload), encoding="utf-8")
+
+            old_path = audit.SPM_ANALYSIS_CACHE_PATH
+            old_sbs = audit._PERSISTENT_SBS_GRAPHS
+            old_sbs_dirty = audit._PERSISTENT_SBS_GRAPHS_DIRTY
+            old_blend = audit._PERSISTENT_BLEND_IMAGES
+            old_blend_dirty = audit._PERSISTENT_BLEND_IMAGES_DIRTY
+            try:
+                audit.SPM_ANALYSIS_CACHE_PATH = cache_path
+                audit._PERSISTENT_SPM_ANALYSIS = {
+                    "new-uncommitted": {"leaf_binding_schema": 5}
+                }
+                audit._PERSISTENT_SPM_ANALYSIS_DIRTY = True
+                audit._PERSISTENT_SBS_GRAPHS = {}
+                audit._PERSISTENT_SBS_GRAPHS_DIRTY = False
+                audit._PERSISTENT_BLEND_IMAGES = {}
+                audit._PERSISTENT_BLEND_IMAGES_DIRTY = False
+
+                with mock.patch.object(
+                        Path, "replace",
+                        side_effect=OSError("forced process-exit boundary")):
+                    with self.assertRaisesRegex(
+                            OSError, "forced process-exit boundary"):
+                        audit.save_spm_analysis_cache()
+
+                self.assertTrue(audit._PERSISTENT_SPM_ANALYSIS_DIRTY)
+                self.assertEqual(
+                    json.loads(cache_path.read_text(encoding="utf-8")),
+                    previous_payload,
+                )
+
+                # A restart ignores the abandoned temp file and reloads the
+                # last atomically committed cache rather than partial data.
+                audit._PERSISTENT_SPM_ANALYSIS = None
+                self.assertEqual(
+                    audit._persistent_spm_analysis(),
+                    previous_payload["entries"],
+                )
+            finally:
+                audit.SPM_ANALYSIS_CACHE_PATH = old_path
+                audit._PERSISTENT_SBS_GRAPHS = old_sbs
+                audit._PERSISTENT_SBS_GRAPHS_DIRTY = old_sbs_dirty
+                audit._PERSISTENT_BLEND_IMAGES = old_blend
+                audit._PERSISTENT_BLEND_IMAGES_DIRTY = old_blend_dirty
 
 
 class InvalidationTests(SharedSnapshotTestCase):

@@ -42,7 +42,10 @@ from speedtree_pipeline_contract import (
     shared_contract_api,
 )
 from speedtree_legacy_cluster_contract import (
+    HANDOFF_STAT_MISMATCH_REASON,
+    SNAPSHOT_SCAN_FAILED_REASON,
     inspect_legacy_cluster_state,
+    make_decoded_spm_handoff,
     peek_generator_foregrounds,
 )
 from sk_batch.sk_common import scan_cluster_spm_sources
@@ -185,9 +188,13 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
-# See _take_pending_decoded_text(): (cache_key, text) for the most recent
-# cold SPM parse, or None. Single slot on purpose -- see _spm_analysis().
-_PENDING_DECODED_TEXT = None
+# One unconsumed cold decode per worker/task context. This preserves the real
+# material-first call order without a process-global cross-worker overwrite.
+# The folder-audit wrapper resets it in ``finally``; a later cold parse in the
+# same context replaces it, so retention is bounded to max_workers documents.
+_PENDING_DECODED_HANDOFF = contextvars.ContextVar(
+    "pcg_pending_decoded_spm_handoff", default=None
+)
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
@@ -289,6 +296,20 @@ def _file_cache_key(path):
     if report_cache is not None:
         report_cache["file_cache_keys"][path_key] = result
     return result
+
+
+def _take_pending_decoded_handoff(path, cache_key):
+    handoff = _PENDING_DECODED_HANDOFF.get()
+    if handoff is None:
+        return None
+    _, size, mtime_ns = cache_key
+    expected_path = str(Path(path).resolve()).casefold()
+    handoff_path, handoff_size, handoff_mtime_ns = handoff.spm_key
+    if (str(handoff_path).casefold(), handoff_size, handoff_mtime_ns) != (
+            expected_path, size, mtime_ns):
+        return None
+    _PENDING_DECODED_HANDOFF.set(None)
+    return handoff
 
 
 def _persistent_spm_analysis():
@@ -781,12 +802,22 @@ def _material_is_managed_leaf_output(block):
             or ("atlas leaf mesh builder" in low and '"generator"' in low))
 
 
-def _spm_analysis(path):
-    """Decompress and parse one SPM once for all read-only audit queries."""
+def _spm_analysis(path, *, include_decoded_handoff=False):
+    """Decompress and parse one SPM once for all read-only audit queries.
+
+    ``include_decoded_handoff`` is reserved for the immediate
+    ``leaf_generator_bindings`` caller. A cold parse then returns an owned,
+    path/stat/generation-bound handoff beside the compact analysis. A
+    material-first caller leaves that handoff only in its worker context until
+    bindings consume it or the folder-task ``finally`` releases it; the
+    long-lived analysis cache never owns the decoded document.
+    """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
     cache_key = _file_cache_key(path)
     cached = _SPM_ANALYSIS_CACHE.get(cache_key)
     if cached is not None:
+        if include_decoded_handoff:
+            return cached, _take_pending_decoded_handoff(path, cache_key)
         return cached
 
     path_key, size, mtime_ns = cache_key
@@ -813,6 +844,8 @@ def _spm_analysis(path):
                 disk_entry),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
+        if include_decoded_handoff:
+            return analysis, _take_pending_decoded_handoff(path, cache_key)
         return analysis
 
     text = read_maybe_gzip_text(path)
@@ -890,24 +923,12 @@ def _spm_analysis(path):
             "leaf_binding_schema": 5,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
-    # Single-slot, single-use hand-off: leaf_generator_bindings(), called
-    # immediately after for every SPM a scan touches, consumes this to share
-    # the decode with the legacy-marker audit. A single slot (rather than a
-    # dict keyed by every SPM ever parsed) bounds the extra memory to at most
-    # one decoded document -- which can be hundreds of MB -- regardless of
-    # whether some other, rarer caller of _spm_analysis never consumes it.
-    global _PENDING_DECODED_TEXT
-    _PENDING_DECODED_TEXT = (cache_key, text)
+    handoff = make_decoded_spm_handoff(
+        path, text, size=size, mtime_ns=mtime_ns)
+    _PENDING_DECODED_HANDOFF.set(handoff)
+    if include_decoded_handoff:
+        return analysis, _take_pending_decoded_handoff(path, cache_key)
     return analysis
-
-
-def _take_pending_decoded_text(cache_key):
-    global _PENDING_DECODED_TEXT
-    pending = _PENDING_DECODED_TEXT
-    if pending is not None and pending[0] == cache_key:
-        _PENDING_DECODED_TEXT = None
-        return pending[1]
-    return None
 
 
 def _disk_generator_foregrounds(disk_entry):
@@ -1167,19 +1188,32 @@ def visible_material_names(path):
 def leaf_generator_bindings(path, visible_only=False):
     """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
     cache_key = _file_cache_key(path)
-    analysis = _spm_analysis(path)
+    analysis, decoded_handoff = _spm_analysis(
+        path, include_decoded_handoff=True)
     bindings = analysis["leaf_generator_bindings"]
     snapshot = analysis.get("generator_foregrounds_snapshot")
-    pending_text = None
-    if snapshot is None:
-        # Either a fresh cold parse just above (the common case -- take the
-        # decoded text so a valid receipt costs one scan, not one read plus
-        # one scan) or a pre-existing schema-4/5 disk cache entry with no
-        # persisted legacy-marker snapshot yet (nothing to hand off; a valid
-        # receipt then costs its own single, narrowed read below).
-        pending_text = _take_pending_decoded_text(cache_key)
     legacy_state = inspect_legacy_cluster_state(
-        path, foregrounds_snapshot=snapshot, decoded_text=pending_text)
+        path,
+        foregrounds_snapshot=snapshot,
+        decoded_handoff=decoded_handoff,
+    )
+    fatal_reasons = [
+        reason for reason in legacy_state.get("reason_tokens", [])
+        if reason in {
+            HANDOFF_STAT_MISMATCH_REASON,
+            SNAPSHOT_SCAN_FAILED_REASON,
+        }
+    ]
+    if fatal_reasons:
+        reason = fatal_reasons[0]
+        evidence = (
+            legacy_state.get("handoff_evidence")
+            if reason == HANDOFF_STAT_MISMATCH_REASON
+            else legacy_state.get("failure_evidence")
+        ) or {}
+        raise RuntimeError(
+            f"{reason}: {json.dumps(evidence, sort_keys=True)}"
+        )
     if snapshot is None:
         # If the legacy audit above actually scanned (only happens when the
         # SPM holds a valid receipt), backfill so it is never read again.
@@ -6252,12 +6286,21 @@ def canonical_cluster_provider_map(root):
 
 
 
+def _audit_one_with_handoff_scope(audit_one, folder):
+    """Bound an unconsumed decoded handoff to one folder task."""
+    _PENDING_DECODED_HANDOFF.set(None)
+    try:
+        return audit_one(folder)
+    finally:
+        _PENDING_DECODED_HANDOFF.set(None)
+
+
 def _audit_report_folders(folders, audit_one, progress_callback=None):
     items = []
     total_folders = len(folders)
     if total_folders <= 1:
         for folder in folders:
-            items.append(audit_one(folder))
+            items.append(_audit_one_with_handoff_scope(audit_one, folder))
             if progress_callback is not None:
                 progress_callback(1, total_folders, folder)
         return items
@@ -6271,7 +6314,9 @@ def _audit_report_folders(folders, audit_one, progress_callback=None):
         thread_name_prefix="pcg-audit",
     ) as executor:
         futures = {
-            executor.submit(audit_one, folder): (index, folder)
+            executor.submit(
+                _audit_one_with_handoff_scope, audit_one, folder
+            ): (index, folder)
             for index, folder in enumerate(folders)
         }
         completed = 0
