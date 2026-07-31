@@ -235,6 +235,65 @@ class LaunchGuardTests(unittest.TestCase):
             self.assertIn("ok_gui.pyw", result.stdout)
             self.assertIn("['--flag', 'value']", result.stdout)
 
+    def test_system_exit_integer_codes_follow_cpython_semantics(self):
+        cases = (
+            ("empty", "sys.exit()\n", 0),
+            ("zero", "sys.exit(0)\n", 0),
+            ("three", "sys.exit(3)\n", 3),
+            ("true", "sys.exit(True)\n", 1),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for name, exit_statement, expected in cases:
+                with self.subTest(name=name):
+                    target = tmp_path / f"{name}_gui.pyw"
+                    target.write_text(
+                        "import sys\n" + exit_statement,
+                        encoding="utf-8",
+                    )
+                    log = tmp_path / f"{name}-launch-errors.log"
+
+                    result = run_guard(target, error_log=log)
+
+                    self.assertEqual(result.returncode, expected)
+                    self.assertEqual(result.stderr, "")
+                    self.assertFalse(log.exists())
+
+    def test_system_exit_messages_are_logged_reported_and_return_one(self):
+        cases = (
+            (
+                "string",
+                "import sys\nsys.exit('requested launch stop')\n",
+                "requested launch stop",
+            ),
+            (
+                "object",
+                "import sys\n"
+                "class ExitReason:\n"
+                "    def __str__(self):\n"
+                "        return 'structured launch stop'\n"
+                "sys.exit(ExitReason())\n",
+                "structured launch stop",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for name, source, diagnostic in cases:
+                with self.subTest(name=name):
+                    target = tmp_path / f"{name}_gui.pyw"
+                    target.write_text(source, encoding="utf-8")
+                    log = tmp_path / f"{name}-launch-errors.log"
+
+                    result = run_guard(target, error_log=log)
+
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertNotIn("ValueError", result.stderr)
+                    appended = log.read_text(encoding="utf-8", errors="replace")
+                    self.assertIn(target.name, appended)
+                    self.assertIn(diagnostic, appended)
+                    self.assertNotIn("ValueError", appended)
+
     def test_guard_runs_the_target_as_main(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "main_gui.pyw"
