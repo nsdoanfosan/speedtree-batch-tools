@@ -36,6 +36,29 @@ GENERATOR_BLOCK_RE = re.compile(
     r"<Generator\b[^>]*>.*?</Generator>", re.IGNORECASE | re.DOTALL
 )
 GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>", re.IGNORECASE)
+# Block boundaries only.  ``GENERATOR_BLOCK_RE`` has to walk ``.*?`` one
+# character at a time, which dominated the cost of a full-folder scan; matching
+# just the open/close tags and then searching inside the recorded offsets is the
+# same walk without materializing a substring per Generator.
+GENERATOR_BOUNDARY_RE = re.compile(r"<(/?)Generator\b[^>]*>", re.IGNORECASE)
+# A Generator block never carries a foreground tag unless one of these names
+# appears in it, so one scan replaces five misses on the common path.
+FOREGROUND_ANY_RE = re.compile(
+    "|".join(re.escape(tag) for tag in FOREGROUND_TAGS), re.IGNORECASE
+)
+FOREGROUND_TAG_RE = {
+    tag: re.compile(
+        rf"<{re.escape(tag)}>([^<]*)</{re.escape(tag)}>", re.IGNORECASE
+    )
+    for tag in FOREGROUND_TAGS
+}
+# ``<Nodes>`` is roughly 90% of a large SPM (248 MB of 280 MB on
+# SK_tree_scotspine_02), and it can hold no Generator block.  Narrowing the
+# document to ``<Generators>`` before any regex work or UTF-8 decode is what
+# keeps a cold GUI launch from spending seconds here.
+GENERATORS_OPEN_BYTES_RE = re.compile(rb"<Generators\b[^>]*>", re.IGNORECASE)
+GENERATORS_CLOSE_BYTES_RE = re.compile(rb"</Generators\s*>", re.IGNORECASE)
+GENERATOR_CLOSE_BYTES = b"</Generator>"
 
 
 def marker_receipt_path(spm_path):
@@ -74,26 +97,74 @@ def _tag_value(block, tag):
     return match.group(1) if match else None
 
 
+def _record_generator_block(text, start, end, rows, duplicate_guids):
+    """Record one ``<Generator>`` body, given its half-open text offsets."""
+
+    guid_match = GUID_RE.search(text, start, end)
+    guid = guid_match.group(1).strip() if guid_match else ""
+    if not guid:
+        return
+    if guid in rows:
+        duplicate_guids.add(guid)
+        return
+    if FOREGROUND_ANY_RE.search(text, start, end) is None:
+        rows[guid] = {tag: None for tag in FOREGROUND_TAGS}
+        return
+    values = {}
+    for tag in FOREGROUND_TAGS:
+        match = FOREGROUND_TAG_RE[tag].search(text, start, end)
+        values[tag] = match.group(1) if match else None
+    rows[guid] = values
+
+
+def _generator_foregrounds_from_text(text):
+    """Return ``{guid: {foreground tag: value}}`` plus duplicate GUIDs."""
+
+    rows = {}
+    duplicate_guids = set()
+    body_start = None
+    for match in GENERATOR_BOUNDARY_RE.finditer(text):
+        if match.group(1):  # </Generator> closes the open block, if any.
+            if body_start is not None:
+                _record_generator_block(
+                    text, body_start, match.start(), rows, duplicate_guids
+                )
+                body_start = None
+        elif body_start is None:
+            # A nested <Generator ...> stays part of the enclosing block, which
+            # is what the former non-greedy block match also did.
+            body_start = match.end()
+    return rows, duplicate_guids
+
+
+def _generator_section_bytes(raw):
+    """Narrow a decompressed SPM to the region that can hold Generator blocks.
+
+    Falls back to the whole document whenever the narrowed region would not
+    contain every ``</Generator>``, so an unexpected layout can only cost time,
+    never a missed Generator.  That fallback is not theoretical: production
+    ``tree_Weeping_Willow_01_back.spm`` keeps 258 of its 259 Generators outside
+    the first ``<Generators>`` container.
+    """
+    open_match = GENERATORS_OPEN_BYTES_RE.search(raw)
+    if open_match is None:
+        return raw
+    close_match = GENERATORS_CLOSE_BYTES_RE.search(raw, open_match.end())
+    section = raw[
+        open_match.end(): close_match.start() if close_match else len(raw)
+    ]
+    if section.count(GENERATOR_CLOSE_BYTES) != raw.count(GENERATOR_CLOSE_BYTES):
+        return raw
+    return section
+
+
 def _generator_foregrounds(spm):
     raw = Path(spm).read_bytes()
     if raw.startswith(b"\x1f\x8b"):
         raw = gzip.decompress(raw)
-    text = raw.decode("utf-8")
-    rows = {}
-    duplicate_guids = set()
-    for match in GENERATOR_BLOCK_RE.finditer(text):
-        block = match.group(0)
-        guid_match = GUID_RE.search(block)
-        guid = guid_match.group(1).strip() if guid_match else ""
-        if not guid:
-            continue
-        if guid in rows:
-            duplicate_guids.add(guid)
-            continue
-        rows[guid] = {
-            tag: _tag_value(block, tag) for tag in FOREGROUND_TAGS
-        }
-    return rows, duplicate_guids
+    return _generator_foregrounds_from_text(
+        _generator_section_bytes(raw).decode("utf-8")
+    )
 
 
 def _problem_marker_guids(spm):
