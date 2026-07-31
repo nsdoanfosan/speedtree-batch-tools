@@ -169,6 +169,12 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             "<Lod_1><Filename>authored.lod</Filename></Lod_1>",
             1,
         )
+        namespaced_atlas = self.after.replace(
+            'Rotation="0"/>',
+            'Rotation="0" xmlns:future="urn:future" '
+            'future:Weight="0.5"/>',
+            1,
+        )
         arbitrary_user_data = self.before.replace(
             '{"generator":"Atlas Leaf Mesh Builder","group":"leaf","kind":"mesh","scope":"0123456789abcdef0123456789abcdef"}',
             '{"owner":"artist"}',
@@ -177,6 +183,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
         for name, changed, baseline in (
             ("nondefault AtlasMaker", nondefault_atlas, self.after_fingerprint),
             ("nonempty LOD", nonempty_lod, self.after_fingerprint),
+            ("namespaced AtlasMaker", namespaced_atlas, self.after_fingerprint),
             ("arbitrary UserData", arbitrary_user_data, self.before_fingerprint),
         ):
             with self.subTest(name=name):
@@ -234,10 +241,53 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             ">two</future:Authored>",
             1,
         )
+        spline_attribute_a = self.before.replace(
+            '<ProfileSpline DrawMode="false">',
+            '<ProfileSpline DrawMode="false" Authored="0.1">',
+            1,
+        )
+        spline_attribute_b = spline_attribute_a.replace(
+            'Authored="0.1"',
+            'Authored="0.10000000149011612"',
+            1,
+        )
+        nested_spline_value_a = self.before.replace(
+            "</SplineProperty>",
+            "<AuthoredNested><Value>0.1</Value></AuthoredNested>"
+            "</SplineProperty>",
+            1,
+        )
+        nested_spline_value_b = nested_spline_value_a.replace(
+            "<AuthoredNested><Value>0.1</Value>",
+            "<AuthoredNested><Value>0.10000000149011612</Value>",
+            1,
+        )
+        nested_texture_size_a = self.before.replace(
+            "<CutoutMeshID>130</CutoutMeshID>",
+            "<Unknown><Map><TexSizeX>0.1</TexSizeX></Map></Unknown>"
+            "<CutoutMeshID>130</CutoutMeshID>",
+            1,
+        )
+        nested_texture_size_b = nested_texture_size_a.replace(
+            "<TexSizeX>0.1</TexSizeX>",
+            "<TexSizeX>0.10000000149011612</TexSizeX>",
+            1,
+        )
         for name, left, right in (
             ("GUID-like authored tag", authored_guid_a, authored_guid_b),
             ("authored float", authored_float_a, authored_float_b),
             ("future namespace", namespaced_a, namespaced_b),
+            ("spline attribute", spline_attribute_a, spline_attribute_b),
+            (
+                "nested spline Value",
+                nested_spline_value_a,
+                nested_spline_value_b,
+            ),
+            (
+                "nested material texture size",
+                nested_texture_size_a,
+                nested_texture_size_b,
+            ),
         ):
             with self.subTest(name=name):
                 self.assertNotEqual(project(left), project(right))

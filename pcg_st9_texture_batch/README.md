@@ -353,6 +353,18 @@ current projection constants:
 | 5 | 1 | 3 | 1 | 2 | 1 | supported |
 | 6 | 1 | 4 | 1 | 2 | 1 | supported (current) |
 
+Each supported tuple resolves through an immutable semantic registry entry
+that owns its frozen graph/core/membership/target projector callables and the
+authoritative fields that must match as one candidate. In particular, a
+target-v1 fingerprint cannot borrow a binding count or Mesh-ID list from a
+different historical candidate. The current writer also selects the explicit
+current dialect tuple (schema 6 here) instead of assembling versions from
+mutable current constants.
+Independent literal `backup.spm`, `receipt.json`, `after.spm`, and
+`expected.json` fixtures under `tests/fixtures/issue_41/` exercise both
+read-only `verify_sealed_resave()` and interrupted pre-save restart paths;
+their receipt bytes are not produced by the production helpers.
+
 Every supported historical fingerprint and its authoritative counts/Mesh-ID
 lists are recomputed from the exact backup before the current projection is
 derived. A valid sealed receipt is reused byte-for-byte; it is never upgraded
@@ -362,6 +374,12 @@ projection tuples fail with `preimage_receipt_projection_version_unsupported`;
 malformed content, fake fingerprints, and source/scope mismatches fail with
 `preimage_receipt_verification_failed`. Backup-byte mismatch remains
 `preimage_backup_verification_failed`.
+
+Backup authority always comes from a fresh immutable capture of the backup
+path itself. Operating-source snapshot bytes are never substituted for backup
+bytes, and the backup is recaptured immediately before Modeler launch and
+again immediately before any continuation claim. A backup race at either
+boundary fails closed without launch, callback, or claim creation.
 
 Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable

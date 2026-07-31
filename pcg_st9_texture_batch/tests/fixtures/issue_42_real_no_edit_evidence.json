@@ -9,21 +9,21 @@
       "source_alias": "Lauraceae_11",
       "before_raw_sha256": "2f996ddb1b180247dd002c942a309bb62a5352712dc5eb3816a1fc5f6c40b3cc",
       "after_raw_sha256": "9489f6e02f3de7dc9bf5f860a7de71484026347c1c66f66f53ce9993b1dac47e",
-      "core_v4_fingerprint": "c3c364feb6c6b19d884ab14265be2e3693037be9e3badb0fb90c2b2aa68d9bed",
+      "core_v4_fingerprint": "5b0966ae8cf48d819d05d9b6de762fe864a2d94280766a6966849023e63c773e",
       "equal": true
     },
     {
       "source_alias": "Lauraceae_12",
       "before_raw_sha256": "141d375f74e3be6289ab28b81b1e40897e58d520e565e7daf53b4cd195f4ae7b",
       "after_raw_sha256": "1872f0abebb076e2be2b7b7f418979625177a25c7cc4100f16e5a910dd0c6ce6",
-      "core_v4_fingerprint": "875ee6ed440f94d88eea014d3021b253a780d10116b8567482f1a192c604efbf",
+      "core_v4_fingerprint": "1e3967401cb3cb9692a86a38a6164e01b688c197d38cb74ce15d55e7231a23f1",
       "equal": true
     },
     {
       "source_alias": "Densiflora_02",
       "before_raw_sha256": "2c94fd6de85749980af51ba89868996253897f9c7eeb555f64dead0030660c72",
       "after_raw_sha256": "38f32e399a1aefdb85aaf23f282b13e49291d832b2c598345db46b79d6bbd387",
-      "core_v4_fingerprint": "eb611113178d9310afd7d69bb0973c7f1ab51fb55ddaaad0dedd31ee47c9fe59",
+      "core_v4_fingerprint": "5b1f17c88b7001d67ed7e236581181e1ef345b208f1fd8d39a082d9b07d95e5e",
       "equal": true
     }
   ]
