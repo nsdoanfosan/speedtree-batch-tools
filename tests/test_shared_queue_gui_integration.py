@@ -74,7 +74,7 @@ class WaitingRuntime(FakeRuntime):
 
 
 class SharedQueueGuiIntegrationTests(unittest.TestCase):
-    def test_spm_click_registers_global_ticket_before_local_start(self):
+    def test_spm_click_defers_global_ticket_until_worker_start(self):
         events = []
         app = SPM_GUI.App.__new__(SPM_GUI.App)
         app.shared_queue_runtime = FakeRuntime(events)
@@ -97,10 +97,9 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(job_id, 1)
-        self.assertEqual(events[0][0], "enqueue")
-        self.assertEqual(events[1], ("local_start",))
+        self.assertEqual(events, [("local_start",)])
         queued = app.pending_jobs[0]
-        self.assertEqual(queued["shared_queue_job_id"], "shared-1")
+        self.assertNotIn("shared_queue_job_id", queued)
 
     def test_sk_click_registers_global_ticket_before_local_start(self):
         events = []
@@ -129,7 +128,7 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
         queued = app.pending_batch_jobs[0]
         self.assertEqual(queued["shared_queue_job_id"], "shared-1")
 
-    def test_spm_worker_waits_for_global_turn_before_callback(self):
+    def test_spm_worker_enqueues_then_waits_before_callback(self):
         events = []
 
         class Root:
@@ -146,7 +145,7 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
             "queue_label": "SPM apply",
             "func": lambda _report: events.append(("callback",)) or "ok",
             "on_success": mock.Mock(),
-            "shared_queue_job_id": "shared-1",
+            "shared_queue": True,
         }])
         app.active_job = None
         app.job_queue = queue.Queue()
@@ -162,7 +161,7 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             [event[0] for event in events],
-            ["wait", "callback", "finish"],
+            ["enqueue", "wait", "callback", "finish"],
         )
         done = next(
             event

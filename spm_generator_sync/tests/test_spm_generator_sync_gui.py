@@ -7,7 +7,7 @@ import time
 import unittest
 import tkinter as tk
 from tkinter import ttk
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from unittest import mock
 
@@ -72,15 +72,20 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             scan.assert_not_called()
             _label, work, done = app._start_job.call_args.args
             report = mock.Mock()
-            board = work(report)
+            result = work(report)
             scan.assert_called_once_with(
                 Path(r"D:\Trees"),
                 sk_only=True,
                 verify_physical=False,
                 progress_callback=report,
             )
-        done(board)
-        app.render_board.assert_called_once_with(fast=True)
+        self.assertEqual(result["board"], [])
+        self.assertIsNone(result["render_analysis"])
+        done(result)
+        app.render_board.assert_called_once_with(
+            fast=True,
+            prepared_analysis=None,
+        )
         self.assertFalse(app._start_job.call_args.kwargs["shared_queue"])
 
     def test_gui_uses_full_sibling_engine_module(self):
@@ -1014,8 +1019,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             app.root_var = tk.StringVar(root, value=r"D:\Trees")
             app.sk_only_var = tk.BooleanVar(root, value=True)
             app.persist_config = mock.Mock()
-            app.render_board = mock.Mock()
+            app.tree = ttk.Treeview(
+                root,
+                columns=("role", "bases", "structure", "status", "last"),
+            )
             app.item_meta = {}
+            app.document_cache = OrderedDict()
+            app.signature_cache = OrderedDict()
+            app.analysis_cache = OrderedDict()
             entered = threading.Event()
             release = threading.Event()
             tk_event = threading.Event()
@@ -1040,7 +1051,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 GUI.engine,
                 "scan_tree_folders",
                 side_effect=slow_scan,
-            ):
+            ), mock.patch.object(GUI, "save_analysis_cache"):
                 app.refresh()
                 root.after(0, tk_event.set)
                 deadline = time.monotonic() + 2
@@ -1075,20 +1086,170 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     time.sleep(0.01)
 
             self.assertIsNone(app.active_job)
-            app.render_board.assert_called_once_with(fast=False)
+            self.assertEqual(app.board, [])
+            self.assertEqual(app.tree.get_children(), ())
         finally:
             release.set()
             root.destroy()
 
-    def test_completion_popup_is_not_suppressed_by_its_own_refresh_job(self):
-        """A done() callback that calls self.refresh() before showing its
-        completion popup must not have that popup silently swallowed.
+    def test_full_refresh_prepares_spm_analysis_before_real_tk_render(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "SK_tree_01.spm"
+            follower = folder / "SK_tree_02.spm"
+            master.write_bytes(b"master")
+            follower.write_bytes(b"follower")
+            board = [{
+                "folder": str(folder),
+                "spms": [master.name, follower.name],
+                "manifest": {
+                    "version": 1,
+                    "independent": [],
+                    "groups": [{
+                        "master": master.name,
+                        "base_categories": {},
+                        "followers": [{
+                            "file": follower.name,
+                            "base_map": {},
+                            "base_map_confirmed": True,
+                            "last_sync": None,
+                            "last_master_hash": None,
+                            "last_target_hash": None,
+                        }],
+                    }],
+                },
+                "master_candidates": [],
+                "cluster_blends": [],
+            }]
+            root = tk.Tk()
+            root.withdraw()
+            analysis_entered = threading.Event()
+            analysis_release = threading.Event()
+            tk_event = threading.Event()
+            analysis_threads = []
+            try:
+                app = GUI.App.__new__(GUI.App)
+                app.root = root
+                app.job_queue = queue.Queue()
+                app.worker = None
+                app.job_started_at = None
+                app.job_stage = "대기"
+                app.status_var = tk.StringVar(root, value="대기")
+                app.progress_text_var = tk.StringVar(
+                    root, value="작업 대기"
+                )
+                app.progress_bar = ttk.Progressbar(root, maximum=100)
+                app.root_var = tk.StringVar(root, value=str(folder))
+                app.sk_only_var = tk.BooleanVar(root, value=True)
+                app.persist_config = mock.Mock()
+                app.tree = ttk.Treeview(
+                    root,
+                    columns=(
+                        "role", "bases", "structure", "status", "last",
+                    ),
+                )
+                app.item_meta = {}
+                app.board = []
+                app.document_cache = OrderedDict()
+                app.signature_cache = OrderedDict()
+                app.analysis_cache = OrderedDict()
+                app.master_status = mock.Mock(
+                    side_effect=AssertionError(
+                        "full master analysis returned to Tk"
+                    )
+                )
+                app.cached_follower_analysis = mock.Mock(
+                    side_effect=AssertionError(
+                        "full follower analysis returned to Tk"
+                    )
+                )
 
-        self.refresh() enqueues its own background job (shared_queue=False)
-        while the just-finished job is still self.active_job, so a naive
-        "any pending job -> suppress popup" check would misfire here even
-        though nothing else is genuinely queued.
-        """
+                def from_path(_path, *, full):
+                    self.assertFalse(full)
+                    analysis_threads.append(threading.get_ident())
+                    if not analysis_entered.is_set():
+                        analysis_entered.set()
+                        analysis_release.wait(2)
+                    return object()
+
+                delta = {
+                    "missing": 0,
+                    "master_sync": 0,
+                    "missing_bases": 0,
+                    "target_local": 0,
+                    "remove": 0,
+                    "missing_details": [],
+                    "master_sync_details": [],
+                    "target_local_details": [],
+                    "remove_details": [],
+                }
+                with mock.patch.object(
+                    GUI.engine, "scan_tree_folders", return_value=board
+                ), mock.patch.object(
+                    GUI.engine.SPMDocument,
+                    "from_path",
+                    side_effect=from_path,
+                ), mock.patch.object(
+                    GUI.engine,
+                    "base_sync_signature",
+                    return_value="master-hash",
+                ), mock.patch.object(
+                    GUI.engine,
+                    "compare_base_structure",
+                    return_value=delta,
+                ), mock.patch.object(
+                    GUI.engine, "assess_scale_risk", return_value={}
+                ), mock.patch.object(
+                    GUI.engine,
+                    "target_sync_signature",
+                    return_value="target-hash",
+                ), mock.patch.object(GUI, "save_analysis_cache"):
+                    app.refresh()
+                    root.after(0, tk_event.set)
+                    deadline = time.monotonic() + 2
+                    while (
+                        (
+                            not analysis_entered.is_set()
+                            or not tk_event.is_set()
+                            or not app.job_stage.startswith("보드 분석")
+                        )
+                        and time.monotonic() < deadline
+                    ):
+                        root.update()
+                        time.sleep(0.01)
+
+                    self.assertTrue(analysis_entered.is_set())
+                    self.assertTrue(tk_event.is_set())
+                    self.assertEqual(
+                        app.job_stage.split(" · ", 1)[0],
+                        "보드 분석 1/2",
+                    )
+                    self.assertLess(
+                        float(app.progress_bar.cget("value")),
+                        100.0,
+                    )
+                    self.assertIsNotNone(app.job_last_progress_at)
+                    analysis_release.set()
+                    deadline = time.monotonic() + 3
+                    while (
+                        (app.active_job is not None or app.pending_jobs)
+                        and time.monotonic() < deadline
+                    ):
+                        root.update()
+                        time.sleep(0.01)
+
+                self.assertIsNone(app.active_job)
+                self.assertTrue(analysis_threads)
+                self.assertNotIn(threading.get_ident(), analysis_threads)
+                self.assertEqual(len(app.item_meta), 3)
+                app.master_status.assert_not_called()
+                app.cached_follower_analysis.assert_not_called()
+            finally:
+                analysis_release.set()
+                root.destroy()
+
+    def test_completion_popup_waits_for_its_own_refresh_job(self):
+        """Post-Sync refresh runs before its deferred completion modal."""
         root = tk.Tk()
         root.withdraw()
         try:
@@ -1107,12 +1268,18 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             app.render_board = mock.Mock()
             app.item_meta = {}
             app.board = []
+            popup_states = []
 
             with mock.patch.object(
                 GUI.engine, "scan_tree_folders", return_value=[]
             ), mock.patch.object(
                 GUI.messagebox, "showinfo"
             ) as showinfo:
+                showinfo.side_effect = lambda *_args, **_kwargs: (
+                    popup_states.append(
+                        (app.active_job, bool(app.pending_jobs))
+                    )
+                )
 
                 def done(_result):
                     app.refresh()
@@ -1134,10 +1301,40 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     time.sleep(0.01)
 
             showinfo.assert_called_once()
+            self.assertEqual(popup_states, [(None, False)])
         finally:
             root.destroy()
 
-    def test_completion_popup_still_suppressed_by_a_real_queued_job(self):
+    def test_deferred_info_flush_is_single_shot_and_rearmed_after_busy(self):
+        app = GUI.App.__new__(GUI.App)
+        app.root = mock.Mock()
+        app.active_job = {"id": 1}
+        app.pending_jobs = deque()
+        app.deferred_job_infos = deque([("완료", "상세")])
+        app._deferred_job_info_flush_scheduled = False
+
+        app._schedule_deferred_job_infos()
+        app._schedule_deferred_job_infos()
+
+        app.root.after_idle.assert_called_once()
+        first_flush = app.root.after_idle.call_args.args[0]
+        with mock.patch.object(GUI.messagebox, "showinfo") as showinfo:
+            first_flush()
+            showinfo.assert_not_called()
+            self.assertEqual(len(app.deferred_job_infos), 1)
+            self.assertFalse(app._deferred_job_info_flush_scheduled)
+
+            app.active_job = None
+            app._schedule_deferred_job_infos()
+            self.assertEqual(app.root.after_idle.call_count, 2)
+            app.root.after_idle.call_args.args[0]()
+
+            showinfo.assert_called_once_with(
+                "완료", "상세", parent=app.root
+            )
+            self.assertFalse(app.deferred_job_infos)
+
+    def test_completion_popup_waits_for_real_queued_job_and_refresh(self):
         root = tk.Tk()
         root.withdraw()
         try:
@@ -1180,6 +1377,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     lambda _result: None,
                     queue_label="테스트 작업 B",
                 )
+                showinfo.assert_not_called()
                 gate.set()
 
                 deadline = time.monotonic() + 3
@@ -1190,7 +1388,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     root.update()
                     time.sleep(0.01)
 
-            showinfo.assert_not_called()
+            showinfo.assert_called_once()
         finally:
             root.destroy()
 
@@ -1256,6 +1454,311 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
 
             self.assertEqual(app.board, fresh_board)
             self.assertEqual(app.render_board.call_count, 1)
+        finally:
+            root.destroy()
+
+    def test_callback_failure_rechecks_live_followup_before_error_modal(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            followup_completed = []
+
+            def callback(_payload):
+                app._start_job(
+                    "후속 refresh",
+                    lambda _report: "refreshed",
+                    followup_completed.append,
+                    shared_queue=False,
+                )
+                raise RuntimeError("callback failed after queueing refresh")
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                app._start_job(
+                    "mutation",
+                    lambda _report: "mutated",
+                    callback,
+                    shared_queue=False,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(followup_completed, ["refreshed"])
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_shared_ticket_is_deferred_until_local_refresh_finishes(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        entered = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            lease = mock.Mock()
+            lease.finished = False
+            runtime = mock.Mock()
+            enqueue_threads = []
+
+            def enqueue(_label, _payload):
+                enqueue_threads.append(threading.get_ident())
+                return {"id": "shared-1", "sequence": 17}
+
+            runtime.enqueue.side_effect = enqueue
+            runtime.wait_for_turn.return_value = lease
+            app.shared_queue_runtime = runtime
+            order = []
+
+            def local_refresh(_report):
+                order.append("refresh-start")
+                entered.set()
+                gate.wait(2)
+                order.append("refresh-end")
+                return "refresh"
+
+            app._start_job(
+                "local refresh",
+                local_refresh,
+                lambda _payload: None,
+                shared_queue=False,
+            )
+            deadline = time.monotonic() + 2
+            while not entered.is_set() and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+            self.assertTrue(entered.is_set())
+
+            app._start_job(
+                "mutation",
+                lambda _report: order.append("mutation") or "done",
+                lambda _payload: None,
+                queue_label="mutation",
+                shared_queue=True,
+            )
+            runtime.enqueue.assert_not_called()
+
+            gate.set()
+            deadline = time.monotonic() + 3
+            while (
+                (app.active_job is not None or app.pending_jobs)
+                and time.monotonic() < deadline
+            ):
+                root.update()
+                time.sleep(0.01)
+
+            runtime.enqueue.assert_called_once()
+            runtime.wait_for_turn.assert_called_once_with(
+                "shared-1",
+                on_wait=mock.ANY,
+            )
+            self.assertNotIn(threading.get_ident(), enqueue_threads)
+            self.assertEqual(
+                order,
+                ["refresh-start", "refresh-end", "mutation"],
+            )
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_deferred_enqueue_failure_counts_and_starts_next_local_job(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = RuntimeError("queue unavailable")
+            app.shared_queue_runtime = runtime
+            completed = []
+
+            app._start_job(
+                "local refresh",
+                lambda _report: gate.wait(2) and "refresh",
+                completed.append,
+                shared_queue=False,
+            )
+            app._start_job(
+                "blocked mutation",
+                lambda _report: "must not run",
+                completed.append,
+                shared_queue=True,
+            )
+            app._start_job(
+                "next local refresh",
+                lambda _report: "next-local",
+                completed.append,
+                shared_queue=False,
+            )
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                gate.set()
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(completed, ["refresh", "next-local"])
+            self.assertEqual(app.queue_run_total, 3)
+            self.assertEqual(app.queue_run_completed, 3)
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_not_called()
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_wait_failure_cancels_unclaimed_shared_ticket(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = [
+                {"id": "shared-wait-failure", "sequence": 18},
+                {"id": "shared-after-failure", "sequence": 19},
+            ]
+            lease = mock.Mock()
+            lease.finished = False
+            runtime.wait_for_turn.side_effect = [
+                RuntimeError("queue wait failed"),
+                lease,
+            ]
+            app.shared_queue_runtime = runtime
+            failed_func = mock.Mock(return_value="must not run")
+            next_completed = []
+
+            with mock.patch.object(GUI.messagebox, "showerror"):
+                app._start_job(
+                    "mutation",
+                    failed_func,
+                    lambda _payload: None,
+                    shared_queue=True,
+                )
+                app._start_job(
+                    "next mutation",
+                    lambda _report: "continued",
+                    next_completed.append,
+                    shared_queue=True,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            runtime.cancel.assert_called_once_with(
+                "shared-wait-failure",
+                reason="worker_wait_failed",
+            )
+            failed_func.assert_not_called()
+            runtime.wait_for_turn.assert_has_calls([
+                mock.call("shared-wait-failure", on_wait=mock.ANY),
+                mock.call("shared-after-failure", on_wait=mock.ANY),
+            ])
+            lease.finish.assert_called_once()
+            self.assertEqual(next_completed, ["continued"])
+            self.assertEqual(app.queue_run_completed, 2)
+            self.assertEqual(len(app.job_failures), 1)
+        finally:
+            root.destroy()
+
+    def test_lone_enqueue_failure_reports_once_and_balances_counters(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = RuntimeError("queue unavailable")
+            app.shared_queue_runtime = runtime
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                job_id = app._start_job(
+                    "mutation",
+                    lambda _report: "must not run",
+                    lambda _payload: None,
+                    shared_queue=True,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    app.active_job is not None
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(job_id, 1)
+            self.assertIsNone(app.active_job)
+            self.assertFalse(app.pending_jobs)
+            self.assertEqual(app.queue_run_total, 1)
+            self.assertEqual(app.queue_run_completed, 1)
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_called_once()
         finally:
             root.destroy()
 

@@ -73,6 +73,10 @@ DEFAULT_CLUSTER_UNIT_PROBE = Path(
 )
 
 
+class SharedQueueEnqueueError(RuntimeError):
+    """A runnable local mutation could not enter the global FIFO."""
+
+
 def find_default_xml_ini() -> str:
     sk_config = REPO_DIR / "sk_batch" / "sk_batch_config.json"
     if sk_config.is_file():
@@ -459,6 +463,8 @@ class App:
         self.job_sequence = 0
         self.job_failures = []
         self._job_has_followup = False
+        self.deferred_job_infos = deque()
+        self._deferred_job_info_flush_scheduled = False
         self.job_started_at = None
         self.job_last_progress_at = None
         self.job_stage = "대기"
@@ -736,6 +742,165 @@ class App:
             self.analysis_cache, key, (delta, target_hash), limit=64
         )
 
+    def _prepare_render_analysis(
+        self,
+        board,
+        *,
+        cache_snapshot,
+        progress_callback=None,
+    ):
+        """Resolve SPM comparisons in the refresh worker, never in Tk."""
+
+        document_cache = cache_snapshot["documents"]
+        signature_cache = cache_snapshot["signatures"]
+        analysis_cache = cache_snapshot["analyses"]
+        masters = {}
+        followers = {}
+
+        def cached_document(path):
+            key = self._path_cache_key(path)
+            if key in document_cache:
+                document_cache.move_to_end(key)
+                return document_cache[key]
+            document = engine.SPMDocument.from_path(path, full=False)
+            return self._cache_store(
+                document_cache, key, document, limit=24
+            )
+
+        def cached_master_signature(path, categories):
+            key = json.dumps(
+                [self._path_cache_key(path), categories],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if key in signature_cache:
+                signature_cache.move_to_end(key)
+                return signature_cache[key]
+            signature = engine.base_sync_signature(
+                cached_document(path), categories
+            )
+            return self._cache_store(
+                signature_cache, key, signature, limit=64
+            )
+
+        def cached_follower_analysis(source_path, target_path, mapping):
+            key = json.dumps(
+                [
+                    self._path_cache_key(source_path),
+                    self._path_cache_key(target_path),
+                    mapping,
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if key in analysis_cache:
+                analysis_cache.move_to_end(key)
+                return analysis_cache[key]
+            source_document = cached_document(source_path)
+            target_document = cached_document(target_path)
+            delta = engine.compare_base_structure(
+                source_document,
+                target_document,
+                mapping,
+                include_details=True,
+            )
+            delta["scale_risk"] = engine.assess_scale_risk(
+                source_document, target_document
+            )
+            target_hash = engine.target_sync_signature(
+                source_document, target_document, mapping
+            )
+            return self._cache_store(
+                analysis_cache,
+                key,
+                (delta, target_hash),
+                limit=64,
+            )
+
+        units = []
+        for folder_item in board:
+            folder = Path(folder_item["folder"])
+            for group in folder_item["manifest"].get("groups", []):
+                master = group.get("master")
+                if not master:
+                    continue
+                units.append(("master", folder, master, group))
+                for follower in group.get("followers", []):
+                    name = follower.get("file")
+                    if name and follower.get("base_map_confirmed"):
+                        units.append(
+                            ("follower", folder, master, follower)
+                        )
+
+        total = len(units)
+        for index, (kind, folder, master, row) in enumerate(
+            units, start=1
+        ):
+            name = master if kind == "master" else row["file"]
+            if progress_callback is not None:
+                progress_callback(
+                    f"보드 분석 {index}/{total} · {name}",
+                    70 + int(29 * (index - 1) / max(1, total)),
+                )
+            if kind == "master":
+                try:
+                    signature = cached_master_signature(
+                        folder / master,
+                        row.get("base_categories") or {},
+                    )
+                    followers_in_group = row.get("followers", [])
+                    if not followers_in_group:
+                        status = "자식 없음"
+                    elif any(
+                        not item.get("base_map_confirmed")
+                        for item in followers_in_group
+                    ):
+                        status = "매핑 필요"
+                    else:
+                        hashes = {
+                            item.get("last_master_hash")
+                            for item in followers_in_group
+                        }
+                        status = (
+                            "최신"
+                            if hashes == {signature}
+                            else "마스터 변경"
+                        )
+                except Exception as exc:
+                    status, signature = "검사 실패", str(exc)
+                masters[(str(folder), master)] = (status, signature)
+                continue
+
+            try:
+                delta, current_target_hash = cached_follower_analysis(
+                    folder / master,
+                    folder / row["file"],
+                    row.get("base_map") or {},
+                )
+                followers[(str(folder), master, row["file"])] = {
+                    "delta": delta,
+                    "current_target_hash": current_target_hash,
+                }
+            except Exception as exc:
+                followers[(str(folder), master, row["file"])] = {
+                    "error": str(exc),
+                }
+
+        if progress_callback is not None:
+            progress_callback(
+                f"보드 분석 완료 · {total}/{total}",
+                99,
+            )
+        return {
+            "masters": masters,
+            "followers": followers,
+            "documents": document_cache,
+            "signatures": signature_cache,
+            "analyses": analysis_cache,
+        }
+
     def pick_root(self):
         folder = filedialog.askdirectory(initialdir=self.root_var.get() or str(Path.home()))
         if folder:
@@ -748,24 +913,60 @@ class App:
         board_root = Path(self.root_var.get().strip())
         sk_only = bool(self.sk_only_var.get())
         verify_physical = not fast
+        cache_snapshot = {
+            "documents": OrderedDict(
+                getattr(self, "document_cache", OrderedDict())
+            ),
+            "signatures": OrderedDict(
+                getattr(self, "signature_cache", OrderedDict())
+            ),
+            "analyses": OrderedDict(
+                getattr(self, "analysis_cache", OrderedDict())
+            ),
+        }
         self.refresh_generation = getattr(
             self, "refresh_generation", 0
         ) + 1
         generation = self.refresh_generation
 
         def scan(report):
-            return engine.scan_tree_folders(
+            scan_report = report
+            if not fast:
+                scan_report = lambda stage, percent: report(
+                    stage, int(70 * percent / 100)
+                )
+            board = engine.scan_tree_folders(
                 board_root,
                 sk_only=sk_only,
                 verify_physical=verify_physical,
-                progress_callback=report,
+                progress_callback=scan_report,
             )
+            render_analysis = None
+            if not fast:
+                render_analysis = self._prepare_render_analysis(
+                    board,
+                    cache_snapshot=cache_snapshot,
+                    progress_callback=report,
+                )
+            return {
+                "board": board,
+                "render_analysis": render_analysis,
+            }
 
-        def done(board):
+        def done(result):
             if generation != self.refresh_generation:
                 return
+            board = result["board"]
+            render_analysis = result["render_analysis"]
             self.board = board
-            self.render_board(fast=fast)
+            if render_analysis is not None:
+                self.document_cache = render_analysis["documents"]
+                self.signature_cache = render_analysis["signatures"]
+                self.analysis_cache = render_analysis["analyses"]
+            self.render_board(
+                fast=fast,
+                prepared_analysis=render_analysis,
+            )
             folder_count = len(self.board)
             spm_count = sum(len(item["spms"]) for item in self.board)
             cluster_count = sum(
@@ -837,7 +1038,15 @@ class App:
             return "최신", signature
         return "마스터 변경", signature
 
-    def render_board(self, *, fast=False):
+    def render_board(self, *, fast=False, prepared_analysis=None):
+        prepared_masters = (
+            prepared_analysis.get("masters", {})
+            if prepared_analysis is not None else None
+        )
+        prepared_followers = (
+            prepared_analysis.get("followers", {})
+            if prepared_analysis is not None else None
+        )
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         for folder_item in self.board:
@@ -863,11 +1072,17 @@ class App:
                 category_text = ", ".join(
                     f"{name}:{category or '미분류'}" for name, category in categories.items()
                 ) or "자동 분류"
-                status, signature = self.master_status(
-                    folder,
-                    group,
-                    fast=fast,
-                )
+                if prepared_masters is not None:
+                    status, signature = prepared_masters.get(
+                        (str(folder), master),
+                        ("검사 실패", "준비된 분석 결과 없음"),
+                    )
+                else:
+                    status, signature = self.master_status(
+                        folder,
+                        group,
+                        fast=fast,
+                    )
                 master_iid = self.tree.insert(
                     folder_iid, "end", text=f"◆ {master}",
                     values=("MASTER", category_text, "기준 Base", status, ""),
@@ -902,6 +1117,33 @@ class App:
                     elif fast:
                         structure = "정밀 검사 대기"
                         current_target_hash = None
+                    elif prepared_followers is not None:
+                        prepared = prepared_followers.get(
+                            (str(folder), master, name),
+                            {"error": "준비된 분석 결과 없음"},
+                        )
+                        if prepared.get("error"):
+                            structure = "검사 실패"
+                            current_target_hash = None
+                        else:
+                            delta = prepared["delta"]
+                            current_target_hash = prepared[
+                                "current_target_hash"
+                            ]
+                            if delta.get("mapping_errors"):
+                                structure = "매핑 오류"
+                            elif delta["missing"] or delta.get("remove"):
+                                structure = (
+                                    "마스터→자식 반영 "
+                                    f"{delta['missing']} · 초과삭제 {delta.get('remove', 0)}"
+                                )
+                            else:
+                                structure = "동일"
+                            risk = delta.get("scale_risk") or {}
+                            if risk.get("level") == "blocked":
+                                structure = f"⚠ 크기 {risk['ratio']:.2f}배 · " + structure
+                            elif risk.get("level") == "warning":
+                                structure = f"△ 크기 {risk['ratio']:.2f}배 · " + structure
                     else:
                         try:
                             delta, current_target_hash = self.cached_follower_analysis(
@@ -2422,24 +2664,53 @@ class App:
             self.queue_run_completed = 0
         if not hasattr(self, "_job_has_followup"):
             self._job_has_followup = False
+        if not hasattr(self, "deferred_job_infos"):
+            self.deferred_job_infos = deque()
+        if not hasattr(self, "_deferred_job_info_flush_scheduled"):
+            self._deferred_job_info_flush_scheduled = False
         if not hasattr(self, "job_last_progress_at"):
             self.job_last_progress_at = None
 
     def _show_job_info(self, title, message):
-        """Do not let a completion popup hold the next queued job.
-
-        ``_job_has_followup`` is snapshotted from ``pending_jobs`` right
-        before ``on_success`` runs (see ``_poll_job``). Checking the live
-        ``pending_jobs`` here instead would misfire: ``on_success`` callbacks
-        commonly call ``self.refresh()`` first, which enqueues its own
-        (silent, ``shared_queue=False``) job while ``active_job`` is still
-        set, making ``pending_jobs`` non-empty even with no real queued work
-        and permanently suppressing the completion popup.
-        """
-        if getattr(self, "_job_has_followup", False):
-            self.status_var.set(f"{title} · 다음 대기 작업 시작")
+        """Defer modal completion detail until every follow-up has run."""
+        self._ensure_job_queue_state()
+        if self._job_has_followup or self.pending_jobs:
+            self.deferred_job_infos.append((str(title), str(message)))
+            self.status_var.set(
+                f"{title} · 상세는 대기열 완료 후 표시"
+            )
             return
         messagebox.showinfo(title, message, parent=self.root)
+
+    def _flush_deferred_job_infos(self):
+        self._ensure_job_queue_state()
+        self._deferred_job_info_flush_scheduled = False
+        if (
+            self.active_job is not None
+            or self.pending_jobs
+            or not self.deferred_job_infos
+        ):
+            return
+        notices = list(self.deferred_job_infos)
+        self.deferred_job_infos.clear()
+        if len(notices) == 1:
+            title, message = notices[0]
+        else:
+            title = "대기열 작업 완료"
+            message = "\n\n".join(
+                f"[{notice_title}]\n{notice_message}"
+                for notice_title, notice_message in notices
+            )
+        messagebox.showinfo(title, message, parent=self.root)
+
+    def _schedule_deferred_job_infos(self):
+        self._ensure_job_queue_state()
+        if (
+            self.deferred_job_infos
+            and not self._deferred_job_info_flush_scheduled
+        ):
+            self._deferred_job_info_flush_scheduled = True
+            self.root.after_idle(self._flush_deferred_job_infos)
 
     def _start_job(
         self,
@@ -2450,7 +2721,7 @@ class App:
         queue_label=None,
         shared_queue=True,
     ):
-        """Capture one request in both the window and process-global FIFO."""
+        """Capture one request in the window-local FIFO."""
         self._ensure_job_queue_state()
         if self.active_job is None and not self.pending_jobs:
             self.job_failures = []
@@ -2466,30 +2737,6 @@ class App:
             "on_success": on_success,
             "shared_queue": bool(shared_queue),
         }
-        shared_runtime = getattr(self, "shared_queue_runtime", None)
-        if shared_queue and shared_runtime is not None:
-            try:
-                shared = shared_runtime.enqueue(
-                    display_label,
-                    {
-                        "tool": "spm_generator_sync",
-                        "local_job_id": job["id"],
-                        "label": display_label,
-                    },
-                )
-            except Exception as exc:
-                messagebox.showerror(
-                    "공용 대기열 등록 실패",
-                    (
-                        "다른 창과 동시에 실행되지 않도록 작업을 시작하지 "
-                        f"않았습니다.\n\n{exc}"
-                    ),
-                    parent=self.root,
-                )
-                self.status_var.set("공용 대기열 등록 실패 · 실행하지 않음")
-                return None
-            job["shared_queue_job_id"] = shared["id"]
-            job["shared_queue_sequence"] = shared["sequence"]
         self.pending_jobs.append(job)
         self.queue_run_total += 1
         if self.active_job is None:
@@ -2540,10 +2787,33 @@ class App:
         def run():
             lease = None
             try:
-                shared_job_id = job.get("shared_queue_job_id")
                 shared_runtime = getattr(
                     self, "shared_queue_runtime", None
                 )
+                shared_job_id = job.get("shared_queue_job_id")
+                if (
+                    job["shared_queue"]
+                    and shared_job_id is None
+                    and shared_runtime is not None
+                ):
+                    report("공용 대기열 등록 중", 0)
+                    try:
+                        shared = shared_runtime.enqueue(
+                            job["queue_label"],
+                            {
+                                "tool": "spm_generator_sync",
+                                "local_job_id": job["id"],
+                                "label": job["queue_label"],
+                            },
+                        )
+                    except Exception as exc:
+                        raise SharedQueueEnqueueError(
+                            "다른 창과 동시에 실행되지 않도록 작업을 "
+                            f"시작하지 않았습니다.\n\n{exc}"
+                        ) from exc
+                    shared_job_id = shared["id"]
+                    job["shared_queue_job_id"] = shared_job_id
+                    job["shared_queue_sequence"] = shared["sequence"]
                 if shared_job_id and shared_runtime is not None:
                     def report_wait(wait_state):
                         position = wait_state.get("position")
@@ -2603,6 +2873,17 @@ class App:
                         exc = RuntimeError(
                             f"{exc}; 공용 대기열 종료 기록 실패: {queue_exc}"
                         )
+                elif shared_job_id and shared_runtime is not None:
+                    try:
+                        shared_runtime.cancel(
+                            shared_job_id,
+                            reason="worker_wait_failed",
+                        )
+                    except Exception:
+                        # wait_for_turn may already have terminalized and
+                        # removed the ticket.  Preserve the causal failure;
+                        # queue recovery remains the runtime's responsibility.
+                        pass
                 self.job_queue.put(("done", job["id"], False, exc))
 
         self.worker = threading.Thread(target=run, daemon=True)
@@ -2669,6 +2950,7 @@ class App:
         self.queue_run_completed += 1
         has_followup = bool(self.pending_jobs)
         self._job_has_followup = has_followup
+        deferred_count = len(self.deferred_job_infos)
         if ok:
             self.progress_bar.configure(value=100)
             self.progress_text_var.set(f"완료 · {elapsed_text}")
@@ -2677,6 +2959,10 @@ class App:
             except Exception as exc:
                 ok = False
                 payload = exc
+                while len(self.deferred_job_infos) > deferred_count:
+                    self.deferred_job_infos.pop()
+        has_followup = bool(self.pending_jobs)
+        self._job_has_followup = has_followup
         if not ok:
             self.job_failures.append((job["queue_label"], str(payload)))
             self.status_var.set(
@@ -2688,14 +2974,21 @@ class App:
             )
             if not has_followup:
                 messagebox.showerror(
-                    "작업 실패", str(payload), parent=self.root
+                    (
+                        "공용 대기열 등록 실패"
+                        if isinstance(payload, SharedQueueEnqueueError)
+                        else "작업 실패"
+                    ),
+                    str(payload),
+                    parent=self.root,
                 )
         self._job_has_followup = False
         self.active_job = None
         self.worker = None
         if self.pending_jobs:
             self._start_next_job()
-            return
+            if self.active_job is not None:
+                return
         if self.queue_run_total > 1:
             if self.job_failures:
                 self.status_var.set(
@@ -2710,6 +3003,7 @@ class App:
                 f"대기열 완료 · {self.queue_run_completed}/"
                 f"{self.queue_run_total}"
             )
+        self._schedule_deferred_job_infos()
 
     def preview_selected(self):
         followers = self.followers_from_selection()
