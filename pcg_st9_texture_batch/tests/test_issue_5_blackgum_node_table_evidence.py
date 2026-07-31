@@ -1,23 +1,11 @@
-"""Validate the issue #5 blackgum stale-node-table evidence fixture.
-
-This fixture records the *asset* evidence for issue #5 (stale saved
-``<Node>`` tables in ``SK_bush_blackgum_02/03.spm``): the confirmed
-before-resave counts, empty pending after-resave slots, and a reproduction
-checklist. It intentionally holds no tool/diagnostic code -- that lives in
-issue #4 (``pcg_texture_audit._node_table_state`` /
-``pcg_cluster_assembly_contract``) and must not be edited from here.
-
-These tests check the fixture is internally consistent and, separately,
-that the *current* node-table staleness policy (owned by #4, read-only
-here) would classify synthetic documents built from the fixture's "before"
-numbers exactly the way the fixture claims. That ties the checked-in
-evidence to the real parser instead of letting it drift into an unverified
-claim.
-"""
+"""Validate the public, anonymized Issue #5 pre-resave evidence."""
 
 import json
+import re
 import sys
 import unittest
+import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -32,65 +20,90 @@ FIXTURE_PATH = (
     / "fixtures"
     / "issue_5_blackgum_node_table_evidence.json"
 )
-
-# Local-machine leakage this fixture must never contain: absolute drive
-# paths, the configured external asset root, or an OS username.
-FORBIDDEN_SUBSTRINGS = (
-    "C:\\Users",
-    "C:/Users",
-    "D:\\OneDrive",
-    "D:/OneDrive",
-    "PARK",
+SHA1_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+GUID_TOKEN_RE = re.compile(r"(?:current|orphan)-[0-9]{3}")
+RAW_UUID_RE = re.compile(
+    r"(?i)(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])"
 )
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![a-z])[a-z]:[\\/]")
+USER_HOME_PATH_RE = re.compile(r"(?i)(?:[\\/](?:users|home)[\\/])")
 
 
 def load_fixture():
-    with open(FIXTURE_PATH, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
-def synthetic_node_table_document(
-    *, current_generator_count, valid_guid_node_counts, orphan_guid_node_counts
-):
-    """Build a minimal SPM-like document matching given node-table counts.
+def relationship_from_anonymized_evidence(before):
+    evidence = before["guid_ownership_evidence"]
+    current = set(evidence["current_generator_guid_tokens"])
+    eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+    eligible_owners = {
+        token for token, count in eligible_by_guid.items() if count > 0
+    }
+    orphan_owners = eligible_owners - current
+    return {
+        "current_generator_count": len(current),
+        "node_table_generator_count": len(eligible_owners),
+        "orphan_generator_guid_count": len(orphan_owners),
+        "orphan_node_count": sum(
+            eligible_by_guid[token] for token in orphan_owners
+        ),
+        "eligible_node_count": sum(eligible_by_guid.values()),
+        "total_node_count": before["total_node_count"],
+        "stale": bool(orphan_owners),
+    }
 
-    ``valid_guid_node_counts`` maps a subset of the current Generator GUIDs
-    to how many nodes they own; ``orphan_guid_node_counts`` maps GUIDs that
-    own nodes but have no matching Generator in the document.
+
+def anonymized_replay_document(before):
+    """Build XML that preserves the public ownership relation only.
+
+    The extra serialized Nodes represented by ``total_node_count`` are made
+    hidden. They remain part of the total table size but are intentionally not
+    added to any eligible owner's count.
     """
-    generator_guids = list(valid_guid_node_counts) + [
-        f"live-only-{i}"
-        for i in range(current_generator_count - len(valid_guid_node_counts))
-    ]
-    assert len(generator_guids) == current_generator_count
-
+    evidence = before["guid_ownership_evidence"]
+    current = evidence["current_generator_guid_tokens"]
+    eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
     generators = [
         (
-            f'<Generator Type="Leaf Mesh"><Name>g{i}</Name>'
-            f"<GUID>{guid}</GUID><Hidden>false</Hidden>"
-            "<Properties>"
-            "<Property><Name>Leaves:Material</Name><Value>4</Value></Property>"
-            "<Property><Name>Leaves:Mesh</Name><Value>130</Value></Property>"
-            "</Properties></Generator>"
+            '<Generator Type="Leaf Mesh">'
+            f"<Name>{token}</Name><GUID>{token}</GUID><Hidden>false</Hidden>"
+            "<Properties></Properties></Generator>"
         )
-        for i, guid in enumerate(generator_guids)
+        for token in current
     ]
-
     nodes = []
     index = 0
-    for guid, count in {
-        **valid_guid_node_counts,
-        **orphan_guid_node_counts,
-    }.items():
+    for token, count in eligible_by_guid.items():
         for _ in range(count):
             nodes.append(
-                f"<Node><GeneratorGUID>{guid}</GeneratorGUID>"
-                f"<ParentGUID></ParentGUID><Name>n{index}</Name>"
-                f"<GUID>node{index}</GUID><Hidden>false</Hidden>"
-                "<Extra></Extra></Node>"
+                "<Node>"
+                f"<GeneratorGUID>{token}</GeneratorGUID>"
+                "<ParentGUID></ParentGUID>"
+                f"<Name>eligible-{index}</Name><GUID>node-{index}</GUID>"
+                "<Hidden>false</Hidden>"
+                "<Extra><m_bDeleted>false</m_bDeleted>"
+                "<m_bCulled>false</m_bCulled></Extra>"
+                "</Node>"
             )
             index += 1
-
+    ineligible_count = before["total_node_count"] - sum(
+        eligible_by_guid.values()
+    )
+    for _ in range(ineligible_count):
+        nodes.append(
+            "<Node>"
+            f"<GeneratorGUID>{current[0]}</GeneratorGUID>"
+            "<ParentGUID></ParentGUID>"
+            f"<Name>ineligible-{index}</Name><GUID>node-{index}</GUID>"
+            "<Hidden>true</Hidden>"
+            "<Extra><m_bDeleted>false</m_bDeleted>"
+            "<m_bCulled>false</m_bCulled></Extra>"
+            "</Node>"
+        )
+        index += 1
     return (
         '<?xml version="1.0"?><SpeedTree>'
         f"<Generators>{''.join(generators)}</Generators>"
@@ -99,214 +112,288 @@ def synthetic_node_table_document(
     )
 
 
-def node_table_state_for(document_text):
-    counts, total = audit._export_node_counts_from_text(document_text)
-    return audit._node_table_state(
-        counts, total, audit._generator_guid_keys_from_text(document_text)
-    )
+def elementtree_relationship(document_text):
+    """Independently recompute the relation without audit regex helpers."""
+    root = ET.fromstring(document_text)
+    current = {
+        (generator.findtext("GUID") or "").strip().casefold()
+        for generator in root.iter("Generator")
+    }
+    current.discard("")
+    eligible_by_guid = Counter()
+    total = 0
+    truthy = {"1", "true", "yes"}
+    for node in root.iter("Node"):
+        total += 1
+        guid = (node.findtext("GeneratorGUID") or "").strip().casefold()
+        hidden = (node.findtext("Hidden") or "").strip().casefold() in truthy
+        deleted = (
+            node.findtext("./Extra/m_bDeleted") or ""
+        ).strip().casefold() in truthy
+        culled = (
+            node.findtext("./Extra/m_bCulled") or ""
+        ).strip().casefold() in truthy
+        if guid and not hidden and not deleted and not culled:
+            eligible_by_guid[guid] += 1
+    eligible_owners = set(eligible_by_guid)
+    orphan_owners = eligible_owners - current
+    return {
+        "current_generator_guid_tokens": current,
+        "eligible_node_count_by_guid_token": dict(eligible_by_guid),
+        "current_generator_count": len(current),
+        "node_table_generator_count": len(eligible_owners),
+        "orphan_generator_guid_count": len(orphan_owners),
+        "orphan_node_count": sum(
+            eligible_by_guid[token] for token in orphan_owners
+        ),
+        "eligible_node_count": sum(eligible_by_guid.values()),
+        "total_node_count": total,
+        "stale": bool(orphan_owners),
+    }
 
 
-class FixtureLoadsTests(unittest.TestCase):
-    def test_fixture_is_valid_json_with_expected_top_level_shape(self):
+class FixtureContractTests(unittest.TestCase):
+    def test_fixture_uses_v2_contract_and_names_the_incomplete_closure(self):
         data = load_fixture()
-        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["schema_version"], 2)
         self.assertEqual(
-            data["contract"], "speedtree_blackgum_node_table_evidence_v1"
+            data["contract"], "speedtree_blackgum_node_table_evidence_v2"
         )
         self.assertEqual(data["issue_number"], 5)
-        for key in (
-            "parser",
-            "delivery_context",
-            "stale_assets",
-            "coherent_reference_assets",
-            "resave_tool",
-            "reproduction_checklist",
-            "completion_checklist",
-        ):
-            self.assertIn(key, data)
+        self.assertEqual(
+            data["result_status"]["summary"],
+            "pre-resave evidence valid / closure incomplete",
+        )
+        self.assertEqual(data["result_status"]["pre_resave_evidence"], "valid")
+        self.assertEqual(data["result_status"]["closure"], "incomplete")
+        self.assertEqual(
+            data["audit_outcome"],
+            "pre_resave_evidence_valid_closure_incomplete",
+        )
 
-    def test_fixture_has_no_local_machine_leakage(self):
+    def test_audit_repository_commit_and_contract_are_pinned(self):
+        provenance = load_fixture()["audit_repository"]
+        self.assertRegex(provenance["repository_commit"], rf"^{SHA1_RE.pattern}$")
+        self.assertEqual(len(provenance["repository_commit"]), 40)
+        self.assertEqual(
+            provenance["snapshot_contract"],
+            "speedtree_live_generator_delivery_snapshot_v1",
+        )
+        self.assertEqual(
+            provenance["independent_crosscheck_contract"],
+            "python_xml_etree_elementtree_v1",
+        )
+
+    def test_public_fixture_has_no_absolute_path_username_or_raw_guid(self):
         raw = FIXTURE_PATH.read_text(encoding="utf-8")
-        for needle in FORBIDDEN_SUBSTRINGS:
-            self.assertNotIn(
-                needle, raw, f"fixture leaks local-machine detail: {needle!r}"
-            )
+        self.assertIsNone(WINDOWS_ABSOLUTE_PATH_RE.search(raw))
+        self.assertIsNone(USER_HOME_PATH_RE.search(raw))
+        self.assertIsNone(RAW_UUID_RE.search(raw))
 
     def test_asset_paths_are_relative_filenames_only(self):
         data = load_fixture()
         assets = data["stale_assets"] + data["coherent_reference_assets"]
         for asset in assets:
-            path = asset["asset_relative_path"]
-            self.assertNotIn(":", path)
-            self.assertNotIn("\\", path)
-            self.assertFalse(path.startswith("/"))
-            self.assertTrue(path.endswith(".spm"))
+            path = Path(asset["asset_relative_path"])
+            self.assertEqual(path.name, asset["asset_relative_path"])
+            self.assertFalse(path.is_absolute())
+            self.assertEqual(path.suffix, ".spm")
 
 
-class StaleAssetInvariantTests(unittest.TestCase):
-    def test_each_stale_asset_before_block_is_internally_consistent(self):
-        data = load_fixture()
-        for asset in data["stale_assets"]:
+class BeforeEvidenceRelationshipTests(unittest.TestCase):
+    def test_sha256_and_anonymized_guid_membership_are_complete(self):
+        for asset in load_fixture()["stale_assets"]:
             before = asset["before"]
-            self.assertGreater(before["orphan_node_count"], 0)
-            self.assertLessEqual(
-                before["orphan_node_count"], before["total_node_count"]
-            )
-            self.assertTrue(before["stale"])
-            if before["orphan_generator_guid_count"] is not None:
-                self.assertLessEqual(
-                    before["orphan_generator_guid_count"],
-                    before["node_table_generator_count"],
+            self.assertRegex(before["spm_text_sha256"], rf"^{SHA256_RE.pattern}$")
+            evidence = before["guid_ownership_evidence"]
+            current = evidence["current_generator_guid_tokens"]
+            eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+            self.assertEqual(len(current), len(set(current)))
+            self.assertEqual(len(current), before["current_generator_count"])
+            self.assertTrue(set(current).issubset(eligible_by_guid))
+            for token, count in eligible_by_guid.items():
+                self.assertRegex(token, rf"^{GUID_TOKEN_RE.pattern}$")
+                self.assertIs(type(count), int)
+                self.assertGreaterEqual(count, 0)
+
+    def test_current_owner_orphan_and_stale_are_recomputed(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            recomputed = relationship_from_anonymized_evidence(before)
+            for field in fields:
+                self.assertEqual(
+                    recomputed[field],
+                    before[field],
+                    f"{asset['asset_id']}.before.{field}",
                 )
 
-    def test_each_stale_asset_after_slot_stays_pending_not_fabricated(self):
+    def test_total_node_count_is_not_conflated_with_eligible_owner_sum(self):
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            eligible_sum = sum(
+                before["guid_ownership_evidence"]
+                ["eligible_node_count_by_guid_token"].values()
+            )
+            self.assertEqual(eligible_sum, before["eligible_node_count"])
+            self.assertGreater(before["total_node_count"], eligible_sum)
+            self.assertEqual(before["total_node_count"] - eligible_sum, 1)
+
+    def test_recorded_elementtree_crosscheck_matches_primary_evidence(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            crosscheck = before["independent_elementtree_crosscheck"]
+            self.assertEqual(crosscheck["parser"], "xml.etree.ElementTree")
+            self.assertEqual(crosscheck["status"], "matched")
+            self.assertTrue(crosscheck["current_generator_guid_membership_match"])
+            self.assertTrue(crosscheck["per_guid_eligible_node_counts_match"])
+            for field in fields:
+                self.assertEqual(crosscheck[field], before[field])
+
+
+class IndependentParserReplayTests(unittest.TestCase):
+    def test_elementtree_replays_membership_counts_and_relationship(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            evidence = before["guid_ownership_evidence"]
+            result = elementtree_relationship(anonymized_replay_document(before))
+            self.assertEqual(
+                result["current_generator_guid_tokens"],
+                set(evidence["current_generator_guid_tokens"]),
+            )
+            replay_counts = {
+                token: result["eligible_node_count_by_guid_token"].get(token, 0)
+                for token in evidence["eligible_node_count_by_guid_token"]
+            }
+            self.assertEqual(
+                replay_counts, evidence["eligible_node_count_by_guid_token"]
+            )
+            for field in fields:
+                self.assertEqual(result[field], before[field])
+
+    def test_committed_regex_policy_replays_the_same_relation(self):
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            text = anonymized_replay_document(before)
+            counts, total = audit._export_node_counts_from_text(text)
+            state = audit._node_table_state(
+                counts, total, audit._generator_guid_keys_from_text(text)
+            )
+            recomputed = relationship_from_anonymized_evidence(before)
+            self.assertEqual(state["generator_count"], recomputed["current_generator_count"])
+            self.assertEqual(
+                state["node_table_generator_count"],
+                recomputed["node_table_generator_count"],
+            )
+            self.assertEqual(
+                len(state["orphan_generator_guids"]),
+                recomputed["orphan_generator_guid_count"],
+            )
+            self.assertEqual(state["orphan_node_count"], recomputed["orphan_node_count"])
+            self.assertEqual(state["total_node_count"], before["total_node_count"])
+            self.assertEqual(sum(counts.values()), before["eligible_node_count"])
+            self.assertEqual(state["stale"], before["stale"])
+
+
+class TargetBindingAndDeliveryTests(unittest.TestCase):
+    def test_target_bindings_are_current_zero_count_stale_evidence(self):
         data = load_fixture()
+        expected_mesh_ids = set(data["delivery_context"]["declared_target_mesh_ids"])
+        result = data["delivery_context"]["target_binding_result_before_resave"]
+        self.assertTrue(result["all_required_mesh_ids_have_current_graph_bindings"])
+        self.assertTrue(result["all_observed_bindings_graph_visible"])
+        self.assertEqual(result["eligible_node_count_per_observed_binding"], 0)
+        self.assertFalse(result["all_observed_bindings_export_participate"])
+        self.assertEqual(result["export_evidence"], "node_table_stale")
         for asset in data["stale_assets"]:
+            before = asset["before"]
+            evidence = before["guid_ownership_evidence"]
+            current = set(evidence["current_generator_guid_tokens"])
+            eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+            bindings = before["target_bindings"]
+            self.assertEqual({row["mesh_id"] for row in bindings}, expected_mesh_ids)
+            for row in bindings:
+                self.assertIn(row["guid_token"], current)
+                self.assertEqual(eligible_by_guid[row["guid_token"]], 0)
+
+    def test_delivery_result_is_blocked_by_stale_evidence_not_disconnection(self):
+        data = load_fixture()
+        context = data["delivery_context"]
+        result = context["delivery_result_before_resave"]
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertEqual(result["delivery_reason"], data["parser"]["stale_delivery_reason"])
+        self.assertEqual(result["delivery_error"], data["parser"]["stale_delivery_error"])
+        self.assertEqual(result["live_export_participating_target_mesh_ids"], [])
+        self.assertEqual(result["downstream_effect"], "dependency_blocked")
+        self.assertIsNone(context["delivery_result_after_resave"])
+
+
+class PendingClosureTests(unittest.TestCase):
+    def test_after_slots_remain_pending_and_unfabricated(self):
+        null_fields = (
+            "captured_utc",
+            "spm_text_sha256",
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+            "guid_ownership_evidence",
+            "independent_elementtree_crosscheck",
+            "target_bindings",
+            "delivery_result",
+        )
+        for asset in load_fixture()["stale_assets"]:
             after = asset["after"]
             self.assertEqual(after["status"], "pending")
             self.assertFalse(after["resaved"])
-            for field in (
-                "captured_utc",
-                "current_generator_count",
-                "node_table_generator_count",
-                "orphan_generator_guid_count",
-                "orphan_node_count",
-                "total_node_count",
-                "stale",
-                "spm_text_sha256",
-            ):
-                self.assertIsNone(
-                    after[field],
-                    f"{asset['asset_id']}.after.{field} must stay null until a"
-                    " real SpeedTree Modeler resave has happened",
-                )
+            for field in null_fields:
+                self.assertIsNone(after[field], f"{asset['asset_id']}.after.{field}")
             self.assertEqual(
-                asset["audit_outcome"], "blocked_pending_manual_modeler_resave"
+                asset["audit_outcome"],
+                "pre_resave_evidence_valid_closure_incomplete",
             )
 
-    def test_resave_tool_has_not_actually_run(self):
+    def test_resave_and_acceptance_items_remain_open(self):
         data = load_fixture()
-        tool = data["resave_tool"]
-        self.assertFalse(tool["executed"])
-        self.assertIsNone(tool["executed_utc"])
-        self.assertEqual(data["audit_outcome"], "blocked_pending_manual_resave")
-
-
-class CoherentReferenceAssetTests(unittest.TestCase):
-    def test_coherent_reference_assets_report_zero_orphans(self):
-        data = load_fixture()
-        for asset in data["coherent_reference_assets"]:
-            self.assertFalse(asset["stale"])
-            self.assertEqual(asset["orphan_node_count"], 0)
-            self.assertEqual(asset["orphan_generator_guid_count"], 0)
-            self.assertEqual(
-                asset["current_generator_count"],
-                asset["node_table_generator_count"],
-            )
-
-
-class DeliveryContextTests(unittest.TestCase):
-    def test_declared_target_mesh_ids_match_issue_evidence(self):
-        data = load_fixture()
-        self.assertEqual(
-            data["delivery_context"]["declared_target_mesh_ids"],
-            [130, 131, 132, 133],
-        )
-        self.assertEqual(
-            data["delivery_context"][
-                "live_export_participating_target_mesh_ids_before_resave"
-            ],
-            [],
-        )
-
-
-class CompletionChecklistTests(unittest.TestCase):
-    def test_checklist_mirrors_issue_acceptance_criteria_and_stays_pending(self):
-        data = load_fixture()
-        items = {row["item"]: row for row in data["completion_checklist"]}
-        self.assertEqual(len(items), 5)
-        pending_items = (
-            "both_affected_spms_report_zero_orphan_node_ownership",
-            "required_current_generator_guids_receive_valid_live_export_evidence",
-            "live_export_participating_target_mesh_ids_equals_normalized_declared_set",
-            "stale_node_table_validation_block_no_longer_occurs_after_resave",
-        )
-        for name in pending_items:
-            self.assertEqual(items[name]["status"], "pending")
-        # The no-bypass criterion is #4's tool-code concern; #5 stays asset-only.
-        self.assertEqual(
-            items["no_validation_bypass_or_fail_open_special_case_introduced"][
-                "status"
-            ],
-            "not_applicable_to_this_asset_only_fixture",
-        )
-
-
-class ParserCrossCheckTests(unittest.TestCase):
-    """Confirm the fixture's before-resave numbers really parse as stale.
-
-    This does not need the real (external, not checked in) SPM files -- it
-    reconstructs a document with the same GUID/node-count shape and runs it
-    through the actual, currently-committed policy function.
-    """
-
-    def test_blackgum_02_before_counts_parse_as_stale(self):
-        data = load_fixture()
-        before = next(
-            a for a in data["stale_assets"] if a["asset_id"] == "SK_bush_blackgum_02"
-        )["before"]
-
-        orphan_guid_count = before["orphan_generator_guid_count"]
-        valid_guid_count = before["node_table_generator_count"] - orphan_guid_count
-        orphan_nodes = before["orphan_node_count"]
-        valid_nodes = before["total_node_count"] - orphan_nodes
-
-        valid_guid_node_counts = {
-            f"valid-{i}": 1 for i in range(valid_guid_count - 1)
+        self.assertFalse(data["resave_tool"]["executed"])
+        self.assertIsNone(data["resave_tool"]["executed_utc"])
+        self.assertIsNone(data["resave_tool"]["operator"])
+        pending = {
+            row["item"]
+            for row in data["completion_checklist"]
+            if row["status"] == "pending"
         }
-        valid_guid_node_counts[f"valid-{valid_guid_count - 1}"] = (
-            valid_nodes - (valid_guid_count - 1)
-        )
-        orphan_guid_node_counts = {
-            f"orphan-{i}": 1 for i in range(orphan_guid_count - 1)
-        }
-        orphan_guid_node_counts[f"orphan-{orphan_guid_count - 1}"] = (
-            orphan_nodes - (orphan_guid_count - 1)
-        )
-
-        text = synthetic_node_table_document(
-            current_generator_count=before["current_generator_count"],
-            valid_guid_node_counts=valid_guid_node_counts,
-            orphan_guid_node_counts=orphan_guid_node_counts,
-        )
-        state = node_table_state_for(text)
-
-        self.assertEqual(state["generator_count"], before["current_generator_count"])
-        self.assertEqual(
-            state["node_table_generator_count"], before["node_table_generator_count"]
-        )
-        self.assertEqual(state["orphan_node_count"], before["orphan_node_count"])
-        self.assertEqual(state["total_node_count"], before["total_node_count"])
-        self.assertEqual(len(state["orphan_generator_guids"]), orphan_guid_count)
-        self.assertTrue(state["stale"])
-        self.assertEqual(state["stale"], before["stale"])
-
-    def test_coherent_reference_counts_parse_as_not_stale(self):
-        data = load_fixture()
-        for asset in data["coherent_reference_assets"]:
-            count = asset["current_generator_count"]
-            valid_guid_node_counts = {f"g-{i}": 1 for i in range(count)}
-            text = synthetic_node_table_document(
-                current_generator_count=count,
-                valid_guid_node_counts=valid_guid_node_counts,
-                orphan_guid_node_counts={},
-            )
-            state = node_table_state_for(text)
-            self.assertFalse(state["stale"])
-            self.assertEqual(state["orphan_node_count"], 0)
-            self.assertEqual(
-                state["node_table_generator_count"], asset["node_table_generator_count"]
-            )
+        self.assertEqual(len(pending), 4)
 
 
 if __name__ == "__main__":
