@@ -51,6 +51,10 @@ from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
 from cluster_blend_sync import discover_cluster_blend_relations
 from speedtree_export_options_contract import require_texture_skip_writing
+try:
+    from .process_stream import ProcessCancelled, run_streaming_process
+except ImportError:  # direct script/GUI-engine loading puts TOOL_DIR on sys.path
+    from process_stream import ProcessCancelled, run_streaming_process
 
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
@@ -100,6 +104,42 @@ GENERATION_PASS_PROPERTY = "Generation:Shared:Pass"
 
 class SyncError(RuntimeError):
     """Actionable SPM synchronization failure."""
+
+
+class SyncCancelled(SyncError):
+    """A requested cancellation with its exact child termination outcome."""
+
+    def __init__(
+        self,
+        termination_state: str = "cancelled_at_safe_boundary",
+        *,
+        pid: int | None = None,
+        returncode: int | None = None,
+    ):
+        self.termination_state = str(termination_state)
+        self.pid = pid
+        self.returncode = returncode
+        labels = {
+            "cancelled_at_safe_boundary": "안전 경계에서 취소됨",
+            "cancelled_before_launch": "프로세스 실행 전에 취소됨",
+            "cancelled_after_exit": "프로세스 종료 경합 중 취소됨",
+            "cancelled_terminated": "프로세스 종료 요청 후 취소됨",
+            "cancelled_killed": "프로세스 강제 종료 fallback 후 취소됨",
+        }
+        super().__init__(labels.get(self.termination_state, "작업이 취소되었습니다"))
+
+    def as_dict(self) -> dict:
+        return {
+            "status": "cancelled",
+            "termination_state": self.termination_state,
+            "pid": self.pid,
+            "returncode": self.returncode,
+        }
+
+
+def _raise_if_cancelled(cancel_requested) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise SyncCancelled("cancelled_at_safe_boundary")
 
 
 def is_active_spm(path: Path) -> bool:
@@ -2889,6 +2929,8 @@ def verify_speedtree_export(
     speedtree_exe: Path,
     xml_ini: Path,
     timeout: int = 300,
+    output_callback=None,
+    cancel_requested=None,
 ) -> None:
     spm_path = Path(spm_path)
     speedtree_exe = Path(speedtree_exe)
@@ -2908,14 +2950,21 @@ def verify_speedtree_export(
             "-export_options", str(xml_ini),
             "-export", str(output),
         ]
-        result = subprocess.run(
-            cmd,
-            cwd=str(spm_path.parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000 if os.name == "nt" else 0,
-        )
+        try:
+            result = run_streaming_process(
+                cmd,
+                cwd=spm_path.parent,
+                timeout=timeout,
+                output_callback=output_callback,
+                cancel_requested=cancel_requested,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+            )
+        except ProcessCancelled as exc:
+            raise SyncCancelled(
+                exc.result.status,
+                pid=exc.result.pid,
+                returncode=exc.result.returncode,
+            ) from exc
         if result.returncode != 0 or not output.is_file():
             detail = (result.stderr or result.stdout or "")[-1000:]
             raise SyncError(
@@ -2932,6 +2981,7 @@ def verify_temporary_patches(
     patches: list[tuple[Path, str, bool]],
     callback,
     progress_callback=None,
+    cancel_requested=None,
 ) -> None:
     """Compute patched sibling copies before originals are ever overwritten."""
     token = uuid.uuid4().hex[:10]
@@ -2939,17 +2989,22 @@ def verify_temporary_patches(
     try:
         total = len(patches)
         for index, (path, text, compressed) in enumerate(patches, start=1):
+            _raise_if_cancelled(cancel_requested)
             temporary = path.parent / f"__spm_sync_preflight_{token}_{path.name}"
             write_spm_text(temporary, text, compressed)
             temporary_paths.append(temporary)
             if progress_callback is not None:
                 progress_callback(path, index, total)
+            _raise_if_cancelled(cancel_requested)
             callback(temporary)
+            _raise_if_cancelled(cancel_requested)
     except subprocess.TimeoutExpired as exc:
         raise SyncError(
             "SpeedTree 사전검사가 5분을 넘겨 중단되었습니다. 노드·폴리곤 폭증 "
             "가능성이 있어 원본은 수정하지 않았습니다."
         ) from exc
+    except SyncCancelled:
+        raise
     except Exception as exc:
         if isinstance(exc, SyncError):
             raise SyncError(f"SpeedTree 사전검사 실패 · 원본 미수정: {exc}") from exc
@@ -3246,6 +3301,8 @@ def apply_group_transaction(
     xml_ini: Path | None = None,
     verify_callback=None,
     progress_callback=None,
+    process_output_callback=None,
+    cancel_requested=None,
     skip_blocked_scale: bool = False,
 ) -> dict:
     """Preflight, backup, write, verify, and rollback a whole master group.
@@ -3253,12 +3310,14 @@ def apply_group_transaction(
     Batch callers may set ``skip_blocked_scale`` so one oversized follower is
     reported in ``scale_skipped`` without suppressing safe siblings.
     """
+    _raise_if_cancelled(cancel_requested)
     prepared = build_group_sync_plans(
         folder,
         master_name,
         follower_names,
         progress_callback=progress_callback,
     )
+    _raise_if_cancelled(cancel_requested)
     folder = prepared["folder"]
     manifest = prepared["manifest"]
     configured = prepared["configured"]
@@ -3275,6 +3334,7 @@ def apply_group_transaction(
 
     if progress_callback is not None:
         progress_callback("크기 위험과 XML 무결성 확인 중", 38)
+    _raise_if_cancelled(cancel_requested)
 
     blocked = [plan for plan in plans if plan.scale_risk.get("level") == "blocked"]
     scale_skipped = [{
@@ -3353,6 +3413,7 @@ def apply_group_transaction(
         # a concurrent SPM edit cannot be stamped as synchronized.
         _assert_spm_unchanged(plan_fingerprints)
         _assert_manifest_unchanged(folder, manifest_fingerprint)
+        _raise_if_cancelled(cancel_requested)
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("이미 최신 · 관계 정보 확인 완료", 100)
@@ -3370,6 +3431,7 @@ def apply_group_transaction(
 
     if progress_callback is not None:
         progress_callback("메모리 패치 검증 완료", 44)
+    _raise_if_cancelled(cancel_requested)
 
     # Built-in Modeler validation is a true preflight: temporary sibling SPMs
     # are computed first and originals remain byte-identical on any failure.
@@ -3379,15 +3441,23 @@ def apply_group_transaction(
             raise SyncError("SpeedTree 검증 경로가 설정되지 않았습니다")
         verify_temporary_patches(
             patches,
-            lambda path: verify_speedtree_export(path, speedtree_exe, xml_ini),
+            lambda path: verify_speedtree_export(
+                path,
+                speedtree_exe,
+                xml_ini,
+                output_callback=process_output_callback,
+                cancel_requested=cancel_requested,
+            ),
             progress_callback=lambda path, index, total: progress_callback(
                 f"SpeedTree 사전검사 · {path.name} ({index}/{total})",
                 45 + round(30 * (index - 1) / max(1, total)),
             ) if progress_callback is not None else None,
+            cancel_requested=cancel_requested,
         )
 
     if progress_callback is not None:
         progress_callback("사전검사 완료 · 동시 수정 확인 중", 76)
+    _raise_if_cancelled(cancel_requested)
 
     _assert_spm_unchanged(plan_fingerprints)
     _assert_manifest_unchanged(folder, manifest_fingerprint)
@@ -3403,11 +3473,13 @@ def apply_group_transaction(
     try:
         transaction_paths = list(dict.fromkeys(folder / name for name in selected))
         for index, path in enumerate(transaction_paths, start=1):
+            _raise_if_cancelled(cancel_requested)
             if progress_callback is not None:
                 progress_callback(
                     f"원본 백업 중 · {path.name} ({index}/{len(transaction_paths)})",
                     78 + round(8 * index / max(1, len(transaction_paths))),
                 )
+            _raise_if_cancelled(cancel_requested)
             backup = backup_dir / f"{index:02d}_{path.name}"
             shutil.copy2(path, backup)
             backups.append((path, backup))
@@ -3418,12 +3490,15 @@ def apply_group_transaction(
         _assert_spm_unchanged(plan_fingerprints)
         _assert_manifest_unchanged(folder, manifest_fingerprint)
         for index, (path, text, compressed) in enumerate(patches, start=1):
+            _raise_if_cancelled(cancel_requested)
             if progress_callback is not None:
                 progress_callback(
                     f"검증된 SPM 저장 중 · {path.name} ({index}/{len(patches)})",
                     86 + round(8 * index / max(1, len(patches))),
                 )
+            _raise_if_cancelled(cancel_requested)
             write_spm_text(path, text, compressed)
+            _raise_if_cancelled(cancel_requested)
         for path, text, _compressed in patches:
             written, _ = read_spm_text(path)
             if written != text:
@@ -3435,7 +3510,9 @@ def apply_group_transaction(
         # built-in SpeedTree path has already verified identical temp bytes.
         if callback is not None:
             for path, _text, _compressed in patches:
+                _raise_if_cancelled(cancel_requested)
                 callback(path)
+                _raise_if_cancelled(cancel_requested)
 
         now = datetime.now().isoformat(timespec="seconds")
         for plan in plans:
@@ -3455,6 +3532,7 @@ def apply_group_transaction(
                 master_doc, target_doc, entry.get("base_map") or {}
             )
         _assert_manifest_unchanged(folder, manifest_fingerprint)
+        _raise_if_cancelled(cancel_requested)
         manifest_write_attempted = True
         save_manifest(folder, manifest)
         if progress_callback is not None:

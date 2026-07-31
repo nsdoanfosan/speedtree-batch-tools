@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import tempfile
+import threading
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -864,7 +865,7 @@ class GeneratorSyncTests(unittest.TestCase):
             spm_before = spm.read_bytes()
             options_before = options.read_bytes()
 
-            with mock.patch.object(sync.subprocess, "run") as run:
+            with mock.patch.object(sync, "run_streaming_process") as run:
                 with self.assertRaisesRegex(
                     RuntimeError, "TextureSkipWriting=false"
                 ):
@@ -875,6 +876,39 @@ class GeneratorSyncTests(unittest.TestCase):
             run.assert_not_called()
             self.assertEqual(spm.read_bytes(), spm_before)
             self.assertEqual(options.read_bytes(), options_before)
+
+    def test_speedtree_verify_streams_stderr_and_reports_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            script = folder / "failure.spm"
+            options = folder / "Options_HI_Xml.ini"
+            script.write_text(
+                "import sys\n"
+                "print('starting', flush=True)\n"
+                "print('fatal detail', file=sys.stderr, flush=True)\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            output = []
+
+            with self.assertRaisesRegex(
+                sync.SyncError, "code 7.*fatal detail"
+            ):
+                sync.verify_speedtree_export(
+                    script,
+                    Path(sys.executable),
+                    options,
+                    output_callback=lambda channel, line: output.append(
+                        (channel, line)
+                    ),
+                )
+
+            self.assertIn(("stdout", "starting"), output)
+            self.assertIn(("stderr", "fatal detail"), output)
 
     def test_auto_copy_verification_keeps_follower_extra_out_of_master_plan(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2073,6 +2107,67 @@ class GeneratorSyncTests(unittest.TestCase):
 
             self.assertEqual(master.read_bytes(), originals[master])
             self.assertEqual(target.read_bytes(), originals[target])
+
+    def test_cancellation_during_write_rolls_back_the_whole_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            first = folder / "tree_02.spm"
+            second = folder / "tree_03.spm"
+            write_spm(master, make_master())
+            write_spm(first, make_target())
+            write_spm(second, make_target())
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+            sync.assign_follower(
+                manifest, master.name, first.name, mapping, confirmed=True
+            )
+            sync.assign_follower(
+                manifest, master.name, second.name, mapping, confirmed=True
+            )
+            sync.save_manifest(folder, manifest)
+            originals = {
+                first: first.read_bytes(),
+                second: second.read_bytes(),
+                folder / sync.MANIFEST_NAME: (
+                    folder / sync.MANIFEST_NAME
+                ).read_bytes(),
+            }
+            cancel = threading.Event()
+
+            def progress(stage, _percent):
+                if "검증된 SPM 저장 중" in stage and "(2/2)" in stage:
+                    cancel.set()
+
+            with self.assertRaises(sync.SyncCancelled) as raised:
+                sync.apply_group_transaction(
+                    folder,
+                    master.name,
+                    [first.name, second.name],
+                    verify_speedtree=False,
+                    verify_callback=lambda _path: None,
+                    progress_callback=progress,
+                    cancel_requested=cancel.is_set,
+                )
+
+            self.assertEqual(
+                raised.exception.termination_state,
+                "cancelled_at_safe_boundary",
+            )
+            for path, expected in originals.items():
+                self.assertEqual(path.read_bytes(), expected)
 
     def test_transaction_preserves_concurrent_manifest_edit_and_rolls_back_spm(self):
         with tempfile.TemporaryDirectory() as temp:

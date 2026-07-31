@@ -1,6 +1,8 @@
+import gc
 import importlib.machinery
 import importlib.util
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -51,6 +53,12 @@ class ClipboardRecorder:
 
 
 class GeneratorSyncGuiCacheTests(unittest.TestCase):
+    def tearDown(self):
+        # Tk variables participate in reference cycles.  Force their finalizers
+        # on the test runner's main thread before a later background-job test
+        # can become the thread that happens to trigger cyclic collection.
+        gc.collect()
+
     def test_initial_fast_refresh_defers_physical_validation(self):
         app = GUI.App.__new__(GUI.App)
         app.persist_config = mock.Mock()
@@ -1241,6 +1249,10 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 self.assertIsNone(app.active_job)
                 self.assertTrue(analysis_threads)
                 self.assertNotIn(threading.get_ident(), analysis_threads)
+                self.assertEqual(
+                    float(app.progress_bar.cget("value")),
+                    100.0,
+                )
                 self.assertEqual(len(app.item_meta), 3)
                 app.master_status.assert_not_called()
                 app.cached_follower_analysis.assert_not_called()
@@ -1578,6 +1590,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             runtime.wait_for_turn.assert_called_once_with(
                 "shared-1",
                 on_wait=mock.ANY,
+                cancel_event=mock.ANY,
             )
             self.assertNotIn(threading.get_ident(), enqueue_threads)
             self.assertEqual(
@@ -1706,8 +1719,16 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             )
             failed_func.assert_not_called()
             runtime.wait_for_turn.assert_has_calls([
-                mock.call("shared-wait-failure", on_wait=mock.ANY),
-                mock.call("shared-after-failure", on_wait=mock.ANY),
+                mock.call(
+                    "shared-wait-failure",
+                    on_wait=mock.ANY,
+                    cancel_event=mock.ANY,
+                ),
+                mock.call(
+                    "shared-after-failure",
+                    on_wait=mock.ANY,
+                    cancel_event=mock.ANY,
+                ),
             ])
             lease.finish.assert_called_once()
             self.assertEqual(next_completed, ["continued"])
@@ -1828,6 +1849,253 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertEqual(len(app.job_failures), 1)
             self.assertIn("대기열 완료", app.status_var.get())
             showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_process_output_streams_through_tk_queue_without_blocking(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            entered = threading.Event()
+            tk_event = threading.Event()
+            completed = []
+
+            def work(report):
+                report.output("stdout", "first line")
+                report.output("stderr", "warning line")
+                entered.set()
+                gate.wait(2)
+                return "ok"
+
+            app._start_job("stream", work, completed.append)
+            root.after(0, tk_event.set)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                root.update()
+                text = app.process_output.get("1.0", "end")
+                if entered.is_set() and tk_event.is_set() and "warning line" in text:
+                    break
+                time.sleep(0.01)
+
+            self.assertTrue(entered.is_set())
+            self.assertTrue(tk_event.is_set())
+            self.assertTrue(app.worker.is_alive())
+            text = app.process_output.get("1.0", "end")
+            self.assertIn("[stdout] first line", text)
+            self.assertIn("[stderr] warning line", text)
+            self.assertIn("마지막 출력", app.progress_text_var.get())
+            self.assertLess(
+                float(app.progress_bar.cget("value")),
+                100.0,
+            )
+
+            gate.set()
+            deadline = time.monotonic() + 2
+            while not completed and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+            self.assertEqual(completed, ["ok"])
+            self.assertEqual(
+                float(app.progress_bar.cget("value")),
+                100.0,
+            )
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_cancelled_fifo_job_is_not_reported_as_failure(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            entered = threading.Event()
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-1", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    self.cancel_event = cancel_event
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def work(report):
+                entered.set()
+                while not report.cancel_requested():
+                    time.sleep(0.01)
+                report.raise_if_cancelled()
+
+            with mock.patch.object(GUI.messagebox, "showerror") as showerror:
+                app._start_job("cancel me", work, lambda _result: None)
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(app.request_active_job_cancel())
+                deadline = time.monotonic() + 3
+                while app.active_job is not None and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertIsNone(app.active_job)
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(
+                app.job_cancellations[0][1],
+                "cancelled_at_safe_boundary",
+            )
+            self.assertIn("취소됨", app.status_var.get())
+            self.assertEqual(shared_results[0][0], False)
+            self.assertEqual(shared_results[0][1]["outcome"], "cancelled")
+            self.assertEqual(
+                shared_results[0][1]["termination_state"],
+                "cancelled_at_safe_boundary",
+            )
+            showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_chatty_output_is_rendered_in_bounded_tk_batches(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            completed = []
+            ticks = []
+            tick_after = [None]
+
+            def work(report):
+                for index in range(4000):
+                    report.output(
+                        "stderr" if index % 2 else "stdout",
+                        f"line {index}",
+                    )
+                return "ok"
+
+            def tick():
+                ticks.append(time.monotonic())
+                if app.active_job is not None:
+                    tick_after[0] = root.after(1, tick)
+                else:
+                    tick_after[0] = None
+
+            app._start_job("chatty", work, completed.append)
+            tick_after[0] = root.after(0, tick)
+            deadline = time.monotonic() + 5
+            while not completed and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.001)
+
+            self.assertEqual(completed, ["ok"])
+            self.assertGreater(len(ticks), 2)
+            self.assertLessEqual(app.process_output_line_count, 3200)
+            self.assertIn("line 3999", app.process_output.get("1.0", "end"))
+        finally:
+            if "tick_after" in locals() and tick_after[0] is not None:
+                try:
+                    root.after_cancel(tick_after[0])
+                except tk.TclError:
+                    pass
+            root.destroy()
+
+    def test_window_shutdown_terminates_active_speedtree_process(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            ready = threading.Event()
+
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                script = folder / "slow.spm"
+                options = folder / "Options_HI_Xml.ini"
+                script.write_text(
+                    "import time\nprint('ready', flush=True)\ntime.sleep(30)\n",
+                    encoding="utf-8",
+                )
+                options.write_text(
+                    "[Options]\nTextureSkipWriting=true\n",
+                    encoding="utf-8",
+                )
+
+                def work(report):
+                    def output(channel, line):
+                        report.output(channel, line)
+                        if line == "ready":
+                            ready.set()
+
+                    return GUI.engine.verify_speedtree_export(
+                        script,
+                        Path(sys.executable),
+                        options,
+                        output_callback=output,
+                        cancel_requested=report.cancel_requested,
+                    )
+
+                app._start_job("slow SpeedTree", work, lambda _result: None)
+                self.assertTrue(ready.wait(3))
+                started = time.monotonic()
+                app.shutdown_shared_queue()
+                elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 5.0)
+            self.assertFalse(app.worker.is_alive())
+            done_events = []
+            while not app.job_queue.empty():
+                event = app.job_queue.get_nowait()
+                if event[0] == "done":
+                    done_events.append(event)
+            self.assertEqual(len(done_events), 1)
+            cancelled = done_events[0][3]
+            self.assertIsInstance(cancelled, GUI.engine.SyncCancelled)
+            self.assertIn(
+                cancelled.termination_state,
+                {"cancelled_terminated", "cancelled_killed"},
+            )
+            self.assertIsNotNone(cancelled.pid)
+            self.assertIsNotNone(cancelled.returncode)
         finally:
             root.destroy()
 
