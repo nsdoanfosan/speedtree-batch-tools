@@ -4547,6 +4547,7 @@ class GuiLabelTests(unittest.TestCase):
             }
             (asset / "speedtree_import_manifest.json").write_text(
                 json.dumps({
+                    "spm": str(asset / "SK_tree_declared.spm"),
                     "texture_contract_status":
                         "source_fallback_needs_pcg_generation",
                     "source_texture_fallbacks": [fallback],

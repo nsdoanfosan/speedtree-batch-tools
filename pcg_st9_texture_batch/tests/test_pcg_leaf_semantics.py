@@ -91,6 +91,7 @@ def write_connection_manifest(spm, atlas_base, bindings,
     scopes = spm.parent / ".atlas_leaf_speedtree_scopes"
     scopes.mkdir(exist_ok=True)
     payload = {
+        "spm": str(spm),
         "atlas_asset_name": atlas_base,
         "generator_connection": {
             "requested": True,
@@ -673,6 +674,28 @@ class AtlasNameAllocationTests(unittest.TestCase):
 
 
 class GeneratorConnectionTests(unittest.TestCase):
+    def test_manifest_connection_audit_is_read_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "tree_test"
+            root.mkdir()
+            target = root / "SK_tree_test.spm"
+            target.write_bytes(b"spm")
+            manifest = write_connection_manifest(
+                target,
+                "M_leaf_test",
+                [],
+            )
+            before = (manifest.read_bytes(), manifest.stat().st_mtime_ns)
+
+            payloads = audit._scoped_connection_payloads(target)
+
+            self.assertEqual(len(payloads), 1)
+            self.assertEqual(payloads[0]["_manifest_path"], str(manifest.resolve()))
+            self.assertEqual(
+                (manifest.read_bytes(), manifest.stat().st_mtime_ns),
+                before,
+            )
+
     def test_audit_lists_only_tagged_connected_outputs_in_exact_target_spm(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "weed_parsley"

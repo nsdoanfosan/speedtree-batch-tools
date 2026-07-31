@@ -87,6 +87,7 @@ class CanonicalOutputManifestTests(unittest.TestCase):
         manifest = asset / "speedtree_import_manifest.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(json.dumps({
+            "spm": str(target_spm),
             "texture_contract_status":
                 "source_fallback_needs_pcg_generation",
             "source_texture_fallbacks": [fallback],
@@ -227,6 +228,62 @@ class CanonicalOutputManifestTests(unittest.TestCase):
             )
             self.assertEqual(second["status"], "current")
             self.assertEqual(second["updated"], [])
+
+    def test_canonical_promotion_updates_selected_records_not_legacy_shadows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_cluster_test.spm"
+            spm.write_bytes(b"spm")
+            payload = {
+                "spm": str(spm),
+                "material_groups": [{
+                    "material": "M_leaf_test",
+                    "material_id": 17,
+                    "texture_contract_status":
+                        "source_fallback_needs_pcg_generation",
+                }],
+                "texture_contract_status":
+                    "source_fallback_needs_pcg_generation",
+            }
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / f"scope__{spm.stem}.json"
+            scope.write_text(json.dumps(payload), encoding="utf-8")
+            legacy = cluster / "speedtree_import_manifest_M_leaf_test.json"
+            legacy.write_text(json.dumps(payload), encoding="utf-8")
+            legacy_before = legacy.read_bytes()
+
+            canonical = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_leaf_test",
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": "17",
+                        "material_name": "M_leaf_test",
+                    }],
+                },
+                self._outputs(asset),
+                producer_source="test.sbs#T_leaf_test",
+            )
+
+            self.assertEqual(
+                json.loads(scope.read_text(encoding="utf-8"))[
+                    "texture_contract_status"
+                ],
+                "canonical_pcg_output",
+            )
+            self.assertEqual(legacy.read_bytes(), legacy_before)
+            result = refresh_atlas_manifests_for_spm(spm, canonical)
+            self.assertEqual(result["status"], "current")
+            self.assertEqual(
+                [row["path"] for row in result[
+                    "atlas_manifest_resolution"
+                ]["shadowed"]],
+                [str(legacy.resolve())],
+            )
 
     def test_atlas_scope_is_not_partially_promoted_between_texture_sets(self):
         with tempfile.TemporaryDirectory() as temporary:
