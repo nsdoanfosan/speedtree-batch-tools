@@ -257,6 +257,12 @@ class DeliveryClassificationTests(unittest.TestCase):
         self.assertEqual(
             evidence["stale_node_table_target_mesh_ids"], [130, 131]
         )
+        recovery = evidence["stale_node_table_recovery"]
+        self.assertEqual(recovery["mode"], "interactive_modeler_save_watch")
+        self.assertFalse(recovery["modeler_auto_save"])
+        self.assertFalse(recovery["direct_spm_xml_edit"])
+        self.assertTrue(recovery["requires_user_save"])
+        self.assertTrue(recovery["automatic_reaudit"])
 
     def test_an_independent_fault_keeps_the_original_reason(self):
         evidence = {
@@ -274,6 +280,10 @@ class DeliveryClassificationTests(unittest.TestCase):
             "generator_connection_contract_incomplete",
         )
         self.assertIsNone(evidence.get("delivery_remedy"))
+        self.assertEqual(
+            evidence["stale_node_table_recovery"]["mode"],
+            "interactive_modeler_save_watch",
+        )
 
     def test_unexplained_missing_mesh_id_keeps_the_original_reason(self):
         evidence = {

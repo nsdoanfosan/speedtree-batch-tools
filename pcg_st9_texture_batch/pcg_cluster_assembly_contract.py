@@ -1732,12 +1732,52 @@ def _stale_node_table_evidence(binding):
 
 
 STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
+STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
 STALE_NODE_TABLE_REMEDY = (
     "대상 SPM의 저장된 <Node> 테이블이 현재 Generator 그래프와 맞지 않습니다"
     " (없는 Generator에 노드가 남아 있음). Generator 연결 자체는 정상이며 export"
     " 참여 여부를 판정할 근거가 없는 상태입니다. SpeedTree Modeler에서 해당 SPM을"
     " 열고 다시 저장해 노드 테이블을 재생성한 뒤 다시 실행하세요."
 )
+
+
+def _stale_node_table_recovery_contract():
+    """Describe the safe recovery boundary without claiming unattended save."""
+    return {
+        "schema_version": 2,
+        "mode": STALE_NODE_TABLE_RECOVERY_MODE,
+        "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
+        "modeler_auto_save": False,
+        "modeler_process_kill": False,
+        "direct_spm_xml_edit": False,
+        "ui_input_simulation": False,
+        "automatic_rollback": False,
+        "requires_user_save": True,
+        "requires_exact_preimage_backup": True,
+        "requires_immutable_preimage_receipt": True,
+        "authoring_graph_projection_version": 1,
+        "watches_content_hash_change": True,
+        "requires_repeated_stat_size_sha_parse_quiescence": True,
+        "same_immutable_snapshot_crosschecks": [
+            "regex",
+            "xml.etree.ElementTree",
+            "target_delivery",
+            "normalization",
+        ],
+        "automatic_reaudit": True,
+        "stale_false_alone_allows_retry": False,
+        "source_sha_rechecked_before_continuation": True,
+        "continuation_scope": "initiating_job_generation_and_after_sha",
+        "continuation_once_only": True,
+        "queue_or_manifest_mutation_before_continuation": False,
+        "continuation_guards": [
+            "cancellation",
+            "app_open",
+            "job_generation_current",
+        ],
+        "retry_only_after_valid_reaudit": True,
+        "blocked_event_privacy": "asset_name_after_sha_reason_tokens_only",
+    }
 
 
 def _classify_stale_node_table_block(
@@ -1773,6 +1813,9 @@ def _classify_stale_node_table_block(
         # the stale table rather than an independent fault.
         consequences.add("normalized_and_live_target_mesh_sets_differ")
     evidence["stale_node_table_target_mesh_ids"] = sorted(stale_mesh_ids)
+    evidence["stale_node_table_recovery"] = (
+        _stale_node_table_recovery_contract()
+    )
     if errors <= consequences:
         evidence["delivery_reason"] = STALE_NODE_TABLE_REASON
         evidence["delivery_remedy"] = STALE_NODE_TABLE_REMEDY
@@ -1815,6 +1858,7 @@ def _normalized_delivery_blocked_issue(dependency):
         # the operator now gets the real cause and the fix.
         issue["code"] = "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
         issue["remedy"] = STALE_NODE_TABLE_REMEDY
+        issue["recovery"] = _stale_node_table_recovery_contract()
         issue["blocked_targets"] = stale_only_targets
     elif stale_evidence_targets:
         # Only part of the block is explained by stale node-table evidence.
@@ -1823,6 +1867,9 @@ def _normalized_delivery_blocked_issue(dependency):
         # Keep the generic code while carrying the stale subset and its fix.
         issue["stale_node_table_targets"] = stale_evidence_targets
         issue["stale_node_table_remedy"] = STALE_NODE_TABLE_REMEDY
+        issue["stale_node_table_recovery"] = (
+            _stale_node_table_recovery_contract()
+        )
     return issue
 
 
@@ -2522,6 +2569,9 @@ def _atlas_normalized_variants(
                     row.get("stale_node_table_target_mesh_ids") or []
                 ),
                 "live_node_table": row.get("live_node_table"),
+                "stale_node_table_recovery": row.get(
+                    "stale_node_table_recovery"
+                ),
             }
             for row in target_deliveries
             if row.get("delivery_decision") == "blocked"

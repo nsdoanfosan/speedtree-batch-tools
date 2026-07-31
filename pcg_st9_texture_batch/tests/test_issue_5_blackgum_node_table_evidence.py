@@ -1,0 +1,540 @@
+"""Validate the public, anonymized Issue #5 before/after evidence."""
+
+import json
+import re
+import sys
+import unittest
+import xml.etree.ElementTree as ET
+from collections import Counter
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+for candidate in (REPO_DIR, REPO_DIR / "pcg_st9_texture_batch"):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
+
+import pcg_texture_audit as audit  # noqa: E402
+
+FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "issue_5_blackgum_node_table_evidence.json"
+)
+SHA1_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+GUID_TOKEN_RE = re.compile(r"(?:current|orphan)-[0-9]{3}")
+RAW_UUID_RE = re.compile(
+    r"(?i)(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])"
+)
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![a-z])[a-z]:[\\/]")
+USER_HOME_PATH_RE = re.compile(r"(?i)(?:[\\/](?:users|home)[\\/])")
+
+
+def load_fixture():
+    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def captured_blocks(data):
+    for asset in data["stale_assets"]:
+        yield asset, "before", asset["before"]
+        yield asset, "after", asset["after"]
+
+
+def relationship_from_anonymized_evidence(before):
+    evidence = before["guid_ownership_evidence"]
+    current = set(evidence["current_generator_guid_tokens"])
+    eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+    eligible_owners = {
+        token for token, count in eligible_by_guid.items() if count > 0
+    }
+    orphan_owners = eligible_owners - current
+    return {
+        "current_generator_count": len(current),
+        "node_table_generator_count": len(eligible_owners),
+        "orphan_generator_guid_count": len(orphan_owners),
+        "orphan_node_count": sum(
+            eligible_by_guid[token] for token in orphan_owners
+        ),
+        "eligible_node_count": sum(eligible_by_guid.values()),
+        "total_node_count": before["total_node_count"],
+        "stale": bool(orphan_owners),
+    }
+
+
+def anonymized_replay_document(before):
+    """Build XML that preserves the public ownership relation only.
+
+    The extra serialized Nodes represented by ``total_node_count`` are made
+    hidden. They remain part of the total table size but are intentionally not
+    added to any eligible owner's count.
+    """
+    evidence = before["guid_ownership_evidence"]
+    current = evidence["current_generator_guid_tokens"]
+    eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+    generators = [
+        (
+            '<Generator Type="Leaf Mesh">'
+            f"<Name>{token}</Name><GUID>{token}</GUID><Hidden>false</Hidden>"
+            "<Properties></Properties></Generator>"
+        )
+        for token in current
+    ]
+    nodes = []
+    index = 0
+    for token, count in eligible_by_guid.items():
+        for _ in range(count):
+            nodes.append(
+                "<Node>"
+                f"<GeneratorGUID>{token}</GeneratorGUID>"
+                "<ParentGUID></ParentGUID>"
+                f"<Name>eligible-{index}</Name><GUID>node-{index}</GUID>"
+                "<Hidden>false</Hidden>"
+                "<Extra><m_bDeleted>false</m_bDeleted>"
+                "<m_bCulled>false</m_bCulled></Extra>"
+                "</Node>"
+            )
+            index += 1
+    ineligible_count = before["total_node_count"] - sum(
+        eligible_by_guid.values()
+    )
+    for _ in range(ineligible_count):
+        nodes.append(
+            "<Node>"
+            f"<GeneratorGUID>{current[0]}</GeneratorGUID>"
+            "<ParentGUID></ParentGUID>"
+            f"<Name>ineligible-{index}</Name><GUID>node-{index}</GUID>"
+            "<Hidden>true</Hidden>"
+            "<Extra><m_bDeleted>false</m_bDeleted>"
+            "<m_bCulled>false</m_bCulled></Extra>"
+            "</Node>"
+        )
+        index += 1
+    return (
+        '<?xml version="1.0"?><SpeedTree>'
+        f"<Generators>{''.join(generators)}</Generators>"
+        f"<Nodes>{''.join(nodes)}</Nodes>"
+        "</SpeedTree>"
+    )
+
+
+def elementtree_relationship(document_text):
+    """Independently recompute the relation without audit regex helpers."""
+    root = ET.fromstring(document_text)
+    current = {
+        (generator.findtext("GUID") or "").strip().casefold()
+        for generator in root.iter("Generator")
+    }
+    current.discard("")
+    eligible_by_guid = Counter()
+    total = 0
+    truthy = {"1", "true", "yes"}
+    for node in root.iter("Node"):
+        total += 1
+        guid = (node.findtext("GeneratorGUID") or "").strip().casefold()
+        hidden = (node.findtext("Hidden") or "").strip().casefold() in truthy
+        deleted = (
+            node.findtext("./Extra/m_bDeleted") or ""
+        ).strip().casefold() in truthy
+        culled = (
+            node.findtext("./Extra/m_bCulled") or ""
+        ).strip().casefold() in truthy
+        if guid and not hidden and not deleted and not culled:
+            eligible_by_guid[guid] += 1
+    eligible_owners = set(eligible_by_guid)
+    orphan_owners = eligible_owners - current
+    return {
+        "current_generator_guid_tokens": current,
+        "eligible_node_count_by_guid_token": dict(eligible_by_guid),
+        "current_generator_count": len(current),
+        "node_table_generator_count": len(eligible_owners),
+        "orphan_generator_guid_count": len(orphan_owners),
+        "orphan_node_count": sum(
+            eligible_by_guid[token] for token in orphan_owners
+        ),
+        "eligible_node_count": sum(eligible_by_guid.values()),
+        "total_node_count": total,
+        "stale": bool(orphan_owners),
+    }
+
+
+class FixtureContractTests(unittest.TestCase):
+    def test_fixture_uses_v2_contract_and_names_the_incomplete_closure(self):
+        data = load_fixture()
+        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(
+            data["contract"], "speedtree_blackgum_node_table_evidence_v2"
+        )
+        self.assertEqual(data["issue_number"], 5)
+        self.assertEqual(
+            data["result_status"]["summary"],
+            "pre-resave evidence valid / closure incomplete",
+        )
+        self.assertEqual(data["result_status"]["pre_resave_evidence"], "valid")
+        self.assertEqual(data["result_status"]["post_resave_evidence"], "valid")
+        self.assertEqual(
+            data["result_status"]["current_generator_membership_continuity"],
+            "unverified",
+        )
+        self.assertEqual(data["result_status"]["closure"], "incomplete")
+        self.assertEqual(len(data["result_status"]["closure_blockers"]), 2)
+        self.assertEqual(
+            data["audit_outcome"],
+            "pre_resave_evidence_valid_closure_incomplete",
+        )
+
+    def test_audit_repository_commit_and_contract_are_pinned(self):
+        provenance = load_fixture()["audit_repository"]
+        self.assertRegex(provenance["repository_commit"], rf"^{SHA1_RE.pattern}$")
+        self.assertEqual(len(provenance["repository_commit"]), 40)
+        self.assertRegex(
+            provenance["post_resave_audit_repository_commit"],
+            rf"^{SHA1_RE.pattern}$",
+        )
+        self.assertEqual(
+            provenance["snapshot_contract"],
+            "speedtree_live_generator_delivery_snapshot_v1",
+        )
+        self.assertEqual(
+            provenance["independent_crosscheck_contract"],
+            "python_xml_etree_elementtree_v1",
+        )
+
+    def test_public_fixture_has_no_absolute_path_username_or_raw_guid(self):
+        raw = FIXTURE_PATH.read_text(encoding="utf-8")
+        self.assertIsNone(WINDOWS_ABSOLUTE_PATH_RE.search(raw))
+        self.assertIsNone(USER_HOME_PATH_RE.search(raw))
+        self.assertIsNone(RAW_UUID_RE.search(raw))
+
+    def test_asset_paths_are_relative_filenames_only(self):
+        data = load_fixture()
+        assets = data["stale_assets"] + data["coherent_reference_assets"]
+        for asset in assets:
+            path = Path(asset["asset_relative_path"])
+            self.assertEqual(path.name, asset["asset_relative_path"])
+            self.assertFalse(path.is_absolute())
+            self.assertEqual(path.suffix, ".spm")
+
+
+class BeforeEvidenceRelationshipTests(unittest.TestCase):
+    def test_sha256_and_anonymized_guid_membership_are_complete(self):
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            self.assertRegex(before["spm_text_sha256"], rf"^{SHA256_RE.pattern}$")
+            evidence = before["guid_ownership_evidence"]
+            current = evidence["current_generator_guid_tokens"]
+            eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+            self.assertEqual(len(current), len(set(current)))
+            self.assertEqual(len(current), before["current_generator_count"])
+            self.assertTrue(set(current).issubset(eligible_by_guid))
+            for token, count in eligible_by_guid.items():
+                self.assertRegex(token, rf"^{GUID_TOKEN_RE.pattern}$")
+                self.assertIs(type(count), int)
+                self.assertGreaterEqual(count, 0)
+
+    def test_current_owner_orphan_and_stale_are_recomputed(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            recomputed = relationship_from_anonymized_evidence(before)
+            for field in fields:
+                self.assertEqual(
+                    recomputed[field],
+                    before[field],
+                    f"{asset['asset_id']}.before.{field}",
+                )
+
+    def test_total_node_count_is_not_conflated_with_eligible_owner_sum(self):
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            eligible_sum = sum(
+                before["guid_ownership_evidence"]
+                ["eligible_node_count_by_guid_token"].values()
+            )
+            self.assertEqual(eligible_sum, before["eligible_node_count"])
+            self.assertGreater(before["total_node_count"], eligible_sum)
+            self.assertEqual(before["total_node_count"] - eligible_sum, 1)
+
+    def test_recorded_elementtree_crosscheck_matches_primary_evidence(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            crosscheck = before["independent_elementtree_crosscheck"]
+            self.assertEqual(crosscheck["parser"], "xml.etree.ElementTree")
+            self.assertEqual(crosscheck["status"], "matched")
+            self.assertTrue(crosscheck["current_generator_guid_membership_match"])
+            self.assertTrue(crosscheck["per_guid_eligible_node_counts_match"])
+            for field in fields:
+                self.assertEqual(crosscheck[field], before[field])
+
+
+class AfterEvidenceRelationshipTests(unittest.TestCase):
+    def test_after_hash_counts_and_relationship_are_real(self):
+        for asset in load_fixture()["stale_assets"]:
+            before = asset["before"]
+            after = asset["after"]
+            self.assertEqual(
+                after["status"], "captured_membership_continuity_unverified"
+            )
+            self.assertTrue(after["resaved"])
+            self.assertTrue(after["pre_resave_hash_changed"])
+            self.assertNotEqual(before["spm_text_sha256"], after["spm_text_sha256"])
+            self.assertRegex(after["spm_text_sha256"], rf"^{SHA256_RE.pattern}$")
+            self.assertRegex(
+                after["audit_repository_commit"], rf"^{SHA1_RE.pattern}$"
+            )
+            recomputed = relationship_from_anonymized_evidence(after)
+            for field, value in recomputed.items():
+                self.assertEqual(value, after[field])
+            self.assertEqual(after["orphan_generator_guid_count"], 0)
+            self.assertEqual(after["orphan_node_count"], 0)
+            self.assertFalse(after["stale"])
+
+    def test_after_elementtree_crosscheck_matches_primary_evidence(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset in load_fixture()["stale_assets"]:
+            after = asset["after"]
+            crosscheck = after["independent_elementtree_crosscheck"]
+            self.assertEqual(crosscheck["status"], "matched")
+            self.assertTrue(crosscheck["current_generator_guid_membership_match"])
+            self.assertTrue(crosscheck["per_guid_eligible_node_counts_match"])
+            for field in fields:
+                self.assertEqual(crosscheck[field], after[field])
+
+    def test_membership_continuity_is_an_explicit_closure_gate(self):
+        for asset in load_fixture()["stale_assets"]:
+            continuity = asset["after"]["membership_continuity"]
+            self.assertEqual(continuity["status"], "unverified")
+            self.assertFalse(continuity["exact_pre_hash_backup_available"])
+            self.assertGreater(continuity["matching_pre_state_backup_count"], 0)
+            self.assertEqual(
+                continuity["matching_pre_state_membership_variant_count"], 1
+            )
+            self.assertFalse(
+                continuity["after_matches_matching_pre_state_membership"]
+            )
+            self.assertEqual(continuity["closure_gate"], "blocked")
+
+    def test_total_and_eligible_counts_remain_separate_after_resave(self):
+        for asset in load_fixture()["stale_assets"]:
+            after = asset["after"]
+            self.assertEqual(
+                after["eligible_node_count"],
+                sum(
+                    after["guid_ownership_evidence"]
+                    ["eligible_node_count_by_guid_token"].values()
+                ),
+            )
+            self.assertEqual(
+                after["total_node_count"] - after["eligible_node_count"], 1
+            )
+
+
+class IndependentParserReplayTests(unittest.TestCase):
+    def test_elementtree_replays_membership_counts_and_relationship(self):
+        fields = (
+            "current_generator_count",
+            "node_table_generator_count",
+            "orphan_generator_guid_count",
+            "orphan_node_count",
+            "eligible_node_count",
+            "total_node_count",
+            "stale",
+        )
+        for asset, label, capture in captured_blocks(load_fixture()):
+            evidence = capture["guid_ownership_evidence"]
+            result = elementtree_relationship(anonymized_replay_document(capture))
+            self.assertEqual(
+                result["current_generator_guid_tokens"],
+                set(evidence["current_generator_guid_tokens"]),
+            )
+            replay_counts = {
+                token: result["eligible_node_count_by_guid_token"].get(token, 0)
+                for token in evidence["eligible_node_count_by_guid_token"]
+            }
+            self.assertEqual(
+                replay_counts, evidence["eligible_node_count_by_guid_token"]
+            )
+            for field in fields:
+                self.assertEqual(
+                    result[field],
+                    capture[field],
+                    f"{asset['asset_id']}.{label}.{field}",
+                )
+
+    def test_committed_regex_policy_replays_the_same_relation(self):
+        for asset, label, capture in captured_blocks(load_fixture()):
+            text = anonymized_replay_document(capture)
+            counts, total = audit._export_node_counts_from_text(text)
+            state = audit._node_table_state(
+                counts, total, audit._generator_guid_keys_from_text(text)
+            )
+            recomputed = relationship_from_anonymized_evidence(capture)
+            self.assertEqual(state["generator_count"], recomputed["current_generator_count"])
+            self.assertEqual(
+                state["node_table_generator_count"],
+                recomputed["node_table_generator_count"],
+            )
+            self.assertEqual(
+                len(state["orphan_generator_guids"]),
+                recomputed["orphan_generator_guid_count"],
+            )
+            self.assertEqual(state["orphan_node_count"], recomputed["orphan_node_count"])
+            self.assertEqual(state["total_node_count"], capture["total_node_count"])
+            self.assertEqual(sum(counts.values()), capture["eligible_node_count"])
+            self.assertEqual(
+                state["stale"],
+                capture["stale"],
+                f"{asset['asset_id']}.{label}.stale",
+            )
+
+
+class TargetBindingAndDeliveryTests(unittest.TestCase):
+    def test_target_bindings_are_current_zero_count_stale_evidence(self):
+        data = load_fixture()
+        expected_mesh_ids = set(data["delivery_context"]["declared_target_mesh_ids"])
+        result = data["delivery_context"]["target_binding_result_before_resave"]
+        self.assertTrue(result["all_required_mesh_ids_have_current_graph_bindings"])
+        self.assertTrue(result["all_observed_bindings_graph_visible"])
+        self.assertEqual(result["eligible_node_count_per_observed_binding"], 0)
+        self.assertFalse(result["all_observed_bindings_export_participate"])
+        self.assertEqual(result["export_evidence"], "node_table_stale")
+        for asset in data["stale_assets"]:
+            before = asset["before"]
+            evidence = before["guid_ownership_evidence"]
+            current = set(evidence["current_generator_guid_tokens"])
+            eligible_by_guid = evidence["eligible_node_count_by_guid_token"]
+            bindings = before["target_bindings"]
+            self.assertEqual({row["mesh_id"] for row in bindings}, expected_mesh_ids)
+            for row in bindings:
+                self.assertIn(row["guid_token"], current)
+                self.assertEqual(eligible_by_guid[row["guid_token"]], 0)
+
+    def test_delivery_result_is_blocked_by_stale_evidence_not_disconnection(self):
+        data = load_fixture()
+        context = data["delivery_context"]
+        result = context["delivery_result_before_resave"]
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertEqual(result["delivery_reason"], data["parser"]["stale_delivery_reason"])
+        self.assertEqual(result["delivery_error"], data["parser"]["stale_delivery_error"])
+        self.assertEqual(result["live_export_participating_target_mesh_ids"], [])
+        self.assertEqual(result["downstream_effect"], "dependency_blocked")
+        after = context["delivery_result_after_resave"]
+        self.assertEqual(after["status"], "live_snapshot_target_delivery_valid")
+        self.assertEqual(
+            after["live_export_participating_target_mesh_ids"],
+            context["declared_target_mesh_ids"],
+        )
+        self.assertTrue(after["all_observed_bindings_export_participate"])
+        self.assertEqual(after["export_evidence"], "node_table")
+        self.assertFalse(after["cluster_normalization_rerun"])
+        self.assertFalse(after["unreal_push_rerun"])
+
+    def test_after_target_bindings_have_positive_current_node_evidence(self):
+        data = load_fixture()
+        expected_mesh_ids = set(data["delivery_context"]["declared_target_mesh_ids"])
+        for asset in data["stale_assets"]:
+            after = asset["after"]
+            ownership = after["guid_ownership_evidence"]
+            current = set(ownership["current_generator_guid_tokens"])
+            eligible_by_guid = ownership["eligible_node_count_by_guid_token"]
+            bindings = after["target_bindings"]
+            self.assertEqual({row["mesh_id"] for row in bindings}, expected_mesh_ids)
+            for row in bindings:
+                self.assertIn(row["guid_token"], current)
+                self.assertGreater(eligible_by_guid[row["guid_token"]], 0)
+                self.assertEqual(
+                    row["eligible_node_count"],
+                    eligible_by_guid[row["guid_token"]],
+                )
+                self.assertTrue(row["graph_visible"])
+                self.assertTrue(row["export_participates"])
+                self.assertEqual(row["export_evidence"], "node_table")
+                self.assertFalse(row["node_table_stale"])
+
+
+class IncompleteClosureTests(unittest.TestCase):
+    def test_user_resave_action_is_recorded_without_invented_version(self):
+        data = load_fixture()
+        tool = data["resave_tool"]
+        self.assertTrue(tool["executed"])
+        self.assertEqual(tool["performed_by"], "user")
+        self.assertEqual(
+            tool["action"],
+            "Opened both operating SPMs in Modeler, recalculated the current "
+            "graph, and saved them.",
+        )
+        self.assertIsNone(tool["version"])
+        self.assertIsNone(data["resave_tool"]["executed_utc"])
+        self.assertIn("not independently observed", tool["verification_scope"])
+
+    def test_acceptance_separates_live_snapshot_from_end_to_end_reruns(self):
+        data = load_fixture()
+        items = {row["item"]: row for row in data["completion_checklist"]}
+        self.assertEqual(
+            items["both_affected_spms_report_zero_orphan_node_ownership"]["status"],
+            "verified",
+        )
+        self.assertEqual(
+            items[
+                "required_current_generator_guids_receive_valid_live_export_evidence"
+            ]["status"],
+            "verified",
+        )
+        self.assertEqual(
+            items[
+                "live_export_participating_target_mesh_ids_equals_normalized_declared_set"
+            ]["status"],
+            "verified_live_snapshot",
+        )
+        self.assertEqual(
+            items[
+                "stale_node_table_validation_block_no_longer_occurs_after_resave"
+            ]["status"],
+            "pending",
+        )
+        after_delivery = data["delivery_context"]["delivery_result_after_resave"]
+        self.assertFalse(after_delivery["cluster_normalization_rerun"])
+        self.assertFalse(after_delivery["unreal_push_rerun"])
+
+    def test_issue_outcome_stays_incomplete(self):
+        data = load_fixture()
+        self.assertEqual(data["result_status"]["closure"], "incomplete")
+        self.assertEqual(
+            data["audit_outcome"],
+            "pre_resave_evidence_valid_closure_incomplete",
+        )
+        for asset in data["stale_assets"]:
+            self.assertEqual(
+                asset["audit_outcome"],
+                "pre_resave_evidence_valid_closure_incomplete",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
