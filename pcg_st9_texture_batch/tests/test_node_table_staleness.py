@@ -19,8 +19,11 @@ for candidate in (REPO_DIR, REPO_DIR / "pcg_st9_texture_batch"):
 
 import pcg_texture_audit as audit  # noqa: E402
 from pcg_cluster_assembly_contract import (  # noqa: E402
+    DELIVERY_MODE_CONNECTION_INCOMPLETE,
     STALE_NODE_TABLE_REASON,
     _classify_stale_node_table_block,
+    _normalized_generator_delivery,
+    _normalized_delivery_blocked_issue,
     _stale_node_table_evidence,
 )
 
@@ -60,6 +63,74 @@ def bindings_for(text):
     counts, total = audit._export_node_counts_from_text(text)
     return audit._leaf_generator_bindings_from_text(
         text, export_node_counts=counts, total_nodes=total
+    )
+
+
+def delivery_binding():
+    return {
+        "state": "already_connected",
+        "generator_index": 0,
+        "generator_name": "Leaf",
+        "generator_guid": "leaf",
+        "generator_type": "Leaf Mesh",
+        "slot_prefix": "Leaves",
+        "target_material_id": 4,
+        "target_mesh_id": 130,
+    }
+
+
+def delivery_payload():
+    return {
+        "generator_connection": {
+            "requested": True,
+            "complete": True,
+            "generator_variant_policy": "ensure_all_material_cutouts",
+            "bindings": [delivery_binding()],
+        },
+    }
+
+
+def live_binding(*, stale=False):
+    return {
+        "generator_index": 0,
+        "generator_name": "Leaf",
+        "generator_guid": "leaf",
+        "generator_type": "Leaf Mesh",
+        "slot_prefix": "Leaves",
+        "material_id": "4",
+        "mesh_id": "130",
+        "visible": not stale,
+        "graph_visible": True,
+        "generated_node_count": 0 if stale else 1,
+        "export_participates": not stale,
+        "export_evidence": "node_table_stale" if stale else "node_table",
+        "node_table_stale": stale,
+    }
+
+
+def live_snapshot(spm, rows, *, stale=False):
+    return {
+        "contract": "speedtree_live_generator_delivery_snapshot_v1",
+        "spm": str(Path(spm).resolve(strict=False)),
+        "spm_text_sha256": "a" * 64,
+        "total_node_count": 1,
+        "leaf_generator_bindings": list(rows),
+        "mesh_asset_ids": [130],
+        "node_table": {
+            "stale": stale,
+            "orphan_generator_guids": ["removed"] if stale else [],
+            "orphan_node_count": 1 if stale else 0,
+        },
+    }
+
+
+def classify_delivery(audit):
+    return _normalized_generator_delivery(
+        audit,
+        "SK_test.spm",
+        delivery_payload(),
+        {"material_id": 4},
+        [{"target_mesh_id": 130}],
     )
 
 
@@ -232,6 +303,180 @@ class DeliveryClassificationTests(unittest.TestCase):
             "generator_connection_contract_incomplete",
         )
         self.assertNotIn("stale_node_table_target_mesh_ids", evidence)
+
+
+class ExistingFailClosedPathTests(unittest.TestCase):
+    def assert_generic_block(self, delivery, expected_error):
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_CONNECTION_INCOMPLETE,
+        )
+        self.assertEqual(delivery["delivery_decision"], "blocked")
+        self.assertEqual(
+            delivery["delivery_reason"],
+            "generator_connection_contract_incomplete",
+        )
+        self.assertIn(expected_error, delivery["errors"])
+        self.assertNotIn(
+            "generator_export_evidence_stale_node_table",
+            delivery["errors"],
+        )
+        self.assertIsNone(delivery["delivery_remedy"])
+        self.assertNotIn("stale_node_table_target_mesh_ids", delivery)
+        issue = _normalized_delivery_blocked_issue({
+            "role": "leaf",
+            "spm": delivery["spm"],
+            "normalized_delivery_mode": delivery["delivery_mode"],
+            "normalized_variants": {
+                "delivery_blocked_targets": [delivery],
+                "delivery_errors": delivery["errors"],
+            },
+        })
+        self.assertEqual(
+            issue["code"],
+            "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+        )
+        self.assertIn(expected_error, issue["errors"])
+        self.assertNotIn("remedy", issue)
+        self.assertNotIn("stale_node_table_targets", issue)
+
+    def test_missing_live_slot_keeps_the_missing_cause_even_if_table_is_stale(
+        self,
+    ):
+        class MissingSlotAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return live_snapshot(spm, [], stale=True)
+
+        delivery = classify_delivery(MissingSlotAudit)
+
+        self.assert_generic_block(delivery, "visible_generator_slot_missing")
+        self.assertEqual(len(delivery["missing_live_bindings"]), 1)
+        mismatch = next(
+            row for row in delivery["binding_mismatches"]
+            if "visible_generator_slot_missing" in row.get("errors", ())
+        )
+        self.assertIsNone(mismatch["current"])
+        self.assertTrue(delivery["live_node_table"]["stale"])
+
+    def test_ambiguous_live_slot_keeps_the_ambiguous_cause_under_stale_evidence(
+        self,
+    ):
+        duplicate = live_binding(stale=True)
+
+        class AmbiguousSlotAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return live_snapshot(
+                    spm,
+                    [duplicate, dict(duplicate)],
+                    stale=True,
+                )
+
+        delivery = classify_delivery(AmbiguousSlotAudit)
+
+        self.assert_generic_block(delivery, "visible_generator_slot_ambiguous")
+        self.assertEqual(delivery["missing_live_bindings"], [])
+        mismatch = next(
+            row for row in delivery["binding_mismatches"]
+            if "visible_generator_slot_ambiguous" in row.get("errors", ())
+        )
+        self.assertIsNone(mismatch["current"])
+        self.assertTrue(delivery["live_node_table"]["stale"])
+
+    def test_unavailable_audit_keeps_its_cause_and_fails_closed(self):
+        delivery = classify_delivery(None)
+
+        self.assert_generic_block(
+            delivery,
+            "production_spm_live_audit_unavailable",
+        )
+        self.assertEqual(
+            delivery["errors"],
+            ["production_spm_live_audit_unavailable"],
+        )
+        self.assertIsNone(delivery["live_node_table"])
+
+
+class NormalizedDeliveryBlockedIssueTests(unittest.TestCase):
+    @staticmethod
+    def blocked_target(spm, *, stale):
+        return {
+            "spm": spm,
+            "delivery_reason": (
+                STALE_NODE_TABLE_REASON if stale else "some_other_reason"
+            ),
+        }
+
+    def dependency(self, blocked_targets, errors=()):
+        return {
+            "role": "leaf",
+            "spm": "SK_bush_blackgum_02.spm",
+            "normalized_delivery_mode": "connection_incomplete",
+            "normalized_variants": {
+                "delivery_blocked_targets": blocked_targets,
+                "delivery_errors": list(errors),
+            },
+        }
+
+    def test_fully_stale_block_is_renamed_with_a_remedy(self):
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=True),
+            self.blocked_target("b.spm", stale=True),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_NODE_TABLE_STALE")
+        self.assertTrue(issue["remedy"])
+        self.assertEqual(len(issue["blocked_targets"]), 2)
+        self.assertNotIn("stale_node_table_targets", issue)
+
+    def test_partially_stale_block_keeps_its_code_but_still_reports_the_remedy(
+        self,
+    ):
+        # Production shape: one target is blocked by a stale node table, a
+        # second is blocked by an independent, real fault. The code must not
+        # be renamed to the stale-only reason, but the stale subset and its
+        # fix must not silently disappear either.
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=True),
+            self.blocked_target("b.spm", stale=False),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertNotIn("remedy", issue)
+        self.assertEqual(len(issue["stale_node_table_targets"]), 1)
+        self.assertEqual(
+            issue["stale_node_table_targets"][0]["spm"], "a.spm"
+        )
+        self.assertTrue(issue["stale_node_table_remedy"])
+
+    def test_no_stale_target_reports_neither_stale_field(self):
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=False),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertNotIn("remedy", issue)
+        self.assertNotIn("stale_node_table_targets", issue)
+        self.assertNotIn("stale_node_table_remedy", issue)
+
+    def test_one_target_with_mixed_faults_keeps_stale_subset_and_remedy(self):
+        target = self.blocked_target("a.spm", stale=False)
+        target["stale_node_table_target_mesh_ids"] = [130]
+        target["errors"] = [
+            "generator_export_evidence_stale_node_table",
+            "visible_generator_slot_missing",
+        ]
+        issue = _normalized_delivery_blocked_issue(
+            self.dependency([target], errors=target["errors"])
+        )
+        self.assertEqual(
+            issue["code"],
+            "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+        )
+        self.assertNotIn("remedy", issue)
+        self.assertEqual(issue["stale_node_table_targets"], [target])
+        self.assertTrue(issue["stale_node_table_remedy"])
 
 
 if __name__ == "__main__":
