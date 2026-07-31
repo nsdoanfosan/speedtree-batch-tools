@@ -30,6 +30,33 @@ jobs:
         with:
           python-version: '3.10'
 
+      # A subset of the suites loads the central SpeedTree policy module from
+      # the substance-tools repository. It is checked out under work/ because
+      # the compile gate ignores that directory, so vendoring it here cannot
+      # change the production source revision the audit children verify.
+      #
+      # It is pinned to a branch, not main: speedtree_handoff_contract.py and
+      # speedtree_handoff_vectors.json exist only on
+      # bake-selection-and-painter-handoff. Until that lands on substance-tools
+      # main, this repository's tests depend on an unmerged branch of another
+      # repository -- which is why they passed only on a machine that happened
+      # to have it checked out.
+      - uses: actions/checkout@v4
+        with:
+          repository: nsdoanfosan/substance-tools
+          ref: bake-selection-and-painter-handoff
+          path: work/substance-tools
+
+      - name: point at the shared contract
+        shell: pwsh
+        run: |
+          $contract = Join-Path $env:GITHUB_WORKSPACE 'work\substance-tools\pipeline_contract.json'
+          if (-not (Test-Path $contract)) {
+            Write-Host "::error::pipeline_contract.json missing at $contract"
+            exit 1
+          }
+          "SUBSTANCE_TOOLS_PIPELINE_CONTRACT=$contract" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # Production code imports PIL lazily and there is no requirements file,
       # but test_pcg_texture_batch / test_pcg_step3_freshness import Pillow and
       # test_pipeline_plan_cli / test_push_dependency_schedule import pytest at
