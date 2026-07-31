@@ -1,0 +1,82 @@
+name: tests
+
+# The compile gate and the unit suites need no assets, no SpeedTree/Blender/
+# Unreal, and no third-party packages: every PIL import in the tree is
+# function-level, and there is no requirements file. So this runs on a clean
+# Windows runner with nothing but the standard library and tkinter.
+#
+# Windows is not incidental. The queue's liveness probe, the Job Object
+# process ownership in process_stream, and the %LOCALAPPDATA% cache paths are
+# all ctypes/OS specific, so a POSIX runner would skip the parts most worth
+# checking.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # Fails in about a second on a syntax break or a contract drift, and
+      # prints the production source revision the audit children verify
+      # against, so a mismatch is visible here rather than mid-batch.
+      - name: compile gate
+        run: python sk_batch/code_compile_gate.py
+
+      # Discovered rather than listed, so adding or renaming a suite needs no
+      # change to this file. Every directory named `tests` is a suite; the
+      # discovery root is its parent so the flat imports the suites rely on
+      # keep working.
+      - name: unit suites
+        shell: pwsh
+        run: |
+          $failed = @()
+          $total = 0
+          Get-ChildItem -Recurse -Directory -Filter tests |
+            Where-Object { $_.FullName -notmatch '__pycache__' } |
+            Sort-Object FullName |
+            ForEach-Object {
+              $rel = Resolve-Path -Relative $_.FullName
+              Write-Host "::group::$rel"
+              $out = & python -m unittest discover -s $rel 2>&1 | Out-String
+              Write-Host $out
+              Write-Host "::endgroup::"
+              if ($LASTEXITCODE -ne 0) { $failed += $rel }
+              $m = [regex]::Match($out, 'Ran (\d+) test')
+              if ($m.Success) { $total += [int]$m.Groups[1].Value }
+            }
+          Write-Host "총 $total tests"
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::failed suites: $($failed -join ', ')"
+            exit 1
+          }
+
+      # Byte-compiling the packages catches a source file that no suite
+      # imports; `-q` keeps the log to actual errors.
+      - name: compileall
+        run: python -m compileall -q batch_ui_common cluster_card_pipeline pcg_st9_texture_batch sk_batch spm_generator_sync
+
+      # A tracked file left modified means a test wrote into the checkout,
+      # which would make results order-dependent.
+      - name: no working-tree side effects
+        shell: pwsh
+        run: |
+          $dirty = git status --porcelain
+          if ($dirty) {
+            Write-Host "::error::tests modified tracked files:`n$dirty"
+            exit 1
+          }
