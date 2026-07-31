@@ -2751,6 +2751,145 @@ class PushQueueFlowTests(unittest.TestCase):
             app.state[str(root)]["push_status_error"]["message"],
         )
 
+    def test_cached_manifest_item_finds_recovered_item_after_provider(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "recovery.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "items": [
+                            {"queue_id": "provider", "fingerprint": "provider-v2"},
+                            {"queue_id": "tree", "fingerprint": "tree-v2"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            app.state["tree"] = {
+                "push_export_cache": {
+                    "source_fingerprint": "source-v2",
+                    "manifest": str(manifest_path),
+                    "fingerprint": "tree-v2",
+                }
+            }
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ):
+                item = app._cached_manifest_item("tree", "source-v2")
+
+        self.assertEqual(item["queue_id"], "tree")
+
+    def test_failed_unreal_recovery_never_calls_blender_export(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {}
+        app._active_production_source_manifest = mock.Mock(
+            content_hash="production-v2"
+        )
+        provider = {
+            "schema_version": 1,
+            "queue_id": "provider.spm",
+            "source_fingerprint": "provider-source-v1",
+            "fingerprint": "provider-item-v1",
+            "blend": "provider.blend",
+            "depends_on_queue_ids": [],
+        }
+        tree = {
+            "schema_version": 1,
+            "queue_id": "tree.spm",
+            "source_fingerprint": "tree-source-v1",
+            "fingerprint": "tree-item-v1",
+            "blend": "tree.blend",
+            "depends_on_queue_ids": ["provider.spm"],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent_path = Path(temp_dir) / "parent.json"
+            parent_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "report_path": str(Path(temp_dir) / "parent_report.json"),
+                        "items": [provider, tree],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            request = {
+                "parent_manifest": str(parent_path),
+                "parent_report": str(Path(temp_dir) / "parent_report.json"),
+                "selected_queue_ids": ["tree.spm"],
+                "source_records": {
+                    "provider.spm": {
+                        "fingerprint": "provider-source-v1",
+                        "snapshot": {},
+                    },
+                    "tree.spm": {
+                        "fingerprint": "tree-source-v1",
+                        "snapshot": {},
+                    },
+                },
+            }
+
+            def recovered(parent_item, **kwargs):
+                result = dict(parent_item)
+                result.update(
+                    {
+                        "source_fingerprint": "current-source",
+                        "fingerprint": parent_item["queue_id"] + "-v2",
+                        "verify_existing_assets": not kwargs["selected"],
+                        "recovery": {
+                            "parent_manifest": str(parent_path),
+                            "old_code_revision": "old",
+                            "new_code_revision": "new",
+                        },
+                    }
+                )
+                return result
+
+            app._push_unreal_code_paths = mock.Mock(return_value=[])
+            app._push_rebindable_unreal_code_paths = mock.Mock(return_value=[])
+            app._source_push_fingerprint = mock.Mock(return_value="current-source")
+            app._run_headless_import_items = mock.Mock(return_value=True)
+            app._export_manifest_item = mock.Mock(
+                side_effect=AssertionError("recovery must not run Blender export")
+            )
+            app.state = {
+                "provider.spm": {
+                    "push_source_fingerprint_cache": {
+                        "fingerprint": "current-source",
+                        "snapshot": {},
+                    }
+                },
+                "tree.spm": {
+                    "push_source_fingerprint_cache": {
+                        "fingerprint": "current-source",
+                        "snapshot": {},
+                    }
+                },
+            }
+            with mock.patch.object(
+                gui, "recover_manifest_item", side_effect=recovered
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_failed_unreal_recovery(
+                    [{"spm": Path("tree.spm"), "checked": True}],
+                    [request],
+                    emit_done=False,
+                )
+
+        self.assertTrue(result)
+        app._export_manifest_item.assert_not_called()
+        pending = app._run_headless_import_items.call_args.args[0]
+        self.assertEqual(
+            [item["queue_id"] for item in pending],
+            ["provider.spm", "tree.spm"],
+        )
+        self.assertTrue(pending[0]["verify_existing_assets"])
+        self.assertFalse(pending[1]["verify_existing_assets"])
+
 
 if __name__ == "__main__":
     unittest.main()
