@@ -884,7 +884,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertTrue(completed)
         self.assertEqual(
             [call.args[0] for call in app._run_batch.call_args_list],
-            ["spm", "blender", "push"],
+            ["blender", "push"],
         )
         self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
 
@@ -1334,24 +1334,36 @@ class PushQueueFlowTests(unittest.TestCase):
     def test_full_pipeline_does_not_forward_failed_items_to_later_phases(self):
         gui = load_gui_module()
         app = self.make_app(gui)
-        targets = self.targets("SK_bad_spm.spm", "SK_bad_blend.spm", "SK_good.spm")
+        cluster_spm = Path("Tree_test") / "Cluster" / "SK_bad_spm.spm"
+        bad_blend = Path("Tree_test") / "SK_bad_blend.spm"
+        good = Path("Tree_test") / "SK_good.spm"
+        targets = [
+            {"spm": cluster_spm, "checked": True},
+            {"spm": bad_blend, "checked": True},
+            {"spm": good, "checked": True},
+        ]
         calls = []
 
         def fake_batch(phase, phase_targets, emit_done=False):
             calls.append((phase, [item["spm"].name for item in phase_targets]))
             if phase == "spm":
-                app._phase_failed_items = {"SK_bad_spm.spm"}
+                app._phase_failed_items = {str(cluster_spm)}
             elif phase == "blender":
-                app._phase_failed_items = {"SK_bad_blend.spm"}
+                app._phase_failed_items = {str(bad_blend)}
             else:
                 app._phase_failed_items = set()
             app._phase_abort_reason = None
             return True
 
         app._run_batch = mock.Mock(side_effect=fake_batch)
-        app._run_full_pipeline(targets)
+        with mock.patch.object(
+            gui,
+            "expand_blender_repair_targets",
+            return_value=(targets, {}, set()),
+        ):
+            app._run_full_pipeline(targets)
 
-        self.assertEqual(calls[0][1], ["SK_bad_spm.spm", "SK_bad_blend.spm", "SK_good.spm"])
+        self.assertEqual(calls[0][1], ["SK_bad_spm.spm"])
         self.assertEqual(calls[1][1], ["SK_bad_blend.spm", "SK_good.spm"])
         self.assertEqual(calls[2][1], ["SK_good.spm"])
         final_progress = [
@@ -1408,7 +1420,6 @@ class PushQueueFlowTests(unittest.TestCase):
             [
                 ("spm", [cluster_spm]),
                 ("blender", [cluster_spm]),
-                ("spm", [tree_spm]),
                 ("blender", [tree_spm]),
                 ("push", [cluster_spm, tree_spm]),
             ],

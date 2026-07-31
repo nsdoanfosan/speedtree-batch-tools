@@ -3518,9 +3518,6 @@ class App:
                     )
                 )
         if downstream_targets:
-            schedule.append(
-                ("spm", downstream_targets, "Tree ① SPM 본 세팅")
-            )
             if terminal_phase in {"blender", "push"}:
                 schedule.append(
                     (

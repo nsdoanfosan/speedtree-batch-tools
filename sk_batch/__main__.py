@@ -12,7 +12,12 @@ import json
 import sys
 from pathlib import Path
 
-from .code_compile_gate import CompileGateError, run_gate
+from .code_compile_gate import (
+    CompileGateError,
+    production_source_manifest,
+    run_gate,
+    validate_production_source_manifest,
+)
 from .pipeline_plan import (
     PLAN_PHASES,
     PipelinePlanInputError,
@@ -94,15 +99,27 @@ def main(argv=None):
         parser.error("explicit --plan-only is required")
 
     try:
+        repo_root = Path(__file__).resolve().parents[1]
+        started_manifest = production_source_manifest(repo_root)
         gate = run_gate(
-            Path(__file__).resolve().parents[1],
+            repo_root,
             Path(__file__).resolve().with_name("sk_batch_gui.pyw"),
+        )
+        validate_production_source_manifest(
+            started_manifest,
+            gate.production_source_manifest,
+            label="Planner compile-gate production source",
         )
         plan = build_pipeline_plan(
             args.root,
             phase=args.phase,
             targets=args.target,
             indexes=args.index,
+        )
+        validate_production_source_manifest(
+            started_manifest,
+            production_source_manifest(repo_root),
+            label="Planner final production source",
         )
     except (CompileGateError, PipelinePlanInputError) as exc:
         print(f"SK Batch plan failed: {exc}", file=sys.stderr)

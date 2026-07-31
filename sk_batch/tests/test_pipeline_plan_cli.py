@@ -410,12 +410,21 @@ def test_cli_emits_compile_revision_and_never_imports_gui(
     capsys,
 ):
     revision = "1" * 64
+    manifest = SimpleNamespace(content_hash=revision)
     gate = SimpleNamespace(
         source_count=10,
         contract_count=3,
-        production_source_manifest=SimpleNamespace(
-            content_hash=revision,
-        ),
+        production_source_manifest=manifest,
+    )
+    monkeypatch.setattr(
+        cli,
+        "production_source_manifest",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_production_source_manifest",
+        lambda *_args, **_kwargs: manifest,
     )
     monkeypatch.setattr(cli, "run_gate", lambda *_args, **_kwargs: gate)
     monkeypatch.setattr(
@@ -444,3 +453,60 @@ def test_cli_emits_compile_revision_and_never_imports_gui(
     assert "sk_batch_gui" not in source
     assert "SharedQueueRuntime" not in source
     assert "tkinter" not in source
+
+
+def test_cli_rejects_source_drift_after_plan(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    started = SimpleNamespace(content_hash="1" * 64)
+    changed = SimpleNamespace(content_hash="2" * 64)
+    manifests = iter((started, changed))
+    gate = SimpleNamespace(
+        source_count=10,
+        contract_count=3,
+        production_source_manifest=started,
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "production_source_manifest",
+        lambda *_args, **_kwargs: next(manifests),
+    )
+
+    def validate(expected, actual, *, label):
+        if expected.content_hash != actual.content_hash:
+            raise cli.CompileGateError(
+                f"{label} revision mismatch"
+            )
+        return actual
+
+    monkeypatch.setattr(
+        cli,
+        "validate_production_source_manifest",
+        validate,
+    )
+    monkeypatch.setattr(cli, "run_gate", lambda *_args, **_kwargs: gate)
+    monkeypatch.setattr(
+        cli,
+        "build_pipeline_plan",
+        lambda *_args, **_kwargs: {
+            "kind": pipeline_plan.PLAN_KIND,
+            "schema_version": pipeline_plan.PLAN_SCHEMA_VERSION,
+            "mode": "plan_only",
+            "status": "ready",
+        },
+    )
+
+    assert cli.main([
+        "--plan-only",
+        "--root",
+        str(tmp_path),
+        "--phase",
+        "spm",
+        "--compact",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Planner final production source revision mismatch" in captured.err
