@@ -290,6 +290,12 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             "authored-two",
             1,
         )
+        mixed_tail_a = self.before.replace(
+            "<AuthoredValue>preserve</AuthoredValue>",
+            "<AuthoredValue>preserve</AuthoredValue>authored-one",
+            1,
+        )
+        mixed_tail_b = mixed_tail_a.replace("authored-one", "authored-two", 1)
         for name, left, right in (
             ("GUID-like authored tag", authored_guid_a, authored_guid_b),
             ("authored float", authored_float_a, authored_float_b),
@@ -311,6 +317,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 processing_instruction_a,
                 processing_instruction_b,
             ),
+            ("mixed-content tail", mixed_tail_a, mixed_tail_b),
         ):
             with self.subTest(name=name):
                 self.assertNotEqual(project(left), project(right))

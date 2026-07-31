@@ -1079,7 +1079,7 @@ def _v4_projected_subtree(element, path=(), *, truthy_value=False):
         else ""
     )
     child_truthy = property_name.casefold() == "random seeds:style"
-    return {
+    projected = {
         "tag": element_tag,
         "attributes": sorted(attributes),
         "text": text,
@@ -1092,6 +1092,10 @@ def _v4_projected_subtree(element, path=(), *, truthy_value=False):
             for child in _v4_ordered_children(element, path)
         ],
     }
+    tail = str(element.tail or "").strip()
+    if tail:
+        projected["tail"] = tail
+    return projected
 
 
 def _authoring_graph_core_projection(text):
