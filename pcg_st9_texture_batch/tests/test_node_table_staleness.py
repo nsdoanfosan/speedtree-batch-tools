@@ -21,6 +21,7 @@ import pcg_texture_audit as audit  # noqa: E402
 from pcg_cluster_assembly_contract import (  # noqa: E402
     STALE_NODE_TABLE_REASON,
     _classify_stale_node_table_block,
+    _normalized_delivery_blocked_issue,
     _stale_node_table_evidence,
 )
 
@@ -232,6 +233,69 @@ class DeliveryClassificationTests(unittest.TestCase):
             "generator_connection_contract_incomplete",
         )
         self.assertNotIn("stale_node_table_target_mesh_ids", evidence)
+
+
+class NormalizedDeliveryBlockedIssueTests(unittest.TestCase):
+    @staticmethod
+    def blocked_target(spm, *, stale):
+        return {
+            "spm": spm,
+            "delivery_reason": (
+                STALE_NODE_TABLE_REASON if stale else "some_other_reason"
+            ),
+        }
+
+    def dependency(self, blocked_targets, errors=()):
+        return {
+            "role": "leaf",
+            "spm": "SK_bush_blackgum_02.spm",
+            "normalized_delivery_mode": "connection_incomplete",
+            "normalized_variants": {
+                "delivery_blocked_targets": blocked_targets,
+                "delivery_errors": list(errors),
+            },
+        }
+
+    def test_fully_stale_block_is_renamed_with_a_remedy(self):
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=True),
+            self.blocked_target("b.spm", stale=True),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_NODE_TABLE_STALE")
+        self.assertTrue(issue["remedy"])
+        self.assertEqual(len(issue["blocked_targets"]), 2)
+        self.assertNotIn("stale_node_table_targets", issue)
+
+    def test_partially_stale_block_keeps_its_code_but_still_reports_the_remedy(
+        self,
+    ):
+        # Production shape: one target is blocked by a stale node table, a
+        # second is blocked by an independent, real fault. The code must not
+        # be renamed to the stale-only reason, but the stale subset and its
+        # fix must not silently disappear either.
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=True),
+            self.blocked_target("b.spm", stale=False),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertNotIn("remedy", issue)
+        self.assertEqual(len(issue["stale_node_table_targets"]), 1)
+        self.assertEqual(
+            issue["stale_node_table_targets"][0]["spm"], "a.spm"
+        )
+        self.assertTrue(issue["stale_node_table_remedy"])
+
+    def test_no_stale_target_reports_neither_stale_field(self):
+        dependency = self.dependency([
+            self.blocked_target("a.spm", stale=False),
+        ])
+        issue = _normalized_delivery_blocked_issue(dependency)
+        self.assertEqual(issue["code"], "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE")
+        self.assertNotIn("remedy", issue)
+        self.assertNotIn("stale_node_table_targets", issue)
+        self.assertNotIn("stale_node_table_remedy", issue)
 
 
 if __name__ == "__main__":

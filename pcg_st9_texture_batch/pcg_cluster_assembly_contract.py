@@ -1778,6 +1778,46 @@ def _classify_stale_node_table_block(
         evidence["delivery_remedy"] = STALE_NODE_TABLE_REMEDY
 
 
+def _normalized_delivery_blocked_issue(dependency):
+    """Name a blocked normalized-delivery dependency for what blocks it.
+
+    A stale node table can explain every blocked target, some of them, or
+    none. Only the all-explained case may rename the issue code (an
+    independent fault must keep pointing at itself), but a partially stale
+    block still has to publish which targets and fix are stale instead of
+    computing that evidence and never surfacing it to an operator.
+    """
+    variants = dependency.get("normalized_variants") or {}
+    blocked_targets = variants.get("delivery_blocked_targets") or []
+    stale_targets = [
+        row for row in blocked_targets
+        if isinstance(row, dict)
+        and row.get("delivery_reason") == STALE_NODE_TABLE_REASON
+    ]
+    issue = {
+        "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+        "role": dependency["role"],
+        "spm": str(dependency["spm"]),
+        "delivery_mode": dependency.get("normalized_delivery_mode"),
+        "errors": variants.get("delivery_errors") or [],
+    }
+    if stale_targets and len(stale_targets) == len(blocked_targets):
+        # Every blocked target is blocked only because its saved node
+        # table cannot answer the export question.  Still blocked, but
+        # the operator now gets the real cause and the fix.
+        issue["code"] = "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+        issue["remedy"] = STALE_NODE_TABLE_REMEDY
+        issue["blocked_targets"] = stale_targets
+    elif stale_targets:
+        # Only some blocked targets are explained by a stale node table;
+        # the rest keep their own real cause, so the code stays generic.
+        # The stale subset and its fix still have to reach the operator
+        # instead of being computed and dropped.
+        issue["stale_node_table_targets"] = stale_targets
+        issue["stale_node_table_remedy"] = STALE_NODE_TABLE_REMEDY
+    return issue
+
+
 def _finalize_normalized_generator_delivery(evidence):
     """Fail closed when published delivery fields contradict their evidence."""
     complete = evidence.get("generator_connection_complete") is True
@@ -3653,32 +3693,7 @@ def build_cluster_assembly_contract(
                 **dependency["normalized_variants_stale"],
             })
         if dependency.get("normalized_delivery_blocked"):
-            variants = dependency.get("normalized_variants") or {}
-            blocked_targets = variants.get("delivery_blocked_targets") or []
-            stale_targets = [
-                row for row in blocked_targets
-                if isinstance(row, dict)
-                and row.get("delivery_reason") == STALE_NODE_TABLE_REASON
-            ]
-            issue = {
-                "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "delivery_mode": dependency.get(
-                    "normalized_delivery_mode"
-                ),
-                "errors": variants.get("delivery_errors") or [],
-            }
-            if stale_targets and len(stale_targets) == len(blocked_targets):
-                # Every blocked target is blocked only because its saved node
-                # table cannot answer the export question.  Still blocked, but
-                # the operator now gets the real cause and the fix.
-                issue["code"] = "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
-                issue["remedy"] = STALE_NODE_TABLE_REMEDY
-                issue["blocked_targets"] = stale_targets
-            elif stale_targets:
-                issue["stale_node_table_targets"] = stale_targets
-            issues.append(issue)
+            issues.append(_normalized_delivery_blocked_issue(dependency))
         tga_validation = dependency.get("tga_basename_validation") or {}
         if tga_validation.get("status") not in {"ok", "not_applicable"}:
             issues.append({

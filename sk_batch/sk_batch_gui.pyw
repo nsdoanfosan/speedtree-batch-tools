@@ -1476,9 +1476,24 @@ def cluster_issue_summary(issues, limit=5):
         ]
         if targets:
             fields.append("targets=" + ", ".join(targets[:3]))
+        # A block can be partly explained by a stale node table even when
+        # an independent fault keeps the overall code generic. Surface that
+        # subset and its fix instead of only the file that failed.
+        stale_targets = [
+            Path(str(row.get("spm"))).name
+            for row in issue.get("stale_node_table_targets") or ()
+            if isinstance(row, dict) and row.get("spm")
+        ]
+        if stale_targets:
+            fields.append(
+                "stale_node_table=" + ", ".join(stale_targets[:3])
+            )
         remedy = str(issue.get("remedy") or "").strip()
         if remedy:
             fields.append("→ " + remedy)
+        stale_remedy = str(issue.get("stale_node_table_remedy") or "").strip()
+        if stale_remedy:
+            fields.append("→ " + stale_remedy)
         lines.append(" ".join(fields))
     return " | ".join(lines)
 
@@ -3515,20 +3530,47 @@ class App:
             if str(item["spm"]) not in excluded
         ]
 
-    def _recorded_failure_reason(self, spm, max_chars=180):
-        """Return the recorded failure text for one already-failed row."""
+    def _recorded_failure_reason(self, spm, max_chars=180, _seen=None):
+        """Return the recorded failure text for one already-failed row.
+
+        A ``dependency_blocked`` column has no cause of its own -- it only
+        records which upstream rows it was blocked by. Stopping there just
+        repeats "차단: required Cluster stage failed" one hop away from the
+        actual error, so walk ``blocked_by`` to the real failure instead.
+        """
+        seen = _seen if _seen is not None else set()
+        key = str(spm)
+        if key in seen:
+            return ""
+        seen.add(key)
         with self.state_lock:
-            entry = self.state.get(str(spm))
+            entry = self.state.get(key)
             entry = dict(entry) if isinstance(entry, dict) else {}
         for column in ("blend", "push", "spm"):
-            if entry.get(f"{column}_status_kind") in {
-                None,
-                "ok",
-                "skipped",
-                "dependency_blocked",
-            }:
+            kind = entry.get(f"{column}_status_kind")
+            if kind in {None, "ok", "skipped"}:
                 continue
-            recorded = entry.get(f"{column}_status_error")
+            error_entry = entry.get(f"{column}_status_error")
+            if kind == "dependency_blocked":
+                blocked_by = (
+                    error_entry.get("blocked_by")
+                    if isinstance(error_entry, dict)
+                    else None
+                ) or ()
+                nested = sorted({
+                    text
+                    for text in (
+                        self._recorded_failure_reason(
+                            value, max_chars, seen
+                        )
+                        for value in blocked_by
+                    )
+                    if text
+                })
+                if nested:
+                    return " | ".join(nested)
+                continue
+            recorded = error_entry
             if isinstance(recorded, dict):
                 recorded = recorded.get("message")
             if not isinstance(recorded, str) or not recorded.strip():
