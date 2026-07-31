@@ -19,6 +19,7 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 import sbs_auto
+import blend_source_index
 import pcg_texture_audit
 import migrate_current_sk_textures
 from pcg_canonical_outputs import record_canonical_output
@@ -436,6 +437,27 @@ class TargetCollectionTests(unittest.TestCase):
 
 
 class SourceSelectionTests(unittest.TestCase):
+    @staticmethod
+    def register_blender_source_row(blend, *image_names):
+        pcg_texture_audit.register_blend_source_index(
+            {
+                "schema_version": 1,
+                "status": "ok",
+                "indexed_by_blender": True,
+                "blend": str(Path(blend).resolve()),
+                "blend_sha256": blend_source_index.file_sha256(blend),
+                "images": [
+                    {
+                        "name": Path(image_name).name,
+                        "filepath": str(image_name),
+                        "filepath_raw": str(image_name),
+                    }
+                    for image_name in image_names
+                ],
+            },
+            blend,
+        )
+
     def test_step1_checks_only_active_unprefixed_materials(self):
         xml = b'''<SpeedTree><Materials>
 <Material_v8 ID="1" Name="M_Material 2"><TexFilename>leaf.tga</TexFilename></Material_v8>
@@ -599,7 +621,7 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertNotEqual(first[0][1], second[0][1])
             self.assertEqual(second[2], [first_spm, second_spm])
 
-    def test_leaf_blend_is_found_by_embedded_source_image(self):
+    def test_leaf_blend_is_found_by_authoritative_blender_source_index(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             atlas = root / "atlas"
@@ -607,8 +629,11 @@ class SourceSelectionTests(unittest.TestCase):
             atlas.mkdir()
             folder.mkdir()
             blend = atlas / "M_leaf_user_friendly_01.blend"
-            blend.write_bytes(
-                b"BLENDER-v300DATA\x00qgvkS_4K_Albedo.jpg\x00END")
+            blend.write_bytes(b"BLENDER-v300DATA")
+            self.register_blender_source_row(
+                blend,
+                root / "qgvkS_4K_Albedo.jpg",
+            )
             found = pcg_texture_audit.find_atlas_blends(
                 atlas, folder, "M_qgvkS_atlas_01",
                 source_images=[root / "qgvkS_4K_Albedo.jpg"],
@@ -624,9 +649,14 @@ class SourceSelectionTests(unittest.TestCase):
             folder.mkdir()
             blackgum = atlas / "M_Leaf_blackgum_01.blend"
             dogwood = atlas / "M_Leaf_silky_dogwood_01.blend"
-            payload = b"BLENDER\x00qgvkS_4K_Albedo.jpg\x00END"
+            payload = b"BLENDER"
             blackgum.write_bytes(payload)
             dogwood.write_bytes(payload)
+            for blend in (blackgum, dogwood):
+                self.register_blender_source_row(
+                    blend,
+                    root / "qgvkS_4K_Albedo.jpg",
+                )
             found = pcg_texture_audit.find_atlas_blends(
                 atlas, folder, "M_qgvkS_atlas_01",
                 source_images=[root / "qgvkS_4K_Albedo.jpg"],
@@ -641,8 +671,11 @@ class SourceSelectionTests(unittest.TestCase):
             atlas.mkdir()
             folder.mkdir()
             blend = atlas / "M_leaf_violet_atlas_02.blend"
-            blend.write_bytes(
-                b"BLENDER\x00TCom_Leaves_ForestViolet01_4K_albedo.tif\x00END")
+            blend.write_bytes(b"BLENDER")
+            self.register_blender_source_row(
+                blend,
+                root / "TCom_Leaves_ForestViolet01_4K_albedo.tif",
+            )
             found = pcg_texture_audit.find_atlas_blends(
                 atlas, folder, "M_forest_violet_atlas_01",
                 source_images=[

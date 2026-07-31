@@ -232,6 +232,9 @@ def main():
             save_spm_target_registry,
             sync_spm_target_registry,
         )
+        from atlas_leaf_mesh_builder.source_index import (
+            current_blend_source_index,
+        )
         work_dir = args.work_dir or str(Path(args.blend_out).parent / "_atlas_job_work")
         Path(work_dir).mkdir(parents=True, exist_ok=True)
         props.output_dir = work_dir
@@ -293,8 +296,13 @@ def main():
                 if "FINISHED" not in spm_result:
                     raise RuntimeError(f"SPM 반영 실패: {spm_result}")
                 spm_summary = props.last_report
-            # scope UUID가 blend에 저장되도록 반영 후 다시 저장
+        # Persist the exact datablocks that Blender will index. The resulting
+        # SHA-bound row is the only source-image authority consumed by PCG.
+        if bpy.data.is_dirty:
             bpy.ops.wm.save_mainfile()
+        blend_source_index = current_blend_source_index(
+            expected_blend_path=blend_out,
+        )
 
         report = {
             "status": "ok",
@@ -307,6 +315,7 @@ def main():
             "spm_report": spm_summary,
             "target_results": target_results,
             "generator_connections_complete": generator_connections_complete,
+            "blend_source_index": blend_source_index,
             "reused_existing_blend": bool(args.reuse_existing_blend),
             "blend_backup": str(blend_backup) if blend_backup else None,
             "spm_backups": [str(backup) for _target, backup in spm_backups],

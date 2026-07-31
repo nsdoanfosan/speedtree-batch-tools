@@ -87,6 +87,25 @@ else:
         persist_cluster_assembly_receipts,
     )
 
+if __package__ in (None, ""):
+    from blend_source_index import (
+        BlendSourceIndexError,
+        BlendSourceIndexSession,
+        SOURCE_INDEX_CACHE_VERSION,
+        SOURCE_INDEX_SCHEMA_VERSION,
+        lookup_blend_source_images,
+        use_blend_source_index,
+    )
+else:
+    from .blend_source_index import (
+        BlendSourceIndexError,
+        BlendSourceIndexSession,
+        SOURCE_INDEX_CACHE_VERSION,
+        SOURCE_INDEX_SCHEMA_VERSION,
+        lookup_blend_source_images,
+        use_blend_source_index,
+    )
+
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
 MATERIAL_ID_RE = re.compile(r'<Material_v8\b[^>]*?ID="([^"]+)"', re.IGNORECASE)
 MATERIAL_BLOCK_RE = re.compile(
@@ -138,11 +157,6 @@ SUPPLEMENTAL_CUTOUT_ID_RE = re.compile(
     r'<CutoutMesh\b[^>]*\bID="([^"]+)"', re.IGNORECASE)
 MESH_ASSET_ID_RE = re.compile(
     r'<Mesh\b[^>]*\bID="([^"]+)"', re.IGNORECASE)
-BLEND_IMAGE_EXTENSION_RE = re.compile(
-    rb"\.(?:png|tga|tif|tiff|jpg|jpeg|exr|bmp)", re.IGNORECASE)
-BLEND_IMAGE_NAME_BYTES = frozenset(
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_. ()-"
-)
 ABS_IMAGE_RE = re.compile(
     r"[A-Za-z]:[\\/][^<>'\"\r\n]+?\.(?:png|tga|tif|tiff|jpg|jpeg|exr|bmp)",
     re.IGNORECASE,
@@ -170,13 +184,12 @@ _PERSISTENT_SPM_ANALYSIS_DIRTY = False
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
 SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
-BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v1.json"
+BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v2.json"
 _PERSISTENT_SBS_GRAPHS = None
 _PERSISTENT_SBS_GRAPHS_DIRTY = False
 _PERSISTENT_BLEND_IMAGES = None
 _PERSISTENT_BLEND_IMAGES_DIRTY = False
 _DIRECTORY_FILE_INDEX_CACHE = {}
-_BLEND_IMAGE_NAMES_CACHE = {}
 _IMAGE_EQUAL_CACHE = {}
 _REPORT_SCAN_CACHE = contextvars.ContextVar("pcg_report_scan_cache", default=None)
 COMMON_BARK_END_RE = re.compile(
@@ -288,20 +301,20 @@ def save_spm_analysis_cache():
     global _PERSISTENT_SPM_ANALYSIS_DIRTY, _PERSISTENT_SBS_GRAPHS_DIRTY
     global _PERSISTENT_BLEND_IMAGES_DIRTY
     written = []
-    for dirty, cache_path, entries in (
+    for dirty, cache_path, entries, cache_version in (
         (_PERSISTENT_SPM_ANALYSIS_DIRTY, SPM_ANALYSIS_CACHE_PATH,
-         _persistent_spm_analysis()),
+         _persistent_spm_analysis(), 1),
         (_PERSISTENT_SBS_GRAPHS_DIRTY, SBS_GRAPH_CACHE_PATH,
-         _persistent_sbs_graphs()),
+         _persistent_sbs_graphs(), 1),
         (_PERSISTENT_BLEND_IMAGES_DIRTY, BLEND_IMAGE_CACHE_PATH,
-         _persistent_blend_images()),
+         _persistent_blend_images(), SOURCE_INDEX_CACHE_VERSION),
     ):
         if not dirty:
             continue
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = cache_path.with_name(
             f".{cache_path.name}.{os.getpid()}.tmp")
-        payload = {"version": 1, "entries": entries}
+        payload = {"version": cache_version, "entries": entries}
         temp_path.write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
@@ -333,7 +346,11 @@ def _persistent_blend_images():
         return _PERSISTENT_BLEND_IMAGES
     try:
         payload = json.loads(BLEND_IMAGE_CACHE_PATH.read_text(encoding="utf-8"))
-        entries = payload.get("entries", {}) if payload.get("version") == 1 else {}
+        entries = (
+            payload.get("entries", {})
+            if payload.get("version") == SOURCE_INDEX_CACHE_VERSION
+            else {}
+        )
         _PERSISTENT_BLEND_IMAGES = entries if isinstance(entries, dict) else {}
     except Exception:
         _PERSISTENT_BLEND_IMAGES = {}
@@ -367,6 +384,10 @@ def _referenced_material_ids_from_text(text):
     }
 
 
+def _generator_guid_key(value):
+    return str(value or "").strip().casefold()
+
+
 def _export_node_counts_from_text(text):
     """Count generated, non-hidden nodes by Generator GUID.
 
@@ -379,7 +400,7 @@ def _export_node_counts_from_text(text):
     total_nodes = 0
     for match in NODE_EXPORT_STATE_RE.finditer(text):
         total_nodes += 1
-        guid = html.unescape(match.group(1).strip())
+        guid = _generator_guid_key(html.unescape(match.group(1)))
         hidden = match.group(2).strip().casefold() in {"1", "true", "yes"}
         extra = match.group(3)
         deleted_match = NODE_DELETED_RE.search(extra)
@@ -422,8 +443,9 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
         guid_match = ELEMENT_GUID_RE.search(block)
         hidden_match = ELEMENT_HIDDEN_RE.search(block)
         guid = guid_match.group(1).strip() if guid_match else ""
-        if guid:
-            hidden_by_guid[guid] = bool(
+        guid_key = _generator_guid_key(guid)
+        if guid_key:
+            hidden_by_guid[guid_key] = bool(
                 hidden_match and hidden_match.group(1).strip().lower() == "true"
             )
         type_match = GENERATOR_TYPE_RE.search(block)
@@ -457,7 +479,7 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
                     branch_generator_has_render_geometry(properties)
                 )
         generators.append(
-            (guid, ids, contributes_render_geometry)
+            (guid_key, ids, contributes_render_geometry)
         )
     if not generators:
         return all_ids
@@ -468,9 +490,13 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
         source = LINK_SOURCE_GUID_RE.search(block)
         target = LINK_TARGET_GUID_RE.search(block)
         if source and target:
-            parent[target.group(1).strip()] = source.group(1).strip()
+            source_key = _generator_guid_key(source.group(1))
+            target_key = _generator_guid_key(target.group(1))
+            if source_key and target_key:
+                parent[target_key] = source_key
 
-    def effectively_hidden(guid):
+    def effectively_hidden(guid_key):
+        guid = guid_key
         seen = set()
         while guid and guid not in seen:
             seen.add(guid)
@@ -480,12 +506,12 @@ def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0
         return False
 
     active = all_ids - generator_ids
-    for guid, ids, contributes_render_geometry in generators:
-        graph_visible = not guid or not effectively_hidden(guid)
+    for guid_key, ids, contributes_render_geometry in generators:
+        graph_visible = not guid_key or not effectively_hidden(guid_key)
         has_export_nodes = (
             not total_nodes
-            or not guid
-            or bool((export_node_counts or {}).get(guid, 0))
+            or not guid_key
+            or bool((export_node_counts or {}).get(guid_key, 0))
         )
         if (
             graph_visible
@@ -523,10 +549,11 @@ def _leaf_generator_bindings_from_text(
         guid_match = ELEMENT_GUID_RE.search(block)
         hidden_match = ELEMENT_HIDDEN_RE.search(block)
         guid = guid_match.group(1).strip() if guid_match else ""
+        guid_key = _generator_guid_key(guid)
         own_hidden = bool(
             hidden_match and hidden_match.group(1).strip().lower() == "true")
-        if guid:
-            hidden_by_guid[guid] = own_hidden
+        if guid_key:
+            hidden_by_guid[guid_key] = own_hidden
         type_match = GENERATOR_TYPE_RE.search(block)
         generator_type = html.unescape(type_match.group(1).strip()) \
             if type_match else ""
@@ -550,6 +577,7 @@ def _leaf_generator_bindings_from_text(
         generators.append({
             "generator_index": generator_index,
             "guid": guid,
+            "guid_key": guid_key,
             "own_hidden": own_hidden,
             "generator_type": generator_type,
             "generator_name": generator_name,
@@ -562,12 +590,15 @@ def _leaf_generator_bindings_from_text(
         source = LINK_SOURCE_GUID_RE.search(block)
         target = LINK_TARGET_GUID_RE.search(block)
         if source and target:
-            parent[target.group(1).strip()] = source.group(1).strip()
+            source_key = _generator_guid_key(source.group(1))
+            target_key = _generator_guid_key(target.group(1))
+            if source_key and target_key:
+                parent[target_key] = source_key
 
     def effectively_hidden(generator):
         if generator["own_hidden"]:
             return True
-        guid = generator["guid"]
+        guid = generator["guid_key"]
         seen = set()
         while guid and guid not in seen:
             seen.add(guid)
@@ -580,13 +611,13 @@ def _leaf_generator_bindings_from_text(
     for generator in generators:
         graph_visible = not effectively_hidden(generator)
         generated_node_count = int(
-            (export_node_counts or {}).get(generator["guid"], 0)
+            (export_node_counts or {}).get(generator["guid_key"], 0)
         )
         export_participates = bool(
             graph_visible
             and (
                 not total_nodes
-                or not generator["guid"]
+                or not generator["guid_key"]
                 or generated_node_count > 0
             )
         )
@@ -616,6 +647,39 @@ def _leaf_generator_bindings_from_text(
                 "export_participates": export_participates,
             })
     return bindings
+
+
+def live_generator_delivery_snapshot(path):
+    """Return one uncached document snapshot for delivery validation.
+
+    Normal audit queries intentionally share a size/mtime keyed parse cache.
+    That cache is useful for a board scan but cannot be authority after an
+    external Atlas writer mutates Generator properties.  Read and parse the
+    target exactly once here so Generator rows, export participation, and Mesh
+    asset IDs all come from the same current document.
+    """
+    text = read_pipeline_spm_text(path)
+    export_node_counts, total_nodes = _export_node_counts_from_text(text)
+    bindings = _leaf_generator_bindings_from_text(
+        text,
+        export_node_counts=export_node_counts,
+        total_nodes=total_nodes,
+    )
+    mesh_asset_ids = sorted({
+        match.group(1).strip()
+        for match in MESH_ASSET_ID_RE.finditer(text)
+        if match.group(1).strip() not in {"", "-1"}
+    })
+    return {
+        "contract": "speedtree_live_generator_delivery_snapshot_v1",
+        "spm": str(Path(path).resolve(strict=False)),
+        "spm_text_sha256": hashlib.sha256(
+            text.encode("utf-8")
+        ).hexdigest(),
+        "total_node_count": total_nodes,
+        "leaf_generator_bindings": [dict(row) for row in bindings],
+        "mesh_asset_ids": mesh_asset_ids,
+    }
 
 
 def _material_cutout_mesh_ids(block):
@@ -652,7 +716,7 @@ def _spm_analysis(path):
     disk_entry = persistent.get(path_key)
     if disk_entry and disk_entry.get("size") == size \
             and disk_entry.get("mtime_ns") == mtime_ns \
-            and disk_entry.get("leaf_binding_schema") == 3:
+            and disk_entry.get("leaf_binding_schema") == 4:
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
@@ -728,7 +792,7 @@ def _spm_analysis(path):
             "visible_material_ids": sorted(visible),
             "leaf_generator_bindings": leaf_bindings,
             "mesh_asset_ids": sorted(mesh_assets),
-            "leaf_binding_schema": 3,
+            "leaf_binding_schema": 4,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     return analysis
@@ -3125,115 +3189,95 @@ def file_exists_case_insensitive(folder, stem, suffixes):
 
 
 def _blend_image_names(path):
+    return set(
+        lookup_blend_source_images(path, _persistent_blend_images())
+    )
+
+
+def register_blend_source_index(index_row, blend_path):
+    """Accept only a Blender-authored row bound to the current blend SHA."""
     global _PERSISTENT_BLEND_IMAGES_DIRTY
-    path = Path(path)
-    cache_key = _file_cache_key(path)
-    cached = _BLEND_IMAGE_NAMES_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    path_key, size, mtime_ns = cache_key
-    disk_entry = _persistent_blend_images().get(path_key)
-    if disk_entry and disk_entry.get("size") == size \
-            and disk_entry.get("mtime_ns") == mtime_ns:
-        names = set(disk_entry.get("names", []))
-        _BLEND_IMAGE_NAMES_CACHE[cache_key] = names
-        return names
-    try:
-        data = path.read_bytes()
-        names = set()
-        for match in BLEND_IMAGE_EXTENSION_RE.finditer(data):
-            start = match.start()
-            limit = max(0, start - 180)
-            while start > limit and data[start - 1] in BLEND_IMAGE_NAME_BYTES:
-                start -= 1
-            if start < match.start():
-                names.add(data[start:match.end()].decode(
-                    "ascii", errors="ignore").lower())
-    except OSError:
-        names = set()
-    _BLEND_IMAGE_NAMES_CACHE[cache_key] = names
-    if size or mtime_ns:
-        _persistent_blend_images()[path_key] = {
-            "size": size,
-            "mtime_ns": mtime_ns,
-            "names": sorted(names),
-        }
+    session = BlendSourceIndexSession(_persistent_blend_images())
+    names = set(session.register_row(index_row, blend_path))
+    if session.changed:
         _PERSISTENT_BLEND_IMAGES_DIRTY = True
     return names
 
 
-def register_blend_source_images(blend_path, source_images, authoritative=False):
-    """Record sources for a newly generated compressed blend without reopening it."""
+def ensure_blend_source_index(cfg, session):
+    """Index only this audit's unresolved exact blend identities."""
     global _PERSISTENT_BLEND_IMAGES_DIRTY
-    cache_key = _file_cache_key(blend_path)
-    path_key, size, mtime_ns = cache_key
-    names = {
-        Path(value).name.lower() for value in (source_images or ()) if value
-    }
-    _BLEND_IMAGE_NAMES_CACHE[cache_key] = names
-    if size or mtime_ns:
-        _persistent_blend_images()[path_key] = {
-            "size": size,
-            "mtime_ns": mtime_ns,
-            "names": sorted(names),
-            "indexed_by_blender": bool(authoritative),
-        }
-        _PERSISTENT_BLEND_IMAGES_DIRTY = True
-    return names
+    requests = session.pending_requests()
+    if not requests:
+        return {"indexed": 0, "cached": True}
 
-
-def ensure_blend_source_index(cfg):
-    """One-time Blender index for compressed blends; later audits use the cache."""
-    atlas_root = Path(cfg.get("atlas_root", ""))
     blender = Path(cfg.get("blender_exe", ""))
     script = Path(__file__).resolve().parent / "jobs" / "index_leaf_blend_sources.py"
-    if not atlas_root.is_dir() or not blender.is_file() or not script.is_file():
-        return {"indexed": 0, "reason": "index prerequisites unavailable"}
-
-    pending = []
-    persistent = _persistent_blend_images()
-    for blend in atlas_root.glob("*.blend"):
-        if not blend.is_file() or is_backup_path(blend):
-            continue
-        path_key, size, mtime_ns = _file_cache_key(blend)
-        entry = persistent.get(path_key)
-        if not entry or entry.get("size") != size \
-                or entry.get("mtime_ns") != mtime_ns \
-                or not entry.get("indexed_by_blender"):
-            pending.append(blend)
-    if not pending:
-        return {"indexed": 0, "cached": True}
+    if not blender.is_file():
+        raise BlendSourceIndexError(
+            f"Blender executable unavailable for source indexing: {blender}"
+        )
+    if not script.is_file():
+        raise BlendSourceIndexError(f"blend source-index job is missing: {script}")
 
     cache_dir = BLEND_IMAGE_CACHE_PATH.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
-    report_path = cache_dir / f".blend_source_index_{os.getpid()}.json"
+    identity = hashlib.sha256(
+        json.dumps(requests, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    request_path = cache_dir / (
+        f".blend_source_index_request_{os.getpid()}_{identity}.json"
+    )
+    report_path = cache_dir / (
+        f".blend_source_index_report_{os.getpid()}_{identity}.json"
+    )
+    request_path.write_text(
+        json.dumps(
+            {
+                "schema_version": SOURCE_INDEX_SCHEMA_VERSION,
+                "requests": requests,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     cmd = [
         str(blender), "--factory-startup", "--background",
         "--python", str(script), "--",
-        "--root", str(atlas_root), "--out", str(report_path),
+        "--request", str(request_path), "--out", str(report_path),
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd,
+            capture_output=True,
+            text=True,
             timeout=cfg.get("atlas_job_timeout", 1800),
-            creationflags=0x08000000,
+            creationflags=0x08000000 if os.name == "nt" else 0,
         )
         if result.returncode != 0 or not report_path.is_file():
-            return {"indexed": 0, "error": (result.stderr or result.stdout)[-500:]}
-        rows = json.loads(report_path.read_text(encoding="utf-8"))
-        indexed = 0
-        for row in rows:
-            if row.get("error"):
-                continue
-            register_blend_source_images(
-                row.get("blend"), row.get("images", []), authoritative=True)
-            indexed += 1
-        return {"indexed": indexed, "pending": len(pending)}
+            detail = (result.stderr or result.stdout or "").strip()[-1000:]
+            raise BlendSourceIndexError(
+                "Blender source indexing failed"
+                + (f": {detail}" if detail else "")
+            )
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        indexed = session.install_report(payload, requests)
+        if indexed:
+            _PERSISTENT_BLEND_IMAGES_DIRTY = True
+        return {"indexed": indexed, "pending": len(requests)}
+    except BlendSourceIndexError:
+        raise
     except Exception as exc:
-        return {"indexed": 0, "error": str(exc)}
+        raise BlendSourceIndexError(
+            f"Blender source indexing failed: {type(exc).__name__}: {exc}"
+        ) from exc
     finally:
-        if report_path.exists():
-            report_path.unlink()
+        for path in (request_path, report_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def find_atlas_blends(atlas_root, folder, atlas_base, source_images=None,
@@ -6038,6 +6082,39 @@ def canonical_cluster_provider_map(root):
     return result
 
 
+
+def _audit_report_folders(folders, audit_one, progress_callback=None):
+    items = []
+    total_folders = len(folders)
+    if total_folders <= 1:
+        for folder in folders:
+            items.append(audit_one(folder))
+            if progress_callback is not None:
+                progress_callback(1, total_folders, folder)
+        return items
+
+    # Asset folders are independent read-only audits. Running four at a time
+    # keeps OneDrive I/O bounded. The shared blend-index session is explicitly
+    # bound inside audit_one; no mutable folder result is shared between tasks.
+    indexed_items = {}
+    with ThreadPoolExecutor(
+        max_workers=min(4, total_folders),
+        thread_name_prefix="pcg-audit",
+    ) as executor:
+        futures = {
+            executor.submit(audit_one, folder): (index, folder)
+            for index, folder in enumerate(folders)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            index, folder = futures[future]
+            indexed_items[index] = future.result()
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total_folders, folder)
+    return [indexed_items[index] for index in range(total_folders)]
+
+
 @_report_scan_cached
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
@@ -6047,8 +6124,8 @@ def make_report(
         cfg.get("pcg_focus_data_assets"),
         cfg.get("pcg_positive_weight_only", True),
     )
-    ensure_blend_source_index(cfg)
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
+    blend_source_session = BlendSourceIndexSession(_persistent_blend_images())
     provider_map = (
         canonical_cluster_provider_map(cfg["tree_root"])
         if cfg.get("tree_root")
@@ -6064,48 +6141,46 @@ def make_report(
         or requested_target_mesh_names
     )
     def audit_one(folder):
-        return audit_folder(
-            folder, cfg, include_refs=include_refs,
-            target_mesh_names=folder_target_mesh_names(
-                folder, report_target_mesh_names)
-                if report_target_mesh_names
-                else local_target_mesh_names(folder),
-            provider_spms=provider_map.get(
-                str(Path(folder).resolve()).casefold(),
-                [],
-            ),
-        )
+        with use_blend_source_index(blend_source_session):
+            return audit_folder(
+                folder, cfg, include_refs=include_refs,
+                target_mesh_names=folder_target_mesh_names(
+                    folder, report_target_mesh_names)
+                    if report_target_mesh_names
+                    else local_target_mesh_names(folder),
+                provider_spms=provider_map.get(
+                    str(Path(folder).resolve()).casefold(),
+                    [],
+                ),
+            )
 
-    items = []
-    total_folders = len(folders)
-    if total_folders <= 1:
-        for folder in folders:
-            items.append(audit_one(folder))
-            if progress_callback is not None:
-                progress_callback(1, total_folders, folder)
-    else:
-        # Asset folders are independent read-only audits. Running four at a
-        # time avoids making GUI startup proportional to the sum of every
-        # large SPM while keeping OneDrive I/O bounded.
-        indexed_items = {}
-        with ThreadPoolExecutor(
-            max_workers=min(4, total_folders),
-            thread_name_prefix="pcg-audit",
-        ) as executor:
-            futures = {
-                executor.submit(audit_one, folder): (index, folder)
-                for index, folder in enumerate(folders)
-            }
-            completed = 0
-            for future in as_completed(futures):
-                index, folder = futures[future]
-                indexed_items[index] = future.result()
-                completed += 1
-                if progress_callback is not None:
-                    progress_callback(completed, total_folders, folder)
-        items = [
-            indexed_items[index] for index in range(total_folders)
-        ]
+    buffered_progress = []
+    discovery_progress = (
+        (lambda *args: buffered_progress.append(args))
+        if progress_callback is not None else None
+    )
+    items = _audit_report_folders(
+        folders, audit_one, progress_callback=discovery_progress
+    )
+    pending = blend_source_session.pending_requests()
+    if pending:
+        ensure_blend_source_index(cfg, blend_source_session)
+        # The index child proved the requested bytes at its exit boundary.
+        # Re-hash on the authoritative final pass so a same-size/mtime-restored
+        # replacement cannot inherit that row between discovery and result.
+        blend_source_session.begin_pass()
+        items = _audit_report_folders(
+            folders, audit_one, progress_callback=progress_callback
+        )
+        unresolved = blend_source_session.pending_requests()
+        if unresolved:
+            raise BlendSourceIndexError(
+                "final PCG audit discovered unindexed blend candidates: "
+                + ", ".join(row["blend"] for row in unresolved)
+            )
+    elif progress_callback is not None:
+        for args in buffered_progress:
+            progress_callback(*args)
     attach_global_m_graphs(items, cfg)
     resolve_shared_atlas_entries(items, cfg)
     refresh_texture_output_contract_states(items, cfg)

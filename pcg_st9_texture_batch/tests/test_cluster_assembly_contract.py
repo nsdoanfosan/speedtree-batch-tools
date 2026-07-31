@@ -363,20 +363,23 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 )
 
             @staticmethod
-            def leaf_generator_bindings(_spm, visible_only=False):
-                self.assertTrue(visible_only)
-                return [{
-                    "generator_index": 2,
-                    "slot_prefix": "Material:Frond:0",
-                    "material_id": "7",
-                    "mesh_id": "63",
-                    "visible": True,
-                    "export_participates": True,
-                }]
-
-            @staticmethod
-            def mesh_asset_ids(_spm):
-                return ["63"]
+            def live_generator_delivery_snapshot(_spm):
+                return {
+                    "contract":
+                        "speedtree_live_generator_delivery_snapshot_v1",
+                    "spm": str(Path(_spm).resolve(strict=False)),
+                    "spm_text_sha256": "a" * 64,
+                    "total_node_count": 1,
+                    "leaf_generator_bindings": [{
+                        "generator_index": 2,
+                        "slot_prefix": "Material:Frond:0",
+                        "material_id": "7",
+                        "mesh_id": "63",
+                        "visible": True,
+                        "export_participates": True,
+                    }],
+                    "mesh_asset_ids": ["63"],
+                }
 
         group = {"material_id": 7}
         variants = [{"target_mesh_id": 63}]

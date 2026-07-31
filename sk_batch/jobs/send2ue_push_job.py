@@ -72,6 +72,16 @@ from send2ue_manifest_contract import (
     validate_material_handoff_wrapper,
 )
 from speedtree_pipeline_contract import shared_contract_api
+from child_progress_contract import (
+    SEND2UE_DISK_EXPORT_DONE_MARKER,
+    SEND2UE_DISK_EXPORT_START_MARKER,
+    SEND2UE_JOB_DONE_MARKER,
+    SEND2UE_JOB_FAILED_MARKER,
+    SEND2UE_JOB_START_MARKER,
+    SEND2UE_RPC_OWNED_DONE_MARKER,
+    SEND2UE_RPC_OWNED_START_MARKER,
+    emit_progress_marker as emit_child_progress_marker,
+)
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
@@ -428,15 +438,6 @@ def enable_required_addon(addon_utils, module):
         bpy.ops.preferences.addon_enable(module=module)
 
 
-def wait_for_json(path, timeout, label):
-    deadline = time.time() + timeout
-    while time.time() < deadline and not path.exists():
-        time.sleep(1.0)
-    if not path.exists():
-        raise RuntimeError(f"{label}: no result file (timed out after {timeout:g}s)")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def export_complexity():
     """Return cheap counts for the exact mesh unit that Send2UE will export."""
     export_collection = bpy.data.collections.get("Export")
@@ -472,6 +473,19 @@ def adaptive_rpc_timeout(complexity, polygon_limit, bone_limit, minimum, maximum
     return seconds, load_ratio
 
 
+def run_owned_rpc(run_commands, lines, label):
+    """Mark an RPC phase without adding a second timeout implementation."""
+    emit_child_progress_marker(
+        SEND2UE_RPC_OWNED_START_MARKER, phase=label
+    )
+    try:
+        return run_commands(lines)
+    finally:
+        emit_child_progress_marker(
+            SEND2UE_RPC_OWNED_DONE_MARKER, phase=label
+        )
+
+
 def main():
     args = parse_args()
     report_path = Path(args.report).resolve()
@@ -488,6 +502,9 @@ def main():
         "stage": "startup",
         "unreal_rpc_started": False,
     }
+    emit_child_progress_marker(
+        SEND2UE_JOB_START_MARKER, transport=args.transport
+    )
     try:
         import addon_utils
 
@@ -790,10 +807,16 @@ def main():
         report["wind_source_stem"] = wind_source_stem
 
         report["stage"] = "send2ue_export"
+        emit_child_progress_marker(
+            SEND2UE_DISK_EXPORT_START_MARKER, unit=unit_name
+        )
         result = bpy.ops.wm.send2ue("EXEC_DEFAULT")
         if "FINISHED" not in result:
             raise RuntimeError(f"send2ue returned {result}")
         report["send2ue"] = "FINISHED"
+        emit_child_progress_marker(
+            SEND2UE_DISK_EXPORT_DONE_MARKER, unit=unit_name
+        )
 
         report["stage"] = "manifest"
         manifest_assets = ingest.build_manifest_items(scene_props)
@@ -1051,25 +1074,29 @@ def main():
                 ),
             ]
             report["stage"] = "rpc_ingest"
-            run_commands(rpc_lines)
-            batch_result = wait_for_json(
-                batch_report_path,
-                max(args.ue_timeout, rpc_timeout + 60),
-                "SK Batch RPC manifest ingest",
+            run_owned_rpc(run_commands, rpc_lines, "manifest_ingest")
+            if not batch_report_path.is_file():
+                raise RuntimeError(
+                    "SK Batch RPC manifest ingest returned without a result file"
+                )
+            batch_result = json.loads(
+                batch_report_path.read_text(encoding="utf-8")
             )
             item_result = (batch_result.get("items") or {}).get(queue_id, {})
             if item_result.get("status") == "runtime_pending":
                 report["stage"] = "rpc_runtime_frame_validation"
                 for runtime_attempt in range(1, 31):
                     time.sleep(0.1)
-                    run_commands(
+                    run_owned_rpc(
+                        run_commands,
                         runner_load_lines
                         + [
                             (
                                 f"_runner.finish_runtime_probe({str(checkpoint_path)!r}, "
                                 f"{str(batch_report_path)!r}, {queue_id!r})"
                             )
-                        ]
+                        ],
+                        f"runtime_probe_{runtime_attempt}",
                     )
                     batch_result = json.loads(
                         batch_report_path.read_text(encoding="utf-8")
@@ -1084,7 +1111,8 @@ def main():
                     timeout_reason = (
                         "runtime probe did not complete within 30 cross-frame RPC attempts"
                     )
-                    run_commands(
+                    run_owned_rpc(
+                        run_commands,
                         runner_load_lines
                         + [
                             (
@@ -1092,7 +1120,8 @@ def main():
                                 f"{str(batch_report_path)!r}, {queue_id!r}, "
                                 f"{timeout_reason!r})"
                             )
-                        ]
+                        ],
+                        "runtime_probe_cancel",
                     )
                     batch_result = json.loads(
                         batch_report_path.read_text(encoding="utf-8")
@@ -1117,6 +1146,9 @@ def main():
         # Record the error before any classification helper runs: a crash in
         # this handler must never leave the report unwritten ("job report was
         # not created" hides the real failure from the GUI).
+        emit_child_progress_marker(
+            SEND2UE_JOB_FAILED_MARKER, stage=report.get("stage", "unknown")
+        )
         error_text = str(exc)
         report["error"] = error_text
         report["traceback"] = traceback.format_exc()
@@ -1125,6 +1157,9 @@ def main():
         except Exception:
             report.setdefault("failure_kind", "data_error")
     write_report(args.report, report)
+    emit_child_progress_marker(
+        SEND2UE_JOB_DONE_MARKER, status=report.get("status", "failed")
+    )
     if report["status"] not in {"ok", "exported_pending_unreal"}:
         sys.exit(1)
 

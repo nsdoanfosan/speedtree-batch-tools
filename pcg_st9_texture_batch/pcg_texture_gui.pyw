@@ -52,7 +52,7 @@ from pcg_texture_audit import (
     make_report,
     persist_cluster_assembly_receipts_safely,
     prepare_sk,
-    register_blend_source_images,
+    register_blend_source_index,
     save_spm_analysis_cache,
 )
 from pcg_board_snapshot import (
@@ -3951,10 +3951,10 @@ class App:
                     require_generator_connections=bool(
                         push_spm and job["target_spms"]),
                 )
-                if not job["reuse_existing_blend"]:
-                    register_blend_source_images(
-                        job["blend_out"], (job["albedo"], job["alpha"]),
-                        authoritative=True)
+                register_blend_source_index(
+                    data.get("blend_source_index"),
+                    job["blend_out"],
+                )
                 save_spm_analysis_cache()
                 done += 1
                 spm_note = (

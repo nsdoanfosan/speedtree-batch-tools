@@ -56,6 +56,10 @@ from code_compile_gate import (
 _PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(REPO_DIR)
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
+from child_progress_contract import (
+    material_preflight_inactivity_rules,
+    send2ue_inactivity_rules,
+)
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
@@ -5295,9 +5299,6 @@ class App:
         queue_timeout = max(1, int(
             self.cfg.get("speedtree_material_preflight_queue_timeout", 3600)
         ))
-        timeout_grace = max(1, int(
-            self.cfg.get("child_timeout_grace", 60)
-        ))
         material_cmd = [
             sys.executable,
             str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
@@ -5366,19 +5367,9 @@ class App:
             affinity=False,
             progress_callback=report_material_progress,
             inactivity_timeout=stage_timeout,
-            inactivity_timeout_by_marker={
-                MATERIAL_PREFLIGHT_START_MARKER: stage_timeout,
-                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER: stage_timeout,
-                SPEEDTREE_SLOT_WAIT_MARKER: queue_timeout,
-                SPEEDTREE_SLOT_ACQUIRED_MARKER: (
-                    export_timeout + timeout_grace
-                ),
-                MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER: stage_timeout,
-                MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER: stage_timeout,
-                MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER: stage_timeout,
-                MATERIAL_PREFLIGHT_FAILED_MARKER: stage_timeout,
-                MATERIAL_PREFLIGHT_DONE_MARKER: stage_timeout,
-            },
+            inactivity_timeout_by_marker=material_preflight_inactivity_rules(
+                stage_timeout, queue_timeout
+            ),
         )
         material_result = load_job_report(material_report)
         return {
@@ -7915,11 +7906,21 @@ class App:
         )
         if resolved_wind == "TREE":
             cmd.append("--require-green-signal")
+        stage_timeout = max(1, int(
+            self.cfg.get("child_stage_inactivity_timeout", 180)
+        ))
+        disk_export_timeout = max(1, int(
+            self.cfg.get("push_job_timeout", 1800)
+        ))
         code, log_file = self._run_limited(
             cmd,
             export_log_name,
-            self.cfg.get("push_job_timeout", 1800),
+            None,
             affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+            inactivity_timeout=disk_export_timeout,
+            inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                stage_timeout, disk_export_timeout
+            ),
         )
         result = load_job_report(export_report)
         if code != 0 or result.get("status") != "exported_pending_unreal":
@@ -8472,8 +8473,21 @@ class App:
         )
         if resolved_wind == "TREE":
             cmd.append("--require-green-signal")
-        code, log_file = self._run_limited(cmd, f"{spm.stem}_push_{stamp}.log",
-                                           self.cfg.get("push_job_timeout", 1800))
+        stage_timeout = max(1, int(
+            self.cfg.get("child_stage_inactivity_timeout", 180)
+        ))
+        disk_export_timeout = max(1, int(
+            self.cfg.get("push_job_timeout", 1800)
+        ))
+        code, log_file = self._run_limited(
+            cmd,
+            f"{spm.stem}_push_{stamp}.log",
+            None,
+            inactivity_timeout=disk_export_timeout,
+            inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                stage_timeout, disk_export_timeout
+            ),
+        )
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             reason = summarize_job_failure(result, log_file)

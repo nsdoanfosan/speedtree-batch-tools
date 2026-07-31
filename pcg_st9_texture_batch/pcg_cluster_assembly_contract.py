@@ -66,6 +66,10 @@ class ClusterAssemblyReceiptError(ValueError):
     """Base error for fail-closed persisted receipt selection."""
 
 
+class ClusterAssemblyInternalContractError(ClusterAssemblyReceiptError):
+    """Published live-delivery fields contradict their own evidence."""
+
+
 class ClusterAssemblyReceiptStaleError(ClusterAssemblyReceiptError):
     """A receipt identity or artifact hash no longer matches disk."""
 
@@ -1696,23 +1700,56 @@ def _positive_asset_id(value):
 
 
 def _delivery_binding_slot_identity(binding):
-    """Prefer stable Generator GUIDs inside the new delivery schema."""
+    """Use authored Generator identity, never XML array position."""
     prefix = str(
         binding.get("slot_prefix")
         or str(binding.get("material_property") or "").rsplit(":", 1)[0]
-    ).casefold()
-    guid = str(binding.get("generator_guid") or "").casefold()
+    ).strip().casefold()
+    guid = str(binding.get("generator_guid") or "").strip().casefold()
     if guid and prefix:
         return "guid", guid, prefix
-    index = binding.get("generator_index")
-    if index is not None and prefix:
-        return "index", str(index), prefix
+    # A missing GUID is already weaker evidence.  Keep the semantic
+    # type/name/prefix tuple so reordering Generator XML cannot silently turn
+    # one authored slot into another.  Duplicate named identities fail closed
+    # as an ambiguous live slot below.
     return (
         "named",
-        str(binding.get("generator_type") or "").casefold(),
-        str(binding.get("generator_name") or "").casefold(),
+        str(binding.get("generator_type") or "").strip().casefold(),
+        str(binding.get("generator_name") or "").strip().casefold(),
         prefix,
     )
+
+
+def _finalize_normalized_generator_delivery(evidence):
+    """Fail closed when published delivery fields contradict their evidence."""
+    complete = evidence.get("generator_connection_complete") is True
+    live_complete = evidence.get("live_generator_delivery_complete") is True
+    live_mesh_ids = list(
+        evidence.get("live_export_participating_target_mesh_ids") or []
+    )
+    mode = evidence.get("delivery_mode")
+    decision = evidence.get("delivery_decision")
+    errors = list(evidence.get("errors") or [])
+    bindings = list(evidence.get("generator_bindings") or [])
+    render_mode = mode == DELIVERY_MODE_RENDER_CONNECTED
+    normalize_decision = decision == "normalize_part"
+    observed_complete = bool(bindings and live_mesh_ids and not errors)
+    inconsistent = (
+        complete != live_complete
+        or complete != render_mode
+        or complete != normalize_decision
+        or complete != observed_complete
+    )
+    if inconsistent:
+        raise ClusterAssemblyInternalContractError(
+            "INTERNAL_NORMALIZED_GENERATOR_DELIVERY_CONFLICT: "
+            "published completion, mode, decision, or current live evidence "
+            "disagree "
+            f"(complete={complete}, live_complete={live_complete}, "
+            f"mode={mode!r}, decision={decision!r}, "
+            f"live_mesh_ids={live_mesh_ids!r}, errors={errors!r})"
+        )
+    return evidence
 
 
 def _normalized_generator_delivery(
@@ -1760,20 +1797,35 @@ def _normalized_generator_delivery(
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "spm": str(Path(production_spm).resolve(strict=False)),
         "delivery_mode": DELIVERY_MODE_CONNECTION_INCOMPLETE,
         "delivery_decision": "blocked",
         "delivery_reason": "generator_connection_contract_incomplete",
         "generator_connection_requested": requested,
-        "generator_connection_complete": declared_complete,
+        # Producer-side post-write/reopen assertion.  This is intentionally
+        # not the final live-delivery result below.
+        "generator_connection_declared_complete": declared_complete,
+        "generator_connection_complete": False,
+        "generator_connection_complete_scope": (
+            "fresh_live_export_delivery"
+        ),
         "generator_variant_policy": variant_policy or None,
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
         "live_export_participating_target_mesh_ids": [],
+        "live_generator_delivery_complete": False,
+        "live_snapshot_contract": None,
+        "live_snapshot_sha256": None,
+        "live_snapshot_total_node_count": None,
         "generator_bindings": bindings,
+        # Compatibility field: only expected-material rows that currently
+        # participate in export, matching the old visible_only consumer scope.
         "live_generator_bindings": [],
+        # Diagnostic fields retain all declared slots before the export filter.
+        "live_declared_slot_bindings": [],
+        "live_non_export_participating_bindings": [],
         "missing_live_bindings": [],
         "binding_mismatches": [],
         "errors": [],
@@ -1786,15 +1838,15 @@ def _normalized_generator_delivery(
         evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
         evidence["delivery_decision"] = "pass_through"
         evidence["delivery_reason"] = "generator_connection_not_requested"
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
     if not isinstance(connection, dict):
         evidence["errors"].append("generator_connection_missing")
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
     if requested is not True:
         evidence["errors"].append(
             "generator_connection_not_explicitly_requested"
         )
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
     if declared_complete is not True:
         evidence["errors"].append(
             "generator_connection_not_declared_complete"
@@ -1806,37 +1858,114 @@ def _normalized_generator_delivery(
     if not bindings:
         evidence["errors"].append("generator_bindings_missing")
     if evidence["errors"]:
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
     if audit is None:
         evidence["errors"].append("production_spm_live_audit_unavailable")
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
 
-    try:
-        live_bindings = audit.leaf_generator_bindings(
-            production_spm,
-            visible_only=True,
+    snapshot_reader = getattr(
+        audit,
+        "live_generator_delivery_snapshot",
+        None,
+    )
+    if not callable(snapshot_reader):
+        evidence["errors"].append(
+            "production_spm_live_snapshot_api_unavailable"
         )
-        live_asset_mesh_ids = sorted({
-            _positive_asset_id(value)
-            for value in audit.mesh_asset_ids(production_spm)
-            if _positive_asset_id(value) is not None
-        })
-    except (OSError, RuntimeError, ValueError) as exc:
+        return _finalize_normalized_generator_delivery(evidence)
+    try:
+        live_snapshot = snapshot_reader(production_spm)
+        if not isinstance(live_snapshot, dict):
+            raise ValueError(
+                "live Generator delivery snapshot is not an object"
+            )
+        if (
+            live_snapshot.get("contract")
+            != "speedtree_live_generator_delivery_snapshot_v1"
+        ):
+            raise ValueError(
+                "live Generator delivery snapshot contract is unsupported"
+            )
+        if _normalized_identity_path(
+            live_snapshot.get("spm") or ""
+        ) != _normalized_identity_path(production_spm):
+            raise ValueError(
+                "live Generator delivery snapshot identifies another SPM"
+            )
+        snapshot_sha256 = str(
+            live_snapshot.get("spm_text_sha256") or ""
+        ).strip().casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256) is None:
+            raise ValueError(
+                "live Generator delivery snapshot has no document hash"
+            )
+        total_node_count = live_snapshot.get("total_node_count")
+        if (
+            isinstance(total_node_count, bool)
+            or not isinstance(total_node_count, int)
+            or total_node_count < 0
+        ):
+            raise ValueError(
+                "live Generator delivery total node count is invalid"
+            )
+        raw_live_bindings = live_snapshot.get("leaf_generator_bindings")
+        raw_live_mesh_ids = live_snapshot.get("mesh_asset_ids")
+        if not isinstance(raw_live_bindings, list):
+            raise ValueError(
+                "live Generator delivery bindings are not a list"
+            )
+        if not isinstance(raw_live_mesh_ids, (list, tuple, set)):
+            raise ValueError(
+                "live Generator delivery mesh IDs are not a collection"
+            )
+        live_bindings = [
+            dict(row) for row in raw_live_bindings
+            if isinstance(row, dict)
+        ]
+        if len(live_bindings) != len(raw_live_bindings):
+            raise ValueError(
+                "live Generator delivery snapshot contains a non-object binding"
+            )
+        parsed_live_mesh_ids = [
+            _positive_asset_id(value) for value in raw_live_mesh_ids
+        ]
+        if any(value is None for value in parsed_live_mesh_ids):
+            raise ValueError(
+                "live Generator delivery snapshot contains an invalid Mesh ID"
+            )
+        live_asset_mesh_ids = sorted(set(parsed_live_mesh_ids))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         evidence["errors"].append(
             "production_spm_live_audit_failed:" + str(exc)
         )
-        return evidence
+        return _finalize_normalized_generator_delivery(evidence)
+    evidence["live_snapshot_contract"] = live_snapshot["contract"]
+    evidence["live_snapshot_sha256"] = snapshot_sha256
+    evidence["live_snapshot_total_node_count"] = total_node_count
     slot_identity = _delivery_binding_slot_identity
+
+    def export_participates(row):
+        return bool(
+            row.get("export_participates") is True
+            or row.get("visible") is True
+        )
+
     relevant_live_bindings = [
         dict(row)
         for row in live_bindings
         if _positive_asset_id(row.get("material_id"))
         == expected_material_id
     ]
-    evidence["live_generator_bindings"] = relevant_live_bindings
+    export_participating_bindings = [
+        row for row in relevant_live_bindings
+        if export_participates(row)
+    ]
+    evidence["live_generator_bindings"] = [
+        dict(row) for row in export_participating_bindings
+    ]
     live_mesh_ids = sorted({
         _positive_asset_id(row.get("mesh_id"))
-        for row in relevant_live_bindings
+        for row in export_participating_bindings
         if _positive_asset_id(row.get("mesh_id")) is not None
     })
     evidence[
@@ -1861,13 +1990,42 @@ def _normalized_generator_delivery(
         })
 
     live_by_slot = {}
-    for row in relevant_live_bindings:
+    for row in live_bindings:
         live_by_slot.setdefault(tuple(slot_identity(row)), []).append(row)
+    export_live_by_slot = {}
+    for row in export_participating_bindings:
+        export_live_by_slot.setdefault(
+            tuple(slot_identity(row)), []
+        ).append(row)
     declared_by_slot = {}
     for row in bindings:
         declared_by_slot.setdefault(
             tuple(slot_identity(row)), []
         ).append(row)
+    for declared_slot, declared_rows in declared_by_slot.items():
+        if len(declared_rows) != 1:
+            evidence["errors"].append(
+                "declared_generator_slot_not_declared_exactly_once"
+            )
+            evidence["binding_mismatches"].append({
+                "slot_identity": list(declared_slot),
+                "reason": (
+                    "declared_generator_slot_not_declared_exactly_once"
+                ),
+                "declared_count": len(declared_rows),
+            })
+    declared_live_bindings = []
+    for declared_slot in declared_by_slot:
+        declared_live_bindings.extend(
+            live_by_slot.get(declared_slot) or []
+        )
+    evidence["live_declared_slot_bindings"] = [
+        dict(row) for row in declared_live_bindings
+    ]
+    evidence["live_non_export_participating_bindings"] = [
+        dict(row) for row in declared_live_bindings
+        if not export_participates(row)
+    ]
 
     for declared in bindings:
         errors = []
@@ -1885,21 +2043,22 @@ def _normalized_generator_delivery(
         if target_mesh_id not in set(live_asset_mesh_ids):
             errors.append("target_mesh_asset_missing")
         if not current_rows:
+            # Retain the established error token for report compatibility.  It
+            # now means the semantic slot is absent from the unfiltered live
+            # document, not merely absent from a visible_only projection.
             errors.append("visible_generator_slot_missing")
         elif len(current_rows) != 1:
             errors.append("visible_generator_slot_ambiguous")
         else:
-            if (
-                _positive_asset_id(current.get("material_id"))
-                != target_material_id
-            ):
+            current_material_id = _positive_asset_id(
+                current.get("material_id")
+            )
+            current_mesh_id = _positive_asset_id(current.get("mesh_id"))
+            if current_material_id != target_material_id:
                 errors.append("visible_generator_material_mismatch")
-            if _positive_asset_id(current.get("mesh_id")) != target_mesh_id:
+            if current_mesh_id != target_mesh_id:
                 errors.append("visible_generator_mesh_mismatch")
-            if not (
-                current.get("export_participates") is True
-                or current.get("visible") is True
-            ):
+            if not export_participates(current):
                 errors.append("generator_not_export_participating")
         verified = {
             "slot_identity": list(declared_slot),
@@ -1915,7 +2074,9 @@ def _normalized_generator_delivery(
             evidence["missing_live_bindings"].append(dict(declared))
         evidence["errors"].extend(errors)
 
-    for live_slot, current_rows in live_by_slot.items():
+    # Preserve the old strict topology scope: only expected-material slots
+    # that currently participate in export must be declared exactly once.
+    for live_slot, current_rows in export_live_by_slot.items():
         declared_rows = declared_by_slot.get(live_slot) or []
         if len(declared_rows) != 1:
             evidence["errors"].append(
@@ -1929,16 +2090,15 @@ def _normalized_generator_delivery(
             })
 
     evidence["errors"] = sorted(set(evidence["errors"]))
-    if (
-        bindings
-        and not evidence["errors"]
-    ):
+    if bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"
         evidence["delivery_reason"] = (
             "generator_connection_matches_live_export"
         )
-    return evidence
+        evidence["generator_connection_complete"] = True
+        evidence["live_generator_delivery_complete"] = True
+    return _finalize_normalized_generator_delivery(evidence)
 
 
 def _aggregate_target_deliveries(rows):
