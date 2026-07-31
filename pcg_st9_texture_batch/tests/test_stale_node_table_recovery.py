@@ -1400,6 +1400,27 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 "receipt": receipt,
                 "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
             }, baseline)
+            reused = _ensure_preimage_artifacts(
+                baseline, TARGET_MESH_IDS, root
+            )
+            self.assertEqual(reused["receipt_path"].read_bytes(), receipt_bytes)
+
+            write_spm(spm, spm_text(stale=False, volatile="two").replace(
+                hidden,
+                "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>true</Hidden>",
+                1,
+            ))
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                verify_sealed_resave(
+                    spm,
+                    artifacts["backup_path"],
+                    artifacts["receipt_path"],
+                    TARGET_MESH_IDS,
+                )
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_reaudit_failed",
+            )
 
     def test_ensure_reuses_exact_valid_v2_receipt_without_rewriting(self):
         with tempfile.TemporaryDirectory() as temporary:
