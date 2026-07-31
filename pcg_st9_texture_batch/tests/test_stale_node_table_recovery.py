@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from stale_node_table_recovery import (  # noqa: E402
     _release_session_lock,
     _resolve_receipt_dialect,
     _resolve_target_scopes,
+    _verify_preimage_artifacts,
     build_parser,
     recover_stale_node_table,
     verify_sealed_resave,
@@ -156,7 +158,52 @@ def write_spm(path, text):
 
 
 def legacy_receipt(snapshot, expected_mesh_ids, backup_name, *, schema_version=2):
-    target = snapshot["target_projection"]
+    requested = sorted(expected_mesh_ids)
+    target_rows = []
+    for row in snapshot["delivery"]["leaf_generator_bindings"]:
+        mesh_id = int(row["mesh_id"])
+        if mesh_id not in requested:
+            continue
+        if schema_version == 3 and row.get("graph_visible") is not True:
+            continue
+        target_rows.append({
+            "generator_guid": (
+                row["generator_guid"].casefold()
+                if schema_version == 2
+                else row["generator_guid"].rstrip("=").casefold()
+            ),
+            "generator_type": row["generator_type"],
+            "generator_name": row["generator_name"],
+            "slot_prefix": row["slot_prefix"],
+            "material_property": row["material_property"],
+            "material_id": int(row["material_id"]),
+            "mesh_property": row["mesh_property"],
+            "mesh_id": mesh_id,
+        })
+    target_rows.sort(key=lambda row: json.dumps(
+        row, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8") + b"\n")
+    target_expected = (
+        requested
+        if schema_version == 2
+        else sorted({row["mesh_id"] for row in target_rows})
+    )
+    if schema_version == 2:
+        root = ET.fromstring(snapshot["text"])
+        membership_guids = sorted({
+            str(next((child.text or "" for child in element
+                      if child.tag.casefold() == "guid"), "")).strip().casefold()
+            for element in root.iter()
+            if element.tag.casefold() == "generator"
+        } - {""})
+        membership_fingerprint = hashlib.sha256((json.dumps(
+            membership_guids, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False,
+        ) + "\n").encode("utf-8")).hexdigest()
+        membership_count = len(membership_guids)
+    else:
+        membership_fingerprint = snapshot["generator_membership_fingerprint"]
+        membership_count = snapshot["elementtree"]["generator_count"]
     receipt = {
         "kind": "speedtree_stale_node_table_preimage_receipt",
         "schema_version": schema_version,
@@ -177,18 +224,18 @@ def legacy_receipt(snapshot, expected_mesh_ids, backup_name, *, schema_version=2
         "generator_membership": {
             "contract": "speedtree_generator_membership_projection",
             "version": 1,
-            "count": snapshot["elementtree"]["generator_count"],
-            "fingerprint": snapshot["generator_membership_fingerprint"],
+            "count": membership_count,
+            "fingerprint": membership_fingerprint,
         },
         "required_target_bindings": {
             "contract": "speedtree_required_target_binding_projection",
             "version": 1,
-            "expected_mesh_ids": list(expected_mesh_ids),
-            "binding_count": target["binding_count"],
-            "fingerprint": _legacy_target_binding_fingerprint(
-                snapshot["delivery"],
-                expected_mesh_ids,
-            ),
+            "expected_mesh_ids": target_expected,
+            "binding_count": len(target_rows),
+            "fingerprint": hashlib.sha256((json.dumps(
+                target_rows, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ) + "\n").encode("utf-8")).hexdigest(),
         },
     }
     if schema_version == 3:
@@ -1108,6 +1155,40 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             )
             self.assertFalse(launches)
 
+    def test_launch_guard_backup_mutation_is_caught_by_final_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            launches = []
+
+            def mutate_backup_and_remain_eligible():
+                backup = next(root.glob("*.preimage.spm"))
+                write_spm(
+                    backup,
+                    spm_text(stale=True, graph_property="guard-race"),
+                )
+                return False
+
+            guards = {
+                "is_cancelled": mutate_backup_and_remain_eligible,
+                "is_app_open": lambda: True,
+                "is_job_current": lambda: True,
+            }
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    guards=guards,
+                    launch_observer=lambda *_args: launches.append(True),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_backup_verification_failed",
+            )
+            self.assertFalse(launches)
+
     def test_backup_race_immediately_before_continuation_blocks_claim(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -1211,6 +1292,114 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertFalse(result["modeler_launched"])
         self.assertTrue(result["reaudit"]["authoring_graph_continuity"])
+
+    def test_literal_schema2_raw_guid_spelling_receipt_is_frozen(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            write_spm(spm, spm_text(stale=True).replace(
+                "<GUID>g-130</GUID>",
+                f"<GUID>{MODELER_GENERATOR_GUID}</GUID>",
+            ))
+            baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+            artifacts = _ensure_preimage_artifacts(
+                baseline, TARGET_MESH_IDS, root
+            )
+            receipt = legacy_receipt(
+                baseline,
+                TARGET_MESH_IDS,
+                artifacts["backup_path"].name,
+                schema_version=2,
+            )
+            self.assertEqual(
+                receipt["generator_membership"]["fingerprint"],
+                "fa6b5bdea9ca952d5dcde635a1aa06d1e0af05a238f57b0a4a2ef58d2d51fb98",
+            )
+            self.assertEqual(
+                receipt["required_target_bindings"],
+                {
+                    "contract": "speedtree_required_target_binding_projection",
+                    "version": 1,
+                    "expected_mesh_ids": [130, 131, 132, 133],
+                    "binding_count": 4,
+                    "fingerprint": "0c2fe78c6673439216abb63416d15265c354456edd49a197d6a2a8b630854f30",
+                },
+            )
+            artifacts["receipt_path"].write_text(
+                json.dumps(receipt, sort_keys=True), encoding="utf-8"
+            )
+            receipt_bytes = artifacts["receipt_path"].read_bytes()
+            frozen = {
+                **artifacts,
+                "receipt": receipt,
+                "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            }
+            _verify_preimage_artifacts(frozen, baseline)
+
+            tampered = json.loads(json.dumps(receipt))
+            tampered["generator_membership"]["fingerprint"] = baseline[
+                "generator_membership_fingerprint"
+            ]
+            artifacts["receipt_path"].write_text(
+                json.dumps(tampered, sort_keys=True), encoding="utf-8"
+            )
+            tampered_bytes = artifacts["receipt_path"].read_bytes()
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                _verify_preimage_artifacts({
+                    **artifacts,
+                    "receipt": tampered,
+                    "receipt_sha256": hashlib.sha256(tampered_bytes).hexdigest(),
+                }, baseline)
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_receipt_verification_failed",
+            )
+
+    def test_literal_schema3_target_v1_seals_visible_projection_not_request(self):
+        hidden = "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>false</Hidden>"
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            write_spm(spm, spm_text(stale=True).replace(
+                hidden,
+                "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>true</Hidden>",
+                1,
+            ))
+            baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+            artifacts = _ensure_preimage_artifacts(
+                baseline, TARGET_MESH_IDS, root
+            )
+            receipt = legacy_receipt(
+                baseline,
+                TARGET_MESH_IDS,
+                artifacts["backup_path"].name,
+                schema_version=3,
+            )
+            self.assertEqual(
+                baseline["target_projection"]["requested_mesh_ids"],
+                [130, 131, 132, 133],
+            )
+            self.assertEqual(
+                receipt["required_target_bindings"],
+                {
+                    "contract": "speedtree_required_target_binding_projection",
+                    "version": 1,
+                    "expected_mesh_ids": [130, 131, 132],
+                    "binding_count": 3,
+                    "fingerprint": "e1e07f589c2da4e9928e72d3be3fec48b2ed8cf03190d072132a0382584be0c2",
+                },
+            )
+            artifacts["receipt_path"].write_text(
+                json.dumps(receipt, sort_keys=True), encoding="utf-8"
+            )
+            receipt_bytes = artifacts["receipt_path"].read_bytes()
+            _verify_preimage_artifacts({
+                **artifacts,
+                "receipt": receipt,
+                "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            }, baseline)
 
     def test_ensure_reuses_exact_valid_v2_receipt_without_rewriting(self):
         with tempfile.TemporaryDirectory() as temporary:
