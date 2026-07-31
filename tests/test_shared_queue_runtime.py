@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from shared_queue_runtime import (
     RuntimeClosed,
@@ -145,6 +146,40 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(observed[0]["position"], 2)
         self.assertEqual(observed[0]["running_head"]["id"], first["id"])
         self.assertEqual(observed[0]["queued_count"], 1)
+        first_lease.finish()
+
+    def test_blocked_poll_tick_reads_one_snapshot_without_claim_or_get(self):
+        first_runtime = self.runtime("app-a")
+        waiting_runtime = self.runtime("app-b")
+        first = first_runtime.enqueue("running", {})
+        waiting = waiting_runtime.enqueue("waiting", {})
+        first_lease = first_runtime.wait_for_turn(first["id"])
+        cancel = threading.Event()
+
+        with mock.patch.object(
+            waiting_runtime.queue,
+            "snapshot",
+            wraps=waiting_runtime.queue.snapshot,
+        ) as snapshot, mock.patch.object(
+            waiting_runtime.queue,
+            "claim",
+            wraps=waiting_runtime.queue.claim,
+        ) as claim, mock.patch.object(
+            waiting_runtime.queue,
+            "get",
+            wraps=waiting_runtime.queue.get,
+        ) as get:
+            with self.assertRaises(WaitCancelled):
+                waiting_runtime.wait_for_turn(
+                    waiting["id"],
+                    on_wait=lambda _status: cancel.set(),
+                    cancel_event=cancel,
+                    poll_interval=0.01,
+                )
+
+        self.assertEqual(snapshot.call_count, 1)
+        self.assertEqual(claim.call_count, 0)
+        self.assertEqual(get.call_count, 0)
         first_lease.finish()
 
     def test_cancel_event_cancels_waiting_ticket(self):

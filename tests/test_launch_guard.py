@@ -13,9 +13,17 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 GUARD = REPO_DIR / "launch_guard.pyw"
 
 
-def run_guard(*args, cwd=None):
+def run_guard(*args, cwd=None, error_log=None):
+    if error_log is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            return run_guard(
+                *args,
+                cwd=cwd,
+                error_log=Path(tmp) / "launch-errors.log",
+            )
     env = os.environ.copy()
     env["SPEEDTREE_BATCH_TOOLS_NO_DIALOG"] = "1"
+    env["SPEEDTREE_BATCH_TOOLS_ERROR_LOG"] = str(error_log)
     return subprocess.run(
         [sys.executable, str(GUARD), *[str(value) for value in args]],
         capture_output=True,
@@ -59,22 +67,49 @@ class LaunchGuardTests(unittest.TestCase):
             broken.write_text(
                 "raise RuntimeError('tkinter is unavailable')\n", encoding="utf-8"
             )
-            log = REPO_DIR / "speedtree_batch_tools_error.log"
-            before = log.stat().st_size if log.is_file() else 0
+            log = Path(tmp) / "launch-errors.log"
+            repo_log = REPO_DIR / "speedtree_batch_tools_error.log"
+            before = repo_log.stat().st_size if repo_log.is_file() else 0
 
-            result = run_guard(broken)
+            result = run_guard(broken, error_log=log)
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("tkinter is unavailable", result.stderr)
             self.assertTrue(log.is_file())
-            with log.open("rb") as handle:
-                handle.seek(before)
-                appended = handle.read().decode(
-                    "utf-8",
-                    errors="replace",
-                )
+            appended = log.read_text(encoding="utf-8", errors="replace")
             self.assertIn("broken_gui.pyw", appended)
             self.assertIn("RuntimeError: tkinter is unavailable", appended)
+            after = repo_log.stat().st_size if repo_log.is_file() else 0
+            self.assertEqual(after, before)
+
+    def test_error_log_rotation_has_a_fixed_total_bound(self):
+        module = load_guard_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "launch-errors.log"
+            globals_patch = {
+                "ERROR_LOG": log,
+                "ERROR_LOG_MAX_BYTES": 300,
+                "ERROR_LOG_BACKUP_COUNT": 2,
+            }
+            with mock.patch.dict(
+                module["record_error"].__globals__,
+                globals_patch,
+            ):
+                for index in range(20):
+                    self.assertTrue(
+                        module["record_error"](
+                            f"failure-{index}",
+                            "diagnostic " + ("x" * 80),
+                        )
+                    )
+
+            retained = sorted(Path(tmp).glob("launch-errors.log*"))
+            self.assertLessEqual(len(retained), 3)
+            self.assertTrue(all(path.stat().st_size <= 300 for path in retained))
+            self.assertIn(
+                "failure-19",
+                log.read_text(encoding="utf-8", errors="replace"),
+            )
 
     def test_missing_target_is_reported_instead_of_silently_succeeding(self):
         result = run_guard(REPO_DIR / "no_such_gui.pyw")

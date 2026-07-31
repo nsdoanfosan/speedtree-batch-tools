@@ -244,33 +244,25 @@ class SharedQueueRuntime:
                     self._cancel_waiting_ticket(job_id, "wait_cancelled")
                     raise WaitCancelled(f"wait cancelled for job {job_id}")
 
-                # Claim and local registration share the runtime lock so
-                # shutdown cannot miss a just-acquired lease.
-                with self._lock:
-                    if self._closed:
-                        self._cancel_waiting_ticket(
-                            job_id,
-                            "runtime_shutdown",
-                        )
-                        raise WaitCancelled(
-                            f"runtime shut down while waiting for job {job_id}"
-                        )
-                    claimed = self.queue.claim(
-                        self.owner_id,
-                        job_id=job_id,
-                        accepted_apps={self.app_id},
-                    )
-                    if claimed is not None:
-                        lease = SharedQueueLease(
-                            self,
-                            claimed,
-                            heartbeat_interval=self.heartbeat_interval,
-                        )
+                # One snapshot answers own status, FIFO position, and whether
+                # a claim is worth attempting.  Only the transition tick does
+                # a second locked read so claim() can re-check atomically.
+                snapshot = self.queue.snapshot()
+                wait_status = self._wait_status(job_id, snapshot=snapshot)
+                state = next(
+                    (
+                        job
+                        for job in snapshot["jobs"]
+                        if job["id"] == job_id
+                    ),
+                    None,
+                )
+                if state is None:
+                    with self._lock:
                         self._pending.pop(job_id, None)
-                        self._active[job_id] = lease
-                        return lease
-
-                state = self.queue.get(job_id)
+                    raise RuntimeErrorBase(
+                        f"job {job_id} disappeared before claim"
+                    )
                 if state["status"] in (
                     "cancelled",
                     "abandoned",
@@ -285,8 +277,37 @@ class SharedQueueRuntime:
                         f"job {job_id} became {state['status']} before claim"
                     )
 
+                fifo_head = wait_status["fifo_head"]
+                if fifo_head is not None and fifo_head["id"] == job_id:
+                    # Claim and local registration share the runtime lock so
+                    # shutdown cannot miss a just-acquired lease.
+                    with self._lock:
+                        if self._closed:
+                            self._cancel_waiting_ticket(
+                                job_id,
+                                "runtime_shutdown",
+                            )
+                            raise WaitCancelled(
+                                "runtime shut down while waiting for job "
+                                f"{job_id}"
+                            )
+                        claimed = self.queue.claim(
+                            self.owner_id,
+                            job_id=job_id,
+                            accepted_apps={self.app_id},
+                        )
+                        if claimed is not None:
+                            lease = SharedQueueLease(
+                                self,
+                                claimed,
+                                heartbeat_interval=self.heartbeat_interval,
+                            )
+                            self._pending.pop(job_id, None)
+                            self._active[job_id] = lease
+                            return lease
+
                 if on_wait is not None:
-                    on_wait(self._wait_status(job_id))
+                    on_wait(wait_status)
 
                 if cancel_event is not None:
                     cancel_event.wait(poll_interval)
@@ -359,8 +380,14 @@ class SharedQueueRuntime:
                 with self._lock:
                     self._pending.pop(job_id, None)
 
-    def _wait_status(self, job_id: str) -> Dict[str, Any]:
-        snapshot = self.queue.snapshot()
+    def _wait_status(
+        self,
+        job_id: str,
+        *,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if snapshot is None:
+            snapshot = self.queue.snapshot()
         queued = sorted(
             (
                 job

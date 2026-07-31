@@ -13,7 +13,11 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISREG
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parent
@@ -52,6 +56,8 @@ PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 LOG_DIR = TOOL_DIR / "logs"
+STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
+STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
 PUSH_MANIFEST_SCHEMA_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
 DEFAULT_SEND2UE_DIR = Path(
@@ -275,17 +281,104 @@ def save_config(cfg):
     _atomic_write_json(CONFIG_PATH, cfg)
 
 
+def _append_bounded_state_recovery_log(message):
+    """Persist a small path-safe recovery notice without unbounded growth."""
+
+    try:
+        existing = STATE_RECOVERY_LOG_PATH.read_bytes()
+    except OSError:
+        existing = b""
+    encoded = str(message).encode("utf-8", errors="replace")
+    payload = existing + encoded
+    if len(payload) > STATE_RECOVERY_LOG_MAX_BYTES:
+        payload = payload[-STATE_RECOVERY_LOG_MAX_BYTES:]
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            payload = payload[newline + 1:]
+    try:
+        atomic_write_bytes(STATE_RECOVERY_LOG_PATH, payload)
+    except OSError:
+        pass
+
+
+def _quarantine_unreadable_state(exc):
+    """Move unreadable state aside before permitting a clean replacement."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    quarantine = STATE_PATH.with_name(
+        f"{STATE_PATH.stem}.unreadable-{stamp}-{uuid.uuid4().hex[:8]}"
+        f"{STATE_PATH.suffix}"
+    )
+    with _JSON_WRITE_LOCK:
+        try:
+            os.replace(STATE_PATH, quarantine)
+        except FileNotFoundError:
+            return None
+        except OSError as move_exc:
+            raise RuntimeError(
+                "Unreadable SK Batch state could not be quarantined; "
+                "refusing to start with empty state"
+            ) from move_exc
+
+    notice = (
+        f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] "
+        f"unreadable state quarantined as {quarantine.name} "
+        f"({type(exc).__name__})\n"
+    )
+    _append_bounded_state_recovery_log(notice)
+    try:
+        warnings.warn(notice.strip(), RuntimeWarning, stacklevel=2)
+    except RuntimeWarning:
+        pass
+    return quarantine
+
+
+def _state_entry_is_persistable(key):
+    """Drop only confirmed dead/backup SPM rows; preserve unknown metadata."""
+
+    if not isinstance(key, str):
+        return True
+    candidate = Path(key).expanduser()
+    if candidate.suffix.casefold() != ".spm":
+        return True
+    if not is_live_spm(candidate, require_file=False):
+        return False
+    try:
+        return S_ISREG(candidate.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A temporarily unavailable drive or permission boundary is not proof
+        # that a production asset is dead.
+        return True
+
+
+def _prune_state_entries(state):
+    if not isinstance(state, dict):
+        raise ValueError("SK Batch state root must be a JSON object")
+    return {
+        key: value
+        for key, value in state.items()
+        if _state_entry_is_persistable(key)
+    }
+
+
 def load_state():
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+            loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            pruned = _prune_state_entries(loaded)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            _quarantine_unreadable_state(exc)
+            return {}
+        if pruned != loaded:
+            _atomic_write_json(STATE_PATH, pruned)
+        return pruned
     return {}
 
 
 def save_state(state):
-    _atomic_write_json(STATE_PATH, state)
+    _atomic_write_json(STATE_PATH, _prune_state_entries(state))
 
 
 def file_content_fingerprint(path, digest_size=16):

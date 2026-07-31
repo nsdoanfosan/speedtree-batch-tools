@@ -98,6 +98,86 @@ class SkCommonOptimizationTests(unittest.TestCase):
 
             self.assertEqual(scan_sk_spms(root), [live])
 
+    def test_unreadable_state_is_quarantined_and_reported_without_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "sk_batch_state.json"
+            recovery_log = root / "logs" / "state_recovery.log"
+            original = b'{"broken": "\xff"'
+            state_path.write_bytes(original)
+
+            with mock.patch.object(
+                sk_common, "STATE_PATH", state_path
+            ), mock.patch.object(
+                sk_common, "STATE_RECOVERY_LOG_PATH", recovery_log
+            ), self.assertWarns(RuntimeWarning):
+                self.assertEqual(sk_common.load_state(), {})
+
+            self.assertFalse(state_path.exists())
+            quarantined = list(root.glob("sk_batch_state.unreadable-*.json"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(quarantined[0].read_bytes(), original)
+            notice = recovery_log.read_text(encoding="utf-8")
+            self.assertIn(quarantined[0].name, notice)
+            self.assertNotIn(str(root), notice)
+
+    def test_unreadable_state_is_not_emptied_if_quarantine_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "sk_batch_state.json"
+            original = b'{"incomplete":'
+            state_path.write_bytes(original)
+
+            with mock.patch.object(
+                sk_common, "STATE_PATH", state_path
+            ), mock.patch.object(
+                sk_common.os,
+                "replace",
+                side_effect=PermissionError("injected"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "could not be quarantined",
+                ):
+                    sk_common.load_state()
+
+            self.assertEqual(state_path.read_bytes(), original)
+
+    def test_state_load_and_save_prune_dead_and_backup_spm_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "sk_batch_state.json"
+            live = root / "tree" / "SK_live.spm"
+            dead = root / "tree" / "SK_dead.spm"
+            backup = (
+                root
+                / "tree"
+                / "_atlas_cluster_normalization_backups"
+                / "SK_backup.spm"
+            )
+            live.parent.mkdir(parents=True)
+            backup.parent.mkdir(parents=True)
+            live.write_bytes(b"live")
+            backup.write_bytes(b"backup")
+            state = {
+                str(live): {"spm_status": "ok"},
+                str(dead): {"spm_status": "missing"},
+                str(backup): {"spm_status": "backup"},
+                "_format": {"version": 1},
+            }
+
+            with mock.patch.object(sk_common, "STATE_PATH", state_path):
+                sk_common.save_state(state)
+                stored = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(set(stored), {str(live), "_format"})
+
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                loaded = sk_common.load_state()
+                self.assertEqual(set(loaded), {str(live), "_format"})
+                persisted = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(persisted, loaded)
+
     def test_content_cache_requires_same_file_and_settings_signature(self):
         cache = {
             "version": CALIBRATION_CACHE_VERSION,

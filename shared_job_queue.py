@@ -26,10 +26,76 @@ from typing import Any, Callable, Dict, Iterable, Iterator, Optional
 
 
 SCHEMA_VERSION = 1
+DEFAULT_MAX_TERMINAL_JOBS = 100
+DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS = 15 * 60
 TERMINAL_STATUSES = frozenset(
     ("completed", "failed", "cancelled", "abandoned")
 )
 VALID_STATUSES = TERMINAL_STATUSES | frozenset(("queued", "running"))
+
+
+if os.name == "nt":
+    # Bind the small kernel32 surface once.  Claim polling probes process
+    # liveness frequently, so rebuilding the DLL wrapper and prototypes for
+    # every queued job turns a cheap check into repeated setup work.
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    class _FILETIME(_ctypes.Structure):
+        _fields_ = (
+            ("low", _wintypes.DWORD),
+            ("high", _wintypes.DWORD),
+        )
+
+    _KERNEL32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _OPEN_PROCESS = _KERNEL32.OpenProcess
+    _OPEN_PROCESS.argtypes = (
+        _wintypes.DWORD,
+        _wintypes.BOOL,
+        _wintypes.DWORD,
+    )
+    _OPEN_PROCESS.restype = _wintypes.HANDLE
+
+    _GET_PROCESS_TIMES = _KERNEL32.GetProcessTimes
+    _GET_PROCESS_TIMES.argtypes = (
+        _wintypes.HANDLE,
+        _ctypes.POINTER(_FILETIME),
+        _ctypes.POINTER(_FILETIME),
+        _ctypes.POINTER(_FILETIME),
+        _ctypes.POINTER(_FILETIME),
+    )
+    _GET_PROCESS_TIMES.restype = _wintypes.BOOL
+
+    _GET_EXIT_CODE_PROCESS = _KERNEL32.GetExitCodeProcess
+    _GET_EXIT_CODE_PROCESS.argtypes = (
+        _wintypes.HANDLE,
+        _ctypes.POINTER(_wintypes.DWORD),
+    )
+    _GET_EXIT_CODE_PROCESS.restype = _wintypes.BOOL
+
+    _CREATE_MUTEX = _KERNEL32.CreateMutexW
+    _CREATE_MUTEX.argtypes = (
+        _wintypes.LPVOID,
+        _wintypes.BOOL,
+        _wintypes.LPCWSTR,
+    )
+    _CREATE_MUTEX.restype = _wintypes.HANDLE
+
+    _WAIT_FOR_SINGLE_OBJECT = _KERNEL32.WaitForSingleObject
+    _WAIT_FOR_SINGLE_OBJECT.argtypes = (
+        _wintypes.HANDLE,
+        _wintypes.DWORD,
+    )
+    _WAIT_FOR_SINGLE_OBJECT.restype = _wintypes.DWORD
+
+    _RELEASE_MUTEX = _KERNEL32.ReleaseMutex
+    _RELEASE_MUTEX.argtypes = (_wintypes.HANDLE,)
+    _RELEASE_MUTEX.restype = _wintypes.BOOL
+
+    _CLOSE_HANDLE = _KERNEL32.CloseHandle
+    _CLOSE_HANDLE.argtypes = (_wintypes.HANDLE,)
+    _CLOSE_HANDLE.restype = _wintypes.BOOL
 
 
 def default_queue_state_path() -> Path:
@@ -72,6 +138,10 @@ class JobNotCancellable(QueueError):
     """Only a job that is still waiting in the FIFO can be cancelled."""
 
 
+class ForceReleaseRejected(QueueError):
+    """A running job did not satisfy the manual-release safety contract."""
+
+
 def _json_copy(value: Any, *, field: str) -> Any:
     """Validate and detach caller-owned JSON data."""
 
@@ -94,55 +164,27 @@ def _process_marker(pid: int) -> Optional[str]:
     if pid <= 0:
         return None
     if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        class FILETIME(ctypes.Structure):
-            _fields_ = (
-                ("low", wintypes.DWORD),
-                ("high", wintypes.DWORD),
-            )
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        open_process = kernel32.OpenProcess
-        open_process.argtypes = (
-            wintypes.DWORD,
-            wintypes.BOOL,
-            wintypes.DWORD,
-        )
-        open_process.restype = wintypes.HANDLE
-        get_process_times = kernel32.GetProcessTimes
-        get_process_times.argtypes = (
-            wintypes.HANDLE,
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-        )
-        get_process_times.restype = wintypes.BOOL
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        handle = open_process(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        handle = _OPEN_PROCESS(
+            0x1000, False, pid
+        )  # QUERY_LIMITED_INFORMATION
         if not handle:
             return None
         try:
-            creation = FILETIME()
-            exit_time = FILETIME()
-            kernel_time = FILETIME()
-            user_time = FILETIME()
-            if not get_process_times(
+            creation = _FILETIME()
+            exit_time = _FILETIME()
+            kernel_time = _FILETIME()
+            user_time = _FILETIME()
+            if not _GET_PROCESS_TIMES(
                 handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
+                _ctypes.byref(creation),
+                _ctypes.byref(exit_time),
+                _ctypes.byref(kernel_time),
+                _ctypes.byref(user_time),
             ):
                 return None
             return f"win:{(creation.high << 32) | creation.low}"
         finally:
-            close_handle(handle)
+            _CLOSE_HANDLE(handle)
 
     try:
         # Linux /proc field 22 is the process start clock tick.
@@ -167,40 +209,24 @@ def _local_process_alive(
         return False
 
     if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        open_process = kernel32.OpenProcess
-        open_process.argtypes = (
-            wintypes.DWORD,
-            wintypes.BOOL,
-            wintypes.DWORD,
-        )
-        open_process.restype = wintypes.HANDLE
-        get_exit_code = kernel32.GetExitCodeProcess
-        get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        get_exit_code.restype = wintypes.BOOL
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        handle = open_process(0x1000, False, pid)
+        handle = _OPEN_PROCESS(0x1000, False, pid)
         if not handle:
-            error = ctypes.get_last_error()
+            error = _ctypes.get_last_error()
             if error == 5:  # Access denied proves a protected process exists.
                 return True
             if error == 87:  # Invalid parameter: the PID no longer exists.
                 return False
             return None
         try:
-            exit_code = wintypes.DWORD()
-            if not get_exit_code(handle, ctypes.byref(exit_code)):
+            exit_code = _wintypes.DWORD()
+            if not _GET_EXIT_CODE_PROCESS(
+                handle, _ctypes.byref(exit_code)
+            ):
                 return None
             if exit_code.value != 259:  # STILL_ACTIVE
                 return False
         finally:
-            close_handle(handle)
+            _CLOSE_HANDLE(handle)
     else:
         try:
             os.kill(pid, 0)
@@ -241,34 +267,17 @@ class _InterprocessMutex:
 
     @contextlib.contextmanager
     def _acquire_windows(self) -> Iterator[None]:
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_mutex = kernel32.CreateMutexW
-        create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
-        create_mutex.restype = wintypes.HANDLE
-        wait_for_single = kernel32.WaitForSingleObject
-        wait_for_single.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-        wait_for_single.restype = wintypes.DWORD
-        release_mutex = kernel32.ReleaseMutex
-        release_mutex.argtypes = (wintypes.HANDLE,)
-        release_mutex.restype = wintypes.BOOL
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        handle = create_mutex(None, False, self.windows_name)
+        handle = _CREATE_MUTEX(None, False, self.windows_name)
         if not handle:
             raise OSError(
-                ctypes.get_last_error(),
+                _ctypes.get_last_error(),
                 f"CreateMutexW failed for {self.windows_name}",
             )
 
         acquired = False
         try:
             timeout_ms = max(1, min(round(self.timeout * 1000), 0xFFFFFFFE))
-            result = wait_for_single(handle, timeout_ms)
+            result = _WAIT_FOR_SINGLE_OBJECT(handle, timeout_ms)
             # WAIT_ABANDONED means the previous owning process ended without
             # releasing the mutex.  The current thread owns it and may safely
             # continue because queue files are atomically replaced.
@@ -280,14 +289,14 @@ class _InterprocessMutex:
                 )
             else:
                 raise OSError(
-                    ctypes.get_last_error(),
+                    _ctypes.get_last_error(),
                     f"WaitForSingleObject failed with status 0x{result:08x}",
                 )
             yield
         finally:
             if acquired:
-                release_mutex(handle)
-            close_handle(handle)
+                _RELEASE_MUTEX(handle)
+            _CLOSE_HANDLE(handle)
 
     @contextlib.contextmanager
     def _acquire_posix(self) -> Iterator[None]:
@@ -323,6 +332,10 @@ class SharedJobQueue:
         *,
         lease_seconds: float = 30.0,
         lock_timeout: float = 10.0,
+        max_terminal_jobs: int = DEFAULT_MAX_TERMINAL_JOBS,
+        force_release_min_age_seconds: float = (
+            DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS
+        ),
         clock: Callable[[], float] = time.time,
         process_alive: Callable[
             [str, int, Optional[str]], Optional[bool]
@@ -332,6 +345,20 @@ class SharedJobQueue:
         self.lease_seconds = float(lease_seconds)
         if self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be greater than zero")
+        if isinstance(max_terminal_jobs, bool) or not isinstance(
+            max_terminal_jobs, int
+        ):
+            raise ValueError("max_terminal_jobs must be a non-negative integer")
+        if max_terminal_jobs < 0:
+            raise ValueError("max_terminal_jobs must be a non-negative integer")
+        self.max_terminal_jobs = max_terminal_jobs
+        self.force_release_min_age_seconds = float(
+            force_release_min_age_seconds
+        )
+        if self.force_release_min_age_seconds <= 0:
+            raise ValueError(
+                "force_release_min_age_seconds must be greater than zero"
+            )
         self._clock = clock
         self._process_alive = process_alive
         self._hostname = socket.gethostname()
@@ -529,6 +556,78 @@ class SharedJobQueue:
 
         return self._change(mutate)
 
+    def force_release(
+        self,
+        job_id: str,
+        *,
+        confirm_owner_stopped: str,
+    ) -> Dict[str, Any]:
+        """Release one old live-owner lease after explicit operator proof.
+
+        This is deliberately not a timeout.  The caller must supply the exact
+        job ID again, the lease must have remained live past the configured
+        minimum age, and the owner process must still be confirmed alive.  An
+        operator should use this only after verifying that the asset worker is
+        stopped and cannot resume; releasing a merely slow worker could allow
+        overlapping writes to shared assets.
+        """
+
+        job_id = _require_text(job_id, field="job_id")
+        confirmation = _require_text(
+            confirm_owner_stopped,
+            field="confirm_owner_stopped",
+        )
+        if confirmation != job_id:
+            raise ForceReleaseRejected(
+                "confirmation must exactly match the running job ID"
+            )
+
+        def mutate(state: Dict[str, Any], now: float) -> Dict[str, Any]:
+            job = self._find_job(state, job_id)
+            lease = job.get("lease")
+            if job.get("status") != "running" or not isinstance(lease, dict):
+                raise ForceReleaseRejected(
+                    f"job {job_id} is not a running leased job"
+                )
+            claimed_at = lease.get("claimed_at")
+            if not isinstance(claimed_at, (int, float)):
+                raise ForceReleaseRejected(
+                    f"job {job_id} has no valid claim timestamp"
+                )
+            running_seconds = max(0.0, now - float(claimed_at))
+            if running_seconds < self.force_release_min_age_seconds:
+                remaining = self.force_release_min_age_seconds - running_seconds
+                raise ForceReleaseRejected(
+                    f"job {job_id} is too new for operator release; "
+                    f"wait at least {remaining:.0f} more seconds"
+                )
+            owner_alive = self._process_alive(
+                lease["hostname"],
+                lease["pid"],
+                lease.get("process_marker"),
+            )
+            if owner_alive is not True:
+                raise ForceReleaseRejected(
+                    f"job {job_id} owner is not confirmed alive; use the "
+                    "normal owner-lost recovery path"
+                )
+
+            job["status"] = "failed"
+            job["finished_at"] = now
+            job["failure_reason"] = "owner_released_by_operator"
+            job["result"] = None
+            job["operator_release"] = {
+                "released_at": now,
+                "running_seconds": running_seconds,
+                "minimum_age_seconds": self.force_release_min_age_seconds,
+                "owner_process_alive": True,
+                "owner_worker_stopped_confirmed": True,
+            }
+            job["lease"] = None
+            return job
+
+        return self._change(mutate)
+
     def get(self, job_id: str) -> Dict[str, Any]:
         """Return one job, recovering an expired lease first if necessary."""
 
@@ -550,14 +649,45 @@ class SharedJobQueue:
                 state = self._load_state()
                 now = float(self._clock())
                 before = copy.deepcopy(state)
-                recovered = self._recover_expired_lease(state, now)
+                self._recover_expired_lease(state, now)
+                self._prune_terminal_jobs(state)
                 result = operation(state, now)
+                self._prune_terminal_jobs(state)
                 self._validate_state(state)
-                if recovered or state != before:
+                if state != before:
                     state["revision"] += 1
                     state["updated_at"] = now
                     self._write_state(state)
                 return copy.deepcopy(result)
+
+    def _prune_terminal_jobs(self, state: Dict[str, Any]) -> bool:
+        """Retain only the newest bounded terminal history.
+
+        Queued and running rows are never candidates, regardless of age.  The
+        monotonically increasing ``next_sequence`` keeps future FIFO identity
+        independent of removed history.
+        """
+
+        terminal = sorted(
+            (
+                job
+                for job in state["jobs"]
+                if job.get("status") in TERMINAL_STATUSES
+            ),
+            key=lambda job: job["sequence"],
+            reverse=True,
+        )
+        retained_ids = {
+            job["id"] for job in terminal[: self.max_terminal_jobs]
+        }
+        original_count = len(state["jobs"])
+        state["jobs"] = [
+            job
+            for job in state["jobs"]
+            if job.get("status") not in TERMINAL_STATUSES
+            or job["id"] in retained_ids
+        ]
+        return len(state["jobs"]) != original_count
 
     def _load_state(self) -> Dict[str, Any]:
         if not self.state_path.exists():
@@ -805,7 +935,95 @@ class SharedJobQueue:
             raise QueueStateError("next_sequence does not follow stored jobs")
 
 
+def _cli_status(queue: SharedJobQueue) -> int:
+    """Print an operator-safe summary without payloads or machine paths."""
+
+    snapshot = queue.snapshot()
+    counts = {
+        status: sum(1 for job in snapshot["jobs"] if job["status"] == status)
+        for status in sorted(VALID_STATUSES)
+    }
+    print(
+        "queue "
+        + " ".join(f"{status}={count}" for status, count in counts.items())
+    )
+    running = next(
+        (job for job in snapshot["jobs"] if job["status"] == "running"),
+        None,
+    )
+    if running is None:
+        print("running none")
+        return 0
+
+    lease = running["lease"]
+    claimed_at = float(lease.get("claimed_at", time.time()))
+    age = max(0.0, time.time() - claimed_at)
+    print(
+        f"running id={running['id']} sequence={running['sequence']} "
+        f"app={running['app_id']} age_seconds={age:.0f}"
+    )
+    if age >= queue.force_release_min_age_seconds:
+        print(
+            "force-release available only after confirming the owner worker "
+            "is stopped; repeat the exact job ID with "
+            "--confirm-owner-stopped"
+        )
+    return 0
+
+
+def _main(argv: Optional[Iterable[str]] = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Inspect or conservatively release the shared job queue."
+    )
+    parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=default_queue_state_path(),
+        help="queue state override for diagnostics/tests",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser(
+        "status",
+        help="show counts and the running job without payloads or paths",
+    )
+    release = commands.add_parser(
+        "force-release",
+        help="release an old live-owner lease after stopping its worker",
+    )
+    release.add_argument("job_id")
+    release.add_argument(
+        "--confirm-owner-stopped",
+        required=True,
+        metavar="JOB_ID",
+        help="repeat the exact job ID after verifying its worker cannot resume",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    queue = SharedJobQueue(args.state_path)
+    try:
+        if args.command == "status":
+            return _cli_status(queue)
+        released = queue.force_release(
+            args.job_id,
+            confirm_owner_stopped=args.confirm_owner_stopped,
+        )
+    except QueueError as exc:
+        print(f"queue operation rejected: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"released id={released['id']} "
+        f"reason={released['failure_reason']}"
+    )
+    return 0
+
+
 __all__ = [
+    "DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS",
+    "DEFAULT_MAX_TERMINAL_JOBS",
+    "ForceReleaseRejected",
     "JobNotCancellable",
     "JobNotFound",
     "LeaseConflict",
@@ -815,3 +1033,7 @@ __all__ = [
     "SharedJobQueue",
     "default_queue_state_path",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import inspect
 import multiprocessing
 import os
 import tempfile
@@ -7,7 +10,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import shared_job_queue
 from shared_job_queue import (
+    ForceReleaseRejected,
     JobNotCancellable,
     LeaseConflict,
     QueueStateError,
@@ -202,6 +207,112 @@ class SharedJobQueueTests(unittest.TestCase):
 
         queue.complete(running["id"], claimed["lease"]["token"])
         self.assertIsNone(queue.claim("worker"))
+
+    def test_terminal_history_is_bounded_without_pruning_live_jobs(self):
+        queue = self.queue(max_terminal_jobs=3)
+        for index in range(40):
+            job = queue.enqueue("pcg-st9", {"fixed": "x" * 50, "i": index})
+            claimed = queue.claim("worker", job_id=job["id"])
+            queue.complete(job["id"], claimed["lease"]["token"])
+
+        waiting = queue.enqueue("sk-batch", {"still": "queued"})
+        snapshot = queue.snapshot()
+        terminal = [
+            job for job in snapshot["jobs"] if job["status"] == "completed"
+        ]
+        self.assertEqual(len(terminal), 3)
+        self.assertEqual(
+            [job["sequence"] for job in terminal],
+            [38, 39, 40],
+        )
+        self.assertIn(waiting["id"], {job["id"] for job in snapshot["jobs"]})
+        self.assertEqual(snapshot["next_sequence"], 42)
+        self.assertLess(self.state_path.stat().st_size, 10_000)
+
+    def test_force_release_requires_age_exact_confirmation_and_live_owner(self):
+        clock_value = [100.0]
+        queue = self.queue(
+            lease_seconds=1000,
+            force_release_min_age_seconds=60,
+            clock=lambda: clock_value[0],
+            process_alive=lambda _host, _pid, _marker: True,
+        )
+        running = queue.enqueue("pcg-st9", {"value": 1})
+        waiting = queue.enqueue("sk-batch", {"value": 2})
+        claimed = queue.claim("worker", job_id=running["id"])
+
+        clock_value[0] = 130.0
+        with self.assertRaises(ForceReleaseRejected):
+            queue.force_release(
+                running["id"],
+                confirm_owner_stopped=running["id"],
+            )
+        clock_value[0] = 161.0
+        with self.assertRaises(ForceReleaseRejected):
+            queue.force_release(
+                running["id"],
+                confirm_owner_stopped="wrong-job",
+            )
+
+        released = queue.force_release(
+            running["id"],
+            confirm_owner_stopped=running["id"],
+        )
+        self.assertEqual(released["status"], "failed")
+        self.assertEqual(
+            released["failure_reason"],
+            "owner_released_by_operator",
+        )
+        self.assertTrue(
+            released["operator_release"]["owner_worker_stopped_confirmed"]
+        )
+        self.assertNotIn("username", released["operator_release"])
+        with self.assertRaises(LeaseConflict):
+            queue.complete(running["id"], claimed["lease"]["token"])
+        claimed_next = queue.claim("next-worker", job_id=waiting["id"])
+        self.assertEqual(claimed_next["id"], waiting["id"])
+
+    def test_force_release_rejects_an_owner_not_confirmed_alive(self):
+        clock_value = [0.0]
+        queue = self.queue(
+            lease_seconds=1000,
+            force_release_min_age_seconds=10,
+            clock=lambda: clock_value[0],
+            process_alive=lambda _host, _pid, _marker: False,
+        )
+        job = queue.enqueue("pcg-st9", {})
+        queue.claim("worker", job_id=job["id"])
+        clock_value[0] = 11.0
+        with self.assertRaises(ForceReleaseRejected):
+            queue.force_release(
+                job["id"],
+                confirm_owner_stopped=job["id"],
+            )
+
+    def test_windows_liveness_api_is_bound_once_at_module_load(self):
+        source = inspect.getsource(shared_job_queue)
+        self.assertEqual(source.count('WinDLL("kernel32"'), 1)
+        self.assertNotIn(
+            "WinDLL",
+            inspect.getsource(shared_job_queue._local_process_alive),
+        )
+        self.assertNotIn(
+            "WinDLL",
+            inspect.getsource(shared_job_queue._process_marker),
+        )
+
+    def test_operator_status_omits_payloads_and_machine_paths(self):
+        queue = self.queue()
+        sensitive_path = r"C:\Users\operator\private\SK_tree.spm"
+        queue.enqueue("pcg-st9", {"path": sensitive_path})
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(shared_job_queue._cli_status(queue), 0)
+
+        rendered = output.getvalue()
+        self.assertNotIn(sensitive_path, rendered)
+        self.assertNotIn("payload", rendered)
 
     def test_failed_atomic_replace_keeps_last_complete_snapshot(self):
         queue = self.queue()
