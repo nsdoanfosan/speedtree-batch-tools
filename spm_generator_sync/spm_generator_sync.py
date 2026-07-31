@@ -1609,10 +1609,12 @@ def remap_generator_asset_references(
 ) -> tuple[int, list[dict[str, str]], list[str]]:
     """Translate source-local asset IDs into target-local IDs by asset name.
 
-    Existing target asset choices remain untouched unless their current local
-    ID is invalid or resolves to a conflicting semantic role (for example a
-    Leaf property resolving to a cluster material).  Fresh clones use force so
-    every resolvable material/mesh ID is translated before insertion.
+    ``force`` makes the source Generator's semantic asset selection
+    authoritative while still translating it to a target-local ID.  Existing
+    target choices remain untouched otherwise unless their current local ID is
+    invalid or resolves to a conflicting semantic role.  Exact asset identity
+    wins over Atlas cutout provenance; the provenance fallback is only needed
+    when the same generated asset is not already present in the target.
     """
     source_properties = source_generator.find("Properties")
     target_properties = target_generator.find("Properties")
@@ -1638,12 +1640,22 @@ def remap_generator_asset_references(
         if atlas_binding is not None:
             if not force:
                 continue
-            target_value = _atlas_binding_target_local_value(
-                source_document,
-                target_document,
-                atlas_binding,
+            source_asset_name = source_document.asset_name(
                 kind,
+                _property_value(source_prop),
             )
+            target_value = (
+                target_document.asset_id(kind, source_asset_name)
+                if source_asset_name is not None
+                else None
+            )
+            if target_value is None:
+                target_value = _atlas_binding_target_local_value(
+                    source_document,
+                    target_document,
+                    atlas_binding,
+                    kind,
+                )
             current_id = _property_value(target_prop)
             if current_id != target_value:
                 _set_child_text(target_prop, "Value", target_value)
@@ -1894,7 +1906,7 @@ def sync_subtree(
         result.property_updates += count
         result.changed_properties.extend(names)
         asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
-            source_document, target_document, source, target, force=False
+            source_document, target_document, source, target, force=True
         )
         result.asset_reference_updates += asset_updates
         result.copied_assets.extend(copied_assets)

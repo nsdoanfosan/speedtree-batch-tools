@@ -396,6 +396,74 @@ class GeneratorSyncTests(unittest.TestCase):
                 sum(item.asset_reference_updates for item in repair.base_results), 1
             )
 
+    def test_matched_generator_asset_selection_follows_master_by_exact_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+
+            master_root = ET.fromstring(with_assets(
+                make_master().replace("MasterLeaf", "11", 1),
+                [
+                    ("Material_v8", "11", "M_leaf_dogwood_02"),
+                    ("Mesh", "31", "cluster_dogwood_02"),
+                ],
+            ))
+            master_leaf = next(
+                item for item in master_root.findall("./Generators/Generator")
+                if item.findtext("GUID") == "leaf-mesh-a"
+            )
+            master_leaf.find("Properties").append(
+                ET.fromstring(property_xml("Leaves:Type:0:Mesh", "31"))
+            )
+
+            target_root = ET.fromstring(with_assets(
+                make_target().replace("TargetLeaf", "22", 1),
+                [
+                    ("Material_v8", "21", "M_leaf_dogwood_02"),
+                    ("Material_v8", "22", "M_leaf_dogwood_04"),
+                    ("Mesh", "41", "cluster_dogwood_02"),
+                    ("Mesh", "42", "cluster_dogwood_04"),
+                ],
+            ))
+            target_leaf = next(
+                item for item in target_root.findall("./Generators/Generator")
+                if item.findtext("GUID") == "target-leaf-mesh"
+            )
+            target_leaf.find("Properties").append(
+                ET.fromstring(property_xml("Leaves:Type:0:Mesh", "42"))
+            )
+
+            write_spm(master, ET.tostring(master_root, encoding="unicode"))
+            write_spm(target, ET.tostring(target_root, encoding="unicode"))
+            mapping = {
+                "Leaf 2": "Leaf", "BranchBig": "Branch",
+                "BranchSmall": None, "End 2": "End",
+            }
+
+            plan = sync.build_sync_plan(master, target, mapping)
+            patched = sync.SPMDocument(
+                target, plan.patched_text, plan.compressed, full=True
+            )
+            patched_leaf = patched.by_guid["target-leaf-mesh"]
+            self.assertEqual(
+                property_value(patched_leaf, "Leaves:Type:0:Material"),
+                "21",
+            )
+            self.assertEqual(
+                property_value(patched_leaf, "Leaves:Type:0:Mesh"),
+                "41",
+            )
+            self.assertEqual(
+                sum(item.asset_reference_updates for item in plan.base_results),
+                2,
+            )
+            self.assertFalse(any(result.copied_assets for result in plan.base_results))
+
+            write_spm(target, plan.patched_text)
+            repeat = sync.build_sync_plan(master, target, mapping)
+            self.assertFalse(repeat.changed)
+
     def test_missing_material_and_cutout_meshes_are_copied_with_new_local_ids(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
