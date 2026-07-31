@@ -33,6 +33,7 @@ from atlas_target_registry import (
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     spm_file_structural_semantic_fingerprint,
@@ -1705,7 +1706,11 @@ def _delivery_binding_slot_identity(binding):
         binding.get("slot_prefix")
         or str(binding.get("material_property") or "").rsplit(":", 1)[0]
     ).strip().casefold()
-    guid = str(binding.get("generator_guid") or "").strip().casefold()
+    # One GUID has two observed SpeedTree serialization spellings (24-character
+    # RFC base64 and the 23-character Modeler dialect), so the raw string is not
+    # the identity.  Compare the canonical form; the raw value stays in the
+    # evidence rows for provenance.
+    guid = generator_guid_key(binding.get("generator_guid"))
     if guid and prefix:
         return "guid", guid, prefix
     # A missing GUID is already weaker evidence.  Keep the semantic

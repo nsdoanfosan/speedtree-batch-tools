@@ -22,6 +22,11 @@ import pcg_texture_audit as audit_module  # noqa: E402
 
 
 GENERATOR_GUID = "blackgum-generator-guid"
+# Synthetic stand-ins for the two observed spellings of one 16-byte SpeedTree
+# GUID: 24-character RFC base64 and the 23-character Modeler dialect that omits
+# an all-zero trailing "A" while retaining the padding.
+MINTED_GENERATOR_GUID = "RegressionFixtureGuidA=="
+MODELER_GENERATOR_GUID = "RegressionFixtureGuid=="
 SLOT_PREFIXES = (
     "Leaves:Type:0",
     "Leaves:Type:1",
@@ -52,7 +57,11 @@ def write_blackgum_delivery_spm(
     connected,
     *,
     node_guid=None,
+    generator_guid=None,
 ):
+    generator_guid = (
+        GENERATOR_GUID if generator_guid is None else generator_guid
+    )
     material_id = 4 if connected else 1
     mesh_ids = TARGET_MESH_IDS if connected else SOURCE_MESH_IDS
     properties = []
@@ -71,7 +80,7 @@ def write_blackgum_delivery_spm(
         f'<Mesh ID="{mesh_id}" Name="mesh-{mesh_id}"/>'
         for mesh_id in SOURCE_MESH_IDS + TARGET_MESH_IDS
     )
-    node_guid = GENERATOR_GUID if node_guid is None else node_guid
+    node_guid = generator_guid if node_guid is None else node_guid
     payload = (
         "<SpeedTree><Assets>"
         + _material_xml(
@@ -87,7 +96,7 @@ def write_blackgum_delivery_spm(
         + mesh_xml
         + "</Assets><Generators>"
         f'<Generator Type="Leaf Mesh"><Name>generator 20</Name>'
-        f"<GUID>{GENERATOR_GUID}</GUID><Hidden>false</Hidden>"
+        f"<GUID>{generator_guid}</GUID><Hidden>false</Hidden>"
         "<Properties>"
         + "".join(properties)
         + "</Properties></Generator></Generators><Nodes>"
@@ -211,7 +220,10 @@ def write_unused_base_delivery_spm(path):
     path.write_bytes(gzip.compress(payload, mtime=0))
 
 
-def declared_bindings():
+def declared_bindings(generator_guid=None):
+    generator_guid = (
+        GENERATOR_GUID.upper() if generator_guid is None else generator_guid
+    )
     return [
         {
             "state": "already_connected",
@@ -219,7 +231,7 @@ def declared_bindings():
             # present, so array position must never become identity.
             "generator_index": 20,
             "generator_name": "generator 20",
-            "generator_guid": GENERATOR_GUID.upper(),
+            "generator_guid": generator_guid,
             "generator_type": "Leaf Mesh",
             "slot_prefix": slot_prefix.upper(),
             "target_material_id": 4,
@@ -229,13 +241,13 @@ def declared_bindings():
     ]
 
 
-def delivery_payload():
+def delivery_payload(generator_guid=None):
     return {
         "generator_connection": {
             "requested": True,
             "complete": True,
             "generator_variant_policy": "ensure_all_material_cutouts",
-            "bindings": declared_bindings(),
+            "bindings": declared_bindings(generator_guid),
         },
     }
 
@@ -660,6 +672,63 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             removed_delivery["live_export_participating_target_mesh_ids"],
             delivery["live_export_participating_target_mesh_ids"],
         )
+
+    def test_modeler_shortened_guid_is_the_same_declared_generator(self):
+        """The RFC and Modeler spellings resolve to one Generator identity."""
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_bush_blackgum_02.spm"
+            write_blackgum_delivery_spm(
+                target,
+                connected=True,
+                generator_guid=MODELER_GENERATOR_GUID,
+            )
+
+            snapshot = audit_module.live_generator_delivery_snapshot(target)
+            delivery = _normalized_generator_delivery(
+                audit_module,
+                target,
+                delivery_payload(MINTED_GENERATOR_GUID),
+                {"material_id": 4},
+                delivery_variants(),
+            )
+
+        self.assertEqual(
+            {
+                row["generator_guid"]
+                for row in snapshot["leaf_generator_bindings"]
+            },
+            {MODELER_GENERATOR_GUID},
+        )
+        self.assertTrue(all(
+            row["export_participates"]
+            for row in snapshot["leaf_generator_bindings"]
+        ))
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(delivery["missing_live_bindings"], [])
+        self.assertEqual(delivery["binding_mismatches"], [])
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_RENDER_CONNECTED,
+        )
+        self.assertTrue(delivery["live_generator_delivery_complete"])
+
+    def test_both_guid_spellings_share_one_slot_identity(self):
+        minted = _delivery_binding_slot_identity({
+            "generator_guid": MINTED_GENERATOR_GUID,
+            "slot_prefix": "Leaves:Type:0",
+        })
+        saved = _delivery_binding_slot_identity({
+            "generator_guid": MODELER_GENERATOR_GUID,
+            "slot_prefix": "Leaves:Type:0",
+        })
+        other = _delivery_binding_slot_identity({
+            "generator_guid": "RegressionFixtureGuiQ==",
+            "slot_prefix": "Leaves:Type:0",
+        })
+
+        self.assertEqual(minted[0], "guid")
+        self.assertEqual(minted, saved)
+        self.assertNotEqual(minted, other)
 
     def test_named_fallback_never_uses_generator_array_position(self):
         base = {

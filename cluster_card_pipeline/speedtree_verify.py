@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from speedtree_export_options_contract import require_texture_skip_writing
+from speedtree_pipeline_contract import generator_guid_key
 from .contract import (
     ContractError,
     _fingerprint,
@@ -361,12 +362,14 @@ def _material_geometry(xml_path, material_name, active_prototype):
 def _write_mesh_variant(source_spm, target_spm, contract, mesh_id):
     root = _read_spm_root(source_spm)
     generators = {
-        str(node.findtext("GUID") or ""): node
+        generator_guid_key(node.findtext("GUID")): node
         for node in root.findall(".//Generator")
     }
     changed = []
     for binding in contract.get("tree_generator_bindings") or []:
-        generator = generators.get(str(binding.get("generator_guid") or ""))
+        # Contracts and SPMs can use either observed serialization spelling for
+        # the same Generator GUID.
+        generator = generators.get(generator_guid_key(binding.get("generator_guid")))
         if generator is None:
             raise ContractError(
                 f"SpeedTree variant lost Generator GUID {binding.get('generator_guid')}"

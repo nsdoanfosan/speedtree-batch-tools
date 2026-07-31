@@ -37,6 +37,12 @@ BACKUP_DIRECTORY_NAMES = frozenset(
 BACKUP_FILENAME_RE = re.compile(
     r"\.(?:codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE
 )
+# A SpeedTree 16-byte Generator GUID appears in two observed serialization
+# spellings.  The shorter Modeler dialect omits a final ``A`` data character --
+# the all-zero tail of a 128-bit value -- while retaining the ``==`` padding.
+# That 23-character form is not decodable RFC 4648 base64 on its own.
+SPEEDTREE_TRUNCATED_GUID_RE = re.compile(r"^([A-Za-z0-9+/]{21})==$")
+SPEEDTREE_PADDED_GUID_RE = re.compile(r"^([A-Za-z0-9+/]{21})A==$")
 _SPM_SEMANTIC_IGNORED_SUBTREE_TAGS = frozenset({"Thumbnail", "Preview"})
 _SPM_AUTHORING_GRAPH_IGNORED_SUBTREE_TAGS = frozenset(
     {
@@ -287,6 +293,45 @@ def read_spm_text(path):
     """Read either supported SPM container through one shared decoder."""
     with open_spm_binary(path) as handle:
         return handle.read().decode("utf-8", errors="replace")
+
+
+def canonical_generator_guid(value):
+    """Return one spelling for a SpeedTree Generator/Link GUID.
+
+    The same 16-byte identity has two observed serialization spellings in this
+    pipeline.  RFC 4648 base64 writes 22 data characters plus ``==``; the
+    Modeler dialect omits a final all-zero ``A`` data character while retaining
+    the padding.  Comparing the raw strings then reports a healthy, active
+    Generator as an undeclared live slot next to a missing declared one.
+
+    Canonicalize toward the decodable 24-character form: a 21-data-character
+    body with ``==`` padding cannot be valid base64 at all, so the omitted
+    character is unambiguously ``A``.  Anything else is returned unchanged so an
+    unexpected identity keeps failing closed instead of being coerced.
+    """
+    text = str(value or "").strip()
+    match = SPEEDTREE_TRUNCATED_GUID_RE.match(text)
+    if match:
+        return match.group(1) + "A=="
+    return text
+
+
+def speedtree_generator_guid(value):
+    """Return the observed Modeler serialization spelling.
+
+    New declarations use this dialect so the declaration and SPM agree
+    textually as well as through the canonical comparison key.
+    """
+    text = str(value or "").strip()
+    match = SPEEDTREE_PADDED_GUID_RE.match(text)
+    if match:
+        return match.group(1) + "=="
+    return text
+
+
+def generator_guid_key(value):
+    """Comparison key for a Generator GUID, stable across both spellings."""
+    return canonical_generator_guid(value).casefold()
 
 
 def _local_xml_tag(tag):

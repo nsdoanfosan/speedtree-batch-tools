@@ -20,7 +20,9 @@ from spm_audit import read_spm as read_sk_spm, write_spm as write_sk_spm
 from speedtree_pipeline_contract import (
     BACKUP_DIRECTORY_NAMES,
     build_preflight_envelope,
+    canonical_generator_guid,
     canonical_path,
+    generator_guid_key,
     is_live_spm,
     naming_shadow_issue,
     prove_legacy_texture_normalize_semantic_migration,
@@ -28,6 +30,7 @@ from speedtree_pipeline_contract import (
     read_tree_instance_profile,
     shared_contract_api,
     source_set_fingerprint,
+    speedtree_generator_guid,
     speedtree_stmat_path,
     spm_container_format,
     spm_file_structural_semantic_fingerprint,
@@ -77,6 +80,53 @@ def write_stmat(spm, material_names, texture_base="T_Leaf_grass_Atlas_01"):
         encoding="utf-8",
     )
     return stmat
+
+
+class GeneratorGuidSpellingTests(unittest.TestCase):
+    """One 16-byte GUID, two spellings, one identity.
+
+    The observed Modeler dialect omits a final all-zero base64 ``A`` data
+    character while retaining the ``==`` padding.
+    """
+
+    MINTED = "RegressionFixtureGuidA=="
+    SAVED = "RegressionFixtureGuid=="
+
+    def test_shortened_guid_canonicalizes_to_the_decodable_form(self):
+        self.assertEqual(canonical_generator_guid(self.SAVED), self.MINTED)
+        self.assertEqual(canonical_generator_guid(self.MINTED), self.MINTED)
+        self.assertEqual(
+            generator_guid_key(self.SAVED),
+            generator_guid_key(self.MINTED),
+        )
+
+    def test_only_the_zero_tail_is_restored(self):
+        # A trailing Q/g/w carries real bits, so the writer never drops it and
+        # canonicalization must not fold those GUIDs into the restored one.
+        for tail in ("Q", "g", "w"):
+            other = "RegressionFixtureGuid" + tail + "=="
+            self.assertEqual(len(other), len(self.MINTED))
+            self.assertEqual(canonical_generator_guid(other), other)
+            self.assertEqual(speedtree_generator_guid(other), other)
+            self.assertNotEqual(
+                generator_guid_key(other),
+                generator_guid_key(self.SAVED),
+            )
+
+    def test_unexpected_identities_are_returned_unchanged(self):
+        for value in ("", "   ", "blackgum-generator-guid", "not base64=="):
+            self.assertEqual(
+                canonical_generator_guid(value),
+                str(value).strip(),
+            )
+
+    def test_writer_dialect_round_trips_to_the_same_identity(self):
+        self.assertEqual(speedtree_generator_guid(self.MINTED), self.SAVED)
+        self.assertEqual(speedtree_generator_guid(self.SAVED), self.SAVED)
+        self.assertEqual(
+            canonical_generator_guid(speedtree_generator_guid(self.MINTED)),
+            self.MINTED,
+        )
 
 
 class SpeedTreePipelineContractTests(unittest.TestCase):

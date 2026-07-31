@@ -55,6 +55,7 @@ try:
     from .process_stream import ProcessCancelled, run_streaming_process
 except ImportError:  # direct script/GUI-engine loading puts TOOL_DIR on sys.path
     from process_stream import ProcessCancelled, run_streaming_process
+from speedtree_pipeline_contract import speedtree_generator_guid
 
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
@@ -494,7 +495,15 @@ def _normalized_xml(element: ET.Element) -> tuple:
 
 
 def _new_guid() -> str:
-    return base64.b64encode(uuid.uuid4().bytes).decode("ascii")
+    """Mint a GUID using the observed Modeler serialization spelling.
+
+    The normalized Generator declaration and the SPM receive the same spelling;
+    comparison code still canonicalizes both supported spellings to one
+    identity.
+    """
+    return speedtree_generator_guid(
+        base64.b64encode(uuid.uuid4().bytes).decode("ascii")
+    )
 
 
 def _format_color(value: float) -> str:
