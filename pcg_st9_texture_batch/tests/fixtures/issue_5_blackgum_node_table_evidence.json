@@ -4,16 +4,22 @@
   "issue_url": "https://github.com/nsdoanfosan/speedtree-batch-tools/issues/5",
   "issue_number": 5,
   "scope_note": "Asset-only evidence. Tool/diagnostic code for interpreting this data lives in issue #4 and is not changed here.",
-  "recorded_utc": "2026-07-31T10:01:41Z",
+  "recorded_utc": "2026-07-31T10:34:32Z",
   "result_status": {
     "summary": "pre-resave evidence valid / closure incomplete",
     "pre_resave_evidence": "valid",
+    "post_resave_evidence": "valid",
+    "current_generator_membership_continuity": "unverified",
     "closure": "incomplete",
-    "closure_blocker": "Real SpeedTree Modeler resave and post-resave re-audit have not been performed."
+    "closure_blockers": [
+      "Exact full current-Generator membership continuity cannot be proved because no local backup matches the exact pre-resave text hashes.",
+      "Cluster normalization and the actual Unreal push have not been rerun after the resave."
+    ]
   },
   "audit_repository": {
     "repository": "nsdoanfosan/speedtree-batch-tools",
     "repository_commit": "c3c16d4f6ea7d23ffd909e8c6006c60610485e27",
+    "post_resave_audit_repository_commit": "3fa2fe904bae51200aa965242fd068eafa28a38f",
     "module": "pcg_texture_audit",
     "snapshot_function": "live_generator_delivery_snapshot",
     "snapshot_contract": "speedtree_live_generator_delivery_snapshot_v1",
@@ -46,7 +52,18 @@
       "live_export_participating_target_mesh_ids": [],
       "downstream_effect": "dependency_blocked"
     },
-    "delivery_result_after_resave": null
+    "delivery_result_after_resave": {
+      "status": "live_snapshot_target_delivery_valid",
+      "source": "Read-only live_generator_delivery_snapshot re-audit of both resaved SPMs.",
+      "live_export_participating_target_mesh_ids": [130, 131, 132, 133],
+      "all_required_mesh_ids_have_current_graph_bindings": true,
+      "all_observed_bindings_graph_visible": true,
+      "all_observed_bindings_have_positive_eligible_node_counts": true,
+      "all_observed_bindings_export_participate": true,
+      "export_evidence": "node_table",
+      "cluster_normalization_rerun": false,
+      "unreal_push_rerun": false
+    }
   },
   "stale_assets": [
     {
@@ -152,21 +169,103 @@
         "source": "Read-only audit of the configured live asset; local absolute path intentionally omitted."
       },
       "after": {
-        "status": "pending",
-        "resaved": false,
-        "captured_utc": null,
-        "spm_text_sha256": null,
-        "current_generator_count": null,
-        "node_table_generator_count": null,
-        "orphan_generator_guid_count": null,
-        "orphan_node_count": null,
-        "eligible_node_count": null,
-        "total_node_count": null,
-        "stale": null,
-        "guid_ownership_evidence": null,
-        "independent_elementtree_crosscheck": null,
-        "target_bindings": null,
-        "delivery_result": null
+        "status": "captured_membership_continuity_unverified",
+        "resaved": true,
+        "captured_utc": "2026-07-31T10:34:32Z",
+        "audit_repository_commit": "3fa2fe904bae51200aa965242fd068eafa28a38f",
+        "snapshot_contract": "speedtree_live_generator_delivery_snapshot_v1",
+        "spm_text_sha256": "8bdc8e4296d56f60314330f31bdfc3c0bb6870d3c750de43722c9d8c9ff15992",
+        "pre_resave_hash_changed": true,
+        "current_generator_count": 29,
+        "node_table_generator_count": 28,
+        "orphan_generator_guid_count": 0,
+        "orphan_node_count": 0,
+        "eligible_node_count": 1840,
+        "total_node_count": 1841,
+        "stale": false,
+        "guid_ownership_evidence": {
+          "token_namespace": "post-resave asset-scoped; not asserted identical to the pre-resave namespace",
+          "anonymization": "Asset-scoped opaque sequential tokens; raw GUIDs and the token mapping are intentionally not published.",
+          "current_generator_guid_tokens": [
+            "current-001", "current-002", "current-003", "current-004", "current-005",
+            "current-006", "current-007", "current-008", "current-009", "current-010",
+            "current-011", "current-012", "current-013", "current-014", "current-015",
+            "current-016", "current-017", "current-018", "current-019", "current-020",
+            "current-021", "current-022", "current-023", "current-024", "current-025",
+            "current-026", "current-027", "current-028", "current-029"
+          ],
+          "eligible_node_count_by_guid_token": {
+            "current-001": 1,
+            "current-002": 104,
+            "current-003": 51,
+            "current-004": 15,
+            "current-005": 32,
+            "current-006": 16,
+            "current-007": 31,
+            "current-008": 328,
+            "current-009": 13,
+            "current-010": 7,
+            "current-011": 578,
+            "current-012": 39,
+            "current-013": 167,
+            "current-014": 32,
+            "current-015": 44,
+            "current-016": 57,
+            "current-017": 4,
+            "current-018": 15,
+            "current-019": 1,
+            "current-020": 44,
+            "current-021": 56,
+            "current-022": 0,
+            "current-023": 96,
+            "current-024": 1,
+            "current-025": 14,
+            "current-026": 51,
+            "current-027": 1,
+            "current-028": 39,
+            "current-029": 3
+          }
+        },
+        "membership_continuity": {
+          "status": "unverified",
+          "exact_pre_hash_backup_available": false,
+          "matching_pre_state_backup_count": 3,
+          "matching_pre_state_membership_variant_count": 1,
+          "after_matches_matching_pre_state_membership": false,
+          "closure_gate": "blocked",
+          "reason": "Matching historical stale-state backups are not the exact pre-hash capture, so they cannot prove whether capture-time membership changed."
+        },
+        "independent_elementtree_crosscheck": {
+          "parser": "xml.etree.ElementTree",
+          "status": "matched",
+          "current_generator_guid_membership_match": true,
+          "per_guid_eligible_node_counts_match": true,
+          "current_generator_count": 29,
+          "node_table_generator_count": 28,
+          "orphan_generator_guid_count": 0,
+          "orphan_node_count": 0,
+          "eligible_node_count": 1840,
+          "total_node_count": 1841,
+          "stale": false
+        },
+        "target_bindings": [
+          {"guid_token": "current-003", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 51, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-008", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 328, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-011", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 578, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-015", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 44, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-007", "slot_prefix": "Material:Frond:1", "material_id": 4, "mesh_id": 131, "graph_visible": true, "eligible_node_count": 31, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-003", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 51, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-008", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 328, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-011", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 578, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-015", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 44, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-007", "slot_prefix": "Material:Frond:0", "material_id": 4, "mesh_id": 133, "graph_visible": true, "eligible_node_count": 31, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false}
+        ],
+        "delivery_result": {
+          "status": "live_snapshot_target_delivery_valid",
+          "live_export_participating_target_mesh_ids": [130, 131, 132, 133],
+          "cluster_normalization_rerun": false,
+          "unreal_push_rerun": false
+        }
       },
       "audit_outcome": "pre_resave_evidence_valid_closure_incomplete"
     },
@@ -267,21 +366,97 @@
         "source": "Read-only audit of the configured live asset; local absolute path intentionally omitted."
       },
       "after": {
-        "status": "pending",
-        "resaved": false,
-        "captured_utc": null,
-        "spm_text_sha256": null,
-        "current_generator_count": null,
-        "node_table_generator_count": null,
-        "orphan_generator_guid_count": null,
-        "orphan_node_count": null,
-        "eligible_node_count": null,
-        "total_node_count": null,
-        "stale": null,
-        "guid_ownership_evidence": null,
-        "independent_elementtree_crosscheck": null,
-        "target_bindings": null,
-        "delivery_result": null
+        "status": "captured_membership_continuity_unverified",
+        "resaved": true,
+        "captured_utc": "2026-07-31T10:34:32Z",
+        "audit_repository_commit": "3fa2fe904bae51200aa965242fd068eafa28a38f",
+        "snapshot_contract": "speedtree_live_generator_delivery_snapshot_v1",
+        "spm_text_sha256": "de8728b9ba67a753a3318a8e38820d9e982ab8f8e2a720522110be504efb00f3",
+        "pre_resave_hash_changed": true,
+        "current_generator_count": 24,
+        "node_table_generator_count": 24,
+        "orphan_generator_guid_count": 0,
+        "orphan_node_count": 0,
+        "eligible_node_count": 3283,
+        "total_node_count": 3284,
+        "stale": false,
+        "guid_ownership_evidence": {
+          "token_namespace": "post-resave asset-scoped; not asserted identical to the pre-resave namespace",
+          "anonymization": "Asset-scoped opaque sequential tokens; raw GUIDs and the token mapping are intentionally not published.",
+          "current_generator_guid_tokens": [
+            "current-001", "current-002", "current-003", "current-004", "current-005",
+            "current-006", "current-007", "current-008", "current-009", "current-010",
+            "current-011", "current-012", "current-013", "current-014", "current-015",
+            "current-016", "current-017", "current-018", "current-019", "current-020",
+            "current-021", "current-022", "current-023", "current-024"
+          ],
+          "eligible_node_count_by_guid_token": {
+            "current-001": 75,
+            "current-002": 48,
+            "current-003": 48,
+            "current-004": 816,
+            "current-005": 470,
+            "current-006": 63,
+            "current-007": 48,
+            "current-008": 340,
+            "current-009": 255,
+            "current-010": 63,
+            "current-011": 257,
+            "current-012": 61,
+            "current-013": 25,
+            "current-014": 14,
+            "current-015": 1,
+            "current-016": 62,
+            "current-017": 1,
+            "current-018": 120,
+            "current-019": 170,
+            "current-020": 66,
+            "current-021": 116,
+            "current-022": 25,
+            "current-023": 66,
+            "current-024": 73
+          }
+        },
+        "membership_continuity": {
+          "status": "unverified",
+          "exact_pre_hash_backup_available": false,
+          "matching_pre_state_backup_count": 2,
+          "matching_pre_state_membership_variant_count": 1,
+          "after_matches_matching_pre_state_membership": false,
+          "closure_gate": "blocked",
+          "reason": "Matching historical stale-state backups are not the exact pre-hash capture, so they cannot prove whether capture-time membership changed."
+        },
+        "independent_elementtree_crosscheck": {
+          "parser": "xml.etree.ElementTree",
+          "status": "matched",
+          "current_generator_guid_membership_match": true,
+          "per_guid_eligible_node_counts_match": true,
+          "current_generator_count": 24,
+          "node_table_generator_count": 24,
+          "orphan_generator_guid_count": 0,
+          "orphan_node_count": 0,
+          "eligible_node_count": 3283,
+          "total_node_count": 3284,
+          "stale": false
+        },
+        "target_bindings": [
+          {"guid_token": "current-004", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 816, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-005", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 470, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-020", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 66, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-024", "slot_prefix": "Leaves:Type:0", "material_id": 4, "mesh_id": 130, "graph_visible": true, "eligible_node_count": 73, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-012", "slot_prefix": "Material:Frond:1", "material_id": 4, "mesh_id": 131, "graph_visible": true, "eligible_node_count": 61, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-004", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 816, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-005", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 470, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-020", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 66, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-024", "slot_prefix": "Leaves:Type:1", "material_id": 4, "mesh_id": 132, "graph_visible": true, "eligible_node_count": 73, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false},
+          {"guid_token": "current-012", "slot_prefix": "Material:Frond:0", "material_id": 4, "mesh_id": 133, "graph_visible": true, "eligible_node_count": 61, "export_participates": true, "export_evidence": "node_table", "node_table_stale": false}
+        ],
+        "delivery_result": {
+          "status": "live_snapshot_target_delivery_valid",
+          "live_export_participating_target_mesh_ids": [130, 131, 132, 133],
+          "cluster_normalization_rerun": false,
+          "unreal_push_rerun": false
+        }
       },
       "audit_outcome": "pre_resave_evidence_valid_closure_incomplete"
     }
@@ -308,10 +483,12 @@
   ],
   "resave_tool": {
     "name": "SpeedTree Modeler",
-    "version": "v10.1.0",
-    "executed": false,
+    "version": null,
+    "executed": true,
     "executed_utc": null,
-    "operator": null
+    "performed_by": "user",
+    "action": "Opened both operating SPMs in Modeler, recalculated the current graph, and saved them.",
+    "verification_scope": "The changed file hashes and post-save audit are verified; Modeler version and internal UI operations were not independently observed."
   },
   "audit_outcome": "pre_resave_evidence_valid_closure_incomplete",
   "reproduction_checklist": [
@@ -324,23 +501,23 @@
   "completion_checklist": [
     {
       "item": "both_affected_spms_report_zero_orphan_node_ownership",
-      "status": "pending",
+      "status": "verified",
       "verified_by": "Post-resave audit reports orphan_node_count == 0 for both files."
     },
     {
       "item": "required_current_generator_guids_receive_valid_live_export_evidence",
-      "status": "pending",
+      "status": "verified",
       "verified_by": "Post-resave target bindings report export_evidence == node_table and the expected bindings export-participate."
     },
     {
       "item": "live_export_participating_target_mesh_ids_equals_normalized_declared_set",
-      "status": "pending",
+      "status": "verified_live_snapshot",
       "verified_by": "Post-resave delivery result reports [130, 131, 132, 133]."
     },
     {
       "item": "stale_node_table_validation_block_no_longer_occurs_after_resave",
       "status": "pending",
-      "verified_by": "Post-resave delivery reason is not live_export_evidence_unavailable_stale_node_table."
+      "verified_by": "The live snapshot stale condition is gone, but Cluster normalization must be rerun to prove the pipeline block no longer occurs."
     },
     {
       "item": "no_validation_bypass_or_fail_open_special_case_introduced",
@@ -351,6 +528,7 @@
   "notes": [
     "GUID tokens are asset-scoped labels, not hashes; no raw GUID or reversible mapping is published.",
     "eligible_node_count excludes hidden, deleted, or culled Nodes. total_node_count counts all serialized Nodes and is therefore only required to be greater than or equal to the eligible per-GUID sum.",
-    "The after blocks and delivery_result_after_resave remain null/pending until a real SpeedTree Modeler open, regenerate, save, and re-audit is performed."
+    "The post-resave live snapshot passes the node-table and target-binding checks, but this is not evidence that Cluster normalization or the Unreal push succeeded.",
+    "Full pre-to-post Generator membership continuity remains unverified. Exact pre-hash files are unavailable locally; matching historical stale-state backups are explicitly not treated as the exact capture."
   ]
 }
