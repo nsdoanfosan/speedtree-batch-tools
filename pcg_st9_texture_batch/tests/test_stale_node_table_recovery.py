@@ -1129,6 +1129,39 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             )
             self.assertFalse(launches)
 
+    def test_launch_guard_source_mutation_is_caught_by_final_recapture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            launches = []
+
+            def mutate_source_and_remain_eligible():
+                write_spm(
+                    spm,
+                    spm_text(stale=True, graph_property="guard-source-race"),
+                )
+                return False
+
+            guards = {
+                "is_cancelled": mutate_source_and_remain_eligible,
+                "is_app_open": lambda: True,
+                "is_job_current": lambda: True,
+            }
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    guards=guards,
+                    launch_observer=lambda *_args: launches.append(True),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "source_changed_before_modeler_launch",
+            )
+            self.assertFalse(launches)
+
     def test_backup_race_immediately_before_continuation_blocks_claim(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -1232,6 +1265,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertFalse(result["modeler_launched"])
         self.assertTrue(result["reaudit"]["authoring_graph_continuity"])
+        self.assertTrue(result["reaudit"]["generator_membership_continuity"])
 
     def test_literal_schema2_raw_guid_spelling_receipt_is_frozen(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1300,7 +1334,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         hidden = "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>false</Hidden>"
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
-            spm, _executable, root = self.make_files(folder)
+            spm, executable, root = self.make_files(folder)
             root.mkdir()
             write_spm(spm, spm_text(stale=True).replace(
                 hidden,
@@ -1361,6 +1395,39 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 caught.exception.reason_token,
                 "preimage_reaudit_failed",
             )
+            sealed_backup_bytes = artifacts["backup_path"].read_bytes()
+            sealed_receipt_bytes = artifacts["receipt_path"].read_bytes()
+            write_spm(spm, spm_text(stale=True).replace(
+                hidden,
+                "<Name>Leaf 133</Name><GUID>g-133</GUID><Hidden>true</Hidden>",
+                1,
+            ))
+            launches = []
+            claims = []
+            with self.assertRaises(StaleNodeTableRecoveryError) as recovery_error:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    retry=lambda continuation: claims.append(continuation),
+                    job_id="schema3-projected-subset",
+                    generation=1,
+                    guards=open_guards(),
+                    launch_observer=lambda *_args: launches.append(True),
+                )
+            self.assertEqual(
+                recovery_error.exception.reason_token,
+                "preimage_target_manifest_incomplete",
+            )
+            self.assertEqual(launches, [])
+            self.assertEqual(claims, [])
+            self.assertEqual(
+                artifacts["backup_path"].read_bytes(), sealed_backup_bytes
+            )
+            self.assertEqual(
+                artifacts["receipt_path"].read_bytes(), sealed_receipt_bytes
+            )
+            self.assertFalse(list(root.glob("continuation.*.claim.json")))
 
     def test_ensure_reuses_exact_valid_v2_receipt_without_rewriting(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2111,6 +2178,46 @@ class QuiescenceAndGraphGateTests(RecoveryTestCase):
 
 
 class ContinuationAndRaceTests(RecoveryTestCase):
+    def test_continuation_guard_source_mutation_blocks_claim_and_callback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            guard_calls = 0
+            continuations = []
+
+            def mutate_on_continuation_guard():
+                nonlocal guard_calls
+                guard_calls += 1
+                if guard_calls == 2:
+                    write_spm(
+                        spm,
+                        spm_text(stale=False, graph_property="guard-source-race"),
+                    )
+                return False
+
+            guards = {
+                "is_cancelled": mutate_on_continuation_guard,
+                "is_app_open": lambda: True,
+                "is_job_current": lambda: True,
+            }
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    retry=lambda continuation: continuations.append(continuation),
+                    job_id="continuation-source-race",
+                    generation=1,
+                    guards=guards,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "source_changed_before_continuation",
+            )
+            self.assertEqual(continuations, [])
+            self.assertFalse(list(root.glob("continuation.*.claim.json")))
+
     def test_source_sha_is_rechecked_immediately_before_continuation(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
