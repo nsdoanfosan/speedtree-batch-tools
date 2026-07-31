@@ -1080,6 +1080,185 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             release.set()
             root.destroy()
 
+    def test_completion_popup_is_not_suppressed_by_its_own_refresh_job(self):
+        """A done() callback that calls self.refresh() before showing its
+        completion popup must not have that popup silently swallowed.
+
+        self.refresh() enqueues its own background job (shared_queue=False)
+        while the just-finished job is still self.active_job, so a naive
+        "any pending job -> suppress popup" check would misfire here even
+        though nothing else is genuinely queued.
+        """
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", return_value=[]
+            ), mock.patch.object(
+                GUI.messagebox, "showinfo"
+            ) as showinfo:
+
+                def done(_result):
+                    app.refresh()
+                    app._show_job_info("작업 완료", "상세 내용")
+
+                app._start_job(
+                    "작업 실행 중",
+                    lambda _report: {"status": "ok"},
+                    done,
+                    queue_label="테스트 작업",
+                )
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            showinfo.assert_called_once()
+        finally:
+            root.destroy()
+
+    def test_completion_popup_still_suppressed_by_a_real_queued_job(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+            gate = threading.Event()
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", return_value=[]
+            ), mock.patch.object(
+                GUI.messagebox, "showinfo"
+            ) as showinfo:
+
+                def done(_result):
+                    app.refresh()
+                    app._show_job_info("작업 완료", "상세 내용")
+
+                app._start_job(
+                    "작업 실행 중",
+                    lambda _report: gate.wait(2) or {"status": "ok"},
+                    done,
+                    queue_label="테스트 작업 A",
+                )
+                app._start_job(
+                    "두 번째 작업",
+                    lambda _report: {"status": "ok"},
+                    lambda _result: None,
+                    queue_label="테스트 작업 B",
+                )
+                gate.set()
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            showinfo.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_stale_refresh_generation_is_discarded_without_rendering(self):
+        """When refresh() is re-triggered before the first scan finishes,
+        the stale first scan's result must not overwrite the board with
+        out-of-date data once the newer refresh has already superseded it.
+        """
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+            first_entered = threading.Event()
+            release_first = threading.Event()
+
+            stale_board = [{"folder": "stale", "spms": [], "cluster_blends": []}]
+            fresh_board = [{"folder": "fresh", "spms": [], "cluster_blends": []}]
+
+            def scan_side_effect(_root, *, sk_only, verify_physical, progress_callback):
+                if not first_entered.is_set():
+                    first_entered.set()
+                    release_first.wait(2)
+                    return stale_board
+                return fresh_board
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", side_effect=scan_side_effect
+            ):
+                app.refresh(fast=True)
+                deadline = time.monotonic() + 2
+                while (
+                    not first_entered.is_set()
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+                self.assertTrue(first_entered.is_set())
+
+                app.refresh(fast=True)
+                release_first.set()
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(app.board, fresh_board)
+            self.assertEqual(app.render_board.call_count, 1)
+        finally:
+            root.destroy()
+
     def test_background_jobs_queue_fifo_and_continue_after_failure(self):
         root = tk.Tk()
         root.withdraw()

@@ -2426,11 +2426,17 @@ class App:
             self.job_last_progress_at = None
 
     def _show_job_info(self, title, message):
-        """Do not let a completion popup hold the next queued job."""
-        if (
-            getattr(self, "_job_has_followup", False)
-            or bool(getattr(self, "pending_jobs", ()))
-        ):
+        """Do not let a completion popup hold the next queued job.
+
+        ``_job_has_followup`` is snapshotted from ``pending_jobs`` right
+        before ``on_success`` runs (see ``_poll_job``). Checking the live
+        ``pending_jobs`` here instead would misfire: ``on_success`` callbacks
+        commonly call ``self.refresh()`` first, which enqueues its own
+        (silent, ``shared_queue=False``) job while ``active_job`` is still
+        set, making ``pending_jobs`` non-empty even with no real queued work
+        and permanently suppressing the completion popup.
+        """
+        if getattr(self, "_job_has_followup", False):
             self.status_var.set(f"{title} · 다음 대기 작업 시작")
             return
         messagebox.showinfo(title, message, parent=self.root)
