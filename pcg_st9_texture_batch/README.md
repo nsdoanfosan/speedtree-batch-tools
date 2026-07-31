@@ -316,11 +316,21 @@ python -m pcg_st9_texture_batch.stale_node_table_recovery ^
   --expected-mesh-id 132 --expected-mesh-id 133
 ```
 
-The command opens the operating SPM in the configured SpeedTree Modeler and
-waits for the user to save it. It does not edit SPM XML, simulate UI input, or
-claim an unattended Modeler save. After a stable content-hash change, it runs a
-fresh Node-table and target-binding audit. Library callers may supply a retry
-callback; that callback is invoked only after the re-audit passes.
+Before Modeler is opened, the command captures an exact byte-for-byte preimage
+under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
+SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
+membership, and required target-binding fingerprints. It then waits for the
+user to save the file and requires repeated identical stat/size/SHA snapshots
+with successful parsing. Regex, independent ElementTree, target delivery, and
+normalization evidence all come from those same immutable bytes.
+
+The command does not edit SPM XML, automate Save or keystrokes, kill Modeler,
+roll back automatically, or continue merely because `stale=false`. Library
+callers may resume the initiating job only once, bound to its generation and
+the verified after SHA, after cancellation/app-close/stale-job guards and a
+final source-SHA recheck. A privacy-safe blocked-event receipt records only the
+asset name, after SHA, and stable reason tokens. Missing/corrupt preimage or
+receipt evidence fails before Modeler launch.
 
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),

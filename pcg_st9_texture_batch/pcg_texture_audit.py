@@ -714,16 +714,8 @@ def _leaf_generator_bindings_from_text(
     return bindings
 
 
-def live_generator_delivery_snapshot(path):
-    """Return one uncached document snapshot for delivery validation.
-
-    Normal audit queries intentionally share a size/mtime keyed parse cache.
-    That cache is useful for a board scan but cannot be authority after an
-    external Atlas writer mutates Generator properties.  Read and parse the
-    target exactly once here so Generator rows, export participation, and Mesh
-    asset IDs all come from the same current document.
-    """
-    text = read_pipeline_spm_text(path)
+def generator_delivery_snapshot_from_spm_text(text, path):
+    """Build delivery evidence from one caller-owned immutable text snapshot."""
     export_node_counts, total_nodes = _export_node_counts_from_text(text)
     bindings = _leaf_generator_bindings_from_text(
         text,
@@ -752,6 +744,21 @@ def live_generator_delivery_snapshot(path):
             _generator_guid_keys_from_text(text),
         ),
     }
+
+
+def live_generator_delivery_snapshot(path):
+    """Return one uncached document snapshot for delivery validation.
+
+    Normal audit queries intentionally share a size/mtime keyed parse cache.
+    That cache is useful for a board scan but cannot be authority after an
+    external Atlas writer mutates Generator properties.  Read and parse the
+    target exactly once here so Generator rows, export participation, and Mesh
+    asset IDs all come from the same current document.
+    """
+    return generator_delivery_snapshot_from_spm_text(
+        read_pipeline_spm_text(path),
+        path,
+    )
 
 
 def _material_cutout_mesh_ids(block):

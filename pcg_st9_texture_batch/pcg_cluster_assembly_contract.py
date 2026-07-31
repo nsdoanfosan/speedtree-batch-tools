@@ -1744,16 +1744,39 @@ STALE_NODE_TABLE_REMEDY = (
 def _stale_node_table_recovery_contract():
     """Describe the safe recovery boundary without claiming unattended save."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": STALE_NODE_TABLE_RECOVERY_MODE,
         "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
         "modeler_auto_save": False,
+        "modeler_process_kill": False,
         "direct_spm_xml_edit": False,
         "ui_input_simulation": False,
+        "automatic_rollback": False,
         "requires_user_save": True,
+        "requires_exact_preimage_backup": True,
+        "requires_immutable_preimage_receipt": True,
+        "authoring_graph_projection_version": 1,
         "watches_content_hash_change": True,
+        "requires_repeated_stat_size_sha_parse_quiescence": True,
+        "same_immutable_snapshot_crosschecks": [
+            "regex",
+            "xml.etree.ElementTree",
+            "target_delivery",
+            "normalization",
+        ],
         "automatic_reaudit": True,
+        "stale_false_alone_allows_retry": False,
+        "source_sha_rechecked_before_continuation": True,
+        "continuation_scope": "initiating_job_generation_and_after_sha",
+        "continuation_once_only": True,
+        "queue_or_manifest_mutation_before_continuation": False,
+        "continuation_guards": [
+            "cancellation",
+            "app_open",
+            "job_generation_current",
+        ],
         "retry_only_after_valid_reaudit": True,
+        "blocked_event_privacy": "asset_name_after_sha_reason_tokens_only",
     }
 
 

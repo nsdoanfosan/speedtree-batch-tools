@@ -24,6 +24,7 @@ from pathlib import Path
 PREFLIGHT_CONTRACT_KIND = "speedtree_material_preflight"
 PREFLIGHT_SCHEMA_VERSION = 1
 SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION = 1
+SPM_AUTHORING_GRAPH_PROJECTION_VERSION = 1
 TREE_USER_DATA_PROPERTY = "SpeedTree SDK:User data"
 BACKUP_DIRECTORY_NAMES = frozenset(
     {
@@ -37,6 +38,19 @@ BACKUP_FILENAME_RE = re.compile(
     r"\.(?:codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE
 )
 _SPM_SEMANTIC_IGNORED_SUBTREE_TAGS = frozenset({"Thumbnail", "Preview"})
+_SPM_AUTHORING_GRAPH_IGNORED_SUBTREE_TAGS = frozenset(
+    {
+        # Known presentation/session payloads observed in supported SPMs.
+        # Keep this list deliberately narrow: unknown metadata remains part of
+        # the fingerprint and therefore fails closed if Modeler changes it.
+        "thumbnail",
+        "thumbnailsize",
+        "preview",
+        "statistics",
+        "quicksavesettings2",
+        "m_stimelinedata",
+    }
+)
 _SPM_SEMANTIC_MATERIAL_GEOMETRY_TAGS = frozenset(
     {
         "CutoutMeshID",
@@ -408,6 +422,59 @@ def spm_structural_semantic_fingerprint(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def _remove_generated_and_known_volatile_spm_content(parent, *, depth=0):
+    """Project the full authoring graph without generated/save-only payloads."""
+    for child in list(parent):
+        tag = _local_xml_tag(child.tag).casefold()
+        # Only the document-root <Nodes> collection is SpeedTree's generated
+        # evaluation table.  A same-named collection nested in an authored
+        # structural asset remains fingerprinted.
+        generated_node_table = depth == 0 and tag == "nodes"
+        if (
+            generated_node_table
+            or tag in _SPM_AUTHORING_GRAPH_IGNORED_SUBTREE_TAGS
+        ):
+            parent.remove(child)
+            continue
+        _remove_generated_and_known_volatile_spm_content(
+            child,
+            depth=depth + 1,
+        )
+
+
+def spm_authoring_graph_fingerprint(source_text, *, projection_version=None):
+    """Hash the authored graph while excluding only generated/volatile data.
+
+    Unlike :func:`spm_structural_semantic_fingerprint`, this projection keeps
+    all Generator properties, Links, materials, meshes, and other structural
+    assets.  It is the continuity gate for an interactive Node-table resave.
+    """
+    projected = ET.fromstring(source_text)
+    _remove_generated_and_known_volatile_spm_content(projected)
+    payload = ET.tostring(
+        projected,
+        encoding="unicode",
+        short_empty_elements=True,
+    )
+    payload = re.sub(r">\s+<", "><", payload).strip()
+    envelope = {
+        "contract": "speedtree_spm_authoring_graph_projection",
+        "projection_version": (
+            SPM_AUTHORING_GRAPH_PROJECTION_VERSION
+            if projection_version is None
+            else projection_version
+        ),
+        "source": payload,
+    }
+    encoded = json.dumps(
+        envelope,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @lru_cache(maxsize=512)
@@ -1013,6 +1080,7 @@ __all__ = [
     "PREFLIGHT_CONTRACT_KIND",
     "PREFLIGHT_SCHEMA_VERSION",
     "SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION",
+    "SPM_AUTHORING_GRAPH_PROJECTION_VERSION",
     "TREE_USER_DATA_PROPERTY",
     "build_preflight_envelope",
     "build_stmat_material_intents",
@@ -1038,6 +1106,7 @@ __all__ = [
     "speedtree_stmat_path",
     "spm_container_format",
     "spm_file_structural_semantic_fingerprint",
+    "spm_authoring_graph_fingerprint",
     "spm_structural_semantic_fingerprint",
     "validate_preflight_envelope",
     "validate_preflight_report",
