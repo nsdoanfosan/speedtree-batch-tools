@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <SpeedTree>
   <Thumbnail>before-cache</Thumbnail>
+  <ThumbnailSize>before-size</ThumbnailSize>
   <Preview>before-preview</Preview>
   <Statistics><TriangleCount>101</TriangleCount></Statistics>
   <TreeInfo>before-tree-info</TreeInfo>

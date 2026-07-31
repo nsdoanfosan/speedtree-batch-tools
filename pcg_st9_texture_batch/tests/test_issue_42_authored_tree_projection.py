@@ -36,7 +36,7 @@ def project(text):
     return _authoring_graph_core_projection(text)["fingerprint"]
 
 
-def default_specular_map(seed):
+def default_material_map(map_name, seed):
     def spline(length):
         return (
             '<Spline DrawMode="false">'
@@ -45,6 +45,12 @@ def default_specular_map(seed):
             '</Spline>'
         )
 
+    specific = {
+        "Specular": ("0.75", "0.75", "0.75", "0", "true"),
+        "Metallic": ("0", "0", "0", "1", "false"),
+        "Custom": ("0", "0", "0", "0", "true"),
+        "Custom2": ("0", "0", "0", "0", "false"),
+    }[map_name]
     scalars = {
         "TexFilename": "",
         "TexBrightness": "0",
@@ -63,11 +69,11 @@ def default_specular_map(seed):
         "Normalize": "false",
         "TexSizeX": "0",
         "TexSizeY": "0",
-        "ColorX": "0.75",
-        "ColorY": "0.75",
-        "ColorZ": "0.75",
-        "TexSource": "0",
-        "TexToLinear": "true",
+        "ColorX": specific[0],
+        "ColorY": specific[1],
+        "ColorZ": specific[2],
+        "TexSource": specific[3],
+        "TexToLinear": specific[4],
     }
     scalar_xml = "".join(
         f"<{name}>{value}</{name}>" for name, value in scalars.items()
@@ -84,7 +90,7 @@ def default_specular_map(seed):
         f'{spline("0.45")}</Noise>'
         '</Generate>'
     )
-    return f'<Map Name="Specular">{scalar_xml}{generate}</Map>'
+    return f'<Map Name="{map_name}">{scalar_xml}{generate}</Map>'
 
 
 class AuthoredTreeProjectionV4Tests(unittest.TestCase):
@@ -190,26 +196,37 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotEqual(project(changed), baseline)
 
-        default_a = default_specular_map(123)
-        default_b = default_specular_map(987654321)
-        with_default_a = self.after.replace(
-            "</Material_V8>", default_a + "</Material_V8>", 1
-        )
-        with_default_b = self.after.replace(
-            "</Material_V8>", default_b + "</Material_V8>", 1
-        )
-        self.assertEqual(project(with_default_a), self.after_fingerprint)
-        self.assertEqual(project(with_default_b), self.after_fingerprint)
-        near_default = self.after.replace(
-            "</Material_V8>",
-            default_a.replace(
-                "<TexBrightness>0</TexBrightness>",
-                "<TexBrightness>0.25</TexBrightness>",
-                1,
-            ) + "</Material_V8>",
-            1,
-        )
-        self.assertNotEqual(project(near_default), self.after_fingerprint)
+        for map_name in ("Specular", "Metallic", "Custom", "Custom2"):
+            with self.subTest(default_map=map_name):
+                default_a = default_material_map(map_name, 123)
+                default_b = default_material_map(map_name, 987654321)
+                with_default_a = self.after.replace(
+                    "</Material_V8>", default_a + "</Material_V8>", 1
+                )
+                with_default_b = self.after.replace(
+                    "</Material_V8>", default_b + "</Material_V8>", 1
+                )
+                self.assertEqual(
+                    project(with_default_a),
+                    self.after_fingerprint,
+                )
+                self.assertEqual(
+                    project(with_default_b),
+                    self.after_fingerprint,
+                )
+                near_default = self.after.replace(
+                    "</Material_V8>",
+                    default_a.replace(
+                        "<TexBrightness>0</TexBrightness>",
+                        "<TexBrightness>0.25</TexBrightness>",
+                        1,
+                    ) + "</Material_V8>",
+                    1,
+                )
+                self.assertNotEqual(
+                    project(near_default),
+                    self.after_fingerprint,
+                )
 
     def test_no_blanket_guid_float_or_namespace_normalization(self):
         authored_guid_a = self.before.replace(
