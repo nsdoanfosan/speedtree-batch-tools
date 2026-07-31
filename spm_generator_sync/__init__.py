@@ -2,7 +2,9 @@
 
 from .spm_generator_sync import (
     CATEGORY_COLORS,
+    SyncCancelled,
     SyncError,
+    TransactionRollbackError,
     apply_group_transaction,
     build_sync_plan,
     load_manifest,
@@ -18,7 +20,9 @@ from cluster_blend_sync import (
 
 __all__ = [
     "CATEGORY_COLORS",
+    "SyncCancelled",
     "SyncError",
+    "TransactionRollbackError",
     "apply_group_transaction",
     "build_sync_plan",
     "load_manifest",

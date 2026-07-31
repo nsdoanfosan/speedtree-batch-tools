@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import importlib.machinery
 import importlib.util
+import inspect
 import os
 import subprocess
 import sys
@@ -906,22 +907,74 @@ class IntegratedApp:
             messagebox.showerror("개별 실행 실패", str(exc), parent=self.root)
 
     def close(self):
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
         if self.find_dialog is not None and self.find_dialog.winfo_exists():
             self.find_dialog.destroy()
-        for app in self.apps.values():
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+        apps = list(self.apps.values())
+        pending = set(range(len(apps)))
+        finalized = False
+
+        def finalize():
+            nonlocal finalized
+            if finalized:
+                return
+            finalized = True
+            for app in apps:
+                persist = getattr(app, "persist_config", None)
+                if callable(persist):
+                    try:
+                        persist()
+                    except Exception:
+                        pass
+            self.root.destroy()
+
+        def completed(index):
+            if index not in pending:
+                return
+            pending.remove(index)
+            if not pending:
+                finalize()
+
+        def shutdown_failed(app, exc):
+            errors = getattr(self, "_close_errors", [])
+            errors.append((app, exc))
+            self._close_errors = errors
+            self._closing = False
+            try:
+                self.status_var.set(
+                    "종료 정리 실패 · 작업/대기열 상태를 확인한 뒤 다시 닫으세요"
+                )
+                self.root.deiconify()
+            except (AttributeError, tk.TclError):
+                pass
+
+        if not apps:
+            finalize()
+            return
+
+        for index, app in enumerate(apps):
             shutdown_queue = getattr(app, "shutdown_shared_queue", None)
             if callable(shutdown_queue):
                 try:
+                    parameters = inspect.signature(shutdown_queue).parameters
+                    if "on_complete" in parameters:
+                        shutdown_queue(
+                            on_complete=(
+                                lambda target=index: completed(target)
+                            )
+                        )
+                        continue
                     shutdown_queue()
-                except Exception:
-                    pass
-            persist = getattr(app, "persist_config", None)
-            if callable(persist):
-                try:
-                    persist()
-                except Exception:
-                    pass
-        self.root.destroy()
+                except Exception as exc:
+                    shutdown_failed(app, exc)
+                    continue
+            completed(index)
 
 
 def main():

@@ -28,7 +28,7 @@ from cluster_blend_sync import (
     run_cluster_relation_transaction,
 )
 from cluster_source_prepare import prepare_cluster_source_if_required
-from shared_queue_runtime import SharedQueueRuntime
+from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 
 
 def _load_sibling_engine():
@@ -60,6 +60,8 @@ CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
 REPORT_DIR = TOOL_DIR / "reports"
 CACHE_VERSION = 4
+PROCESS_OUTPUT_BUFFER_LINES = 4096
+PROCESS_OUTPUT_LINE_CHARS = 4096
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
@@ -467,7 +469,12 @@ class App:
         self._deferred_job_info_flush_scheduled = False
         self.job_started_at = None
         self.job_last_progress_at = None
+        self.job_last_output_at = None
         self.job_stage = "대기"
+        self.closing = False
+        self._shutdown_callbacks = []
+        self._shutdown_poll_scheduled = False
+        self._shutdown_complete = False
         self.refresh_generation = 0
         self.shared_queue_runtime = SharedQueueRuntime(
             "spm_generator_sync"
@@ -559,6 +566,13 @@ class App:
             command=self.apply_connected_board,
         )
         self.apply_connected_button.pack(side="left", padx=(5, 0))
+        self.cancel_job_button = ttk.Button(
+            actions,
+            text="현재 작업 취소",
+            command=self.request_active_job_cancel,
+            state="disabled",
+        )
+        self.cancel_job_button.pack(side="left", padx=(8, 0))
         self.verify_var = tk.BooleanVar(value=bool(self.config.get("verify_speedtree", True)))
         ttk.Checkbutton(actions, text="SpeedTree 10.1 실제 검증", variable=self.verify_var,
                         command=self.persist_config).pack(side="left", padx=12)
@@ -574,6 +588,36 @@ class App:
         ttk.Label(
             progress_row, textvariable=self.progress_text_var, width=58, anchor="e",
         ).pack(side="right", padx=(10, 0))
+
+        output_frame = ttk.LabelFrame(
+            self.root,
+            text="SpeedTree 프로세스 출력 (stdout / stderr)",
+            padding=(6, 4),
+        )
+        output_frame.pack(fill="x", padx=8, pady=(0, 6))
+        self.process_output = tk.Text(
+            output_frame,
+            height=6,
+            wrap="none",
+            font=("Consolas", 9),
+            background="#111827",
+            foreground="#d1d5db",
+            insertbackground="#d1d5db",
+            state="disabled",
+        )
+        output_scroll = ttk.Scrollbar(
+            output_frame,
+            orient="vertical",
+            command=self.process_output.yview,
+        )
+        self.process_output.configure(yscrollcommand=output_scroll.set)
+        self.process_output.grid(row=0, column=0, sticky="nsew")
+        output_scroll.grid(row=0, column=1, sticky="ns")
+        output_frame.columnconfigure(0, weight=1)
+        self.process_output.tag_configure("stdout", foreground="#d1d5db")
+        self.process_output.tag_configure("stderr", foreground="#fca5a5")
+        self.process_output.tag_configure("system", foreground="#93c5fd")
+        self.process_output_line_count = 0
 
         board_frame = ttk.Frame(self.root, padding=(8, 0, 8, 5))
         board_frame.pack(fill="both", expand=True)
@@ -2435,6 +2479,11 @@ class App:
 
         def apply(report):
             started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            raise_if_cancelled = getattr(
+                report, "raise_if_cancelled", lambda: None
+            )
+            process_output = getattr(report, "output", None)
+            cancel_requested = getattr(report, "cancel_requested", None)
             report("실행 시점 연결 관계 다시 검사 중", 1)
             runtime_board = engine.scan_tree_folders(
                 Path(board_root),
@@ -2492,12 +2541,14 @@ class App:
                 report(f"{label} · {stage}", overall)
 
             unit_index = 0
+            cancelled_exc = None
             for group in runtime_groups:
                 label = (
                     f"Generator {unit_index + 1}/{total_units} · "
                     f"{group['master']}"
                 )
                 try:
+                    raise_if_cancelled()
                     result = engine.apply_group_transaction(
                         group["folder"],
                         group["master"],
@@ -2510,6 +2561,8 @@ class App:
                             lambda stage, percent, i=unit_index, text=label:
                             unit_report(i, text, stage, percent)
                         ),
+                        process_output_callback=process_output,
+                        cancel_requested=cancel_requested,
                     )
                     for entry in result.get("scale_skipped") or ():
                         risk = entry.get("scale_risk") or {}
@@ -2532,6 +2585,10 @@ class App:
                         "followers": list(group["names"]),
                         "result": self._connected_result_summary(result),
                     })
+                except engine.SyncCancelled as exc:
+                    cancelled_exc = exc
+                    payload["cancellation"] = exc.as_dict()
+                    break
                 except Exception as exc:
                     payload["failures"].append({
                         "stage": "generator_sync",
@@ -2543,11 +2600,14 @@ class App:
                 unit_index += 1
 
             for row in runtime_cluster_rows:
+                if cancelled_exc is not None:
+                    break
                 blend = Path(row["blend"])
                 label = (
                     f"Cluster {unit_index + 1}/{total_units} · {blend.name}"
                 )
                 try:
+                    raise_if_cancelled()
                     result = self._execute_cluster_refresh_rows(
                         [row],
                         job_config,
@@ -2562,6 +2622,11 @@ class App:
                         ],
                         "result": self._connected_result_summary(result),
                     })
+                    raise_if_cancelled()
+                except engine.SyncCancelled as exc:
+                    cancelled_exc = exc
+                    payload["cancellation"] = exc.as_dict()
+                    break
                 except Exception as exc:
                     payload["failures"].append({
                         "stage": "cluster_refresh",
@@ -2579,7 +2644,9 @@ class App:
                 + len(payload["cluster_refresh"])
             )
             payload["status"] = (
-                "ok"
+                "cancelled"
+                if cancelled_exc is not None
+                else "ok"
                 if not payload["failures"]
                 else "partial"
                 if success_count
@@ -2593,6 +2660,10 @@ class App:
                 )
             except Exception as exc:
                 payload["report_error"] = str(exc)
+            if cancelled_exc is not None:
+                cancelled_exc.report_payload = payload
+                cancelled_exc.report_path = payload.get("report_path")
+                raise cancelled_exc
             return payload
 
         def done(result):
@@ -2638,6 +2709,22 @@ class App:
                 detail,
             )
 
+        def cancelled(exc):
+            self.refresh()
+            payload = getattr(exc, "report_payload", {}) or {}
+            report_path = getattr(exc, "report_path", None) or payload.get(
+                "report_path"
+            )
+            self._show_job_info(
+                "연결 전체 처리 취소됨",
+                f"상태: {self._cancel_state_label(exc.termination_state)}\n"
+                f"완료된 Generator 그룹: "
+                f"{len(payload.get('generator_sync') or ())}\n"
+                f"완료된 Cluster 관계: "
+                f"{len(payload.get('cluster_refresh') or ())}\n\n"
+                f"보고서: {report_path or '저장되지 않음'}",
+            )
+
         self._start_job(
             "연결 데이터 동기화 및 Cluster 갱신 중...",
             apply,
@@ -2646,6 +2733,7 @@ class App:
                 f"연결 전체 처리 · 자식 {follower_count}개 · "
                 f"Cluster {len(cluster_rows)}개"
             ),
+            on_cancel=cancelled,
         )
 
     def _ensure_job_queue_state(self):
@@ -2658,6 +2746,8 @@ class App:
             self.job_sequence = 0
         if not hasattr(self, "job_failures"):
             self.job_failures = []
+        if not hasattr(self, "job_cancellations"):
+            self.job_cancellations = []
         if not hasattr(self, "queue_run_total"):
             self.queue_run_total = 0
         if not hasattr(self, "queue_run_completed"):
@@ -2670,6 +2760,88 @@ class App:
             self._deferred_job_info_flush_scheduled = False
         if not hasattr(self, "job_last_progress_at"):
             self.job_last_progress_at = None
+        if not hasattr(self, "job_last_output_at"):
+            self.job_last_output_at = None
+        if not hasattr(self, "closing"):
+            self.closing = False
+        if not hasattr(self, "_shutdown_callbacks"):
+            self._shutdown_callbacks = []
+        if not hasattr(self, "_shutdown_poll_scheduled"):
+            self._shutdown_poll_scheduled = False
+        if not hasattr(self, "_shutdown_complete"):
+            self._shutdown_complete = False
+
+    @staticmethod
+    def _cancel_state_label(state):
+        return {
+            "cancelled_at_safe_boundary": "안전 경계에서 취소",
+            "cancelled_before_launch": "실행 전 취소",
+            "cancelled_after_exit": "종료 경합 중 취소",
+            "cancelled_terminated": "정상 종료 요청으로 취소",
+            "cancelled_killed": "강제 종료 fallback으로 취소",
+        }.get(str(state), str(state or "취소"))
+
+    def _append_process_output(self, channel, line):
+        self._append_process_output_batch([(channel, line)])
+
+    def _append_process_output_batch(self, entries):
+        widget = getattr(self, "process_output", None)
+        if widget is None or not entries:
+            return
+        fragments = []
+        for channel, line in entries:
+            channel = (
+                channel
+                if channel in {"stdout", "stderr", "system"}
+                else "system"
+            )
+            prefix = {
+                "stdout": "[stdout] ",
+                "stderr": "[stderr] ",
+                "system": "[system] ",
+            }[channel]
+            fragments.extend((prefix + str(line) + "\n", (channel,)))
+        try:
+            widget.configure(state="normal")
+            widget.insert("end", fragments[0], *fragments[1:])
+            self.process_output_line_count = (
+                getattr(self, "process_output_line_count", 0) + len(entries)
+            )
+            overflow = self.process_output_line_count - 3000
+            if overflow >= 200:
+                widget.delete("1.0", f"{overflow + 1}.0")
+                self.process_output_line_count -= overflow
+            widget.see("end")
+            widget.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def request_active_job_cancel(self):
+        """Mark the current FIFO job cancelled without touching other jobs."""
+
+        self._ensure_job_queue_state()
+        job = self.active_job
+        if job is None:
+            return False
+        cancel_event = job.get("cancel_event")
+        if cancel_event is None or cancel_event.is_set():
+            return False
+        job["cancel_state"] = "requested"
+        job["cancel_requested_at"] = time.monotonic()
+        cancel_event.set()
+        self.status_var.set(f"취소 요청됨 · {job['queue_label']}")
+        self.progress_text_var.set(
+            f"취소 요청됨 · {self.job_stage} · 안전 종료 대기"
+        )
+        button = getattr(self, "cancel_job_button", None)
+        if button is not None:
+            button.configure(state="disabled")
+        self._append_process_output(
+            "system",
+            "취소 요청을 접수했습니다. 현재 안전 경계 또는 실행 중인 "
+            "SpeedTree 프로세스 종료를 기다립니다.",
+        )
+        return True
 
     def _show_job_info(self, title, message):
         """Defer modal completion detail until every follow-up has run."""
@@ -2720,11 +2892,13 @@ class App:
         *,
         queue_label=None,
         shared_queue=True,
+        on_cancel=None,
     ):
         """Capture one request in the window-local FIFO."""
         self._ensure_job_queue_state()
         if self.active_job is None and not self.pending_jobs:
             self.job_failures = []
+            self.job_cancellations = []
             self.queue_run_total = 0
             self.queue_run_completed = 0
         self.job_sequence += 1
@@ -2735,7 +2909,18 @@ class App:
             "queue_label": display_label,
             "func": func,
             "on_success": on_success,
+            "on_cancel": on_cancel,
             "shared_queue": bool(shared_queue),
+            "cancel_event": threading.Event(),
+            "cancel_state": "queued",
+            "output_buffer": deque(),
+            "output_lock": threading.Lock(),
+            "output_wakeup_queued": False,
+            "output_omitted_lines": 0,
+            "output_omitted_chars": 0,
+            "output_total_omitted_lines": 0,
+            "output_total_omitted_chars": 0,
+            "output_omission_summary_rendered": False,
         }
         self.pending_jobs.append(job)
         self.queue_run_total += 1
@@ -2753,9 +2938,12 @@ class App:
 
     def _start_next_job(self):
         self._ensure_job_queue_state()
-        if self.active_job is not None or not self.pending_jobs:
+        if self.closing or self.active_job is not None or not self.pending_jobs:
             return
         job = self.pending_jobs.popleft()
+        job.setdefault("cancel_event", threading.Event())
+        job.setdefault("cancel_state", "queued")
+        job.setdefault("on_cancel", None)
         self.active_job = job
         self.status_var.set(
             f"{job['queue_label']} · 실행"
@@ -2766,7 +2954,9 @@ class App:
         )
         self.job_started_at = time.monotonic()
         self.job_last_progress_at = self.job_started_at
+        self.job_last_output_at = None
         self.job_stage = job["label"]
+        job["cancel_state"] = "running"
         self.progress_bar.configure(value=1)
         self.progress_text_var.set(
             f"{job['queue_label']} · 00:00"
@@ -2775,6 +2965,9 @@ class App:
                 if self.pending_jobs else ""
             )
         )
+        cancel_button = getattr(self, "cancel_job_button", None)
+        if cancel_button is not None:
+            cancel_button.configure(state="normal")
 
         def report(stage, percent):
             self.job_queue.put((
@@ -2783,6 +2976,44 @@ class App:
                 str(stage),
                 max(0, min(100, int(percent))),
             ))
+
+        def output(channel, line):
+            channel = str(channel)
+            line = str(line)
+            omitted_chars = 0
+            if len(line) > PROCESS_OUTPUT_LINE_CHARS:
+                omitted_chars = len(line) - PROCESS_OUTPUT_LINE_CHARS
+                marker = (
+                    f"[process_output_line_truncated omitted_chars="
+                    f"{omitted_chars}] "
+                )
+                keep = max(0, PROCESS_OUTPUT_LINE_CHARS - len(marker))
+                line = marker + (line[-keep:] if keep else "")
+            should_wake = False
+            with job["output_lock"]:
+                if len(job["output_buffer"]) >= PROCESS_OUTPUT_BUFFER_LINES:
+                    _old_channel, old_line = job["output_buffer"].popleft()
+                    job["output_omitted_lines"] += 1
+                    job["output_omitted_chars"] += len(old_line)
+                    job["output_total_omitted_lines"] += 1
+                    job["output_total_omitted_chars"] += len(old_line)
+                job["output_omitted_chars"] += omitted_chars
+                job["output_total_omitted_chars"] += omitted_chars
+                job["output_buffer"].append((channel, line))
+                if not job["output_wakeup_queued"]:
+                    job["output_wakeup_queued"] = True
+                    should_wake = True
+            if should_wake:
+                self.job_queue.put(("output_ready", job["id"]))
+
+        def raise_if_cancelled():
+            if job["cancel_event"].is_set():
+                raise engine.SyncCancelled("cancelled_at_safe_boundary")
+
+        report.output = output
+        report.cancel_requested = job["cancel_event"].is_set
+        report.cancel_event = job["cancel_event"]
+        report.raise_if_cancelled = raise_if_cancelled
 
         def run():
             lease = None
@@ -2830,18 +3061,25 @@ class App:
                             0,
                         )
 
-                    lease = shared_runtime.wait_for_turn(
-                        shared_job_id,
-                        on_wait=report_wait,
-                    )
+                    try:
+                        lease = shared_runtime.wait_for_turn(
+                            shared_job_id,
+                            on_wait=report_wait,
+                            cancel_event=job["cancel_event"],
+                        )
+                    except WaitCancelled as exc:
+                        raise engine.SyncCancelled(
+                            "cancelled_before_launch"
+                        ) from exc
                     report("공용 대기열 진입 · 단독 실행", 1)
+                raise_if_cancelled()
                 payload = job["func"](report)
                 queue_success = not (
                     isinstance(payload, dict)
                     and (
                         payload.get("failures")
                         or str(payload.get("status") or "").casefold()
-                        in {"failed", "error", "partial"}
+                        in {"failed", "error", "partial", "cancelled"}
                     )
                 )
                 if lease is not None:
@@ -2856,8 +3094,13 @@ class App:
                             ),
                         },
                     )
+                job["worker_terminal_ok"] = True
+                job["worker_terminal_payload"] = payload
                 self.job_queue.put(("done", job["id"], True, payload))
             except Exception as exc:
+                cancelled = isinstance(exc, engine.SyncCancelled)
+                if cancelled:
+                    job["cancel_state"] = exc.termination_state
                 if lease is not None and not lease.finished:
                     try:
                         lease.finish(
@@ -2865,7 +3108,12 @@ class App:
                             result={
                                 "tool": "spm_generator_sync",
                                 "local_job_id": job["id"],
-                                "outcome": "failed",
+                                "outcome": (
+                                    "cancelled" if cancelled else "failed"
+                                ),
+                                "termination_state": getattr(
+                                    exc, "termination_state", None
+                                ),
                                 "error": str(exc),
                             },
                         )
@@ -2884,20 +3132,63 @@ class App:
                         # removed the ticket.  Preserve the causal failure;
                         # queue recovery remains the runtime's responsibility.
                         pass
+                job["worker_terminal_ok"] = False
+                job["worker_terminal_payload"] = exc
                 self.job_queue.put(("done", job["id"], False, exc))
 
-        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker = threading.Thread(target=run, daemon=False)
         self.worker.start()
         self.root.after(100, self._poll_job)
+
+    def _drain_process_output(self, job, maximum):
+        """Drain a bounded batch and keep at most one wake-up queued."""
+
+        entries = []
+        maximum = max(1, int(maximum))
+        requeue = False
+        with job["output_lock"]:
+            job["output_wakeup_queued"] = False
+            omitted_lines = job["output_omitted_lines"]
+            omitted_chars = job["output_omitted_chars"]
+            job["output_omitted_lines"] = 0
+            job["output_omitted_chars"] = 0
+            if omitted_lines or omitted_chars:
+                entries.append((
+                    "system",
+                    "[process_output_omitted] "
+                    f"lines={omitted_lines} chars={omitted_chars}",
+                ))
+            while job["output_buffer"] and len(entries) < maximum:
+                entries.append(job["output_buffer"].popleft())
+            if job["output_buffer"]:
+                job["output_wakeup_queued"] = True
+                requeue = True
+        if requeue:
+            self.job_queue.put(("output_ready", job["id"]))
+        return entries
+
+    @staticmethod
+    def _job_output_pending(job):
+        if job is None or "output_lock" not in job:
+            return False
+        with job["output_lock"]:
+            return bool(
+                job["output_buffer"]
+                or job["output_omitted_lines"]
+                or job["output_omitted_chars"]
+            )
 
     def _poll_job(self):
         self._ensure_job_queue_state()
         completed = None
-        while True:
+        processed = 0
+        output_batch = []
+        while processed < 500:
             try:
                 event = self.job_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if event[0] == "progress":
                 _kind, job_id, stage, percent = event
                 if (
@@ -2915,6 +3206,34 @@ class App:
                         if self.pending_jobs else ""
                     )
                 )
+            elif event[0] == "output":
+                _kind, job_id, channel, line = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
+                now = time.monotonic()
+                self.job_last_progress_at = now
+                self.job_last_output_at = now
+                output_batch.append((channel, line))
+            elif event[0] == "output_ready":
+                _kind, job_id = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
+                if len(output_batch) >= 500:
+                    self.job_queue.put(event)
+                    break
+                now = time.monotonic()
+                self.job_last_progress_at = now
+                self.job_last_output_at = now
+                output_batch.extend(self._drain_process_output(
+                    self.active_job,
+                    max(1, 500 - len(output_batch)),
+                ))
             elif event[0] == "done":
                 _kind, job_id, _ok, _payload = event
                 if (
@@ -2922,6 +3241,32 @@ class App:
                     and job_id == self.active_job["id"]
                 ):
                     completed = event
+
+        self._append_process_output_batch(output_batch)
+
+        if (
+            completed is not None
+            and self._job_output_pending(self.active_job)
+        ):
+            self.job_queue.put(completed)
+            self.root.after(10, self._poll_job)
+            return
+        if (
+            completed is not None
+            and self.active_job is not None
+            and not self.active_job.get("output_omission_summary_rendered")
+            and (
+                self.active_job.get("output_total_omitted_lines", 0)
+                or self.active_job.get("output_total_omitted_chars", 0)
+            )
+        ):
+            self.active_job["output_omission_summary_rendered"] = True
+            self._append_process_output(
+                "system",
+                "[process_output_omitted] total "
+                f"lines={self.active_job['output_total_omitted_lines']} "
+                f"chars={self.active_job['output_total_omitted_chars']}",
+            )
 
         elapsed = max(0, int(time.monotonic() - (self.job_started_at or time.monotonic())))
         elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
@@ -2932,21 +3277,48 @@ class App:
                 - (self.job_last_progress_at or time.monotonic())
             ),
         )
+        output_age = (
+            None
+            if self.job_last_output_at is None
+            else max(0, int(time.monotonic() - self.job_last_output_at))
+        )
         self.progress_text_var.set(
             f"{self.job_stage} · {elapsed_text} · "
-            f"마지막 진행 {heartbeat_age}초 전"
+            f"마지막 진행 {heartbeat_age}초 전 · "
+            + (
+                f"마지막 출력 {output_age}초 전"
+                if output_age is not None
+                else "프로세스 출력 대기"
+            )
             + (
                 f" · 대기 {len(self.pending_jobs)}개"
                 if self.pending_jobs else ""
             )
         )
+        if (
+            completed is not None
+            and self.worker is not None
+            and self.worker.is_alive()
+        ):
+            # The worker queues ``done`` as its final action, but can still be
+            # unwinding the closure that owns this App and its Tk variables.
+            # Keep completion on the Tk thread until the worker has actually
+            # exited; otherwise a fast teardown may finalize Tk objects from
+            # the worker thread.
+            self.job_queue.put(completed)
+            self.root.after(10, self._poll_job)
+            return
         if completed is None:
-            if self.worker and self.worker.is_alive():
+            if processed >= 500 or not self.job_queue.empty():
+                self.root.after(10, self._poll_job)
+            elif self.worker and self.worker.is_alive():
                 self.root.after(100, self._poll_job)
             return
 
         _kind, _job_id, ok, payload = completed
         job = self.active_job
+        job["terminal_ok"] = bool(ok)
+        job["terminal_payload"] = payload
         self.queue_run_completed += 1
         has_followup = bool(self.pending_jobs)
         self._job_has_followup = has_followup
@@ -2963,7 +3335,27 @@ class App:
                     self.deferred_job_infos.pop()
         has_followup = bool(self.pending_jobs)
         self._job_has_followup = has_followup
-        if not ok:
+        cancelled = not ok and isinstance(payload, engine.SyncCancelled)
+        if cancelled:
+            state = payload.termination_state
+            label = self._cancel_state_label(state)
+            job["cancel_state"] = state
+            self.job_cancellations.append((job["queue_label"], state))
+            self.status_var.set(
+                f"취소됨 · {job['queue_label']} · {label}"
+                + (" · 다음 대기 작업 시작" if has_followup else "")
+            )
+            self.progress_text_var.set(f"취소됨 · {label} · {elapsed_text}")
+            self._append_process_output("system", f"작업 취소 완료: {label}")
+            on_cancel = job.get("on_cancel")
+            if callable(on_cancel) and not self.closing:
+                try:
+                    on_cancel(payload)
+                except Exception as exc:
+                    self.job_failures.append(
+                        (job["queue_label"] + " 취소 후 처리", str(exc))
+                    )
+        elif not ok:
             self.job_failures.append((job["queue_label"], str(payload)))
             self.status_var.set(
                 f"실패 · {job['queue_label']}"
@@ -2972,7 +3364,7 @@ class App:
             self.progress_text_var.set(
                 f"실패 · {self.job_stage} · {elapsed_text}"
             )
-            if not has_followup:
+            if not has_followup and not self.closing:
                 messagebox.showerror(
                     (
                         "공용 대기열 등록 실패"
@@ -2985,15 +3377,19 @@ class App:
         self._job_has_followup = False
         self.active_job = None
         self.worker = None
-        if self.pending_jobs:
+        cancel_button = getattr(self, "cancel_job_button", None)
+        if cancel_button is not None:
+            cancel_button.configure(state="disabled")
+        if self.pending_jobs and not self.closing:
             self._start_next_job()
             if self.active_job is not None:
                 return
         if self.queue_run_total > 1:
-            if self.job_failures:
+            if self.job_failures or self.job_cancellations:
                 self.status_var.set(
                     f"대기열 완료 · {self.queue_run_completed}개 처리 · "
-                    f"실패 {len(self.job_failures)}개"
+                    f"실패 {len(self.job_failures)}개 · "
+                    f"취소 {len(self.job_cancellations)}개"
                 )
             else:
                 self.status_var.set(
@@ -3108,6 +3504,8 @@ class App:
                 speedtree_exe=speedtree_exe,
                 xml_ini=xml_ini,
                 progress_callback=report,
+                process_output_callback=getattr(report, "output", None),
+                cancel_requested=getattr(report, "cancel_requested", None),
             )
 
         def done(result):
@@ -3119,11 +3517,15 @@ class App:
                 f"백업: {result.get('backup_dir') or '새 백업 없음'}",
             )
 
+        def cancelled(_exc):
+            self.refresh()
+
         self._start_job(
             "SPM 동기화 및 검증 중...",
             apply,
             done,
             queue_label=f"SPM 동기화 · {master} → 자식 {len(names)}개",
+            on_cancel=cancelled,
         )
 
     def apply_selected(self):
@@ -3137,10 +3539,67 @@ class App:
             return
         self._apply_followers(self.followers_from_selection())
 
-    def shutdown_shared_queue(self):
-        runtime = getattr(self, "shared_queue_runtime", None)
-        if runtime is not None:
-            runtime.shutdown()
+    def shutdown_shared_queue(self, *, on_complete=None):
+        """Begin two-phase shutdown and complete only after the owner exits."""
+
+        self._ensure_job_queue_state()
+        if callable(on_complete):
+            if self._shutdown_complete:
+                self.root.after_idle(on_complete)
+                return
+            self._shutdown_callbacks.append(on_complete)
+        if not self.closing:
+            self.closing = True
+            active = self.active_job
+            if active is not None:
+                cancel_event = active.get("cancel_event")
+                if cancel_event is not None:
+                    active["cancel_state"] = "requested_on_close"
+                    cancel_event.set()
+            for job in list(self.pending_jobs):
+                cancel_event = job.get("cancel_event")
+                if cancel_event is not None:
+                    cancel_event.set()
+                job["cancel_state"] = "cancelled_on_close"
+            self.pending_jobs.clear()
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                runtime.shutdown()
+        self._schedule_shutdown_completion_poll()
+
+    def _schedule_shutdown_completion_poll(self):
+        if self._shutdown_complete or self._shutdown_poll_scheduled:
+            return
+        self._shutdown_poll_scheduled = True
+        self.root.after(50, self._poll_shutdown_completion)
+
+    def _poll_shutdown_completion(self):
+        self._shutdown_poll_scheduled = False
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.is_alive():
+            self._schedule_shutdown_completion_poll()
+            return
+        active = getattr(self, "active_job", None)
+        terminal_payload = (
+            active.get("worker_terminal_payload")
+            if isinstance(active, dict) else None
+        )
+        if (
+            terminal_payload is not None
+            and not isinstance(terminal_payload, engine.SyncCancelled)
+            and not getattr(self, "_shutdown_failure_reported", False)
+        ):
+            self._shutdown_failure_reported = True
+            messagebox.showerror(
+                "종료 정리 실패",
+                str(terminal_payload),
+                parent=self.root,
+            )
+        self._shutdown_complete = True
+        callbacks = list(self._shutdown_callbacks)
+        self._shutdown_callbacks.clear()
+        for callback in callbacks:
+            callback()
 
 
 def main():
@@ -3148,9 +3607,16 @@ def main():
     app = App(root)
 
     def close():
-        app.shutdown_shared_queue()
-        app.persist_config()
-        root.destroy()
+        if getattr(app, "_standalone_close_requested", False):
+            return
+        app._standalone_close_requested = True
+        root.withdraw()
+
+        def finalize():
+            app.persist_config()
+            root.destroy()
+
+        app.shutdown_shared_queue(on_complete=finalize)
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()

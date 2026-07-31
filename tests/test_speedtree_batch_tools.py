@@ -339,6 +339,102 @@ class IntegratedLauncherTests(unittest.TestCase):
             "파일 삭제 실패 · 파일이 그대로 보존되었습니다",
         )
 
+    def test_integrated_close_waits_for_async_tool_shutdown_completion(self):
+        class Root:
+            def __init__(self):
+                self.withdraw_calls = 0
+                self.destroy_calls = 0
+
+            def withdraw(self):
+                self.withdraw_calls += 1
+
+            def destroy(self):
+                self.destroy_calls += 1
+
+        class AsyncApp:
+            def __init__(self):
+                self.callback = None
+                self.persist_calls = 0
+
+            def shutdown_shared_queue(self, *, on_complete):
+                self.callback = on_complete
+
+            def persist_config(self):
+                self.persist_calls += 1
+
+        class SyncApp:
+            def __init__(self):
+                self.shutdown_calls = 0
+                self.persist_calls = 0
+
+            def shutdown_shared_queue(self):
+                self.shutdown_calls += 1
+
+            def persist_config(self):
+                self.persist_calls += 1
+
+        root = Root()
+        async_app = AsyncApp()
+        sync_app = SyncApp()
+        owner = object.__new__(self.launcher.IntegratedApp)
+        owner.root = root
+        owner.apps = {0: async_app, 1: sync_app}
+        owner.find_dialog = None
+
+        owner.close()
+
+        self.assertEqual(root.withdraw_calls, 1)
+        self.assertEqual(root.destroy_calls, 0)
+        self.assertIsNotNone(async_app.callback)
+        self.assertEqual(sync_app.shutdown_calls, 1)
+        self.assertEqual(async_app.persist_calls, 0)
+        self.assertEqual(sync_app.persist_calls, 0)
+
+        async_app.callback()
+        self.assertEqual(root.destroy_calls, 1)
+        self.assertEqual(async_app.persist_calls, 1)
+        self.assertEqual(sync_app.persist_calls, 1)
+
+        owner.close()
+        self.assertEqual(root.destroy_calls, 1)
+
+    def test_integrated_close_fails_closed_when_tool_shutdown_cannot_start(self):
+        class Root:
+            def __init__(self):
+                self.destroy_calls = 0
+                self.deiconify_calls = 0
+
+            def withdraw(self):
+                pass
+
+            def deiconify(self):
+                self.deiconify_calls += 1
+
+            def destroy(self):
+                self.destroy_calls += 1
+
+        class Status:
+            def set(self, value):
+                self.value = value
+
+        class FailingApp:
+            def shutdown_shared_queue(self, *, on_complete):
+                raise RuntimeError("[queue_shutdown_failed] state locked")
+
+        root = Root()
+        owner = object.__new__(self.launcher.IntegratedApp)
+        owner.root = root
+        owner.apps = {0: FailingApp()}
+        owner.find_dialog = None
+        owner.status_var = Status()
+
+        owner.close()
+
+        self.assertEqual(root.destroy_calls, 0)
+        self.assertEqual(root.deiconify_calls, 1)
+        self.assertIn("종료 정리 실패", owner.status_var.value)
+        self.assertEqual(len(owner._close_errors), 1)
+
 
 
 if __name__ == "__main__":
