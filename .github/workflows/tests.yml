@@ -1,9 +1,8 @@
 name: tests
 
-# The compile gate and the unit suites need no assets, no SpeedTree/Blender/
-# Unreal, and no third-party packages: every PIL import in the tree is
-# function-level, and there is no requirements file. So this runs on a clean
-# Windows runner with nothing but the standard library and tkinter.
+# The compile gate and the unit suites need no assets and no SpeedTree/Blender/
+# Unreal. Production code imports PIL lazily, but a handful of test modules
+# import Pillow and pytest at module level, so those two are installed.
 #
 # Windows is not incidental. The queue's liveness probe, the Job Object
 # process ownership in process_stream, and the %LOCALAPPDATA% cache paths are
@@ -30,6 +29,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      # Production code imports PIL lazily and there is no requirements file,
+      # but test_pcg_texture_batch / test_pcg_step3_freshness import Pillow and
+      # test_pipeline_plan_cli / test_push_dependency_schedule import pytest at
+      # module level, so unittest cannot even load them without these.
+      - name: test-only dependencies
+        run: python -m pip install --disable-pip-version-check --quiet pillow pytest
+
+      # Several suites build an expected path from tempfile.TemporaryDirectory()
+      # and compare it against a value the production code has resolved(). On a
+      # runner whose account name exceeds eight characters the default %TEMP%
+      # resolves to its 8.3 short form (RUNNER~1 vs runneradmin) and those
+      # comparisons fail -- a test-harness weakness, not a product defect: the
+      # product canonicalizes correctly. Pinning TEMP to a short path keeps CI
+      # measuring the product until the expectations are canonicalized too.
+      - name: short temp path
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:	 | Out-Null
+          "TEMP=C:	"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=C:	"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Fails in about a second on a syntax break or a contract drift, and
       # prints the production source revision the audit children verify
