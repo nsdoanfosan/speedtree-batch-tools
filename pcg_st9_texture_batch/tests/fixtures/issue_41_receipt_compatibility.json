@@ -64,6 +64,18 @@
         "target_requirements": 1
       },
       "result": "supported"
+    },
+    {
+      "name": "schema6_graph1_core4_target2_requirements1",
+      "receipt_schema_version": 6,
+      "projections": {
+        "authoring_graph": 1,
+        "authoring_graph_core": 4,
+        "generator_membership": 1,
+        "required_target_bindings": 2,
+        "target_requirements": 1
+      },
+      "result": "supported"
     }
   ],
   "sanitized_real_legacy_probe": {

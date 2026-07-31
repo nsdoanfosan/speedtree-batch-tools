@@ -49,7 +49,7 @@ RECOVERY_CONTRACT = "speedtree_stale_node_table_interactive_recovery_v2"
 PREIMAGE_RECEIPT_KIND = "speedtree_stale_node_table_preimage_receipt"
 BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
-AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 3
+AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 4
 TARGET_BINDING_PROJECTION_VERSION = 2
 TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
@@ -62,8 +62,9 @@ _RECEIPT_DIALECTS = {
     (3, 1, 2, 1, 1, None): "schema3_graph1_core2_target1",
     (4, 1, 3, 1, 2, None): "schema4_graph1_core3_target2",
     (5, 1, 3, 1, 2, 1): "schema5_graph1_core3_target2_requirements1",
+    (6, 1, 4, 1, 2, 1): "schema6_graph1_core4_target2_requirements1",
 }
-_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5})
+_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6})
 _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
     # A real Lauraceae receipt uses this tuple, but the historical core-v1
     # implementation is unavailable.  Its sanitized evidence fixture records
@@ -731,8 +732,8 @@ def _authoring_graph_core_subtree(
     }
 
 
-def _authoring_graph_core_projection(text):
-    """Hash durable authored semantics across an ordinary Modeler Save.
+def _legacy_authoring_graph_core_v3_projection(text):
+    """Reproduce the historical core-v3 projection without widening it.
 
     The projection retains stable global/settings subtrees, complete Generator,
     Force, RuleScript, Fan, and Light properties, Link endpoints, complete
@@ -789,11 +790,314 @@ def _authoring_graph_core_projection(text):
     }
     return {
         "contract": "speedtree_spm_authoring_graph_core_projection",
-        "version": AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+        "version": 3,
         "generator_count": len(generators),
         "link_count": len(links),
         "asset_identity_count": len(assets),
         "global_setting_count": len(global_settings),
+        "fingerprint": _json_fingerprint(rows),
+        "_rows": rows,
+    }
+
+
+_AUTHORING_GRAPH_V4_EXCLUDED_ROOT_TAGS = frozenset({
+    "thumbnail",
+    "thumbnailsize",
+    "preview",
+    "statistics",
+    "treeinfo",
+    "quicksavesettings2",
+    "m_stimelinedata",
+    "window",
+    "nodes",
+})
+_AUTHORING_GRAPH_V4_GENERATED_GUID_PATHS = frozenset({
+    ("speedtree", "light", "guid"),
+    ("speedtree", "fan", "guid"),
+    ("speedtree", "rulescript", "guid"),
+    ("speedtree", "force", "guid"),
+    ("speedtree", "forces", "force", "guid"),
+    ("speedtree", "links", "link", "guid"),
+    ("speedtree", "assets", "guid"),
+})
+_AUTHORING_GRAPH_V4_CANONICAL_GUID_PATHS = frozenset({
+    ("speedtree", "generators", "generator", "guid"),
+    ("speedtree", "links", "link", "sourceguid"),
+    ("speedtree", "links", "link", "targetguid"),
+})
+_AUTHORING_GRAPH_V4_SPLINE_NUMBER_TAGS = frozenset({
+    "value",
+    "x",
+    "y",
+    "tangentx",
+    "tangenty",
+    "length",
+})
+
+
+def _v4_plain_tag(element, expected):
+    """Match a namespace-free SpeedTree tag without collapsing namespaces."""
+    tag = str(element.tag)
+    return "}" not in tag and tag.casefold() == str(expected).casefold()
+
+
+def _v4_path_key(path):
+    keys = []
+    for tag in path:
+        tag = str(tag)
+        if "}" in tag:
+            return None
+        keys.append(tag.casefold())
+    return tuple(keys)
+
+
+def _v4_float32_token(value):
+    text = str(value or "").strip()
+    if not re.fullmatch(
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+        text,
+    ):
+        return text
+    try:
+        number = float(text)
+        if not math.isfinite(number):
+            return text
+        return "float32:" + struct.pack("!f", number).hex()
+    except (OverflowError, TypeError, ValueError):
+        return text
+
+
+def _v4_generated_collection_default(element, prefix):
+    if not _v4_plain_tag(element, "Property") or element.attrib:
+        return False
+    children = list(element)
+    if len(children) != 2 or not (
+        _v4_plain_tag(children[0], "Name")
+        and _v4_plain_tag(children[1], "Value")
+    ):
+        return False
+    if any(child.attrib or list(child) for child in children):
+        return False
+    name = str(children[0].text or "").strip().casefold()
+    value = str(children[1].text or "").strip().casefold()
+    return bool(name.startswith(prefix) and name != prefix and value == "false")
+
+
+def _v4_generated_atlas_mesh_user_data(element):
+    if (
+        not _v4_plain_tag(element, "UserData")
+        or element.attrib
+        or list(element)
+    ):
+        return False
+    try:
+        payload = json.loads(str(element.text or "").strip())
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and set(payload) == {"generator", "group", "kind", "scope"}
+        and payload.get("generator") == "Atlas Leaf Mesh Builder"
+        and payload.get("kind") == "mesh"
+        and isinstance(payload.get("group"), str)
+        and bool(payload["group"].strip())
+        and isinstance(payload.get("scope"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", payload["scope"])
+    )
+
+
+def _v4_child_is_excluded(parent_path, child):
+    parent_key = _v4_path_key(parent_path)
+    child_key = str(child.tag).casefold() if "}" not in str(child.tag) else None
+    if parent_key == ("speedtree",):
+        return child_key in _AUTHORING_GRAPH_V4_EXCLUDED_ROOT_TAGS
+    if parent_key == ("speedtree", "generators", "generator", "properties"):
+        return _v4_generated_collection_default(
+            child,
+            "generation:collections:",
+        )
+    if parent_key in {
+        ("speedtree", "forces", "force", "properties"),
+        ("speedtree", "force", "properties"),
+    }:
+        return _v4_generated_collection_default(child, "mesh:collections:")
+    if parent_key == ("speedtree", "assets", "material_v8"):
+        if child_key in {"preview", "streamplaceholder"}:
+            return True
+        if child_key == "atlasmaker" and _default_modeler_atlas_maker(child):
+            return True
+        if child_key == "map" and _default_modeler_material_map(child):
+            return True
+    if parent_key == ("speedtree", "assets", "mesh"):
+        if child_key == "userdata" and _v4_generated_atlas_mesh_user_data(child):
+            return True
+        if child_key in {"lod_1", "lod_2"} and _default_modeler_lod(child):
+            return True
+    if (
+        parent_key
+        and "splineproperty" in parent_key
+        and child_key == "compoundparentspline"
+        and _default_or_empty_parent_spline(child)
+    ):
+        return True
+    return False
+
+
+def _v4_ordered_children(element, path):
+    children = [
+        child for child in element
+        if not _v4_child_is_excluded(path, child)
+    ]
+    if _v4_path_key(path) == ("speedtree", "assets"):
+        # A no-edit Modeler Save stably partitions direct Assets children by
+        # kind. Preserve the authored order inside each proven partition and
+        # preserve every unknown/non-asset child in its original relative order.
+        materials = [
+            child for child in children if _v4_plain_tag(child, "Material_v8")
+        ]
+        meshes = [child for child in children if _v4_plain_tag(child, "Mesh")]
+        others = [
+            child for child in children
+            if not _v4_plain_tag(child, "Material_v8")
+            and not _v4_plain_tag(child, "Mesh")
+        ]
+        return materials + meshes + others
+    return children
+
+
+def _v4_projected_subtree(element, path=(), *, truthy_value=False):
+    path = tuple(path) + (str(element.tag),)
+    path_key = _v4_path_key(path)
+    tag_key = (
+        str(element.tag).casefold()
+        if "}" not in str(element.tag)
+        else None
+    )
+    text = str(element.text or "").strip()
+    if path_key in _AUTHORING_GRAPH_V4_GENERATED_GUID_PATHS:
+        text = "<modeler-generated-guid>"
+    elif path_key in _AUTHORING_GRAPH_V4_CANONICAL_GUID_PATHS:
+        text = generator_guid_key(text)
+    elif path_key in {
+        (
+            "speedtree", "generators", "generator", "extra",
+            "m_nordervalue",
+        ),
+    }:
+        text = "<modeler-graph-order>"
+    elif path_key in {
+        (
+            "speedtree", "generators", "generator", "extra",
+            "m_vecbackgroundiconcolor_r",
+        ),
+        (
+            "speedtree", "generators", "generator", "extra",
+            "m_vecbackgroundiconcolor_g",
+        ),
+        (
+            "speedtree", "generators", "generator", "extra",
+            "m_vecbackgroundiconcolor_b",
+        ),
+    }:
+        text = _v4_float32_token(text)
+    elif (
+        path_key
+        and "splineproperty" in path_key
+        and tag_key in _AUTHORING_GRAPH_V4_SPLINE_NUMBER_TAGS
+    ):
+        text = (
+            _normalized_spline_number(text)
+            if "controlpoint" in path_key
+            else _v4_float32_token(text)
+        )
+    elif path_key == ("speedtree", "assets", "mesh", "scale"):
+        text = _v4_float32_token(text)
+    elif (
+        path_key
+        and len(path_key) >= 5
+        and path_key[:3] == ("speedtree", "assets", "material_v8")
+        and path_key[-2] == "map"
+        and tag_key in {"texsizex", "texsizey"}
+    ):
+        text = "<derived-texture-size>"
+    elif truthy_value and tag_key == "value":
+        try:
+            text = "0" if float(text) == 0 else "1"
+        except (TypeError, ValueError):
+            pass
+
+    attributes = []
+    for name, value in element.attrib.items():
+        normalized = str(value).strip()
+        if path_key and "splineproperty" in path_key:
+            normalized = _v4_float32_token(normalized)
+        attributes.append((str(name), normalized))
+
+    property_name = (
+        _child_text(element, "Name")
+        if tag_key in {"property", "splineproperty"}
+        else ""
+    )
+    child_truthy = property_name.casefold() == "random seeds:style"
+    return {
+        "tag": str(element.tag),
+        "attributes": sorted(attributes),
+        "text": text,
+        "children": [
+            _v4_projected_subtree(
+                child,
+                path,
+                truthy_value=child_truthy,
+            )
+            for child in _v4_ordered_children(element, path)
+        ],
+    }
+
+
+def _authoring_graph_core_projection(text):
+    """Project the full authored XML tree under fail-closed core-v4 rules."""
+    root = ET.fromstring(text)
+    projected = _v4_projected_subtree(root)
+    root_children = [
+        child for child in root
+        if not _v4_child_is_excluded((str(root.tag),), child)
+    ]
+    generators = next(
+        (child for child in root_children if _v4_plain_tag(child, "Generators")),
+        None,
+    )
+    links = next(
+        (child for child in root_children if _v4_plain_tag(child, "Links")),
+        None,
+    )
+    assets = next(
+        (child for child in root_children if _v4_plain_tag(child, "Assets")),
+        None,
+    )
+    generator_count = sum(
+        _v4_plain_tag(child, "Generator") for child in (generators or ())
+    )
+    link_count = sum(_v4_plain_tag(child, "Link") for child in (links or ()))
+    asset_identity_count = sum(
+        not any(_v4_plain_tag(child, name) for name in (
+            "Name", "GUID", "Hidden", "Properties",
+        ))
+        for child in (assets or ())
+    )
+    global_setting_count = sum(
+        not any(_v4_plain_tag(child, name) for name in (
+            "Generators", "Links", "Assets",
+        ))
+        for child in root_children
+    )
+    rows = {"root": projected}
+    return {
+        "contract": "speedtree_spm_authoring_graph_core_projection",
+        "version": AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+        "generator_count": generator_count,
+        "link_count": link_count,
+        "asset_identity_count": asset_identity_count,
+        "global_setting_count": global_setting_count,
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
     }
@@ -1572,7 +1876,7 @@ def _preimage_receipt(
     )
     return {
         "kind": PREIMAGE_RECEIPT_KIND,
-        "schema_version": 5,
+        "schema_version": 6,
         "recovery_contract": RECOVERY_CONTRACT,
         **snapshot["source_identity"],
         "exact_preimage": {
@@ -1686,7 +1990,7 @@ def _receipt_target_scopes(receipt):
             "authoring_mesh_ids": requested,
             "required_live_mesh_ids": list(requested),
         }
-    if schema_version != 5 or not isinstance(requirements, dict):
+    if schema_version not in {5, 6} or not isinstance(requirements, dict):
         return None
     authoring = _receipt_requested_mesh_ids({
         "requested_mesh_ids": requirements.get("authoring_mesh_ids")
@@ -1773,7 +2077,7 @@ def _resolve_receipt_dialect(receipt, snapshot=None):
             "authoring_graph_core_projection",
             "speedtree_spm_authoring_graph_core_projection",
         ),)
-    if schema_version == 5:
+    if schema_version in {5, 6}:
         required_blocks += ((
             "target_requirements",
             "speedtree_stale_node_target_requirements",
@@ -1990,6 +2294,14 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
         )
         receipt_core = receipt.get("authoring_graph_core_projection")
         if receipt_schema_version in {4, 5}:
+            observed_core = _legacy_authoring_graph_core_v3_projection(
+                snapshot["text"]
+            )
+            checks.append((
+                observed_core.get("fingerprint"),
+                receipt_core.get("fingerprint"),
+            ))
+        elif receipt_schema_version == 6:
             observed_core = snapshot.get("authoring_graph_core", {})
             checks.append((
                 observed_core.get("fingerprint"),
@@ -2011,7 +2323,7 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
                 "link_count",
                 "asset_identity_count",
             ]
-            if receipt_schema_version in {4, 5}:
+            if receipt_schema_version in {4, 5, 6}:
                 core_count_fields.append("global_setting_count")
             for field in core_count_fields:
                 checks.append((

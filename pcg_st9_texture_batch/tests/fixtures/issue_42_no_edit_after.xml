@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SpeedTree>
+  <Thumbnail>after-cache</Thumbnail>
+  <Preview>after-preview</Preview>
+  <Statistics><TriangleCount>202</TriangleCount></Statistics>
+  <TreeInfo>after-tree-info</TreeInfo>
+  <QuickSaveSettings2>after-quick-save</QuickSaveSettings2>
+  <m_sTimelineData>after-timeline</m_sTimelineData>
+  <Window><X>20</X></Window>
+  <Light><GUID>generated-light-after</GUID><Properties><Property><Name>Light:Intensity</Name><Value>1</Value></Property></Properties></Light>
+  <Fan><GUID>generated-fan-after</GUID><Properties><Property><Name>Fan:Strength</Name><Value>2</Value></Property></Properties></Fan>
+  <RuleScript><GUID>generated-rule-after</GUID><Properties><Property><Name>Rule:Enabled</Name><Value>true</Value></Property></Properties></RuleScript>
+  <Force><GUID>generated-force-after</GUID><Properties><Property><Name>Force:Strength</Name><Value>3</Value></Property></Properties></Force>
+  <Forces>
+    <Force><GUID>generated-nested-force-after</GUID><Properties><Property><Name>Mesh:Collections:new</Name><Value>false</Value></Property><Property><Name>Force:Falloff</Name><Value>4</Value></Property></Properties></Force>
+  </Forces>
+  <Generators>
+    <Generator Type="Tree">
+      <Name>Tree</Name>
+      <GUID>ABCDEFGHIJKLMNOPQRSTU==</GUID>
+      <Hidden>false</Hidden>
+      <Properties>
+        <Property><Name>Custom:Density</Name><Value>1</Value></Property>
+        <Property><Name>Generation:Collections:new</Name><Value>false</Value></Property>
+        <Property><Name>Generation:Collections:authored</Name><Value>true</Value></Property>
+        <Property><Name>Random Seeds:Style</Name><Value>1</Value></Property>
+        <SplineProperty><Name>Physics:Bones</Name><Value>0.44190001487731934</Value><CompoundParentSpline Count="0"/><ProfileSpline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>0.24253587424755096</TangentX><TangentY>-0.97014254331588745</TangentY><Length>0</Length></ControlPoint></ProfileSpline></SplineProperty>
+      </Properties>
+      <Extra><m_nOrderValue>42</m_nOrderValue><m_vecBackgroundIconColor_R>0.10000000149011612</m_vecBackgroundIconColor_R><m_vecBackgroundIconColor_G>0.20000000298023224</m_vecBackgroundIconColor_G><m_vecBackgroundIconColor_B>0.30000001192092896</m_vecBackgroundIconColor_B><AuthoredExtra>keep</AuthoredExtra></Extra>
+    </Generator>
+  </Generators>
+  <Links><Link><GUID>generated-link-after</GUID><SourceGUID>ABCDEFGHIJKLMNOPQRSTU==</SourceGUID><TargetGUID>abcdefghijklmnopqrstu==</TargetGUID><Weight>7</Weight></Link></Links>
+  <Assets>
+    <Material_V8 ID="10"><Name>leaf-material</Name><Preview>after-material-preview</Preview><StreamPlaceholder><Data>after-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>2048</TexSizeX><TexSizeY>1024</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID><AtlasMaker Weight="0.5" FullHeight="false" UpdateMeshes="true" MakeUVArea="false" TranslationX="0" TranslationY="0" ScaleX="1" ScaleY="1" Rotation="0"/></Material_V8>
+    <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.10000000149011612</Scale><VertexData>authored-vertices</VertexData><Lod_1><Filename/></Lod_1><Lod_2><Filename/></Lod_2></Mesh>
+    <GUID>generated-assets-after</GUID>
+  </Assets>
+  <GlobalSettings><WindQuality>Best</WindQuality></GlobalSettings>
+  <UnknownRoot><AuthoredValue>preserve</AuthoredValue></UnknownRoot>
+  <Nodes><Node>rebuilt-node-table</Node></Nodes>
+</SpeedTree>
