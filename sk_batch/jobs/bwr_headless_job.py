@@ -358,16 +358,14 @@ def main():
     # Cluster rows reach this job under their canonical SK_ output identity.
     # ``--speedtree-spm`` can additionally point at an immutable isolated copy
     # when the Assembly receipt requires canonical bark before Atlas capture.
-    # Legacy receipt lineage stays the one thing that relaxes the source gate.
+    # Legacy receipt lineage is diagnostic only and never relaxes validation.
     legacy_state = inspect_legacy_cluster_state(speedtree_spm)
     legacy_cluster_origin = bool(
         legacy_state.get("receipt_valid")
         and legacy_state.get("classified_generator_guids")
     )
-    source_review_allowed = legacy_cluster_origin
-    source_review_policy = (
-        "legacy_cluster_receipt" if legacy_cluster_origin else "strict"
-    )
+    source_review_allowed = False
+    source_review_policy = "strict"
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
         "status": "recognized" if legacy_cluster_origin else "not_applicable",
@@ -378,13 +376,12 @@ def main():
         ),
         "generator_guids": legacy_state.get("classified_generator_guids") or [],
         "marker_drift_guids": legacy_state.get("marker_drift_guids") or [],
-        "marker_drift_non_blocking": True,
         "errors": legacy_state.get("errors") or [],
     }
     if report["legacy_cluster_lineage"]["marker_drift_guids"]:
         report.setdefault("warnings", []).append(
-            "Legacy Cluster foreground marker drift is recorded but does not "
-            "block Blender Repair; the permanent GUID receipt remains authoritative."
+            "Legacy Cluster foreground marker drift is diagnostic only; "
+            "the GUID receipt does not relax source validation."
         )
     try:
         bark_normalization_manifest = None

@@ -231,7 +231,7 @@ def test_current_pass_through_contract_suppresses_relation_dependencies(
     discover.assert_not_called()
 
 
-def test_relation_dependencies_replace_unusable_stale_assembly_contract(
+def test_stale_assembly_contract_fails_without_relation_fallback(
     tmp_path,
 ):
     owner = tmp_path / "Tree_stale_relation"
@@ -263,14 +263,16 @@ def test_relation_dependencies_replace_unusable_stale_assembly_contract(
                 "owner_target": True,
             }],
         }],
+    ) as discover, pytest.raises(
+        schedule.PushDependencyError,
+        match="stale assembly",
     ):
-        ordered, dependencies, _auto_added = schedule.expand_push_targets(
+        schedule.expand_push_targets(
             [items[str(root_spm)]],
             items,
         )
 
-    assert [item["spm"] for item in ordered] == [source_spm, root_spm]
-    assert dependencies[str(root_spm)] == (str(source_spm),)
+    discover.assert_not_called()
 
 
 def test_same_pipeline_contract_skips_persisted_and_relation_discovery(

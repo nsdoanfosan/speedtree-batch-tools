@@ -389,11 +389,10 @@ def resolve_cluster_receipt_path(
     """Resolve the additive PCG receipt without adding a new batch argument.
 
     PCG persists the Cluster contract independently from the existing SK
-    material preflight report.  Prefer that current, hash-validated receipt;
-    older reports that already embed ``cluster_assembly`` remain a fallback.
-    A stale persisted receipt is cache history, not an authoritative data
-    failure.  When the caller supplies a current embedded live-audit contract,
-    prefer that contract instead of blocking on the stale cache snapshot.
+    material preflight report.  A current, hash-validated persisted receipt is
+    usable cache evidence.  Only a run-specific embedded contract explicitly
+    marked ``live_audit_complete`` can supersede that cache; an older material
+    report is never a fallback authority.
     """
     from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
         ClusterAssemblyReceiptStaleError,
@@ -441,44 +440,31 @@ def resolve_cluster_receipt_path(
             }
         return embedded_resolved
 
-    stale_error = None
+    cache_error = None
     try:
         if include_resolution:
             resolution = cluster_assembly_receipt_resolution(spm_path)
             return Path(resolution["selected_receipt"]).resolve(), resolution
         return Path(locate_cluster_assembly_receipt(spm_path)).resolve()
-    except FileNotFoundError:
-        pass
+    except FileNotFoundError as exc:
+        cache_error = str(exc)
     except ClusterAssemblyReceiptStaleError as exc:
-        stale_error = str(exc)
+        cache_error = str(exc)
 
-    if embedded_resolved is None:
-        if include_resolution:
-            return None, {
-                "policy": "no_cluster_assembly_receipt",
-                "requested_spm": str(spm_path),
-                "selected_receipt": None,
-            }
-        return None
-    resolved = embedded_resolved
     if include_resolution:
-        return resolved, {
-            "policy": (
-                "embedded_live_audit_fallback"
-                if stale_error
-                else "embedded_material_contract_fallback"
-            ),
+        return None, {
+            "policy": "no_cluster_assembly_receipt",
             "requested_spm": str(spm_path),
-            "selected_receipt": str(resolved),
-            "current_candidates": [{"path": str(resolved)}],
+            "selected_receipt": None,
+            "current_candidates": [],
             "superseded_current_receipts": [],
             "ignored_stale_candidates": (
-                [{"path": "", "error": stale_error}]
-                if stale_error
+                [{"path": "", "error": cache_error}]
+                if cache_error
                 else []
             ),
         }
-    return resolved
+    return None
 
 
 def _role_receipt_rows(contract):

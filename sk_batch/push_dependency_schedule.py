@@ -304,20 +304,13 @@ def cluster_dependency_spms(
     if stage_dependencies is not None:
         return stage_dependencies
 
-    manifest_error = None
-    try:
-        manifest_dependencies = _manifest_dependency_spms(root_spm)
-    except PushDependencyError as exc:
-        manifest_error = exc
-        manifest_dependencies = None
+    manifest_dependencies = _manifest_dependency_spms(root_spm)
     if manifest_dependencies is not None:
         return manifest_dependencies
     relation_dependencies = _relation_dependency_spms(
         root_spm,
         relation_cache=relation_cache,
     )
-    if manifest_error is not None and not relation_dependencies:
-        raise manifest_error
 
     dependencies = []
     seen = set()

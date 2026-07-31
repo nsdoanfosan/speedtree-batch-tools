@@ -1,10 +1,9 @@
-"""② source-review policy must stay reachable.
+"""BWR source validation has one strict policy.
 
 Cluster rows are normalized to their canonical ``SK_`` name before the Blender
 job starts, so ``--spm`` and ``--speedtree-spm`` always name the same file.
-Any policy keyed on "this is a raw, unprefixed Cluster source" is therefore
-unreachable: it silently mislabels the report while the strict gate is what
-actually runs.  These tests pin the two policies that can occur.
+Legacy marker/GUID receipts remain useful lineage diagnostics but cannot waive
+source issues or authorize a weaker handoff.  These tests pin that strict gate.
 
 The job imports ``bpy``, so it is inspected as source rather than imported.
 """
@@ -65,7 +64,7 @@ def call_lines(tree, function_name):
 class SourceReviewPolicyTests(unittest.TestCase):
     def test_only_reachable_policies_are_declared(self):
         policies = assigned_string_values(job_tree(), "source_review_policy")
-        self.assertEqual(policies, {"strict", "legacy_cluster_receipt"})
+        self.assertEqual(policies, {"strict"})
 
     def test_no_policy_keys_off_a_raw_unprefixed_cluster_name(self):
         source = JOB_PATH.read_text(encoding="utf-8")
@@ -74,7 +73,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
         self.assertNotIn("cluster_pair_strict", source)
         self.assertNotIn("is_cluster_source_spm", source)
 
-    def test_the_source_gate_is_relaxed_only_by_legacy_receipt_lineage(self):
+    def test_legacy_receipt_lineage_never_relaxes_the_source_gate(self):
         tree = job_tree()
         gate = None
         for node in ast.walk(tree):
@@ -88,10 +87,16 @@ class SourceReviewPolicyTests(unittest.TestCase):
             ):
                 gate = node.value
         self.assertIsNotNone(gate, "source_review_allowed assignment is missing")
-        names = {
-            child.id for child in ast.walk(gate) if isinstance(child, ast.Name)
-        }
-        self.assertEqual(names, {"legacy_cluster_origin"})
+        self.assertIsInstance(gate, ast.Constant)
+        self.assertIs(gate.value, False)
+
+    def test_marker_drift_is_diagnostic_not_a_validation_waiver(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("marker_drift_non_blocking", source)
+        self.assertIn(
+            "the GUID receipt does not relax source validation",
+            source,
+        )
 
     def test_the_two_spm_identities_are_still_plumbed_separately(self):
         """The pair contract can still hand the job two different files."""

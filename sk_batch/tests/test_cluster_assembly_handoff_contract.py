@@ -274,7 +274,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
                 "cluster_assembly_receipt_resolution",
                 return_value={"selected_receipt": str(persisted)},
-            ):
+            ) as persisted_resolution:
                 resolved, resolution = resolve_cluster_receipt_path(
                     spm,
                     embedded,
@@ -286,6 +286,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 resolution["policy"],
                 "embedded_live_audit_authoritative",
             )
+            persisted_resolution.assert_not_called()
 
     def test_divergent_persisted_receipts_fail_closed_without_live_audit(self):
         spm = Path("C:/Trees/SK_Tree_elm_01.spm")
@@ -299,7 +300,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             with self.assertRaises(ClusterAssemblyReceiptAmbiguityError):
                 resolve_cluster_receipt_path(spm)
 
-    def test_embedded_cluster_contract_remains_a_legacy_fallback(self):
+    def test_unmarked_embedded_contract_is_not_missing_receipt_authority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -315,13 +316,22 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
             with mock.patch(
                 "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
-                "locate_cluster_assembly_receipt",
+                "cluster_assembly_receipt_resolution",
                 side_effect=FileNotFoundError,
             ):
-                resolved = resolve_cluster_receipt_path(spm, embedded)
-            self.assertEqual(resolved, embedded.resolve())
+                resolved, resolution = resolve_cluster_receipt_path(
+                    spm,
+                    embedded,
+                    include_resolution=True,
+                )
+            self.assertIsNone(resolved)
+            self.assertEqual(
+                resolution["policy"],
+                "no_cluster_assembly_receipt",
+            )
+            self.assertIsNone(resolution["selected_receipt"])
 
-    def test_stale_persisted_receipt_uses_clean_embedded_live_audit(self):
+    def test_unmarked_embedded_contract_is_not_stale_receipt_authority(self):
         from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
             ClusterAssemblyReceiptStaleError,
         )
@@ -341,11 +351,23 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
             with mock.patch(
                 "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
-                "locate_cluster_assembly_receipt",
+                "cluster_assembly_receipt_resolution",
                 side_effect=ClusterAssemblyReceiptStaleError("old snapshot"),
             ):
-                resolved = resolve_cluster_receipt_path(spm, embedded)
-            self.assertEqual(resolved, embedded.resolve())
+                resolved, resolution = resolve_cluster_receipt_path(
+                    spm,
+                    embedded,
+                    include_resolution=True,
+                )
+            self.assertIsNone(resolved)
+            self.assertEqual(
+                resolution["policy"],
+                "no_cluster_assembly_receipt",
+            )
+            self.assertIn(
+                "old snapshot",
+                resolution["ignored_stale_candidates"][0]["error"],
+            )
 
     def test_export_name_normalization_keeps_role_identity(self):
         self.assertEqual(
