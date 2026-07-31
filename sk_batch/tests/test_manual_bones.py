@@ -1,3 +1,4 @@
+import copy
 import queue
 import json
 import sys
@@ -44,7 +45,7 @@ class FakeTree:
 
 
 class ManualBonesTests(unittest.TestCase):
-    def test_full_pipeline_runs_three_phases_in_order_and_emits_one_done(self):
+    def test_full_pipeline_skips_tree_bone_wave_and_emits_one_done(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         app.stop_flag = threading.Event()
@@ -58,7 +59,6 @@ class ManualBonesTests(unittest.TestCase):
         self.assertEqual(
             app._run_batch.call_args_list,
             [
-                mock.call("spm", targets, emit_done=False),
                 mock.call("blender", targets, emit_done=False),
                 mock.call("push", targets, emit_done=False),
             ],
@@ -68,6 +68,34 @@ class ManualBonesTests(unittest.TestCase):
             queued.append(app.ui_queue.get_nowait())
         self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
         self.assertIn(("progress", "전체 자동 완료"), queued)
+
+    def test_blender_button_chain_runs_only_tree_blender(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.stop_flag = threading.Event()
+        app.ui_queue = queue.Queue()
+        app.log = mock.Mock()
+        app._run_batch = mock.Mock()
+        targets = [{"spm": Path("SK_test.spm"), "checked": True}]
+
+        app._run_full_pipeline(
+            targets,
+            terminal_phase="blender",
+            selected_scope=True,
+        )
+
+        self.assertEqual(
+            app._run_batch.call_args_list,
+            [
+                mock.call("blender", targets, emit_done=False),
+            ],
+        )
+        queued = list(app.ui_queue.queue)
+        self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
+        self.assertIn(
+            ("progress", "② Blender Repair 연계 실행 완료"),
+            queued,
+        )
 
     def test_manual_marker_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,26 +114,151 @@ class ManualBonesTests(unittest.TestCase):
 
     def test_locked_spm_job_returns_before_launching_any_process(self):
         gui = load_gui_module()
-        spm = Path("SK_manual_test.spm")
+        spm = Path("Tree_test/Cluster/SK_manual_test.spm")
         iid = str(spm)
         app = gui.App.__new__(gui.App)
         app.items = {iid: {"spm": spm, "manual_bones_locked": True}}
-        app.state = {}
+        app.state = {iid: {"spm_summary": "본 282 / 가지 90"}}
         app.state_lock = threading.Lock()
         app.ui_queue = queue.Queue()
         app.log = lambda _message: None
 
         with mock.patch.object(gui, "save_state"), mock.patch.object(
+            app,
+            "_prepare_pair_for_job",
+            return_value=spm,
+        ), mock.patch.object(
             app, "_run_limited", side_effect=AssertionError("process must not launch")
         ):
             app._job_spm(iid, spm)
 
         self.assertIn("① 전체 건너뜀", app.state[iid]["spm_status"])
+        self.assertEqual(app.state[iid]["spm_summary"], "본 282 / 가지 90")
+
+    def test_owner_spm_job_skips_before_pair_normalization_or_process_launch(self):
+        gui = load_gui_module()
+        spm = Path("Tree_test") / "SK_tree_test_01.spm"
+        iid = str(spm)
+        app = gui.App.__new__(gui.App)
+        app.items = {
+            iid: {
+                "spm": spm,
+                "source_read_only": False,
+                "manual_bones_locked": False,
+            }
+        }
+        app.state = {iid: {}}
+        app.state_lock = threading.Lock()
+        app.ui_queue = queue.Queue()
+        app.log = mock.Mock()
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            app,
+            "_prepare_pair_for_job",
+            side_effect=AssertionError("pair normalization must not run"),
+        ) as prepare, mock.patch.object(
+            app,
+            "_run_limited",
+            side_effect=AssertionError("process must not launch"),
+        ) as run:
+            app._job_spm(iid, spm)
+
+        self.assertIn(
+            "일반 SPM 본 세팅 제외",
+            app.state[iid]["spm_status"],
+        )
+        prepare.assert_not_called()
+        run.assert_not_called()
+
+    def test_manual_check_uses_verified_count_and_does_not_persist_or_touch_spm(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            spm = Path(tmp) / "SK_tree_birch_paper_03.spm"
+            spm.write_bytes(b"stable-spm")
+            iid = str(spm)
+            app = gui.App.__new__(gui.App)
+            app.items = {iid: {"spm": spm, "manual_bones_locked": True}}
+            app.state = {
+                iid: {
+                    "spm_summary": "SK 미제작",
+                    "calibration_cache": {"summary": "SK 미제작"},
+                }
+            }
+            app.state_lock = threading.RLock()
+            app.ui_queue = queue.Queue()
+            app._blend_status_text = mock.Mock(return_value="최신 ✓")
+            app._handoff_ready = mock.Mock(return_value=(True, "준비됨 ✓"))
+            app._current_push_status_text = mock.Mock(return_value="미전송")
+            before_state = copy.deepcopy(app.state)
+            before_source = (
+                spm.read_bytes(),
+                spm.stat().st_size,
+                spm.stat().st_mtime_ns,
+            )
+
+            with mock.patch.object(
+                gui,
+                "manual_bone_status_text",
+                return_value=(
+                    "수동 본 유지 🔒 · SpeedTree 본 282개 "
+                    "(현재 SPM과 일치하는 XML)"
+                ),
+            ), mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
+                "spm_audit.sk_readiness", return_value={"ready": False}
+            ), mock.patch.object(gui, "save_state") as save_mock:
+                app._job_check(iid, spm)
+
+            queued = []
+            while not app.ui_queue.empty():
+                queued.append(app.ui_queue.get_nowait())
+            spm_text = next(
+                payload[2]
+                for kind, payload in queued
+                if kind == "cell" and payload[1] == "spm_status"
+            )
+            self.assertIn("282개", spm_text)
+            self.assertNotIn("현재 본 0", spm_text)
+            self.assertNotIn("SK 미제작", spm_text)
+            self.assertEqual(app.state, before_state)
+            self.assertEqual(
+                before_source,
+                (spm.read_bytes(), spm.stat().st_size, spm.stat().st_mtime_ns),
+            )
+            save_mock.assert_not_called()
+
+    def test_check_batch_does_not_persist_state_or_dispatch_processing_jobs(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        spm = Path("SK_read_only_check.spm")
+        target = {"spm": spm, "checked": True}
+        app.stop_flag = threading.Event()
+        app.state_lock = threading.RLock()
+        app.state = {str(spm): {"calibration_cache": {"summary": "kept"}}}
+        app.ui_queue = queue.Queue()
+        app.cfg = {"check_parallel_jobs": 1}
+        app.log = mock.Mock()
+        app._job_check = mock.Mock()
+        app._job_spm = mock.Mock(side_effect=AssertionError("must not run"))
+        app._job_blender = mock.Mock(side_effect=AssertionError("must not run"))
+        app._job_push = mock.Mock(side_effect=AssertionError("must not run"))
+        before_state = copy.deepcopy(app.state)
+
+        with mock.patch.object(gui, "save_state") as save_mock:
+            result = app._run_batch("check", [target], emit_done=False)
+
+        self.assertTrue(result)
+        app._job_check.assert_called_once_with(str(spm), spm)
+        app._job_spm.assert_not_called()
+        app._job_blender.assert_not_called()
+        app._job_push.assert_not_called()
+        self.assertEqual(app.state, before_state)
+        save_mock.assert_not_called()
 
     def test_unchanged_cached_spm_returns_before_launching_any_process(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as tmp:
-            spm = Path(tmp) / "SK_cached_test.spm"
+            spm = Path(tmp) / "Tree_test" / "Cluster" / "SK_cached_test.spm"
+            spm.parent.mkdir(parents=True)
             spm.write_bytes(b"stable-spm")
             snapshot = file_content_snapshot(spm)
             iid = str(spm)
@@ -136,6 +289,10 @@ class ManualBonesTests(unittest.TestCase):
             app.spm_calibration_signature = signature
 
             with mock.patch.object(gui, "save_state"), mock.patch.object(
+                gui,
+                "current_cluster_root_postcondition",
+                return_value={"ok": True},
+            ), mock.patch.object(
                 app, "_run_limited", side_effect=AssertionError("process must not launch")
             ):
                 app._job_spm(iid, spm)
@@ -146,7 +303,10 @@ class ManualBonesTests(unittest.TestCase):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            spm = root / "SK_cache_write_test.spm"
+            spm = (
+                root / "Tree_test" / "Cluster" / "SK_cache_write_test.spm"
+            )
+            spm.parent.mkdir(parents=True)
             spm.write_bytes(b"stable-spm")
             iid = str(spm)
             app = gui.App.__new__(gui.App)
@@ -178,6 +338,12 @@ class ManualBonesTests(unittest.TestCase):
                                 "status": "calibrated",
                                 "total_bones": 12,
                                 "warnings": [],
+                                "final_spm_fingerprint": (
+                                    file_content_snapshot(spm)["fingerprint"]
+                                ),
+                                "cluster_root_logical_postcondition": {
+                                    "ok": True,
+                                },
                                 "calibration": {
                                     "total_branches": 4,
                                     "capped": False,
@@ -192,6 +358,10 @@ class ManualBonesTests(unittest.TestCase):
 
             with mock.patch.object(gui, "LOG_DIR", root), mock.patch.object(
                 gui, "save_state"
+            ), mock.patch.object(
+                gui,
+                "current_cluster_root_postcondition",
+                return_value={"ok": True},
             ), mock.patch.object(app, "_run_limited", side_effect=fake_run) as run_mock:
                 app._job_spm(iid, spm)
                 self.assertEqual(run_mock.call_count, 1)
@@ -228,7 +398,10 @@ class ManualBonesTests(unittest.TestCase):
                     "manual_bones_locked": False,
                 },
             }
-            app.state = {first_iid: {}, second_iid: {}}
+            app.state = {
+                first_iid: {"spm_summary": "본 282 / 가지 90"},
+                second_iid: {},
+            }
             app.tree = FakeTree()
             app.log = lambda _message: None
 
@@ -239,6 +412,9 @@ class ManualBonesTests(unittest.TestCase):
             self.assertEqual(app.items[first_iid]["bone_mode"], "manual")
             self.assertFalse(app.items[second_iid]["manual_bones_locked"])
             self.assertNotIn("manual_bones_locked", app.state[second_iid])
+            self.assertEqual(
+                app.state[first_iid]["spm_summary"], "본 282 / 가지 90"
+            )
             self.assertIn("수동 본 유지", app.tree.values[(first_iid, "bone_mode")])
 
     def test_wind_dropdown_sets_explicit_value_for_only_the_target_row(self):

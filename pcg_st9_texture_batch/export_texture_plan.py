@@ -378,6 +378,11 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
             normal_convention = infer_normal_convention(refs) if refs else item.get("normal_convention", "unknown")
             missing_maps = cluster.get("missing_export_maps", [])
             duplicate_targets = item.get("duplicate_pcg_target_mesh_names", [])
+            is_cluster_bake = (
+                cluster.get("origin_kind") == "blender_cluster_bake"
+                or cluster.get("normalization_workflow_mode")
+                == "PHYSICAL_DIRECT_CAPTURE"
+            )
             rows.append({
                 "folder_name": item.get("name", ""),
                 "folder": item.get("folder", ""),
@@ -388,7 +393,10 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "cluster_spm": cluster.get("cluster_spm", ""),
                 "source": cluster.get("source", "cluster"),
                 "material_names": cluster.get("material_names", []),
+                "material_aliases": cluster.get(
+                    "material_aliases", cluster.get("material_names", [])),
                 "material_spms": cluster.get("material_spms", []),
+                "material_targets": cluster.get("material_targets", []),
                 "needs_leaf_mesh": cluster.get("needs_leaf_mesh", True),
                 "shared_from": cluster.get("shared_from"),
                 "m_graph": cluster.get("m_graph"),
@@ -397,23 +405,58 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
                 "atlas_base": cluster.get("atlas_base", ""),
                 "texture_base": cluster.get("texture_base", cluster.get("atlas_base", "")),
                 "atlas_blends": cluster.get("atlas_blends", []),
-                "atlas_blend_status": "ok" if cluster.get("atlas_blends") else "missing",
+                "atlas_blend_status": (
+                    "preserved_cluster_bake"
+                    if is_cluster_bake
+                    else "ok" if cluster.get("atlas_blends") else "missing"
+                ),
                 "atlas_generator_quality": atlas_quality_for_folder(item.get("name", "")),
                 "atlas_generator_plate_mode": "one plate",
-                "atlas_generator_input_status": input_status(buckets),
+                "atlas_generator_input_status": (
+                    "preserved_cluster_bake"
+                    if is_cluster_bake else input_status(buckets)
+                ),
                 "sbs_files": item.get("sbs_files", []),
-                "sbs_status": sbs_status(item, buckets),
-                "texture_dir": cluster.get("texture_dir") or item.get("texture_dir", ""),
+                "sbs_status": (
+                    "preserved_cluster_bake"
+                    if is_cluster_bake else sbs_status(item, buckets)
+                ),
+                "texture_dir": (
+                    ""
+                    if is_cluster_bake
+                    else cluster.get("texture_dir")
+                    or item.get("texture_dir", "")
+                ),
                 "export_maps": cluster.get("export_maps", {}),
                 "legacy_export_maps": cluster.get("legacy_export_maps", {}),
                 "missing_export_maps": missing_maps,
-                "export_status": "ok" if not missing_maps else "missing " + ",".join(missing_maps),
+                "export_status": (
+                    "preserved_cluster_bake"
+                    if is_cluster_bake
+                    else "ok" if not missing_maps
+                    else "missing " + ",".join(missing_maps)
+                ),
+                "connection_update_needed": bool(
+                    cluster.get("connection_update_needed")),
+                "connection_materials": cluster.get("connection_materials", []),
+                "origin_kind": cluster.get("origin_kind"),
+                "normalization_workflow_mode": cluster.get(
+                    "normalization_workflow_mode"),
+                "texture_contract_state": cluster.get(
+                    "texture_contract_state"),
+                "source_signature": cluster.get("source_signature", []),
                 "normal_convention": normal_convention,
                 "normal_opengl": True if normal_convention == "OpenGL" else (False if normal_convention == "DirectX" else None),
                 "ao_policy": item.get("ao_policy", ""),
                 "sdf_policy": item.get("sdf_policy", ""),
-                "source_scope": source_scope,
-                "canonical_source_provenance": has_canonical_provenance,
+                "source_scope": (
+                    "blender_cluster_bake"
+                    if is_cluster_bake else source_scope
+                ),
+                "canonical_source_provenance": (
+                    False if is_cluster_bake
+                    else has_canonical_provenance
+                ),
                 "source_refs": refs,
                 "source_albedo": buckets.get("albedo", []),
                 "source_alpha": buckets.get("alpha", []),
@@ -427,10 +470,19 @@ def build_texture_plan_from_report(report, source_report="<memory>"):
             })
     counts = {
         "clusters": len(rows),
-        "missing_atlas_blend": sum(1 for row in rows if row["atlas_blend_status"] != "ok"),
+        "missing_atlas_blend": sum(
+            1 for row in rows
+            if row["atlas_blend_status"] not in {
+                "ok", "preserved_cluster_bake"}),
         "missing_export_maps": sum(1 for row in rows if row["missing_export_maps"]),
-        "missing_atlas_inputs": sum(1 for row in rows if row["atlas_generator_input_status"] != "ready"),
-        "missing_sbs_inputs": sum(1 for row in rows if row["sbs_status"] != "ready"),
+        "missing_atlas_inputs": sum(
+            1 for row in rows
+            if row["atlas_generator_input_status"] not in {
+                "ready", "preserved_cluster_bake"}),
+        "missing_sbs_inputs": sum(
+            1 for row in rows
+            if row["sbs_status"] not in {
+                "ready", "preserved_cluster_bake"}),
         "folder_notes": len(folder_notes),
     }
     return {

@@ -22,6 +22,7 @@ from pcg_texture_audit import (
     canonical_material_name,
     read_maybe_gzip_text,
     texture_base_for_material,
+    visible_material_ids,
 )
 
 
@@ -215,25 +216,50 @@ def _source_material_block(source_spm, canonical_name):
         f"{Path(source_spm).name}: source material is missing: {canonical_name}")
 
 
-def build_spm_patch(spm, material_outputs, require_outputs=True):
+def build_spm_patch(
+        spm, material_outputs, require_outputs=True,
+        allow_partial_materials=False):
     """Return a verified in-memory patch for one SPM.
 
-    ``material_outputs`` is keyed by canonical material name and contains
-    ``texture_dir`` and ``texture_base`` for each active material.
+    ``material_outputs`` can be keyed by exact ``@id:<Material_v8 ID>`` or by
+    canonical material name.  Exact ID mappings take priority so duplicate
+    material names can safely use different managed outputs.
     """
     spm = Path(spm)
     text = read_maybe_gzip_text(spm)
     if not text:
         raise RuntimeError(f"cannot read SPM: {spm}")
-    active_ids = {str(value).lower() for value in active_material_ids(spm)}
-    if not active_ids:
+    referenced_ids = {
+        str(value).lower() for value in active_material_ids(spm)
+    }
+    if referenced_ids:
+        visible_ids = {
+            str(value).lower() for value in visible_material_ids(spm)
+        }
+        # A production SPM can intentionally hide every provider generator
+        # while keeping its material bindings authoritative for relationship
+        # or export handoff.  Exact audited material-ID mappings must remain
+        # usable in that state; an empty visibility projection is not evidence
+        # that every referenced material is inactive.
+        active_ids = visible_ids or referenced_ids
+    else:
         active_ids = {
             _material_id(match.group(0)).lower()
             for match in MATERIAL_BLOCK_RE.finditer(text)
             if _material_id(match.group(0))
         }
+    # Exact plan targets are already provenance-checked by the audit.  Include
+    # those material IDs even when an Atlas Auto Split sibling is currently
+    # hidden or has no Generator slot; this lets all same-source collection
+    # variants share the default suffix-free T_* atlas set.
+    active_ids.update(
+        str(key)[4:].strip().lower()
+        for key in material_outputs
+        if str(key).lower().startswith("@id:") and str(key)[4:].strip()
+    )
     changed = []
     missing = []
+    matched_count = 0
     chunks = []
     cursor = 0
 
@@ -244,14 +270,35 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             continue
         current_name = _material_name(block)
         canonical = canonical_material_name(current_name)
-        output = material_outputs.get(canonical.lower())
+        output = material_outputs.get(f"@id:{material_id}")
+        if output is None:
+            output = material_outputs.get(canonical.lower())
         if not output:
-            missing.append(f"{canonical}: no managed output mapping")
+            missing.append({
+                "material_id": material_id,
+                "material_name": canonical,
+                "reason": "no managed output mapping",
+            })
             continue
+        matched_count += 1
         if output.get("mode") == "preserve_source":
+            try:
+                source_is_target = (
+                    Path(output["source_spm"]).resolve() == spm.resolve()
+                )
+            except (OSError, ValueError):
+                source_is_target = (
+                    os.path.normcase(os.path.abspath(str(
+                        output["source_spm"])))
+                    == os.path.normcase(os.path.abspath(str(spm)))
+                )
+            if source_is_target:
+                continue
             source_block = _source_material_block(output["source_spm"], canonical)
             patched = restore_material_maps(block, canonical, source_block)
             expected_row = next(iter(inspect_material_slots(patched).values()))
+            if patched == block:
+                continue
             chunks.extend((text[cursor:match.start()], patched))
             cursor = match.end()
             changed.append({
@@ -271,7 +318,11 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             and (role != "subsurface" or subsurface_enabled)
         ]
         if absent:
-            missing.append(f"{canonical}: missing outputs: {', '.join(absent)}")
+            missing.append({
+                "material_id": material_id,
+                "material_name": canonical,
+                "reason": f"missing outputs: {', '.join(absent)}",
+            })
             continue
         refs = {
             role: (_relative_texture_ref(spm, path) if path.is_file() else "")
@@ -279,6 +330,8 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
         }
         patched = normalize_material_block(
             block, canonical, refs, subsurface_enabled=subsurface_enabled)
+        if patched == block:
+            continue
         chunks.extend((text[cursor:match.start()], patched))
         cursor = match.end()
         changed.append({
@@ -290,14 +343,36 @@ def build_spm_patch(spm, material_outputs, require_outputs=True):
             "subsurface_enabled": subsurface_enabled,
         })
 
-    if missing:
-        raise RuntimeError(f"{spm.name}: " + " | ".join(missing))
-    if not changed:
+    if missing and not allow_partial_materials:
+        raise RuntimeError(
+            f"{spm.name}: "
+            + " | ".join(
+                f"{entry['material_name']}: {entry['reason']}"
+                for entry in missing
+            )
+        )
+    if not matched_count:
         raise RuntimeError(f"{spm.name}: no active materials were normalized")
+    if not changed:
+        return {
+            "spm": str(spm), "text": text, "materials": [],
+            "changed": False,
+            "skipped_materials": missing,
+        }
     chunks.append(text[cursor:])
     patched_text = "".join(chunks)
+    if patched_text == text:
+        return {
+            "spm": str(spm), "text": text, "materials": [],
+            "changed": False,
+            "skipped_materials": missing,
+        }
     verify_spm_text(spm, patched_text, changed)
-    return {"spm": str(spm), "text": patched_text, "materials": changed}
+    return {
+        "spm": str(spm), "text": patched_text, "materials": changed,
+        "changed": True,
+        "skipped_materials": missing,
+    }
 
 
 def inspect_material_slots(text):
@@ -371,14 +446,49 @@ def _write_spm(path, text, compressed):
         path.write_text(text, encoding="utf-8")
 
 
-def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True):
-    """Preflight, back up, write, and verify all SPMs as one transaction."""
-    patches = [
-        build_spm_patch(job["spm"], job["materials"], require_outputs=require_outputs)
-        for job in jobs
-    ]
+def normalize_spms_transactionally(
+        jobs, backup_root=None, require_outputs=True, skip_unbuildable=False,
+        allow_partial_materials=False):
+    """Preflight, back up, write, and verify all SPMs as one transaction.
+
+    With skip_unbuildable, an SPM whose patch cannot even be built (e.g. a
+    legacy tree whose materials have no managed T_ outputs yet) is reported
+    under "skipped" instead of aborting every other SPM in the folder.
+    """
+    patches = []
+    unchanged_spms = []
+    skipped = []
+    skipped_materials = []
+    for job in jobs:
+        try:
+            patch = build_spm_patch(
+                job["spm"], job["materials"],
+                require_outputs=require_outputs,
+                allow_partial_materials=allow_partial_materials,
+            )
+            skipped_materials.extend({
+                "spm": str(job["spm"]),
+                **entry,
+            } for entry in patch.get("skipped_materials") or [])
+            if patch.get("changed") is False:
+                unchanged_spms.append(patch["spm"])
+            else:
+                patches.append(patch)
+        except Exception as exc:
+            if not skip_unbuildable:
+                raise
+            skipped.append({"spm": str(job["spm"]), "reason": str(exc)})
     if not patches:
-        return {"spms": [], "materials": 0, "backup_dir": None}
+        if skipped and not unchanged_spms:
+            raise RuntimeError(
+                "no SPM could be normalized: "
+                + " | ".join(entry["reason"] for entry in skipped)
+            )
+        return {
+            "spms": [], "materials": 0, "backup_dir": None,
+            "skipped": skipped, "unchanged_spms": unchanged_spms,
+            "skipped_materials": skipped_materials,
+        }
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_root = Path(backup_root or (Path(patches[0]["spm"]).parent / "_spm_backups"))
@@ -405,15 +515,21 @@ def normalize_spms_transactionally(jobs, backup_root=None, require_outputs=True)
         "spms": [patch["spm"] for patch in patches],
         "materials": sum(len(patch["materials"]) for patch in patches),
         "backup_dir": str(backup_dir),
+        "skipped": skipped,
+        "skipped_materials": skipped_materials,
+        "unchanged_spms": unchanged_spms,
     }
 
 
 def cleanup_preserved_cluster_outputs(plan):
-    """Undo managed T_ artifacts for materials restored to cluster renders."""
-    import sbs_auto
+    """Report preserved Cluster bake materials without mutating their assets.
 
-    cleaned = []
-    conflicts = []
+    Blender physical-capture outputs and SBS/PCG T_* outputs have independent
+    provenance.  A Cluster material selecting its bake maps is not evidence
+    that an asset-local T_* graph or file is stale or unreferenced, so cleanup
+    belongs to the later reference-audited cache transaction, never migration.
+    """
+    preserved = []
     seen = set()
     for row in plan.get("preserved_cluster_materials") or []:
         material = canonical_material_name(row.get("material_name"))
@@ -421,44 +537,42 @@ def cleanup_preserved_cluster_outputs(plan):
         if key in seen:
             continue
         seen.add(key)
-        folder = Path(row["spm"]).parent
-        texture_base = texture_base_for_material(material)
-        renamed = None
-        for sbs in active_sbs_files(folder):
-            t_graph = sbs_auto.find_m_graph_name(sbs, texture_base)
-            m_graph = sbs_auto.find_m_graph_name(sbs, material)
-            if t_graph and not m_graph:
-                renamed = sbs_auto.rename_managed_graph(sbs, t_graph, material)
-                break
-            if t_graph and m_graph:
-                conflicts.append({
-                    "material": material,
-                    "sbs": str(sbs),
-                    "reason": "both M_ authoring and T_ managed graphs exist",
-                })
-        candidates = []
-        for texture_dir in (folder / "texture", folder / "textures"):
-            if not texture_dir.is_dir():
-                continue
-            for role in ("color", "normal", "extra", "height", "opacity", "subsurface"):
-                candidates.extend(texture_dir.glob(f"{texture_base}_{role}.*"))
-        files = [path for path in candidates if path.is_file()]
-        if files:
-            for path in files:
-                path.unlink()
-        cleaned.append({
+        preserved.append({
+            "spm": str(row.get("spm") or ""),
             "material": material,
-            "texture_base": texture_base,
-            "graph_rename": renamed,
-            "removed_outputs": [str(path) for path in files],
-            "backup_dir": None,
+            "source_spm": str(row.get("source_spm") or ""),
+            "source_refs": list(row.get("source_refs") or []),
+            "reason": str(row.get("reason") or "blender_cluster_bake"),
         })
-    return {"cleaned": cleaned, "conflicts": conflicts}
+    return {
+        "status": "preserved_no_mutation",
+        "cleaned": [],
+        "conflicts": [],
+        "preserved": preserved,
+    }
 
 
-def jobs_from_texture_plan(plan, only_existing_sk=True):
-    """Build per-SPM material mappings from texture-plan rows."""
-    def subsurface_is_real_source(row):
+def jobs_from_texture_plan(plan, only_existing_sk=True, allowed_spms=None):
+    """Build per-SPM material mappings from texture-plan rows.
+
+    ``allowed_spms`` is an exact-path safety boundary for GUI selections. A
+    folder can contain several SK variants; selecting one PCG target must not
+    normalize every sibling merely because the audit plan mentions them.
+    """
+    allowed_keys = None
+    if allowed_spms is not None:
+        allowed_keys = {
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in allowed_spms
+        }
+
+    def spm_is_allowed(spm):
+        return allowed_keys is None or (
+            os.path.normcase(os.path.abspath(str(spm))) in allowed_keys
+        )
+
+    def subsurface_is_real_source(
+            row, target_spm=None, target_material_id=None):
         generated = re.compile(
             r"^[mt]_.*_subsurface\.(?:tga|png|tif|tiff|exr)$", re.IGNORECASE)
         if any(not generated.match(Path(str(ref)).name)
@@ -472,11 +586,19 @@ def jobs_from_texture_plan(plan, only_existing_sk=True):
             for name in (row.get("material_names") or [row.get("atlas_base")])
             if name
         }
-        for spm_value in row.get("material_spms") or []:
+        material_spms = (
+            [target_spm] if target_spm is not None
+            else (row.get("material_spms") or [])
+        )
+        for spm_value in material_spms:
             spm = Path(spm_value)
             if not spm.is_file():
                 continue
-            for material in inspect_material_slots(read_maybe_gzip_text(spm)).values():
+            for material_id, material in inspect_material_slots(
+                    read_maybe_gzip_text(spm)).items():
+                if target_material_id is not None and material_id != str(
+                        target_material_id).strip().lower():
+                    continue
                 if canonical_material_name(material["name"]).lower() not in wanted:
                     continue
                 slot = material["slots"].get("subsurfacecolor")
@@ -509,38 +631,125 @@ def jobs_from_texture_plan(plan, only_existing_sk=True):
                     pass
         return False
 
+    def output_signature(output):
+        mode = output.get("mode") or "managed"
+        if mode == "preserve_source":
+            return (
+                mode,
+                os.path.normcase(os.path.abspath(str(output.get("source_spm", "")))),
+            )
+        return (
+            mode,
+            os.path.normcase(os.path.abspath(str(output.get("texture_dir", "")))),
+            str(output.get("texture_base", "")).lower(),
+            bool(output.get("subsurface_enabled")),
+        )
+
+    def add_material_mapping(spm, key, output):
+        material_map = by_spm.setdefault(str(spm), {})
+        existing = material_map.get(key)
+        if existing is not None and output_signature(existing) != output_signature(output):
+            raise RuntimeError(
+                f"{spm.name}: conflicting managed output mapping for {key}: "
+                f"{existing.get('texture_base') or existing.get('source_spm')} vs "
+                f"{output.get('texture_base') or output.get('source_spm')}")
+        material_map[key] = output
+
     by_spm = {}
     for row in plan.get("items", []):
+        if (
+            row.get("origin_kind") == "blender_cluster_bake"
+            or row.get("normalization_workflow_mode")
+            == "PHYSICAL_DIRECT_CAPTURE"
+        ):
+            for target in row.get("material_targets") or []:
+                material_id = target.get("material_id")
+                if not target.get("spm") or not material_id:
+                    raise RuntimeError(
+                        "blender_cluster_bake material target requires "
+                        "exact spm and material_id")
+                spm = Path(target["spm"])
+                if not spm_is_allowed(spm):
+                    continue
+                if only_existing_sk and not spm.name.lower().startswith("sk_"):
+                    continue
+                if not spm.is_file():
+                    continue
+                add_material_mapping(
+                    spm,
+                    f"@id:{str(material_id).strip().lower()}",
+                    {
+                        "mode": "preserve_source",
+                        "source_spm": str(spm),
+                    },
+                )
+            continue
         texture_dir = row.get("texture_dir")
         texture_base = row.get("texture_base")
         if not texture_dir or not texture_base:
             continue
+        material_targets = row.get("material_targets") or []
+        if material_targets and not isinstance(material_targets, list):
+            raise RuntimeError("material_targets must be a list")
+        if material_targets:
+            for target in material_targets:
+                if not isinstance(target, dict) or not target.get("spm"):
+                    raise RuntimeError(
+                        "material_targets entry requires an SPM path")
+                material_id = target.get("material_id")
+                if material_id is None or not str(material_id).strip():
+                    raise RuntimeError(
+                        f"{Path(target['spm']).name}: material_targets entry "
+                        "requires material_id")
+                spm = Path(target["spm"])
+                if not spm_is_allowed(spm):
+                    continue
+                if only_existing_sk and not spm.name.lower().startswith("sk_"):
+                    continue
+                if not spm.is_file():
+                    continue
+                key = f"@id:{str(material_id).strip().lower()}"
+                add_material_mapping(spm, key, {
+                    "texture_dir": texture_dir,
+                    "texture_base": texture_base,
+                    "subsurface_enabled": subsurface_is_real_source(
+                        row,
+                        target_spm=spm,
+                        target_material_id=material_id,
+                    ),
+                })
+            continue
         names = row.get("material_names") or [row.get("atlas_base")]
         for spm_value in row.get("material_spms") or []:
             spm = Path(spm_value)
+            if not spm_is_allowed(spm):
+                continue
             if only_existing_sk and not spm.name.lower().startswith("sk_"):
                 continue
             if not spm.is_file():
                 continue
-            material_map = by_spm.setdefault(str(spm), {})
             for name in names:
                 canonical = canonical_material_name(name)
-                material_map[canonical.lower()] = {
+                add_material_mapping(spm, canonical.lower(), {
                     "texture_dir": texture_dir,
                     "texture_base": texture_base,
-                    "subsurface_enabled": subsurface_is_real_source(row),
-                }
+                    "subsurface_enabled": subsurface_is_real_source(
+                        row, target_spm=spm
+                    ),
+                })
     for row in plan.get("preserved_cluster_materials") or []:
         spm = Path(row.get("spm", ""))
+        if not spm_is_allowed(spm):
+            continue
         if only_existing_sk and not spm.name.lower().startswith("sk_"):
             continue
         if not spm.is_file() or not Path(row.get("source_spm", "")).is_file():
             continue
         canonical = canonical_material_name(row.get("material_name"))
-        by_spm.setdefault(str(spm), {})[canonical.lower()] = {
+        add_material_mapping(spm, canonical.lower(), {
             "mode": "preserve_source",
             "source_spm": row["source_spm"],
-        }
+        })
     return [
         {"spm": spm, "materials": materials}
         for spm, materials in sorted(by_spm.items(), key=lambda item: item[0].lower())

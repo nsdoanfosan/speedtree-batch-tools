@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import queue
@@ -9,25 +10,73 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+# Keep the tool folder first: the GUI engine is the sibling
+# spm_generator_sync.py, not the repository package's limited public API.
 sys.path.insert(0, str(TOOL_DIR))
 
-import spm_generator_sync as engine
+from batch_ui_common import clipboard_text, copy_selected_row_paths
+from cluster_blend_sync import (
+    run_cluster_folder_relation_transaction,
+    run_cluster_relation_transaction,
+)
+from cluster_source_prepare import prepare_cluster_source_if_required
+from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
+
+
+def _load_sibling_engine():
+    """Load the full GUI engine without colliding with the public package."""
+
+    module_name = "_speedtree_spm_generator_sync_gui_engine"
+    engine_path = TOOL_DIR / "spm_generator_sync.py"
+    loaded = sys.modules.get(module_name)
+    loaded_path = getattr(loaded, "__file__", None)
+    if loaded_path and Path(loaded_path).resolve() == engine_path.resolve():
+        return loaded
+    spec = importlib.util.spec_from_file_location(module_name, engine_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"SPM Generator Sync engine을 불러올 수 없습니다: {engine_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+engine = _load_sibling_engine()
 
 
 CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
-CACHE_VERSION = 1
+REPORT_DIR = TOOL_DIR / "reports"
+CACHE_VERSION = 4
+PROCESS_OUTPUT_BUFFER_LINES = 4096
+PROCESS_OUTPUT_LINE_CHARS = 4096
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
 )
+DEFAULT_BLENDER = Path(
+    r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+)
+DEFAULT_CLUSTER_UNIT_PROBE = Path(
+    r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
+    r"\speedtree_unit_probe_10cm_user_scale_0_1_verified.json"
+)
+
+
+class SharedQueueEnqueueError(RuntimeError):
+    """A runnable local mutation could not enter the global FIFO."""
 
 
 def find_default_xml_ini() -> str:
@@ -55,6 +104,9 @@ def load_config() -> dict:
         "tree_root": str(DEFAULT_TREE_ROOT if DEFAULT_TREE_ROOT.is_dir() else Path.home()),
         "speedtree_exe": str(DEFAULT_SPEEDTREE),
         "xml_ini": find_default_xml_ini(),
+        "blender_exe": str(DEFAULT_BLENDER),
+        "cluster_unit_probe": str(DEFAULT_CLUSTER_UNIT_PROBE),
+        "cluster_capture_resolution": 1024,
         "verify_speedtree": True,
         "sk_only": True,
     }
@@ -72,6 +124,28 @@ def save_config(config: dict) -> None:
         json.dumps(config, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def write_connected_run_report(payload: dict) -> Path:
+    """Persist one run-specific connected sync/Cluster refresh report."""
+
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    path = REPORT_DIR / (
+        f"connected_sync_cluster_refresh_{stamp}_{os.getpid()}_"
+        f"{time.time_ns()}.json"
+    )
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return path
 
 
 def load_analysis_cache() -> dict:
@@ -114,24 +188,30 @@ def rgba_to_hex(category: str, base_name: str = "") -> str:
     )
 
 
+def paths_for_row(row):
+    """Adapt a Generator Sync SPM/folder row to the shared path API."""
+
+    folder = Path(row.get("folder", ""))
+    if row.get("kind") == "spm" and row.get("file"):
+        return (folder / row["file"],)
+    if row.get("kind") == "folder" and row.get("folder"):
+        return (folder,)
+    if row.get("kind") == "cluster_blend" and row.get("blend"):
+        return (Path(row["blend"]),)
+    if row.get("kind") == "cluster_relation":
+        return tuple(
+            Path(path) for path in (
+                row.get("blend"), row.get("source_spm"),
+                *(row.get("target_spms") or ()),
+            ) if path
+        )
+    return ()
+
+
 def clipboard_text_for_rows(rows) -> str:
-    """Return raw absolute paths suitable for pasting into Everything."""
-    paths: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        folder = Path(row.get("folder", ""))
-        if row.get("kind") == "spm" and row.get("file"):
-            path = folder / row["file"]
-        elif row.get("kind") == "folder":
-            path = folder
-        else:
-            continue
-        value = str(path.resolve())
-        key = value.casefold()
-        if key not in seen:
-            seen.add(key)
-            paths.append(value)
-    return "\n".join(paths)
+    """Compatibility wrapper for existing callers and tests."""
+
+    return clipboard_text(path for row in rows for path in paths_for_row(row))
 
 
 class Tooltip:
@@ -354,7 +434,10 @@ class PreviewWindow(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         ttk.Label(
             frame,
-            text="읽기 전용 미리보기입니다. 자식 전용 구조는 삭제되지 않습니다.",
+            text=(
+                "읽기 전용 미리보기입니다. 마스터 변경은 자식에게만 반영됩니다. "
+                "관리 Base의 자식 초과 Generator는 삭제되며 부모·형제에게 전파되지 않습니다."
+            ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 6))
         box = tk.Text(frame, wrap="word", font=("Consolas", 10))
@@ -377,8 +460,25 @@ class App:
         self.item_meta = {}
         self.job_queue = queue.Queue()
         self.worker = None
+        self.pending_jobs = deque()
+        self.active_job = None
+        self.job_sequence = 0
+        self.job_failures = []
+        self._job_has_followup = False
+        self.deferred_job_infos = deque()
+        self._deferred_job_info_flush_scheduled = False
         self.job_started_at = None
+        self.job_last_progress_at = None
+        self.job_last_output_at = None
         self.job_stage = "대기"
+        self.closing = False
+        self._shutdown_callbacks = []
+        self._shutdown_poll_scheduled = False
+        self._shutdown_complete = False
+        self.refresh_generation = 0
+        self.shared_queue_runtime = SharedQueueRuntime(
+            "spm_generator_sync"
+        )
         self.drag_source_iids = ()
         self.drag_start = None
         self.drag_active = False
@@ -392,7 +492,7 @@ class App:
         root.geometry("1460x880")
         root.minsize(1120, 680)
         self._build_ui()
-        self.refresh()
+        self.root.after_idle(lambda: self.refresh(fast=True))
 
     def _build_ui(self):
         style = ttk.Style(self.root)
@@ -434,6 +534,21 @@ class App:
         )
         ttk.Button(relation, text="○ 선택을 독립으로", command=self.set_selected_independent).pack(side="left")
         ttk.Separator(relation, orient="vertical").pack(side="left", fill="y", padx=10)
+        self.cluster_on_button = ttk.Button(
+            relation, text="Cluster 관계 ON", command=lambda: self.set_selected_cluster_relation(True)
+        )
+        self.cluster_on_button.pack(side="left")
+        self.cluster_refresh_button = ttk.Button(
+            relation,
+            text="Cluster 갱신",
+            command=self.refresh_selected_cluster_relation,
+        )
+        self.cluster_refresh_button.pack(side="left", padx=(5, 0))
+        self.cluster_off_button = ttk.Button(
+            relation, text="Cluster 관계 OFF", command=lambda: self.set_selected_cluster_relation(False)
+        )
+        self.cluster_off_button.pack(side="left", padx=5)
+        ttk.Separator(relation, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(relation, text="Base 매핑", command=self.edit_selected_base_map).pack(side="left")
         ttk.Button(relation, text="Base 색 분류", command=self.edit_selected_categories).pack(side="left", padx=5)
 
@@ -445,6 +560,19 @@ class App:
         self.apply_button.pack(side="left", padx=5)
         self.apply_all_button = ttk.Button(actions, text="마스터의 모든 자식 동기화", command=self.apply_all_children)
         self.apply_all_button.pack(side="left")
+        self.apply_connected_button = ttk.Button(
+            actions,
+            text="연결 전체 동기화 + Cluster 갱신",
+            command=self.apply_connected_board,
+        )
+        self.apply_connected_button.pack(side="left", padx=(5, 0))
+        self.cancel_job_button = ttk.Button(
+            actions,
+            text="현재 작업 취소",
+            command=self.request_active_job_cancel,
+            state="disabled",
+        )
+        self.cancel_job_button.pack(side="left", padx=(8, 0))
         self.verify_var = tk.BooleanVar(value=bool(self.config.get("verify_speedtree", True)))
         ttk.Checkbutton(actions, text="SpeedTree 10.1 실제 검증", variable=self.verify_var,
                         command=self.persist_config).pack(side="left", padx=12)
@@ -461,6 +589,36 @@ class App:
             progress_row, textvariable=self.progress_text_var, width=58, anchor="e",
         ).pack(side="right", padx=(10, 0))
 
+        output_frame = ttk.LabelFrame(
+            self.root,
+            text="SpeedTree 프로세스 출력 (stdout / stderr)",
+            padding=(6, 4),
+        )
+        output_frame.pack(fill="x", padx=8, pady=(0, 6))
+        self.process_output = tk.Text(
+            output_frame,
+            height=6,
+            wrap="none",
+            font=("Consolas", 9),
+            background="#111827",
+            foreground="#d1d5db",
+            insertbackground="#d1d5db",
+            state="disabled",
+        )
+        output_scroll = ttk.Scrollbar(
+            output_frame,
+            orient="vertical",
+            command=self.process_output.yview,
+        )
+        self.process_output.configure(yscrollcommand=output_scroll.set)
+        self.process_output.grid(row=0, column=0, sticky="nsew")
+        output_scroll.grid(row=0, column=1, sticky="ns")
+        output_frame.columnconfigure(0, weight=1)
+        self.process_output.tag_configure("stdout", foreground="#d1d5db")
+        self.process_output.tag_configure("stderr", foreground="#fca5a5")
+        self.process_output.tag_configure("system", foreground="#93c5fd")
+        self.process_output_line_count = 0
+
         board_frame = ttk.Frame(self.root, padding=(8, 0, 8, 5))
         board_frame.pack(fill="both", expand=True)
         columns = ("role", "bases", "structure", "status", "last")
@@ -470,13 +628,13 @@ class App:
         self.tree.heading("#0", text="나무 폴더 / SPM")
         self.tree.heading("role", text="관계")
         self.tree.heading("bases", text="따라가는 Base")
-        self.tree.heading("structure", text="Base 구조")
+        self.tree.heading("structure", text="정규화 구조")
         self.tree.heading("status", text="동기화 상태")
         self.tree.heading("last", text="마지막 적용")
         self.tree.column("#0", width=430, minwidth=280)
         self.tree.column("role", width=145, anchor="center")
         self.tree.column("bases", width=330)
-        self.tree.column("structure", width=180)
+        self.tree.column("structure", width=240)
         self.tree.column("status", width=160, anchor="center")
         self.tree.column("last", width=155, anchor="center")
         yscroll = ttk.Scrollbar(board_frame, orient="vertical", command=self.tree.yview)
@@ -493,13 +651,7 @@ class App:
         )
         self.tree.tag_configure("follower", background="#f4f9ff")
         self.tree.tag_configure(
-            "follower_unique", background="#f7e5dd", foreground="#6f2818"
-        )
-        self.tree.tag_configure(
-            "follower_missing", background="#fff2cc", foreground="#745000"
-        )
-        self.tree.tag_configure(
-            "follower_delta", background="#f2dfcf", foreground="#612d12"
+            "follower_master_sync", background="#e8ddf5", foreground="#4b2c63"
         )
         self.tree.tag_configure(
             "follower_risk", background="#ffd6d6", foreground="#8b0000",
@@ -508,6 +660,17 @@ class App:
         self.tree.tag_configure("independent", foreground="#555")
         self.tree.tag_configure("candidate", font=("Segoe UI", 9, "bold"), background="#fff3c4")
         self.tree.tag_configure("unassigned", foreground="#8a4b00")
+        self.tree.tag_configure(
+            "cluster_blend", font=("Segoe UI", 9, "bold"),
+            foreground="#4b2c63", background="#eee5f5",
+        )
+        self.tree.tag_configure(
+            "cluster_on", foreground="#0b5d2a", background="#e5f5e9",
+        )
+        self.tree.tag_configure(
+            "cluster_pending", foreground="#8a4b00", background="#fff3c4",
+        )
+        self.tree.tag_configure("cluster_off", foreground="#666")
         self.tree.tag_configure(
             "drop_target", font=("Segoe UI", 10, "bold"),
             foreground="#073b24", background="#a9edc5",
@@ -523,9 +686,11 @@ class App:
         details.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Label(
             details,
-            text=("추가 예정 = 마스터에만 있는 구조입니다. 아직 동기화하지 않았거나 마스터를 나중에 "
-                  "수정했을 때 생기며 다음 동기화에서 자식에 추가됩니다. · "
-                  "자식 전용 = 자식에만 있는 변형 구조이며 자동 삭제하지 않고 보존합니다."),
+            text=(
+                "마스터 → 자식 단방향 동기화입니다. 마스터에만 있는 구조는 자식에 "
+                "반영하고, 관리 Base의 자식 초과 Generator는 삭제합니다. 자식에서 "
+                "부모·형제로 구조가 역전파되는 경로는 없습니다."
+            ),
             foreground="#555",
         ).pack(anchor="w", pady=(0, 4))
         self.details_var = tk.StringVar(value="행을 선택하면 관계와 Base 매핑을 보여 줍니다.")
@@ -536,13 +701,17 @@ class App:
         )
         self.delta_box.pack(fill="x", pady=(5, 0))
         self.delta_box.tag_configure("missing", foreground="#9a5b00", font=("Segoe UI", 9, "bold"))
-        self.delta_box.tag_configure("unique", foreground="#7d2417", font=("Segoe UI", 9, "bold"))
+        self.delta_box.tag_configure("master_sync", foreground="#4b2c63", font=("Segoe UI", 9, "bold"))
+        self.delta_box.tag_configure("remove", foreground="#9b1c1c", font=("Segoe UI", 9, "bold"))
         self.delta_box.tag_configure("muted", foreground="#777")
         self.delta_box.configure(state="disabled")
 
         Tooltip(
             self.preview_button,
-            "SPM을 수정하지 않고 공통 노드·속성 변경·추가 예정·자식 전용 구조·색상 변경을 계산합니다.",
+            (
+                "SPM을 수정하지 않고 마스터와 현재 SPM 사이의 Generator 구조·"
+                "속성·색상 동기화를 계산합니다."
+            ),
         )
         Tooltip(
             self.apply_button,
@@ -580,7 +749,7 @@ class App:
         document = engine.SPMDocument.from_path(path, full=False)
         return self._cache_store(self.document_cache, key, document, limit=24)
 
-    def cached_master_signature(self, path: Path, categories: dict, document=None):
+    def cached_master_signature(self, path: Path, categories: dict):
         key = json.dumps(
             [self._path_cache_key(path), categories],
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -588,13 +757,12 @@ class App:
         if key in self.signature_cache:
             self.signature_cache.move_to_end(key)
             return self.signature_cache[key]
-        document = document or self.cached_document(path)
+        document = self.cached_document(path)
         signature = engine.base_sync_signature(document, categories)
         return self._cache_store(self.signature_cache, key, signature, limit=64)
 
     def cached_follower_analysis(
         self, source_path: Path, target_path: Path, mapping: dict,
-        source_document=None, target_document=None,
     ):
         key = json.dumps(
             [self._path_cache_key(source_path), self._path_cache_key(target_path), mapping],
@@ -603,8 +771,8 @@ class App:
         if key in self.analysis_cache:
             self.analysis_cache.move_to_end(key)
             return self.analysis_cache[key]
-        source_document = source_document or self.cached_document(source_path)
-        target_document = target_document or self.cached_document(target_path)
+        source_document = self.cached_document(source_path)
+        target_document = self.cached_document(target_path)
         delta = engine.compare_base_structure(
             source_document, target_document, mapping, include_details=True
         )
@@ -618,6 +786,165 @@ class App:
             self.analysis_cache, key, (delta, target_hash), limit=64
         )
 
+    def _prepare_render_analysis(
+        self,
+        board,
+        *,
+        cache_snapshot,
+        progress_callback=None,
+    ):
+        """Resolve SPM comparisons in the refresh worker, never in Tk."""
+
+        document_cache = cache_snapshot["documents"]
+        signature_cache = cache_snapshot["signatures"]
+        analysis_cache = cache_snapshot["analyses"]
+        masters = {}
+        followers = {}
+
+        def cached_document(path):
+            key = self._path_cache_key(path)
+            if key in document_cache:
+                document_cache.move_to_end(key)
+                return document_cache[key]
+            document = engine.SPMDocument.from_path(path, full=False)
+            return self._cache_store(
+                document_cache, key, document, limit=24
+            )
+
+        def cached_master_signature(path, categories):
+            key = json.dumps(
+                [self._path_cache_key(path), categories],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if key in signature_cache:
+                signature_cache.move_to_end(key)
+                return signature_cache[key]
+            signature = engine.base_sync_signature(
+                cached_document(path), categories
+            )
+            return self._cache_store(
+                signature_cache, key, signature, limit=64
+            )
+
+        def cached_follower_analysis(source_path, target_path, mapping):
+            key = json.dumps(
+                [
+                    self._path_cache_key(source_path),
+                    self._path_cache_key(target_path),
+                    mapping,
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if key in analysis_cache:
+                analysis_cache.move_to_end(key)
+                return analysis_cache[key]
+            source_document = cached_document(source_path)
+            target_document = cached_document(target_path)
+            delta = engine.compare_base_structure(
+                source_document,
+                target_document,
+                mapping,
+                include_details=True,
+            )
+            delta["scale_risk"] = engine.assess_scale_risk(
+                source_document, target_document
+            )
+            target_hash = engine.target_sync_signature(
+                source_document, target_document, mapping
+            )
+            return self._cache_store(
+                analysis_cache,
+                key,
+                (delta, target_hash),
+                limit=64,
+            )
+
+        units = []
+        for folder_item in board:
+            folder = Path(folder_item["folder"])
+            for group in folder_item["manifest"].get("groups", []):
+                master = group.get("master")
+                if not master:
+                    continue
+                units.append(("master", folder, master, group))
+                for follower in group.get("followers", []):
+                    name = follower.get("file")
+                    if name and follower.get("base_map_confirmed"):
+                        units.append(
+                            ("follower", folder, master, follower)
+                        )
+
+        total = len(units)
+        for index, (kind, folder, master, row) in enumerate(
+            units, start=1
+        ):
+            name = master if kind == "master" else row["file"]
+            if progress_callback is not None:
+                progress_callback(
+                    f"보드 분석 {index}/{total} · {name}",
+                    70 + int(29 * (index - 1) / max(1, total)),
+                )
+            if kind == "master":
+                try:
+                    signature = cached_master_signature(
+                        folder / master,
+                        row.get("base_categories") or {},
+                    )
+                    followers_in_group = row.get("followers", [])
+                    if not followers_in_group:
+                        status = "자식 없음"
+                    elif any(
+                        not item.get("base_map_confirmed")
+                        for item in followers_in_group
+                    ):
+                        status = "매핑 필요"
+                    else:
+                        hashes = {
+                            item.get("last_master_hash")
+                            for item in followers_in_group
+                        }
+                        status = (
+                            "최신"
+                            if hashes == {signature}
+                            else "마스터 변경"
+                        )
+                except Exception as exc:
+                    status, signature = "검사 실패", str(exc)
+                masters[(str(folder), master)] = (status, signature)
+                continue
+
+            try:
+                delta, current_target_hash = cached_follower_analysis(
+                    folder / master,
+                    folder / row["file"],
+                    row.get("base_map") or {},
+                )
+                followers[(str(folder), master, row["file"])] = {
+                    "delta": delta,
+                    "current_target_hash": current_target_hash,
+                }
+            except Exception as exc:
+                followers[(str(folder), master, row["file"])] = {
+                    "error": str(exc),
+                }
+
+        if progress_callback is not None:
+            progress_callback(
+                f"보드 분석 완료 · {total}/{total}",
+                99,
+            )
+        return {
+            "masters": masters,
+            "followers": followers,
+            "documents": document_cache,
+            "signatures": signature_cache,
+            "analyses": analysis_cache,
+        }
+
     def pick_root(self):
         folder = filedialog.askdirectory(initialdir=self.root_var.get() or str(Path.home()))
         if folder:
@@ -625,42 +952,127 @@ class App:
             self.persist_config()
             self.refresh()
 
-    def refresh(self, reveal=None):
+    def refresh(self, reveal=None, *, fast=False):
         self.persist_config()
-        try:
-            self.board = engine.scan_tree_folders(
-                Path(self.root_var.get().strip()),
-                sk_only=bool(self.sk_only_var.get()),
-            )
-        except Exception as exc:
-            messagebox.showerror("검사 실패", str(exc), parent=self.root)
-            return
-        self.render_board()
-        folder_count = len(self.board)
-        spm_count = sum(len(item["spms"]) for item in self.board)
-        self.status_var.set(f"{folder_count}개 폴더 · {spm_count}개 SPM")
-        if reveal:
-            reveal_folder, reveal_file = reveal
-            for iid, meta in self.item_meta.items():
-                if (
-                    meta.get("kind") == "spm"
-                    and meta.get("folder") == Path(reveal_folder)
-                    and meta.get("file") == reveal_file
-                ):
-                    self.tree.selection_set(iid)
-                    self.tree.focus(iid)
-                    self.tree.see(iid)
-                    self.update_details()
-                    break
+        board_root = Path(self.root_var.get().strip())
+        sk_only = bool(self.sk_only_var.get())
+        verify_physical = not fast
+        cache_snapshot = {
+            "documents": OrderedDict(
+                getattr(self, "document_cache", OrderedDict())
+            ),
+            "signatures": OrderedDict(
+                getattr(self, "signature_cache", OrderedDict())
+            ),
+            "analyses": OrderedDict(
+                getattr(self, "analysis_cache", OrderedDict())
+            ),
+        }
+        self.refresh_generation = getattr(
+            self, "refresh_generation", 0
+        ) + 1
+        generation = self.refresh_generation
 
-    def master_status(self, folder: Path, group: dict, document=None) -> tuple[str, str]:
+        def scan(report):
+            scan_report = report
+            if not fast:
+                scan_report = lambda stage, percent: report(
+                    stage, int(70 * percent / 100)
+                )
+            board = engine.scan_tree_folders(
+                board_root,
+                sk_only=sk_only,
+                verify_physical=verify_physical,
+                progress_callback=scan_report,
+            )
+            render_analysis = None
+            if not fast:
+                render_analysis = self._prepare_render_analysis(
+                    board,
+                    cache_snapshot=cache_snapshot,
+                    progress_callback=report,
+                )
+            return {
+                "board": board,
+                "render_analysis": render_analysis,
+            }
+
+        def done(result):
+            if generation != self.refresh_generation:
+                return
+            board = result["board"]
+            render_analysis = result["render_analysis"]
+            self.board = board
+            if render_analysis is not None:
+                self.document_cache = render_analysis["documents"]
+                self.signature_cache = render_analysis["signatures"]
+                self.analysis_cache = render_analysis["analyses"]
+            self.render_board(
+                fast=fast,
+                prepared_analysis=render_analysis,
+            )
+            folder_count = len(self.board)
+            spm_count = sum(len(item["spms"]) for item in self.board)
+            cluster_count = sum(
+                len(item.get("cluster_blends") or ())
+                for item in self.board
+            )
+            self.status_var.set(
+                f"{folder_count}개 폴더 · {spm_count}개 SPM · "
+                f"Cluster blend {cluster_count}개"
+            )
+            if reveal:
+                reveal_folder, reveal_file = reveal
+                for iid, meta in self.item_meta.items():
+                    if (
+                        meta.get("kind") == "spm"
+                        and meta.get("folder") == Path(reveal_folder)
+                        and meta.get("file") == reveal_file
+                    ):
+                        self.tree.selection_set(iid)
+                        self.tree.focus(iid)
+                        self.tree.see(iid)
+                        self.update_details()
+                        break
+
+        return self._start_job(
+            "폴더 검사 중...",
+            scan,
+            done,
+            queue_label=(
+                "빠른 폴더 검사"
+                if fast
+                else "폴더 검사 및 물리 Cluster 검증"
+            ),
+            shared_queue=False,
+        )
+
+    def master_status(
+        self,
+        folder: Path,
+        group: dict,
+        *,
+        fast=False,
+    ) -> tuple[str, str | None]:
         categories = group.get("base_categories") or {}
+        followers = group.get("followers", [])
+        if fast:
+            recorded = {
+                str(item.get("last_master_hash") or "").strip()
+                for item in followers
+                if str(item.get("last_master_hash") or "").strip()
+            }
+            signature = next(iter(recorded)) if len(recorded) == 1 else None
+            if not followers:
+                return "자식 없음", signature
+            if any(not item.get("base_map_confirmed") for item in followers):
+                return "매핑 필요", signature
+            return "정밀 검사 대기", signature
         try:
             master_path = folder / group["master"]
-            signature = self.cached_master_signature(master_path, categories, document=document)
+            signature = self.cached_master_signature(master_path, categories)
         except Exception as exc:
             return "검사 실패", str(exc)
-        followers = group.get("followers", [])
         if not followers:
             return "자식 없음", signature
         if any(not item.get("base_map_confirmed") for item in followers):
@@ -670,7 +1082,15 @@ class App:
             return "최신", signature
         return "마스터 변경", signature
 
-    def render_board(self):
+    def render_board(self, *, fast=False, prepared_analysis=None):
+        prepared_masters = (
+            prepared_analysis.get("masters", {})
+            if prepared_analysis is not None else None
+        )
+        prepared_followers = (
+            prepared_analysis.get("followers", {})
+            if prepared_analysis is not None else None
+        )
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         for folder_item in self.board:
@@ -696,7 +1116,17 @@ class App:
                 category_text = ", ".join(
                     f"{name}:{category or '미분류'}" for name, category in categories.items()
                 ) or "자동 분류"
-                status, signature = self.master_status(folder, group)
+                if prepared_masters is not None:
+                    status, signature = prepared_masters.get(
+                        (str(folder), master),
+                        ("검사 실패", "준비된 분석 결과 없음"),
+                    )
+                else:
+                    status, signature = self.master_status(
+                        folder,
+                        group,
+                        fast=fast,
+                    )
                 master_iid = self.tree.insert(
                     folder_iid, "end", text=f"◆ {master}",
                     values=("MASTER", category_text, "기준 Base", status, ""),
@@ -717,13 +1147,47 @@ class App:
                         for target, source in mapping.items()
                     ]
                     delta = {
-                        "missing": 0, "target_only": 0, "missing_bases": 0,
-                        "missing_details": [], "target_only_details": [],
+                        "missing": 0, "master_sync": 0, "missing_bases": 0,
+                        "target_local": 0,
+                        "remove": 0,
+                        "missing_details": [], "master_sync_details": [],
+                        "target_local_details": [],
+                        "remove_details": [],
                     }
                     risk = {}
                     if not follower.get("base_map_confirmed"):
                         structure = "매핑 확인 필요"
                         current_target_hash = None
+                    elif fast:
+                        structure = "정밀 검사 대기"
+                        current_target_hash = None
+                    elif prepared_followers is not None:
+                        prepared = prepared_followers.get(
+                            (str(folder), master, name),
+                            {"error": "준비된 분석 결과 없음"},
+                        )
+                        if prepared.get("error"):
+                            structure = "검사 실패"
+                            current_target_hash = None
+                        else:
+                            delta = prepared["delta"]
+                            current_target_hash = prepared[
+                                "current_target_hash"
+                            ]
+                            if delta.get("mapping_errors"):
+                                structure = "매핑 오류"
+                            elif delta["missing"] or delta.get("remove"):
+                                structure = (
+                                    "마스터→자식 반영 "
+                                    f"{delta['missing']} · 초과삭제 {delta.get('remove', 0)}"
+                                )
+                            else:
+                                structure = "동일"
+                            risk = delta.get("scale_risk") or {}
+                            if risk.get("level") == "blocked":
+                                structure = f"⚠ 크기 {risk['ratio']:.2f}배 · " + structure
+                            elif risk.get("level") == "warning":
+                                structure = f"△ 크기 {risk['ratio']:.2f}배 · " + structure
                     else:
                         try:
                             delta, current_target_hash = self.cached_follower_analysis(
@@ -731,15 +1195,11 @@ class App:
                             )
                             if delta.get("mapping_errors"):
                                 structure = "매핑 오류"
-                            elif delta["missing"] or delta["target_only"]:
-                                parts = []
-                                if delta.get("missing_bases"):
-                                    parts.append(f"Base 추가 {delta['missing_bases']}")
-                                if delta["missing"]:
-                                    parts.append(f"추가 예정 {delta['missing']}")
-                                if delta["target_only"]:
-                                    parts.append(f"자식 전용 {delta['target_only']}")
-                                structure = " · ".join(parts)
+                            elif delta["missing"] or delta.get("remove"):
+                                structure = (
+                                    "마스터→자식 반영 "
+                                    f"{delta['missing']} · 초과삭제 {delta.get('remove', 0)}"
+                                )
                             else:
                                 structure = "동일"
                             risk = delta.get("scale_risk") or {}
@@ -753,8 +1213,16 @@ class App:
                     last_hash = follower.get("last_master_hash")
                     if not follower.get("base_map_confirmed"):
                         follower_status = "매핑 필요"
+                    elif fast:
+                        follower_status = (
+                            "정밀 검사 대기"
+                            if follower.get("last_sync")
+                            else "미실행"
+                        )
                     elif follower.get("last_sync") and last_hash != signature:
                         follower_status = "마스터 변경"
+                    elif follower.get("last_sync") and delta.get("remove"):
+                        follower_status = "정규화 필요"
                     elif follower.get("last_sync") and follower.get("last_target_hash") != current_target_hash:
                         follower_status = "차이 있음"
                     elif follower.get("last_sync"):
@@ -767,9 +1235,8 @@ class App:
                                 follower_status, follower.get("last_sync") or "—"),
                         tags=(
                             "follower_risk" if risk.get("level") == "blocked"
-                            else "follower_delta" if delta.get("missing") and delta.get("target_only")
-                            else "follower_missing" if delta.get("missing")
-                            else "follower_unique" if delta.get("target_only")
+                            else "follower_master_sync"
+                            if delta.get("missing") or delta.get("remove")
                             else "follower",
                         )
                     )
@@ -778,9 +1245,9 @@ class App:
                         "role": "follower", "group": group, "follower": follower,
                         "master": master,
                         "missing_details": delta.get("missing_details") or [],
-                        "target_only_details": delta.get("target_only_details") or [],
-                        "missing_count": delta.get("missing", 0),
-                        "target_only_count": delta.get("target_only", 0),
+                        "master_sync_details": delta.get("master_sync_details") or [],
+                        "target_local_details": delta.get("target_local_details") or [],
+                        "remove_details": delta.get("remove_details") or [],
                         "scale_risk": delta.get("scale_risk") or {},
                     }
             independent = set(manifest.get("independent", []))
@@ -812,6 +1279,147 @@ class App:
                 self.item_meta[iid] = {
                     "kind": "spm", "folder": folder, "file": name, "role": role,
                 }
+            cluster_blends = folder_item.get("cluster_blends") or []
+            if cluster_blends:
+                cluster_iid = f"cluster::{len(self.item_meta)}"
+                cluster_path = Path(cluster_blends[0]["cluster_folder"])
+                self.tree.insert(
+                    folder_iid, "end", iid=cluster_iid,
+                    text=f"▾ {cluster_path.name}",
+                    values=("CLUSTER", "—", "정규화 3D + plan", "", ""),
+                    open=True, tags=("cluster_blend",),
+                )
+                self.item_meta[cluster_iid] = {
+                    "kind": "folder",
+                    "folder": cluster_path,
+                    "role": "cluster_folder",
+                }
+                for blend_index, blend_row in enumerate(cluster_blends):
+                    blend_iid = f"{cluster_iid}::blend::{blend_index}"
+                    targets = [
+                        target for target in (blend_row.get("targets") or [])
+                        if target.get("owner_target")
+                    ]
+                    relation = blend_row.get("folder_relation") or "empty"
+                    total_count = int(blend_row.get("owner_target_count") or len(targets))
+                    on_count = int(blend_row.get("owner_on_count") or 0)
+                    refresh_required_count = int(
+                        blend_row.get("refresh_required_count") or 0
+                    )
+                    refresh_deferred_count = int(
+                        blend_row.get("refresh_deferred_count") or 0
+                    )
+                    refresh_reasons = list(
+                        blend_row.get("refresh_reasons") or []
+                    )
+                    all_synced = bool(
+                        relation == "on"
+                        and targets
+                        and all(target.get("status") == "synced" for target in targets)
+                    )
+                    if blend_row.get("registry_error"):
+                        status_text = "대상 JSON 오류"
+                        tag = "cluster_pending"
+                    elif relation == "empty":
+                        status_text = "부모 폴더에 SK_*.spm 없음"
+                        tag = "cluster_pending"
+                    elif relation == "off":
+                        status_text = f"폴더 SK {total_count}개 전체 미적용"
+                        tag = "cluster_off"
+                    elif relation == "partial":
+                        if refresh_required_count:
+                            status_text = (
+                                f"부분 연결 {on_count}/{total_count} · 원본 변경 · "
+                                f"ON 대상 {refresh_required_count}개 갱신 필요"
+                            )
+                        else:
+                            status_text = (
+                                f"부분 연결 {on_count}/{total_count} · "
+                                "ON/OFF로 정규화 필요"
+                            )
+                        tag = "cluster_pending"
+                    elif refresh_required_count:
+                        status_text = (
+                            f"Cluster 원본 변경 · 폴더 SK "
+                            f"{refresh_required_count}개 갱신 필요"
+                        )
+                        tag = "cluster_pending"
+                    elif refresh_deferred_count:
+                        status_text = (
+                            f"폴더 SK {total_count}개 전체 ON · 정밀 검사 대기"
+                        )
+                        tag = "cluster_pending"
+                    elif all_synced:
+                        status_text = f"폴더 SK {total_count}개 메시 교체 완료 ✓"
+                        tag = "cluster_on"
+                    else:
+                        status_text = f"폴더 SK {total_count}개 전체 ON · 동기화 점검 필요"
+                        tag = "cluster_pending"
+                    relation_label = {
+                        "on": "ON", "off": "OFF",
+                        "partial": "PARTIAL", "empty": "—",
+                    }.get(relation, relation.upper())
+                    material_names = sorted({
+                        str(target.get("material"))
+                        for target in targets if target.get("material")
+                    })
+                    material_text = ", ".join(material_names) or "원본 M_ 재료"
+                    source_spm = Path(blend_row["source_spm"])
+                    canonical_spm = Path(
+                        blend_row.get("canonical_spm") or (
+                            source_spm
+                            if source_spm.name.casefold().startswith("sk_")
+                            else source_spm.with_name("SK_" + source_spm.name)
+                        )
+                    )
+                    mirror_spm = Path(
+                        blend_row.get("mirror_spm") or (
+                            canonical_spm.with_name(canonical_spm.name[3:])
+                            if canonical_spm.name.casefold().startswith("sk_")
+                            else source_spm
+                        )
+                    )
+                    self.tree.insert(
+                        cluster_iid, "end", iid=blend_iid,
+                        text=f"◆ {Path(blend_row['blend']).name}",
+                        values=(
+                            relation_label,
+                            "—",
+                            f"폴더 SK {total_count}개 일괄 · {material_text}",
+                            status_text,
+                            "—",
+                        ),
+                        open=False, tags=(tag,),
+                    )
+                    self.item_meta[blend_iid] = {
+                        "kind": "cluster_relation",
+                        "folder": folder,
+                        "file": Path(blend_row["blend"]).name,
+                        "blend": Path(blend_row["blend"]),
+                        "source_spm": source_spm,
+                        "canonical_spm": canonical_spm,
+                        "mirror_spm": mirror_spm,
+                        "role": "cluster_relation",
+                        "folder_relation": relation,
+                        "relation_on": (
+                            True if relation == "on"
+                            else False if relation == "off"
+                            else None
+                        ),
+                        "target_spms": [
+                            Path(target["target_spm"]) for target in targets
+                        ],
+                        "on_target_spms": [
+                            Path(target["target_spm"]) for target in targets
+                            if target.get("relation_on")
+                        ],
+                        "target_count": total_count,
+                        "on_count": on_count,
+                        "all_synced": all_synced,
+                        "refresh_required_count": refresh_required_count,
+                        "refresh_reasons": refresh_reasons,
+                        "material": material_text,
+                    }
         try:
             save_analysis_cache(self.signature_cache, self.analysis_cache)
         except OSError:
@@ -821,23 +1429,79 @@ class App:
         return [self.item_meta[iid] for iid in self.tree.selection()
                 if iid in self.item_meta and self.item_meta[iid].get("kind") == "spm"]
 
+    def selected_cluster_relations(self, *, include_cluster_folders=False):
+        relation_iids = []
+        for iid in self.tree.selection():
+            meta = self.item_meta.get(iid, {})
+            if meta.get("kind") == "cluster_relation":
+                relation_iids.append(iid)
+            elif include_cluster_folders and meta.get("role") == "cluster_folder":
+                relation_iids.extend(self.tree.get_children(iid))
+
+        rows = []
+        seen = set()
+        for iid in relation_iids:
+            row = self.item_meta.get(iid, {})
+            if row.get("kind") != "cluster_relation":
+                continue
+            key = os.path.normcase(
+                str(Path(row["blend"]).absolute())
+            ).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        return rows
+
     def copy_selected_paths(self, _event=None):
-        rows = [
-            self.item_meta[iid] for iid in self.tree.selection()
-            if iid in self.item_meta
-        ]
-        text = clipboard_text_for_rows(rows)
-        if not text:
+        count = copy_selected_row_paths(
+            self.root,
+            self.tree,
+            self.item_meta,
+            paths_for_row,
+        )
+        if not count:
             self.status_var.set("복사할 SPM 또는 폴더 행을 선택하세요")
             return "break"
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update_idletasks()
-        count = len(text.splitlines())
         self.status_var.set(f"전체 경로 복사 완료 · {count}개")
         return "break"
 
     def update_details(self, _event=None):
+        cluster_relations = self.selected_cluster_relations()
+        if cluster_relations:
+            if len(cluster_relations) > 1:
+                self.details_var.set(f"Cluster 관계 {len(cluster_relations)}개 선택됨")
+            else:
+                relation = cluster_relations[0]
+                reason_labels = {
+                    "canonical_source_missing": "canonical SPM 없음",
+                    "canonical_source_changed": "canonical SPM 변경",
+                    "recorded_source_conflict": "적용 영수증의 원본 해시 충돌",
+                    "physical_capture_manifest_missing": (
+                        "Blender physical-capture 영수증 없음"
+                    ),
+                    "physical_capture_changed": "Blender 촬영/plan 변경",
+                }
+                refresh_text = ", ".join(
+                    reason_labels.get(reason, reason)
+                    for reason in relation.get("refresh_reasons") or []
+                )
+                self.details_var.set("\n".join([
+                    f"{relation['blend'].name} · 폴더 관계 "
+                    f"{str(relation.get('folder_relation') or 'unknown').upper()}",
+                    f"정규화 blend: {relation['blend']}",
+                    f"canonical Cluster SPM: {relation['canonical_spm']}",
+                    f"legacy mirror (읽기 전용): {relation['mirror_spm']}",
+                    f"대상: 폴더 직하 SK_*.spm {relation.get('target_count', 0)}개 전체",
+                    f"현재 적용: {relation.get('on_count', 0)}/{relation.get('target_count', 0)}",
+                    (
+                        f"갱신 필요: {relation.get('refresh_required_count', 0)}개"
+                        + (f" · {refresh_text}" if refresh_text else "")
+                    ),
+                    f"교체 대상 재료: {relation.get('material') or '적용 후 manifest에서 확정'}",
+                ]))
+            self.show_delta_details(None)
+            return
         items = self.selected_items()
         if not items:
             self.details_var.set("행을 선택하면 관계와 Base 매핑을 보여 줍니다.")
@@ -874,12 +1538,16 @@ class App:
         self.delta_box.configure(state="normal")
         self.delta_box.delete("1.0", "end")
         if not item or item.get("role") != "follower":
-            self.delta_box.insert("end", "자식 행을 선택하면 추가 예정·자식 전용 Generator 상세가 표시됩니다.", "muted")
+            self.delta_box.insert(
+                "end",
+                "SPM 행을 선택하면 마스터와 동기화될 Generator 상세가 표시됩니다.",
+                "muted",
+            )
             self.delta_box.configure(state="disabled")
             return
         missing = item.get("missing_details") or []
-        unique = item.get("target_only_details") or []
-        if not missing and not unique:
+        remove = item.get("remove_details") or []
+        if not missing and not remove:
             self.delta_box.insert("end", "구조 차이 없음 — 마스터와 자식의 관리 대상 구조가 같습니다.", "muted")
             self.delta_box.configure(state="disabled")
             return
@@ -901,12 +1569,24 @@ class App:
                 )
 
         if missing:
-            insert_group("추가 예정 — 동기화 시 자식에 추가될 구조", missing, "missing")
-        if unique:
-            insert_group("자식 전용 — 자식에만 있어 보존되는 구조", unique, "unique")
+            insert_group(
+                "마스터 → 현재 SPM — 마스터 기준으로 반영될 구조",
+                missing,
+                "missing",
+            )
+        if remove:
+            insert_group(
+                "현재 SPM에서 삭제 — 부모에 없는 초과 Generator",
+                remove,
+                "remove",
+            )
         self.delta_box.configure(state="disabled")
 
     def on_double_click(self, _event=None):
+        relations = self.selected_cluster_relations()
+        if len(relations) == 1:
+            self.set_selected_cluster_relation(not relations[0]["relation_on"])
+            return
         item = self.selected_items()
         if len(item) == 1 and item[0].get("role") == "follower":
             self.edit_selected_base_map()
@@ -1035,18 +1715,24 @@ class App:
         folder = item["folder"]
         if item.get("role") == "master":
             return
-        try:
-            manifest = engine.load_manifest(folder)
-            engine.set_master(manifest, item["file"])
-            group = engine.find_group(manifest, item["file"])
-            document = engine.SPMDocument.from_path(folder / item["file"], full=False)
-            group["base_categories"] = engine.source_base_categories(document)
-            engine.save_manifest(folder, manifest)
-        except Exception as exc:
-            messagebox.showerror("마스터 지정 실패", str(exc), parent=self.root)
-            return
-        self.refresh(reveal=(folder, item["file"]))
-        self.status_var.set(f"마스터 지정 완료 · {item['file']}")
+
+        def apply(report):
+            report("마스터 관계 적용 중...", 35)
+            return engine.promote_master(folder, item["file"])
+
+        def done(result):
+            self.refresh(reveal=(folder, item["file"]))
+            self.status_var.set(
+                f"마스터 지정 완료 · {item['file']} · "
+                f"Base 색상 {result['color_updates']}개 적용"
+            )
+
+        self._start_job(
+            "마스터 관계 적용 중...",
+            apply,
+            done,
+            queue_label=f"마스터 지정 · {item['file']}",
+        )
 
     def choose_master(self, folder: Path, manifest: dict):
         masters = [item.get("master") for item in manifest.get("groups", []) if item.get("master")]
@@ -1086,13 +1772,15 @@ class App:
             return
         source_doc = engine.SPMDocument.from_path(folder / master, full=False)
         manifest = engine.load_manifest(folder)
-        if promote_master:
-            engine.set_master(manifest, master)
-            promoted_group = engine.find_group(manifest, master)
-            promoted_group["base_categories"] = engine.source_base_categories(source_doc)
-        group = engine.find_group(manifest, master)
-        categories = group.get("base_categories") or engine.source_base_categories(source_doc)
-        group["base_categories"] = categories
+        try:
+            group = engine.find_group(manifest, master)
+        except Exception:
+            group = {}
+        categories = (
+            group.get("base_categories")
+            or engine.source_base_categories(source_doc)
+        )
+        assignments = []
         for item in items:
             if item["file"] == master:
                 continue
@@ -1103,15 +1791,46 @@ class App:
             )
             mapping = dialog.result
             if mapping is None:
-                engine.assign_follower(
-                    manifest, master, item["file"], suggestion, confirmed=False
+                assignments.append(
+                    (item["file"], suggestion, False)
                 )
             else:
+                assignments.append((item["file"], mapping, True))
+        if not assignments and not promote_master:
+            return
+
+        def apply(report):
+            report("자식 관계 manifest 다시 확인 중...", 15)
+            if promote_master:
+                engine.promote_master(folder, master)
+            live_manifest = engine.load_manifest(folder)
+            live_group = engine.find_group(live_manifest, master)
+            live_group["base_categories"] = categories
+            for name, mapping, confirmed in assignments:
                 engine.assign_follower(
-                    manifest, master, item["file"], mapping, confirmed=True
+                    live_manifest,
+                    master,
+                    name,
+                    mapping,
+                    confirmed=confirmed,
                 )
-        engine.save_manifest(folder, manifest)
-        self.refresh()
+            engine.save_manifest(folder, live_manifest)
+            return {
+                "status": "completed",
+                "followers": len(assignments),
+            }
+
+        def done(_result):
+            self.refresh()
+
+        self._start_job(
+            "자식 관계 적용 중...",
+            apply,
+            done,
+            queue_label=(
+                f"자식 연결 · {master} → {len(assignments)}개"
+            ),
+        )
 
     def set_selected_independent(self):
         items = self.selected_items()
@@ -1120,11 +1839,339 @@ class App:
         by_folder = {}
         for item in items:
             by_folder.setdefault(item["folder"], []).append(item["file"])
-        for folder, names in by_folder.items():
-            manifest = engine.load_manifest(folder)
-            engine.set_independent(manifest, names)
-            engine.save_manifest(folder, manifest)
-        self.refresh()
+        def apply(report):
+            total = len(by_folder)
+            for index, (folder, names) in enumerate(
+                    by_folder.items(), start=1):
+                report(
+                    f"독립 관계 적용 {index}/{total}",
+                    int(90 * index / max(1, total)),
+                )
+                manifest = engine.load_manifest(folder)
+                engine.set_independent(manifest, names)
+                engine.save_manifest(folder, manifest)
+            return {"status": "completed", "folders": total}
+
+        self._start_job(
+            "독립 관계 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=(
+                f"독립 관계 · SPM {sum(len(v) for v in by_folder.values())}개"
+            ),
+        )
+
+    def refresh_selected_cluster_relation(self):
+        self.set_selected_cluster_relation(True, refresh_only=True)
+
+    def _execute_cluster_refresh_rows(self, rows, job_config, report):
+        """Refresh exact ON relation rows without widening their target scope."""
+
+        rows = list(rows)
+        cluster_count = len(rows)
+        if not cluster_count:
+            return {
+                "status": "ok",
+                "mode": "sync",
+                "cluster_count": 0,
+                "results": [],
+            }
+        results = []
+        for index, row in enumerate(rows, start=1):
+            blend_path = Path(row["blend"])
+            on_targets = list(row.get("on_target_spms") or [])
+            blender_path = Path(
+                job_config.get("blender_exe") or DEFAULT_BLENDER
+            )
+            unit_probe_path = Path(
+                job_config.get("cluster_unit_probe")
+                or DEFAULT_CLUSTER_UNIT_PROBE
+            )
+            capture_resolution = int(
+                job_config.get("cluster_capture_resolution") or 1024
+            )
+            report(
+                f"Cluster 갱신 {index}/{cluster_count} · {blend_path.name}",
+                10 + int(80 * (index - 1) / cluster_count),
+            )
+            preparation = prepare_cluster_source_if_required(
+                blend_path,
+                on_targets,
+                blender_exe=blender_path,
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+                progress_callback=lambda _stage, message, i=index: report(
+                    f"Cluster 갱신 {i}/{cluster_count} · {message}",
+                    10 + int(80 * (i - 0.5) / cluster_count),
+                ),
+            )
+            relation_result = run_cluster_relation_transaction(
+                blend_path,
+                on_targets,
+                enabled=True,
+                blender_exe=blender_path,
+                unit_probe_path=unit_probe_path,
+                capture_resolution=capture_resolution,
+                repair_runtime_config=job_config,
+                force_refresh=True,
+                progress_callback=(
+                    lambda _stage, message, i=index: report(
+                        f"Cluster refresh {i}/{cluster_count} · {message}",
+                        10 + int(80 * (i - 0.5) / cluster_count),
+                    )
+                ),
+            )
+            relation_result["source_preparation"] = preparation
+            results.append(relation_result)
+        report("Cluster SPM 메시/Generator 검증 완료", 95)
+        if cluster_count == 1:
+            return results[0]
+        return {
+            "status": "ok",
+            "mode": "sync",
+            "cluster_count": cluster_count,
+            "results": results,
+        }
+
+    def set_selected_cluster_relation(self, enabled, *, refresh_only=False):
+        # ON/OFF is a folder-wide contract just like refresh.  Expand a
+        # selected Cluster folder to its child relation rows so the folder
+        # action cannot silently preserve an old one-target partial registry.
+        rows = self.selected_cluster_relations(
+            include_cluster_folders=True
+        )
+        if not rows:
+            messagebox.showinfo(
+                "Cluster 관계",
+                "Cluster 폴더 또는 아래의 정규화 SK_*.blend 행을 선택하세요.",
+                parent=self.root,
+            )
+            return
+        blend_keys = {
+            os.path.normcase(str(Path(row["blend"]).absolute())).casefold()
+            for row in rows
+        }
+        if not refresh_only and len(blend_keys) != 1:
+            messagebox.showinfo(
+                "Cluster 관계",
+                "한 번에는 같은 Cluster blend의 관계만 처리하세요.",
+                parent=self.root,
+            )
+            return
+        if refresh_only:
+            partial_rows = [
+                row for row in rows
+                if row.get("folder_relation") == "partial"
+            ]
+            if partial_rows:
+                messagebox.showinfo(
+                    "Cluster 관계 불일치",
+                    "일부 트리에만 연결된 기존 Cluster 관계가 있습니다. "
+                    "해당 Cluster 관계를 ON 또는 OFF로 먼저 정규화하세요.",
+                    parent=self.root,
+                )
+                return
+            rows = [
+                row for row in rows
+                if (
+                    row.get("folder_relation") == "on"
+                    and row.get("on_target_spms")
+                )
+            ]
+            if not rows:
+                messagebox.showinfo(
+                    "Cluster 갱신",
+                    "현재 ON으로 연결된 대상이 없습니다. 먼저 관계를 ON으로 설정하세요.",
+                    parent=self.root,
+                )
+                return
+        changes = rows if refresh_only else [
+            row for row in rows
+            if (
+                row.get("folder_relation") != ("on" if enabled else "off")
+                or (enabled and not row.get("all_synced"))
+            )
+        ]
+        if not changes:
+            self.status_var.set(
+                (
+                    "선택 Cluster는 이미 최신입니다."
+                    if refresh_only
+                    else f"선택 관계는 이미 {'ON' if enabled else 'OFF'}입니다."
+                )
+            )
+            return
+        changes = [
+            {
+                **row,
+                "on_target_spms": list(row.get("on_target_spms") or ()),
+                "target_spms": list(row.get("target_spms") or ()),
+            }
+            for row in changes
+        ]
+        job_config = dict(self.config)
+        blend = Path(changes[0]["blend"])
+        requested_blend_keys = set(blend_keys)
+        board_root = str(job_config.get("tree_root") or "")
+        cluster_count = len(changes)
+        if refresh_only:
+            target_binding_count = sum(
+                len(row.get("on_target_spms") or []) for row in changes
+            )
+            target_keys = {
+                os.path.normcase(str(Path(target).absolute())).casefold()
+                for row in changes
+                for target in (row.get("on_target_spms") or [])
+            }
+            target_count = len(target_keys)
+        else:
+            target_binding_count = int(
+                changes[0].get("target_count") or 0
+            )
+            target_count = target_binding_count
+        action = (
+            "갱신 · 현재 Blender 결과 재적용"
+            if refresh_only
+            else "ON · 메시 동기화" if enabled
+            else "OFF · 원본 메시 복원"
+        )
+        target_label = (
+            f"현재 ON으로 연결된 SK_*.spm {target_count}개 · "
+            f"Cluster 연결 {target_binding_count}건"
+            if refresh_only
+            else f"부모 식생 폴더의 SK_*.spm {target_count}개 전체"
+        )
+        blend_label = (
+            blend.name
+            if cluster_count == 1
+            else f"{cluster_count}개 (선택 Cluster 폴더 전체)"
+        )
+        message = (
+            f"Cluster blend: {blend_label}\n관계: {action}\n"
+            f"대상: {target_label}\n\n"
+            + (
+                (
+                    "canonical Cluster SPM 변경을 검사하고, 필요하면 SK Batch blend에서 "
+                    "정규화 3D prototype/plan/texture와 Atlas 설정을 자동 재생성한 뒤 "
+                    "현재 ON 대상 SPM의 Generator 연결을 갱신합니다."
+                    if refresh_only else
+                    "Blender 5.1 백그라운드에서 Cluster Normalizer와 Atlas를 연속 실행해 "
+                    "정규화 prototype/plan을 준비하고 대상 SPM의 기존 M_ 재료 mesh를 "
+                    "교체합니다."
+                )
+                if enabled else
+                "Atlas manifest의 백업 스냅샷으로 이 blend가 관리한 mesh와 Generator "
+                "슬롯만 원래 상태로 복원합니다."
+            )
+        )
+        title = "Cluster 갱신" if refresh_only else "Cluster 관계 적용"
+        if not messagebox.askyesno(title, message, parent=self.root):
+            return
+
+        def apply(report):
+            stage = (
+                "Cluster 갱신"
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'}"
+            )
+            report(f"{stage} 준비", 10)
+            if refresh_only:
+                # A shared queue turn may begin long after the click. Re-scan
+                # the registry/manifest contract now and refresh only blends
+                # that are still fully ON; never replay captured target paths.
+                runtime_board = engine.scan_tree_folders(
+                    Path(board_root),
+                    sk_only=bool(job_config.get("sk_only", True)),
+                    verify_physical=False,
+                )
+                runtime_scope = self._connected_scope_from_board(
+                    runtime_board
+                )
+                live_changes = [
+                    row
+                    for row in runtime_scope["cluster_rows"]
+                    if (
+                        os.path.normcase(
+                            str(Path(row["blend"]).absolute())
+                        ).casefold()
+                        in requested_blend_keys
+                    )
+                ]
+                if not live_changes:
+                    raise RuntimeError(
+                        "실행 차례에 Cluster 관계를 다시 확인했지만 "
+                        "선택한 blend가 더 이상 완전한 ON 상태가 아닙니다."
+                    )
+                result = self._execute_cluster_refresh_rows(
+                    live_changes,
+                    job_config,
+                    report,
+                )
+            else:
+                result = run_cluster_folder_relation_transaction(
+                    blend,
+                    enabled=enabled,
+                    blender_exe=Path(
+                        job_config.get("blender_exe") or DEFAULT_BLENDER
+                    ),
+                    unit_probe_path=Path(
+                        job_config.get("cluster_unit_probe")
+                        or DEFAULT_CLUSTER_UNIT_PROBE
+                    ),
+                    capture_resolution=int(
+                        job_config.get("cluster_capture_resolution") or 1024
+                    ),
+                    repair_runtime_config=job_config,
+                    progress_callback=lambda _stage, message: report(
+                        f"Cluster relationship · {message}",
+                        55,
+                    ),
+                )
+                report("Cluster SPM 메시/Generator 검증 완료", 95)
+            return result
+
+        def done(result):
+            self.refresh()
+            self.status_var.set(
+                (
+                    f"Cluster 갱신 완료 · Cluster {cluster_count}개 · "
+                    f"ON 대상 SK {target_count}개 · 연결 {target_binding_count}건"
+                    if refresh_only
+                    else
+                    f"Cluster 관계 {'ON' if enabled else 'OFF'} 완료 · "
+                    f"폴더 SK {target_count}개"
+                )
+            )
+            self._show_job_info(
+                "Cluster 갱신 완료" if refresh_only else "Cluster 관계 완료",
+                f"{blend_label}\n"
+                + (
+                    "현재 Blender 결과 재적용"
+                    if refresh_only else f"관계 {'ON' if enabled else 'OFF'}"
+                )
+                + " · "
+                + (
+                    f"ON 대상 SK {target_count}개\n"
+                    if refresh_only
+                    else f"폴더 SK {target_count}개 전체\n"
+                )
+                + f"모드: {result.get('mode')}",
+            )
+
+        self._start_job(
+            (
+                "Cluster 갱신 적용 중..."
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'} 적용 중..."
+            ),
+            apply,
+            done,
+            queue_label=(
+                f"Cluster 갱신 · {blend_label}"
+                if refresh_only
+                else f"Cluster 관계 {'ON' if enabled else 'OFF'} · {blend_label}"
+            ),
+        )
 
     def edit_selected_base_map(self):
         items = self.selected_items()
@@ -1140,15 +2187,30 @@ class App:
         )
         if dialog.result is None:
             return
-        manifest = engine.load_manifest(item["folder"])
-        group = engine.find_group(manifest, item["master"])
-        follower = next(row for row in group["followers"] if row.get("file") == item["file"])
-        follower["base_map"] = dialog.result
-        follower["base_map_confirmed"] = True
-        follower["last_master_hash"] = None
-        follower["last_target_hash"] = None
-        engine.save_manifest(item["folder"], manifest)
-        self.refresh()
+        mapping = dict(dialog.result)
+
+        def apply(report):
+            report("Base 매핑 manifest 다시 확인 중...", 25)
+            manifest = engine.load_manifest(item["folder"])
+            group = engine.find_group(manifest, item["master"])
+            follower = next(
+                row
+                for row in group["followers"]
+                if row.get("file") == item["file"]
+            )
+            follower["base_map"] = mapping
+            follower["base_map_confirmed"] = True
+            follower["last_master_hash"] = None
+            follower["last_target_hash"] = None
+            engine.save_manifest(item["folder"], manifest)
+            return {"status": "completed"}
+
+        self._start_job(
+            "Base 매핑 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=f"Base 매핑 · {item['file']}",
+        )
 
     def edit_selected_categories(self):
         items = self.selected_items()
@@ -1161,14 +2223,25 @@ class App:
         )
         if dialog.result is None:
             return
-        manifest = engine.load_manifest(item["folder"])
-        group = engine.find_group(manifest, item["file"])
-        group["base_categories"] = dialog.result
-        for follower in group.get("followers", []):
-            follower["last_master_hash"] = None
-            follower["last_target_hash"] = None
-        engine.save_manifest(item["folder"], manifest)
-        self.refresh()
+        categories = dict(dialog.result)
+
+        def apply(report):
+            report("Base 분류 manifest 다시 확인 중...", 25)
+            manifest = engine.load_manifest(item["folder"])
+            group = engine.find_group(manifest, item["file"])
+            group["base_categories"] = categories
+            for follower in group.get("followers", []):
+                follower["last_master_hash"] = None
+                follower["last_target_hash"] = None
+            engine.save_manifest(item["folder"], manifest)
+            return {"status": "completed"}
+
+        self._start_job(
+            "Base 분류 적용 중...",
+            apply,
+            lambda _result: self.refresh(),
+            queue_label=f"Base 분류 · {item['file']}",
+        )
 
     def followers_from_selection(self, require_same_group=True):
         items = self.selected_items()
@@ -1196,65 +2269,1137 @@ class App:
             return []
         return followers
 
-    def _start_job(self, label, func, on_success):
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("작업 중", "현재 작업이 끝날 때까지 기다려 주세요.", parent=self.root)
+    @staticmethod
+    def _connected_scope_from_board(board):
+        """Build a connected scope from one disk-scan board snapshot."""
+
+        grouped = {}
+        skipped = []
+        seen_followers = set()
+        cluster_rows = []
+        seen_blends = set()
+        for folder_item in board:
+            folder = Path(folder_item["folder"])
+            manifest = folder_item.get("manifest") or {}
+            for group in manifest.get("groups") or ():
+                if not isinstance(group, dict):
+                    continue
+                master = str(group.get("master") or "").strip()
+                if not master:
+                    continue
+                for follower in group.get("followers") or ():
+                    if not isinstance(follower, dict):
+                        skipped.append({
+                            "stage": "generator_sync",
+                            "folder": str(folder),
+                            "master": master,
+                            "target": "",
+                            "reason": "자식 관계 메타데이터 형식 오류",
+                        })
+                        continue
+                    name = str(follower.get("file") or "").strip()
+                    if not name:
+                        continue
+                    follower_key = (
+                        os.path.normcase(
+                            str(folder.absolute())
+                        ).casefold(),
+                        master.casefold(),
+                        name.casefold(),
+                    )
+                    if follower_key in seen_followers:
+                        continue
+                    seen_followers.add(follower_key)
+                    if not follower.get("base_map_confirmed"):
+                        skipped.append({
+                            "stage": "generator_sync",
+                            "folder": str(folder),
+                            "master": master,
+                            "target": name,
+                            "reason": "Base 매핑 미확정",
+                        })
+                        continue
+                    group_key = (follower_key[0], follower_key[1])
+                    scope_group = grouped.setdefault(group_key, {
+                        "folder": folder,
+                        "master": master,
+                        "names": [],
+                    })
+                    scope_group["names"].append(name)
+
+            for row in folder_item.get("cluster_blends") or ():
+                if (
+                    not isinstance(row, dict)
+                    or row.get("folder_relation") != "on"
+                ):
+                    continue
+                targets = [
+                    target
+                    for target in row.get("targets") or ()
+                    if (
+                        isinstance(target, dict)
+                        and target.get("owner_target")
+                    )
+                ]
+                on_target_spms = [
+                    Path(target["target_spm"])
+                    for target in targets
+                    if target.get("relation_on") and target.get("target_spm")
+                ]
+                if not on_target_spms or not row.get("blend"):
+                    continue
+                blend = Path(row["blend"])
+                blend_key = os.path.normcase(
+                    str(blend.absolute())
+                ).casefold()
+                if blend_key in seen_blends:
+                    continue
+                seen_blends.add(blend_key)
+                cluster_rows.append({
+                    **row,
+                    "kind": "cluster_relation",
+                    "blend": blend,
+                    "on_target_spms": on_target_spms,
+                    "target_spms": [
+                        Path(target["target_spm"])
+                        for target in targets
+                        if target.get("target_spm")
+                    ],
+                })
+
+        groups = list(grouped.values())
+        for group in groups:
+            group["names"].sort(key=str.casefold)
+        groups.sort(key=lambda group: (
+            str(group["folder"]).casefold(),
+            group["master"].casefold(),
+        ))
+        cluster_rows.sort(
+            key=lambda row: str(row["blend"]).casefold()
+        )
+        return {
+            "groups": groups,
+            "cluster_rows": cluster_rows,
+            "skipped": skipped,
+        }
+
+    def connected_board_scope(self):
+        """Return the currently displayed board's executable connections."""
+
+        return self._connected_scope_from_board(self.board)
+
+    @staticmethod
+    def _connected_result_summary(result):
+        """Keep reports useful without serializing full SPM patch documents."""
+
+        return {
+            key: result.get(key)
+            for key in (
+                "status",
+                "mode",
+                "changed_files",
+                "backup_dir",
+                "master_hash",
+                "cluster_count",
+                "scale_skipped",
+            )
+            if result.get(key) is not None
+        }
+
+    def apply_connected_board(self):
+        """Sync all confirmed board relations, then refresh all exact ON Clusters."""
+
+        self._ensure_job_queue_state()
+        queue_busy = self.active_job is not None or bool(self.pending_jobs)
+        scope = self.connected_board_scope()
+        groups = scope["groups"]
+        cluster_rows = scope["cluster_rows"]
+        skipped = scope["skipped"]
+        follower_count = sum(len(group["names"]) for group in groups)
+        cluster_target_keys = {
+            os.path.normcase(str(Path(path).absolute())).casefold()
+            for row in cluster_rows
+            for path in row.get("on_target_spms") or ()
+        }
+        if not groups and not cluster_rows and not queue_busy:
+            messagebox.showinfo(
+                "연결 전체 처리",
+                "현재 보드에 실행 가능한 연결이 없습니다.\n"
+                "확정된 마스터→자식 또는 ON Cluster 관계를 먼저 설정하세요.",
+                parent=self.root,
+            )
             return
-        self.status_var.set(label)
-        self.job_started_at = time.monotonic()
-        self.job_stage = label
-        self.progress_bar.configure(value=1)
-        self.progress_text_var.set(f"{label} · 00:00")
-        for button in (self.preview_button, self.apply_button, self.apply_all_button):
+
+        verify = bool(self.verify_var.get())
+        if groups and verify:
+            if not Path(self.config.get("speedtree_exe", "")).is_file():
+                messagebox.showerror(
+                    "SpeedTree 경로",
+                    "SpeedTree 실행 파일이 없습니다:\n"
+                    f"{self.config.get('speedtree_exe', '')}",
+                    parent=self.root,
+                )
+                return
+            if not Path(self.config.get("xml_ini", "")).is_file():
+                messagebox.showerror(
+                    "XML 검증 설정",
+                    "XML export 설정 파일이 없습니다:\n"
+                    f"{self.config.get('xml_ini', '')}",
+                    parent=self.root,
+                )
+                return
+
+        message = (
+            "현재 보드의 확정된 연결만 일괄 처리합니다.\n\n"
+            f"Generator Sync: 마스터 {len(groups)}개 · 자식 {follower_count}개\n"
+            f"Cluster 갱신: ON 관계 {len(cluster_rows)}개 · "
+            f"대상 SK {len(cluster_target_keys)}개\n"
+            f"사전 제외: {len(skipped)}개\n\n"
+            "순서: 마스터→자식 데이터 동기화 후 ON Cluster 결과를 재적용합니다.\n"
+            "독립·미지정·OFF·PARTIAL 관계는 변경하지 않습니다. "
+            "개별 실패는 보고서에 기록하고 나머지 연결은 계속 처리합니다."
+        )
+        if verify and groups:
+            message += "\nGenerator Sync 대상은 SpeedTree 10.1 사전검사를 수행합니다."
+        if queue_busy:
+            message += (
+                "\n현재 작업 뒤에 대기하며, 실제 시작 시 연결 범위를 다시 검사합니다."
+            )
+        if not messagebox.askyesno(
+            "연결 전체 동기화 + Cluster 갱신",
+            message,
+            parent=self.root,
+        ):
+            return
+
+        job_config = dict(self.config)
+        speedtree_exe = Path(job_config.get("speedtree_exe") or "")
+        xml_ini = Path(job_config.get("xml_ini") or "")
+        board_root = self.root_var.get().strip()
+
+        def apply(report):
+            started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            raise_if_cancelled = getattr(
+                report, "raise_if_cancelled", lambda: None
+            )
+            process_output = getattr(report, "output", None)
+            cancel_requested = getattr(report, "cancel_requested", None)
+            report("실행 시점 연결 관계 다시 검사 중", 1)
+            runtime_board = engine.scan_tree_folders(
+                Path(board_root),
+                sk_only=bool(job_config.get("sk_only", True)),
+                verify_physical=False,
+            )
+            runtime_scope = self._connected_scope_from_board(runtime_board)
+            runtime_groups = runtime_scope["groups"]
+            runtime_cluster_rows = runtime_scope["cluster_rows"]
+            runtime_skipped = runtime_scope["skipped"]
+            runtime_follower_count = sum(
+                len(group["names"]) for group in runtime_groups
+            )
+            runtime_cluster_target_keys = {
+                os.path.normcase(
+                    str(Path(path).absolute())
+                ).casefold()
+                for row in runtime_cluster_rows
+                for path in row.get("on_target_spms") or ()
+            }
+            total_units = (
+                len(runtime_groups) + len(runtime_cluster_rows)
+            )
+            payload = {
+                "schema_version": 1,
+                "started_at": started_at,
+                "root": board_root,
+                "verify_speedtree": verify,
+                "queued_scope": {
+                    "generator_group_count": len(groups),
+                    "generator_follower_count": follower_count,
+                    "cluster_relation_count": len(cluster_rows),
+                    "cluster_target_count": len(cluster_target_keys),
+                },
+                "scope": {
+                    "generator_group_count": len(runtime_groups),
+                    "generator_follower_count": runtime_follower_count,
+                    "cluster_relation_count": len(runtime_cluster_rows),
+                    "cluster_target_count": len(
+                        runtime_cluster_target_keys
+                    ),
+                },
+                "skipped": list(runtime_skipped),
+                "generator_sync": [],
+                "cluster_refresh": [],
+                "failures": [],
+            }
+
+            def unit_report(unit_index, label, stage, percent):
+                overall = 2 + int(
+                    94 * (
+                        unit_index + max(0, min(100, int(percent))) / 100
+                    ) / max(1, total_units)
+                )
+                report(f"{label} · {stage}", overall)
+
+            unit_index = 0
+            cancelled_exc = None
+            for group in runtime_groups:
+                label = (
+                    f"Generator {unit_index + 1}/{total_units} · "
+                    f"{group['master']}"
+                )
+                try:
+                    raise_if_cancelled()
+                    result = engine.apply_group_transaction(
+                        group["folder"],
+                        group["master"],
+                        group["names"],
+                        verify_speedtree=verify,
+                        speedtree_exe=speedtree_exe,
+                        xml_ini=xml_ini,
+                        skip_blocked_scale=True,
+                        progress_callback=(
+                            lambda stage, percent, i=unit_index, text=label:
+                            unit_report(i, text, stage, percent)
+                        ),
+                        process_output_callback=process_output,
+                        cancel_requested=cancel_requested,
+                    )
+                    for entry in result.get("scale_skipped") or ():
+                        risk = entry.get("scale_risk") or {}
+                        payload["skipped"].append({
+                            "stage": "generator_sync",
+                            "folder": str(group["folder"]),
+                            "master": group["master"],
+                            "target": Path(
+                                entry.get("target") or ""
+                            ).name,
+                            "reason": (
+                                entry.get("reason")
+                                or "크기 폭증 위험"
+                            ),
+                            "scale_risk": risk,
+                        })
+                    payload["generator_sync"].append({
+                        "folder": str(group["folder"]),
+                        "master": group["master"],
+                        "followers": list(group["names"]),
+                        "result": self._connected_result_summary(result),
+                    })
+                except engine.SyncCancelled as exc:
+                    cancelled_exc = exc
+                    payload["cancellation"] = exc.as_dict()
+                    break
+                except Exception as exc:
+                    payload["failures"].append({
+                        "stage": "generator_sync",
+                        "folder": str(group["folder"]),
+                        "master": group["master"],
+                        "targets": list(group["names"]),
+                        "reason": str(exc),
+                    })
+                unit_index += 1
+
+            for row in runtime_cluster_rows:
+                if cancelled_exc is not None:
+                    break
+                blend = Path(row["blend"])
+                label = (
+                    f"Cluster {unit_index + 1}/{total_units} · {blend.name}"
+                )
+                try:
+                    raise_if_cancelled()
+                    result = self._execute_cluster_refresh_rows(
+                        [row],
+                        job_config,
+                        lambda stage, percent, i=unit_index, text=label:
+                        unit_report(i, text, stage, percent),
+                    )
+                    payload["cluster_refresh"].append({
+                        "blend": str(blend),
+                        "targets": [
+                            str(path)
+                            for path in row.get("on_target_spms") or ()
+                        ],
+                        "result": self._connected_result_summary(result),
+                    })
+                    raise_if_cancelled()
+                except engine.SyncCancelled as exc:
+                    cancelled_exc = exc
+                    payload["cancellation"] = exc.as_dict()
+                    break
+                except Exception as exc:
+                    payload["failures"].append({
+                        "stage": "cluster_refresh",
+                        "blend": str(blend),
+                        "targets": [
+                            str(path)
+                            for path in row.get("on_target_spms") or ()
+                        ],
+                        "reason": str(exc),
+                    })
+                unit_index += 1
+
+            success_count = (
+                len(payload["generator_sync"])
+                + len(payload["cluster_refresh"])
+            )
+            payload["status"] = (
+                "cancelled"
+                if cancelled_exc is not None
+                else "ok"
+                if not payload["failures"]
+                else "partial"
+                if success_count
+                else "failed"
+            )
+            payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            report("실행 보고서 저장 중", 98)
+            try:
+                payload["report_path"] = str(
+                    write_connected_run_report(payload)
+                )
+            except Exception as exc:
+                payload["report_error"] = str(exc)
+            if cancelled_exc is not None:
+                cancelled_exc.report_payload = payload
+                cancelled_exc.report_path = payload.get("report_path")
+                raise cancelled_exc
+            return payload
+
+        def done(result):
+            self.refresh()
+            sync_ok = len(result["generator_sync"])
+            cluster_ok = len(result["cluster_refresh"])
+            failure_count = len(result["failures"])
+            runtime_group_count = int(
+                result["scope"]["generator_group_count"]
+            )
+            runtime_cluster_count = int(
+                result["scope"]["cluster_relation_count"]
+            )
+            report_path = result.get("report_path") or (
+                f"저장 실패: {result.get('report_error', '알 수 없음')}"
+            )
+            self.status_var.set(
+                f"연결 전체 처리 완료 · Generator "
+                f"{sync_ok}/{runtime_group_count} · "
+                f"Cluster {cluster_ok}/{runtime_cluster_count} · "
+                f"실패 {failure_count}"
+            )
+            failure_lines = [
+                f"· {failure.get('master') or Path(failure.get('blend', '')).name}: "
+                f"{failure['reason']}"
+                for failure in result["failures"][:8]
+            ]
+            detail = (
+                f"Generator Sync 성공: {sync_ok}/{runtime_group_count} 그룹\n"
+                f"Cluster 갱신 성공: {cluster_ok}/{runtime_cluster_count} 관계\n"
+                f"사전 제외: {len(result['skipped'])}개\n"
+                f"실패: {failure_count}개\n\n"
+                f"보고서: {report_path}"
+            )
+            if failure_lines:
+                detail += "\n\n실패 요약:\n" + "\n".join(failure_lines)
+            self._show_job_info(
+                (
+                    "연결 전체 처리 완료"
+                    if not failure_count
+                    else "연결 전체 처리 완료 · 실패 있음"
+                ),
+                detail,
+            )
+
+        def cancelled(exc):
+            self.refresh()
+            payload = getattr(exc, "report_payload", {}) or {}
+            report_path = getattr(exc, "report_path", None) or payload.get(
+                "report_path"
+            )
+            self._show_job_info(
+                "연결 전체 처리 취소됨",
+                f"상태: {self._cancel_state_label(exc.termination_state)}\n"
+                f"완료된 Generator 그룹: "
+                f"{len(payload.get('generator_sync') or ())}\n"
+                f"완료된 Cluster 관계: "
+                f"{len(payload.get('cluster_refresh') or ())}\n\n"
+                f"보고서: {report_path or '저장되지 않음'}",
+            )
+
+        self._start_job(
+            "연결 데이터 동기화 및 Cluster 갱신 중...",
+            apply,
+            done,
+            queue_label=(
+                f"연결 전체 처리 · 자식 {follower_count}개 · "
+                f"Cluster {len(cluster_rows)}개"
+            ),
+            on_cancel=cancelled,
+        )
+
+    def _ensure_job_queue_state(self):
+        """Initialize queue fields for normal startup and lightweight tests."""
+        if not hasattr(self, "pending_jobs"):
+            self.pending_jobs = deque()
+        if not hasattr(self, "active_job"):
+            self.active_job = None
+        if not hasattr(self, "job_sequence"):
+            self.job_sequence = 0
+        if not hasattr(self, "job_failures"):
+            self.job_failures = []
+        if not hasattr(self, "job_cancellations"):
+            self.job_cancellations = []
+        if not hasattr(self, "queue_run_total"):
+            self.queue_run_total = 0
+        if not hasattr(self, "queue_run_completed"):
+            self.queue_run_completed = 0
+        if not hasattr(self, "_job_has_followup"):
+            self._job_has_followup = False
+        if not hasattr(self, "deferred_job_infos"):
+            self.deferred_job_infos = deque()
+        if not hasattr(self, "_deferred_job_info_flush_scheduled"):
+            self._deferred_job_info_flush_scheduled = False
+        if not hasattr(self, "job_last_progress_at"):
+            self.job_last_progress_at = None
+        if not hasattr(self, "job_last_output_at"):
+            self.job_last_output_at = None
+        if not hasattr(self, "closing"):
+            self.closing = False
+        if not hasattr(self, "_shutdown_callbacks"):
+            self._shutdown_callbacks = []
+        if not hasattr(self, "_shutdown_poll_scheduled"):
+            self._shutdown_poll_scheduled = False
+        if not hasattr(self, "_shutdown_complete"):
+            self._shutdown_complete = False
+
+    @staticmethod
+    def _cancel_state_label(state):
+        return {
+            "cancelled_at_safe_boundary": "안전 경계에서 취소",
+            "cancelled_before_launch": "실행 전 취소",
+            "cancelled_after_exit": "종료 경합 중 취소",
+            "cancelled_terminated": "정상 종료 요청으로 취소",
+            "cancelled_killed": "강제 종료 fallback으로 취소",
+        }.get(str(state), str(state or "취소"))
+
+    def _append_process_output(self, channel, line):
+        self._append_process_output_batch([(channel, line)])
+
+    def _append_process_output_batch(self, entries):
+        widget = getattr(self, "process_output", None)
+        if widget is None or not entries:
+            return
+        fragments = []
+        for channel, line in entries:
+            channel = (
+                channel
+                if channel in {"stdout", "stderr", "system"}
+                else "system"
+            )
+            prefix = {
+                "stdout": "[stdout] ",
+                "stderr": "[stderr] ",
+                "system": "[system] ",
+            }[channel]
+            fragments.extend((prefix + str(line) + "\n", (channel,)))
+        try:
+            widget.configure(state="normal")
+            widget.insert("end", fragments[0], *fragments[1:])
+            self.process_output_line_count = (
+                getattr(self, "process_output_line_count", 0) + len(entries)
+            )
+            overflow = self.process_output_line_count - 3000
+            if overflow >= 200:
+                widget.delete("1.0", f"{overflow + 1}.0")
+                self.process_output_line_count -= overflow
+            widget.see("end")
+            widget.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def request_active_job_cancel(self):
+        """Mark the current FIFO job cancelled without touching other jobs."""
+
+        self._ensure_job_queue_state()
+        job = self.active_job
+        if job is None:
+            return False
+        cancel_event = job.get("cancel_event")
+        if cancel_event is None or cancel_event.is_set():
+            return False
+        job["cancel_state"] = "requested"
+        job["cancel_requested_at"] = time.monotonic()
+        cancel_event.set()
+        self.status_var.set(f"취소 요청됨 · {job['queue_label']}")
+        self.progress_text_var.set(
+            f"취소 요청됨 · {self.job_stage} · 안전 종료 대기"
+        )
+        button = getattr(self, "cancel_job_button", None)
+        if button is not None:
             button.configure(state="disabled")
+        self._append_process_output(
+            "system",
+            "취소 요청을 접수했습니다. 현재 안전 경계 또는 실행 중인 "
+            "SpeedTree 프로세스 종료를 기다립니다.",
+        )
+        return True
+
+    def _show_job_info(self, title, message):
+        """Defer modal completion detail until every follow-up has run."""
+        self._ensure_job_queue_state()
+        if self._job_has_followup or self.pending_jobs:
+            self.deferred_job_infos.append((str(title), str(message)))
+            self.status_var.set(
+                f"{title} · 상세는 대기열 완료 후 표시"
+            )
+            return
+        messagebox.showinfo(title, message, parent=self.root)
+
+    def _flush_deferred_job_infos(self):
+        self._ensure_job_queue_state()
+        self._deferred_job_info_flush_scheduled = False
+        if (
+            self.active_job is not None
+            or self.pending_jobs
+            or not self.deferred_job_infos
+        ):
+            return
+        notices = list(self.deferred_job_infos)
+        self.deferred_job_infos.clear()
+        if len(notices) == 1:
+            title, message = notices[0]
+        else:
+            title = "대기열 작업 완료"
+            message = "\n\n".join(
+                f"[{notice_title}]\n{notice_message}"
+                for notice_title, notice_message in notices
+            )
+        messagebox.showinfo(title, message, parent=self.root)
+
+    def _schedule_deferred_job_infos(self):
+        self._ensure_job_queue_state()
+        if (
+            self.deferred_job_infos
+            and not self._deferred_job_info_flush_scheduled
+        ):
+            self._deferred_job_info_flush_scheduled = True
+            self.root.after_idle(self._flush_deferred_job_infos)
+
+    def _start_job(
+        self,
+        label,
+        func,
+        on_success,
+        *,
+        queue_label=None,
+        shared_queue=True,
+        on_cancel=None,
+    ):
+        """Capture one request in the window-local FIFO."""
+        self._ensure_job_queue_state()
+        if self.active_job is None and not self.pending_jobs:
+            self.job_failures = []
+            self.job_cancellations = []
+            self.queue_run_total = 0
+            self.queue_run_completed = 0
+        self.job_sequence += 1
+        display_label = str(queue_label or label)
+        job = {
+            "id": self.job_sequence,
+            "label": str(label),
+            "queue_label": display_label,
+            "func": func,
+            "on_success": on_success,
+            "on_cancel": on_cancel,
+            "shared_queue": bool(shared_queue),
+            "cancel_event": threading.Event(),
+            "cancel_state": "queued",
+            "output_buffer": deque(),
+            "output_lock": threading.Lock(),
+            "output_wakeup_queued": False,
+            "output_omitted_lines": 0,
+            "output_omitted_chars": 0,
+            "output_total_omitted_lines": 0,
+            "output_total_omitted_chars": 0,
+            "output_omission_summary_rendered": False,
+        }
+        self.pending_jobs.append(job)
+        self.queue_run_total += 1
+        if self.active_job is None:
+            self._start_next_job()
+        else:
+            waiting = len(self.pending_jobs)
+            self.status_var.set(
+                f"대기열 추가 · {job['queue_label']} · 대기 {waiting}개"
+            )
+            self.progress_text_var.set(
+                f"{self.job_stage} · 대기열 {waiting}개"
+            )
+        return job["id"]
+
+    def _start_next_job(self):
+        self._ensure_job_queue_state()
+        if self.closing or self.active_job is not None or not self.pending_jobs:
+            return
+        job = self.pending_jobs.popleft()
+        job.setdefault("cancel_event", threading.Event())
+        job.setdefault("cancel_state", "queued")
+        job.setdefault("on_cancel", None)
+        self.active_job = job
+        self.status_var.set(
+            f"{job['queue_label']} · 실행"
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
+        self.job_started_at = time.monotonic()
+        self.job_last_progress_at = self.job_started_at
+        self.job_last_output_at = None
+        self.job_stage = job["label"]
+        job["cancel_state"] = "running"
+        self.progress_bar.configure(value=1)
+        self.progress_text_var.set(
+            f"{job['queue_label']} · 00:00"
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
+        cancel_button = getattr(self, "cancel_job_button", None)
+        if cancel_button is not None:
+            cancel_button.configure(state="normal")
 
         def report(stage, percent):
-            self.job_queue.put(("progress", str(stage), max(0, min(100, int(percent)))))
+            self.job_queue.put((
+                "progress",
+                job["id"],
+                str(stage),
+                max(0, min(100, int(percent))),
+            ))
+
+        def output(channel, line):
+            channel = str(channel)
+            line = str(line)
+            omitted_chars = 0
+            if len(line) > PROCESS_OUTPUT_LINE_CHARS:
+                omitted_chars = len(line) - PROCESS_OUTPUT_LINE_CHARS
+                marker = (
+                    f"[process_output_line_truncated omitted_chars="
+                    f"{omitted_chars}] "
+                )
+                keep = max(0, PROCESS_OUTPUT_LINE_CHARS - len(marker))
+                line = marker + (line[-keep:] if keep else "")
+            should_wake = False
+            with job["output_lock"]:
+                if len(job["output_buffer"]) >= PROCESS_OUTPUT_BUFFER_LINES:
+                    _old_channel, old_line = job["output_buffer"].popleft()
+                    job["output_omitted_lines"] += 1
+                    job["output_omitted_chars"] += len(old_line)
+                    job["output_total_omitted_lines"] += 1
+                    job["output_total_omitted_chars"] += len(old_line)
+                job["output_omitted_chars"] += omitted_chars
+                job["output_total_omitted_chars"] += omitted_chars
+                job["output_buffer"].append((channel, line))
+                if not job["output_wakeup_queued"]:
+                    job["output_wakeup_queued"] = True
+                    should_wake = True
+            if should_wake:
+                self.job_queue.put(("output_ready", job["id"]))
+
+        def raise_if_cancelled():
+            if job["cancel_event"].is_set():
+                raise engine.SyncCancelled("cancelled_at_safe_boundary")
+
+        report.output = output
+        report.cancel_requested = job["cancel_event"].is_set
+        report.cancel_event = job["cancel_event"]
+        report.raise_if_cancelled = raise_if_cancelled
 
         def run():
+            lease = None
             try:
-                self.job_queue.put(("done", True, func(report), on_success))
-            except Exception as exc:
-                self.job_queue.put(("done", False, exc, on_success))
+                shared_runtime = getattr(
+                    self, "shared_queue_runtime", None
+                )
+                shared_job_id = job.get("shared_queue_job_id")
+                if (
+                    job["shared_queue"]
+                    and shared_job_id is None
+                    and shared_runtime is not None
+                ):
+                    report("공용 대기열 등록 중", 0)
+                    try:
+                        shared = shared_runtime.enqueue(
+                            job["queue_label"],
+                            {
+                                "tool": "spm_generator_sync",
+                                "local_job_id": job["id"],
+                                "label": job["queue_label"],
+                            },
+                        )
+                    except Exception as exc:
+                        raise SharedQueueEnqueueError(
+                            "다른 창과 동시에 실행되지 않도록 작업을 "
+                            f"시작하지 않았습니다.\n\n{exc}"
+                        ) from exc
+                    shared_job_id = shared["id"]
+                    job["shared_queue_job_id"] = shared_job_id
+                    job["shared_queue_sequence"] = shared["sequence"]
+                if shared_job_id and shared_runtime is not None:
+                    def report_wait(wait_state):
+                        position = wait_state.get("position")
+                        queued = wait_state.get("queued_count", 0)
+                        report(
+                            (
+                                "공용 대기열 대기"
+                                + (
+                                    f" · 전체 {position}번째"
+                                    if position else ""
+                                )
+                                + f" · 대기 {queued}개"
+                            ),
+                            0,
+                        )
 
-        self.worker = threading.Thread(target=run, daemon=True)
+                    try:
+                        lease = shared_runtime.wait_for_turn(
+                            shared_job_id,
+                            on_wait=report_wait,
+                            cancel_event=job["cancel_event"],
+                        )
+                    except WaitCancelled as exc:
+                        raise engine.SyncCancelled(
+                            "cancelled_before_launch"
+                        ) from exc
+                    report("공용 대기열 진입 · 단독 실행", 1)
+                raise_if_cancelled()
+                payload = job["func"](report)
+                queue_success = not (
+                    isinstance(payload, dict)
+                    and (
+                        payload.get("failures")
+                        or str(payload.get("status") or "").casefold()
+                        in {"failed", "error", "partial", "cancelled"}
+                    )
+                )
+                if lease is not None:
+                    lease.finish(
+                        success=queue_success,
+                        result={
+                            "tool": "spm_generator_sync",
+                            "local_job_id": job["id"],
+                            "outcome": (
+                                "completed"
+                                if queue_success else "failed"
+                            ),
+                        },
+                    )
+                job["worker_terminal_ok"] = True
+                job["worker_terminal_payload"] = payload
+                self.job_queue.put(("done", job["id"], True, payload))
+            except Exception as exc:
+                cancelled = isinstance(exc, engine.SyncCancelled)
+                if cancelled:
+                    job["cancel_state"] = exc.termination_state
+                if lease is not None and not lease.finished:
+                    try:
+                        lease.finish(
+                            success=False,
+                            result={
+                                "tool": "spm_generator_sync",
+                                "local_job_id": job["id"],
+                                "outcome": (
+                                    "cancelled" if cancelled else "failed"
+                                ),
+                                "termination_state": getattr(
+                                    exc, "termination_state", None
+                                ),
+                                "error": str(exc),
+                            },
+                        )
+                    except Exception as queue_exc:
+                        exc = RuntimeError(
+                            f"{exc}; 공용 대기열 종료 기록 실패: {queue_exc}"
+                        )
+                elif shared_job_id and shared_runtime is not None:
+                    try:
+                        shared_runtime.cancel(
+                            shared_job_id,
+                            reason="worker_wait_failed",
+                        )
+                    except Exception:
+                        # wait_for_turn may already have terminalized and
+                        # removed the ticket.  Preserve the causal failure;
+                        # queue recovery remains the runtime's responsibility.
+                        pass
+                job["worker_terminal_ok"] = False
+                job["worker_terminal_payload"] = exc
+                self.job_queue.put(("done", job["id"], False, exc))
+
+        self.worker = threading.Thread(target=run, daemon=False)
         self.worker.start()
         self.root.after(100, self._poll_job)
 
+    def _drain_process_output(self, job, maximum):
+        """Drain a bounded batch and keep at most one wake-up queued."""
+
+        entries = []
+        maximum = max(1, int(maximum))
+        requeue = False
+        with job["output_lock"]:
+            job["output_wakeup_queued"] = False
+            omitted_lines = job["output_omitted_lines"]
+            omitted_chars = job["output_omitted_chars"]
+            job["output_omitted_lines"] = 0
+            job["output_omitted_chars"] = 0
+            if omitted_lines or omitted_chars:
+                entries.append((
+                    "system",
+                    "[process_output_omitted] "
+                    f"lines={omitted_lines} chars={omitted_chars}",
+                ))
+            while job["output_buffer"] and len(entries) < maximum:
+                entries.append(job["output_buffer"].popleft())
+            if job["output_buffer"]:
+                job["output_wakeup_queued"] = True
+                requeue = True
+        if requeue:
+            self.job_queue.put(("output_ready", job["id"]))
+        return entries
+
+    @staticmethod
+    def _job_output_pending(job):
+        if job is None or "output_lock" not in job:
+            return False
+        with job["output_lock"]:
+            return bool(
+                job["output_buffer"]
+                or job["output_omitted_lines"]
+                or job["output_omitted_chars"]
+            )
+
     def _poll_job(self):
+        self._ensure_job_queue_state()
         completed = None
-        while True:
+        processed = 0
+        output_batch = []
+        while processed < 500:
             try:
                 event = self.job_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if event[0] == "progress":
-                _kind, stage, percent = event
+                _kind, job_id, stage, percent = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
                 self.job_stage = stage
+                self.job_last_progress_at = time.monotonic()
                 self.progress_bar.configure(value=percent)
-                self.status_var.set(stage)
+                self.status_var.set(
+                    stage
+                    + (
+                        f" · 대기 {len(self.pending_jobs)}개"
+                        if self.pending_jobs else ""
+                    )
+                )
+            elif event[0] == "output":
+                _kind, job_id, channel, line = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
+                now = time.monotonic()
+                self.job_last_progress_at = now
+                self.job_last_output_at = now
+                output_batch.append((channel, line))
+            elif event[0] == "output_ready":
+                _kind, job_id = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
+                if len(output_batch) >= 500:
+                    self.job_queue.put(event)
+                    break
+                now = time.monotonic()
+                self.job_last_progress_at = now
+                self.job_last_output_at = now
+                output_batch.extend(self._drain_process_output(
+                    self.active_job,
+                    max(1, 500 - len(output_batch)),
+                ))
             elif event[0] == "done":
-                completed = event
+                _kind, job_id, _ok, _payload = event
+                if (
+                    self.active_job is not None
+                    and job_id == self.active_job["id"]
+                ):
+                    completed = event
+
+        self._append_process_output_batch(output_batch)
+
+        if (
+            completed is not None
+            and self._job_output_pending(self.active_job)
+        ):
+            self.job_queue.put(completed)
+            self.root.after(10, self._poll_job)
+            return
+        if (
+            completed is not None
+            and self.active_job is not None
+            and not self.active_job.get("output_omission_summary_rendered")
+            and (
+                self.active_job.get("output_total_omitted_lines", 0)
+                or self.active_job.get("output_total_omitted_chars", 0)
+            )
+        ):
+            self.active_job["output_omission_summary_rendered"] = True
+            self._append_process_output(
+                "system",
+                "[process_output_omitted] total "
+                f"lines={self.active_job['output_total_omitted_lines']} "
+                f"chars={self.active_job['output_total_omitted_chars']}",
+            )
 
         elapsed = max(0, int(time.monotonic() - (self.job_started_at or time.monotonic())))
         elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-        self.progress_text_var.set(f"{self.job_stage} · {elapsed_text}")
+        heartbeat_age = max(
+            0,
+            int(
+                time.monotonic()
+                - (self.job_last_progress_at or time.monotonic())
+            ),
+        )
+        output_age = (
+            None
+            if self.job_last_output_at is None
+            else max(0, int(time.monotonic() - self.job_last_output_at))
+        )
+        self.progress_text_var.set(
+            f"{self.job_stage} · {elapsed_text} · "
+            f"마지막 진행 {heartbeat_age}초 전 · "
+            + (
+                f"마지막 출력 {output_age}초 전"
+                if output_age is not None
+                else "프로세스 출력 대기"
+            )
+            + (
+                f" · 대기 {len(self.pending_jobs)}개"
+                if self.pending_jobs else ""
+            )
+        )
+        if (
+            completed is not None
+            and self.worker is not None
+            and self.worker.is_alive()
+        ):
+            # The worker queues ``done`` as its final action, but can still be
+            # unwinding the closure that owns this App and its Tk variables.
+            # Keep completion on the Tk thread until the worker has actually
+            # exited; otherwise a fast teardown may finalize Tk objects from
+            # the worker thread.
+            self.job_queue.put(completed)
+            self.root.after(10, self._poll_job)
+            return
         if completed is None:
-            if self.worker and self.worker.is_alive():
+            if processed >= 500 or not self.job_queue.empty():
+                self.root.after(10, self._poll_job)
+            elif self.worker and self.worker.is_alive():
                 self.root.after(100, self._poll_job)
             return
 
-        _kind, ok, payload, on_success = completed
-        for button in (self.preview_button, self.apply_button, self.apply_all_button):
-            button.configure(state="normal")
+        _kind, _job_id, ok, payload = completed
+        job = self.active_job
+        job["terminal_ok"] = bool(ok)
+        job["terminal_payload"] = payload
+        self.queue_run_completed += 1
+        has_followup = bool(self.pending_jobs)
+        self._job_has_followup = has_followup
+        deferred_count = len(self.deferred_job_infos)
         if ok:
             self.progress_bar.configure(value=100)
             self.progress_text_var.set(f"완료 · {elapsed_text}")
-            on_success(payload)
-        else:
-            self.status_var.set("실패")
-            self.progress_text_var.set(f"실패 · {self.job_stage} · {elapsed_text}")
-            messagebox.showerror("작업 실패", str(payload), parent=self.root)
+            try:
+                job["on_success"](payload)
+            except Exception as exc:
+                ok = False
+                payload = exc
+                while len(self.deferred_job_infos) > deferred_count:
+                    self.deferred_job_infos.pop()
+        has_followup = bool(self.pending_jobs)
+        self._job_has_followup = has_followup
+        cancelled = not ok and isinstance(payload, engine.SyncCancelled)
+        if cancelled:
+            state = payload.termination_state
+            label = self._cancel_state_label(state)
+            job["cancel_state"] = state
+            self.job_cancellations.append((job["queue_label"], state))
+            self.status_var.set(
+                f"취소됨 · {job['queue_label']} · {label}"
+                + (" · 다음 대기 작업 시작" if has_followup else "")
+            )
+            self.progress_text_var.set(f"취소됨 · {label} · {elapsed_text}")
+            self._append_process_output("system", f"작업 취소 완료: {label}")
+            on_cancel = job.get("on_cancel")
+            if callable(on_cancel) and not self.closing:
+                try:
+                    on_cancel(payload)
+                except Exception as exc:
+                    self.job_failures.append(
+                        (job["queue_label"] + " 취소 후 처리", str(exc))
+                    )
+        elif not ok:
+            self.job_failures.append((job["queue_label"], str(payload)))
+            self.status_var.set(
+                f"실패 · {job['queue_label']}"
+                + (" · 다음 대기 작업 시작" if has_followup else "")
+            )
+            self.progress_text_var.set(
+                f"실패 · {self.job_stage} · {elapsed_text}"
+            )
+            if not has_followup and not self.closing:
+                messagebox.showerror(
+                    (
+                        "공용 대기열 등록 실패"
+                        if isinstance(payload, SharedQueueEnqueueError)
+                        else "작업 실패"
+                    ),
+                    str(payload),
+                    parent=self.root,
+                )
+        self._job_has_followup = False
+        self.active_job = None
+        self.worker = None
+        cancel_button = getattr(self, "cancel_job_button", None)
+        if cancel_button is not None:
+            cancel_button.configure(state="disabled")
+        if self.pending_jobs and not self.closing:
+            self._start_next_job()
+            if self.active_job is not None:
+                return
+        if self.queue_run_total > 1:
+            if self.job_failures or self.job_cancellations:
+                self.status_var.set(
+                    f"대기열 완료 · {self.queue_run_completed}개 처리 · "
+                    f"실패 {len(self.job_failures)}개 · "
+                    f"취소 {len(self.job_cancellations)}개"
+                )
+            else:
+                self.status_var.set(
+                    f"대기열 완료 · {self.queue_run_completed}개"
+                )
+            self.progress_text_var.set(
+                f"대기열 완료 · {self.queue_run_completed}/"
+                f"{self.queue_run_total}"
+            )
+        self._schedule_deferred_job_infos()
 
     def preview_selected(self):
         followers = self.followers_from_selection()
@@ -1265,32 +3410,14 @@ class App:
         def build(report):
             folder = followers[0]["folder"]
             master = followers[0]["master"]
-            report("마스터 구조 분석 중", 8)
-            manifest = engine.load_manifest(folder)
-            group = engine.find_group(manifest, master)
-            source, _text, color_updates, master_ref_renames, color_warnings = engine.standardize_master_document(
-                folder / master, group.get("base_categories") or {}
+            prepared = engine.build_group_sync_plans(
+                folder,
+                master,
+                [item["file"] for item in followers],
+                progress_callback=report,
             )
-            plans = []
-            for index, item in enumerate(followers, start=1):
-                report(
-                    f"미리보기 계산 중 · {item['file']} ({index}/{len(followers)})",
-                    15 + round(75 * (index - 1) / max(1, len(followers))),
-                )
-                follower = next(row for row in group["followers"] if row.get("file") == item["file"])
-                if not follower.get("base_map_confirmed"):
-                    raise engine.SyncError(f"Base 매핑을 먼저 확인하세요: {item['file']}")
-                plan = engine.build_sync_plan(
-                    folder / master, folder / item["file"],
-                    follower.get("base_map") or {}, group.get("base_categories") or {},
-                    master_document=source,
-                )
-                plan.master_color_updates = color_updates
-                plan.master_reference_renames = master_ref_renames
-                plan.warnings.extend(color_warnings)
-                plans.append(plan)
             report("미리보기 결과 정리 중", 95)
-            return plans
+            return prepared["plans"]
 
         def show(plans):
             lines = []
@@ -1303,7 +3430,15 @@ class App:
             PreviewWindow(self.root, "SPM Generator Sync · 변경 미리보기", "\n".join(lines))
             self.status_var.set(f"미리보기 완료 · 자식 {len(plans)}개")
 
-        self._start_job("변경 계산 중...", build, show)
+        self._start_job(
+            "변경 계산 중...",
+            build,
+            show,
+            queue_label=(
+                f"변경 미리보기 · {followers[0]['master']} → "
+                f"자식 {len(followers)}개"
+            ),
+        )
 
     def _apply_followers(self, followers):
         if not followers:
@@ -1346,8 +3481,11 @@ class App:
                 return
         message = (
             f"마스터: {master}\n자식: {', '.join(names)}\n\n"
-            "적용 전 마스터와 모든 자식이 하나의 백업 폴더에 저장됩니다.\n"
-            "자식 전용 구조, GUID, Random Seed, 재질과 Node/Freehand Edit는 유지됩니다."
+            "마스터는 읽기 전용 기준으로 사용하며 선택 자식만 백업·저장됩니다.\n"
+            "마스터에만 있는 Generator 구조는 자식에 반영됩니다. 자식에서 발견한 추가 "
+            "Generator 구조는 관리 Base에서 삭제되고 부모·형제에게 전파되지 않습니다. "
+            "Generation Pass는 자식 계산 순서에 맞게 재정규화합니다. GUID, Random Seed, "
+            "재질과 Node/Freehand Edit는 각 SPM의 로컬 값을 유지합니다."
         )
         if verify:
             message += (
@@ -1356,27 +3494,39 @@ class App:
             )
         if not messagebox.askyesno("동기화 적용", message, parent=self.root):
             return
+        speedtree_exe = Path(self.config["speedtree_exe"])
+        xml_ini = Path(self.config["xml_ini"])
 
         def apply(report):
             return engine.apply_group_transaction(
                 folder, master, names,
                 verify_speedtree=verify,
-                speedtree_exe=Path(self.config["speedtree_exe"]),
-                xml_ini=Path(self.config["xml_ini"]),
+                speedtree_exe=speedtree_exe,
+                xml_ini=xml_ini,
                 progress_callback=report,
+                process_output_callback=getattr(report, "output", None),
+                cancel_requested=getattr(report, "cancel_requested", None),
             )
 
         def done(result):
             self.refresh()
             changed = "\n".join(Path(path).name for path in result["changed_files"]) or "변경 없음"
-            messagebox.showinfo(
+            self._show_job_info(
                 "동기화 완료",
                 f"상태: {result['status']}\n\n변경 파일:\n{changed}\n\n"
                 f"백업: {result.get('backup_dir') or '새 백업 없음'}",
-                parent=self.root,
             )
 
-        self._start_job("SPM 동기화 및 검증 중...", apply, done)
+        def cancelled(_exc):
+            self.refresh()
+
+        self._start_job(
+            "SPM 동기화 및 검증 중...",
+            apply,
+            done,
+            queue_label=f"SPM 동기화 · {master} → 자식 {len(names)}개",
+            on_cancel=cancelled,
+        )
 
     def apply_selected(self):
         self._apply_followers(self.followers_from_selection())
@@ -1389,11 +3539,86 @@ class App:
             return
         self._apply_followers(self.followers_from_selection())
 
+    def shutdown_shared_queue(self, *, on_complete=None):
+        """Begin two-phase shutdown and complete only after the owner exits."""
+
+        self._ensure_job_queue_state()
+        if callable(on_complete):
+            if self._shutdown_complete:
+                self.root.after_idle(on_complete)
+                return
+            self._shutdown_callbacks.append(on_complete)
+        if not self.closing:
+            self.closing = True
+            active = self.active_job
+            if active is not None:
+                cancel_event = active.get("cancel_event")
+                if cancel_event is not None:
+                    active["cancel_state"] = "requested_on_close"
+                    cancel_event.set()
+            for job in list(self.pending_jobs):
+                cancel_event = job.get("cancel_event")
+                if cancel_event is not None:
+                    cancel_event.set()
+                job["cancel_state"] = "cancelled_on_close"
+            self.pending_jobs.clear()
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                runtime.shutdown()
+        self._schedule_shutdown_completion_poll()
+
+    def _schedule_shutdown_completion_poll(self):
+        if self._shutdown_complete or self._shutdown_poll_scheduled:
+            return
+        self._shutdown_poll_scheduled = True
+        self.root.after(50, self._poll_shutdown_completion)
+
+    def _poll_shutdown_completion(self):
+        self._shutdown_poll_scheduled = False
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.is_alive():
+            self._schedule_shutdown_completion_poll()
+            return
+        active = getattr(self, "active_job", None)
+        terminal_payload = (
+            active.get("worker_terminal_payload")
+            if isinstance(active, dict) else None
+        )
+        if (
+            terminal_payload is not None
+            and not isinstance(terminal_payload, engine.SyncCancelled)
+            and not getattr(self, "_shutdown_failure_reported", False)
+        ):
+            self._shutdown_failure_reported = True
+            messagebox.showerror(
+                "종료 정리 실패",
+                str(terminal_payload),
+                parent=self.root,
+            )
+        self._shutdown_complete = True
+        callbacks = list(self._shutdown_callbacks)
+        self._shutdown_callbacks.clear()
+        for callback in callbacks:
+            callback()
+
 
 def main():
     root = tk.Tk()
     app = App(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.persist_config(), root.destroy()))
+
+    def close():
+        if getattr(app, "_standalone_close_requested", False):
+            return
+        app._standalone_close_requested = True
+        root.withdraw()
+
+        def finalize():
+            app.persist_config()
+            root.destroy()
+
+        app.shutdown_shared_queue(on_complete=finalize)
+
+    root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
 
 

@@ -65,6 +65,27 @@ SLOT_SUFFIX = {
     "Vertex_Color": "vertex_color",
     "Ambient_Occlusion": "ao",
 }
+
+# Procedural authoring graphs expose their final PBR values as graph outputs.
+# These values are the inputs to Cluster_System; already-packed ``color`` and
+# ``extra`` outputs must never be fed back into it.
+PROCEDURAL_OUTPUT_ALIASES = {
+    "Base_Color": ("basecolor", "base_color", "albedo"),
+    "Opacity": ("opacity", "alpha"),
+    "Normal": ("normal",),
+    "Height": ("height",),
+    "Roughness": ("roughness",),
+    "Depth": ("depth",),
+    "Subsurface": ("subsurface", "scatteringcolor"),
+    "Subsurface_Amount": ("subsurface_amount", "translucency"),
+    "Vertex_Color": ("vertex_color", "vertexcolor"),
+    "Ambient_Occlusion": ("ambientocclusion", "ambient_occlusion", "ao"),
+}
+REQUIRED_PROCEDURAL_SLOTS = ("Base_Color", "Normal", "Height", "Roughness")
+CLUSTER_GRAPH_OUTPUTS = (
+    "basecolor", "normal", "roughness", "metallic", "height",
+    "ambientocclusion", "subsurface", "color", "extra", "opacity",
+)
 # 템플릿(elm) 리소스 접미사 -> 슬롯. ao_from_height 같은 변형 포함.
 TEMPLATE_SUFFIX_TO_SLOT = {
     "albedo": "Base_Color",
@@ -185,6 +206,38 @@ def image_pixel_size(path):
     from PIL import Image
     with Image.open(path) as image:
         return tuple(image.size)
+
+
+def rendered_map_content_error(path, role):
+    """Return a semantic error for a rendered map that must never be empty.
+
+    A missing or disconnected graph can still make sbsrender exit 0 and emit a
+    correctly sized TGA.  In particular, a tangent-space normal map cannot be
+    RGB black everywhere; even the neutral fallback is (128, 128, 255).
+    """
+    if str(role).lower() != "normal":
+        return None
+    from PIL import Image
+    path = Path(path)
+    try:
+        with Image.open(path) as image:
+            extrema = image.convert("RGB").getextrema()
+    except Exception as exc:
+        return f"unreadable normal output ({exc})"
+    if all(channel_max == 0 for _channel_min, channel_max in extrema):
+        return "all-zero RGB normal output (disconnected or wrong graph source)"
+    return None
+
+
+def validate_rendered_map_contents(paths_by_role):
+    """Raise when rendered files exist but contain a known-invalid payload."""
+    errors = []
+    for role, path in paths_by_role.items():
+        error = rendered_map_content_error(path, role)
+        if error:
+            errors.append(f"{role}={error}")
+    if errors:
+        raise RuntimeError("invalid rendered map content: " + "; ".join(errors))
 
 
 def _size_value(size_log2):
@@ -368,6 +421,17 @@ def authoring_graph_promotion_candidate(sbs_path, material_name, texture_name):
     managed = exact_graph_name(sbs_path, texture_name)
     if not authoring or not managed or authoring.lower() == managed.lower():
         return None
+    # A legacy authoring graph with dangling node UIDs is not authoritative.
+    # Promoting it would delete an intact managed T_ graph and reproduce the
+    # broken connections under the final name.  Keep the valid final graph
+    # and leave the unused broken authoring graph untouched for provenance.
+    try:
+        authoring_state = graph_cluster_normalization_state(
+            sbs_path, authoring)
+    except Exception:
+        return None
+    if not authoring_state.get("integrity", {}).get("valid"):
+        return None
     authoring_info = inspect_graph_sources(sbs_path, authoring)
     managed_info = inspect_graph_sources(sbs_path, managed)
     required = {"color", "normal", "extra", "height"}
@@ -538,6 +602,228 @@ def rename_managed_graph(sbs_path, old_name, new_name):
             "backup": str(backup)}
 
 
+def _source_resource_identifier(input_path, slot, occupied):
+    """Return a source-named SBS resource identifier, never an output T_ name."""
+    stem = re.sub(
+        r"[^A-Za-z0-9_]+",
+        "_",
+        Path(input_path).stem,
+    ).strip("_") or "source"
+    candidate = stem
+    if candidate.casefold() in occupied:
+        slot_suffix = re.sub(
+            r"[^A-Za-z0-9_]+",
+            "_",
+            str(slot),
+        ).strip("_")
+        candidate = f"{stem}_{slot_suffix}" if slot_suffix else f"{stem}_source"
+    index = 2
+    base = candidate
+    while candidate.casefold() in occupied:
+        candidate = f"{base}_{index}"
+        index += 1
+    occupied.add(candidate.casefold())
+    return candidate
+
+
+def _set_cluster_instance_parameter(instance, name, tag, value):
+    parameters = instance.find("parameters")
+    if parameters is None:
+        parameters = ET.SubElement(instance, "parameters")
+    parameter = next((
+        candidate for candidate in parameters.findall("parameter")
+        if candidate.find("name") is not None
+        and candidate.find("name").get("v") == name
+    ), None)
+    if parameter is None:
+        parameter = ET.SubElement(parameters, "parameter")
+        ET.SubElement(parameter, "name").set("v", name)
+        ET.SubElement(parameter, "relativeTo").set("v", "0")
+        ET.SubElement(parameter, "paramValue")
+    param_value = parameter.find("paramValue")
+    if param_value is None:
+        param_value = ET.SubElement(parameter, "paramValue")
+    for child in list(param_value):
+        param_value.remove(child)
+    ET.SubElement(param_value, tag).set("v", str(value))
+
+
+def rebind_managed_graph_source_inputs(
+        sbs_path, graph_name, inputs, params=None, output_dir=None):
+    """Transactionally point one T_ graph at explicit original source images.
+
+    Managed graph names describe outputs. Bitmap resource identifiers describe
+    inputs and therefore retain the original file stem. A graph may never read
+    its own ``T_<graph>_<role>`` output back as an input.
+    """
+    sbs_path = Path(sbs_path)
+    requested = {
+        str(slot): Path(path).resolve()
+        for slot, path in dict(inputs or {}).items()
+    }
+    for slot, path in requested.items():
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(f"{graph_name}: source input missing: {slot}={path}")
+        if path.stem.casefold().startswith(
+                str(graph_name).casefold() + "_"):
+            raise RuntimeError(
+                f"{graph_name}: managed output cannot be its own input: {path.name}"
+            )
+
+    tree = ET.parse(sbs_path)
+    root = tree.getroot()
+    graph = _find_graph(root, graph_name)
+    if graph is None:
+        raise RuntimeError(f"graph not found: {graph_name} in {sbs_path.name}")
+    nodes, bitmap_by_uid = _graph_bitmap_nodes(graph)
+    instance_node = next((
+        node for node in graph.find("compNodes") or []
+        if _is_cluster_instance(_node_implementation(node))
+    ), None)
+    if instance_node is None:
+        raise RuntimeError(f"{graph_name}: Cluster_System instance not found")
+    instance = _node_implementation(instance_node)
+
+    resources = {
+        resource.find("identifier").get("v"): resource
+        for resource in root.iter("resource")
+        if resource.find("identifier") is not None
+        and resource.find("filepath") is not None
+    }
+    graph_descendants = set(graph.iter())
+    resource_descendants = {
+        element
+        for resource in root.iter("resource")
+        for element in resource.iter()
+    }
+    occupied = {name.casefold() for name in resources}
+    mappings = []
+
+    for slot, input_path in requested.items():
+        connection = next((
+            candidate for candidate in instance_node.iter("connection")
+            if candidate.find("identifier") is not None
+            and candidate.find("identifier").get("v") == slot
+        ), None)
+        if connection is None or connection.find("connRef") is None:
+            raise RuntimeError(f"{graph_name}: input connection not found: {slot}")
+        upstream = _upstream_bitmap_resources(
+            connection.find("connRef").get("v"),
+            nodes,
+            bitmap_by_uid,
+        )
+        if len(upstream) != 1:
+            raise RuntimeError(
+                f"{graph_name}: expected one source bitmap for {slot}, got {upstream}"
+            )
+        old_name = upstream[0]
+        resource = resources.get(old_name)
+        if resource is None:
+            raise RuntimeError(
+                f"{graph_name}: resource element not found: {old_name}"
+            )
+        needle = f"pkg:///resources/{old_name}".casefold()
+        external_users = [
+            element for element in root.iter()
+            if element not in graph_descendants
+            and element not in resource_descendants
+            and needle in str(element.get("v") or "").casefold()
+        ]
+        if external_users:
+            raise RuntimeError(
+                f"{graph_name}: source resource is shared outside the graph: "
+                f"{old_name}"
+            )
+
+        occupied.discard(old_name.casefold())
+        new_name = _source_resource_identifier(input_path, slot, occupied)
+        resource.find("identifier").set("v", new_name)
+        resource.find("filepath").set(
+            "v", _relpath_posix(input_path, sbs_path.parent)
+        )
+        format_element = resource.find("format")
+        if format_element is not None:
+            format_element.set(
+                "v", IMAGE_EXT_FORMAT.get(input_path.suffix.lower(), "png")
+            )
+        pattern = re.compile(
+            rf"(?i)(pkg:///resources/){re.escape(old_name)}(?=[?/#]|$)"
+        )
+        replaced = False
+        for element in graph.iter():
+            value = element.get("v")
+            if not value:
+                continue
+            updated = pattern.sub(rf"\1{new_name}", value)
+            if updated != value:
+                element.set("v", updated)
+                replaced = True
+        if not replaced:
+            raise RuntimeError(
+                f"{graph_name}: bitmap reference not found: {old_name}"
+            )
+        mappings.append({
+            "slot": slot,
+            "old_resource": old_name,
+            "resource": new_name,
+            "path": str(input_path),
+        })
+
+    for name, tag_value in dict(params or {}).items():
+        tag, value = tag_value
+        _set_cluster_instance_parameter(instance, str(name), str(tag), value)
+    if output_dir is not None:
+        destination = str(Path(output_dir).resolve()).replace("\\", "/")
+        for mode in ("export/fromGraph", "export/batch"):
+            _set_graph_export_option(
+                graph, f"{mode}/destination", destination
+            )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = sbs_path.with_name(
+        f"{sbs_path.stem}.pcgtex_backup_before_source_rebind_"
+        f"{graph_name}_{stamp}.sbs"
+    )
+    temporary = sbs_path.with_name(
+        f".{sbs_path.stem}.pcgtex_source_rebind_{stamp}.tmp.sbs"
+    )
+    shutil.copy2(sbs_path, backup)
+    try:
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        parsed = parse_m_graph(temporary, graph_name)
+        for slot, expected in requested.items():
+            actual = parsed["inputs"].get(slot)
+            if actual is None or Path(actual).resolve() != expected:
+                raise RuntimeError(
+                    f"{graph_name}: source rebind verification failed: "
+                    f"{slot}={actual}"
+                )
+        verify_root = ET.parse(temporary).getroot()
+        verify_graph = _find_graph(verify_root, graph_name)
+        state = _graph_cluster_normalization_state(verify_graph)
+        if not state.get("fully_normalized") or not state.get(
+                "integrity", {}).get("valid"):
+            raise RuntimeError(
+                f"{graph_name}: graph contract invalid after source rebind"
+            )
+        temporary.replace(sbs_path)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return {
+        "sbs": str(sbs_path),
+        "graph": graph_name,
+        "backup": str(backup),
+        "inputs": {slot: str(path) for slot, path in requested.items()},
+        "resources": mappings,
+        "output_dir": (
+            str(Path(output_dir).resolve())
+            if output_dir is not None else None
+        ),
+    }
+
+
 def parse_m_graph(sbs_path, graph_name):
     """T_ 관리 그래프의 비트맵 연결과 인스턴스 파라미터를 읽는다."""
     sbs_path = Path(sbs_path)
@@ -640,6 +926,375 @@ def inspect_graph_sources(sbs_path, graph_name):
     return {"bitmaps": bitmaps, "instances": instances, "outputs": outputs}
 
 
+def _semantic_key(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _node_uid(node):
+    uid = node.find("uid")
+    return uid.get("v") if uid is not None else None
+
+
+def _node_implementation(node):
+    wrapper = node.find("compImplementation")
+    return list(wrapper)[0] if wrapper is not None and len(wrapper) else None
+
+
+def _graph_output_source_records(graph):
+    """Return the exact node/output pair feeding every graph output bridge."""
+    output_meta = {}
+    for output in graph.findall("graphOutputs/graphoutput"):
+        identifier = output.find("identifier")
+        uid = output.find("uid")
+        if identifier is None or uid is None:
+            continue
+        output_meta[uid.get("v")] = {
+            "identifier": identifier.get("v", ""),
+            "uid": uid.get("v"),
+            "usages": [
+                name.get("v", "")
+                for name in output.findall("usages/usage/name")
+            ],
+            "graph_output": output,
+            "bridges": [],
+        }
+    for node in graph.iter("compNode"):
+        implementation = _node_implementation(node)
+        if implementation is None or implementation.tag != "compOutputBridge":
+            continue
+        output = implementation.find("output")
+        if output is None or output.get("v") not in output_meta:
+            continue
+        connection = next((
+            row for row in node.findall("connections/connection")
+            if row.find("identifier") is not None
+            and row.find("identifier").get("v") == "inputNodeOutput"
+        ), None)
+        if connection is None:
+            connection = node.find("connections/connection")
+        ref = connection.find("connRef") if connection is not None else None
+        ref_output = connection.find("connRefOutput") if connection is not None else None
+        output_meta[output.get("v")]["bridges"].append({
+            "node": node,
+            "connection": connection,
+            "conn_ref": ref.get("v") if ref is not None else "",
+            "conn_ref_output": ref_output.get("v") if ref_output is not None else "",
+        })
+    records = []
+    for record in output_meta.values():
+        bridge = record["bridges"][0] if record["bridges"] else {}
+        records.append({
+            **record,
+            "conn_ref": bridge.get("conn_ref", ""),
+            "conn_ref_output": bridge.get("conn_ref_output", ""),
+        })
+    return records
+
+
+def _select_output_source(records, aliases):
+    aliases = [_semantic_key(alias) for alias in aliases]
+    by_identifier = {
+        _semantic_key(record["identifier"]): record
+        for record in records
+    }
+    for alias in aliases:
+        record = by_identifier.get(alias)
+        if record and record["conn_ref"] and record["conn_ref_output"]:
+            return record
+    # Usage is only a fallback.  Identifier matches above keep packed outputs
+    # such as ``extra`` (sometimes tagged roughness) out of Cluster inputs.
+    for alias in aliases:
+        for record in records:
+            if alias in {_semantic_key(value) for value in record["usages"]} \
+                    and record["conn_ref"] and record["conn_ref_output"]:
+                return record
+    return None
+
+
+def _color_merge_alpha_source(graph, records):
+    """Recover a deliberately hidden opacity input from an RGB-A merge."""
+    color = _select_output_source(records, ("color",))
+    if not color:
+        return None
+    nodes = {
+        _node_uid(node): node for node in graph.iter("compNode")
+        if _node_uid(node)
+    }
+    source = nodes.get(color["conn_ref"])
+    implementation = _node_implementation(source) if source is not None else None
+    if implementation is None or implementation.tag != "compInstance":
+        return None
+    path = implementation.find("path")
+    if path is None or "rgbamerge" not in _semantic_key(path.get("v", "")):
+        return None
+    for connection in source.findall("connections/connection"):
+        identifier = connection.find("identifier")
+        if identifier is None or _semantic_key(identifier.get("v")) not in {"a", "alpha"}:
+            continue
+        ref = connection.find("connRef")
+        ref_output = connection.find("connRefOutput")
+        if ref is not None and ref_output is not None \
+                and ref.get("v") and ref_output.get("v"):
+            return {
+                "identifier": "color merge alpha",
+                "conn_ref": ref.get("v"),
+                "conn_ref_output": ref_output.get("v"),
+                "source_kind": "color_merge_alpha",
+            }
+    return None
+
+
+def _rgba_merge_channel_sources(graph, record):
+    if not record:
+        return {}
+    nodes = {
+        _node_uid(node): node for node in graph.iter("compNode")
+        if _node_uid(node)
+    }
+    source = nodes.get(record["conn_ref"])
+    implementation = _node_implementation(source) if source is not None else None
+    path = implementation.find("path") if implementation is not None \
+        and implementation.tag == "compInstance" else None
+    if path is None or "rgbamerge" not in _semantic_key(path.get("v", "")):
+        return {}
+    result = {}
+    for connection in source.findall("connections/connection"):
+        identifier = connection.find("identifier")
+        ref = connection.find("connRef")
+        ref_output = connection.find("connRefOutput")
+        channel = _semantic_key(identifier.get("v")) if identifier is not None else ""
+        if channel and ref is not None and ref_output is not None \
+                and ref.get("v") and ref_output.get("v"):
+            result[channel] = {
+                "identifier": f"{record['identifier']}.{channel.upper()}",
+                "conn_ref": ref.get("v"),
+                "conn_ref_output": ref_output.get("v"),
+                "source_kind": "packed_output_channel",
+            }
+    return result
+
+
+def _unique_height_to_normal_source(graph):
+    candidates = []
+    for node in graph.iter("compNode"):
+        implementation = _node_implementation(node)
+        if implementation is None or implementation.tag != "compInstance":
+            continue
+        path = implementation.find("path")
+        if path is None or "heighttonormal" not in _semantic_key(path.get("v", "")):
+            continue
+        for bridging in implementation.findall("outputBridgings/outputBridging"):
+            uid = bridging.find("uid")
+            identifier = bridging.find("identifier")
+            if uid is None or identifier is None:
+                continue
+            if _semantic_key(identifier.get("v")) in {"output", "normal"}:
+                candidates.append({
+                    "identifier": "height_to_normal output",
+                    "conn_ref": _node_uid(node),
+                    "conn_ref_output": uid.get("v"),
+                    "source_kind": "unique_height_to_normal",
+                })
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _procedural_cluster_input_sources(graph, ignore_cluster_outputs=False):
+    records = _graph_output_source_records(graph)
+    clusters = _cluster_nodes(graph)
+    cluster_uids = {_node_uid(node) for node in clusters}
+    raw_records = [
+        record for record in records
+        if not ignore_cluster_outputs or record["conn_ref"] not in cluster_uids
+    ]
+    sources = {}
+    if ignore_cluster_outputs and len(clusters) == 1:
+        for connection in clusters[0].findall("connections/connection"):
+            identifier = connection.find("identifier")
+            ref = connection.find("connRef")
+            ref_output = connection.find("connRefOutput")
+            slot = identifier.get("v", "") if identifier is not None else ""
+            if slot in SLOT_ORDER and ref is not None and ref_output is not None \
+                    and ref.get("v") and ref_output.get("v"):
+                sources[slot] = {
+                    "identifier": f"existing Cluster input {slot}",
+                    "conn_ref": ref.get("v"),
+                    "conn_ref_output": ref_output.get("v"),
+                    "source_kind": "existing_cluster_input",
+                }
+    for slot, aliases in PROCEDURAL_OUTPUT_ALIASES.items():
+        record = _select_output_source(raw_records, aliases)
+        if record and slot not in sources:
+            sources[slot] = {
+                "identifier": record["identifier"],
+                "conn_ref": record["conn_ref"],
+                "conn_ref_output": record["conn_ref_output"],
+                "source_kind": "graph_output",
+            }
+    if "Base_Color" not in sources and ignore_cluster_outputs:
+        color = _select_output_source(raw_records, ("color",))
+        if color:
+            sources["Base_Color"] = {
+                "identifier": color["identifier"],
+                "conn_ref": color["conn_ref"],
+                "conn_ref_output": color["conn_ref_output"],
+                "source_kind": "legacy_color_output",
+            }
+    if ignore_cluster_outputs:
+        extra = _select_output_source(raw_records, ("extra",))
+        channels = _rgba_merge_channel_sources(graph, extra)
+        for slot, channel in (
+                ("Ambient_Occlusion", "r"),
+                ("Roughness", "g"),
+                ("Height", "b"),
+                ("Opacity", "a")):
+            if slot not in sources and channel in channels:
+                sources[slot] = channels[channel]
+        if "Normal" not in sources:
+            normal = _unique_height_to_normal_source(graph)
+            if normal:
+                sources["Normal"] = normal
+    if "Opacity" not in sources:
+        hidden_alpha = _color_merge_alpha_source(graph, raw_records)
+        if hidden_alpha:
+            sources["Opacity"] = hidden_alpha
+    return sources
+
+
+def _graph_connection_integrity(graph):
+    known_uids = {uid.get("v") for uid in graph.iter("uid") if uid.get("v")}
+    unresolved_refs = []
+    unresolved_outputs = []
+    for connection in graph.iter("connection"):
+        ref = connection.find("connRef")
+        ref_output = connection.find("connRefOutput")
+        if ref is not None and ref.get("v") and ref.get("v") not in known_uids:
+            unresolved_refs.append(ref.get("v"))
+        if ref_output is not None and ref_output.get("v") \
+                and ref_output.get("v") not in known_uids:
+            unresolved_outputs.append(ref_output.get("v"))
+    return {
+        "valid": not unresolved_refs and not unresolved_outputs,
+        "unresolved_conn_refs": sorted(set(unresolved_refs)),
+        "unresolved_conn_ref_outputs": sorted(set(unresolved_outputs)),
+    }
+
+
+def _cluster_nodes(graph):
+    return [
+        node for node in graph.iter("compNode")
+        if _is_cluster_instance(_node_implementation(node))
+    ]
+
+
+def _cluster_output_uid_map(cluster_node):
+    implementation = _node_implementation(cluster_node)
+    if implementation is None:
+        return {}
+    result = {}
+    for bridging in implementation.findall("outputBridgings/outputBridging"):
+        uid = bridging.find("uid")
+        identifier = bridging.find("identifier")
+        if uid is not None and identifier is not None:
+            result[_semantic_key(identifier.get("v"))] = uid.get("v")
+    return result
+
+
+def _graph_cluster_normalization_state(graph):
+    integrity = _graph_connection_integrity(graph)
+    clusters = _cluster_nodes(graph)
+    records = _graph_output_source_records(graph)
+    by_identifier = {
+        _semantic_key(record["identifier"]): record
+        for record in records
+    }
+    normalized_outputs = {role: False for role in RENDER_MAPS}
+    cluster_inputs = {}
+    inputs_are_direct_bitmaps = False
+    has_nonbitmap_inputs = False
+    standard_outputs_through_cluster = {name: False for name in CLUSTER_GRAPH_OUTPUTS}
+    if len(clusters) == 1:
+        cluster = clusters[0]
+        cluster_uid = _node_uid(cluster)
+        output_uids = _cluster_output_uid_map(cluster)
+        for identifier in CLUSTER_GRAPH_OUTPUTS:
+            record = by_identifier.get(_semantic_key(identifier))
+            expected = output_uids.get(_semantic_key(identifier))
+            standard_outputs_through_cluster[identifier] = bool(
+                record and expected and record["conn_ref"] == cluster_uid
+                and record["conn_ref_output"] == expected
+            )
+        normalized_outputs = {
+            role: standard_outputs_through_cluster[role]
+            for role in RENDER_MAPS
+        }
+        connection_rows = {}
+        for connection in cluster.findall("connections/connection"):
+            identifier = connection.find("identifier")
+            ref = connection.find("connRef")
+            ref_output = connection.find("connRefOutput")
+            if identifier is None:
+                continue
+            connection_rows.setdefault(identifier.get("v", ""), []).append({
+                "conn_ref": ref.get("v") if ref is not None else "",
+                "conn_ref_output": ref_output.get("v") if ref_output is not None else "",
+            })
+        cluster_inputs = {
+            slot: rows[0] for slot, rows in connection_rows.items()
+            if len(rows) == 1
+        }
+        nodes = {
+            _node_uid(node): node for node in graph.iter("compNode")
+            if _node_uid(node)
+        }
+        bitmap_flags = []
+        for slot in SLOT_ORDER:
+            source = cluster_inputs.get(slot)
+            if source is None:
+                continue
+            node = nodes.get(source.get("conn_ref")) if source else None
+            implementation = _node_implementation(node) if node is not None else None
+            bitmap_flags.append(bool(
+                implementation is not None
+                and implementation.tag == "compFilter"
+                and implementation.find("filter") is not None
+                and implementation.find("filter").get("v") == "bitmap"
+            ))
+        inputs_are_direct_bitmaps = bool(bitmap_flags) and all(bitmap_flags)
+        has_nonbitmap_inputs = any(not value for value in bitmap_flags)
+    outputs_routed_through_cluster = bool(
+        len(clusters) == 1
+        and integrity["valid"]
+        and all(standard_outputs_through_cluster.values())
+    )
+    exact_output_identifiers = {record["identifier"] for record in records}
+    canonical_output_identifiers = all(
+        identifier in exact_output_identifiers for identifier in CLUSTER_GRAPH_OUTPUTS)
+    fully_normalized = outputs_routed_through_cluster and canonical_output_identifiers
+    return {
+        "cluster_count": len(clusters),
+        "fully_normalized": fully_normalized,
+        "wrapped_direct": fully_normalized and has_nonbitmap_inputs,
+        "cluster_inputs_are_direct_bitmaps": inputs_are_direct_bitmaps,
+        "cluster_inputs_complete": all(slot in cluster_inputs for slot in SLOT_ORDER),
+        "outputs_routed_through_cluster": outputs_routed_through_cluster,
+        "canonical_output_identifiers": canonical_output_identifiers,
+        "normalized_outputs": normalized_outputs,
+        "standard_outputs_through_cluster": standard_outputs_through_cluster,
+        "cluster_inputs": cluster_inputs,
+        "integrity": integrity,
+        "outputs": [record["identifier"] for record in records],
+    }
+
+
+def graph_cluster_normalization_state(sbs_path, graph_name):
+    """Inspect whether a graph's standard exports are routed through Cluster_System."""
+    root = ET.parse(sbs_path).getroot()
+    graph = _find_graph(root, graph_name)
+    if graph is None:
+        raise RuntimeError(f"graph not found: {graph_name} in {Path(sbs_path).name}")
+    return _graph_cluster_normalization_state(graph)
+
+
 def graph_render_size_log2(sbs_path, graph_name, max_log2=MAX_OUTPUT_LOG2):
     """Infer a graph's intended aspect ratio from Base Color, then graph options."""
     try:
@@ -728,6 +1383,28 @@ def _set_graph_resolution(graph, size_log2):
         if implementation is None or not len(implementation):
             continue
         imp = list(implementation)[0]
+        # The final Cluster_System instance may carry a legacy relative
+        # output-size override (for example -2/-2), which silently clamps a
+        # 4K graph to 1K even when sbsrender receives $outputsize=12,12.
+        # Normalize only this final wrapper to the managed graph's absolute
+        # target; authored helper instances keep their intentional sizing.
+        if imp.tag == "compInstance" and _is_cluster_instance(imp):
+            for param in imp.iter("parameter"):
+                name = param.find("name")
+                if name is None or name.get("v") != "outputsize":
+                    continue
+                value_el = param.find("paramValue")
+                value_el = (
+                    list(value_el)[0]
+                    if value_el is not None and len(value_el) else None)
+                if value_el is not None and value_el.get("v") != int2_value:
+                    value_el.set("v", int2_value)
+                    changed = True
+                relative = param.find("relativeTo")
+                if relative is not None and relative.get("v") != "0":
+                    relative.set("v", "0")
+                    changed = True
+            continue
         filter_el = imp.find("filter") if imp.tag == "compFilter" else None
         if filter_el is None or filter_el.get("v") != "bitmap":
             continue
@@ -751,8 +1428,9 @@ def _set_graph_resolution(graph, size_log2):
 
 
 def managed_graph_resolution_state(sbs_path, graph_name, inputs=None,
-                                   max_log2=MAX_OUTPUT_LOG2):
-    desired = render_size_log2(inputs, max_log2=max_log2) if inputs else \
+                                   max_log2=MAX_OUTPUT_LOG2, size_log2=None):
+    desired = normalize_size_log2(size_log2) if size_log2 is not None else \
+        render_size_log2(inputs, max_log2=max_log2) if inputs else \
         graph_render_size_log2(sbs_path, graph_name, max_log2=max_log2)
     root = ET.parse(sbs_path).getroot()
     graph = _find_graph(root, graph_name)
@@ -765,7 +1443,7 @@ def managed_graph_resolution_state(sbs_path, graph_name, inputs=None,
 
 
 def set_managed_graph_resolution(sbs_path, graph_name, inputs=None,
-                                 max_log2=MAX_OUTPUT_LOG2):
+                                 max_log2=MAX_OUTPUT_LOG2, size_log2=None):
     """Persist capped native aspect ratio in the SBS graph with rollback."""
     sbs_path = Path(sbs_path)
     tree = ET.parse(sbs_path)
@@ -773,7 +1451,8 @@ def set_managed_graph_resolution(sbs_path, graph_name, inputs=None,
     graph = _find_graph(root, graph_name)
     if graph is None:
         raise RuntimeError(f"graph not found: {graph_name} in {sbs_path.name}")
-    desired = render_size_log2(inputs, max_log2=max_log2) if inputs else \
+    desired = normalize_size_log2(size_log2) if size_log2 is not None else \
+        render_size_log2(inputs, max_log2=max_log2) if inputs else \
         graph_render_size_log2(sbs_path, graph_name, max_log2=max_log2)
     if not _set_graph_resolution(graph, desired):
         return {"changed": False, "backup": None, "size_log2": desired,
@@ -785,7 +1464,8 @@ def set_managed_graph_resolution(sbs_path, graph_name, inputs=None,
     try:
         tree.write(sbs_path, encoding="utf-8", xml_declaration=True)
         verify = managed_graph_resolution_state(
-            sbs_path, graph_name, inputs=inputs, max_log2=max_log2)
+            sbs_path, graph_name, inputs=inputs, max_log2=max_log2,
+            size_log2=desired)
         if verify["needs_update"]:
             raise RuntimeError("managed graph resolution verification failed")
     except Exception:
@@ -853,33 +1533,92 @@ def _invert_normal_green(path):
         Image.merge(mode, channels).save(path)
 
 
+def _file_content_hash(path):
+    """Hash exact file bytes so an unchanged source keeps its path and mtime."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _prepare_output_transaction(produced, atlas_base):
-    existing = {path: path.exists() for path in produced}
+    """Create an isolated same-volume staging area without touching targets."""
+    produced = [Path(path) for path in produced]
+    if not produced:
+        raise ValueError("output transaction requires at least one target")
+    staging_dir = Path(tempfile.mkdtemp(
+        prefix=".pcgtx_", dir=produced[0].parent))
+    return {
+        "files": produced,
+        "staging_dir": staging_dir,
+        "staged_files": [staging_dir / path.name for path in produced],
+        "atlas_base": atlas_base,
+    }
+
+
+def _commit_output_transaction(transaction):
+    """Replace only byte-changed targets and roll back a partial commit."""
+    produced = transaction["files"]
+    staged = transaction["staged_files"]
+    pairs = list(zip(staged, produced))
+    changed_pairs = []
+    unchanged = []
+    created = []
+    existing = {}
+    for staged_path, target in pairs:
+        if not staged_path.is_file() or staged_path.stat().st_size <= 0:
+            raise RuntimeError(f"staged output missing or empty: {staged_path.name}")
+        if target.exists() and not target.is_file():
+            raise RuntimeError(f"output target is not a file: {target}")
+        was_present = target.is_file()
+        existing[target] = was_present
+        if was_present and target.stat().st_size == staged_path.stat().st_size \
+                and _file_content_hash(target) == _file_content_hash(staged_path):
+            unchanged.append(target)
+            continue
+        changed_pairs.append((staged_path, target))
+        if not was_present:
+            created.append(target)
+
     backup_dir = None
-    if any(existing.values()):
+    existing_changed = [target for _staged, target in changed_pairs if existing[target]]
+    if existing_changed:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        backup_dir = produced[0].parent / "_pcgtex_backups" / f"{atlas_base}_{stamp}"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        for path, was_present in existing.items():
-            if was_present:
-                shutil.copy2(path, backup_dir / path.name)
-    # Remove exact TGA targets so an old file cannot make a failed render look successful.
+        backup_dir = produced[0].parent / "_pcgtex_backups" / \
+            f"{transaction['atlas_base']}_{stamp}"
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            for target in existing_changed:
+                shutil.copy2(target, backup_dir / target.name)
+        except Exception:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            raise
+
+    replaced = []
     try:
-        for path, was_present in existing.items():
-            if was_present:
-                path.unlink()
+        for staged_path, target in changed_pairs:
+            staged_path.replace(target)
+            replaced.append(target)
     except Exception:
-        _restore_output_transaction(produced, existing, backup_dir)
+        for target in reversed(replaced):
+            if existing[target]:
+                shutil.copy2(backup_dir / target.name, target)
+            elif target.exists():
+                target.unlink()
         raise
-    return existing, backup_dir
+    return {
+        "files": produced,
+        "changed_files": [target for _staged, target in changed_pairs],
+        "unchanged_files": unchanged,
+        "created_files": created,
+        "backup_dir": backup_dir,
+    }
 
 
-def _restore_output_transaction(produced, existing, backup_dir):
-    for path in produced:
-        if path.exists():
-            path.unlink()
-        if existing.get(path) and backup_dir:
-            shutil.copy2(backup_dir / path.name, path)
+def _restore_output_transaction(transaction):
+    """Discard staged outputs; targets are untouched or already rolled back."""
+    shutil.rmtree(transaction["staging_dir"], ignore_errors=True)
 
 
 def render_maps(atlas_base, inputs, params, out_dir, cfg=None,
@@ -895,6 +1634,7 @@ def render_maps(atlas_base, inputs, params, out_dir, cfg=None,
         raise RuntimeError(f"Cluster_System_01.sbsar 없음: {sbsar}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    produced = [out_dir / f"{atlas_base}_{m}.tga" for m in maps]
 
     # A white Subsurface_Amount is the identity multiplier.  Always force it
     # to 1 so the source translucency/subsurface image passes through without
@@ -919,45 +1659,45 @@ def render_maps(atlas_base, inputs, params, out_dir, cfg=None,
             cmd += ["--set-value", arg]
     for map_name in maps:
         cmd += ["--input-graph-output", map_name]
+    transaction = _prepare_output_transaction(produced, atlas_base)
+    staged = transaction["staged_files"]
     cmd += [
         "--output-name", f"{atlas_base}_{{outputNodeName}}",
         "--output-format", "tga",
-        "--output-path", str(out_dir),
+        "--output-path", str(transaction["staging_dir"]),
     ]
-    produced = [out_dir / f"{atlas_base}_{m}.tga" for m in maps]
-    existing, backup_dir = _prepare_output_transaction(produced, atlas_base)
     normal_corrected = False
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
             creationflags=_hidden_creationflags(),
         )
-        missing = [p.name for p in produced if not p.exists() or p.stat().st_size == 0]
+        missing = [p.name for p in staged if not p.exists() or p.stat().st_size == 0]
         if result.returncode != 0 or missing:
             tail = (result.stderr or result.stdout or "")[-1500:]
             raise RuntimeError(f"sbsrender 실패 (누락: {missing}): {tail}")
         wrong_size = [
             f"{path.name}={image_pixel_size(path)}"
-            for path in produced
+            for path in staged
             if image_pixel_size(path) != size_log2_pixels(resolved_size)
         ]
         if wrong_size:
             raise RuntimeError(
                 f"sbsrender output size mismatch; expected "
                 f"{size_log2_pixels(resolved_size)}: {wrong_size}")
+        validate_rendered_map_contents(dict(zip(maps, staged)))
         # The current Cluster_System_01.sbsar always performs OpenGL -> DirectX.
         # A DirectX source therefore needs one compensating G inversion afterward.
         normal_opengl = _param_bool(params, "normal")
         behavior = cfg.get("cluster_sbsar_normal_behavior", "opengl_to_directx")
         if normal_opengl is False and behavior == "opengl_to_directx" and "normal" in maps:
-            _invert_normal_green(out_dir / f"{atlas_base}_normal.tga")
+            _invert_normal_green(transaction["staging_dir"] / f"{atlas_base}_normal.tga")
             normal_corrected = True
-    except Exception:
-        _restore_output_transaction(produced, existing, backup_dir)
-        raise
+        output_info = _commit_output_transaction(transaction)
+    finally:
+        _restore_output_transaction(transaction)
     info = {
-        "files": produced,
-        "backup_dir": backup_dir,
+        **output_info,
         "normal_green_corrected": normal_corrected,
         "size_log2": resolved_size,
         "pixel_size": size_log2_pixels(resolved_size),
@@ -990,16 +1730,195 @@ def cook_sbs_package(sbs_path, cache_root, cfg=None, timeout=1800):
     return sbsar
 
 
+_EXTERNAL_INPUT_HASH_CACHE = {}
+
+
+def _cached_external_input_hash(path):
+    """Hash a live bitmap once per file identity for SBSAR cache invalidation."""
+    path = Path(path)
+    stat = path.stat()
+    key = (
+        str(path.resolve()).casefold(),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    cached = _EXTERNAL_INPUT_HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = _file_content_hash(path)
+    if len(_EXTERNAL_INPUT_HASH_CACHE) >= 4096:
+        _EXTERNAL_INPUT_HASH_CACHE.clear()
+    _EXTERNAL_INPUT_HASH_CACHE[key] = digest
+    return digest
+
+
+def graph_external_input_fingerprint(sbs_path, graph_names):
+    """Fingerprint current external bitmaps used by the requested graph set."""
+    sbs_path = Path(sbs_path)
+    inputs = {}
+    for graph_name in graph_names:
+        try:
+            source = inspect_graph_sources(sbs_path, graph_name)
+        except Exception:
+            source = {}
+        for bitmap in source.get("bitmaps") or []:
+            raw_path = bitmap.get("path")
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path.absolute()).casefold()
+            inputs[key] = path
+        try:
+            parsed = parse_m_graph(sbs_path, graph_name)
+        except Exception:
+            parsed = {}
+        for raw_path in (parsed.get("inputs") or {}).values():
+            path = Path(raw_path)
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path.absolute()).casefold()
+            inputs[key] = path
+    rows = []
+    for key, path in sorted(inputs.items()):
+        if not path.is_file():
+            rows.append(f"{key}|missing")
+            continue
+        stat = path.stat()
+        rows.append(
+            f"{key}|{stat.st_size}|{stat.st_mtime_ns}|"
+            f"{_cached_external_input_hash(path)}"
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
+                           timeout=1800, force_recook=False):
+    """Cook only the requested graphs while retaining package resources/dependencies.
+
+    Legacy SBS packages often contain unrelated broken graphs, so package-wide
+    cooking can fail even when the requested graph is valid.  The temporary SBS
+    stays beside its source to preserve every relative dependency path.
+    """
+    cfg = cfg or load_config()
+    sbs_path = Path(sbs_path)
+    requested = list(dict.fromkeys(str(name) for name in graph_names))
+    stat = sbs_path.stat()
+    tree = ET.parse(sbs_path)
+    root = tree.getroot()
+    graphs = {
+        graph.find("identifier").get("v", "").lower(): graph
+        for graph in root.iter("graph")
+        if graph.find("identifier") is not None
+    }
+    missing = [name for name in requested if name.lower() not in graphs]
+    if missing:
+        raise RuntimeError(f"graphs not found for isolated cook: {missing}")
+
+    keep = {name.lower() for name in requested}
+    himself_uid = _find_dependency_uid(root, lambda filename: filename == "?himself")
+    # Retain any package-local graph instances reachable from the requested
+    # graph.  Most current graphs are self-contained, but this closure makes
+    # isolation safe for authored helper graphs too.
+    pending = list(keep)
+    while pending:
+        graph = graphs[pending.pop()]
+        for instance in graph.iter("compInstance"):
+            path = instance.find("path")
+            value = path.get("v", "") if path is not None else ""
+            if not value.lower().startswith("pkg:///"):
+                continue
+            package_name, _, query = value[7:].partition("?")
+            dependency = next((
+                part.split("=", 1)[1]
+                for part in query.split("&")
+                if part.lower().startswith("dependency=")
+            ), None)
+            local_name = package_name.lower()
+            if local_name in graphs and (dependency is None or dependency == himself_uid) \
+                    and local_name not in keep:
+                keep.add(local_name)
+                pending.append(local_name)
+
+    kept_graph_names = [
+        graphs[name].find("identifier").get("v", name)
+        for name in sorted(keep)
+    ]
+    input_fingerprint = graph_external_input_fingerprint(
+        sbs_path, kept_graph_names
+    )
+    key = hashlib.sha1(
+        (f"{sbs_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+         + "|".join(name.lower() for name in requested)
+         + f"|inputs={input_fingerprint}").encode("utf-8")
+    ).hexdigest()[:16]
+    if force_recook:
+        # This is an explicit user action after Cluster_System changes.  Use a
+        # fresh cache location so no previously cooked dependency can survive.
+        key += "_manual_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    cache_dir = Path(cache_root) / f"{sbs_path.stem}_graphs_{key}"
+    stable_sbsar = cache_dir / f"{sbs_path.stem}_{key}.sbsar"
+    if stable_sbsar.is_file() and stable_sbsar.stat().st_size > 0:
+        return stable_sbsar
+
+    for parent in root.iter():
+        for child in list(parent):
+            if child.tag != "graph":
+                continue
+            identifier = child.find("identifier")
+            name = identifier.get("v", "").lower() if identifier is not None else ""
+            if name not in keep:
+                parent.remove(child)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp_sbs = sbs_path.with_name(
+        f"{sbs_path.stem}_pcgtex_isolated_{key}.sbs")
+    try:
+        tree.write(temp_sbs, encoding="utf-8", xml_declaration=True)
+        result = subprocess.run(
+            [str(sbscooker_exe(cfg)), "--inputs", str(temp_sbs),
+             "--output-path", str(cache_dir)],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=_hidden_creationflags(),
+        )
+        candidates = [
+            cache_dir / f"{temp_sbs.stem}.sbsar",
+            cache_dir / f"{sbs_path.stem}.sbsar",
+        ]
+        candidates.extend(sorted(
+            cache_dir.glob("*.sbsar"), key=lambda path: path.stat().st_mtime_ns,
+            reverse=True))
+        cooked = next((
+            path for path in candidates
+            if path.is_file() and path.stat().st_size > 0
+        ), None)
+        if cooked is None:
+            tail = (result.stderr or result.stdout or "")[-2000:]
+            raise RuntimeError(
+                f"isolated SBS cook failed: {sbs_path.name} {requested}: {tail}")
+        if cooked != stable_sbsar:
+            shutil.copy2(cooked, stable_sbsar)
+    finally:
+        if temp_sbs.exists():
+            temp_sbs.unlink()
+    return stable_sbsar
+
+
 def render_sbs_graph_maps(sbs_path, graph_name, texture_base, out_dir,
                           cache_root, cfg=None, maps=RENDER_MAPS,
-                          size_log2=None, timeout=1800, return_info=False):
+                          size_log2=None, timeout=1800, return_info=False,
+                          normal_opengl=None, force_recook=False):
     """Render final maps directly from a procedural/composite SBS graph."""
     cfg = cfg or load_config()
-    sbsar = cook_sbs_package(sbs_path, cache_root, cfg=cfg, timeout=timeout)
+    sbsar = cook_sbs_graph_package(
+        sbs_path, [graph_name], cache_root, cfg=cfg, timeout=timeout,
+        force_recook=force_recook)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     produced = [out_dir / f"{texture_base}_{name}.tga" for name in maps]
-    existing, backup_dir = _prepare_output_transaction(produced, texture_base)
     resolved_size = (
         render_size_log2(size_log2=size_log2)
         if size_log2 is not None
@@ -1012,36 +1931,45 @@ def render_sbs_graph_maps(sbs_path, graph_name, texture_base, out_dir,
     ]
     for name in maps:
         cmd += ["--input-graph-output", name]
+    transaction = _prepare_output_transaction(produced, texture_base)
+    staged = transaction["staged_files"]
     cmd += [
         "--output-name", f"{texture_base}_{{outputNodeName}}",
         "--output-format", "tga",
-        "--output-path", str(out_dir),
+        "--output-path", str(transaction["staging_dir"]),
     ]
+    normal_corrected = False
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
             creationflags=_hidden_creationflags(),
         )
-        missing = [path.name for path in produced if not path.is_file() or path.stat().st_size == 0]
+        missing = [path.name for path in staged if not path.is_file() or path.stat().st_size == 0]
         if result.returncode != 0 or missing:
             tail = (result.stderr or result.stdout or "")[-2000:]
             raise RuntimeError(
                 f"SBS graph render failed: {graph_name} (missing: {missing}): {tail}")
-        actual_sizes = {image_pixel_size(path) for path in produced}
+        actual_sizes = {image_pixel_size(path) for path in staged}
         if len(actual_sizes) != 1:
             raise RuntimeError(f"SBS graph outputs have inconsistent sizes: {actual_sizes}")
         actual_pixels = next(iter(actual_sizes))
-        actual_size = image_size_log2(produced[0])
+        actual_size = image_size_log2(staged[0])
         if size_log2_pixels(actual_size) != actual_pixels or max(actual_pixels) > (1 << MAX_OUTPUT_LOG2):
             raise RuntimeError(
                 f"SBS graph output size is not a capped power-of-two size: {actual_pixels}")
-    except Exception:
-        _restore_output_transaction(produced, existing, backup_dir)
-        raise
-    info = {"files": produced, "backup_dir": backup_dir, "cooked_sbsar": sbsar,
+        validate_rendered_map_contents(dict(zip(maps, staged)))
+        behavior = cfg.get("cluster_sbsar_normal_behavior", "opengl_to_directx")
+        if normal_opengl is False and behavior == "opengl_to_directx" and "normal" in maps:
+            _invert_normal_green(transaction["staging_dir"] / f"{texture_base}_normal.tga")
+            normal_corrected = True
+        output_info = _commit_output_transaction(transaction)
+    finally:
+        _restore_output_transaction(transaction)
+    info = {**output_info, "cooked_sbsar": sbsar,
             "requested_size_log2": resolved_size,
             "size_log2": actual_size, "pixel_size": actual_pixels,
-            "size_overridden_by_graph": actual_size != resolved_size}
+            "size_overridden_by_graph": actual_size != resolved_size,
+            "normal_green_corrected": normal_corrected}
     return info if return_info else produced
 
 
@@ -1392,6 +2320,660 @@ def m_graph_backup(sbs_path, graph_name):
     return backup
 
 
+def _clone_with_remapped_uids(element, used_uids, seed_map=None):
+    """Deep-copy one graph fragment and remap every graph-local UID reference."""
+    cloned = copy.deepcopy(element)
+    uid_map = dict(seed_map or {})
+    for uid in cloned.iter("uid"):
+        old = uid.get("v")
+        if old and old not in uid_map:
+            uid_map[old] = _new_uid(used_uids)
+    for child in cloned.iter():
+        value = child.get("v")
+        if value in uid_map:
+            child.set("v", uid_map[value])
+    return cloned, uid_map
+
+
+def _find_graph_case_insensitive(root, graph_name):
+    wanted = str(graph_name).lower()
+    for graph in root.iter("graph"):
+        identifier = graph.find("identifier")
+        if identifier is not None and identifier.get("v", "").lower() == wanted:
+            return graph
+    return None
+
+
+def _graph_structure_signature(graph):
+    """UID-independent signature used only to recover a broken graph clone."""
+    rows = []
+    for node in graph.iter("compNode"):
+        implementation = _node_implementation(node)
+        if implementation is None:
+            detail = ""
+            kind = ""
+        elif implementation.tag == "compInstance":
+            path = implementation.find("path")
+            detail = (path.get("v", "").split("?", 1)[0].lower()
+                      if path is not None else "")
+            kind = implementation.tag
+        elif implementation.tag == "compFilter":
+            filter_element = implementation.find("filter")
+            detail = filter_element.get("v", "") if filter_element is not None else ""
+            kind = implementation.tag
+        else:
+            detail = ""
+            kind = implementation.tag
+        connection_ids = tuple(
+            connection.find("identifier").get("v", "")
+            for connection in node.findall("connections/connection")
+            if connection.find("identifier") is not None
+        )
+        output_types = tuple(
+            output.find("comptype").get("v", "")
+            for output in node.findall("compOutputs/compOutput")
+            if output.find("comptype") is not None
+        )
+        rows.append((kind, detail, connection_ids, output_types))
+    output_ids = tuple(sorted(
+        _semantic_key(identifier.get("v", ""))
+        for identifier in graph.findall("graphOutputs/graphoutput/identifier")
+    ))
+    return output_ids, tuple(rows)
+
+
+def _replace_broken_graph_from_authoring(root, graph, used_uids):
+    """Replace a broken T_ clone from its intact package-local authoring graph."""
+    identifier = graph.find("identifier")
+    graph_name = identifier.get("v", "") if identifier is not None else ""
+    if not graph_name.lower().startswith(("t_", "m_")):
+        return graph, None
+    authoring_name = graph_name[2:]
+    preferred = _find_graph_case_insensitive(root, authoring_name)
+    candidates = [preferred] if preferred is not None and preferred is not graph else []
+    target_signature = _graph_structure_signature(graph)
+    if not candidates:
+        candidates = [
+            candidate for candidate in root.iter("graph")
+            if candidate is not graph
+            and _graph_connection_integrity(candidate)["valid"]
+            and _graph_structure_signature(candidate) == target_signature
+        ]
+    candidates = [
+        candidate for candidate in candidates
+        if candidate is not None
+        and _graph_connection_integrity(candidate)["valid"]
+    ]
+    if len(candidates) != 1:
+        return graph, None
+    authoring = candidates[0]
+    cloned, _uid_map = _clone_with_remapped_uids(authoring, used_uids)
+    cloned.find("identifier").set("v", graph_name)
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    parent = parent_map.get(graph)
+    if parent is None:
+        raise RuntimeError(f"cannot locate graph parent: {graph_name}")
+    index = list(parent).index(graph)
+    parent.remove(graph)
+    parent.insert(index, cloned)
+    return cloned, authoring.find("identifier").get("v")
+
+
+def _normalization_template_parts():
+    template_graph, template_resource = _load_template()
+    cluster_node = next((
+        node for node in template_graph.findall("compNodes/compNode")
+        if _is_cluster_instance(_node_implementation(node))
+    ), None)
+    if cluster_node is None:
+        raise RuntimeError("normalization template has no Cluster_System node")
+    bitmap_nodes = {}
+    output_bridges = {}
+    for node in template_graph.findall("compNodes/compNode"):
+        implementation = _node_implementation(node)
+        if implementation is None:
+            continue
+        if implementation.tag == "compFilter" and implementation.find("filter") is not None \
+                and implementation.find("filter").get("v") == "bitmap":
+            for parameter in implementation.iter("parameter"):
+                name = parameter.find("name")
+                if name is None or name.get("v") != "bitmapresourcepath":
+                    continue
+                value = _param_value(parameter)
+                resource_name = value[1].split("/")[-1].split("?")[0] if value else ""
+                prefix = TEMPLATE_GRAPH_NAME + "_"
+                suffix = resource_name[len(prefix):].lower() \
+                    if resource_name.lower().startswith(prefix.lower()) else ""
+                slot = TEMPLATE_SUFFIX_TO_SLOT.get(suffix)
+                if slot:
+                    bitmap_nodes[slot] = node
+        elif implementation.tag == "compOutputBridge":
+            output = implementation.find("output")
+            if output is not None:
+                output_bridges[output.get("v")] = node
+    graph_outputs = {}
+    root_outputs = {}
+    for output in template_graph.findall("graphOutputs/graphoutput"):
+        identifier = output.find("identifier")
+        uid = output.find("uid")
+        if identifier is not None and uid is not None:
+            graph_outputs[_semantic_key(identifier.get("v"))] = output
+    for output in template_graph.findall("root/rootOutputs/rootOutput"):
+        ref = output.find("output")
+        if ref is not None:
+            root_outputs[ref.get("v")] = output
+    return {
+        "graph": template_graph,
+        "resource": template_resource,
+        "cluster_node": cluster_node,
+        "bitmap_nodes": bitmap_nodes,
+        "graph_outputs": graph_outputs,
+        "output_bridges": output_bridges,
+        "root_outputs": root_outputs,
+    }
+
+
+def _resources_group_content(root, used_uids):
+    content = root.find("content")
+    if content is None:
+        raise RuntimeError("SBS package has no content element")
+    group = None
+    for candidate in content.findall("group"):
+        identifier = candidate.find("identifier")
+        if identifier is not None and identifier.get("v") == "Resources":
+            group = candidate
+            break
+    if group is None:
+        group = ET.SubElement(content, "group")
+        ET.SubElement(group, "identifier").set("v", "Resources")
+        ET.SubElement(group, "uid").set("v", _new_uid(used_uids))
+    group_content = group.find("content")
+    if group_content is None:
+        group_content = ET.SubElement(group, "content")
+    return group_content
+
+
+def _ensure_neutral_resource(root, sbs_path, kind, template_resource, used_uids):
+    neutral = neutral_image(kind).resolve()
+    for resource in root.iter("resource"):
+        identifier = resource.find("identifier")
+        filepath = resource.find("filepath")
+        if identifier is None or filepath is None:
+            continue
+        raw = filepath.get("v", "").replace("\\", "/")
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path(sbs_path).parent / candidate
+        try:
+            same = candidate.resolve() == neutral
+        except OSError:
+            same = candidate.name.lower() == neutral.name.lower()
+        if same:
+            return identifier.get("v"), False
+
+    group_content = _resources_group_content(root, used_uids)
+    existing = {
+        resource.find("identifier").get("v", "").lower()
+        for resource in root.iter("resource")
+        if resource.find("identifier") is not None
+    }
+    base = f"PCGTex_neutral_{kind}"
+    resource_name = base
+    index = 2
+    while resource_name.lower() in existing:
+        resource_name = f"{base}_{index}"
+        index += 1
+    resource = copy.deepcopy(template_resource)
+    resource.find("identifier").set("v", resource_name)
+    resource.find("uid").set("v", _new_uid(used_uids))
+    resource.find("filepath").set(
+        "v", _relpath_posix(neutral, Path(sbs_path).parent))
+    resource.find("format").set("v", "png")
+    group_content.append(resource)
+    return resource_name, True
+
+
+def _set_node_position(node, x, y):
+    position = node.find("GUILayout/gpos")
+    if position is not None:
+        position.set("v", f"{float(x):g} {float(y):g} 0")
+
+
+def _graph_right_edge(graph):
+    positions = []
+    for position in graph.findall(".//GUILayout/gpos"):
+        try:
+            positions.append(float(position.get("v", "").split()[0]))
+        except (ValueError, IndexError):
+            pass
+    return max(positions) if positions else 0.0
+
+
+def _set_cluster_parameters(cluster_node, normal_opengl):
+    implementation = _node_implementation(cluster_node)
+    desired = normalized_export_params(default_params(normal_opengl))
+    parameters = implementation.find("parameters")
+    if parameters is None:
+        return
+    for parameter in list(parameters.findall("parameter")):
+        name = parameter.find("name")
+        # Current Cluster_System_01.sbsar no longer exposes this legacy
+        # parameter.  Normal convention is corrected after graph rendering.
+        if name is not None and name.get("v") == "normal":
+            parameters.remove(parameter)
+            continue
+        if name is None or name.get("v") not in desired:
+            continue
+        tag, value = desired[name.get("v")]
+        container = parameter.find("paramValue")
+        if container is None:
+            container = ET.SubElement(parameter, "paramValue")
+        for child in list(container):
+            container.remove(child)
+        ET.SubElement(container, tag).set("v", value)
+
+
+def _set_output_bridge_source(node, source_uid, source_output_uid):
+    connections = node.find("connections")
+    if connections is None:
+        connections = ET.Element("connections")
+        uid = node.find("uid")
+        node.insert(1 if uid is not None else 0, connections)
+    for connection in list(connections):
+        connections.remove(connection)
+    connection = ET.SubElement(connections, "connection")
+    ET.SubElement(connection, "identifier").set("v", "inputNodeOutput")
+    ET.SubElement(connection, "connRef").set("v", source_uid)
+    ET.SubElement(connection, "connRefOutput").set("v", source_output_uid)
+
+
+def _set_graph_export_option(graph, option_name, option_value):
+    options = graph.find("options")
+    if options is None:
+        options = ET.SubElement(graph, "options")
+    matches = []
+    for option in options.findall("option"):
+        name = option.find("name")
+        if name is not None and name.get("v", "").lower() == option_name.lower():
+            matches.append(option)
+    option = matches[0] if matches else ET.SubElement(options, "option")
+    name = option.find("name")
+    if name is None:
+        name = ET.SubElement(option, "name")
+    value = option.find("value")
+    if value is None:
+        value = ET.SubElement(option, "value")
+    name.set("v", option_name)
+    value.set("v", option_value)
+    for duplicate in matches[1:]:
+        options.remove(duplicate)
+
+
+def _enable_normalized_graph_exports(graph):
+    for mode in ("export/fromGraph", "export/batch"):
+        _set_graph_export_option(graph, f"{mode}/extension", "tga")
+        for identifier in RENDER_MAPS:
+            _set_graph_export_option(
+                graph, f"{mode}/outputs/{identifier}", "true")
+            _set_graph_export_option(
+                graph, f"{mode}/outputsColorspace/{identifier}", "Raw")
+
+
+def _canonicalize_standard_output_identifiers(graph):
+    records = _graph_output_source_records(graph)
+    changed = []
+    for identifier in CLUSTER_GRAPH_OUTPUTS:
+        matching = [
+            record for record in records
+            if _semantic_key(record["identifier"]) == _semantic_key(identifier)
+        ]
+        if len(matching) == 1 and matching[0]["identifier"] != identifier:
+            matching[0]["graph_output"].find("identifier").set("v", identifier)
+            changed.append((matching[0]["identifier"], identifier))
+    return changed
+
+
+def _remove_numbered_cluster_output_duplicates(graph, cluster_uid):
+    records = _graph_output_source_records(graph)
+    exact = {_semantic_key(record["identifier"]) for record in records}
+    removable = []
+    for record in records:
+        match = re.match(r"^(.*)_\d+$", record["identifier"], re.IGNORECASE)
+        if not match:
+            continue
+        base = _semantic_key(match.group(1))
+        if base not in {_semantic_key(name) for name in CLUSTER_GRAPH_OUTPUTS} \
+                or base not in exact:
+            continue
+        if record["bridges"] and all(
+                bridge["conn_ref"] == cluster_uid for bridge in record["bridges"]):
+            removable.append(record)
+    if not removable:
+        return []
+    comp_nodes = graph.find("compNodes")
+    graph_outputs = graph.find("graphOutputs")
+    root_outputs = graph.find("root/rootOutputs")
+    removed = []
+    for record in removable:
+        output_uid = record["uid"]
+        graph_outputs.remove(record["graph_output"])
+        for bridge in record["bridges"]:
+            if bridge["node"] in list(comp_nodes):
+                comp_nodes.remove(bridge["node"])
+        if root_outputs is not None:
+            for root_output in list(root_outputs.findall("rootOutput")):
+                output = root_output.find("output")
+                if output is not None and output.get("v") == output_uid:
+                    root_outputs.remove(root_output)
+        removed.append(record["identifier"])
+    return removed
+
+
+def _normalize_graph_in_tree(root, graph, sbs_path, normal_opengl,
+                             cfg, used_uids, template):
+    graph_name = graph.find("identifier").get("v")
+    before = _graph_cluster_normalization_state(graph)
+    if before["fully_normalized"]:
+        return graph, {
+            "graph": graph_name,
+            "changed": False,
+            "repaired_from": None,
+            "neutral_slots": [],
+            "input_sources": {},
+        }
+    if before["outputs_routed_through_cluster"]:
+        cluster_uid = _ensure_cluster_dependency(root, sbs_path, cfg, used_uids)
+        cluster_node = _cluster_nodes(graph)[0]
+        cluster_instance = _node_implementation(cluster_node)
+        cluster_instance.find("path").set(
+            "v", f"pkg:///Cluster_System_01?dependency={cluster_uid}")
+        renamed_outputs = _canonicalize_standard_output_identifiers(graph)
+        _set_cluster_parameters(cluster_node, normal_opengl)
+        _enable_normalized_graph_exports(graph)
+        if not _graph_cluster_normalization_state(graph)["fully_normalized"]:
+            raise RuntimeError(f"{graph_name}: failed to canonicalize Cluster outputs")
+        return graph, {
+            "graph": graph_name,
+            "changed": True,
+            "repaired_from": None,
+            "neutral_slots": [],
+            "added_resources": [],
+            "removed_duplicate_outputs": [],
+            "renamed_outputs": renamed_outputs,
+            "input_sources": {},
+        }
+    if before["cluster_count"] > 1:
+        raise RuntimeError(
+            f"{graph_name}: multiple Cluster_System wrappers; refusing to guess")
+
+    repaired_from = None
+    if not before["integrity"]["valid"]:
+        graph, repaired_from = _replace_broken_graph_from_authoring(
+            root, graph, used_uids)
+        if repaired_from is None:
+            raise RuntimeError(
+                f"{graph_name}: unresolved graph references and no intact authoring source "
+                f"({len(before['integrity']['unresolved_conn_refs'])} connRef, "
+                f"{len(before['integrity']['unresolved_conn_ref_outputs'])} connRefOutput)")
+        graph_name = graph.find("identifier").get("v")
+
+    repaired_state = _graph_cluster_normalization_state(graph)
+    if repaired_from and repaired_state["outputs_routed_through_cluster"]:
+        cluster_uid = _ensure_cluster_dependency(root, sbs_path, cfg, used_uids)
+        cluster_node = _cluster_nodes(graph)[0]
+        cluster_instance = _node_implementation(cluster_node)
+        cluster_instance.find("path").set(
+            "v", f"pkg:///Cluster_System_01?dependency={cluster_uid}")
+        renamed_outputs = _canonicalize_standard_output_identifiers(graph)
+        _set_cluster_parameters(cluster_node, normal_opengl)
+        _enable_normalized_graph_exports(graph)
+        if not _graph_cluster_normalization_state(graph)["fully_normalized"]:
+            raise RuntimeError(f"{graph_name}: repaired Cluster output verification failed")
+        return graph, {
+            "graph": graph_name,
+            "changed": True,
+            "repaired_from": repaired_from,
+            "neutral_slots": [],
+            "added_resources": [],
+            "removed_duplicate_outputs": [],
+            "renamed_outputs": renamed_outputs,
+            "input_sources": {
+                slot: {
+                    "identifier": f"preserved authoring Cluster input {slot}",
+                    "source_kind": "existing_cluster_input",
+                }
+                for slot in repaired_state["cluster_inputs"]
+            },
+        }
+
+    sources = _procedural_cluster_input_sources(
+        graph, ignore_cluster_outputs=bool(repaired_state["cluster_count"]))
+    missing_required = [slot for slot in REQUIRED_PROCEDURAL_SLOTS if slot not in sources]
+    if missing_required:
+        raise RuntimeError(
+            f"{graph_name}: missing final authoring outputs for {missing_required}")
+
+    cluster_uid = _ensure_cluster_dependency(root, sbs_path, cfg, used_uids)
+    himself_uid = _find_dependency_uid(root, lambda filename: filename == "?himself")
+    if not himself_uid:
+        raise RuntimeError(f"{graph_name}: package has no ?himself dependency")
+
+    comp_nodes = graph.find("compNodes")
+    graph_outputs = graph.find("graphOutputs")
+    if comp_nodes is None or graph_outputs is None:
+        raise RuntimeError(f"{graph_name}: missing compNodes or graphOutputs")
+    root_element = graph.find("root")
+    if root_element is None:
+        root_element = ET.SubElement(graph, "root")
+    root_outputs = root_element.find("rootOutputs")
+    if root_outputs is None:
+        root_outputs = ET.SubElement(root_element, "rootOutputs")
+
+    existing_clusters = _cluster_nodes(graph)
+    cluster_is_new = not existing_clusters
+    if cluster_is_new:
+        cluster_node, _cluster_uid_map = _clone_with_remapped_uids(
+            template["cluster_node"], used_uids)
+    else:
+        cluster_node = existing_clusters[0]
+    cluster_instance = _node_implementation(cluster_node)
+    cluster_instance.find("path").set(
+        "v", f"pkg:///Cluster_System_01?dependency={cluster_uid}")
+    _set_cluster_parameters(cluster_node, normal_opengl)
+    removed_duplicate_outputs = _remove_numbered_cluster_output_duplicates(
+        graph, _node_uid(cluster_node))
+    connections = cluster_node.find("connections")
+    if connections is None:
+        connections = ET.SubElement(cluster_node, "connections")
+    for connection in list(connections):
+        connections.remove(connection)
+
+    right_edge = _graph_right_edge(graph)
+    if cluster_is_new:
+        _set_node_position(cluster_node, right_edge - 320, 0)
+    neutral_slots = []
+    added_resources = []
+    input_sources = {}
+    for index, slot in enumerate(SLOT_ORDER):
+        source = sources.get(slot)
+        if source is None:
+            neutral_slots.append(slot)
+            kind = neutral_kind_for_slot(slot)
+            resource_name, added = _ensure_neutral_resource(
+                root, sbs_path, kind, template["resource"], used_uids)
+            if added:
+                added_resources.append(resource_name)
+            template_node = template["bitmap_nodes"].get(slot)
+            if template_node is None:
+                raise RuntimeError(f"normalization template has no bitmap node for {slot}")
+            bitmap_node, _bitmap_uid_map = _clone_with_remapped_uids(
+                template_node, used_uids)
+            implementation = _node_implementation(bitmap_node)
+            value_element = None
+            for parameter in implementation.iter("parameter"):
+                name = parameter.find("name")
+                if name is not None and name.get("v") == "bitmapresourcepath":
+                    value_element = parameter.find("paramValue/constantValueString")
+                    break
+            if value_element is None:
+                raise RuntimeError(f"normalization template bitmap has no resource path: {slot}")
+            value_element.set(
+                "v", f"pkg:///Resources/{resource_name}?dependency={himself_uid}")
+            _set_node_position(bitmap_node, right_edge - 720, (index - 4.5) * 110)
+            comp_nodes.append(bitmap_node)
+            output = bitmap_node.find("compOutputs/compOutput/uid")
+            source = {
+                "identifier": f"neutral_{kind}",
+                "conn_ref": _node_uid(bitmap_node),
+                "conn_ref_output": output.get("v") if output is not None else "",
+                "source_kind": "neutral",
+            }
+        connection = ET.SubElement(connections, "connection")
+        ET.SubElement(connection, "identifier").set("v", slot)
+        ET.SubElement(connection, "connRef").set("v", source["conn_ref"])
+        ET.SubElement(connection, "connRefOutput").set("v", source["conn_ref_output"])
+        input_sources[slot] = {
+            "identifier": source["identifier"],
+            "source_kind": source["source_kind"],
+        }
+    if cluster_is_new:
+        comp_nodes.append(cluster_node)
+
+    cluster_node_uid = _node_uid(cluster_node)
+    cluster_outputs = _cluster_output_uid_map(cluster_node)
+    records = _graph_output_source_records(graph)
+    for identifier in CLUSTER_GRAPH_OUTPUTS:
+        key = _semantic_key(identifier)
+        matching = [record for record in records if _semantic_key(record["identifier"]) == key]
+        if len(matching) > 1:
+            raise RuntimeError(f"{graph_name}: duplicate graph output {identifier}")
+        cluster_output_uid = cluster_outputs.get(key)
+        if not cluster_output_uid:
+            raise RuntimeError(f"normalization template has no Cluster output {identifier}")
+        if matching:
+            record = matching[0]
+            record["graph_output"].find("identifier").set("v", identifier)
+            if not record["bridges"]:
+                raise RuntimeError(f"{graph_name}: graph output has no bridge: {identifier}")
+            for bridge in record["bridges"]:
+                _set_output_bridge_source(
+                    bridge["node"], cluster_node_uid, cluster_output_uid)
+            graph_output_uid = record["uid"]
+        else:
+            template_output = template["graph_outputs"].get(key)
+            if template_output is None:
+                raise RuntimeError(f"normalization template has no graph output {identifier}")
+            graph_output, output_uid_map = _clone_with_remapped_uids(
+                template_output, used_uids)
+            graph_output.find("identifier").set("v", identifier)
+            graph_outputs.append(graph_output)
+            old_output_uid = template_output.find("uid").get("v")
+            graph_output_uid = output_uid_map[old_output_uid]
+            template_bridge = template["output_bridges"].get(old_output_uid)
+            if template_bridge is None:
+                raise RuntimeError(f"normalization template has no output bridge {identifier}")
+            bridge, _bridge_uid_map = _clone_with_remapped_uids(
+                template_bridge, used_uids,
+                seed_map={old_output_uid: graph_output_uid})
+            _set_output_bridge_source(bridge, cluster_node_uid, cluster_output_uid)
+            comp_nodes.append(bridge)
+
+        if not any(
+                output.find("output") is not None
+                and output.find("output").get("v") == graph_output_uid
+                for output in root_outputs.findall("rootOutput")):
+            template_output = template["graph_outputs"].get(key)
+            old_output_uid = template_output.find("uid").get("v")
+            template_root_output = template["root_outputs"].get(old_output_uid)
+            if template_root_output is None:
+                raise RuntimeError(f"normalization template has no root output {identifier}")
+            root_output, _unused = _clone_with_remapped_uids(
+                template_root_output, used_uids,
+                seed_map={old_output_uid: graph_output_uid})
+            root_outputs.append(root_output)
+
+    _enable_normalized_graph_exports(graph)
+    after = _graph_cluster_normalization_state(graph)
+    if not after["fully_normalized"] or not all(
+            after["standard_outputs_through_cluster"].values()):
+        raise RuntimeError(f"{graph_name}: Cluster_System normalization verification failed")
+    return graph, {
+        "graph": graph_name,
+        "changed": True,
+        "repaired_from": repaired_from,
+        "neutral_slots": neutral_slots,
+        "added_resources": added_resources,
+        "removed_duplicate_outputs": removed_duplicate_outputs,
+        "input_sources": input_sources,
+    }
+
+
+def normalize_graphs_through_cluster(sbs_path, graph_names, normal_opengl=True, cfg=None):
+    """Normalize one SBS package transactionally, routing graphs through Cluster_System."""
+    cfg = cfg or load_config()
+    sbs_path = Path(sbs_path)
+    graph_names = list(dict.fromkeys(str(name) for name in graph_names))
+    tree = ET.parse(sbs_path)
+    root = tree.getroot()
+    used_uids = _collect_uids(root)
+    template = _normalization_template_parts()
+    results = []
+    for graph_name in graph_names:
+        graph = _find_graph_case_insensitive(root, graph_name)
+        if graph is None:
+            raise RuntimeError(f"graph not found: {graph_name} in {sbs_path.name}")
+        convention = normal_opengl.get(graph_name, True) \
+            if isinstance(normal_opengl, dict) else normal_opengl
+        _graph, result = _normalize_graph_in_tree(
+            root, graph, sbs_path, bool(convention), cfg, used_uids, template)
+        results.append(result)
+    if not any(result["changed"] for result in results):
+        return {
+            "sbs": str(sbs_path),
+            "changed": False,
+            "backup": None,
+            "graphs": results,
+        }
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    label = "__".join(re.sub(r"[^A-Za-z0-9_.-]", "_", name) for name in graph_names)
+    backup = sbs_path.with_name(
+        f"{sbs_path.stem}.pcgtex_backup_before_cluster_normalize_{label}_{stamp}.sbs")
+    temporary = sbs_path.with_name(
+        f".{sbs_path.stem}.pcgtex_cluster_normalize_{stamp}.tmp.sbs")
+    shutil.copy2(sbs_path, backup)
+    try:
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        verify_root = ET.parse(temporary).getroot()
+        for graph_name in graph_names:
+            graph = _find_graph_case_insensitive(verify_root, graph_name)
+            state = _graph_cluster_normalization_state(graph) if graph is not None else {}
+            if not state.get("fully_normalized") or not all(
+                    state.get("standard_outputs_through_cluster", {}).values()):
+                raise RuntimeError(
+                    f"{graph_name}: written Cluster_System graph failed verification")
+        temporary.replace(sbs_path)
+        ET.parse(sbs_path)
+    except Exception:
+        shutil.copy2(backup, sbs_path)
+        raise
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {
+        "sbs": str(sbs_path),
+        "changed": True,
+        "backup": str(backup),
+        "graphs": results,
+    }
+
+
+def normalize_graph_through_cluster(sbs_path, graph_name, normal_opengl=True, cfg=None):
+    """Single-graph convenience wrapper for normalize_graphs_through_cluster."""
+    return normalize_graphs_through_cluster(
+        sbs_path, [graph_name], normal_opengl=normal_opengl, cfg=cfg)
+
+
 def _patch_m_graph_input_resource_legacy(sbs_path, graph_name, slot, input_path):
     """Point one existing M_ graph bitmap slot at a new file, with rollback."""
     sbs_path = Path(sbs_path)
@@ -1666,6 +3248,11 @@ def insert_m_graph(sbs_path, graph_name, inputs, normal_opengl=True, cfg=None):
             path = neutral_image(neutral_kind_for_slot(slot))
         filled[slot] = Path(path)
 
+    existing_resource_names = {
+        resource.find("identifier").get("v", "").casefold()
+        for resource in root.iter("resource")
+        if resource.find("identifier") is not None
+    }
     resources = []
     for el in graph.iter():
         if el.tag != "compImplementation" or not len(el):
@@ -1689,9 +3276,20 @@ def insert_m_graph(sbs_path, graph_name, inputs, normal_opengl=True, cfg=None):
                 slot = TEMPLATE_SUFFIX_TO_SLOT.get(suffix)
                 if slot is None:
                     raise RuntimeError(f"템플릿 리소스 접미사 해석 실패: {old_res}")
-                new_res = f"{graph_name}_{SLOT_SUFFIX[slot]}"
+                input_path = filled[slot]
+                if input_path.stem.casefold().startswith(
+                        graph_name.casefold() + "_"):
+                    raise RuntimeError(
+                        f"{graph_name}: managed output cannot be its own input: "
+                        f"{input_path.name}"
+                    )
+                new_res = _source_resource_identifier(
+                    input_path,
+                    slot,
+                    existing_resource_names,
+                )
                 value_el.set("v", f"pkg:///Resources/{new_res}?dependency={himself_uid}")
-                resources.append((new_res, filled[slot]))
+                resources.append((new_res, input_path))
 
     # 3) 리소스 요소 생성 (Resources 그룹의 content 안)
     content = root.find("content")

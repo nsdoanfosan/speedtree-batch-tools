@@ -11,12 +11,16 @@ pcg_st9_texture_batch/pcg_texture_state.json
 pcg_st9_texture_batch/pcg_targets.json
 sk_batch/sk_batch_config.json
 sk_batch/sk_batch_state.json
+sk_batch/sk_batch_state.unreadable-*.json
 spm_generator_sync/spm_generator_sync_config.json
 spm_generator_sync/spm_generator_sync_state.json
 spm_generator_sync/spm_generator_sync_cache.json
 spm_generator_sync/spm_generator_sync_cache.json.tmp
 
 # Generated logs, audits, queues, and work reports
+work/
 pcg_st9_texture_batch/reports/
+sk_batch/cache/
 sk_batch/logs/
 spm_generator_sync/logs/
+spm_generator_sync/reports/

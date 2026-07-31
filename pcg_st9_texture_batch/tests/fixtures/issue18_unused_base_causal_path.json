@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "source_evidence": {
+    "run_date": "2026-07-31",
+    "shared_queue_sequence": 43,
+    "target": "SK_weed_blackgum_01.spm",
+    "node_table_stale": false
+  },
+  "inactive_base": {
+    "generator_name": "Leafbig",
+    "generator_type": "Base",
+    "generated_node_count": 0
+  },
+  "inactive_bindings": [
+    {
+      "generator_name": "Leaf 7",
+      "generator_type": "Leaf Mesh",
+      "parent_generator_name": "Branch 13",
+      "generated_node_count": 0,
+      "slot_prefixes": [
+        "Leaves:Type:0",
+        "Leaves:Type:1"
+      ]
+    },
+    {
+      "generator_name": "main_leaf_02 3",
+      "generator_type": "Leaf Mesh",
+      "parent_generator_name": "Branch 13",
+      "generated_node_count": 0,
+      "slot_prefixes": [
+        "Leaves:Type:0",
+        "Leaves:Type:1"
+      ]
+    }
+  ],
+  "active_control": {
+    "generator_name": "Leaf 8",
+    "generator_type": "Leaf Mesh",
+    "base_generator_name": "LeafSmall",
+    "base_generated_node_count": 87,
+    "generated_node_count": 113,
+    "slot_prefixes": [
+      "Leaves:Type:0",
+      "Leaves:Type:1"
+    ]
+  },
+  "expected": {
+    "planned_inactive_binding_count": 4,
+    "reason": "generator_causal_path_inactive_unused_base",
+    "blocking_error_absent": "generator_not_export_participating"
+  }
+}

@@ -3,17 +3,39 @@
 Pure Python (no bpy). Used by the GUI and by spm_audit; the Blender-side job
 scripts under jobs/ are self-contained on purpose (they run inside Blender).
 """
+import configparser
+import ctypes
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import uuid
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISREG
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from speedtree_pipeline_contract import (
+    BACKUP_DIRECTORY_NAMES,
+    is_live_spm,
+    production_spm_folders,
+)
+from cluster_spm_pair_contract import (
+    ClusterSpmPairPathError,
+    bootstrap_cluster_authoring,
+    inspect_cluster_spm_pair,
+    resolve_cluster_spm_pair,
+)
+from shared_job_queue import InterprocessMutex
 
 
 def _default_addon_dir():
@@ -35,6 +57,13 @@ PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 LOG_DIR = TOOL_DIR / "logs"
+STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
+STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
+PUSH_MANIFEST_SCHEMA_VERSION = 1
+PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
+DEFAULT_SEND2UE_DIR = Path(
+    r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
+)
 
 DEFAULT_CONFIG = {
     "root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",
@@ -55,21 +84,64 @@ DEFAULT_CONFIG = {
     "value_floor": 0.02,
     "max_calibration_rounds": 4,
     "probe_cache_enabled": True,
-    # Stop after the first bad Relative/FBX verification. Restore the source
-    # and mark it for manual handling instead of paying for more ~16s launches.
-    "fast_skip_problem_spm": True,
+    # Positive bone receipts are independent of the large GUI state JSON.
+    # Keeping them in one ignored tool cache avoids sidecars in asset folders.
+    "spm_calibration_receipt_dir": str(TOOL_DIR / "cache" / "spm_calibration"),
+    # Cluster prototype SPMs use exactly one Absolute bone on the first
+    # renderable structural Branch below each Tree root. Meshless placement
+    # Trunks and terminal needle/leaf spines stay at Absolute/0 and never reach
+    # Blender as long pivot bones or hundreds of Start/End pairs.
+    "cluster_root_only_bones": True,
     "rename_materials": True,    # checklist item 2: M_ prefix
+    # Direct leaf-parent Branches receive R=0 at the root and R=1 at the tip.
+    # This is tree-only and preserves the established G channel contract.
+    "tree_leaf_parent_red_gradient": True,
     "backup_spm": True,
     # SpeedTree startup is expensive, so independent SPMs run concurrently.
     # A single slow export is bounded separately by spm_verify_timeout.
     "spm_parallel_jobs": 4,
     "check_parallel_jobs": 8,
+    "blender_parallel_jobs": 2,
     # resource limits (checklist "background + cpu limit")
     "priority": "belownormal",   # idle | belownormal | normal
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
     "spm_verify_timeout": 120,
+    # Whole-worker lifetime includes waiting for the machine-wide serialized
+    # SpeedTree exporter.  The per-export timeout above starts only after the
+    # worker owns that gate.
+    "spm_job_timeout": 7200,
     "blender_job_timeout": 3600,
+    "speedtree_material_preflight_timeout": 900,
+    # These are inactivity budgets, not one queue+runtime wall-clock budget.
+    # A child progress marker resets the applicable phase budget.
+    "speedtree_material_preflight_queue_timeout": 3600,
+    "child_stage_inactivity_timeout": 180,
+    "child_timeout_grace": 60,
+    "cluster_receipt_refresh_timeout": 600,
+    "cluster_unit_probe": (
+        r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
+        r"\speedtree_unit_probe_10cm_user_scale_0_1_verified.json"
+    ),
+    "cluster_capture_resolution": 1024,
     "push_job_timeout": 1800,
+    # Avoid wedging Unreal's synchronous RPC queue with assets that are faster
+    # to handle manually than to import through the unattended handoff.
+    "push_max_polygons": 2_000_000,
+    "push_max_bones": 1_500,
+    # Successful RPC calls return immediately. These bounds only control how
+    # long an unattended Push tolerates a slow import before declaring failure.
+    "push_rpc_timeout_min": 180,
+    "push_rpc_timeout_max": 900,
+    # Preserve the established standalone Push behavior. The one-click/full
+    # unattended pipeline uses headless by default via night_headless.
+    "push_transport": "rpc",
+    "night_headless": True,
+    "unreal_editor_cmd": r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+    "unreal_project": r"C:\UnrealProjects\MyProject2\MyProject2.uproject",
+    "send2ue_dir": str(DEFAULT_SEND2UE_DIR),
+    "headless_item_crash_retries": 2,
+    "headless_batch_max_restarts": 10,
+    "headless_job_timeout": 14_400,
     "process_poll_interval": 0.2,
 }
 
@@ -79,8 +151,77 @@ PRIORITY_FLAGS = {
     "normal": 0x00000020,      # NORMAL_PRIORITY_CLASS
 }
 CREATE_NO_WINDOW = 0x08000000
-CALIBRATION_CACHE_VERSION = 1
+CALIBRATION_CACHE_VERSION = 2
+# Bump only when the semantic skeleton selection/calibration result changes.
+# Ordinary diagnostics, exporter presets and timeout changes are not bone
+# contracts and must not schedule every SPM again.
+SPM_BONE_CONTRACT_VERSION = 1
 _JSON_WRITE_LOCK = threading.RLock()
+
+
+def unreal_remote_execution_settings(unreal_project):
+    """Read Send2UE-compatible RPC discovery settings from an Unreal project.
+
+    Unreal's Python Remote Execution plugin binds multicast discovery to the
+    adapter configured in DefaultEngine.ini.  Send2UE also uses its command
+    endpoint host as the multicast bind address, so background Blender must
+    mirror the project setting instead of assuming loopback.
+    """
+    if not unreal_project:
+        return {}
+    project_path = Path(unreal_project).expanduser()
+    project_dir = (
+        project_path.parent
+        if project_path.suffix.casefold() == ".uproject"
+        else project_path
+    )
+    ini_path = project_dir / "Config" / "DefaultEngine.ini"
+    if not ini_path.is_file():
+        return {}
+
+    parser = configparser.RawConfigParser(
+        strict=False,
+        interpolation=None,
+        allow_no_value=True,
+    )
+    try:
+        parser.read_string(ini_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, configparser.Error):
+        return {}
+
+    section_name = "/Script/PythonScriptPlugin.PythonScriptPluginSettings"
+    if not parser.has_section(section_name):
+        return {}
+    values = {
+        str(key).casefold(): str(value or "").strip()
+        for key, value in parser.items(section_name)
+    }
+    enabled = values.get("bremoteexecution", "true").casefold()
+    if enabled in {"0", "false", "no", "off"}:
+        return {}
+
+    settings = {"config_path": str(ini_path.resolve())}
+    bind_address = values.get("remoteexecutionmulticastbindaddress", "")
+    try:
+        bind_ip = ipaddress.ip_address(bind_address)
+        if bind_ip.version == 4 and not bind_ip.is_unspecified:
+            settings["multicast_bind_address"] = bind_address
+    except ValueError:
+        pass
+
+    group_endpoint = values.get("remoteexecutionmulticastgroupendpoint", "")
+    group_match = re.fullmatch(r"([^:\s]+):(\d{1,5})", group_endpoint)
+    if group_match and 0 < int(group_match.group(2)) <= 65535:
+        settings["multicast_group_endpoint"] = group_endpoint
+
+    ttl_text = values.get("remoteexecutionmulticastttl", "")
+    try:
+        ttl = int(ttl_text)
+    except ValueError:
+        ttl = None
+    if ttl is not None and 0 <= ttl <= 255:
+        settings["multicast_ttl"] = ttl
+    return settings
 
 
 def _atomic_write_json(path, data):
@@ -96,6 +237,32 @@ def _atomic_write_json(path, data):
         finally:
             if temp.exists():
                 temp.unlink()
+
+
+def atomic_write_bytes(path, payload):
+    """Atomically replace a small receipt/report without exposing partial data."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    with _JSON_WRITE_LOCK:
+        try:
+            try:
+                if target.read_bytes() == payload:
+                    return
+            except OSError:
+                pass
+            temp.write_bytes(payload)
+            os.replace(temp, target)
+        finally:
+            if temp.exists():
+                temp.unlink()
+
+
+def atomic_write_json(path, data):
+    """Public atomic JSON writer for queue manifests and checkpoints."""
+    _atomic_write_json(path, data)
 
 
 def load_config():
@@ -115,17 +282,170 @@ def save_config(cfg):
     _atomic_write_json(CONFIG_PATH, cfg)
 
 
+def _append_bounded_state_recovery_log(message):
+    """Persist a small path-safe recovery notice without unbounded growth."""
+
+    try:
+        existing = STATE_RECOVERY_LOG_PATH.read_bytes()
+    except OSError:
+        existing = b""
+    encoded = str(message).encode("utf-8", errors="replace")
+    payload = existing + encoded
+    if len(payload) > STATE_RECOVERY_LOG_MAX_BYTES:
+        payload = payload[-STATE_RECOVERY_LOG_MAX_BYTES:]
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            payload = payload[newline + 1:]
+    try:
+        atomic_write_bytes(STATE_RECOVERY_LOG_PATH, payload)
+    except OSError:
+        pass
+
+
+def _state_mutex():
+    """Build the path-scoped process mutex after test/runtime path overrides."""
+
+    return InterprocessMutex(Path(STATE_PATH), timeout=10.0)
+
+
+def _state_bytes_unchanged(expected):
+    try:
+        return STATE_PATH.read_bytes() == expected
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _quarantine_unreadable_state(exc, expected_bytes):
+    """Move the exact unreadable snapshot aside, or request a re-read."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    quarantine = STATE_PATH.with_name(
+        f"{STATE_PATH.stem}.unreadable-{stamp}-{uuid.uuid4().hex[:8]}"
+        f"{STATE_PATH.suffix}"
+    )
+    if not _state_bytes_unchanged(expected_bytes):
+        return None
+    try:
+        os.replace(STATE_PATH, quarantine)
+    except FileNotFoundError:
+        return None
+    except OSError as move_exc:
+        raise RuntimeError(
+            "state_quarantine_failed: unreadable SK Batch state could not "
+            "be quarantined; refusing to start with empty state"
+        ) from move_exc
+
+    notice = (
+        f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] "
+        f"state_unreadable_quarantined name={quarantine.name} "
+        f"({type(exc).__name__})\n"
+    )
+    _append_bounded_state_recovery_log(notice)
+    try:
+        warnings.warn(notice.strip(), RuntimeWarning, stacklevel=2)
+    except RuntimeWarning:
+        pass
+    return quarantine
+
+
+def _state_entry_is_persistable(key):
+    """Drop only confirmed dead/backup SPM rows; preserve unknown metadata."""
+
+    if not isinstance(key, str):
+        return True
+    candidate = Path(key).expanduser()
+    if candidate.suffix.casefold() != ".spm":
+        return True
+    if not is_live_spm(candidate, require_file=False):
+        return False
+    try:
+        return S_ISREG(candidate.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A temporarily unavailable drive or permission boundary is not proof
+        # that a production asset is dead.
+        return True
+
+
+def _prune_state_entries(state):
+    if not isinstance(state, dict):
+        raise ValueError("SK Batch state root must be a JSON object")
+    return {
+        key: value
+        for key, value in state.items()
+        if _state_entry_is_persistable(key)
+    }
+
+
 def load_state():
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    with _JSON_WRITE_LOCK:
+        with _state_mutex().acquire():
+            for _attempt in range(8):
+                try:
+                    raw = STATE_PATH.read_bytes()
+                except FileNotFoundError:
+                    return {}
+                except OSError as exc:
+                    raise RuntimeError(
+                        "state_read_failed: SK Batch state could not be read"
+                    ) from exc
+                try:
+                    loaded = json.loads(raw)
+                    pruned = _prune_state_entries(loaded)
+                except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    quarantine = _quarantine_unreadable_state(exc, raw)
+                    if quarantine is None:
+                        continue
+                    return {}
+                if pruned != loaded:
+                    if not _state_bytes_unchanged(raw):
+                        continue
+                    _atomic_write_json(STATE_PATH, pruned)
+                return pruned
+    raise RuntimeError(
+        "state_changed_during_load: SK Batch state changed repeatedly"
+    )
 
 
 def save_state(state):
-    _atomic_write_json(STATE_PATH, state)
+    incoming = _prune_state_entries(state)
+    with _JSON_WRITE_LOCK:
+        with _state_mutex().acquire():
+            current = {}
+            try:
+                raw = STATE_PATH.read_bytes()
+            except FileNotFoundError:
+                raw = None
+            except OSError as exc:
+                raise RuntimeError(
+                    "state_read_failed: SK Batch state could not be read"
+                ) from exc
+            if raw is not None:
+                try:
+                    current = _prune_state_entries(json.loads(raw))
+                except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    quarantine = _quarantine_unreadable_state(exc, raw)
+                    if quarantine is None:
+                        raise RuntimeError(
+                            "state_changed_during_save: SK Batch state changed "
+                            "before quarantine"
+                        )
+            # State rows are asset-keyed independent updates.  Merging the
+            # latest locked snapshot prevents a stale producer from deleting
+            # a valid row created by another process; confirmed dead/backup
+            # rows were already removed from both sides.
+            merged = dict(current)
+            merged.update(incoming)
+            if raw is not None and STATE_PATH.exists():
+                if not _state_bytes_unchanged(raw):
+                    raise RuntimeError(
+                        "state_changed_during_save: SK Batch state changed "
+                        "during the locked transaction"
+                    )
+            _atomic_write_json(STATE_PATH, merged)
 
 
 def file_content_fingerprint(path, digest_size=16):
@@ -155,26 +475,196 @@ def file_content_snapshot(path):
     raise RuntimeError(f"File changed while hashing: {candidate}")
 
 
-def _dependency_identity(path, hash_content=False):
+def cached_file_content_snapshot(path, cache=None):
+    """Reuse a verified content snapshot while the file stat is unchanged."""
+    candidate = Path(path)
+    stat = candidate.stat()
+    if (
+        isinstance(cache, dict)
+        and cache.get("fingerprint")
+        and cache.get("size") == stat.st_size
+        and cache.get("mtime_ns") == stat.st_mtime_ns
+    ):
+        return {
+            "fingerprint": cache["fingerprint"],
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }, True
+    return file_content_snapshot(candidate), False
+
+
+def _push_source_stat_identity(path, required=False):
+    candidate = Path(path)
+    if not candidate.is_file():
+        if required:
+            raise FileNotFoundError(f"Push source file missing: {candidate}")
+        return {"path": str(candidate), "missing": True}
+    stat = candidate.stat()
+    return {
+        "path": str(candidate.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def push_source_snapshot(blend_path, dependency_paths=()):
+    """Cheap source identity used to decide whether a full content hash is needed."""
+    return {
+        "blend": _push_source_stat_identity(blend_path, required=True),
+        "dependencies": [
+            _push_source_stat_identity(path) for path in dependency_paths
+        ],
+    }
+
+
+def _push_source_fingerprint_record(blend_path, dependency_paths=()):
+    """Hash one stable cross-file snapshot and return its persistent cache record."""
+    dependency_paths = tuple(dependency_paths)
+    for _attempt in range(2):
+        blend_candidate = Path(blend_path)
+        blend_content = file_content_snapshot(blend_candidate)
+        blend_path_resolved = str(blend_candidate.resolve())
+        blend_identity = {
+            "path": blend_path_resolved,
+            "fingerprint": blend_content["fingerprint"],
+        }
+        snapshot = {
+            "blend": {
+                "path": blend_path_resolved,
+                "size": blend_content["size"],
+                "mtime_ns": blend_content["mtime_ns"],
+            },
+            "dependencies": [],
+        }
+        dependencies = []
+        for path in dependency_paths:
+            candidate = Path(path)
+            if not candidate.is_file():
+                missing = {"path": str(candidate), "missing": True}
+                dependencies.append(missing)
+                snapshot["dependencies"].append(dict(missing))
+                continue
+            content = file_content_snapshot(candidate)
+            resolved = str(candidate.resolve())
+            dependencies.append(
+                {"path": resolved, "fingerprint": content["fingerprint"]}
+            )
+            snapshot["dependencies"].append(
+                {
+                    "path": resolved,
+                    "size": content["size"],
+                    "mtime_ns": content["mtime_ns"],
+                }
+            )
+
+        # A source changing after its own hash but before the set completed must
+        # not be cached as one coherent export input.
+        if snapshot != push_source_snapshot(blend_path, dependency_paths):
+            continue
+        payload = {
+            "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
+            "blend": blend_identity,
+            "dependencies": dependencies,
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return {
+            "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint": hashlib.blake2b(encoded, digest_size=16).hexdigest(),
+            "snapshot": snapshot,
+        }
+    raise RuntimeError("Push source set changed while hashing")
+
+
+def push_source_fingerprint(blend_path, dependency_paths=()):
+    """Fingerprint the Blender export input and code that defines its contract."""
+    return _push_source_fingerprint_record(
+        blend_path,
+        dependency_paths,
+    )["fingerprint"]
+
+
+def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
+    """Reuse a stored content fingerprint when every source stat is unchanged."""
+    dependency_paths = tuple(dependency_paths)
+    snapshot = push_source_snapshot(blend_path, dependency_paths)
+    cache = cache if isinstance(cache, dict) else {}
+    fingerprint = cache.get("fingerprint")
+    cache_valid = (
+        cache.get("version") == PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
+        and cache.get("snapshot") == snapshot
+        and isinstance(fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{32}", fingerprint) is not None
+    )
+    if cache_valid:
+        return fingerprint, {
+            "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint": fingerprint,
+            "snapshot": snapshot,
+        }, True
+    record = _push_source_fingerprint_record(blend_path, dependency_paths)
+    return record["fingerprint"], record, False
+
+
+def manifest_item_files_match(item):
+    """Validate all cached source/export fingerprints referenced by one item."""
+    if not isinstance(item, dict) or not item.get("fingerprint"):
+        return False
+    groups = (
+        item.get("exported_files") or [],
+        item.get("handoff_files") or [],
+        [item["wind_file"]] if item.get("wind_file") else [],
+        item.get("code_files") or [],
+    )
+    for group in groups:
+        for identity in group:
+            try:
+                path = Path(identity["path"])
+                if not path.is_file():
+                    return False
+                stat = path.stat()
+                if stat.st_size != identity.get("size"):
+                    return False
+                if not identity.get("fingerprint"):
+                    return False
+                # New manifests retain the exact stat observed after hashing.
+                # Reusing a multi-GB cached FBX should be an O(1) metadata check,
+                # not another full disk read.  Older manifests have no mtime and
+                # deliberately fall back to the content hash once.
+                if identity.get("mtime_ns") == stat.st_mtime_ns:
+                    continue
+                if file_content_fingerprint(path) != identity.get("fingerprint"):
+                    return False
+            except (KeyError, OSError, TypeError):
+                return False
+    return True
+
+
+def _dependency_identity(path, hash_content=False, include_hashed_stat=False):
     candidate = Path(path) if path else None
     if not candidate or not candidate.exists():
         return {"path": str(candidate or ""), "missing": True}
     try:
         stat = candidate.stat()
-        identity = {
-            "path": str(candidate.resolve()),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-        }
+        identity = {"path": str(candidate.resolve())}
         if hash_content:
             identity["fingerprint"] = file_content_fingerprint(candidate)
+            if include_hashed_stat:
+                identity["size"] = stat.st_size
+                identity["mtime_ns"] = stat.st_mtime_ns
+        else:
+            identity["size"] = stat.st_size
+            identity["mtime_ns"] = stat.st_mtime_ns
         return identity
     except OSError as exc:
         return {"path": str(candidate), "error": str(exc)}
 
 
-def calibration_settings_signature(cfg):
-    """Invalidate result caches when behavior, presets, or target values change."""
+def _legacy_calibration_settings_signature(cfg):
+    """Return the pre-semantic signature for one-time GUI-state migration."""
     setting_keys = (
         "target_bones_per_branch",
         "max_total_bones",
@@ -185,16 +675,32 @@ def calibration_settings_signature(cfg):
         "value_floor",
         "max_calibration_rounds",
         "probe_cache_enabled",
-        "fast_skip_problem_spm",
+        "cluster_root_only_bones",
         "spm_verify_timeout",
         "rename_materials",
+        "tree_leaf_parent_red_gradient",
     )
     payload = {
         "version": CALIBRATION_CACHE_VERSION,
         "settings": {key: cfg.get(key) for key in setting_keys},
-        "spm_audit": _dependency_identity(TOOL_DIR / "spm_audit.py", hash_content=True),
-        "xml_ini": _dependency_identity(cfg.get("xml_ini"), hash_content=True),
-        "fbx_ini": _dependency_identity(cfg.get("fbx_ini"), hash_content=True),
+        # Last broad-signature producer before the semantic contract split.
+        # Keeping its exact content identity lets the current in-progress
+        # estate migrate once even though this module now imports the durable
+        # receipt fast-path.
+        "spm_audit": {
+            "path": str((TOOL_DIR / "spm_audit.py").resolve()),
+            "fingerprint": "d45ea6e72c0b1e506b4f07d97c6d7610",
+        },
+        "xml_ini": _dependency_identity(
+            cfg.get("xml_ini"),
+            hash_content=True,
+            include_hashed_stat=False,
+        ),
+        "fbx_ini": _dependency_identity(
+            cfg.get("fbx_ini"),
+            hash_content=True,
+            include_hashed_stat=False,
+        ),
         # Hashing the large executable would erase the speed win; size+mtime
         # changes whenever the installed SpeedTree build is replaced.
         "speedtree_exe": _dependency_identity(cfg.get("speedtree_exe")),
@@ -203,12 +709,46 @@ def calibration_settings_signature(cfg):
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
-def calibration_cache_matches(cache, spm_fingerprint, settings_signature):
+def calibration_settings_signature(cfg):
+    """Hash only settings that can change the semantic skeleton result."""
+    setting_keys = (
+        "target_bones_per_branch",
+        "max_total_bones",
+        "total_window_low",
+        "total_window_high",
+        "seed_relative_value",
+        "value_cap",
+        "value_floor",
+        "max_calibration_rounds",
+        "cluster_root_only_bones",
+    )
+    payload = {
+        "bone_contract_version": SPM_BONE_CONTRACT_VERSION,
+        "settings": {key: cfg.get(key) for key in setting_keys},
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def legacy_calibration_settings_signature(cfg):
+    """Return the former broad signature so current state migrates once."""
+    return _legacy_calibration_settings_signature(cfg)
+
+
+def calibration_cache_matches(
+    cache,
+    spm_fingerprint,
+    settings_signature,
+    legacy_settings_signature=None,
+):
+    accepted_signatures = {settings_signature}
+    if legacy_settings_signature:
+        accepted_signatures.add(legacy_settings_signature)
     return bool(
         isinstance(cache, dict)
         and cache.get("version") == CALIBRATION_CACHE_VERSION
         and cache.get("spm_fingerprint") == spm_fingerprint
-        and cache.get("settings_signature") == settings_signature
+        and cache.get("settings_signature") in accepted_signatures
     )
 
 
@@ -248,26 +788,107 @@ def _read_log_tail(path, max_bytes=65536):
         return ""
 
 
+PUSH_ABORT_KINDS = frozenset(
+    {"unreal_crash", "unreal_unavailable", "rpc_timeout", "push_timeout"}
+)
+
+
+def classify_push_failure(report=None, log_path=None):
+    """Classify whether a Push failure is item-local or poisons the UE queue."""
+    report = report if isinstance(report, dict) else {}
+    explicit = report.get("failure_kind")
+    if explicit:
+        return str(explicit)
+    if report.get("status") == "manual_required" or report.get("manual_required"):
+        return "manual_required"
+
+    text = "\n".join(
+        str(value)
+        for value in (
+            report.get("error"),
+            report.get("reason"),
+            report.get("message"),
+            report.get("traceback"),
+            report.get("trace"),
+            report.get("_report_error"),
+            _read_log_tail(log_path) if log_path else "",
+        )
+        if value
+    )
+    lowered = text.lower()
+    if "unreal editor crashed or exited during push" in lowered:
+        return "unreal_crash"
+    if any(
+        token in lowered
+        for token in (
+            'the call "import_asset" timed out',
+            "rpc timeout",
+            "rpc_time_out",
+            "no result file (timed out",
+        )
+    ):
+        return "rpc_timeout"
+    if any(
+        token in lowered
+        for token in (
+            "could not find an open unreal editor instance",
+            "rpc not reachable",
+            "unreal editor is not running",
+            "connectionreseterror",
+            "winerror 10054",
+        )
+    ):
+        if report.get("unreal_editor_running_after_failure") is False:
+            return "unreal_crash"
+        return "unreal_unavailable"
+    return "data_error"
+
+
 def summarize_job_failure(report=None, log_path=None, max_chars=100):
     """Extract a short actionable cause from Blender/Unreal reports and logs."""
     report = report if isinstance(report, dict) else {}
-    sources = []
+    report_sources = []
     for key in ("error", "reason", "message", "traceback", "trace", "_report_error"):
         value = report.get(key)
         if value:
-            sources.append(str(value))
+            report_sources.append(str(value))
     wind = report.get("wind")
     if isinstance(wind, dict):
         for key in ("error", "trace"):
             if wind.get(key):
-                sources.append(str(wind[key]))
-    if log_path:
-        sources.append(_read_log_tail(log_path))
-    text = "\n".join(sources)
+                report_sources.append(str(wind[key]))
+    report_text = "\n".join(report_sources)
+    log_text = _read_log_tail(log_path) if log_path else ""
+    text = "\n".join(value for value in (report_text, log_text) if value)
     lowered = text.lower()
+
+    empty_slot = re.search(
+        r"(?:mesh\s+['\"]([^'\"]+)['\"]\s+)?slot\s+(\d+)\s+has no material",
+        text,
+        re.IGNORECASE,
+    )
+    if empty_slot:
+        mesh_name = empty_slot.group(1)
+        slot_index = empty_slot.group(2)
+        location = f"{mesh_name} slot {slot_index}" if mesh_name else f"slot {slot_index}"
+        return compact_error_message(
+            f"머티리얼 빈 슬롯: {location} — ② Blender Repair에서 확인 필요",
+            max_chars,
+        )
 
     if "unreal editor crashed or exited during push" in lowered:
         return "Unreal Editor 크래시 — Push 중 에디터 종료"
+
+    failure_kind = classify_push_failure(report, log_path)
+    if failure_kind == "manual_required":
+        primary = report.get("error") or report.get("reason") or report.get("message")
+        return compact_error_message(primary or "Unreal Push 수동 처리 필요", max_chars)
+    if failure_kind == "rpc_timeout":
+        return "Unreal RPC 시간 초과 — 큐 응답 정지"
+    if failure_kind == "unreal_crash":
+        return "Unreal Editor 크래시 — Push 중 에디터 종료"
+    if failure_kind == "unreal_unavailable":
+        return "Unreal 연결 실패 — 에디터/RPC 응답 없음"
 
     if any(
         token in lowered
@@ -310,8 +931,12 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
         match = re.search(r"export_from_speedtree returned\s*([^\r\n]+)", text, re.IGNORECASE)
         return compact_error_message(f"Blender repair 실행 실패: {(match.group(1) if match else '').strip()}", max_chars)
 
+    # A structured report is authoritative. Blender shutdown can append noisy
+    # unregister_class exceptions after the real item error; those must never
+    # replace the cause shown in GUI/state.
+    exception_text = report_text or log_text
     exception_lines = []
-    for line in text.splitlines():
+    for line in exception_text.splitlines():
         stripped = line.strip()
         if re.match(r"^[A-Za-z_][\w.]*?(?:Error|Exception):\s*.+", stripped):
             exception_lines.append(stripped)
@@ -325,12 +950,15 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
     return compact_error_message(report.get("_report_error") or "원인 확인 불가", max_chars)
 
 
-BACKUP_RE = re.compile(r"\.(codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE)
+BACKUP_RE = re.compile(
+    r"\.(codex_backup|skbatch_backup|pcgtex_backup|skbatch-rescue)",
+    re.IGNORECASE,
+)
 BACKUP_SUBDIR = "_spm_backups"
 MANUAL_BONES_SUFFIX = ".skbatch_manual_bones.json"
 # Older runs used a per-tool folder name; still skip it so stragglers never
 # reappear in the working list.
-LEGACY_BACKUP_SUBDIRS = ("_skbatch_backup",)
+LEGACY_BACKUP_SUBDIRS = ("_skbatch_backup", "_pcgtex_backups")
 
 
 def manual_bones_marker_path(spm_path):
@@ -369,21 +997,172 @@ def set_manual_bones_marker(spm_path, locked):
 
 
 def scan_sk_spms(root):
-    """All live SK_*.spm while pruning backup trees before descending."""
+    """Non-Cluster SK inputs; Cluster canonical rows come from pair inventory.
+
+    Only ``<owner>/SK_x.spm`` is a shipping identity.  Timestamped safety
+    copies, capture staging and verify candidates all reuse the same SK_ name
+    deeper in the tree, so a recursive walk drowned the real rows; the location
+    contract keeps the list to what can actually be pushed.
+    """
     out = []
-    skip_dirs = {BACKUP_SUBDIR, *LEGACY_BACKUP_SUBDIRS}
-    root = Path(root)
-    if not root.exists():
-        return out
-    for current, dirs, files in os.walk(root, topdown=True):
-        dirs[:] = [name for name in dirs if name not in skip_dirs]
-        for name in files:
+    for folder in production_spm_folders(root):
+        if folder.name.casefold() == "cluster":
+            continue
+        try:
+            names = sorted(path.name for path in folder.iterdir() if path.is_file())
+        except OSError:
+            continue
+        for name in names:
             if not name.lower().startswith("sk_") or not name.lower().endswith(".spm"):
                 continue
-            if BACKUP_RE.search(name):
+            candidate = folder / name
+            if BACKUP_RE.search(name) or not is_live_spm(candidate):
                 continue
-            out.append(Path(current) / name)
+            out.append(candidate)
     return sorted(out)
+
+
+def _connected_cluster_rows(owner_folder, clusters):
+    """Return PCG's exact final-SPM-to-Cluster texture connections."""
+    from pcg_st9_texture_batch.pcg_texture_audit import cluster_connection_rows
+
+    return cluster_connection_rows(
+        owner_folder,
+        clusters=clusters,
+        connected_only=True,
+    )
+
+
+def _path_key(value):
+    return os.path.normcase(os.path.abspath(str(value))).casefold()
+
+
+def scan_cluster_spm_sources(root):
+    """Connected Cluster outputs, normalized to one canonical SK row.
+
+    A legacy unprefixed file remains a discoverable normalization input only
+    while its canonical ``SK_`` output is missing.  Once canonical exists, all
+    downstream identities use it and never publish back to the legacy name.
+    """
+    inventory = {}
+    root = Path(root)
+    if not root.exists():
+        return inventory
+    for cluster_folder in production_spm_folders(root):
+        if cluster_folder.name.casefold() != "cluster":
+            continue
+        try:
+            names = sorted(
+                path.name for path in cluster_folder.iterdir() if path.is_file()
+            )
+        except OSError:
+            continue
+        for name in names:
+            lowered = name.casefold()
+            if (
+                not lowered.endswith(".spm")
+                or lowered.startswith("~")
+                or BACKUP_RE.search(name)
+            ):
+                continue
+            source = cluster_folder / name
+            if not is_live_spm(source):
+                continue
+            try:
+                pair = resolve_cluster_spm_pair(source)
+            except ClusterSpmPairPathError:
+                continue
+            inventory.setdefault(pair["pair_id"], pair)
+
+    rows = []
+    by_owner = {}
+    for pair in inventory.values():
+        preview = inspect_cluster_spm_pair(pair["canonical_spm"])
+        row = {
+            "kind": "cluster_spm_output",
+            "source_spm": pair["canonical_spm"],
+            "authoring_spm": pair["canonical_spm"],
+            "output_spm": pair["canonical_spm"],
+            "legacy_output_spm": pair["mirror_spm"],
+            "blend_path": pair["canonical_spm"].with_suffix(".blend"),
+            "cluster_folder": pair["canonical_spm"].parent,
+            "owner_folder": pair["canonical_spm"].parent.parent,
+            "display_name": pair["canonical_spm"].name,
+            "pair_status": preview["status"],
+            "pair_action": preview["action"],
+            "pair_generation": preview["generation"],
+            "pair_conflicts": tuple(preview["conflicts"]),
+            "can_bootstrap": bool(preview["can_bootstrap"]),
+            "can_publish": bool(preview["can_publish"]),
+            "pair_receipt": pair["receipt_path"],
+            # Compatibility alias for state written by the former raw-row UI.
+            "legacy_sk_spm": pair["canonical_spm"],
+        }
+        by_owner.setdefault(row["owner_folder"], []).append(row)
+    for owner_folder, owner_rows in by_owner.items():
+        sources = [
+            row["output_spm"]
+            if row["output_spm"].is_file()
+            else row["legacy_output_spm"]
+            for row in owner_rows
+        ]
+        connection_by_source = {
+            _path_key(row.get("source_spm") or row.get("authoring_spm")): row
+            for row in _connected_cluster_rows(owner_folder, sources)
+        }
+        for row in owner_rows:
+            connection = connection_by_source.get(
+                _path_key(row["output_spm"])
+            ) or connection_by_source.get(
+                _path_key(row["legacy_output_spm"])
+            ) or {}
+            connected = tuple(connection.get("cluster_output_textures") or ())
+            if not connected and not row["authoring_spm"].is_file():
+                continue
+            row["connected_output_textures"] = connected
+            row["missing_output_textures"] = tuple(
+                connection.get("missing_cluster_output_textures") or ()
+            )
+            row["referenced_by_spms"] = tuple(
+                connection.get("referenced_by_spms") or ()
+            )
+            rows.append(row)
+    return sorted(rows, key=lambda row: str(row["authoring_spm"]).casefold())
+
+
+def speedtree_output_spm_for(spm_path):
+    """Return the canonical SK output identity for one SK Batch row."""
+    candidate = Path(spm_path)
+    try:
+        return resolve_cluster_spm_pair(candidate)["canonical_spm"]
+    except ClusterSpmPairPathError:
+        return candidate
+
+
+def prepare_cluster_spm_pair_for_job(spm_path):
+    """Normalize a legacy Cluster output name before an SK job starts."""
+    candidate = Path(spm_path)
+    try:
+        preview = inspect_cluster_spm_pair(candidate)
+    except ClusterSpmPairPathError:
+        return {"status": "not_applicable", "canonical_spm": candidate,
+                "mirror_spm": candidate, "operation": "none"}
+    if preview["can_bootstrap"]:
+        return bootstrap_cluster_authoring(preview["mirror_spm"])
+    if Path(preview["canonical_spm"]).is_file():
+        return {
+            "status": "up_to_date",
+            "operation": "none",
+            "generation": preview["generation"],
+            "canonical_spm": preview["canonical_spm"],
+            "mirror_spm": preview["mirror_spm"],
+            "output_spm": preview["canonical_spm"],
+            "receipt_path": preview["receipt_path"],
+        }
+    raise RuntimeError(
+        f"Cluster SPM output name cannot be normalized ({preview['status']}): "
+        + "; ".join(preview["conflicts"])
+    )
 
 
 # Wind preset from the file name (checklist item 4). Dead vegetation must not
@@ -401,10 +1180,55 @@ def wind_preset_for(stem):
     return "GRASS"
 
 
-def blend_path_for(spm_path):
-    """One .blend per SPM, next to it (matches SK_tree_elm_01.blend convention)."""
+def wind_preset_for_spm(spm_path):
+    """Resolve Cluster child wind from its owning vegetation folder."""
     spm = Path(spm_path)
+    owner = spm.parent.parent.name if spm.parent.name.casefold() == "cluster" else ""
+    return wind_preset_for(f"{spm.stem} {owner}")
+
+
+def blend_path_for(spm_path):
+    """Return the canonical Blend identity for ordinary or Cluster inputs."""
+    spm = Path(spm_path)
+    try:
+        spm = resolve_cluster_spm_pair(spm)["canonical_spm"]
+    except ClusterSpmPairPathError:
+        pass
     return spm.with_suffix(".blend")
+
+
+def blender_open_file_window_titles(blend_path):
+    """Return interactive Blender windows that currently hold this blend."""
+    if os.name != "nt":
+        return []
+    try:
+        expected = str(Path(blend_path).resolve()).casefold()
+    except (OSError, ValueError):
+        return []
+    titles = []
+    try:
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+        )
+
+        @callback_type
+        def collect(window, _extra):
+            length = user32.GetWindowTextLengthW(window)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(window, buffer, length + 1)
+            title = buffer.value
+            lowered = title.casefold()
+            if "blender" in lowered and expected in lowered:
+                titles.append(title)
+            return True
+
+        user32.EnumWindows(collect, 0)
+    except (AttributeError, OSError):
+        return []
+    return titles
 
 
 def set_process_affinity(pid, cores):
@@ -428,7 +1252,140 @@ def set_process_affinity(pid, cores):
         kernel32.CloseHandle(handle)
 
 
-def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True):
+def _create_kill_on_close_job(proc):
+    """Create and assign a Windows Job that owns *proc* and its descendants.
+
+    Closing the returned handle terminates every process still in the Job.  A
+    Job is the only reliable cleanup boundary when the direct Blender/Python
+    parent crashes before the GUI has a chance to run ``taskkill /T``.
+
+    Return ``None`` when Jobs are unavailable or assignment is denied.  Some
+    hosts place children in a non-nestable Job already; callers must retain the
+    existing process-tree fallback for that case.
+    """
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = (
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        )
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = (
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        )
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = (
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        )
+
+    job_object_extended_limit_information = 9
+    job_object_limit_kill_on_job_close = 0x00002000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+    )
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    assigned = False
+    try:
+        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = (
+            job_object_limit_kill_on_job_close
+        )
+        if not kernel32.SetInformationJobObject(
+            job,
+            job_object_extended_limit_information,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            return None
+        process_handle = getattr(proc, "_handle", None)
+        if process_handle is None or not kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(process_handle)
+        ):
+            return None
+        assigned = True
+        return job
+    finally:
+        if not assigned:
+            kernel32.CloseHandle(job)
+
+
+def attach_process_kill_job(proc):
+    """Best-effort Job assignment; never prevents a child from launching."""
+    job = None
+    try:
+        job = _create_kill_on_close_job(proc)
+    except Exception:
+        # Sandboxes and inherited non-nestable Jobs can reject assignment.
+        # ``terminate_process_tree`` remains the safe fallback.
+        job = None
+    proc.sk_job_handle = job
+    return job is not None
+
+
+def _close_windows_handle(handle):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return bool(kernel32.CloseHandle(wintypes.HANDLE(handle)))
+
+
+def close_process_kill_job(proc):
+    """Close a managed Job once, killing any descendants that still survive."""
+    job = getattr(proc, "sk_job_handle", None)
+    proc.sk_job_handle = None
+    if job is None or os.name != "nt":
+        return False
+    try:
+        return _close_windows_handle(job)
+    except Exception:
+        return False
+
+
+def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     """Start a background child at reduced priority + optional CPU affinity.
 
     Priority class and affinity are inherited by grandchildren (Blender ->
@@ -442,14 +1399,21 @@ def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True):
     flags = PRIORITY_FLAGS.get(cfg.get("priority", "belownormal"), PRIORITY_FLAGS["belownormal"])
     flags |= CREATE_NO_WINDOW
     handle = open(log_file, "w", encoding="utf-8", errors="replace") if log_file else None
-    proc = subprocess.Popen(
-        cmd,
-        stdout=handle if handle else subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        cwd=cwd,
-        creationflags=flags,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=handle if handle else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+            creationflags=flags,
+        )
+    except Exception:
+        if handle:
+            handle.close()
+        raise
     proc.sk_log_handle = handle  # caller closes after wait (see GUI _run_limited)
+    attach_process_kill_job(proc)
     try:
         if affinity:
             set_process_affinity(proc.pid, cfg.get("cpu_cores", os.cpu_count()))

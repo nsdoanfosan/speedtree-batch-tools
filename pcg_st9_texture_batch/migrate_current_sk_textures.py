@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,10 @@ if __package__ in (None, ""):
 
 import sbs_auto
 from export_texture_plan import build_texture_plan_from_report, bucket_refs
+from pcg_canonical_outputs import (
+    canonical_texture_root,
+    record_canonical_output,
+)
 from pcg_texture_audit import make_report
 from pcg_texture_common import REPORT_DIR, load_config
 from spm_texture_normalize import (
@@ -36,6 +41,11 @@ def current_sk_owner_rows(plan):
     """Return one render owner per texture base used by any current SK SPM."""
     groups = {}
     for row in plan.get("items", []):
+        if row.get("origin_kind") == "blender_cluster_bake":
+            # Blender physical-capture maps are already final Cluster outputs.
+            # They participate in SPM coverage as preserve-source jobs, but
+            # must never be turned into an SBS render/rename request.
+            continue
         key = str(row.get("texture_base") or row.get("atlas_base") or "").lower()
         if key:
             groups.setdefault(key, []).append(row)
@@ -44,22 +54,76 @@ def current_sk_owner_rows(plan):
         if not any(row_uses_current_sk(row) for row in rows):
             continue
         owner = next((row for row in rows if not row.get("shared_from")), rows[0])
+        owner = dict(owner)
+        material_targets = {}
+        material_spms = {}
+        for row in rows:
+            for target in row.get("material_targets") or []:
+                key = (
+                    str(Path(target.get("spm") or "").resolve()).casefold(),
+                    str(target.get("material_id") or "").casefold(),
+                    str(target.get("material_name") or "").casefold(),
+                )
+                material_targets[key] = dict(target)
+            for spm in row.get("material_spms") or []:
+                material_spms[
+                    str(Path(spm).resolve()).casefold()
+                ] = str(spm)
+        if material_targets:
+            owner["material_targets"] = [
+                material_targets[key] for key in sorted(material_targets)
+            ]
+        owner["material_spms"] = [
+            material_spms[key] for key in sorted(material_spms)
+        ]
         owners.append(owner)
     return sorted(owners, key=lambda row: str(row.get("texture_base", "")).lower())
 
 
 def complete_output_set(row, expected_pixels=None, roles=None):
     paths = output_paths(row["texture_dir"], row["texture_base"])
-    selected = [paths[role] for role in (roles or paths)]
+    selected_roles = tuple(roles or paths)
+    selected = [paths[role] for role in selected_roles]
     if not all(path.is_file() and path.stat().st_size > 0 for path in selected):
         return False
     if expected_pixels:
         try:
-            return all(sbs_auto.image_pixel_size(path) == tuple(expected_pixels)
-                       for path in selected)
+            if not all(sbs_auto.image_pixel_size(path) == tuple(expected_pixels)
+                       for path in selected):
+                return False
         except Exception:
             return False
-    return True
+    return not any(
+        sbs_auto.rendered_map_content_error(paths[role], role)
+        for role in selected_roles
+    )
+
+
+def verify_complete_output_set(texture_dir, texture_base, expected_pixels=None):
+    """Raise unless the complete six-map contract exists at one resolution."""
+    paths = output_paths(texture_dir, texture_base)
+    errors = []
+    for role in sbs_auto.RENDER_MAPS:
+        path = paths[role]
+        if not path.is_file() or path.stat().st_size <= 0:
+            errors.append(f"{role}=missing")
+            continue
+        if expected_pixels:
+            try:
+                size = sbs_auto.image_pixel_size(path)
+            except Exception as exc:
+                errors.append(f"{role}=unreadable ({exc})")
+                continue
+            if tuple(size) != tuple(expected_pixels):
+                errors.append(f"{role}={size}, expected {tuple(expected_pixels)}")
+                continue
+        content_error = sbs_auto.rendered_map_content_error(path, role)
+        if content_error:
+            errors.append(f"{role}={content_error}")
+    if errors:
+        raise RuntimeError(
+            f"{texture_base}: incomplete six-map output: " + "; ".join(errors))
+    return [paths[role] for role in sbs_auto.RENDER_MAPS]
 
 
 def expected_job_size(job):
@@ -74,6 +138,8 @@ def expected_job_size(job):
 
 
 def job_needs_source_repair(job):
+    if job.get("mode") == "direct":
+        return bool(_direct_subsurface_repair(job))
     if job.get("mode") != "render" or not job["row"].get("canonical_source_provenance"):
         return False
     try:
@@ -88,10 +154,40 @@ def job_needs_source_repair(job):
     )
 
 
+def _is_neutral_input(path):
+    return bool(path) and Path(path).stem.lower().startswith("neutral_")
+
+
+def _direct_subsurface_repair(job):
+    """Recover only an authoritative real Subsurface source from a neutral slot.
+
+    Direct procedural graphs may intentionally author Subsurface Amount, so this
+    deliberately does not reconcile every bitmap or force Amount to white.
+    """
+    if job.get("mode") != "direct" \
+            or not job.get("row", {}).get("canonical_source_provenance"):
+        return {}
+    try:
+        current = sbs_auto.parse_m_graph(job["sbs"], job["graph"])["inputs"]
+        planned, _notes = sbs_auto.plan_inputs_from_row(
+            job["row"], require_alpha=False)
+    except Exception:
+        return {}
+    desired = planned.get("Subsurface")
+    existing = current.get("Subsurface")
+    if not desired or _is_neutral_input(desired) or not Path(desired).is_file():
+        return {}
+    if not _is_neutral_input(existing):
+        return {}
+    return {"Subsurface": Path(desired)}
+
+
 def _packaged_resource_replacement(sbs_path, missing_path):
     """Find a moved embedded resource beside its SBS by the recorded filename."""
     sbs_path = Path(sbs_path)
     raw_stem = Path(missing_path).stem.lower()
+    if raw_stem in {"neutral_black", "neutral_white", "neutral_normal"}:
+        return sbs_auto.neutral_image(raw_stem.removeprefix("neutral_"))
     target_stems = [raw_stem]
     if raw_stem.startswith("xxxxxx-"):
         target_stems.append(raw_stem[7:])
@@ -177,11 +273,17 @@ def build_job(row):
             if name:
                 graph_name, graph_sbs = name, sbs
                 break
+    asset_root = row.get("folder")
+    output_dir = (
+        canonical_texture_root(asset_root)
+        if asset_root
+        else Path(row.get("texture_dir") or Path.cwd()).resolve()
+    )
     job = {
         "base": base,
         "texture_base": texture_base,
         "row": row,
-        "out_dir": row.get("texture_dir") or str(Path(row["folder"]) / "texture"),
+        "out_dir": str(output_dir),
         "normal_opengl": row.get("normal_convention") != "DirectX",
     }
     if graph_name:
@@ -194,9 +296,15 @@ def build_job(row):
                 mode="direct",
                 graph=promotion["authoring"],
                 sbs=graph_sbs,
-                direct_maps=promotion["direct_maps"],
+                direct_maps=list(sbs_auto.RENDER_MAPS),
+                normalize_cluster=True,
                 direct_fallback_opacity=_unique_graph_opacity_source(authoring_sources),
                 promote_authoring=promotion,
+                rename_graph_to=(
+                    texture_base
+                    if promotion["managed"].lower() != texture_base.lower()
+                    else None
+                ),
                 notes=[
                     f"promote procedural/direct {promotion['authoring']} over generated clone "
                     f"{promotion['managed']}"
@@ -209,6 +317,27 @@ def build_job(row):
             current_name = sbs_auto.find_m_graph_name(graph_sbs, graph_name)
         if current_name:
             graph_name = current_name
+        cluster_state = sbs_auto.graph_cluster_normalization_state(
+            graph_sbs, graph_name)
+        if cluster_state["cluster_count"] > 1:
+            raise RuntimeError(
+                f"{graph_name}: multiple Cluster_System wrappers")
+        # A procedural graph already wrapped by Cluster_System must be cooked
+        # and rendered as that graph.  Parsing its bitmap ancestry and calling
+        # Cluster_System.sbsar directly would bypass the authoring nodes again.
+        if cluster_state["wrapped_direct"]:
+            source = sbs_auto.inspect_graph_sources(graph_sbs, graph_name)
+            job.update(
+                mode="direct", graph=graph_name, sbs=graph_sbs,
+                direct_maps=list(sbs_auto.RENDER_MAPS),
+                normalize_cluster=False,
+                direct_fallback_opacity=_unique_graph_opacity_source(source),
+                rename_graph_to=(
+                    texture_base
+                    if graph_name.lower() != texture_base.lower() else None
+                ),
+            )
+            return job
         try:
             info = sbs_auto.parse_m_graph(graph_sbs, graph_name)
             graph_error = None
@@ -240,11 +369,12 @@ def build_job(row):
             if all(name in direct_maps for name in ("color", "normal", "extra", "height")):
                 job.update(
                     mode="direct", graph=graph_name, sbs=graph_sbs,
-                    direct_maps=direct_maps,
+                    direct_maps=list(sbs_auto.RENDER_MAPS),
+                    normalize_cluster=True,
                     direct_fallback_opacity=_unique_graph_opacity_source(source),
                     rename_graph_to=(
-                        texture_base if graph_name.lower().startswith("m_")
-                        and graph_name.lower() != texture_base.lower() else None
+                        texture_base
+                        if graph_name.lower() != texture_base.lower() else None
                     ),
                 )
                 return job
@@ -270,8 +400,7 @@ def build_job(row):
             return job
         rename_to = (
             texture_base
-            if graph_name.lower().startswith("m_")
-            and graph_name.lower() != texture_base.lower()
+            if graph_name.lower() != texture_base.lower()
             else None
         )
         job.update(
@@ -290,13 +419,15 @@ def build_job(row):
     return job
 
 
-def preflight(plan, force=False):
+def preflight(plan, force=False, record_manifests=False):
     jobs = []
     skipped_complete = []
     errors = []
     for row in current_sk_owner_rows(plan):
         try:
             job = build_job(row)
+            if force:
+                job["force_cluster_recook"] = True
             job["size_log2"] = expected_job_size(job)
             expected_pixels = sbs_auto.size_log2_pixels(job["size_log2"])
             graph_needs_update = False
@@ -304,19 +435,31 @@ def preflight(plan, force=False):
                 graph_needs_update = sbs_auto.managed_graph_resolution_state(
                     job["sbs"], job["graph"])["needs_update"]
             source_needs_repair = job_needs_source_repair(job)
-            structural_needs_update = bool(job.get("promote_authoring"))
-            if (complete_output_set(row, expected_pixels=expected_pixels)
+            structural_needs_update = bool(
+                job.get("promote_authoring")
+                or job.get("normalize_cluster")
+                or job.get("rename_graph_to")
+            )
+            canonical_row = dict(row)
+            canonical_row["texture_dir"] = job["out_dir"]
+            if (complete_output_set(
+                    canonical_row, expected_pixels=expected_pixels)
                     and not force and not graph_needs_update
                     and not source_needs_repair
                     and not structural_needs_update):
-                skipped_complete.append(row)
+                completed_row = dict(row)
+                if record_manifests:
+                    files = verify_complete_output_set(
+                        job["out_dir"],
+                        job["texture_base"],
+                        expected_pixels=expected_pixels,
+                    )
+                    manifest = _record_job_manifest(job, files)
+                    completed_row["canonical_manifest"] = (
+                        str(manifest) if manifest else None
+                    )
+                skipped_complete.append(completed_row)
                 continue
-            if not force and job.get("mode") == "direct" and not structural_needs_update:
-                required = set(job.get("direct_maps", [])) | {"opacity"}
-                if complete_output_set(
-                        row, expected_pixels=expected_pixels, roles=required):
-                    skipped_complete.append(row)
-                    continue
             jobs.append(job)
         except Exception as exc:
             errors.append({
@@ -349,6 +492,68 @@ def _same_path(left, right):
         return str(left).lower() == str(right).lower()
 
 
+def _merge_render_output_info(render_results):
+    """Merge changed/unchanged partitions from direct and fallback renders."""
+    merged = {
+        "changed_files": [],
+        "unchanged_files": [],
+        "created_files": [],
+        "backup_dirs": [],
+    }
+    seen = {key: set() for key in merged}
+
+    def append_unique(key, value):
+        path = Path(value)
+        marker = str(path).lower()
+        if marker not in seen[key]:
+            seen[key].add(marker)
+            merged[key].append(path)
+
+    for info in render_results:
+        for path in info.get("changed_files", info.get("files", [])):
+            append_unique("changed_files", path)
+        for path in info.get("unchanged_files", []):
+            append_unique("unchanged_files", path)
+        for path in info.get("created_files", []):
+            append_unique("created_files", path)
+        if info.get("backup_dir"):
+            append_unique("backup_dirs", info["backup_dir"])
+
+    changed_keys = {str(path).lower() for path in merged["changed_files"]}
+    merged["unchanged_files"] = [
+        path for path in merged["unchanged_files"]
+        if str(path).lower() not in changed_keys
+    ]
+    merged["backup_dir"] = (
+        merged["backup_dirs"][0] if merged["backup_dirs"] else None)
+    return merged
+
+
+def _record_job_manifest(job, files):
+    """Record production jobs; isolated renderer unit fixtures have no asset."""
+    if not job.get("row", {}).get("folder"):
+        return None
+    return record_canonical_output(
+        job["row"],
+        files,
+        producer_source=(
+            f"{job.get('sbs') or ''}#{job.get('graph') or ''}"
+        ),
+    )
+
+
+def _asset_local_legacy_maps(job):
+    """Never delete a legacy output outside this job's asset texture folder."""
+    output_dir = Path(job["out_dir"]).resolve()
+    return {
+        role: path
+        for role, path in (
+            job.get("row", {}).get("legacy_export_maps") or {}
+        ).items()
+        if path and Path(path).resolve().parent == output_dir
+    }
+
+
 def run_job(job, cfg, timeout):
     base = job["base"]
     texture_base = job["texture_base"]
@@ -364,45 +569,110 @@ def run_job(job, cfg, timeout):
         job["graph"] = job["rename_graph_to"]
         job["rename_graph_to"] = None
     if job["mode"] == "direct":
-        rendered = sbs_auto.render_sbs_graph_maps(
-            job["sbs"], job["graph"], texture_base, job["out_dir"],
-            cache_root=REPORT_DIR / "_cooked_sbs_cache",
-            cfg=cfg, maps=job.get("direct_maps", sbs_auto.RENDER_MAPS),
-            size_log2=job.get("size_log2"),
-            timeout=timeout, return_info=True)
-        job["size_log2"] = tuple(rendered["size_log2"])
-        resolution_update = sbs_auto.set_graph_default_size(
-            job["sbs"], job["graph"], job["size_log2"])
-        files = list(rendered["files"])
-        if "opacity" not in job.get("direct_maps", sbs_auto.RENDER_MAPS):
-            try:
-                planned_inputs, _notes = sbs_auto.plan_inputs_from_row(
-                    job["row"], require_alpha=False)
-            except Exception:
-                planned_inputs = {}
-            opacity_source = (
-                job.get("direct_fallback_opacity")
-                or planned_inputs.get("Opacity")
-                or sbs_auto.neutral_image("white")
-            )
-            files.extend(sbs_auto.render_maps(
-                texture_base,
-                {"Opacity": opacity_source},
-                sbs_auto.default_params(job["normal_opengl"]),
-                job["out_dir"], cfg=cfg, maps=("opacity",),
+        normalization_update = None
+        resolution_update = None
+        source_repair_updates = []
+        try:
+            for slot, replacement in _direct_subsurface_repair(job).items():
+                source_repair_updates.append(
+                    sbs_auto.patch_m_graph_input_resource(
+                        job["sbs"], job["graph"], slot, replacement))
+            if job.get("normalize_cluster"):
+                normalization_update = sbs_auto.normalize_graph_through_cluster(
+                    job["sbs"], job["graph"],
+                    normal_opengl=job["normal_opengl"], cfg=cfg)
+                job["normalize_cluster"] = False
+                job["direct_maps"] = list(sbs_auto.RENDER_MAPS)
+            direct_maps = tuple(
+                job.get("direct_maps", sbs_auto.RENDER_MAPS))
+            desired_size = tuple(
+                job.get("size_log2")
+                or sbs_auto.graph_render_size_log2(
+                    job["sbs"], job["graph"]))
+            # Normalize the graph, bitmap readers, and final Cluster_System
+            # wrapper before cooking.  A relative -2 wrapper override would
+            # otherwise turn an explicitly requested 4K render into 1K.
+            resolution_update = sbs_auto.set_managed_graph_resolution(
+                job["sbs"], job["graph"], size_log2=desired_size)
+            job["size_log2"] = tuple(resolution_update["size_log2"])
+            rendered = sbs_auto.render_sbs_graph_maps(
+                job["sbs"], job["graph"], texture_base, job["out_dir"],
+                cache_root=REPORT_DIR / "_cooked_sbs_cache",
+                cfg=cfg, maps=direct_maps,
                 size_log2=job.get("size_log2"),
-                timeout=timeout,
-            ))
+                timeout=timeout, return_info=True,
+                normal_opengl=job["normal_opengl"],
+                force_recook=bool(job.get("force_cluster_recook")))
+            render_results = [rendered]
+            actual_size = tuple(rendered["size_log2"])
+            if actual_size != job["size_log2"]:
+                raise RuntimeError(
+                    f"direct graph ignored normalized output size: "
+                    f"expected {job['size_log2']}, got {actual_size}")
+            missing_roles = tuple(
+                role for role in sbs_auto.RENDER_MAPS if role not in direct_maps)
+            if missing_roles:
+                try:
+                    planned_inputs, _notes = sbs_auto.plan_inputs_from_row(
+                        job["row"], require_alpha=False)
+                except Exception:
+                    planned_inputs = {}
+                if "opacity" in missing_roles:
+                    planned_inputs["Opacity"] = (
+                        job.get("direct_fallback_opacity")
+                        or planned_inputs.get("Opacity")
+                        or sbs_auto.neutral_image("white")
+                    )
+                fallback_rendered = sbs_auto.render_maps(
+                    texture_base,
+                    planned_inputs,
+                    sbs_auto.default_params(job["normal_opengl"]),
+                    job["out_dir"], cfg=cfg, maps=missing_roles,
+                    size_log2=job.get("size_log2"),
+                    timeout=timeout,
+                    return_info=True,
+                )
+                render_results.append(fallback_rendered)
+            files = verify_complete_output_set(
+                job["out_dir"], texture_base,
+                expected_pixels=sbs_auto.size_log2_pixels(job["size_log2"]),
+            )
+            output_changes = _merge_render_output_info(render_results)
+        except Exception:
+            # Graph structure and the six rendered maps are one transaction.
+            # render_sbs_graph_maps restores textures; restore the SBS too.
+            if resolution_update and resolution_update.get("changed") \
+                    and resolution_update.get("backup"):
+                shutil.copy2(resolution_update["backup"], job["sbs"])
+            if normalization_update and normalization_update.get("changed") \
+                    and normalization_update.get("backup"):
+                shutil.copy2(normalization_update["backup"], job["sbs"])
+            if source_repair_updates:
+                shutil.copy2(source_repair_updates[0]["backup"], job["sbs"])
+            raise
         deleted = sbs_auto.delete_legacy_m_outputs(
-            base, job["out_dir"], legacy_maps=job["row"].get("legacy_export_maps"))
+            base,
+            job["out_dir"],
+            legacy_maps=_asset_local_legacy_maps(job),
+        )
+        manifest = _record_job_manifest(job, files)
         return {
             "texture_base": texture_base,
             "mode": "direct_sbs_graph",
             "files": [str(path) for path in files],
-            "backup_dir": str(rendered["backup_dir"]) if rendered.get("backup_dir") else None,
+            "changed_files": [str(path) for path in output_changes["changed_files"]],
+            "unchanged_files": [str(path) for path in output_changes["unchanged_files"]],
+            "created_files": [str(path) for path in output_changes["created_files"]],
+            "backup_dir": (
+                str(output_changes["backup_dir"])
+                if output_changes["backup_dir"] else None),
+            "backup_dirs": [str(path) for path in output_changes["backup_dirs"]],
             "resolution_update": resolution_update,
             "promotion_update": promotion_update,
+            "cluster_normalization": normalization_update,
+            "source_repairs": source_repair_updates,
             "deleted_legacy": [str(path) for path in deleted],
+            "canonical_manifest": str(manifest) if manifest else None,
         }
     if job["mode"] == "render":
         for slot, replacement in job.get("repair_resources", {}).items():
@@ -426,7 +696,7 @@ def run_job(job, cfg, timeout):
         current_subsurface = inputs.get("Subsurface")
         if desired_subsurface and (
                 not current_subsurface
-                or "neutral_black" in Path(current_subsurface).name.lower()):
+                or _is_neutral_input(current_subsurface)):
             sbs_auto.patch_m_graph_input_resource(
                 job["sbs"], job["graph"], "Subsurface", desired_subsurface)
             inputs["Subsurface"] = desired_subsurface
@@ -461,14 +731,29 @@ def run_job(job, cfg, timeout):
     rendered = sbs_auto.render_maps(
         texture_base, inputs, params, job["out_dir"],
         cfg=cfg, size_log2=job.get("size_log2"), timeout=timeout, return_info=True)
+    files = verify_complete_output_set(
+        job["out_dir"], texture_base,
+        expected_pixels=rendered.get("pixel_size"),
+    )
+    output_changes = _merge_render_output_info([rendered])
     deleted = sbs_auto.delete_legacy_m_outputs(
-        base, job["out_dir"], legacy_maps=job["row"].get("legacy_export_maps"))
+        base,
+        job["out_dir"],
+        legacy_maps=_asset_local_legacy_maps(job),
+    )
+    manifest = _record_job_manifest(job, files)
     return {
         "texture_base": texture_base,
-        "files": [str(path) for path in rendered["files"]],
-        "backup_dir": str(rendered["backup_dir"]) if rendered.get("backup_dir") else None,
+        "files": [str(path) for path in files],
+        "changed_files": [str(path) for path in output_changes["changed_files"]],
+        "unchanged_files": [str(path) for path in output_changes["unchanged_files"]],
+        "created_files": [str(path) for path in output_changes["created_files"]],
+        "backup_dir": (
+            str(output_changes["backup_dir"])
+            if output_changes["backup_dir"] else None),
         "resolution_update": resolution_update,
         "deleted_legacy": [str(path) for path in deleted],
+        "canonical_manifest": str(manifest) if manifest else None,
     }
 
 
@@ -504,7 +789,11 @@ def main():
     # also records which existing graphs have real Subsurface/Translucency.
     spm_jobs = jobs_from_texture_plan(plan)
     print("[preflight] checking render jobs", flush=True)
-    jobs, complete, errors = preflight(plan, force=args.force)
+    jobs, complete, errors = preflight(
+        plan,
+        force=args.force,
+        record_manifests=not args.dry_run,
+    )
     errors.extend(validate_spm_job_coverage(spm_jobs))
     summary = {
         "audit": str(audit_path),

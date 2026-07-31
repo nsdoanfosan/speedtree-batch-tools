@@ -7,11 +7,15 @@ The tool treats each vegetation folder as a small family graph:
       - follower_b.spm
     independent.spm
 
-Only generator settings and additive Base-subtree structure are synchronized.
-Target identity and variation data (GUIDs, names, random seeds, materials,
-BaseRef placement, node/freehand edits, and target-only generators) remain in
-the follower.  The Generators/Links XML sections are patched without rewriting
-the usually very large Nodes section.
+Generator settings and additive Base-subtree structure flow one way from the
+master to each selected follower.  The master is an immutable source during a
+follower sync: it is fingerprinted for concurrent-change detection, but it is
+never patched, backed up, verified, or restored by that transaction.
+Follower-only governed Generator subtrees are removed from that follower and
+are never promoted to the master or distributed to siblings.  Per-file
+identity and variation data (GUIDs, names, random seeds, materials, BaseRef
+placement, and node/freehand edits) remain local.  The Generators/Links XML
+sections are patched without rewriting the usually very large Nodes section.
 """
 
 from __future__ import annotations
@@ -21,12 +25,12 @@ import base64
 import copy
 import gzip
 import hashlib
-import html
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -39,9 +43,29 @@ from pathlib import Path
 
 
 TOOL_DIR = Path(__file__).resolve().parent
+REPO_DIR = TOOL_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
+from cluster_blend_sync import discover_cluster_blend_relations
+from speedtree_export_options_contract import require_texture_skip_writing
+try:
+    from .process_stream import ProcessCancelled, run_streaming_process
+except ImportError:  # direct script/GUI-engine loading puts TOOL_DIR on sys.path
+    from process_stream import ProcessCancelled, run_streaming_process
+from speedtree_pipeline_contract import speedtree_generator_guid
+
 MANIFEST_NAME = "spm_generator_sync.json"
 BACKUP_SUBDIR = "_spm_backups"
-SKIP_DIRS = {BACKUP_SUBDIR, "_skbatch_backup", "_pcgtex_backups"}
+SKIP_DIRS = {
+    BACKUP_SUBDIR,
+    "_skbatch_backup",
+    "_pcgtex_backups",
+    "_codex_backups",
+    "_atlas_cluster_normalization_backups",
+}
 BACKUP_NAME_RE = re.compile(
     r"(^~|\.sbk$|backup|codex_backup|skbatch_backup|pcgtex_backup)",
     re.IGNORECASE,
@@ -75,11 +99,66 @@ SELF_CLOSING_SECTION_RE = {
     tag: re.compile(rf"<{tag}\b[^>]*/>") for tag in ("Generators", "Links")
 }
 ASSETS_SECTION_RE = re.compile(r"<Assets(?:\s[^>]*)?>.*?</Assets>", re.DOTALL)
-ASSET_TAG_RE = re.compile(r"<(Material_v8|Mesh)\b([^>]*)>", re.DOTALL)
+ASSETS_SELF_CLOSING_RE = re.compile(r"<Assets\b[^>]*/>")
+GENERATION_PASS_PROPERTY = "Generation:Shared:Pass"
 
 
 class SyncError(RuntimeError):
     """Actionable SPM synchronization failure."""
+
+
+class SyncCancelled(SyncError):
+    """A requested cancellation with its exact child termination outcome."""
+
+    def __init__(
+        self,
+        termination_state: str = "cancelled_at_safe_boundary",
+        *,
+        pid: int | None = None,
+        returncode: int | None = None,
+    ):
+        self.termination_state = str(termination_state)
+        self.pid = pid
+        self.returncode = returncode
+        labels = {
+            "cancelled_at_safe_boundary": "안전 경계에서 취소됨",
+            "cancelled_before_launch": "프로세스 실행 전에 취소됨",
+            "cancelled_after_exit": "프로세스 종료 경합 중 취소됨",
+            "cancelled_terminated": "프로세스 종료 요청 후 취소됨",
+            "cancelled_killed": "프로세스 강제 종료 fallback 후 취소됨",
+        }
+        super().__init__(labels.get(self.termination_state, "작업이 취소되었습니다"))
+
+    def as_dict(self) -> dict:
+        return {
+            "status": "cancelled",
+            "termination_state": self.termination_state,
+            "pid": self.pid,
+            "returncode": self.returncode,
+        }
+
+
+class TransactionRollbackError(SyncError):
+    """A transaction failed and at least one restore step also failed."""
+
+    reason_token = "transaction_rollback_failed"
+
+    def __init__(self, original: BaseException, rollback_errors: list[dict]):
+        self.original_error = f"{type(original).__name__}: {original}"
+        self.rollback_errors = tuple(dict(item) for item in rollback_errors)
+        evidence = "; ".join(
+            f"{item['operation']}:{item['path']}:{item['error']}"
+            for item in self.rollback_errors
+        )
+        super().__init__(
+            f"[{self.reason_token}] original={self.original_error}; "
+            f"rollback={evidence}"
+        )
+
+
+def _raise_if_cancelled(cancel_requested) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise SyncCancelled("cancelled_at_safe_boundary")
 
 
 def is_active_spm(path: Path) -> bool:
@@ -91,16 +170,39 @@ def is_active_spm(path: Path) -> bool:
     return not BACKUP_NAME_RE.search(path.name)
 
 
-def read_spm_text(path: Path) -> tuple[str, bool]:
+def read_spm_snapshot(path: Path) -> tuple[str, bool, str]:
+    """Read one stable SPM byte snapshot and retain its exact fingerprint."""
+
     path = Path(path)
-    raw = path.read_bytes()
+    raw = None
+    for _attempt in range(2):
+        before = path.stat()
+        candidate = path.read_bytes()
+        after = path.stat()
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raw = candidate
+            break
+    if raw is None:
+        raise SyncError(f"읽는 동안 SPM이 변경되었습니다: {path}")
+    fingerprint = hashlib.sha256(raw).hexdigest()
     compressed = raw.startswith(b"\x1f\x8b")
     if compressed:
         raw = gzip.decompress(raw)
     try:
-        return raw.decode("utf-8"), compressed
+        return raw.decode("utf-8"), compressed, fingerprint
     except UnicodeDecodeError as exc:
         raise SyncError(f"UTF-8 SPM이 아닙니다: {path}") from exc
+
+
+def read_spm_text(path: Path) -> tuple[str, bool]:
+    text, compressed, _fingerprint = read_spm_snapshot(path)
+    return text, compressed
 
 
 def read_spm_prefix(path: Path) -> str:
@@ -125,6 +227,31 @@ def read_spm_prefix(path: Path) -> str:
         # omit the Links section entirely.
         return joined
     raise SyncError(f"SPM에서 Links 섹션을 찾지 못했습니다: {path}")
+
+
+def _spm_fingerprint(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _assert_spm_unchanged(fingerprints: dict[Path, str]) -> None:
+    """Refuse to overwrite SPMs another tool rewrote while this run computed.
+
+    Patches are built from the bytes read at plan time and the SpeedTree
+    preflight between then and the write can run for minutes, so a Cluster
+    relationship ON/OFF or a second sync finishing in that window would
+    otherwise be silently reverted by this transaction's stale text.
+    """
+    drifted = [
+        path for path, digest in fingerprints.items()
+        if not path.is_file() or _spm_fingerprint(path) != digest
+    ]
+    if drifted:
+        raise SyncError(
+            "동기화를 계산하는 동안 다른 작업이 같은 SPM을 수정했습니다. "
+            "원본을 덮어쓰지 않고 중단합니다: "
+            + ", ".join(path.name for path in drifted)
+            + "\nCluster 관계 ON/OFF 등 다른 도구가 끝난 뒤 다시 실행하세요."
+        )
 
 
 def write_spm_text(path: Path, text: str, compressed: bool) -> None:
@@ -173,6 +300,29 @@ def insert_links_section(text: str, replacement: str) -> str:
     return text[:index] + replacement + "\n" + text[index:]
 
 
+def append_assets_section(text: str, assets: list[ET.Element]) -> str:
+    """Append cloned asset definitions without reserializing existing assets."""
+    if not assets:
+        return text
+    serialized = "".join(
+        "\n\t\t" + ET.tostring(asset, encoding="unicode", short_empty_elements=True)
+        for asset in assets
+    )
+    section = ASSETS_SECTION_RE.search(text)
+    if section is not None:
+        close_at = section.end() - len("</Assets>")
+        return text[:close_at] + serialized + "\n\t" + text[close_at:]
+    self_closing = ASSETS_SELF_CLOSING_RE.search(text)
+    if self_closing is not None:
+        replacement = "<Assets>" + serialized + "\n\t</Assets>"
+        return text[:self_closing.start()] + replacement + text[self_closing.end():]
+    generators = _section_match(text, "Generators")
+    if generators is None:
+        raise SyncError("SPM에서 Assets 섹션을 삽입할 위치를 찾지 못했습니다")
+    replacement = "<Assets>" + serialized + "\n\t</Assets>\n\t"
+    return text[:generators.start()] + replacement + text[generators.start():]
+
+
 def validate_xml_text(text: str) -> None:
     parser = xml.parsers.expat.ParserCreate()
     try:
@@ -187,11 +337,125 @@ def canonical_base_name(name: str) -> str:
     return value.replace(" ", "_")
 
 
+class SearchSyntaxError(ValueError):
+    """Malformed SpeedTree search expression used by a Base filter."""
+
+
+def _split_search_expression(expression: str, operator: str) -> list[str]:
+    """Split one SpeedTree search operator outside quotes and parentheses."""
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quoted = False
+    for index, character in enumerate(expression):
+        if character == '"':
+            quoted = not quoted
+            continue
+        if quoted:
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                raise SearchSyntaxError("닫는 괄호가 더 많습니다")
+        elif character == operator and depth == 0:
+            parts.append(expression[start:index].strip())
+            start = index + 1
+    if quoted:
+        raise SearchSyntaxError("닫히지 않은 따옴표가 있습니다")
+    if depth != 0:
+        raise SearchSyntaxError("닫히지 않은 괄호가 있습니다")
+    parts.append(expression[start:].strip())
+    if any(not part for part in parts):
+        raise SearchSyntaxError(f"'{operator}' 연산자 양쪽에 검색식이 필요합니다")
+    return parts
+
+
+def _strip_search_parentheses(expression: str) -> str:
+    value = expression.strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        quoted = False
+        closes_at_end = False
+        for index, character in enumerate(value):
+            if character == '"':
+                quoted = not quoted
+                continue
+            if quoted:
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(value) - 1
+                    break
+        if not closes_at_end:
+            break
+        value = value[1:-1].strip()
+    return value
+
+
+def speedtree_search_matches(value: str, expression: str) -> bool:
+    """Evaluate documented SpeedTree search syntax against one Base name."""
+    query = str(expression or "").strip()
+    if not query:
+        return True
+
+    def evaluate(term: str) -> bool:
+        term = _strip_search_parentheses(term)
+        alternatives = _split_search_expression(term, "|")
+        if len(alternatives) > 1:
+            return any(evaluate(item) for item in alternatives)
+        requirements = _split_search_expression(term, "&")
+        if len(requirements) > 1:
+            return all(evaluate(item) for item in requirements)
+        if term.startswith("!"):
+            remainder = term[1:].strip()
+            if not remainder:
+                raise SearchSyntaxError("'!' 뒤에 검색식이 필요합니다")
+            return not evaluate(remainder)
+        if term.startswith("(") or term.endswith(")"):
+            raise SearchSyntaxError("괄호 위치가 올바르지 않습니다")
+
+        case_sensitive = False
+        exact = False
+        if term.startswith("=="):
+            case_sensitive = True
+            exact = True
+            term = term[2:].strip()
+        elif term.startswith("="):
+            exact = True
+            term = term[1:].strip()
+        quoted_term = len(term) >= 2 and term.startswith('"') and term.endswith('"')
+        if quoted_term:
+            term = term[1:-1]
+        elif '"' in term:
+            raise SearchSyntaxError("따옴표는 검색어 전체를 감싸야 합니다")
+        if not term:
+            raise SearchSyntaxError("빈 검색어입니다")
+
+        candidate = str(value)
+        if exact:
+            return candidate == term if case_sensitive else candidate.casefold() == term.casefold()
+        if quoted_term or not any(character in term for character in "*?"):
+            return term.casefold() in candidate.casefold()
+        wildcard = "".join(
+            ".*" if character == "*" else "." if character == "?" else re.escape(character)
+            for character in term
+        )
+        return re.search(wildcard, candidate, re.IGNORECASE) is not None
+
+    return evaluate(query)
+
+
 def classify_base_name(name: str) -> str | None:
     token = canonical_base_name(name)
     if "leaf" in token or "leaves" in token:
         return "leaf"
-    if "end" in token or "tip" in token:
+    words = set(filter(None, re.split(r"[^a-z0-9]+", token)))
+    if words & {"end", "tip"}:
         return "end"
     if "branch" in token or "bough" in token or "twig" in token:
         return "branch"
@@ -231,7 +495,15 @@ def _normalized_xml(element: ET.Element) -> tuple:
 
 
 def _new_guid() -> str:
-    return base64.b64encode(uuid.uuid4().bytes).decode("ascii")
+    """Mint a GUID using the observed Modeler serialization spelling.
+
+    The normalized Generator declaration and the SPM receive the same spelling;
+    comparison code still canonicalizes both supported spellings to one
+    identity.
+    """
+    return speedtree_generator_guid(
+        base64.b64encode(uuid.uuid4().bytes).decode("ascii")
+    )
 
 
 def _format_color(value: float) -> str:
@@ -242,9 +514,26 @@ def _format_color(value: float) -> str:
     return format(value, ".10g")
 
 
+# A multi-property container holds its slot count in <MultiPropertyChildren>,
+# while the indexed ``:N:Material`` / ``:Mesh`` / ``:Weight`` slot properties it
+# counts are protected below so the follower keeps its own assets.  Copying the
+# container on its own therefore makes the follower claim the master's slot
+# count with nothing behind it, and SpeedTree draws the surplus slots as
+# "Material: None / Mesh: Any" (a smaller count instead hides authored slots).
+PROTECTED_MULTI_PROPERTY_CONTAINERS = (
+    "leaves:type",
+    "material:frond",
+    "cap:material",
+)
+
+
 def is_protected_property(name: str) -> bool:
     """Properties kept from the follower to preserve identity and assets."""
     lowered = str(name or "").strip().lower()
+    if lowered == "generation:shared:pass":
+        return True
+    if lowered in PROTECTED_MULTI_PROPERTY_CONTAINERS:
+        return True
     protected_prefixes = (
         "random seeds:",
         "generation:collections:",
@@ -262,17 +551,30 @@ def is_protected_property(name: str) -> bool:
 class BaseSyncResult:
     source_base: str
     target_base: str
-    category: str
+    category: str | None
     matched_nodes: int = 0
     property_updates: int = 0
     added_nodes: int = 0
-    target_only_nodes: int = 0
+    removed_nodes: int = 0
     color_updates: int = 0
     asset_reference_updates: int = 0
+    copied_assets: list[dict[str, str]] = field(default_factory=list)
     created_base: bool = False
     added_node_details: list[dict[str, str]] = field(default_factory=list)
-    target_only_details: list[dict[str, str]] = field(default_factory=list)
+    removed_node_details: list[dict[str, str]] = field(default_factory=list)
     changed_properties: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MasterSyncResult:
+    source_file: str
+    source_base: str
+    master_base: str
+    category: str
+    synced_nodes: int = 0
+    synced_node_details: list[dict[str, str]] = field(default_factory=list)
+    copied_assets: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -281,6 +583,7 @@ class SyncPlan:
     master: str
     target: str
     base_results: list[BaseSyncResult] = field(default_factory=list)
+    master_sync_results: list[MasterSyncResult] = field(default_factory=list)
     master_color_updates: int = 0
     target_color_updates: int = 0
     mapping_required: list[str] = field(default_factory=list)
@@ -290,6 +593,7 @@ class SyncPlan:
     base_ref_filter_updates: int = 0
     master_reference_renames: list[dict[str, str]] = field(default_factory=list)
     reference_renames: list[dict[str, str]] = field(default_factory=list)
+    pass_adjustments: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     scale_risk: dict[str, object] = field(default_factory=dict)
     changed: bool = False
@@ -305,8 +609,8 @@ class SyncPlan:
         return sum(item.added_nodes for item in self.base_results)
 
     @property
-    def target_only_nodes(self) -> int:
-        return sum(item.target_only_nodes for item in self.base_results)
+    def master_sync_nodes(self) -> int:
+        return sum(item.synced_nodes for item in self.master_sync_results)
 
     def summary_lines(self) -> list[str]:
         lines = [
@@ -326,6 +630,24 @@ class SyncPlan:
             if level != "safe":
                 lines.append("  거리 기반 생성 노드와 폴리곤이 크게 늘어날 수 있습니다.")
             lines.append("")
+        for item in self.master_sync_results:
+            lines.append(
+                f"마스터 구조 동기화: {item.master_base} ← "
+                f"{Path(item.source_file).name}:{item.source_base} · "
+                f"{item.synced_nodes}개"
+            )
+            lines.extend(
+                f"  ↑ 마스터 추가: {detail['path']} ({detail['type']})"
+                for detail in item.synced_node_details
+            )
+            lines.extend(
+                f"  + 마스터 에셋 복사: {asset['kind']} · "
+                f"{asset['name']} (ID {asset['id']})"
+                for asset in item.copied_assets
+            )
+            lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
+        if self.master_sync_results:
+            lines.append("")
         for item in self.base_results:
             relation = (
                 f"[새 Base] {item.target_base} ← {item.source_base}"
@@ -335,17 +657,23 @@ class SyncPlan:
             lines.append(
                 f"{relation} [{item.category}] · "
                 f"공통 {item.matched_nodes}, 속성 {item.property_updates}, "
-                f"추가 예정 {item.added_nodes}, 자식 전용 {item.target_only_nodes}, "
-                f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}"
+                f"마스터→SPM {item.added_nodes}, "
+                f"SPM 초과 삭제 {item.removed_nodes}, "
+                f"색 {item.color_updates}, 에셋 ID {item.asset_reference_updates}, "
+                f"에셋 복사 {len(item.copied_assets)}"
+            )
+            lines.extend(
+                f"  + 에셋 복사: {asset['kind']} · {asset['name']} (ID {asset['id']})"
+                for asset in item.copied_assets
+            )
+            lines.extend(
+                f"  - 자식 Generator 삭제: {detail['path']} ({detail['type']})"
+                for detail in item.removed_node_details
             )
             lines.extend(f"  ⚠ {warning}" for warning in item.warnings)
             for detail in item.added_node_details:
                 lines.append(
-                    f"  + 추가 예정: {detail['path']} ({detail['type']})"
-                )
-            for detail in item.target_only_details:
-                lines.append(
-                    f"  ◆ 자식 전용: {detail['path']} ({detail['type']})"
+                    f"  ↓ 마스터 → SPM: {detail['path']} ({detail['type']})"
                 )
         if self.mapping_required:
             lines.append("매핑 확인 필요: " + ", ".join(self.mapping_required))
@@ -369,18 +697,85 @@ class SyncPlan:
                 f"  Ref: {item['old']} → {item['new']}"
                 for item in self.reference_renames
             )
+        if self.pass_adjustments:
+            lines.append(f"Generation Pass 안전 보정: {len(self.pass_adjustments)}개")
+            lines.extend(
+                f"  {item['type']} {item['name']}: "
+                f"{item['old_pass']} → {item['new_pass']} ({item['reason']})"
+                for item in self.pass_adjustments
+            )
         lines.extend(f"⚠ {warning}" for warning in self.warnings)
         lines.append("")
         lines.append("변경 예정" if self.changed else "현재 동기화 상태가 최신입니다")
         return lines
 
 
+def _path_identity(path: Path | str) -> str:
+    try:
+        value = Path(path).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        value = Path(str(path or ""))
+    return os.path.normcase(str(value))
+
+
+def _atlas_target_relation_manifest(spm_path: Path) -> dict:
+    """Load the one exact target-local Atlas relationship manifest, if any."""
+    manifest_dir = Path(spm_path).parent / ".atlas_leaf_speedtree_targets"
+    if not manifest_dir.is_dir():
+        return {}
+    target_key = _path_identity(spm_path)
+    matches = []
+    for path in sorted(manifest_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("spm")
+            and _path_identity(payload["spm"]) == target_key
+            and (payload.get("generator_connection") or {}).get("complete")
+        ):
+            matches.append(payload)
+    if len(matches) > 1:
+        raise SyncError(
+            "동일 SPM을 가리키는 Atlas target manifest가 여러 개입니다: "
+            f"{spm_path}"
+        )
+    return matches[0] if matches else {}
+
+
+def _material_cutout_ids(material: ET.Element | None) -> list[str]:
+    if material is None:
+        return []
+    values = []
+    primary = str(material.findtext("CutoutMeshID") or "").strip()
+    if primary and primary != "-1":
+        values.append(primary)
+    values.extend(
+        str(item.attrib.get("ID") or "").strip()
+        for item in material.findall(
+            "./SupplementalCutoutMeshIDs/CutoutMesh"
+        )
+        if str(item.attrib.get("ID") or "").strip() not in {"", "-1"}
+    )
+    return values
+
+
 class SPMDocument:
-    def __init__(self, path: Path, text: str, compressed: bool, full: bool = True):
+    def __init__(
+        self,
+        path: Path,
+        text: str,
+        compressed: bool,
+        full: bool = True,
+        source_fingerprint: str | None = None,
+    ):
         self.path = Path(path)
         self.text = text if full else ""
         self.compressed = compressed
         self.full = full
+        self.source_fingerprint = source_fingerprint
         self.links_missing = _section_match(text, "Links") is None
         self.asset_names_by_id: dict[str, dict[str, str]] = {
             "Material_v8": {}, "Mesh": {},
@@ -388,6 +783,32 @@ class SPMDocument:
         self.asset_ids_by_name: dict[str, dict[str, str]] = {
             "Material_v8": {}, "Mesh": {},
         }
+        self.asset_elements_by_id: dict[str, dict[str, ET.Element]] = {
+            "Material_v8": {}, "Mesh": {},
+        }
+        self.pending_asset_elements: list[ET.Element] = []
+        self.atlas_relation_manifest = (
+            _atlas_target_relation_manifest(self.path) if full else {}
+        )
+        self.atlas_relation_bindings: dict[tuple[str, str], dict] = {}
+        for binding in (
+            self.atlas_relation_manifest.get("generator_connection") or {}
+        ).get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            key = (
+                str(binding.get("generator_guid") or "").strip(),
+                str(binding.get("slot_prefix") or "").strip(),
+            )
+            if not all(key):
+                continue
+            previous = self.atlas_relation_bindings.get(key)
+            if previous is not None and previous != binding:
+                raise SyncError(
+                    "Atlas target manifest에 충돌하는 Generator binding이 "
+                    f"있습니다: {self.path.name} · {key[0]} · {key[1]}"
+                )
+            self.atlas_relation_bindings[key] = binding
         if full:
             self._index_assets(text)
         try:
@@ -403,16 +824,21 @@ class SPMDocument:
         section = ASSETS_SECTION_RE.search(text)
         if section is None:
             return
-        for match in ASSET_TAG_RE.finditer(text, section.start(), section.end()):
-            kind, attributes = match.groups()
-            id_match = re.search(r'\bID="([^"]+)"', attributes)
-            name_match = re.search(r'\bName="([^"]*)"', attributes)
-            if id_match is None or name_match is None:
+        try:
+            assets = ET.fromstring(section.group(0))
+        except ET.ParseError as exc:
+            raise SyncError(f"Assets XML 파싱 실패: {self.path.name}: {exc}") from exc
+        for asset in list(assets):
+            kind = asset.tag
+            if kind not in self.asset_names_by_id:
                 continue
-            asset_id = html.unescape(id_match.group(1))
-            asset_name = html.unescape(name_match.group(1))
+            asset_id = str(asset.attrib.get("ID", ""))
+            asset_name = str(asset.attrib.get("Name", ""))
+            if not asset_id or not asset_name:
+                continue
             self.asset_names_by_id[kind][asset_id] = asset_name
             self.asset_ids_by_name[kind][asset_name.casefold()] = asset_id
+            self.asset_elements_by_id[kind][asset_id] = asset
 
     def asset_name(self, kind: str, asset_id: str) -> str | None:
         return self.asset_names_by_id.get(kind, {}).get(str(asset_id))
@@ -420,16 +846,92 @@ class SPMDocument:
     def asset_id(self, kind: str, asset_name: str) -> str | None:
         return self.asset_ids_by_name.get(kind, {}).get(str(asset_name).casefold())
 
+    def _next_asset_id(self, kind: str) -> str:
+        used = set(self.asset_names_by_id.get(kind, {}))
+        numeric = [int(value) for value in used if value.isdigit()]
+        candidate = max(numeric, default=-1) + 1
+        while str(candidate) in used:
+            candidate += 1
+        return str(candidate)
+
+    def copy_asset_from(
+        self,
+        source_document: "SPMDocument",
+        kind: str,
+        source_asset_id: str,
+        copied_assets: list[dict[str, str]],
+        warnings: list[str],
+    ) -> str | None:
+        """Copy one missing asset and recursively remap its dependencies."""
+        source_asset_id = str(source_asset_id)
+        source_name = source_document.asset_name(kind, source_asset_id)
+        if source_name is None:
+            warnings.append(f"마스터 에셋 정의 없음: {kind} ID {source_asset_id}")
+            return None
+        existing_id = self.asset_id(kind, source_name)
+        if existing_id is not None:
+            return existing_id
+        source_asset = source_document.asset_elements_by_id.get(kind, {}).get(source_asset_id)
+        if source_asset is None:
+            warnings.append(f"마스터 에셋 XML 없음: {kind} · {source_name}")
+            return None
+
+        clone = copy.deepcopy(source_asset)
+        clone.tail = None
+        target_asset_id = self._next_asset_id(kind)
+        clone.set("ID", target_asset_id)
+
+        # Register before recursion so cyclic BackMaterialID references cannot
+        # clone the same asset repeatedly.
+        self.asset_names_by_id[kind][target_asset_id] = source_name
+        self.asset_ids_by_name[kind][source_name.casefold()] = target_asset_id
+        self.asset_elements_by_id[kind][target_asset_id] = clone
+        self.pending_asset_elements.append(clone)
+        copied_assets.append({"kind": kind, "name": source_name, "id": target_asset_id})
+
+        if kind == "Material_v8":
+            cutout = clone.find("CutoutMeshID")
+            if cutout is not None and cutout.text not in (None, "", "-1"):
+                remapped = self.copy_asset_from(
+                    source_document, "Mesh", cutout.text, copied_assets, warnings
+                )
+                if remapped is not None:
+                    cutout.text = remapped
+            for item in clone.findall("./SupplementalCutoutMeshIDs/CutoutMesh"):
+                source_mesh_id = item.attrib.get("ID")
+                if source_mesh_id in (None, "", "-1"):
+                    continue
+                remapped = self.copy_asset_from(
+                    source_document, "Mesh", source_mesh_id, copied_assets, warnings
+                )
+                if remapped is not None:
+                    item.set("ID", remapped)
+            back = clone.find("BackMaterialID")
+            if back is not None and back.text not in (None, "", "-1"):
+                remapped = self.copy_asset_from(
+                    source_document, "Material_v8", back.text, copied_assets, warnings
+                )
+                if remapped is not None:
+                    back.text = remapped
+        return target_asset_id
+
     @classmethod
     def from_path(cls, path: Path, full: bool = True) -> "SPMDocument":
         path = Path(path)
         if full:
-            text, compressed = read_spm_text(path)
+            text, compressed, fingerprint = read_spm_snapshot(path)
         else:
             text = read_spm_prefix(path)
             with path.open("rb") as handle:
                 compressed = handle.read(2) == b"\x1f\x8b"
-        return cls(path, text, compressed, full=full)
+            fingerprint = None
+        return cls(
+            path,
+            text,
+            compressed,
+            full=full,
+            source_fingerprint=fingerprint,
+        )
 
     def reindex(self) -> None:
         self.generators = list(self.generators_element.findall("Generator"))
@@ -482,6 +984,46 @@ class SPMDocument:
     def base_refs(self) -> list[ET.Element]:
         return [item for item in self.generators if self.generator_type(item) == "BaseRef"]
 
+    def generator_pass(self, generator: ET.Element) -> int:
+        properties = generator.find("Properties")
+        raw_value = "1"
+        if properties is not None:
+            for prop in list(properties):
+                if _property_name(prop) == GENERATION_PASS_PROPERTY:
+                    raw_value = _property_value(prop).strip() or "1"
+                    break
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise SyncError(
+                f"{self.generator_type(generator)} '{self.generator_name(generator)}'의 "
+                f"Generation Pass가 정수가 아닙니다: {raw_value}"
+            ) from exc
+        if value < 1:
+            raise SyncError(
+                f"{self.generator_type(generator)} '{self.generator_name(generator)}'의 "
+                f"Generation Pass는 1 이상이어야 합니다: {value}"
+            )
+        return value
+
+    def set_generator_pass(self, generator: ET.Element, value: int) -> bool:
+        value = int(value)
+        current = self.generator_pass(generator)
+        if current == value:
+            return False
+        properties = generator.find("Properties")
+        if properties is None:
+            properties = ET.SubElement(generator, "Properties")
+        prop = next(
+            (item for item in list(properties) if _property_name(item) == GENERATION_PASS_PROPERTY),
+            None,
+        )
+        if prop is None:
+            prop = ET.SubElement(properties, "Property")
+            _set_child_text(prop, "Name", GENERATION_PASS_PROPERTY)
+        _set_child_text(prop, "Value", str(value))
+        return True
+
     def resolve_base(self, name: str) -> ET.Element | None:
         exact = [item for item in self.base_nodes() if self.generator_name(item).casefold() == str(name).casefold()]
         if len(exact) == 1:
@@ -522,11 +1064,16 @@ class SPMDocument:
         return ""
 
     def refs_for_base(self, base: ET.Element) -> list[ET.Element]:
-        identity = canonical_base_name(self.generator_name(base))
-        return [
-            ref for ref in self.base_refs()
-            if canonical_base_name(self.base_ref_filter(ref)) == identity
-        ]
+        base_name = self.generator_name(base)
+        return [ref for ref in self.base_refs() if speedtree_search_matches(
+            base_name, self.base_ref_filter(ref)
+        )]
+
+    def bases_for_ref(self, ref: ET.Element) -> list[ET.Element]:
+        expression = self.base_ref_filter(ref)
+        return [base for base in self.base_nodes() if speedtree_search_matches(
+            self.generator_name(base), expression
+        )]
 
     def base_type_signature(self, base: ET.Element) -> tuple[tuple[str, int], ...]:
         counter = Counter(
@@ -539,6 +1086,13 @@ class SPMDocument:
     def integrity_errors(self) -> list[str]:
         errors: list[str] = []
         link_guids: set[str] = set()
+        passes: dict[str, int] = {}
+        for generator in self.generators:
+            guid = self.generator_guid(generator)
+            try:
+                passes[guid] = self.generator_pass(generator)
+            except SyncError as exc:
+                errors.append(str(exc))
         for link in self.links:
             source = _child_text(link, "SourceGUID")
             target = _child_text(link, "TargetGUID")
@@ -552,12 +1106,51 @@ class SPMDocument:
             elif link_guid in link_guids:
                 errors.append(f"중복 Link GUID: {link_guid}")
             link_guids.add(link_guid)
+            source_generator = self.by_guid.get(source)
+            target_generator = self.by_guid.get(target)
+            # Base generators are special template boundaries. Their own pass
+            # schedules Reference consumption and does not constrain the pass
+            # of generators authored inside the reusable Base template.
+            if (
+                source_generator is not None
+                and target_generator is not None
+                and self.generator_type(source_generator) != "Base"
+                and source in passes
+                and target in passes
+                and passes[target] < passes[source]
+            ):
+                errors.append(
+                    f"Generation Pass 조상 순서 오류: "
+                    f"{self.generator_name(source_generator)}({passes[source]}) > "
+                    f"{self.generator_name(target_generator)}({passes[target]})"
+                )
         for ref in self.base_refs():
             filter_name = self.base_ref_filter(ref)
-            if filter_name and self.resolve_base(filter_name) is None:
+            try:
+                bases = self.bases_for_ref(ref)
+            except SearchSyntaxError as exc:
                 errors.append(
-                    f"BaseRef '{self.generator_name(ref)}'의 Base filter를 찾지 못함: {filter_name}"
+                    f"BaseRef '{self.generator_name(ref)}'의 Base filter 검색식 오류: "
+                    f"{filter_name!r} ({exc})"
                 )
+                continue
+            if not bases:
+                errors.append(
+                    f"BaseRef '{self.generator_name(ref)}'의 Base filter를 찾지 못함: "
+                    f"{filter_name or '<비어 있음>'}"
+                )
+                continue
+            ref_guid = self.generator_guid(ref)
+            if ref_guid not in passes:
+                continue
+            for base in bases:
+                base_guid = self.generator_guid(base)
+                if base_guid in passes and passes[ref_guid] >= passes[base_guid]:
+                    errors.append(
+                        f"Reference/Base Pass 순서 오류: {self.generator_name(ref)}"
+                        f"({passes[ref_guid]}) < {self.generator_name(base)}"
+                        f"({passes[base_guid]}) 이어야 합니다"
+                    )
         return errors
 
     def validate(self, rendered_text: str | None = None) -> None:
@@ -578,7 +1171,81 @@ class SPMDocument:
         text = insert_links_section(text, links) if self.links_missing else replace_section(
             text, "Links", links
         )
+        text = append_assets_section(text, self.pending_asset_elements)
         return text
+
+
+def repair_generation_passes(document: SPMDocument) -> list[dict[str, object]]:
+    """Increase only the passes needed by SpeedTree hierarchy/reference rules.
+
+    Existing target scheduling remains intact whenever it is valid. Base
+    template children are excluded from ancestor propagation because the Base
+    pass schedules Reference consumption, not the reusable template subtree.
+    """
+    original = {
+        document.generator_guid(generator): document.generator_pass(generator)
+        for generator in document.generators
+    }
+    reasons: dict[str, set[str]] = defaultdict(set)
+    limit = max(1, len(document.generators) + 1)
+    for _round in range(limit):
+        changed = False
+        for parent_guid, child_guids in document.children.items():
+            parent = document.by_guid.get(parent_guid)
+            if parent is None or document.generator_type(parent) == "Base":
+                continue
+            parent_pass = document.generator_pass(parent)
+            for child_guid in child_guids:
+                child = document.by_guid.get(child_guid)
+                if child is None or document.generator_pass(child) >= parent_pass:
+                    continue
+                document.set_generator_pass(child, parent_pass)
+                reasons[child_guid].add(
+                    f"조상 {document.generator_name(parent)} pass {parent_pass}"
+                )
+                changed = True
+
+        for ref in document.base_refs():
+            try:
+                bases = document.bases_for_ref(ref)
+            except SearchSyntaxError as exc:
+                raise SyncError(
+                    f"BaseRef '{document.generator_name(ref)}'의 Base filter 검색식 오류: "
+                    f"{document.base_ref_filter(ref)!r} ({exc})"
+                ) from exc
+            ref_pass = document.generator_pass(ref)
+            for base in bases:
+                required = ref_pass + 1
+                if document.generator_pass(base) >= required:
+                    continue
+                document.set_generator_pass(base, required)
+                reasons[document.generator_guid(base)].add(
+                    f"Reference {document.generator_name(ref)} pass {ref_pass}보다 이후"
+                )
+                changed = True
+        if not changed:
+            break
+    else:
+        raise SyncError(
+            f"{document.path.name} Generation Pass 제약에 순환이 있어 자동 보정할 수 없습니다"
+        )
+
+    adjustments: list[dict[str, object]] = []
+    for generator in document.generators:
+        guid = document.generator_guid(generator)
+        old_pass = original[guid]
+        new_pass = document.generator_pass(generator)
+        if old_pass == new_pass:
+            continue
+        adjustments.append({
+            "guid": guid,
+            "name": document.generator_name(generator),
+            "type": document.generator_type(generator),
+            "old_pass": old_pass,
+            "new_pass": new_pass,
+            "reason": "; ".join(sorted(reasons.get(guid, {"의존성 제약"}))),
+        })
+    return adjustments
 
 
 def _scale_color(color: tuple[float, float, float, float], factor: float):
@@ -605,15 +1272,10 @@ def base_role_color(category: str, base_name: str) -> tuple[float, float, float,
     return _scale_color(color, factor)
 
 
-def unique_role_color(category: str, base_name: str):
-    color = base_role_color(category, base_name)
-    return _scale_color(color, 0.42) if color is not None else None
-
-
 def set_icon_palette(
     generator: ET.Element,
     background: tuple[float, float, float, float] | None,
-    unique: bool = False,
+    preserve_foreground: bool = False,
 ) -> bool:
     if background is None:
         return False
@@ -624,17 +1286,20 @@ def set_icon_palette(
         index = list(generator).index(properties) if properties is not None else len(generator)
         generator.insert(index, extra)
     expected = {
-        "m_bSetForegroundIconColor": "true",
-        "m_vecForegroundIconColor_r": "1" if unique else "0",
-        "m_vecForegroundIconColor_g": "1" if unique else "0",
-        "m_vecForegroundIconColor_b": "1" if unique else "0",
-        "m_vecForegroundIconColor_a": "1",
         "m_bSetBackgroundIconColor": "true",
         "m_vecBackgroundIconColor_r": _format_color(background[0]),
         "m_vecBackgroundIconColor_g": _format_color(background[1]),
         "m_vecBackgroundIconColor_b": _format_color(background[2]),
         "m_vecBackgroundIconColor_a": _format_color(background[3]),
     }
+    if not preserve_foreground:
+        expected.update({
+            "m_bSetForegroundIconColor": "true",
+            "m_vecForegroundIconColor_r": "0",
+            "m_vecForegroundIconColor_g": "0",
+            "m_vecForegroundIconColor_b": "0",
+            "m_vecForegroundIconColor_a": "1",
+        })
     changed = False
     for name, value in expected.items():
         child = extra.find(name)
@@ -648,19 +1313,50 @@ def set_icon_palette(
     return changed
 
 
-def set_icon_background(generator: ET.Element, category: str) -> bool:
+def _icon_foreground_values(generator: ET.Element):
+    extra = generator.find("Extra")
+    if extra is None:
+        return None
+    values = {
+        tag: extra.findtext(tag) for tag in FOREGROUND_TAGS
+    }
+    return values if all(value is not None for value in values.values()) else None
+
+
+def _restore_icon_foreground(
+    generator: ET.Element, values: dict[str, str] | None
+) -> None:
+    if not values:
+        return
+    extra = generator.find("Extra")
+    if extra is None:
+        extra = ET.Element("Extra")
+        properties = generator.find("Properties")
+        index = (
+            list(generator).index(properties)
+            if properties is not None else len(generator)
+        )
+        generator.insert(index, extra)
+    for tag, value in values.items():
+        child = extra.find(tag)
+        if child is None:
+            child = ET.SubElement(extra, tag)
+        child.text = value
+
+
+def set_icon_background(generator: ET.Element, category: str | None) -> bool:
     """Compatibility wrapper for callers that only know the role."""
-    return set_icon_palette(generator, CATEGORY_COLORS.get(category), unique=False)
+    return set_icon_palette(generator, CATEGORY_COLORS.get(category))
 
 
 def standardize_base_colors(
     document: SPMDocument,
     categories: dict[str, str | None],
-    unique_guids: set[str] | None = None,
+    preserve_foreground_guids: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     updates = 0
     warnings: list[str] = []
-    unique_guids = unique_guids or set()
+    preserve_foreground_guids = preserve_foreground_guids or set()
     processed: set[str] = set()
     for base in document.base_nodes():
         name = document.generator_name(base)
@@ -670,22 +1366,21 @@ def standardize_base_colors(
             warnings.append(f"색 분류가 없는 Base: {name}")
             continue
         regular_color = base_role_color(category, name)
-        unique_color = unique_role_color(category, name)
         member_guids = [document.generator_guid(base), *document.descendants(document.generator_guid(base))]
         for guid in member_guids:
             node = document.by_guid.get(guid)
-            is_unique = guid in unique_guids
-            color = unique_color if is_unique else regular_color
-            if node is not None and set_icon_palette(node, color, unique=is_unique):
+            if node is not None and set_icon_palette(
+                    node, regular_color,
+                    preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
         for ref in document.refs_for_base(base):
             guid = document.generator_guid(ref)
             if guid in processed:
                 continue
-            is_unique = guid in unique_guids
-            color = unique_color if is_unique else regular_color
-            if set_icon_palette(ref, color, unique=is_unique):
+            if set_icon_palette(
+                    ref, regular_color,
+                    preserve_foreground=guid in preserve_foreground_guids):
                 updates += 1
             processed.add(guid)
     return updates, warnings
@@ -788,26 +1483,213 @@ def _asset_role(asset_name: str | None) -> str | None:
     return None
 
 
+def _atlas_binding_for_property(
+    source_document: SPMDocument,
+    source_generator: ET.Element,
+    property_name: str,
+) -> dict | None:
+    suffix = str(property_name or "").rsplit(":", 1)
+    if len(suffix) != 2 or suffix[1].casefold() not in {"material", "mesh"}:
+        return None
+    return source_document.atlas_relation_bindings.get(
+        (
+            source_document.generator_guid(source_generator),
+            suffix[0],
+        )
+    )
+
+
+def _target_material_id_by_exact_name(
+    target_document: SPMDocument,
+    material_name: str,
+) -> str:
+    matches = [
+        asset_id
+        for asset_id, name in target_document.asset_names_by_id[
+            "Material_v8"
+        ].items()
+        if name.casefold() == str(material_name).casefold()
+    ]
+    if len(matches) != 1:
+        raise SyncError(
+            "Atlas 관계 Generator를 follower에 추가하려면 원본 material이 "
+            "대상 SPM에서 정확히 하나여야 합니다: "
+            f"{target_document.path.name} · {material_name} · {len(matches)}개"
+        )
+    return matches[0]
+
+
+def _atlas_binding_target_local_value(
+    source_document: SPMDocument,
+    target_document: SPMDocument,
+    binding: dict,
+    kind: str,
+) -> str:
+    material_name = str(binding.get("source_material_name") or "").strip()
+    source_material_id = str(binding.get("source_material_id") or "").strip()
+    if not material_name or not source_material_id:
+        raise SyncError(
+            "Atlas 관계 출력 Generator의 원본 Material provenance가 "
+            "없어 follower에 안전하게 복제할 수 없습니다: "
+            f"{source_document.path.name} · "
+            f"{binding.get('generator_name')} · "
+            f"{binding.get('slot_prefix')}"
+        )
+    target_material_id = _target_material_id_by_exact_name(
+        target_document,
+        material_name,
+    )
+    if kind == "Material_v8":
+        return target_material_id
+
+    source_mesh_id = str(binding.get("source_mesh_id") or "").strip()
+    if source_mesh_id == "-10":
+        return source_mesh_id
+    if not source_mesh_id or source_mesh_id.startswith("-"):
+        raise SyncError(
+            "Atlas 관계 출력 Generator의 원본 Mesh provenance가 "
+            "없어 follower에 안전하게 복제할 수 없습니다: "
+            f"{source_document.path.name} · "
+            f"{binding.get('generator_name')} · "
+            f"{binding.get('slot_prefix')}"
+        )
+
+    adoption = source_document.atlas_relation_manifest.get(
+        "source_material_adoption"
+    ) or {}
+    if (
+        str(adoption.get("material_id") or "").strip()
+        == source_material_id
+    ):
+        source_cutouts = [
+            str(value)
+            for value in adoption.get("original_mesh_ids") or []
+        ]
+    else:
+        source_cutouts = _material_cutout_ids(
+            source_document.asset_elements_by_id["Material_v8"].get(
+                source_material_id
+            )
+        )
+    if source_mesh_id not in source_cutouts:
+        raise SyncError(
+            "Atlas 관계 manifest의 원본 Mesh가 source material cutout에 "
+            "없습니다: "
+            f"{source_document.path.name} · {material_name} · "
+            f"{source_mesh_id} not in {source_cutouts}"
+        )
+    ordinal = source_cutouts.index(source_mesh_id)
+    target_cutouts = _material_cutout_ids(
+        target_document.asset_elements_by_id["Material_v8"].get(
+            target_material_id
+        )
+    )
+    if ordinal >= len(target_cutouts):
+        raise SyncError(
+            "Atlas 관계 Generator의 원본 cutout ordinal을 follower "
+            "material에 적용할 수 없습니다: "
+            f"{target_document.path.name} · {material_name} · "
+            f"ordinal {ordinal + 1}/{len(target_cutouts)}"
+        )
+    return target_cutouts[ordinal]
+
+
+def strip_atlas_created_variant_slots_from_clone(
+    source_document: SPMDocument,
+    source_generator: ET.Element,
+    clone: ET.Element,
+) -> list[str]:
+    """Remove relationship-owned variant slots before cloning a Generator."""
+    guid = source_document.generator_guid(source_generator)
+    bindings = [
+        binding
+        for (binding_guid, _slot), binding
+        in source_document.atlas_relation_bindings.items()
+        if binding_guid == guid and binding.get("created_slot")
+    ]
+    properties = clone.find("Properties")
+    if not bindings or properties is None:
+        return []
+    removed = []
+    authored_counts: dict[str, set[int]] = defaultdict(set)
+    for binding in bindings:
+        names = {
+            str(value)
+            for value in binding.get("created_property_names") or []
+            if str(value)
+        }
+        names.update(
+            str(binding.get(field) or "")
+            for field in (
+                "created_material_property",
+                "created_mesh_property",
+            )
+            if str(binding.get(field) or "")
+        )
+        for prop in list(properties):
+            if _property_name(prop) in names:
+                removed.append(_property_name(prop))
+                properties.remove(prop)
+        parent_name = str(
+            binding.get("variant_parent_property") or ""
+        ).strip()
+        before = binding.get("variant_parent_children_before")
+        try:
+            before = int(before)
+        except (TypeError, ValueError):
+            before = None
+        if parent_name and before is not None:
+            authored_counts[parent_name].add(before)
+    for parent_name, counts in authored_counts.items():
+        if len(counts) != 1:
+            raise SyncError(
+                "Atlas 관계 manifest의 authored variant count가 "
+                f"충돌합니다: {source_document.path.name} · {parent_name}"
+            )
+        parent = next(
+            (
+                prop
+                for prop in list(properties)
+                if _property_name(prop) == parent_name
+            ),
+            None,
+        )
+        if parent is None:
+            raise SyncError(
+                "Atlas 관계 manifest가 가리키는 variant parent가 "
+                f"없습니다: {source_document.path.name} · {parent_name}"
+            )
+        _set_child_text(
+            parent,
+            "MultiPropertyChildren",
+            str(next(iter(counts))),
+        )
+    return removed
+
+
 def remap_generator_asset_references(
     source_document: SPMDocument,
     target_document: SPMDocument,
     source_generator: ET.Element,
     target_generator: ET.Element,
     force: bool = False,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[dict[str, str]], list[str]]:
     """Translate source-local asset IDs into target-local IDs by asset name.
 
-    Existing target asset choices remain untouched unless their current local
-    ID is invalid or resolves to a conflicting semantic role (for example a
-    Leaf property resolving to a cluster material).  Fresh clones use force so
-    every resolvable material/mesh ID is translated before insertion.
+    ``force`` makes the source Generator's semantic asset selection
+    authoritative while still translating it to a target-local ID.  Existing
+    target choices remain untouched otherwise unless their current local ID is
+    invalid or resolves to a conflicting semantic role.  Exact asset identity
+    wins over Atlas cutout provenance; the provenance fallback is only needed
+    when the same generated asset is not already present in the target.
     """
     source_properties = source_generator.find("Properties")
     target_properties = target_generator.find("Properties")
     if source_properties is None or target_properties is None:
-        return 0, []
+        return 0, [], []
     target_by_name = {_property_name(item): item for item in list(target_properties)}
     updates = 0
+    copied_assets: list[dict[str, str]] = []
     warnings: list[str] = []
     for source_prop in list(source_properties):
         property_name = _property_name(source_prop)
@@ -817,15 +1699,37 @@ def remap_generator_asset_references(
         target_prop = target_by_name.get(property_name)
         if target_prop is None:
             continue
+        atlas_binding = _atlas_binding_for_property(
+            source_document,
+            source_generator,
+            property_name,
+        )
+        if atlas_binding is not None:
+            if not force:
+                continue
+            source_asset_name = source_document.asset_name(
+                kind,
+                _property_value(source_prop),
+            )
+            target_value = (
+                target_document.asset_id(kind, source_asset_name)
+                if source_asset_name is not None
+                else None
+            )
+            if target_value is None:
+                target_value = _atlas_binding_target_local_value(
+                    source_document,
+                    target_document,
+                    atlas_binding,
+                    kind,
+                )
+            current_id = _property_value(target_prop)
+            if current_id != target_value:
+                _set_child_text(target_prop, "Value", target_value)
+                updates += 1
+            continue
         source_asset_name = source_document.asset_name(kind, _property_value(source_prop))
         if source_asset_name is None:
-            continue
-        target_asset_id = target_document.asset_id(kind, source_asset_name)
-        if target_asset_id is None:
-            if force:
-                warnings.append(
-                    f"대상 SPM에 같은 에셋 없음: {property_name} · {source_asset_name}"
-                )
             continue
         current_id = _property_value(target_prop)
         current_asset_name = target_document.asset_name(kind, current_id)
@@ -836,10 +1740,21 @@ def remap_generator_asset_references(
             and source_role != current_role
         )
         should_update = force or current_asset_name is None or role_conflict
+        target_asset_id = target_document.asset_id(kind, source_asset_name)
+        if should_update and target_asset_id is None:
+            target_asset_id = target_document.copy_asset_from(
+                source_document,
+                kind,
+                _property_value(source_prop),
+                copied_assets,
+                warnings,
+            )
+        if target_asset_id is None:
+            continue
         if should_update and current_id != target_asset_id:
             _set_child_text(target_prop, "Value", target_asset_id)
             updates += 1
-    return updates, warnings
+    return updates, copied_assets, warnings
 
 
 def clone_subtree(
@@ -849,7 +1764,7 @@ def clone_subtree(
     source_parent_guid: str,
     target_parent_guid: str,
     target_parent_level: int,
-    category: str,
+    category: str | None,
     salt: str,
     result: BaseSyncResult,
     detail_path: str = "",
@@ -857,17 +1772,31 @@ def clone_subtree(
     source = source_document.by_guid[source_guid]
     if source_document.generator_type(source) == "BaseRef":
         result.warnings.append(
-            f"마스터 전용 BaseRef는 자동 추가하지 않음: {source_document.generator_name(source)}"
+            f"BaseRef는 파일별 배치이므로 자동 추가하지 않음: "
+            f"{source_document.generator_name(source)}"
         )
         return None
     clone = copy.deepcopy(source)
     new_guid = _new_guid()
     _set_child_text(clone, "GUID", new_guid)
     _set_child_text(clone, "Level", str(target_parent_level + 1))
-    asset_updates, asset_warnings = remap_generator_asset_references(
+    removed_relation_slots = strip_atlas_created_variant_slots_from_clone(
+        source_document,
+        source,
+        clone,
+    )
+    if removed_relation_slots:
+        result.warnings.append(
+            "Atlas 관계가 만든 Generator variant slot은 follower 구조 "
+            "동기화에서 제외함: "
+            f"{source_document.generator_name(source)} · "
+            + ", ".join(sorted(removed_relation_slots))
+        )
+    asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
         source_document, target_document, source, clone, force=True
     )
     result.asset_reference_updates += asset_updates
+    result.copied_assets.extend(copied_assets)
     for warning in asset_warnings:
         if warning not in result.warnings:
             result.warnings.append(warning)
@@ -958,6 +1887,50 @@ def _collect_subtree_details(
     return details
 
 
+def remove_generator_subtree(
+    document: SPMDocument,
+    guid: str,
+    result: BaseSyncResult,
+    path_prefix: str = "",
+) -> int:
+    """Remove one follower-only governed Generator subtree and its links."""
+
+    generator = document.by_guid.get(guid)
+    if generator is None:
+        return 0
+    if document.generator_type(generator) == "BaseRef":
+        result.warnings.append(
+            f"BaseRef는 파일별 배치이므로 자동 삭제하지 않음: "
+            f"{document.generator_name(generator)}"
+        )
+        return 0
+
+    details = _collect_subtree_details(
+        document,
+        guid,
+        result.target_base,
+        path_prefix,
+        exclude_source_baseref=True,
+    )
+    removed_guids = {guid, *document.descendants(guid)}
+    removed_count = 0
+    for item in list(document.generators_element.findall("Generator")):
+        item_guid = document.generator_guid(item)
+        if item_guid in removed_guids:
+            document.generators_element.remove(item)
+            removed_count += 1
+    for link in list(document.links_element.findall("Link")):
+        if (
+            _child_text(link, "SourceGUID") in removed_guids
+            or _child_text(link, "TargetGUID") in removed_guids
+        ):
+            document.links_element.remove(link)
+    document.reindex()
+    result.removed_nodes += removed_count
+    result.removed_node_details.extend(details)
+    return removed_count
+
+
 def _matching_target_parent(
     source_document: SPMDocument,
     target_document: SPMDocument,
@@ -988,7 +1961,7 @@ def sync_subtree(
     target_document: SPMDocument,
     source_guid: str,
     target_guid: str,
-    category: str,
+    category: str | None,
     salt: str,
     result: BaseSyncResult,
 ) -> None:
@@ -999,10 +1972,11 @@ def sync_subtree(
         count, names = sync_generator_properties(source, target)
         result.property_updates += count
         result.changed_properties.extend(names)
-        asset_updates, asset_warnings = remap_generator_asset_references(
-            source_document, target_document, source, target, force=False
+        asset_updates, copied_assets, asset_warnings = remap_generator_asset_references(
+            source_document, target_document, source, target, force=True
         )
         result.asset_reference_updates += asset_updates
+        result.copied_assets.extend(copied_assets)
         for warning in asset_warnings:
             if warning not in result.warnings:
                 result.warnings.append(warning)
@@ -1042,11 +2016,11 @@ def sync_subtree(
                 result,
             )
         for target_child in target_children[paired:]:
-            details = _collect_subtree_details(
-                target_document, target_child, result.target_base
+            remove_generator_subtree(
+                target_document,
+                target_child,
+                result,
             )
-            result.target_only_details.extend(details)
-            result.target_only_nodes += len(details)
 
 
 def _set_base_ref_filter(generator: ET.Element, value: str) -> bool:
@@ -1274,12 +2248,27 @@ def build_sync_plan(
     base_map: dict[str, str | None],
     base_categories: dict[str, str | None] | None = None,
     master_document: SPMDocument | None = None,
+    target_document: SPMDocument | None = None,
 ) -> SyncPlan:
     master_path = Path(master_path)
     target_path = Path(target_path)
     source = master_document or SPMDocument.from_path(master_path, full=True)
-    target = SPMDocument.from_path(target_path, full=True)
+    target = target_document or SPMDocument.from_path(target_path, full=True)
+    if target.path.absolute() != target_path.absolute():
+        raise SyncError(
+            f"대상 문서 경로가 동기화 요청과 다릅니다: "
+            f"{target.path} != {target_path}"
+        )
     original_target_text = target.text
+    legacy_cluster_guids = set(
+        inspect_legacy_cluster_state(target_path)[
+            "classified_generator_guids"
+        ]
+    )
+    legacy_foregrounds = {
+        guid: _icon_foreground_values(target.by_guid[guid])
+        for guid in legacy_cluster_guids if guid in target.by_guid
+    }
     categories = source_base_categories(source, base_categories)
     plan = SyncPlan(master=str(master_path), target=str(target_path), compressed=target.compressed)
     plan.scale_risk = assess_scale_risk(source, target)
@@ -1303,9 +2292,9 @@ def build_sync_plan(
             continue
         resolved_source_name = source.generator_name(source_base)
         category = categories.get(resolved_source_name)
-        if category not in CATEGORY_COLORS:
-            plan.mapping_required.append(f"색 분류 없음: {resolved_source_name}")
-            continue
+        # Base mapping is the structural contract.  A role category only
+        # standardizes editor icon colors; unknown/custom Base names must still
+        # synchronize and keep their existing/source palette.
         used_source.add(resolved_source_name)
         result = BaseSyncResult(
             source_base=resolved_source_name,
@@ -1330,9 +2319,8 @@ def build_sync_plan(
         if source_name in used_source:
             continue
         category = categories.get(source_name)
-        if category not in CATEGORY_COLORS:
-            plan.mapping_required.append(f"색 분류 없음: {source_name}")
-            continue
+        # New master Bases are additive even when their names do not encode one
+        # of the optional leaf/branch/end color roles.
         existing_name = [
             base for base in target.base_nodes()
             if canonical_base_name(target.generator_name(base)) == canonical_base_name(source_name)
@@ -1375,17 +2363,23 @@ def build_sync_plan(
         used_source.add(source_name)
 
     target.reindex()
+    plan.pass_adjustments = repair_generation_passes(target)
     plan.reference_renames = standardize_base_ref_names(target)
     target_color_categories: dict[str, str | None] = {}
-    unique_guids: set[str] = set()
     for item in plan.base_results:
         target_color_categories[item.target_base] = item.category
-        unique_guids.update(
-            detail["guid"] for detail in item.target_only_details
-            if detail.get("guid")
-        )
+    # sync_subtree applies the role palette while copying settings. Restore
+    # the exact receipt-owned foreground observed at transaction start before
+    # the final background-only palette pass. Drifted/user-edited foregrounds
+    # are preserved as-is; this is not an automatic marker repair.
+    for guid, values in legacy_foregrounds.items():
+        node = target.by_guid.get(guid)
+        if node is not None:
+            _restore_icon_foreground(node, values)
     target_color_updates, color_warnings = standardize_base_colors(
-        target, target_color_categories, unique_guids=unique_guids
+        target,
+        target_color_categories,
+        preserve_foreground_guids=legacy_cluster_guids,
     )
     plan.target_color_updates = target_color_updates
     plan.warnings.extend(color_warnings)
@@ -1408,13 +2402,28 @@ def standardize_master_document(
     document = SPMDocument.from_path(master_path, full=True)
     categories = source_base_categories(document, base_categories)
     reference_renames = standardize_base_ref_names(document)
-    updates, warnings = standardize_base_colors(document, categories)
+    legacy_cluster_guids = set(
+        inspect_legacy_cluster_state(master_path)[
+            "classified_generator_guids"
+        ]
+    )
+    updates, warnings = standardize_base_colors(
+        document,
+        categories,
+        preserve_foreground_guids=legacy_cluster_guids,
+    )
     document.reindex()
     document.validate()
     rendered = document.render()
     document.validate(rendered)
     # Followers should read the standardized source in the same transaction.
-    standardized = SPMDocument(Path(master_path), rendered, document.compressed, full=True)
+    standardized = SPMDocument(
+        Path(master_path),
+        rendered,
+        document.compressed,
+        full=True,
+        source_fingerprint=document.source_fingerprint,
+    )
     return standardized, rendered, updates, reference_renames, warnings
 
 
@@ -1448,12 +2457,12 @@ def base_sync_signature(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _common_target_payload(
-    source_document: SPMDocument,
+def _managed_target_payload(
     target_document: SPMDocument,
-    source_guid: str,
     target_guid: str,
 ) -> dict[str, object]:
+    """Hash all master-governed follower structure, including new extras."""
+
     target = target_document.by_guid[target_guid]
     properties = []
     target_properties = target.find("Properties")
@@ -1462,19 +2471,12 @@ def _common_target_payload(
             if not is_protected_property(_property_name(prop)):
                 properties.append(_normalized_xml(prop))
     children = []
-    source_groups = _children_by_type(source_document, source_guid)
     target_groups = _children_by_type(target_document, target_guid)
-    for generator_type in sorted(source_groups):
-        source_children = source_groups[generator_type]
-        target_children = target_groups.get(generator_type, [])
-        for index, source_child in enumerate(source_children):
-            if index < len(target_children):
-                children.append(_common_target_payload(
-                    source_document, target_document,
-                    source_child, target_children[index],
-                ))
-            else:
-                children.append({"type": generator_type, "missing": True})
+    for generator_type in sorted(target_groups):
+        if generator_type == "BaseRef":
+            continue
+        for child_guid in target_groups[generator_type]:
+            children.append(_managed_target_payload(target_document, child_guid))
     return {
         "type": target_document.generator_type(target),
         "properties": properties,
@@ -1489,8 +2491,9 @@ def target_sync_signature(
 ) -> str:
     """Hash only the follower data governed by the master.
 
-    Target-only generators are intentionally excluded. Protected identity and
-    asset properties are excluded for the same reason.
+    Extra governed structure is included so a new follower subtree immediately
+    reports a pending master normalization.  Protected identity, asset, and
+    BaseRef placement data remain excluded.
     """
     payload = []
     for target_name, source_name in sorted(base_map.items(), key=lambda item: item[0].casefold()):
@@ -1504,10 +2507,8 @@ def target_sync_signature(
         payload.append({
             "target": canonical_base_name(target_name),
             "source": canonical_base_name(source_name),
-            "tree": _common_target_payload(
-                source_document, target_document,
-                source_document.generator_guid(source_base),
-                target_document.generator_guid(target_base),
+            "tree": _managed_target_payload(
+                target_document, target_document.generator_guid(target_base)
             ),
         })
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1522,11 +2523,11 @@ def _structure_delta(
     source_base_name: str = "",
     target_base_name: str = "",
     missing_details: list[dict[str, str]] | None = None,
-    target_only_details: list[dict[str, str]] | None = None,
+    remove_details: list[dict[str, str]] | None = None,
 ) -> tuple[int, int, int]:
     common = 1
     missing = 0
-    target_only = 0
+    remove = 0
     source_groups = _children_by_type(source_document, source_guid)
     target_groups = _children_by_type(target_document, target_guid)
     for generator_type in sorted(set(source_groups) | set(target_groups)):
@@ -1534,15 +2535,15 @@ def _structure_delta(
         target_children = target_groups.get(generator_type, [])
         paired = min(len(source_children), len(target_children))
         for index in range(paired):
-            child_common, child_missing, child_only = _structure_delta(
+            child_common, child_missing, child_remove = _structure_delta(
                 source_document, target_document,
                 source_children[index], target_children[index],
                 source_base_name, target_base_name,
-                missing_details, target_only_details,
+                missing_details, remove_details,
             )
             common += child_common
             missing += child_missing
-            target_only += child_only
+            remove += child_remove
         for source_child in source_children[paired:]:
             details = _collect_subtree_details(
                 source_document,
@@ -1555,12 +2556,15 @@ def _structure_delta(
                 missing_details.extend(details)
         for target_child in target_children[paired:]:
             details = _collect_subtree_details(
-                target_document, target_child, target_base_name
+                target_document,
+                target_child,
+                target_base_name,
+                exclude_source_baseref=True,
             )
-            target_only += len(details)
-            if target_only_details is not None:
-                target_only_details.extend(details)
-    return common, missing, target_only
+            remove += len(details)
+            if remove_details is not None:
+                remove_details.extend(details)
+    return common, missing, remove
 
 
 def compare_base_structure(
@@ -1570,12 +2574,18 @@ def compare_base_structure(
     include_details: bool = False,
 ) -> dict[str, object]:
     totals = {
-        "common": 0, "missing": 0, "target_only": 0,
+        "common": 0, "missing": 0,
+        # Backward-compatible fields.  Reverse synchronization is forbidden.
+        "master_sync": 0,
+        "target_local": 0,
+        "remove": 0,
         "mapping_errors": 0, "missing_bases": 0,
     }
     if include_details:
         totals["missing_details"] = []
-        totals["target_only_details"] = []
+        totals["master_sync_details"] = []
+        totals["target_local_details"] = []
+        totals["remove_details"] = []
     used_source: set[str] = set()
     for target_name, source_name in base_map.items():
         if source_name in (None, "", "__independent__"):
@@ -1586,18 +2596,18 @@ def compare_base_structure(
             totals["mapping_errors"] += 1
             continue
         used_source.add(source_document.generator_name(source_base))
-        common, missing, target_only = _structure_delta(
+        common, missing, remove = _structure_delta(
             source_document, target_document,
             source_document.generator_guid(source_base),
             target_document.generator_guid(target_base),
             source_document.generator_name(source_base),
             target_document.generator_name(target_base),
             totals.get("missing_details") if include_details else None,
-            totals.get("target_only_details") if include_details else None,
+            totals.get("remove_details") if include_details else None,
         )
         totals["common"] += common
         totals["missing"] += missing
-        totals["target_only"] += target_only
+        totals["remove"] += remove
     for source_base in source_document.base_nodes():
         source_name = source_document.generator_name(source_base)
         if source_name not in used_source:
@@ -1618,19 +2628,65 @@ def default_manifest() -> dict:
     return {"version": 1, "groups": [], "independent": []}
 
 
-def load_manifest(folder: Path) -> dict:
+def load_manifest_snapshot(folder: Path) -> tuple[dict, str | None]:
+    """Load one stable manifest snapshot and its exact on-disk fingerprint."""
+
     folder = Path(folder)
     path = folder / MANIFEST_NAME
-    if not path.exists():
-        return default_manifest()
+    raw = None
+    for _attempt in range(2):
+        try:
+            before = path.stat()
+            candidate = path.read_bytes()
+            after = path.stat()
+        except FileNotFoundError:
+            if not path.exists():
+                return default_manifest(), None
+            continue
+        except OSError as exc:
+            raise SyncError(
+                f"관계 설정 파일을 읽을 수 없습니다: {path}: {exc}"
+            ) from exc
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raw = candidate
+            break
+    if raw is None:
+        raise SyncError(f"읽는 동안 관계 설정 파일이 변경되었습니다: {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SyncError(f"관계 설정 파일을 읽을 수 없습니다: {path}: {exc}") from exc
     data.setdefault("version", 1)
     data.setdefault("groups", [])
     data.setdefault("independent", [])
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def load_manifest(folder: Path) -> dict:
+    manifest, _fingerprint = load_manifest_snapshot(folder)
+    return manifest
+
+
+def _assert_manifest_unchanged(
+    folder: Path,
+    expected_fingerprint: str | None,
+) -> None:
+    path = Path(folder) / MANIFEST_NAME
+    if not path.exists():
+        current_fingerprint = None
+    else:
+        _manifest, current_fingerprint = load_manifest_snapshot(folder)
+    if current_fingerprint != expected_fingerprint:
+        raise SyncError(
+            "동기화를 계산하는 동안 다른 작업이 관계 설정 파일을 "
+            f"수정했습니다. 변경을 덮어쓰지 않고 중단합니다: {path}"
+        )
 
 
 def save_manifest(folder: Path, manifest: dict) -> Path:
@@ -1690,6 +2746,94 @@ def set_master(manifest: dict, filename: str) -> dict:
     return manifest
 
 
+def promote_master(
+    folder: Path,
+    filename: str,
+    verify_callback=None,
+) -> dict:
+    """Promote one SPM and standardize its master-side Base data immediately."""
+
+    folder = Path(folder)
+    master_path = folder / filename
+    if not master_path.is_file():
+        raise SyncError(f"마스터 SPM이 없습니다: {master_path}")
+
+    manifest, manifest_fingerprint = load_manifest_snapshot(folder)
+    set_master(manifest, filename)
+    group = find_group(manifest, filename)
+    document, rendered, color_updates, reference_renames, warnings = (
+        standardize_master_document(master_path)
+    )
+    categories = source_base_categories(document)
+    group["base_categories"] = categories
+    original_text, compressed, current_fingerprint = read_spm_snapshot(
+        master_path
+    )
+    if current_fingerprint != document.source_fingerprint:
+        raise SyncError(
+            "마스터 승격을 계산하는 동안 다른 작업이 같은 SPM을 "
+            f"수정했습니다. 원본을 덮어쓰지 않고 중단합니다: {filename}"
+        )
+    changed = rendered != original_text
+
+    validate_xml_text(rendered)
+    check = SPMDocument(master_path, rendered, compressed, full=True)
+    check.validate()
+
+    _assert_spm_unchanged({
+        master_path: document.source_fingerprint,
+    })
+    _assert_manifest_unchanged(folder, manifest_fingerprint)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = folder / BACKUP_SUBDIR / f"master_promotion_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    master_backup = backup_dir / f"01_{filename}"
+    shutil.copy2(master_path, master_backup)
+
+    manifest_path = folder / MANIFEST_NAME
+    manifest_existed = manifest_path.is_file()
+    manifest_backup = backup_dir / f"00_{MANIFEST_NAME}"
+    if manifest_existed:
+        shutil.copy2(manifest_path, manifest_backup)
+
+    manifest_write_attempted = False
+    try:
+        if changed:
+            _assert_spm_unchanged({
+                master_path: document.source_fingerprint,
+            })
+            _assert_manifest_unchanged(folder, manifest_fingerprint)
+            write_spm_text(master_path, rendered, compressed)
+            written, written_compressed = read_spm_text(master_path)
+            if written != rendered or written_compressed != compressed:
+                raise SyncError(f"저장 후 바이트 검증 실패: {filename}")
+            SPMDocument(master_path, written, compressed, full=True).validate()
+            if verify_callback is not None:
+                verify_callback(master_path)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
+        manifest_write_attempted = True
+        save_manifest(folder, manifest)
+    except Exception:
+        shutil.copy2(master_backup, master_path)
+        if manifest_write_attempted:
+            if manifest_existed and manifest_backup.is_file():
+                shutil.copy2(manifest_backup, manifest_path)
+            elif not manifest_existed:
+                manifest_path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "manifest": manifest,
+        "master": str(master_path),
+        "changed": changed,
+        "color_updates": color_updates,
+        "reference_renames": reference_renames,
+        "warnings": warnings,
+        "backup_dir": str(backup_dir),
+    }
+
+
 def set_independent(manifest: dict, filenames: list[str]) -> dict:
     for filename in filenames:
         _remove_relation(manifest, filename)
@@ -1721,14 +2865,45 @@ def assign_follower(
     return manifest
 
 
-def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
+def scan_tree_folders(
+    root: Path,
+    sk_only: bool = False,
+    *,
+    verify_physical: bool = True,
+    progress_callback=None,
+) -> list[dict]:
     root = Path(root)
     if not root.is_dir():
         raise SyncError(f"나무 루트 폴더가 없습니다: {root}")
     folders: list[dict] = []
-    for current, dirs, files in os.walk(root):
-        dirs[:] = [name for name in dirs if name.lower() not in {item.lower() for item in SKIP_DIRS}]
-        folder = Path(current)
+    skipped = {item.casefold() for item in SKIP_DIRS}
+    candidates = [root]
+    try:
+        candidates.extend(
+            path for path in root.iterdir()
+            if (
+                path.is_dir()
+                and path.name.casefold() not in skipped
+                and path.name.casefold() != "cluster"
+            )
+        )
+    except OSError as exc:
+        raise SyncError(f"나무 루트를 읽을 수 없습니다: {root}") from exc
+    scan_candidates = sorted(
+        candidates,
+        key=lambda path: (path != root, path.name.casefold()),
+    )
+    total_candidates = len(scan_candidates)
+    for index, folder in enumerate(scan_candidates, start=1):
+        if progress_callback:
+            progress_callback(
+                f"폴더 검사 {index}/{total_candidates} · {folder.name}",
+                int(100 * (index - 1) / max(1, total_candidates)),
+            )
+        try:
+            files = [path.name for path in folder.iterdir() if path.is_file()]
+        except OSError:
+            continue
         spms = sorted(
             [
                 folder / name
@@ -1738,7 +2913,14 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
             ],
             key=lambda item: item.name.casefold(),
         )
-        if not spms:
+        cluster_blends = json.loads(json.dumps(
+            discover_cluster_blend_relations(
+                folder,
+                verify_physical=verify_physical,
+            ),
+            default=str,
+        ))
+        if not spms and not cluster_blends:
             continue
         manifest = load_manifest(folder)
         relations = relation_index(manifest)
@@ -1752,7 +2934,13 @@ def scan_tree_folders(root: Path, sk_only: bool = False) -> list[dict]:
             "manifest": manifest,
             "relations": relations,
             "master_candidates": candidates,
+            "cluster_blends": cluster_blends,
         })
+    if progress_callback:
+        progress_callback(
+            f"폴더 검사 완료 · {total_candidates}/{total_candidates}",
+            100,
+        )
     return folders
 
 
@@ -1768,6 +2956,8 @@ def verify_speedtree_export(
     speedtree_exe: Path,
     xml_ini: Path,
     timeout: int = 300,
+    output_callback=None,
+    cancel_requested=None,
 ) -> None:
     spm_path = Path(spm_path)
     speedtree_exe = Path(speedtree_exe)
@@ -1776,6 +2966,10 @@ def verify_speedtree_export(
         raise SyncError(f"SpeedTree 실행 파일이 없습니다: {speedtree_exe}")
     if not xml_ini.is_file():
         raise SyncError(f"SpeedTree XML export 설정이 없습니다: {xml_ini}")
+    require_texture_skip_writing(
+        xml_ini,
+        purpose=f"{spm_path.name} Generator Sync verification XML export",
+    )
     with tempfile.TemporaryDirectory(prefix="spm_generator_sync_verify_") as temp:
         output = Path(temp) / f"{spm_path.stem}_verify.xml"
         cmd = [
@@ -1783,19 +2977,42 @@ def verify_speedtree_export(
             "-export_options", str(xml_ini),
             "-export", str(output),
         ]
-        result = subprocess.run(
-            cmd,
-            cwd=str(spm_path.parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000 if os.name == "nt" else 0,
-        )
+        try:
+            result = run_streaming_process(
+                cmd,
+                cwd=spm_path.parent,
+                timeout=timeout,
+                output_callback=output_callback,
+                cancel_requested=cancel_requested,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                ),
+            )
+        except ProcessCancelled as exc:
+            raise SyncCancelled(
+                exc.result.status,
+                pid=exc.result.pid,
+                returncode=exc.result.returncode,
+            ) from exc
         if result.returncode != 0 or not output.is_file():
             detail = (result.stderr or result.stdout or "")[-1000:]
+            omitted_chars = (
+                result.stderr_omitted_chars
+                if result.stderr
+                else result.stdout_omitted_chars
+            )
+            evidence = (
+                f" [process_output_tail_omitted chars={omitted_chars}]"
+                if omitted_chars else ""
+            )
+            reason_token = (
+                "speedtree_process_nonzero"
+                if result.returncode != 0
+                else "speedtree_export_output_missing"
+            )
             raise SyncError(
-                f"SpeedTree 10.1 XML 검증 실패: {spm_path.name} "
-                f"(code {result.returncode}) {detail}"
+                f"[{reason_token}] SpeedTree 10.1 XML 검증 실패: "
+                f"{spm_path.name} (code {result.returncode}){evidence} {detail}"
             )
         try:
             ET.parse(output)
@@ -1807,6 +3024,7 @@ def verify_temporary_patches(
     patches: list[tuple[Path, str, bool]],
     callback,
     progress_callback=None,
+    cancel_requested=None,
 ) -> None:
     """Compute patched sibling copies before originals are ever overwritten."""
     token = uuid.uuid4().hex[:10]
@@ -1814,17 +3032,22 @@ def verify_temporary_patches(
     try:
         total = len(patches)
         for index, (path, text, compressed) in enumerate(patches, start=1):
+            _raise_if_cancelled(cancel_requested)
             temporary = path.parent / f"__spm_sync_preflight_{token}_{path.name}"
             write_spm_text(temporary, text, compressed)
             temporary_paths.append(temporary)
             if progress_callback is not None:
                 progress_callback(path, index, total)
+            _raise_if_cancelled(cancel_requested)
             callback(temporary)
+            _raise_if_cancelled(cancel_requested)
     except subprocess.TimeoutExpired as exc:
         raise SyncError(
             "SpeedTree 사전검사가 5분을 넘겨 중단되었습니다. 노드·폴리곤 폭증 "
             "가능성이 있어 원본은 수정하지 않았습니다."
         ) from exc
+    except SyncCancelled:
+        raise
     except Exception as exc:
         if isinstance(exc, SyncError):
             raise SyncError(f"SpeedTree 사전검사 실패 · 원본 미수정: {exc}") from exc
@@ -1844,6 +3067,157 @@ def verify_temporary_patches(
                         pass
 
 
+def apply_pass_repair_transaction(
+    spm_path: Path,
+    verify_callback=None,
+) -> dict:
+    """Repair only Generation Pass dependencies with backup and rollback."""
+    spm_path = Path(spm_path)
+    if not spm_path.is_file():
+        raise SyncError(f"SPM이 없습니다: {spm_path}")
+    original_bytes = spm_path.read_bytes()
+    document = SPMDocument.from_path(spm_path, full=True)
+    adjustments = repair_generation_passes(document)
+    if not adjustments:
+        document.validate()
+        return {
+            "status": "unchanged",
+            "file": str(spm_path),
+            "backup_dir": None,
+            "pass_adjustments": [],
+        }
+
+    rendered = document.render()
+    document.validate(rendered)
+    if verify_callback is not None:
+        verify_temporary_patches(
+            [(spm_path, rendered, document.compressed)],
+            verify_callback,
+        )
+    if spm_path.read_bytes() != original_bytes:
+        raise SyncError(
+            f"사전검사 중 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+        )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = spm_path.parent / BACKUP_SUBDIR / f"pass_repair_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    spm_backup = backup_dir / f"01_{spm_path.name}"
+    temporary = spm_path.with_name(
+        f".__spm_pass_repair_{uuid.uuid4().hex[:10]}_{spm_path.name}"
+    )
+    replaced_original = False
+    try:
+        write_spm_text(temporary, rendered, document.compressed)
+        candidate_text, candidate_compressed = read_spm_text(temporary)
+        candidate = SPMDocument(
+            temporary, candidate_text, candidate_compressed, full=True
+        )
+        candidate.validate(candidate_text)
+
+        shutil.copy2(spm_path, spm_backup)
+        if spm_backup.read_bytes() != original_bytes:
+            raise SyncError(
+                f"백업 직전 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+            )
+        autosave_path = spm_path.with_name(f"~{spm_path.stem}.sbk")
+        if autosave_path.is_file():
+            shutil.copy2(autosave_path, backup_dir / f"02_{autosave_path.name}")
+        # Keep the final comparison adjacent to the atomic replacement so an
+        # open Modeler or OneDrive update is far less likely to be overwritten.
+        if spm_path.read_bytes() != original_bytes:
+            raise SyncError(
+                f"저장 직전 파일이 변경되어 Pass 복구를 중단했습니다: {spm_path.name}"
+            )
+        os.replace(temporary, spm_path)
+        replaced_original = True
+        written_text, written_compressed = read_spm_text(spm_path)
+        written = SPMDocument(spm_path, written_text, written_compressed, full=True)
+        written.validate(written_text)
+    except Exception:
+        if replaced_original:
+            shutil.copy2(spm_backup, spm_path)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "status": "applied",
+        "file": str(spm_path),
+        "backup_dir": str(backup_dir),
+        "pass_adjustments": adjustments,
+    }
+
+
+def build_normalized_sync_plans(
+    master_path: Path,
+    target_specs: list[tuple[Path, dict[str, str | None]]],
+    categories: dict[str, str | None],
+    progress_callback=None,
+) -> dict[str, object]:
+    """Build independent follower patches from one immutable master snapshot."""
+
+    master_path = Path(master_path)
+    if not target_specs:
+        raise SyncError("동기화할 SPM이 없습니다")
+    master_doc = SPMDocument.from_path(master_path, full=True)
+    master_doc.validate()
+    master_text = master_doc.text
+    master_hash = base_sync_signature(master_doc, categories)
+
+    loaded_targets: list[
+        tuple[Path, dict[str, str | None], SPMDocument]
+    ] = []
+    total = len(target_specs)
+    for index, (target_path, mapping) in enumerate(target_specs, start=1):
+        target_path = Path(target_path)
+        if progress_callback is not None:
+            progress_callback(
+                f"자식 SPM 읽는 중 · {target_path.name} ({index}/{total})",
+                5 + round(15 * (index - 1) / max(1, total)),
+            )
+        target_doc = SPMDocument.from_path(target_path, full=True)
+        loaded_targets.append((target_path, mapping, target_doc))
+
+    plans: list[SyncPlan] = []
+    for index, (target_path, mapping, target_doc) in enumerate(
+        loaded_targets,
+        start=1,
+    ):
+        if progress_callback is not None:
+            progress_callback(
+                f"SPM 동기화 패치 계산 중 · {target_path.name} ({index}/{total})",
+                20 + round(15 * (index - 1) / max(1, total)),
+            )
+        plan = build_sync_plan(
+            master_path,
+            target_path,
+            mapping,
+            categories,
+            master_document=master_doc,
+            target_document=target_doc,
+        )
+        if plan.mapping_required:
+            raise SyncError(
+                f"{target_path.name} Base 매핑 확인 필요: "
+                + ", ".join(plan.mapping_required)
+            )
+        plans.append(plan)
+
+    return {
+        "master_document": master_doc,
+        "master_text": master_text,
+        "master_hash": master_hash,
+        "source_fingerprints": {
+            master_path: master_doc.source_fingerprint,
+            **{
+                target_path: target_doc.source_fingerprint
+                for target_path, _mapping, target_doc in loaded_targets
+            },
+        },
+        "plans": plans,
+    }
+
+
 def verify_auto_copies(
     folder: Path,
     master_name: str,
@@ -1860,37 +3234,35 @@ def verify_auto_copies(
     master_path = folder / master_name
     source_prefix = SPMDocument.from_path(master_path, full=False)
     categories = source_base_categories(source_prefix)
-    master_doc, master_text, color_updates, master_ref_renames, color_warnings = standardize_master_document(
-        master_path, categories
+    target_specs = []
+    for target_name in target_names:
+        target_path = folder / target_name
+        target_prefix = SPMDocument.from_path(target_path, full=False)
+        target_specs.append((
+            target_path,
+            suggest_base_map(source_prefix, target_prefix, categories),
+        ))
+    prepared = build_normalized_sync_plans(
+        master_path,
+        target_specs,
+        categories,
     )
+    master_doc = prepared["master_document"]
+    master_text = prepared["master_text"]
+    plans = prepared["plans"]
     token = uuid.uuid4().hex[:10]
     temporary_paths: list[Path] = []
-    plans: list[SyncPlan] = []
     try:
         temp_master = folder / f"__spm_sync_verify_{token}_{master_name}"
         write_spm_text(temp_master, master_text, master_doc.compressed)
         temporary_paths.append(temp_master)
         verify_speedtree_export(temp_master, speedtree_exe, xml_ini)
-        for target_name in target_names:
-            target_path = folder / target_name
-            target_prefix = SPMDocument.from_path(target_path, full=False)
-            mapping = suggest_base_map(source_prefix, target_prefix, categories)
-            plan = build_sync_plan(
-                master_path, target_path, mapping, categories,
-                master_document=master_doc,
-            )
-            plan.master_color_updates = color_updates
-            plan.master_reference_renames = master_ref_renames
-            plan.warnings.extend(color_warnings)
-            if plan.mapping_required:
-                raise SyncError(
-                    f"{target_name} 자동 매핑 확인 필요: " + ", ".join(plan.mapping_required)
-                )
-            temp_target = folder / f"__spm_sync_verify_{token}_{target_name}"
+        for plan in plans:
+            target_path = Path(plan.target)
+            temp_target = folder / f"__spm_sync_verify_{token}_{target_path.name}"
             write_spm_text(temp_target, plan.patched_text, plan.compressed)
             temporary_paths.append(temp_target)
             verify_speedtree_export(temp_target, speedtree_exe, xml_ini)
-            plans.append(plan)
         return plans
     finally:
         for path in temporary_paths:
@@ -1906,21 +3278,18 @@ def verify_auto_copies(
                     pass
 
 
-def apply_group_transaction(
+def build_group_sync_plans(
     folder: Path,
     master_name: str,
     follower_names: list[str] | None = None,
-    verify_speedtree: bool = True,
-    speedtree_exe: Path | None = None,
-    xml_ini: Path | None = None,
-    verify_callback=None,
     progress_callback=None,
-) -> dict:
-    """Preflight, backup, write, verify, and rollback a whole master group."""
+) -> dict[str, object]:
+    """Build one normalized master plus all selected follower patches in memory."""
+
     folder = Path(folder)
     if progress_callback is not None:
         progress_callback("설정과 마스터 읽는 중", 2)
-    manifest = load_manifest(folder)
+    manifest, manifest_fingerprint = load_manifest_snapshot(folder)
     group = find_group(manifest, master_name)
     configured = {item.get("file"): item for item in group.get("followers", [])}
     selected = follower_names or list(configured)
@@ -1934,41 +3303,89 @@ def apply_group_transaction(
     if not master_path.is_file():
         raise SyncError(f"마스터 SPM이 없습니다: {master_path}")
     categories = group.get("base_categories") or {}
-    master_doc, master_text, master_color_updates, master_ref_renames, master_warnings = standardize_master_document(
-        master_path, categories
-    )
-    master_hash = base_sync_signature(master_doc, categories)
-
-    plans: list[SyncPlan] = []
-    for index, name in enumerate(selected, start=1):
-        if progress_callback is not None:
-            percent = 5 + round(30 * (index - 1) / max(1, len(selected)))
-            progress_callback(f"패치 계산 중 · {name} ({index}/{len(selected)})", percent)
+    target_specs = []
+    for name in selected:
         entry = configured[name]
         if not entry.get("base_map_confirmed"):
             raise SyncError(f"Base 매핑을 먼저 확인해야 합니다: {name}")
         target_path = folder / name
         if not target_path.is_file():
             raise SyncError(f"자식 SPM이 없습니다: {target_path}")
-        plan = build_sync_plan(
-            master_path,
+        target_specs.append((
             target_path,
             entry.get("base_map") or {},
-            categories,
-            master_document=master_doc,
-        )
-        plan.master_color_updates = master_color_updates
-        plan.master_reference_renames = master_ref_renames
-        plan.warnings.extend(master_warnings)
-        if plan.mapping_required:
-            raise SyncError(f"{name} Base 매핑 확인 필요: " + ", ".join(plan.mapping_required))
-        plans.append(plan)
+        ))
+    normalized = build_normalized_sync_plans(
+        master_path,
+        target_specs,
+        categories,
+        progress_callback=progress_callback,
+    )
+
+    return {
+        "folder": folder,
+        "manifest": manifest,
+        "manifest_fingerprint": manifest_fingerprint,
+        "group": group,
+        "configured": configured,
+        "selected": selected,
+        "master_path": master_path,
+        "categories": categories,
+        **normalized,
+    }
+
+
+def apply_group_transaction(
+    folder: Path,
+    master_name: str,
+    follower_names: list[str] | None = None,
+    verify_speedtree: bool = True,
+    speedtree_exe: Path | None = None,
+    xml_ini: Path | None = None,
+    verify_callback=None,
+    progress_callback=None,
+    process_output_callback=None,
+    cancel_requested=None,
+    skip_blocked_scale: bool = False,
+) -> dict:
+    """Preflight, backup, write, verify, and rollback a whole master group.
+
+    Batch callers may set ``skip_blocked_scale`` so one oversized follower is
+    reported in ``scale_skipped`` without suppressing safe siblings.
+    """
+    _raise_if_cancelled(cancel_requested)
+    prepared = build_group_sync_plans(
+        folder,
+        master_name,
+        follower_names,
+        progress_callback=progress_callback,
+    )
+    _raise_if_cancelled(cancel_requested)
+    folder = prepared["folder"]
+    manifest = prepared["manifest"]
+    configured = prepared["configured"]
+    selected = prepared["selected"]
+    master_path = prepared["master_path"]
+    master_doc = prepared["master_document"]
+    master_hash = prepared["master_hash"]
+    plans = prepared["plans"]
+    manifest_fingerprint = prepared["manifest_fingerprint"]
+
+    # Every patch below is built from the bytes just read, so remember them and
+    # re-check right before the write.
+    plan_fingerprints = dict(prepared["source_fingerprints"])
 
     if progress_callback is not None:
         progress_callback("크기 위험과 XML 무결성 확인 중", 38)
+    _raise_if_cancelled(cancel_requested)
 
     blocked = [plan for plan in plans if plan.scale_risk.get("level") == "blocked"]
-    if blocked:
+    scale_skipped = [{
+        "target": str(plan.target),
+        "reason": "크기 차이로 노드·폴리곤 폭증 위험",
+        "scale_risk": dict(plan.scale_risk),
+    } for plan in blocked]
+    if blocked and not skip_blocked_scale:
         details = []
         for plan in blocked:
             risk = plan.scale_risk
@@ -1980,11 +3397,41 @@ def apply_group_transaction(
             "크기 차이로 노드·폴리곤 폭증 위험이 있어 원본을 수정하지 않았습니다. "
             "큰 나무용 Base를 별도 마스터로 사용하세요.\n" + "\n".join(details)
         )
+    if blocked:
+        blocked_targets = {
+            os.path.normcase(str(Path(plan.target).absolute())).casefold()
+            for plan in blocked
+        }
+        plans = [
+            plan for plan in plans
+            if os.path.normcase(
+                str(Path(plan.target).absolute())
+            ).casefold() not in blocked_targets
+        ]
+        selected = [Path(plan.target).name for plan in plans]
+        plan_fingerprints = {
+            path: fingerprint
+            for path, fingerprint in plan_fingerprints.items()
+            if (
+                Path(path) == master_path
+                or os.path.normcase(
+                    str(Path(path).absolute())
+                ).casefold() not in blocked_targets
+            )
+        }
+        if not plans:
+            if progress_callback is not None:
+                progress_callback("크기 폭증 위험 자식 제외 완료", 100)
+            return {
+                "status": "skipped_scale_risk",
+                "changed_files": [],
+                "backup_dir": None,
+                "plans": [],
+                "master_hash": master_hash,
+                "scale_skipped": scale_skipped,
+            }
 
     patches: list[tuple[Path, str, bool]] = []
-    original_master_text, master_compressed = read_spm_text(master_path)
-    if master_text != original_master_text:
-        patches.append((master_path, master_text, master_compressed))
     for plan in plans:
         if plan.changed and plan.patched_text is not None:
             patches.append((Path(plan.target), plan.patched_text, plan.compressed))
@@ -2004,12 +3451,19 @@ def apply_group_transaction(
             entry["last_target_hash"] = target_sync_signature(
                 master_doc, target_doc, entry.get("base_map") or {}
             )
+        # "Already current" still commits relationship/freshness metadata.
+        # Recheck the immutable master/follower snapshot before that write so
+        # a concurrent SPM edit cannot be stamped as synchronized.
+        _assert_spm_unchanged(plan_fingerprints)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
+        _raise_if_cancelled(cancel_requested)
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("이미 최신 · 관계 정보 확인 완료", 100)
         return {
             "status": "up_to_date", "changed_files": [], "backup_dir": None,
             "plans": plans, "master_hash": master_hash,
+            "scale_skipped": scale_skipped,
         }
 
     # All in-memory patches must be valid before the first filesystem mutation.
@@ -2020,6 +3474,7 @@ def apply_group_transaction(
 
     if progress_callback is not None:
         progress_callback("메모리 패치 검증 완료", 44)
+    _raise_if_cancelled(cancel_requested)
 
     # Built-in Modeler validation is a true preflight: temporary sibling SPMs
     # are computed first and originals remain byte-identical on any failure.
@@ -2029,43 +3484,64 @@ def apply_group_transaction(
             raise SyncError("SpeedTree 검증 경로가 설정되지 않았습니다")
         verify_temporary_patches(
             patches,
-            lambda path: verify_speedtree_export(path, speedtree_exe, xml_ini),
+            lambda path: verify_speedtree_export(
+                path,
+                speedtree_exe,
+                xml_ini,
+                output_callback=process_output_callback,
+                cancel_requested=cancel_requested,
+            ),
             progress_callback=lambda path, index, total: progress_callback(
                 f"SpeedTree 사전검사 · {path.name} ({index}/{total})",
                 45 + round(30 * (index - 1) / max(1, total)),
             ) if progress_callback is not None else None,
+            cancel_requested=cancel_requested,
         )
 
     if progress_callback is not None:
-        progress_callback("사전검사 완료 · 백업 준비 중", 76)
+        progress_callback("사전검사 완료 · 동시 수정 확인 중", 76)
+    _raise_if_cancelled(cancel_requested)
+
+    _assert_spm_unchanged(plan_fingerprints)
+    _assert_manifest_unchanged(folder, manifest_fingerprint)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_dir = folder / BACKUP_SUBDIR / f"generator_sync_{stamp}"
     backup_dir.mkdir(parents=True, exist_ok=False)
     backups: list[tuple[Path, Path]] = []
+    manifest_write_attempted = False
+    manifest_path = folder / MANIFEST_NAME
+    manifest_existed = manifest_fingerprint is not None
+    manifest_backup = backup_dir / f"00_{MANIFEST_NAME}"
     try:
-        transaction_paths = list(dict.fromkeys(
-            [master_path, *(folder / name for name in selected)]
-        ))
+        transaction_paths = list(dict.fromkeys(folder / name for name in selected))
         for index, path in enumerate(transaction_paths, start=1):
+            _raise_if_cancelled(cancel_requested)
             if progress_callback is not None:
                 progress_callback(
                     f"원본 백업 중 · {path.name} ({index}/{len(transaction_paths)})",
                     78 + round(8 * index / max(1, len(transaction_paths))),
                 )
+            _raise_if_cancelled(cancel_requested)
             backup = backup_dir / f"{index:02d}_{path.name}"
             shutil.copy2(path, backup)
             backups.append((path, backup))
-        manifest_path = folder / MANIFEST_NAME
         if manifest_path.is_file():
-            shutil.copy2(manifest_path, backup_dir / f"00_{MANIFEST_NAME}")
+            shutil.copy2(manifest_path, manifest_backup)
+        # The master remains read-only, but must still be the exact source
+        # snapshot used to calculate every follower patch.
+        _assert_spm_unchanged(plan_fingerprints)
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
         for index, (path, text, compressed) in enumerate(patches, start=1):
+            _raise_if_cancelled(cancel_requested)
             if progress_callback is not None:
                 progress_callback(
                     f"검증된 SPM 저장 중 · {path.name} ({index}/{len(patches)})",
                     86 + round(8 * index / max(1, len(patches))),
                 )
+            _raise_if_cancelled(cancel_requested)
             write_spm_text(path, text, compressed)
+            _raise_if_cancelled(cancel_requested)
         for path, text, _compressed in patches:
             written, _ = read_spm_text(path)
             if written != text:
@@ -2077,7 +3553,9 @@ def apply_group_transaction(
         # built-in SpeedTree path has already verified identical temp bytes.
         if callback is not None:
             for path, _text, _compressed in patches:
+                _raise_if_cancelled(cancel_requested)
                 callback(path)
+                _raise_if_cancelled(cancel_requested)
 
         now = datetime.now().isoformat(timespec="seconds")
         for plan in plans:
@@ -2096,13 +3574,54 @@ def apply_group_transaction(
             entry["last_target_hash"] = target_sync_signature(
                 master_doc, target_doc, entry.get("base_map") or {}
             )
+        _assert_manifest_unchanged(folder, manifest_fingerprint)
+        _raise_if_cancelled(cancel_requested)
+        manifest_write_attempted = True
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("관계 정보 저장 완료", 100)
-    except Exception:
+    except Exception as original_exc:
+        rollback_errors = []
         for path, backup in backups:
             if backup.exists():
-                shutil.copy2(backup, path)
+                try:
+                    shutil.copy2(backup, path)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "restore_spm",
+                        "path": str(path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
+        if manifest_write_attempted:
+            if manifest_existed and manifest_backup.is_file():
+                try:
+                    shutil.copy2(manifest_backup, manifest_path)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "restore_manifest",
+                        "path": str(manifest_path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
+            elif not manifest_existed:
+                try:
+                    manifest_path.unlink(missing_ok=True)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "remove_new_manifest",
+                        "path": str(manifest_path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
+        if rollback_errors:
+            raise TransactionRollbackError(
+                original_exc,
+                rollback_errors,
+            ) from original_exc
         raise
     return {
         "status": "applied",
@@ -2110,6 +3629,7 @@ def apply_group_transaction(
         "backup_dir": str(backup_dir),
         "plans": plans,
         "master_hash": master_hash,
+        "scale_skipped": scale_skipped,
     }
 
 
@@ -2118,11 +3638,15 @@ def inspect_file(path: Path) -> dict:
     bases = []
     for base in document.base_nodes():
         name = document.generator_name(base)
+        try:
+            reference_count = len(document.refs_for_base(base))
+        except SearchSyntaxError:
+            reference_count = 0
         bases.append({
             "name": name,
             "category": classify_base_name(name),
             "signature": dict(document.base_type_signature(base)),
-            "refs": len(document.refs_for_base(base)),
+            "refs": reference_count,
         })
     return {"file": Path(path).name, "bases": bases, "errors": document.integrity_errors()}
 
@@ -2147,6 +3671,12 @@ def main(argv: list[str] | None = None) -> int:
 
     inspect_parser = sub.add_parser("inspect")
     inspect_parser.add_argument("spm", nargs="+")
+
+    repair_pass_parser = sub.add_parser("repair-passes")
+    repair_pass_parser.add_argument("spm")
+    repair_pass_parser.add_argument("--no-speedtree-verify", action="store_true")
+    repair_pass_parser.add_argument("--speedtree-exe")
+    repair_pass_parser.add_argument("--xml-ini")
 
     preview_parser = sub.add_parser("preview")
     preview_parser.add_argument("folder")
@@ -2184,22 +3714,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "inspect":
         print(json.dumps([inspect_file(Path(path)) for path in args.spm], ensure_ascii=False, indent=2))
         return 0
+    if args.command == "repair-passes":
+        callback = None
+        if not args.no_speedtree_verify:
+            if not args.speedtree_exe or not args.xml_ini:
+                raise SyncError("SpeedTree 검증 경로가 설정되지 않았습니다")
+            speedtree_exe = Path(args.speedtree_exe)
+            xml_ini = Path(args.xml_ini)
+            callback = lambda path: verify_speedtree_export(path, speedtree_exe, xml_ini)
+        result = apply_pass_repair_transaction(Path(args.spm), verify_callback=callback)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "preview":
-        folder = Path(args.folder)
-        manifest = load_manifest(folder)
-        group = find_group(manifest, args.master)
-        follower = next(
-            (item for item in group.get("followers", []) if item.get("file") == args.target),
-            None,
+        prepared = build_group_sync_plans(
+            Path(args.folder),
+            args.master,
+            [args.target],
         )
-        if follower is None:
-            raise SyncError(f"자식 설정이 없습니다: {args.target}")
-        plan = build_sync_plan(
-            folder / args.master,
-            folder / args.target,
-            follower.get("base_map") or {},
-            group.get("base_categories") or {},
-        )
+        plan = prepared["plans"][0]
         print(json.dumps(plan_to_json(plan), ensure_ascii=False, indent=2))
         return 0
     if args.command == "preview-auto":
@@ -2207,22 +3739,27 @@ def main(argv: list[str] | None = None) -> int:
         master_path = folder / args.master
         source_prefix = SPMDocument.from_path(master_path, full=False)
         categories = source_base_categories(source_prefix)
-        source_full, _master_text, color_updates, master_ref_renames, color_warnings = standardize_master_document(
-            master_path, categories
-        )
-        output = []
+        target_specs = []
         for target_name in args.target:
             target_path = folder / target_name
             target_prefix = SPMDocument.from_path(target_path, full=False)
             mapping = suggest_base_map(source_prefix, target_prefix, categories)
-            plan = build_sync_plan(
-                master_path, target_path, mapping, categories,
-                master_document=source_full,
+            target_specs.append((target_path, mapping))
+        prepared = build_normalized_sync_plans(
+            master_path,
+            target_specs,
+            categories,
+        )
+        output = [
+            {
+                "base_map_suggestion": mapping,
+                "plan": plan_to_json(plan),
+            }
+            for (_target_path, mapping), plan in zip(
+                target_specs,
+                prepared["plans"],
             )
-            plan.master_color_updates = color_updates
-            plan.master_reference_renames = master_ref_renames
-            plan.warnings.extend(color_warnings)
-            output.append({"base_map_suggestion": mapping, "plan": plan_to_json(plan)})
+        ]
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     if args.command == "apply":

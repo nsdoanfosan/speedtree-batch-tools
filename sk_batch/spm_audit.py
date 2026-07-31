@@ -32,8 +32,12 @@ if calibration dies midway.
 Standalone:  python spm_audit.py <file.spm> [--dry-run] [--report out.json]
 """
 import argparse
+import contextvars
+import ctypes
+import errno
 import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -42,23 +46,81 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
+if str(BATCH_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(BATCH_TOOLS_DIR))
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sk_common import file_content_fingerprint, load_config
+    from sk_common import (
+        SPM_BONE_CONTRACT_VERSION,
+        calibration_settings_signature,
+        file_content_fingerprint,
+        load_config,
+        speedtree_output_spm_for,
+    )
+    from spm_calibration_receipt import (
+        POSITIVE_CALIBRATION_STATUSES,
+        bone_semantic_fingerprint,
+        legacy_bone_semantic_fingerprint,
+        load_positive_calibration_receipt,
+        write_positive_calibration_receipt,
+    )
+else:
+    from .sk_common import (
+        SPM_BONE_CONTRACT_VERSION,
+        calibration_settings_signature,
+        file_content_fingerprint,
+        load_config,
+        speedtree_output_spm_for,
+    )
+    from .spm_calibration_receipt import (
+        POSITIVE_CALIBRATION_STATUSES,
+        bone_semantic_fingerprint,
+        legacy_bone_semantic_fingerprint,
+        load_positive_calibration_receipt,
+        write_positive_calibration_receipt,
+    )
+from speedtree_pipeline_contract import (
+    branch_generator_has_render_geometry,
+    read_spm_text as read_pipeline_spm_text,
+)
+from speedtree_export_options_contract import require_texture_skip_writing
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
+NODE_TYPE_RE = re.compile(r'<Node\b[^>]*Type="([^"]+)"')
 FIRST_NAME_RE = re.compile(r"<Name>([^<]*)</Name>")
 FIRST_GUID_RE = re.compile(r"<GUID>([^<]*)</GUID>")
 MATERIAL_RE = re.compile(r'(<Material_v8\b[^>]*?Name=")([^"]*)(")')
 
 BACKUP_SUBDIR = "_spm_backups"
+CALIBRATION_MARKER_SUFFIX = ".skbatch_calibration_in_progress.json"
+CALIBRATION_MARKER_VERSION = 1
 PROBE_CACHE_VERSION = 1
 PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
+SPM_PROCESS_LOCK_SUFFIX = ".skbatch_process.lock"
+SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION = 1
+SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION = 1
+SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
+SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
+    r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
+)
+SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS = 900.0
+SPEEDTREE_EXPORT_CRASH_RETRIES = 2
+SPM_REPLACE_MAX_ATTEMPTS = 9
+SPM_REPLACE_INITIAL_BACKOFF_SECONDS = 0.05
+SPM_REPLACE_MAX_BACKOFF_SECONDS = 1.0
+_SPM_WRITE_TRANSACTION = contextvars.ContextVar(
+    "spm_write_transaction",
+    default=None,
+)
 BONE_VALUE_RE = re.compile(
     r"(<Name>Physics:(?:Bone style|Bones)</Name>\s*<Value>)[^<]*(</Value>)",
     re.DOTALL,
@@ -89,13 +151,746 @@ class ManualCalibrationRequired(RuntimeError):
 class SpeedTreeExportTimeout(RuntimeError):
     """One SpeedTree export exceeded the automatic-calibration time budget."""
 
-    def __init__(self, stage, timeout_seconds):
+    def __init__(self, stage, timeout_seconds, *, evidence=None):
         self.stage = stage
         self.timeout_seconds = float(timeout_seconds)
+        self.evidence = dict(evidence or {})
+        reason = self.evidence.get("timeout_reason")
+        reason_detail = f" ({reason})" if reason else ""
         super().__init__(
-            f"SpeedTree {stage} export exceeded {self.timeout_seconds:g}s; "
-            "skipped automatic calibration for manual bone setup"
+            f"SpeedTree {stage} export exceeded its progress deadline"
+            f"{reason_detail}; "
+            "automatic calibration stopped and the original SPM was restored"
         )
+
+
+class SpeedTreeExportProcessError(RuntimeError):
+    """A SpeedTree process/runtime failure with report-safe evidence."""
+
+    def __init__(self, message, diagnostic):
+        self.diagnostic = dict(diagnostic)
+        super().__init__(message)
+
+
+class SPMAtomicOperationError(RuntimeError):
+    """A lock or concurrent modification that must not be hidden by rollback."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = dict(diagnostic)
+        super().__init__(
+            json.dumps(self.diagnostic, ensure_ascii=False, sort_keys=True)
+        )
+
+
+class SpeedTreeExportResult:
+    """Tuple-compatible process result with structured attempt evidence."""
+
+    def __init__(self, returncode, stdout, stderr, evidence):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.evidence = evidence
+
+    def __iter__(self):
+        yield self.returncode
+        yield self.stdout
+        yield self.stderr
+
+
+def canonical_spm_process_lock_path(spm_path):
+    """Return the one persistent lock identity shared by a Cluster SPM pair."""
+    canonical = Path(speedtree_output_spm_for(spm_path)).expanduser().resolve()
+    return (
+        canonical.parent
+        / BACKUP_SUBDIR
+        / f"{canonical.stem}{SPM_PROCESS_LOCK_SUFFIX}"
+    )
+
+
+def _retryable_windows_lock_error(exc):
+    return (
+        getattr(exc, "errno", None)
+        in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        or getattr(exc, "winerror", None) in {33, 36, 158}
+    )
+
+
+def _retryable_file_operation_error(exc):
+    return (
+        getattr(exc, "errno", None)
+        in {
+            errno.EACCES,
+            errno.EAGAIN,
+            getattr(errno, "EBUSY", errno.EACCES),
+        }
+        or getattr(exc, "winerror", None) in {5, 32, 33}
+    )
+
+
+def _content_snapshot_from_bytes(payload):
+    return {
+        "exists": True,
+        "size": len(payload),
+        "sha256": _sha256_bytes(payload),
+    }
+
+
+def _missing_content_snapshot():
+    return {"exists": False, "size": 0, "sha256": ""}
+
+
+def _read_content_snapshot(path, *, include_bytes=False):
+    candidate = Path(path)
+    try:
+        payload = candidate.read_bytes()
+    except FileNotFoundError:
+        snapshot = _missing_content_snapshot()
+        return (snapshot, None) if include_bytes else snapshot
+    snapshot = _content_snapshot_from_bytes(payload)
+    return (snapshot, payload) if include_bytes else snapshot
+
+
+def _same_content_snapshot(left, right):
+    return (
+        bool(left.get("exists")) == bool(right.get("exists"))
+        and int(left.get("size") or 0) == int(right.get("size") or 0)
+        and str(left.get("sha256") or "") == str(right.get("sha256") or "")
+    )
+
+
+def _content_signature_advanced(previous, current):
+    """Count content growth, never timestamp churn by itself, as progress."""
+    if current is None:
+        return False
+    if previous is None:
+        return int(current[0]) > 0
+    return int(current[0]) > int(previous[0])
+
+
+def _operation_diagnostic(
+    category,
+    *,
+    operation,
+    target,
+    attempts,
+    error=None,
+    expected=None,
+    observed=None,
+):
+    diagnostic = {
+        "contract": "spm_atomic_replace_v1",
+        "failure_kind": category,
+        "category": category,
+        "operation": operation,
+        "target": str(Path(target)),
+        "attempts": int(attempts),
+    }
+    if error is not None:
+        diagnostic.update(
+            {
+                "error": str(error),
+                "errno": getattr(error, "errno", None),
+                "winerror": getattr(error, "winerror", None),
+            }
+        )
+    if expected is not None:
+        diagnostic["expected_target"] = dict(expected)
+    if observed is not None:
+        diagnostic["observed_target"] = dict(observed)
+    return diagnostic
+
+
+def _transaction_key(path):
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _seed_spm_transaction(path, payload):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is not None:
+        transaction[_transaction_key(path)] = _content_snapshot_from_bytes(
+            payload
+        )
+
+
+def _transaction_expected(path, baseline):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is None:
+        return baseline
+    return transaction.setdefault(_transaction_key(path), baseline)
+
+
+def _transaction_record_write(path, snapshot):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is not None:
+        transaction[_transaction_key(path)] = dict(snapshot)
+    candidate = Path(path)
+    if candidate.suffix.casefold() == ".spm":
+        _update_calibration_marker_last_pipeline_sha(
+            candidate,
+            snapshot.get("sha256", ""),
+        )
+
+
+def _transaction_target_is_current(path):
+    transaction = _SPM_WRITE_TRANSACTION.get()
+    if transaction is None:
+        return True
+    expected = transaction.get(_transaction_key(path))
+    if expected is None:
+        return True
+    try:
+        observed = _read_content_snapshot(path)
+    except OSError:
+        return False
+    return _same_content_snapshot(expected, observed)
+
+
+def _sleep_file_backoff(attempt):
+    delay = min(
+        SPM_REPLACE_INITIAL_BACKOFF_SECONDS * (2 ** max(0, attempt - 1)),
+        SPM_REPLACE_MAX_BACKOFF_SECONDS,
+    )
+    time.sleep(delay)
+
+
+def _read_content_snapshot_with_backoff(
+    path,
+    *,
+    operation,
+    include_bytes=False,
+):
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            return _read_content_snapshot(
+                path,
+                include_bytes=include_bytes,
+            )
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=path,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+        )
+    )
+
+
+def _unlink_with_backoff(path, *, operation, missing_ok=True):
+    candidate = Path(path)
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            candidate.unlink()
+            return True
+        except FileNotFoundError:
+            return bool(missing_ok)
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=candidate,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+        )
+    )
+
+
+def _replace_file_with_rescue(
+    temporary,
+    target,
+    *,
+    require_existing=False,
+):
+    """Atomically retain the exact replaced target on Windows.
+
+    ``ReplaceFileW`` puts the destination that existed at the instant of the
+    swap in ``rescue``. Comparing that file with the transaction fingerprint
+    closes the stat/hash -> replace race: if an unmanaged writer won that
+    window, its bytes are restored instead of being silently discarded.
+    """
+    temporary = Path(temporary)
+    target = Path(target)
+    if require_existing and os.name != "nt":
+        if not target.exists():
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "CAS target disappeared before atomic replacement",
+                str(target),
+            )
+        os.replace(temporary, target)
+        return None
+    if not require_existing and (
+        os.name != "nt" or not target.exists()
+    ):
+        os.replace(temporary, target)
+        return None
+    rescue_dir = target.parent
+    if target.suffix.casefold() == ".spm":
+        rescue_dir = target.parent / BACKUP_SUBDIR / "conflicts"
+        rescue_dir.mkdir(parents=True, exist_ok=True)
+    rescue = rescue_dir / (
+        f".{target.stem}.{os.getpid()}.{time.time_ns()}"
+        f".skbatch-rescue{target.suffix}"
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    kernel32.ReplaceFileW.restype = ctypes.c_bool
+    if not kernel32.ReplaceFileW(
+        str(target),
+        str(temporary),
+        str(rescue),
+        0,
+        None,
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return rescue
+
+
+def _restore_conflict_rescue(
+    rescue,
+    target,
+    *,
+    expected_current,
+    max_swaps=4,
+):
+    """Restore the newest unmanaged bytes without clobbering a later writer."""
+    replacement = Path(rescue)
+    target = Path(target)
+    expected = dict(expected_current)
+    for _swap in range(max(1, int(max_swaps))):
+        observed = _read_content_snapshot(target)
+        if not _same_content_snapshot(observed, expected):
+            # A newer writer already owns the live target. Keep it there and
+            # retain the earlier displaced content as an explicit artifact.
+            return {
+                "restored": False,
+                "conflict_artifact": str(replacement),
+                "observed_target": observed,
+            }
+        replacement_snapshot = _read_content_snapshot(replacement)
+        displaced = _replace_file_with_rescue(
+            replacement,
+            target,
+            require_existing=bool(expected.get("exists")),
+        )
+        if displaced is None:
+            return {"restored": True, "conflict_artifact": ""}
+        displaced_snapshot = _read_content_snapshot(displaced)
+        if _same_content_snapshot(displaced_snapshot, expected):
+            _unlink_with_backoff(
+                displaced,
+                operation="restore_conflict_rescue:discard_pipeline_bytes",
+            )
+            return {"restored": True, "conflict_artifact": ""}
+        # Another external write won between the pre-check and the atomic
+        # exchange. The now-live target is the previous replacement; exchange
+        # the newer displaced bytes back on the next bounded round.
+        replacement = Path(displaced)
+        expected = replacement_snapshot
+    return {
+        "restored": False,
+        "conflict_artifact": str(replacement),
+        "observed_target": _read_content_snapshot(target),
+    }
+
+
+def _atomic_replace_payload(
+    target,
+    payload,
+    *,
+    operation,
+    baseline=None,
+    source_stat=None,
+):
+    """CAS-replace a file, retrying only sharing/lock failures.
+
+    The transaction fingerprint is the last payload written by this process.
+    An artist or sync client changing the target between writes therefore
+    causes a fail-closed concurrent modification instead of a rollback
+    overwrite.
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if baseline is None:
+        baseline = _read_content_snapshot_with_backoff(
+            target,
+            operation=f"{operation}:initial_snapshot",
+        )
+    expected = dict(_transaction_expected(target, baseline))
+    desired = _content_snapshot_from_bytes(payload)
+    suffix = target.suffix or ".tmp"
+    temporary = None
+    try:
+        stage_error = None
+        for stage_attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{target.stem}.{os.getpid()}.",
+                    suffix=f".skbatch{suffix}",
+                    dir=str(target.parent),
+                )
+                temporary = Path(temporary_name)
+                with os.fdopen(descriptor, "wb") as raw:
+                    raw.write(payload)
+                    raw.flush()
+                    os.fsync(raw.fileno())
+                if source_stat is not None:
+                    os.utime(
+                        temporary,
+                        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                    )
+                break
+            except OSError as exc:
+                if not _retryable_file_operation_error(exc):
+                    raise
+                stage_error = exc
+                if temporary is not None and temporary.exists():
+                    try:
+                        _unlink_with_backoff(
+                            temporary,
+                            operation=f"{operation}:discard_failed_stage",
+                        )
+                    except (OSError, SPMAtomicOperationError):
+                        pass
+                temporary = None
+                if stage_attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(stage_attempt)
+        if temporary is None:
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "process_file_lock",
+                    operation=f"{operation}:stage",
+                    target=target,
+                    attempts=SPM_REPLACE_MAX_ATTEMPTS,
+                    error=stage_error,
+                )
+            )
+
+        last_error = None
+        for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+            try:
+                observed = _read_content_snapshot(target)
+            except OSError as exc:
+                if not _retryable_file_operation_error(exc):
+                    raise
+                last_error = exc
+                if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(attempt)
+                    continue
+                break
+            if not _same_content_snapshot(observed, expected):
+                # A replace can succeed even if a filesystem filter reports a
+                # late error. Treat the exact desired payload as committed.
+                if _same_content_snapshot(observed, desired):
+                    _transaction_record_write(target, desired)
+                    return target
+                raise SPMAtomicOperationError(
+                    _operation_diagnostic(
+                        "concurrent_spm_modification",
+                        operation=operation,
+                        target=target,
+                        attempts=attempt,
+                        expected=expected,
+                        observed=observed,
+                    )
+                )
+            rescue = None
+            try:
+                rescue = _replace_file_with_rescue(
+                    temporary,
+                    target,
+                    require_existing=bool(expected.get("exists")),
+                )
+                temporary = None
+                if rescue is not None:
+                    replaced_snapshot = _read_content_snapshot(rescue)
+                    if not _same_content_snapshot(
+                        replaced_snapshot,
+                        expected,
+                    ):
+                        restore = _restore_conflict_rescue(
+                            rescue,
+                            target,
+                            expected_current=desired,
+                        )
+                        rescue = None
+                        observed_external = _read_content_snapshot(target)
+                        diagnostic = _operation_diagnostic(
+                            "concurrent_spm_modification",
+                            operation=f"{operation}:atomic_swap",
+                            target=target,
+                            attempts=attempt,
+                            expected=expected,
+                            observed=observed_external,
+                        )
+                        if restore.get("conflict_artifact"):
+                            diagnostic["conflict_artifact"] = restore[
+                                "conflict_artifact"
+                            ]
+                        raise SPMAtomicOperationError(diagnostic)
+                    _unlink_with_backoff(
+                        rescue,
+                        operation=f"{operation}:discard_swap_rescue",
+                    )
+                    rescue = None
+                observed_after = _read_content_snapshot(target)
+                if not _same_content_snapshot(observed_after, desired):
+                    raise SPMAtomicOperationError(
+                        _operation_diagnostic(
+                            "concurrent_spm_modification",
+                            operation=f"{operation}:post_verify",
+                            target=target,
+                            attempts=attempt,
+                            expected=desired,
+                            observed=observed_after,
+                        )
+                    )
+                _transaction_record_write(target, desired)
+                return target
+            except FileNotFoundError as exc:
+                last_error = exc
+                if expected.get("exists") and attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    continue
+                observed_missing = _read_content_snapshot(target)
+                raise SPMAtomicOperationError(
+                    _operation_diagnostic(
+                        "concurrent_spm_modification",
+                        operation=f"{operation}:target_disappeared",
+                        target=target,
+                        attempts=attempt,
+                        expected=expected,
+                        observed=observed_missing,
+                        error=exc,
+                    )
+                ) from exc
+            except OSError as exc:
+                if rescue is not None and rescue.exists():
+                    try:
+                        _restore_conflict_rescue(
+                            rescue,
+                            target,
+                            expected_current=desired,
+                        )
+                        rescue = None
+                    except OSError:
+                        pass
+                if not _retryable_file_operation_error(exc):
+                    raise
+                last_error = exc
+                if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                    _sleep_file_backoff(attempt)
+                    continue
+                break
+        raise SPMAtomicOperationError(
+            _operation_diagnostic(
+                "process_file_lock",
+                operation=operation,
+                target=target,
+                attempts=SPM_REPLACE_MAX_ATTEMPTS,
+                error=last_error,
+                expected=expected,
+            )
+        )
+    finally:
+        if temporary is not None and temporary.exists():
+            try:
+                _unlink_with_backoff(
+                    temporary,
+                    operation=f"{operation}:discard_partial",
+                )
+            except (OSError, SPMAtomicOperationError):
+                pass
+
+
+def _atomic_publish_staged_file(
+    staged,
+    target,
+    *,
+    operation,
+    baseline,
+):
+    staged = Path(staged)
+    target = Path(target)
+    desired = _read_content_snapshot(staged)
+    expected = dict(baseline)
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            observed = _read_content_snapshot(target)
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+                continue
+            break
+        if not _same_content_snapshot(observed, expected):
+            if _same_content_snapshot(observed, desired):
+                return target
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "concurrent_spm_modification",
+                    operation=operation,
+                    target=target,
+                    attempts=attempt,
+                    expected=expected,
+                    observed=observed,
+                )
+            )
+        try:
+            os.replace(staged, target)
+            return target
+        except OSError as exc:
+            if not _retryable_file_operation_error(exc):
+                raise
+            last_error = exc
+            if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+                _sleep_file_backoff(attempt)
+                continue
+            break
+    raise SPMAtomicOperationError(
+        _operation_diagnostic(
+            "process_file_lock",
+            operation=operation,
+            target=target,
+            attempts=SPM_REPLACE_MAX_ATTEMPTS,
+            error=last_error,
+            expected=expected,
+        )
+    )
+
+
+@contextmanager
+def spm_exclusive_lock(spm_path, *, log=None, retry_seconds=0.1):
+    """Serialize every read/recovery/rewrite of one canonical SPM.
+
+    The file remains as a harmless lock identity under ``_spm_backups``.
+    The byte-range lock itself is owned by the OS and is released if a worker
+    is killed, so a stale file never means a stale lock.
+    """
+    lock_path = canonical_spm_process_lock_path(spm_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    waited = False
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if not _retryable_windows_lock_error(exc):
+                        raise
+                    if not waited and log is not None:
+                        log(
+                            "  [SPM lock] another worker is using the same "
+                            f"canonical SPM; waiting: {Path(spm_path).name}"
+                        )
+                    waited = True
+                    time.sleep(max(0.01, float(retry_seconds)))
+            try:
+                yield lock_path
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield lock_path
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def speedtree_export_gate():
+    """Allow one SpeedTree Modeler export machine-wide.
+
+    Waiting happens before the Modeler process is launched, so queue time does
+    not consume the per-export timeout.  The same stable mutex name is used by
+    the Blender repair add-on's ``speedtree_cli`` module.
+    """
+    name = os.environ.get(
+        SPEEDTREE_EXPORT_MUTEX_ENV, SPEEDTREE_EXPORT_MUTEX_DEFAULT
+    )
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_bool,
+            ctypes.c_wchar_p,
+        )
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.ReleaseMutex.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        acquired = False
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if result not in {0x00000000, 0x00000080}:
+                if result == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                raise RuntimeError(
+                    f"SpeedTree export mutex wait returned {result:#x}"
+                )
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    import fcntl
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    lock_path = Path(tempfile.gettempdir()) / f"{safe_name}.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 SYNC_MANIFEST_NAME = "spm_generator_sync.json"
@@ -208,14 +1003,52 @@ def _descendants_to_depth(seeds, edges, max_depth):
 
 
 def classify_asset_kind(spm_path):
-    """Classify the authored SK role from its established filename prefix."""
-    stem = Path(spm_path).stem.casefold() if spm_path else ""
+    """Classify by filename, then the exact owner of a Cluster child.
+
+    Generic parts such as ``SK_branch_elm_01`` omit the vegetation kind.  For
+    an immediate ``Cluster`` parent only, the owner folder one level above is
+    the established source of that kind.  Arbitrary ancestor walking is not
+    allowed because Bush/Weed assets share a physical ``Tree`` library root.
+    """
+    path = Path(spm_path) if spm_path else None
+    stem = path.stem.casefold() if path else ""
     if stem.startswith("sk_"):
         stem = stem[3:]
     for kind in ("tree", "bush", "weed"):
         if stem == kind or stem.startswith(kind + "_"):
             return kind
+    if path and path.parent.name.casefold() == "cluster":
+        owner = path.parent.parent.name.casefold()
+        for kind in ("tree", "bush", "weed"):
+            if owner == kind or owner.startswith(kind + "_"):
+                return kind
     return "other"
+
+
+def bone_semantic_context(spm_path):
+    """Return path/manifest semantics that affect automatic bone selection."""
+    categories, _manifest = load_sync_base_categories(spm_path)
+    return {
+        "asset_kind": classify_asset_kind(spm_path),
+        "cluster_normalization_spm": is_cluster_normalization_spm(spm_path),
+        "sync_base_categories": dict(sorted(categories.items())),
+    }
+
+
+def current_bone_semantic_fingerprint(spm_path, source_text=None):
+    text = read_spm(spm_path) if source_text is None else source_text
+    return bone_semantic_fingerprint(
+        text,
+        context=bone_semantic_context(spm_path),
+    )
+
+
+def current_legacy_bone_semantic_fingerprint(spm_path, source_text=None):
+    text = read_spm(spm_path) if source_text is None else source_text
+    return legacy_bone_semantic_fingerprint(
+        text,
+        context=bone_semantic_context(spm_path),
+    )
 
 
 def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
@@ -483,12 +1316,50 @@ def analyze_branch_bone_graph(text, spm_path=None, base_categories=None):
 
 
 def read_spm(path):
-    return gzip.open(path, "rb").read().decode("utf-8")
+    return read_pipeline_spm_text(path)
 
 
 def write_spm(path, text):
-    with gzip.open(path, "wb") as handle:
-        handle.write(text.encode("utf-8"))
+    """Replace one SPM atomically with byte-stable output.
+
+    Two properties matter downstream:
+      * ``mtime=0`` keeps the gzip header out of the payload, so identical
+        logical content always hashes identically.  Otherwise a no-op ① rewrite
+        changes the file's content fingerprint and needlessly invalidates the
+        calibration cache, the .blend freshness receipt and the Push manifest.
+      * ``os.replace`` means a crash or kill during a write can never leave a
+        truncated SPM; the previous file survives untouched.
+    """
+    candidate = Path(path)
+    baseline, current_payload = _read_content_snapshot_with_backoff(
+        candidate,
+        operation="write_spm:initial_snapshot",
+        include_bytes=True,
+    )
+    compressed = (
+        bool(current_payload and current_payload.startswith(b"\x1f\x8b"))
+        if baseline["exists"]
+        else True
+    )
+    text_payload = text.encode("utf-8")
+    if compressed:
+        encoded = io.BytesIO()
+        with gzip.GzipFile(
+            filename=candidate.name,
+            mode="wb",
+            fileobj=encoded,
+            mtime=0,
+        ) as handle:
+            handle.write(text_payload)
+        payload = encoded.getvalue()
+    else:
+        payload = text_payload
+    _atomic_replace_payload(
+        candidate,
+        payload,
+        operation="write_spm",
+        baseline=baseline,
+    )
 
 
 def probe_cache_path(spm_path):
@@ -589,6 +1460,375 @@ def set_prop_value(block, prop_name, new_value):
         re.DOTALL,
     )
     return pat.sub(lambda m: m.group(1) + format_value(new_value) + m.group(2), block, count=1)
+
+
+def _is_leaf_generator_type(generator_type):
+    """Return whether a SpeedTree generator creates leaf geometry.
+
+    SpeedTree versions and authoring modes use labels such as ``Leaf Mesh``
+    and ``Batched Leaf``. Matching the generator *type* keeps this independent
+    of artist-controlled generator names.
+    """
+    return "leaf" in str(generator_type or "").strip().casefold()
+
+
+def _contains_leaf_node(text):
+    """Cheaply reject SPMs where the Red leaf-parent transform is irrelevant."""
+    return any(
+        _is_leaf_generator_type(match.group(1))
+        for match in NODE_TYPE_RE.finditer(text)
+    )
+
+
+def _direct_vertex_color_properties(generator):
+    properties = generator.find("Properties")
+    if properties is None:
+        return {}
+    return {
+        prop.findtext("Name"): prop
+        for prop in list(properties)
+        if prop.findtext("Name")
+    }
+
+
+def _vertex_color_channel_signature(text, channel):
+    """Semantic snapshot used to prove another channel was not changed."""
+    root = ET.fromstring(text)
+    prefix = f"Vertex Color:{channel}:"
+    signature = []
+    for generator in root.findall(".//Generator"):
+        properties = _direct_vertex_color_properties(generator)
+        payload = [
+            ET.tostring(properties[name], encoding="unicode")
+            for name in sorted(properties)
+            if name.startswith(prefix)
+        ]
+        if payload:
+            signature.append(
+                (
+                    generator.findtext("GUID") or "",
+                    generator.findtext("Name") or "",
+                    tuple(payload),
+                )
+            )
+    encoded = json.dumps(signature, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _set_simple_xml_text(block, tag, text):
+    pattern = re.compile(
+        r"(<" + re.escape(tag) + r">)[^<]*(</" + re.escape(tag) + r">)",
+        re.DOTALL,
+    )
+    return pattern.sub(
+        lambda match: match.group(1) + str(text) + match.group(2),
+        block,
+        count=1,
+    )
+
+
+def _set_simple_xml_value(block, tag, value):
+    return _set_simple_xml_text(block, tag, format_value(value))
+
+
+def _linearize_spline_profile(block, prop_name):
+    """Set one SplineProperty profile to Y=X without reserializing the SPM."""
+    property_pattern = re.compile(
+        r"<SplineProperty>\s*<Name>"
+        + re.escape(prop_name)
+        + r"</Name>.*?</SplineProperty>",
+        re.DOTALL,
+    )
+    property_match = property_pattern.search(block)
+    if not property_match:
+        return block, f"missing SplineProperty: {prop_name}"
+
+    property_block = property_match.group(0)
+    profile_pattern = re.compile(
+        r"(<ProfileSpline\b[^>]*>)(.*?)(</ProfileSpline>)", re.DOTALL
+    )
+    profile_matches = list(profile_pattern.finditer(property_block))
+    if not profile_matches:
+        return block, f"missing ProfileSpline: {prop_name}"
+    if len(profile_matches) != 1:
+        return block, f"expected exactly one ProfileSpline: {prop_name}"
+    profile_match = profile_matches[0]
+
+    control_point_pattern = re.compile(
+        r"<ControlPoint>.*?</ControlPoint>", re.DOTALL
+    )
+    control_points = list(control_point_pattern.finditer(profile_match.group(2)))
+    if len(control_points) < 2:
+        return block, f"ProfileSpline needs at least two points: {prop_name}"
+
+    required_tags = ("X", "Y", "TangentX", "TangentY")
+
+    def parse_control_point(point_text, point_index):
+        values = {}
+        for tag in required_tags:
+            matches = re.findall(
+                r"<" + re.escape(tag) + r">([^<]*)</" + re.escape(tag) + r">",
+                point_text,
+            )
+            if len(matches) != 1:
+                return None, (
+                    f"ProfileSpline point {point_index} needs exactly one {tag}: "
+                    f"{prop_name}"
+                )
+            try:
+                value = float(matches[0])
+            except (TypeError, ValueError):
+                return None, (
+                    f"ProfileSpline point {point_index} has an invalid {tag}: "
+                    f"{prop_name}"
+                )
+            if not math.isfinite(value):
+                return None, (
+                    f"ProfileSpline point {point_index} has a non-finite {tag}: "
+                    f"{prop_name}"
+                )
+            values[tag] = value
+        return values, None
+
+    parsed_points = []
+    for point_index, point in enumerate(control_points):
+        values, point_error = parse_control_point(point.group(0), point_index)
+        if point_error:
+            return block, point_error
+        parsed_points.append(values)
+
+    x_values = [values["X"] for values in parsed_points]
+    if any(value < 0.0 or value > 1.0 for value in x_values):
+        return block, f"ProfileSpline X coordinates must stay in [0, 1]: {prop_name}"
+    if any(
+        current < previous
+        for previous, current in zip(x_values, x_values[1:])
+    ):
+        return block, f"ProfileSpline X coordinates are out of order: {prop_name}"
+    if not math.isclose(x_values[0], 0.0, abs_tol=1e-6) or not math.isclose(
+        x_values[-1], 1.0, abs_tol=1e-6
+    ):
+        return block, f"ProfileSpline endpoints are not 0 and 1: {prop_name}"
+
+    def patch_control_point(match):
+        point = match.group(0)
+        x_match = re.search(r"<X>([^<]*)</X>", point)
+        point = _set_simple_xml_text(point, "Y", x_match.group(1))
+        point = _set_simple_xml_value(point, "TangentX", 0.0)
+        point = _set_simple_xml_value(point, "TangentY", 0.0)
+        return point
+
+    profile_inner = control_point_pattern.sub(
+        patch_control_point, profile_match.group(2)
+    )
+    patched_control_points = list(control_point_pattern.finditer(profile_inner))
+    if len(patched_control_points) != len(parsed_points):
+        return block, f"ProfileSpline control-point count changed: {prop_name}"
+    for point_index, (original, patched_point) in enumerate(
+        zip(parsed_points, patched_control_points)
+    ):
+        patched_values, point_error = parse_control_point(
+            patched_point.group(0), point_index
+        )
+        if point_error:
+            return block, point_error
+        if not math.isclose(
+            patched_values["X"], original["X"], abs_tol=1e-12
+        ):
+            return block, f"ProfileSpline point {point_index} changed X: {prop_name}"
+        if not math.isclose(
+            patched_values["Y"], patched_values["X"], abs_tol=1e-6
+        ):
+            return block, (
+                f"ProfileSpline point {point_index} failed Y=X postcondition: "
+                f"{prop_name}"
+            )
+        if not math.isclose(
+            patched_values["TangentX"], 0.0, abs_tol=1e-6
+        ) or not math.isclose(patched_values["TangentY"], 0.0, abs_tol=1e-6):
+            return block, (
+                f"ProfileSpline point {point_index} failed zero-tangent postcondition: "
+                f"{prop_name}"
+            )
+    patched_property = (
+        property_block[: profile_match.start(2)]
+        + profile_inner
+        + property_block[profile_match.end(2) :]
+    )
+    patched_block = (
+        block[: property_match.start()]
+        + patched_property
+        + block[property_match.end() :]
+    )
+    return patched_block, None
+
+
+def _vertex_color_channel_summary(generator, channel):
+    properties = _direct_vertex_color_properties(generator)
+    style = properties.get(f"Vertex Color:{channel}:Style")
+    value = properties.get(f"Vertex Color:{channel}:Value")
+    profile = []
+    if value is not None:
+        for point in value.findall("./ProfileSpline/ControlPoint"):
+            profile.append(
+                {
+                    "x": _number(point.findtext("X")),
+                    "y": _number(point.findtext("Y")),
+                    "tangent_x": _number(point.findtext("TangentX")),
+                    "tangent_y": _number(point.findtext("TangentY")),
+                }
+            )
+    return {
+        "style": _number(style.findtext("Value")) if style is not None else None,
+        "value": _number(value.findtext("Value")) if value is not None else None,
+        "profile": profile,
+    }
+
+
+def apply_leaf_parent_red_gradient(text):
+    """Author R on direct leaf-parent Branch generators, preserving G/B/A."""
+    root = ET.fromstring(text)
+    generators = root.findall(".//Generator")
+    generator_by_guid = {
+        generator.findtext("GUID"): generator
+        for generator in generators
+        if generator.findtext("GUID")
+    }
+    nodes = root.findall(".//Node")
+    node_by_guid = {
+        node.findtext("GUID"): node
+        for node in nodes
+        if node.findtext("GUID")
+    }
+    target_info = {}
+    warnings = []
+    for leaf_node in nodes:
+        if not _is_leaf_generator_type(leaf_node.attrib.get("Type")):
+            continue
+        leaf_node_guid = leaf_node.findtext("GUID") or ""
+        parent_guid = leaf_node.findtext("ParentGUID") or ""
+        parent_node = node_by_guid.get(parent_guid)
+        if parent_node is None:
+            warnings.append(
+                f"leaf node {leaf_node_guid or '?'} has no resolvable ParentGUID"
+            )
+            continue
+        if parent_node.attrib.get("Type") != "Branch":
+            continue
+        branch_generator_guid = parent_node.findtext("GeneratorGUID") or ""
+        branch_generator = generator_by_guid.get(branch_generator_guid)
+        if branch_generator is None or branch_generator.attrib.get("Type") != "Branch":
+            warnings.append(
+                f"leaf node {leaf_node_guid or '?'} has a Branch parent whose "
+                f"GeneratorGUID is not a Branch generator: {branch_generator_guid or '?'}"
+            )
+            continue
+        leaf_generator_guid = leaf_node.findtext("GeneratorGUID") or ""
+        leaf_generator = generator_by_guid.get(leaf_generator_guid)
+        info = target_info.setdefault(
+            branch_generator_guid,
+            {
+                "guid": branch_generator_guid,
+                "name": branch_generator.findtext("Name") or "?",
+                "leaf_nodes": [],
+                "before": _vertex_color_channel_summary(branch_generator, "Red"),
+            },
+        )
+        info["leaf_nodes"].append(
+            {
+                "node_guid": leaf_node_guid,
+                "generator_guid": leaf_generator_guid,
+                "generator_name": leaf_generator.findtext("Name")
+                if leaf_generator is not None
+                else "?",
+                "generator_type": leaf_generator.attrib.get("Type", "?")
+                if leaf_generator is not None
+                else leaf_node.attrib.get("Type", "?"),
+            }
+        )
+
+    green_before = _vertex_color_channel_signature(text, "Green")
+    errors = []
+    changed_generators = []
+    out = []
+    position = 0
+    for match in GEN_RE.finditer(text):
+        block = match.group(0)
+        guid_match = FIRST_GUID_RE.search(block)
+        guid = guid_match.group(1) if guid_match else None
+        if guid in target_info:
+            style_name = "Vertex Color:Red:Style"
+            value_name = "Vertex Color:Red:Value"
+            if prop_value(block, style_name) is None:
+                errors.append(
+                    f"{target_info[guid]['name']}({guid}) has no {style_name}"
+                )
+            elif prop_value(block, value_name) is None:
+                errors.append(
+                    f"{target_info[guid]['name']}({guid}) has no {value_name}"
+                )
+            else:
+                patched = set_prop_value(block, style_name, 0.0)
+                patched = set_prop_value(patched, value_name, 1.0)
+                patched, profile_error = _linearize_spline_profile(
+                    patched, value_name
+                )
+                if profile_error:
+                    errors.append(
+                        f"{target_info[guid]['name']}({guid}): {profile_error}"
+                    )
+                elif patched != block:
+                    block = patched
+                    changed_generators.append(guid)
+        out.append(text[position : match.start()])
+        out.append(block)
+        position = match.end()
+    out.append(text[position:])
+    patched_text = "".join(out)
+
+    # Atomic patch: an unsupported target must not leave a half-authored tree.
+    if errors:
+        patched_text = text
+        changed_generators = []
+
+    patched_root = ET.fromstring(patched_text)
+    patched_by_guid = {
+        generator.findtext("GUID"): generator
+        for generator in patched_root.findall(".//Generator")
+        if generator.findtext("GUID")
+    }
+    targets = []
+    for guid, info in target_info.items():
+        after_generator = patched_by_guid.get(guid)
+        targets.append(
+            {
+                **info,
+                "after": _vertex_color_channel_summary(after_generator, "Red")
+                if after_generator is not None
+                else {},
+                "changed": guid in changed_generators,
+            }
+        )
+
+    green_after = _vertex_color_channel_signature(patched_text, "Green")
+    report = {
+        "channel": "VertexColor.R",
+        "selection": (
+            "GeneratorGUID of the immediate Branch parent Node for each "
+            "leaf-type Node, deduplicated by Branch generator GUID"
+        ),
+        "authoring": "Set (Style 0), Value 1, Profile Y=X (root 0 -> tip 1)",
+        "target_count": len(targets),
+        "leaf_node_count": sum(len(item["leaf_nodes"]) for item in targets),
+        "changed_generator_count": len(changed_generators),
+        "targets": targets,
+        "errors": errors,
+        "warnings": warnings,
+        "green_signature_before": green_before,
+        "green_signature_after": green_after,
+        "green_unchanged": green_before == green_after,
+    }
+    return patched_text, report
 
 
 def format_value(value):
@@ -756,6 +1996,321 @@ def apply_branch_values(text, indices, style, bones):
     return "".join(out)
 
 
+def apply_branch_hidden_values(text, indices, hidden):
+    """Set the direct Hidden flag on Branch generators by document index."""
+    index_set = set(indices)
+    value = "true" if hidden else "false"
+    out = []
+    pos = 0
+    branch_i = -1
+    for match in GEN_RE.finditer(text):
+        block = match.group(0)
+        type_match = GEN_TYPE_RE.match(block)
+        if type_match and type_match.group(1) == "Branch":
+            branch_i += 1
+            if branch_i in index_set:
+                hidden_match = re.search(
+                    r"(<Hidden>)[^<]*(</Hidden>)",
+                    block,
+                )
+                if hidden_match:
+                    block = (
+                        block[: hidden_match.start()]
+                        + hidden_match.group(1)
+                        + value
+                        + hidden_match.group(2)
+                        + block[hidden_match.end() :]
+                    )
+                elif "<Properties>" in block:
+                    block = block.replace(
+                        "<Properties>",
+                        f"<Hidden>{value}</Hidden><Properties>",
+                        1,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Branch generator has no Hidden or Properties field "
+                        f"at index {branch_i}"
+                    )
+        out.append(text[pos : match.start()])
+        out.append(block)
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def is_cluster_normalization_spm(spm_path):
+    """Return whether an SPM is a Cluster prototype source.
+
+    Cluster prototype SPMs have a different skeleton contract from whole-tree
+    assets.  Their authored hierarchy may contain hundreds of visible terminal
+    spines, but Blender normalization needs one SpeedTree root bone per
+    top-level Cluster piece, not one bone on every terminal spine.
+    """
+    path = Path(spm_path)
+    return (
+        path.parent.name.casefold() == "cluster"
+        or path.stem.casefold().startswith("sk_cluster_")
+    )
+
+
+def _cluster_branch_has_render_geometry(properties):
+    """Return whether a Branch generator contributes renderable geometry."""
+    return branch_generator_has_render_geometry(properties)
+
+
+def plan_cluster_root_bones(text):
+    """Select the first renderable Branch node below each Tree root.
+
+    Hidden Branch nodes and visible ``Skin:Type=3`` Branches are authoring
+    scaffolds.  The latter are commonly long Trunk spines used only as Cluster
+    placement pivots; they have no mesh and must never become exported bones.
+    Traversing through both kinds and stopping at the first Branch that
+    contributes real skin/segment-mesh geometry reproduces the structural roots
+    seen in the known-good elm and elm-side Cluster exports:
+
+    * Tree -> hidden Trunk -> visible Trunk 3
+    * Tree -> hidden Trunk -> hidden Trunk 4 -> visible Big 4
+    * Tree -> meshless pivot Trunk -> visible Branch 5
+
+    Every selected generator is authored as Absolute/1.  Every other Branch
+    generator is authored as Absolute/0, so terminal leaf/needle spines cannot
+    inflate the exported skeleton.
+    """
+    root = ET.fromstring(text)
+    branch_generators = []
+    generator_by_guid = {}
+    duplicate_generator_guids = set()
+    for generator in root.findall(".//Generator"):
+        if generator.attrib.get("Type") != "Branch":
+            continue
+        guid = generator.findtext("GUID")
+        info = {
+            "index": len(branch_generators),
+            "guid": guid,
+            "name": generator.findtext("Name") or "?",
+            "hidden": (generator.findtext("Hidden") or "").strip().lower()
+            in {"1", "true", "yes"},
+            "properties": _direct_properties(generator),
+        }
+        info["has_render_geometry"] = _cluster_branch_has_render_geometry(
+            info["properties"]
+        )
+        branch_generators.append(info)
+        if guid:
+            if guid in generator_by_guid:
+                duplicate_generator_guids.add(guid)
+            generator_by_guid[guid] = info
+
+    nodes = []
+    node_by_guid = {}
+    children_by_parent = {}
+    duplicate_node_guids = set()
+    for node in root.findall(".//Node"):
+        record = {
+            "guid": node.findtext("GUID"),
+            "type": node.attrib.get("Type", "?"),
+            "generator_guid": node.findtext("GeneratorGUID"),
+            "parent_guid": node.findtext("ParentGUID"),
+        }
+        nodes.append(record)
+        if record["guid"]:
+            if record["guid"] in node_by_guid:
+                duplicate_node_guids.add(record["guid"])
+            node_by_guid[record["guid"]] = record
+        children_by_parent.setdefault(record["parent_guid"], []).append(record)
+
+    errors = []
+    if duplicate_generator_guids:
+        errors.append(
+            "duplicate Branch Generator GUIDs prevent Cluster root selection: "
+            + ", ".join(sorted(duplicate_generator_guids))
+        )
+    if duplicate_node_guids:
+        errors.append(
+            "duplicate Node GUIDs prevent Cluster root selection: "
+            + ", ".join(sorted(duplicate_node_guids))
+        )
+
+    selected_nodes = []
+    meshless_pivot_nodes = []
+    visited = set()
+
+    def walk_children(parent_guid):
+        if parent_guid in visited:
+            errors.append(
+                f"Node hierarchy cycle encountered below {parent_guid or '<root>'}"
+            )
+            return
+        visited.add(parent_guid)
+        try:
+            for child in children_by_parent.get(parent_guid, ()):
+                if child["type"] != "Branch":
+                    # Zone/Base-style containers may sit between the Tree and
+                    # the first authored Branch.  They are transparent here.
+                    walk_children(child["guid"])
+                    continue
+                generator = generator_by_guid.get(child["generator_guid"])
+                if generator is None:
+                    errors.append(
+                        "Cluster root Branch node references an unknown generator: "
+                        f"{child['generator_guid'] or '<missing>'}"
+                    )
+                    continue
+                if not generator["has_render_geometry"]:
+                    meshless_pivot_nodes.append(
+                        {
+                            "node_guid": child["guid"],
+                            "generator_guid": generator["guid"],
+                            "generator_index": generator["index"],
+                            "generator_name": generator["name"],
+                            "was_hidden": generator["hidden"],
+                        }
+                    )
+                    walk_children(child["guid"])
+                elif generator["hidden"]:
+                    walk_children(child["guid"])
+                else:
+                    selected_nodes.append(
+                        {
+                            "node_guid": child["guid"],
+                            "generator_guid": generator["guid"],
+                            "generator_index": generator["index"],
+                            "generator_name": generator["name"],
+                        }
+                    )
+        finally:
+            visited.remove(parent_guid)
+
+    tree_nodes = [node for node in nodes if node["type"] == "Tree"]
+    for tree_node in tree_nodes:
+        walk_children(tree_node["guid"])
+
+    selected_indices = sorted(
+        {item["generator_index"] for item in selected_nodes}
+    )
+    meshless_pivot_indices = sorted(
+        {item["generator_index"] for item in meshless_pivot_nodes}
+    )
+    for index in selected_indices:
+        properties = branch_generators[index]["properties"]
+        if (
+            "Physics:Bone style" not in properties
+            or "Physics:Bones" not in properties
+        ):
+            errors.append(
+                "Cluster structural root generator has no bone properties: "
+                + branch_generators[index]["name"]
+            )
+    if not tree_nodes:
+        errors.append("Cluster SPM has no Tree node")
+    if not selected_nodes:
+        errors.append(
+            "Cluster SPM has no renderable structural Branch below its Tree root"
+        )
+
+    root_name_counts = {}
+    for item in selected_nodes:
+        name = item["generator_name"]
+        root_name_counts[name] = root_name_counts.get(name, 0) + 1
+
+    return {
+        "mode": "cluster_first_renderable_root_absolute_1",
+        "branch_generator_count": len(branch_generators),
+        "selected_generator_indices": selected_indices,
+        "selected_generators": [
+            {
+                "index": branch_generators[index]["index"],
+                "guid": branch_generators[index]["guid"],
+                "name": branch_generators[index]["name"],
+            }
+            for index in selected_indices
+        ],
+        "selected_nodes": selected_nodes,
+        "meshless_pivot_generator_indices": meshless_pivot_indices,
+        "meshless_pivot_generators": [
+            {
+                "index": branch_generators[index]["index"],
+                "guid": branch_generators[index]["guid"],
+                "name": branch_generators[index]["name"],
+                "was_hidden": branch_generators[index]["hidden"],
+            }
+            for index in meshless_pivot_indices
+        ],
+        "meshless_pivot_nodes": meshless_pivot_nodes,
+        "expected_root_bone_count": len(selected_nodes),
+        "expected_root_generator_counts": root_name_counts,
+        "disabled_generator_count": (
+            len(branch_generators) - len(selected_indices)
+        ),
+        "errors": errors,
+        "ready": not errors,
+    }
+
+
+def apply_cluster_root_bone_plan(text, plan):
+    """Author one Absolute bone on Cluster roots and zero everywhere else."""
+    if not plan.get("ready"):
+        raise RuntimeError(
+            "Cluster root bone plan is invalid: "
+            + "; ".join(plan.get("errors") or ["unknown error"])
+        )
+    branch_count = int(plan["branch_generator_count"])
+    patched = apply_branch_values(
+        text, range(branch_count), 0.0, 0.0
+    )
+    patched = apply_branch_values(
+        patched,
+        plan["selected_generator_indices"],
+        0.0,
+        1.0,
+    )
+    return apply_branch_hidden_values(
+        patched,
+        plan.get("meshless_pivot_generator_indices") or (),
+        True,
+    )
+
+
+def cluster_root_logical_postcondition(text):
+    """Prove that the final Cluster XML is the normalizer's fixed point."""
+    try:
+        plan = plan_cluster_root_bones(text)
+        if not plan.get("ready"):
+            return {
+                "ok": False,
+                "mode": plan.get("mode"),
+                "errors": list(plan.get("errors") or ()),
+                "expected_root_bone_count": plan.get(
+                    "expected_root_bone_count"
+                ),
+            }
+        expected = apply_cluster_root_bone_plan(text, plan)
+    except (ET.ParseError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "mode": "cluster_root_logical_postcondition_error",
+            "errors": [str(exc)],
+        }
+    return {
+        "ok": expected == text,
+        "mode": plan.get("mode"),
+        "expected_root_bone_count": plan.get("expected_root_bone_count"),
+        "selected_generator_indices": list(
+            plan.get("selected_generator_indices") or ()
+        ),
+        "disabled_generator_count": plan.get("disabled_generator_count"),
+        "errors": (
+            []
+            if expected == text
+            else [
+                "final Cluster SPM is not the fixed point of its current "
+                "render-geometry root bone plan"
+            ]
+        ),
+    }
+
+
 def apply_prioritized_branch_values(
     text, relative_indices, relative_value, disabled_base_indices=()
 ):
@@ -919,7 +2474,1019 @@ def backup_spm(path):
     return str(backup)
 
 
+def _terminate_speedtree_tree(process):
+    """Kill a timed-out Modeler and every descendant it launched."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = (
+        ("low", ctypes.c_uint32),
+        ("high", ctypes.c_uint32),
+    )
+
+
+def _windows_handle_cpu_seconds(handle):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    )
+    kernel32.GetProcessTimes.restype = ctypes.c_bool
+    creation = _FILETIME()
+    exit_time = _FILETIME()
+    kernel = _FILETIME()
+    user = _FILETIME()
+    if not kernel32.GetProcessTimes(
+        ctypes.c_void_p(int(handle)),
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+
+    def seconds(value):
+        ticks = (int(value.high) << 32) | int(value.low)
+        return ticks / 10_000_000.0
+
+    return seconds(kernel) + seconds(user)
+
+
+def _windows_descendant_pids(root_pid):
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32FirstW.restype = ctypes.c_bool
+    kernel32.Process32NextW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(PROCESSENTRY32W),
+    )
+    kernel32.Process32NextW.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot in {None, ctypes.c_void_p(-1).value}:
+        return []
+    parent_by_pid = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            parent_by_pid[int(entry.th32ProcessID)] = int(
+                entry.th32ParentProcessID
+            )
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    descendants = {int(root_pid)}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent_pid in parent_by_pid.items():
+            if parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    descendants.discard(int(root_pid))
+    return sorted(descendants)
+
+
+def _process_cpu_seconds(process):
+    """Return SpeedTree plus descendant CPU without a psutil dependency."""
+    if os.name == "nt":
+        handle = getattr(process, "_handle", None)
+        total = (
+            _windows_handle_cpu_seconds(handle)
+            if handle is not None
+            else None
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_bool,
+            ctypes.c_uint32,
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        for pid in _windows_descendant_pids(process.pid):
+            child_handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not child_handle:
+                continue
+            try:
+                value = _windows_handle_cpu_seconds(child_handle)
+                if value is not None:
+                    total = (total or 0.0) + value
+            finally:
+                kernel32.CloseHandle(child_handle)
+        return total
+
+    stat_path = Path("/proc") / str(process.pid) / "stat"
+    try:
+        fields = stat_path.read_text(encoding="ascii").split()
+        ticks = float(fields[13]) + float(fields[14])
+        return ticks / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _file_progress_signature(path):
+    if not path:
+        return None
+    try:
+        stat = Path(path).stat()
+        return (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _handle_progress_signature(handle):
+    try:
+        stat = os.fstat(handle.fileno())
+        return (stat.st_size, stat.st_mtime_ns)
+    except (AttributeError, OSError):
+        return None
+
+
+def _speedtree_export_output_path(cmd):
+    try:
+        index = list(cmd).index("-export")
+        return Path(cmd[index + 1])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _attempt_output_path(target, attempt):
+    return target.with_name(
+        f".{target.stem}.{os.getpid()}.{attempt}.{time.time_ns()}"
+        f".skbatch{target.suffix}"
+    )
+
+
+def _crashed_with_access_violation(returncode):
+    if returncode is None:
+        return False
+    return (int(returncode) & 0xFFFFFFFF) == 0xC0000005
+
+
+class _SpeedTreeProgressDeadline(subprocess.TimeoutExpired):
+    def __init__(self, cmd, timeout, *, stdout, stderr, evidence):
+        super().__init__(cmd, timeout, output=stdout, stderr=stderr)
+        self.evidence = evidence
+        self.reason = evidence.get("timeout_reason")
+
+
+def _run_speedtree_export_attempt(
+    cmd,
+    *,
+    popen_kwargs,
+    soft_timeout,
+    absolute_timeout,
+    poll_interval,
+    staged_output,
+    attempt,
+):
+    def read_handle(handle):
+        handle.flush()
+        handle.seek(0)
+        return handle.read().decode("utf-8", errors="replace")
+
+    started = time.monotonic()
+    hard_deadline = started + absolute_timeout
+    soft_deadline = min(hard_deadline, started + soft_timeout)
+    progress_events = []
+    with tempfile.TemporaryFile(
+        mode="w+b"
+    ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=out_file,
+            stderr=err_file,
+            **popen_kwargs,
+        )
+        signatures = {
+            "cpu_seconds": _process_cpu_seconds(process),
+            "output": _file_progress_signature(staged_output),
+            "stdout": _handle_progress_signature(out_file),
+            "stderr": _handle_progress_signature(err_file),
+        }
+        last_progress = started
+        while True:
+            now = time.monotonic()
+            remaining = min(soft_deadline, hard_deadline) - now
+            if remaining <= 0:
+                reason = (
+                    "hard_cap"
+                    if now >= hard_deadline
+                    else "stalled"
+                )
+                stdout = read_handle(out_file)
+                stderr = read_handle(err_file)
+                _terminate_speedtree_tree(process)
+                elapsed = max(0.0, now - started)
+                evidence = {
+                    "attempt": attempt,
+                    "timeout_reason": reason,
+                    "soft_timeout_seconds": soft_timeout,
+                    "absolute_max_seconds": absolute_timeout,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "last_progress_age_seconds": round(
+                        max(0.0, now - last_progress),
+                        3,
+                    ),
+                    "progress_event_count": len(progress_events),
+                    "progress_events": progress_events[-64:],
+                }
+                raise _SpeedTreeProgressDeadline(
+                    cmd,
+                    soft_timeout,
+                    stdout=stdout,
+                    stderr=stderr,
+                    evidence=evidence,
+                )
+            wait_slice = max(
+                0.001,
+                min(float(poll_interval), remaining),
+            )
+            try:
+                returncode = process.wait(timeout=wait_slice)
+            except subprocess.TimeoutExpired:
+                returncode = None
+            now = time.monotonic()
+            current = {
+                "cpu_seconds": _process_cpu_seconds(process),
+                "output": _file_progress_signature(staged_output),
+                "stdout": _handle_progress_signature(out_file),
+                "stderr": _handle_progress_signature(err_file),
+            }
+            changed = []
+            old_cpu = signatures.get("cpu_seconds")
+            new_cpu = current.get("cpu_seconds")
+            if (
+                old_cpu is not None
+                and new_cpu is not None
+                and new_cpu > old_cpu
+            ):
+                changed.append("child_cpu")
+            for role in ("output", "stdout", "stderr"):
+                if _content_signature_advanced(
+                    signatures.get(role),
+                    current.get(role),
+                ):
+                    changed.append(role)
+            if changed:
+                last_progress = now
+                soft_deadline = min(
+                    hard_deadline,
+                    now + soft_timeout,
+                )
+                progress_events.append(
+                    {
+                        "elapsed_seconds": round(now - started, 3),
+                        "signals": changed,
+                        "cpu_seconds": new_cpu,
+                        "output": current.get("output"),
+                        "stdout": current.get("stdout"),
+                        "stderr": current.get("stderr"),
+                    }
+                )
+            signatures = current
+            if returncode is not None:
+                stdout = read_handle(out_file)
+                stderr = read_handle(err_file)
+                return (
+                    returncode,
+                    stdout,
+                    stderr,
+                    {
+                        "attempt": attempt,
+                        "duration_seconds": round(now - started, 3),
+                        "returncode": int(returncode),
+                        "returncode_hex": (
+                            f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                        ),
+                        "progress_event_count": len(progress_events),
+                        "progress_events": progress_events[-64:],
+                    },
+                )
+
+
+def run_speedtree_export(
+    cmd,
+    cwd,
+    timeout,
+    *,
+    absolute_timeout=SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
+    poll_interval=0.5,
+    crash_retries=SPEEDTREE_EXPORT_CRASH_RETRIES,
+):
+    """Run one Modeler export, waiting on the process handle, not on pipe EOF.
+
+    SpeedTree is a GUI executable even under ``-export``: descendants can keep
+    an inherited stdout/stderr pipe open after the Modeler process itself has
+    exited.  ``subprocess.run(capture_output=True)`` then blocks on EOF until
+    the timeout fires and a finished 16s export is reported as a 120s failure.
+    Regular temporary files remove that failure mode; this mirrors the add-on's
+    ``speedtree_cli._run_process`` contract.
+    """
+    absolute_timeout = max(
+        0.001,
+        min(
+            SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
+            float(absolute_timeout),
+        ),
+    )
+    soft_timeout = min(absolute_timeout, max(0.001, float(timeout)))
+    crash_retries = max(0, min(2, int(crash_retries)))
+    popen_kwargs = {"cwd": str(cwd), "stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = 0x08000000 | getattr(  # CREATE_NO_WINDOW
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    original_cmd = [str(value) for value in cmd]
+    final_output = _speedtree_export_output_path(original_cmd)
+    if final_output is not None and not final_output.is_absolute():
+        final_output = Path(cwd) / final_output
+    if final_output is not None:
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        _unlink_with_backoff(
+            final_output,
+            operation="speedtree_export:discard_stale_output",
+        )
+    evidence = {
+        "contract": "speedtree_export_runtime_v1",
+        "failure_kind": "internal_error",
+        "soft_timeout_seconds": soft_timeout,
+        "absolute_max_seconds": absolute_timeout,
+        "max_access_violation_retries": crash_retries,
+        "attempts": [],
+    }
+    with speedtree_export_gate():
+        gate_started = time.monotonic()
+        for attempt in range(1, crash_retries + 2):
+            remaining_absolute = max(
+                0.001,
+                absolute_timeout - (time.monotonic() - gate_started),
+            )
+            attempt_cmd = list(original_cmd)
+            staged_output = None
+            if final_output is not None:
+                staged_output = _attempt_output_path(final_output, attempt)
+                export_index = attempt_cmd.index("-export") + 1
+                attempt_cmd[export_index] = str(staged_output)
+            try:
+                (
+                    returncode,
+                    stdout,
+                    stderr,
+                    attempt_evidence,
+                ) = _run_speedtree_export_attempt(
+                    attempt_cmd,
+                    popen_kwargs=popen_kwargs,
+                    soft_timeout=min(soft_timeout, remaining_absolute),
+                    absolute_timeout=remaining_absolute,
+                    poll_interval=poll_interval,
+                    staged_output=staged_output,
+                    attempt=attempt,
+                )
+            except _SpeedTreeProgressDeadline as exc:
+                evidence["attempts"].append(exc.evidence)
+                evidence["result"] = "timeout"
+                evidence["timeout_reason"] = exc.reason
+                if staged_output is not None:
+                    _unlink_with_backoff(
+                        staged_output,
+                        operation="speedtree_export:discard_timeout_partial",
+                    )
+                raise _SpeedTreeProgressDeadline(
+                    original_cmd,
+                    soft_timeout,
+                    stdout=exc.output,
+                    stderr=exc.stderr,
+                    evidence=evidence,
+                ) from exc
+            attempt_evidence["stdout_tail"] = stdout[-500:]
+            attempt_evidence["stderr_tail"] = stderr[-500:]
+            attempt_evidence["access_violation"] = (
+                _crashed_with_access_violation(returncode)
+            )
+            evidence["attempts"].append(attempt_evidence)
+            if _crashed_with_access_violation(returncode):
+                if staged_output is not None:
+                    _unlink_with_backoff(
+                        staged_output,
+                        operation=(
+                            "speedtree_export:"
+                            "discard_access_violation_partial"
+                        ),
+                    )
+                if attempt <= crash_retries:
+                    continue
+                evidence["result"] = "access_violation_exhausted"
+                evidence["retry_count"] = attempt - 1
+                return SpeedTreeExportResult(
+                    returncode,
+                    stdout,
+                    stderr,
+                    evidence,
+                )
+            if returncode == 0 and staged_output is not None:
+                staged_snapshot = _read_content_snapshot(staged_output)
+                if not staged_snapshot["exists"]:
+                    evidence["result"] = "output_missing"
+                    evidence["retry_count"] = attempt - 1
+                    return SpeedTreeExportResult(
+                        returncode,
+                        stdout,
+                        stderr,
+                        evidence,
+                    )
+                final_baseline = _read_content_snapshot(final_output)
+                _atomic_publish_staged_file(
+                    staged_output,
+                    final_output,
+                    operation="speedtree_export:publish_output",
+                    baseline=final_baseline,
+                )
+                published = _read_content_snapshot(final_output)
+                if not _same_content_snapshot(staged_snapshot, published):
+                    raise SpeedTreeExportProcessError(
+                        "SpeedTree export publication changed the output bytes",
+                        {
+                            **evidence,
+                            "failure_kind": "process",
+                            "category": "output_publish_mismatch",
+                            "expected_output": staged_snapshot,
+                            "observed_output": published,
+                        },
+                    )
+            elif staged_output is not None:
+                _unlink_with_backoff(
+                    staged_output,
+                    operation="speedtree_export:discard_failed_partial",
+                )
+            evidence["result"] = (
+                "ok" if returncode == 0 else "non_retryable_returncode"
+            )
+            evidence["retry_count"] = attempt - 1
+            return SpeedTreeExportResult(
+                returncode,
+                stdout,
+                stderr,
+                evidence,
+            )
+
+
+def calibration_marker_path(spm_path):
+    """Crash marker beside the backups, outside the scanned working list."""
+    spm = Path(spm_path)
+    return spm.parent / BACKUP_SUBDIR / f"{spm.stem}{CALIBRATION_MARKER_SUFFIX}"
+
+
+def write_calibration_marker(spm_path, backup, source_sha256):
+    """Record that the SPM is mid-rewrite before the first destructive write.
+
+    Calibration edits the source SPM in place (Absolute/1 probe, then Relative
+    rounds) and restores it afterwards.  Every *exception* path restores, but a
+    hard kill has none: Stop and the watchdog timeout both use
+    ``taskkill /T /F``, so a killed run can leave the SPM in its probe state.
+    This marker makes that state detectable and repairable on the next scan
+    instead of silently shipping probe bones into ② and ③.
+    """
+    marker = calibration_marker_path(spm_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CALIBRATION_MARKER_VERSION,
+        "spm": str(Path(spm_path)),
+        "backup": str(backup) if backup else "",
+        "source_sha256": source_sha256,
+        "last_pipeline_sha256": source_sha256,
+        "pid": os.getpid(),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "note": (
+            "Calibration was interrupted before it could restore this SPM. "
+            "Restore the recorded backup before trusting its bone settings."
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    _atomic_replace_payload(
+        marker,
+        encoded,
+        operation="write_calibration_marker",
+    )
+    return marker
+
+
+def _update_calibration_marker_last_pipeline_sha(spm_path, sha256):
+    marker = calibration_marker_path(spm_path)
+    marker_snapshot, marker_bytes = _read_content_snapshot_with_backoff(
+        marker,
+        operation="update_calibration_marker:read",
+        include_bytes=True,
+    )
+    if not marker_snapshot.get("exists"):
+        transaction = _SPM_WRITE_TRANSACTION.get()
+        expected = (
+            transaction.get(_transaction_key(marker))
+            if transaction is not None
+            else None
+        )
+        if expected and expected.get("exists"):
+            raise SPMAtomicOperationError(
+                _operation_diagnostic(
+                    "concurrent_spm_modification",
+                    operation="update_calibration_marker:missing",
+                    target=marker,
+                    attempts=1,
+                    expected=expected,
+                    observed=_missing_content_snapshot(),
+                )
+            )
+        return False
+    try:
+        payload = json.loads(marker_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SPMAtomicOperationError(
+            _operation_diagnostic(
+                "concurrent_spm_modification",
+                operation="update_calibration_marker:invalid_json",
+                target=marker,
+                attempts=1,
+                error=exc,
+            )
+        ) from exc
+    payload["last_pipeline_sha256"] = str(sha256 or "")
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    _atomic_replace_payload(
+        marker,
+        encoded,
+        operation="update_calibration_marker",
+    )
+    return True
+
+
+def clear_calibration_marker(spm_path):
+    marker = calibration_marker_path(spm_path)
+    cleared = _unlink_with_backoff(
+        marker,
+        operation="clear_calibration_marker",
+        missing_ok=True,
+    )
+    if cleared:
+        _transaction_record_write(marker, _missing_content_snapshot())
+    return bool(cleared)
+
+
+def _sha256_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def inspect_interrupted_calibration(spm_path):
+    """Report whether a previous ① run was killed while rewriting this SPM."""
+    marker = calibration_marker_path(spm_path)
+    if not marker.is_file():
+        return {"status": "clean", "marker": str(marker)}
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "unreadable_marker",
+            "marker": str(marker),
+            "error": str(exc),
+        }
+    backup = Path(payload.get("backup") or "")
+    result = {
+        "status": "interrupted",
+        "marker_version": payload.get("version"),
+        "marker": str(marker),
+        "spm": payload.get("spm", str(spm_path)),
+        "backup": str(backup) if payload.get("backup") else "",
+        "started_at": payload.get("started_at", ""),
+        "source_sha256": payload.get("source_sha256", ""),
+        "last_pipeline_sha256": payload.get(
+            "last_pipeline_sha256",
+            "",
+        ),
+        "backup_available": bool(payload.get("backup")) and backup.is_file(),
+    }
+    try:
+        current_snapshot = _read_content_snapshot(spm_path)
+        result["spm_snapshot"] = current_snapshot
+        result["spm_matches_source"] = (
+            current_snapshot["sha256"]
+            == str(payload.get("source_sha256") or "")
+        )
+    except OSError:
+        result["spm_matches_source"] = False
+    if result["spm_matches_source"]:
+        # The kill landed between two writes that happen to reproduce the
+        # source bytes, so nothing was actually lost.
+        result["status"] = "interrupted_but_intact"
+    return result
+
+
+def _calibration_recovery_failure(
+    state,
+    *,
+    failure_kind,
+    category,
+    error,
+    details=None,
+):
+    message = (
+        "Interrupted SPM calibration marker cannot be recovered safely: "
+        + str(error)
+    )
+    diagnostic = {
+        "contract": "spm_calibration_recovery_v1",
+        "failure_kind": failure_kind,
+        "category": category,
+        "marker": state.get("marker", ""),
+        "spm": state.get("spm", ""),
+        "backup": state.get("backup", ""),
+        "error": message,
+    }
+    if details:
+        diagnostic["details"] = dict(details)
+    return {
+        **state,
+        "recovered": False,
+        "cleared": False,
+        "error": message,
+        "diagnostic": diagnostic,
+        "failure_kind": failure_kind,
+    }
+
+
+def _decode_spm_payload(payload):
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+    return payload.decode("utf-8")
+
+
+def _calibration_recovery_clear_result(state, spm_path, *, recovered):
+    try:
+        cleared = clear_calibration_marker(spm_path)
+    except SPMAtomicOperationError as exc:
+        return {
+            **state,
+            "recovered": bool(recovered),
+            "cleared": False,
+            "error": (
+                "calibration marker could not be cleared safely: "
+                + str(exc)
+            ),
+            "diagnostic": exc.diagnostic,
+            "failure_kind": exc.diagnostic.get(
+                "failure_kind",
+                "process_file_lock",
+            ),
+        }
+    return {
+        **state,
+        "recovered": bool(recovered),
+        "cleared": bool(cleared),
+    }
+
+
+def _restore_legacy_calibration_values(
+    spm_path,
+    current_text,
+    backup_text,
+):
+    """Restore only Branch bone properties that an interrupted probe mutates."""
+    current = audit_spm(
+        spm_path,
+        text=current_text,
+        analyze_bone_graph=False,
+    )["generators"]
+    backup = {
+        row["guid"]: row
+        for row in audit_spm(
+            spm_path,
+            text=backup_text,
+            analyze_bone_graph=False,
+        )["generators"]
+        if (
+            row.get("guid")
+            and row.get("style") is not None
+            and row.get("bones") is not None
+        )
+    }
+    patched = current_text
+    repairs = []
+    shared = 0
+    for branch_index, row in enumerate(current):
+        source = backup.get(row.get("guid"))
+        if source is None:
+            continue
+        shared += 1
+        before = (row.get("style"), row.get("bones"))
+        after = (source["style"], source["bones"])
+        if before == after:
+            continue
+        patched = apply_branch_values(
+            patched,
+            [branch_index],
+            source["style"],
+            source["bones"],
+        )
+        repairs.append({
+            "guid": row.get("guid"),
+            "name": row.get("name"),
+            "before": {
+                "style": before[0],
+                "bones": before[1],
+            },
+            "restored": {
+                "style": after[0],
+                "bones": after[1],
+            },
+        })
+    return patched, repairs, shared
+
+
+def recover_interrupted_calibration(spm_path):
+    """Restore a killed calibration's source SPM from its recorded backup."""
+    state = inspect_interrupted_calibration(spm_path)
+    if state["status"] == "clean":
+        return {**state, "recovered": False}
+    if state["status"] == "interrupted_but_intact":
+        return _calibration_recovery_clear_result(
+            state,
+            spm_path,
+            recovered=False,
+        )
+    if state["status"] == "unreadable_marker":
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="interrupted_calibration",
+            category="unreadable_calibration_marker",
+            error=state.get("error") or "calibration marker is unreadable",
+        )
+    if not state.get("backup_available"):
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="interrupted_calibration",
+            category="calibration_backup_missing",
+            error="recorded calibration backup is unavailable",
+        )
+    backup = Path(state["backup"])
+    backup_snapshot, backup_payload = _read_content_snapshot_with_backoff(
+        backup,
+        operation="recover_interrupted_calibration:read_backup",
+        include_bytes=True,
+    )
+    source_sha256 = str(state.get("source_sha256") or "")
+    if (
+        not source_sha256
+        or backup_snapshot.get("sha256") != source_sha256
+    ):
+        return _calibration_recovery_failure(
+            state,
+            failure_kind="concurrent_spm_modification",
+            category="calibration_backup_hash_mismatch",
+            error="recorded backup does not match the interrupted source hash",
+            details={
+                "source_sha256": source_sha256,
+                "backup_sha256": backup_snapshot.get("sha256", ""),
+            },
+        )
+    if not state.get("last_pipeline_sha256"):
+        if state.get("marker_version") != 1:
+            return _calibration_recovery_failure(
+                state,
+                failure_kind="interrupted_calibration",
+                category="unsupported_marker_without_pipeline_hash",
+                error=(
+                    "only legacy calibration marker version 1 may use "
+                    "logical no-write migration"
+                ),
+                details={
+                    "marker_version": state.get("marker_version"),
+                },
+            )
+        try:
+            current_snapshot, current_payload = (
+                _read_content_snapshot_with_backoff(
+                    spm_path,
+                    operation=(
+                        "recover_interrupted_calibration:"
+                        "read_legacy_current"
+                    ),
+                    include_bytes=True,
+                )
+            )
+            current_text = _decode_spm_payload(current_payload)
+            backup_text = _decode_spm_payload(backup_payload)
+        except (
+            AttributeError,
+            EOFError,
+            gzip.BadGzipFile,
+            OSError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as exc:
+            return _calibration_recovery_failure(
+                state,
+                failure_kind="interrupted_calibration",
+                category="legacy_marker_logical_audit_failed",
+                error=f"legacy marker logical SPM audit failed: {exc}",
+            )
+        calibration_repairs = []
+        shared_calibration_generators = 0
+        logical_xml_exact_equal = current_text == backup_text
+        if not logical_xml_exact_equal:
+            (
+                recovered_text,
+                calibration_repairs,
+                shared_calibration_generators,
+            ) = _restore_legacy_calibration_values(
+                spm_path,
+                current_text,
+                backup_text,
+            )
+            if not shared_calibration_generators:
+                return _calibration_recovery_failure(
+                    state,
+                    failure_kind="concurrent_spm_modification",
+                    category="legacy_marker_logical_mismatch",
+                    error=(
+                        "legacy marker current SPM logical XML differs from "
+                        "the recorded source backup, and no shared Branch "
+                        "calibration properties can be recovered safely"
+                    ),
+                    details={
+                        "current_sha256": current_snapshot.get(
+                            "sha256", ""
+                        ),
+                        "backup_sha256": backup_snapshot.get(
+                            "sha256", ""
+                        ),
+                    },
+                )
+            if recovered_text != current_text:
+                write_spm(spm_path, recovered_text)
+                current_text = read_spm(spm_path)
+                if current_text != recovered_text:
+                    return _calibration_recovery_failure(
+                        state,
+                        failure_kind="interrupted_calibration",
+                        category=(
+                            "legacy_marker_calibration_restore_verify_failed"
+                        ),
+                        error=(
+                            "selectively restored Branch calibration values "
+                            "did not verify after the atomic SPM write"
+                        ),
+                    )
+        cluster_postcondition = None
+        if is_cluster_normalization_spm(spm_path):
+            cluster_postcondition = cluster_root_logical_postcondition(
+                current_text
+            )
+            if not cluster_postcondition.get("ok"):
+                return _calibration_recovery_failure(
+                    state,
+                    failure_kind="interrupted_calibration",
+                    category="legacy_marker_cluster_postcondition_failed",
+                    error=(
+                        "legacy marker logical XML matches its backup, but "
+                        "the live Cluster root-bone postcondition is not valid"
+                    ),
+                    details={
+                        "cluster_postcondition": cluster_postcondition,
+                    },
+                )
+        migrated_state = {
+            **state,
+            "status": (
+                "legacy_marker_calibration_values_restored"
+                if calibration_repairs
+                else "legacy_marker_logically_intact"
+            ),
+            "legacy_marker_migration": {
+                "policy": (
+                    "restore_only_interrupted_branch_calibration_values"
+                    if calibration_repairs
+                    else "clear_marker_without_spm_write"
+                ),
+                "marker_version": state.get("marker_version"),
+                "backup_hash_matches_source": True,
+                "logical_xml_exact_equal": logical_xml_exact_equal,
+                "shared_calibration_generator_count":
+                    shared_calibration_generators,
+                "restored_calibration_generator_count":
+                    len(calibration_repairs),
+                "restored_calibration_generators": calibration_repairs,
+                "cluster_postcondition": cluster_postcondition,
+            },
+        }
+        return _calibration_recovery_clear_result(
+            migrated_state,
+            spm_path,
+            recovered=bool(calibration_repairs),
+        )
+    live_sha256 = (state.get("spm_snapshot") or {}).get("sha256", "")
+    if live_sha256 != state["last_pipeline_sha256"]:
+        return _calibration_recovery_failure(
+            {
+                **state,
+                "status": "concurrent_spm_modification",
+            },
+            failure_kind="concurrent_spm_modification",
+            category="live_spm_hash_mismatch",
+            error=(
+                "current SPM content differs from the last pipeline-authored "
+                "fingerprint; external edit preserved"
+            ),
+            details={
+                "live_sha256": live_sha256,
+                "last_pipeline_sha256": state["last_pipeline_sha256"],
+            },
+        )
+    backup_stat = backup.stat()
+    _atomic_replace_payload(
+        spm_path,
+        backup_payload,
+        operation="recover_interrupted_calibration",
+        baseline=state.get("spm_snapshot"),
+        source_stat=backup_stat,
+    )
+    return _calibration_recovery_clear_result(
+        state,
+        spm_path,
+        recovered=True,
+    )
+
+
 def export_verify_xml(spm_path, cfg, out_path):
+    require_texture_skip_writing(
+        cfg["xml_ini"],
+        purpose=f"{Path(spm_path).name} verification XML export",
+    )
     cmd = [
         cfg["speedtree_exe"],
         str(spm_path),
@@ -930,23 +3497,55 @@ def export_verify_xml(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(Path(spm_path).parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        result = run_speedtree_export(
+            cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
-        raise SpeedTreeExportTimeout("XML", timeout) from exc
-    if result.returncode != 0 or not Path(out_path).exists():
-        detail = (result.stderr or result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree XML verify export failed ({result.returncode}): {detail}")
+        raise SpeedTreeExportTimeout(
+            "XML",
+            timeout,
+            evidence=getattr(exc, "evidence", {}),
+        ) from exc
+    returncode, stdout, stderr = result
+    if returncode != 0 or not Path(out_path).exists():
+        detail = (stderr or stdout or "").strip()[-500:]
+        evidence = dict(getattr(result, "evidence", {}) or {})
+        evidence.update(
+            {
+                "stage": "XML",
+                "category": (
+                    "access_violation"
+                    if _crashed_with_access_violation(returncode)
+                    else (
+                        "output_missing"
+                        if returncode == 0
+                        else "non_retryable_returncode"
+                    )
+                ),
+                "returncode": int(returncode),
+                "returncode_hex": (
+                    f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                ),
+                "output_exists": Path(out_path).exists(),
+            }
+        )
+        evidence["failure_kind"] = (
+            "process_exporter_crash"
+            if evidence["category"] == "access_violation"
+            else "internal_error"
+        )
+        raise SpeedTreeExportProcessError(
+            f"SpeedTree XML verify export failed ({returncode}): {detail}",
+            evidence,
+        )
     return out_path
 
 
 def export_verify_fbx_geometry(spm_path, cfg, out_path):
+    require_texture_skip_writing(
+        cfg["fbx_ini"],
+        purpose=f"{Path(spm_path).name} verification FBX export",
+    )
     cmd = [
         cfg["speedtree_exe"],
         str(spm_path),
@@ -957,20 +3556,48 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     ]
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(Path(spm_path).parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000,
+        result = run_speedtree_export(
+            cmd, Path(spm_path).parent, timeout
         )
     except subprocess.TimeoutExpired as exc:
-        raise SpeedTreeExportTimeout("FBX", timeout) from exc
+        raise SpeedTreeExportTimeout(
+            "FBX",
+            timeout,
+            evidence=getattr(exc, "evidence", {}),
+        ) from exc
+    returncode, stdout, stderr = result
     path = Path(out_path)
-    if result.returncode != 0 or not path.exists():
-        detail = (result.stderr or result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"SpeedTree FBX verify export failed ({result.returncode}): {detail}")
+    if returncode != 0 or not path.exists():
+        detail = (stderr or stdout or "").strip()[-500:]
+        evidence = dict(getattr(result, "evidence", {}) or {})
+        evidence.update(
+            {
+                "stage": "FBX",
+                "category": (
+                    "access_violation"
+                    if _crashed_with_access_violation(returncode)
+                    else (
+                        "output_missing"
+                        if returncode == 0
+                        else "non_retryable_returncode"
+                    )
+                ),
+                "returncode": int(returncode),
+                "returncode_hex": (
+                    f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                ),
+                "output_exists": path.exists(),
+            }
+        )
+        evidence["failure_kind"] = (
+            "process_exporter_crash"
+            if evidence["category"] == "access_violation"
+            else "internal_error"
+        )
+        raise SpeedTreeExportProcessError(
+            f"SpeedTree FBX verify export failed ({returncode}): {detail}",
+            evidence,
+        )
     # SpeedTree writes binary FBX. A real mesh contains the FBX property name
     # "Vertices" in clear text; armature-only/container-only exports do not.
     return b"Vertices" in path.read_bytes()
@@ -999,6 +3626,125 @@ def bone_lengths_from_xml(xml_path):
         if math.isfinite(length) and length > 0:
             lengths.append(length)
     return lengths
+
+
+def cluster_root_bones_from_xml(xml_path):
+    """Return the exact structural-root bone inventory from a Raw XML export."""
+    root = ET.parse(xml_path).getroot()
+    bones = root.findall(".//Bone")
+    root_bones = []
+    non_root_bones = []
+    for bone in bones:
+        record = {
+            "id": bone.get("ID"),
+            "parent_id": bone.get("ParentID", "-1"),
+            "generator": bone.get("Generator") or "?",
+        }
+        if record["parent_id"] in {"", "-1"}:
+            root_bones.append(record)
+        else:
+            non_root_bones.append(record)
+    counts = {}
+    for bone in root_bones:
+        name = bone["generator"]
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        "bone_count": len(bones),
+        "root_bone_count": len(root_bones),
+        "non_root_bone_count": len(non_root_bones),
+        "root_generator_counts": counts,
+        "root_bones": root_bones,
+        "non_root_bones": non_root_bones,
+    }
+
+
+def calibrate_cluster_root_bones(
+    spm_path,
+    cfg,
+    *,
+    original_text,
+    log=print,
+):
+    """Write and verify the Cluster one-root-per-piece SpeedTree contract."""
+    plan = plan_cluster_root_bones(original_text)
+    if not plan["ready"]:
+        raise RuntimeError(
+            "Cluster root bone planning failed: "
+            + "; ".join(plan["errors"])
+        )
+
+    patched_text = apply_cluster_root_bone_plan(original_text, plan)
+    write_spm(spm_path, patched_text)
+    with tempfile.TemporaryDirectory(prefix="skbatch_cluster_root_") as tmp:
+        xml_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.xml"
+        fbx_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.fbx"
+        log(
+            "  [Cluster bones] SpeedTree structural-root XML verification: "
+            f"{plan['expected_root_bone_count']} roots"
+        )
+        export_verify_xml(spm_path, cfg, xml_out)
+        inventory = cluster_root_bones_from_xml(xml_out)
+        if inventory["bone_count"] != plan["expected_root_bone_count"]:
+            raise RuntimeError(
+                "Cluster structural-root bone count mismatch: "
+                f"expected {plan['expected_root_bone_count']}, "
+                f"exported {inventory['bone_count']}"
+            )
+        if inventory["non_root_bone_count"]:
+            raise RuntimeError(
+                "Cluster structural-root export still contains descendant bones: "
+                f"{inventory['non_root_bone_count']}"
+            )
+        if (
+            inventory["root_generator_counts"]
+            != plan["expected_root_generator_counts"]
+        ):
+            raise RuntimeError(
+                "Cluster structural-root generator mismatch: "
+                f"expected {plan['expected_root_generator_counts']}, "
+                f"exported {inventory['root_generator_counts']}"
+            )
+        log("  [Cluster bones] SpeedTree FBX geometry verification")
+        if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+            raise RuntimeError(
+                "Cluster structural-root bone compaction produced an FBX "
+                "without mesh geometry"
+            )
+
+    generator_counts = dict(
+        sorted(
+            inventory["root_generator_counts"].items(),
+            key=lambda item: item[0].casefold(),
+        )
+    )
+    meta = {
+        **plan,
+        "actual_root_bone_count": inventory["root_bone_count"],
+        "actual_root_generator_counts": inventory["root_generator_counts"],
+        "verified_xml": True,
+        "verified_fbx_geometry": True,
+    }
+    rounds = [
+        {
+            "phase": "cluster structural roots absolute/1",
+            "total_bones": inventory["bone_count"],
+            "root_bones": inventory["root_bone_count"],
+            "disabled_generator_count": plan["disabled_generator_count"],
+            "hidden_meshless_pivot_generator_count": len(
+                plan["meshless_pivot_generator_indices"]
+            ),
+        }
+    ]
+    changed = patched_text != original_text
+    return (
+        generator_counts,
+        rounds,
+        inventory["bone_count"],
+        meta,
+        [],
+        [],
+        changed,
+    )
 
 
 def estimate_relative_value_from_probe(
@@ -1065,6 +3811,110 @@ def estimate_relative_value_from_probe(
     )
 
 
+def shared_authored_relative_value(audit, target_indices):
+    """Return one unambiguous authored Relative value for selected targets."""
+    generators = list((audit or {}).get("generators") or ())
+    values = []
+    for index in target_indices:
+        if not 0 <= int(index) < len(generators):
+            continue
+        generator = generators[int(index)]
+        try:
+            style = float(generator.get("style"))
+            bones = float(generator.get("bones"))
+        except (TypeError, ValueError):
+            continue
+        if style == 1.0 and math.isfinite(bones) and bones > 0.0:
+            values.append(bones)
+    if not values:
+        return None
+    reference = values[0]
+    tolerance = max(1e-6, abs(reference) * 1e-6)
+    if any(abs(value - reference) > tolerance for value in values[1:]):
+        return None
+    return sum(values) / len(values)
+
+
+def _next_relative_candidate(
+    observations,
+    *,
+    target_total,
+    value_floor,
+    value_cap,
+):
+    """Choose a bounded correction from measured SpeedTree output."""
+    current_r, current_total = observations[-1]
+    under = sorted(
+        (
+            (relative, total)
+            for relative, total in observations
+            if total < target_total
+        ),
+        key=lambda item: item[0],
+    )
+    over = sorted(
+        (
+            (relative, total)
+            for relative, total in observations
+            if total > target_total
+        ),
+        key=lambda item: item[0],
+    )
+    lower = max(under, default=None, key=lambda item: item[0])
+    upper = min(over, default=None, key=lambda item: item[0])
+    if lower is not None and upper is not None and lower[0] < upper[0]:
+        if lower[0] > 0.0:
+            candidate = math.sqrt(lower[0] * upper[0])
+        else:
+            candidate = (lower[0] + upper[0]) * 0.5
+    elif current_total <= 0:
+        candidate = max(current_r * 3.0, current_r + 0.05)
+    else:
+        ratio = max(1e-9, float(target_total) / float(current_total))
+        candidate = current_r * ratio ** 0.6
+        if current_total < target_total:
+            candidate = max(candidate, current_r * 1.2)
+        else:
+            candidate = min(candidate, current_r * 0.8)
+    return max(value_floor, min(value_cap, candidate))
+
+
+def _relative_failure_mode(
+    observations,
+    *,
+    lo,
+    hi,
+    value_floor,
+    value_cap,
+):
+    """Classify why bounded Relative calibration did not converge."""
+    relative, total = observations[-1]
+    epsilon = max(1e-6, abs(relative) * 1e-6)
+    if total == 0:
+        return "manual_required_relative_zero"
+    if relative >= value_cap - epsilon and total < lo:
+        return "manual_required_relative_cap"
+    if relative <= value_floor + epsilon and total > hi:
+        return "manual_required_relative_floor"
+    for left_index, (left_r, left_total) in enumerate(observations):
+        for right_r, right_total in observations[left_index + 1:]:
+            if right_r > left_r + 1e-6 and right_total < left_total:
+                return "manual_required_relative_nonmonotonic"
+            if left_r > right_r + 1e-6 and left_total < right_total:
+                return "manual_required_relative_nonmonotonic"
+    if len(observations) >= 2:
+        previous_r, previous_total = observations[-2]
+        if (
+            total == previous_total
+            and abs(relative - previous_r)
+            > max(1e-5, abs(previous_r) * 1e-4)
+        ):
+            return "manual_required_relative_plateau"
+    if total < lo:
+        return "manual_required_relative_underflow"
+    return "manual_required_relative_overflow"
+
+
 def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=None):
     """Keep Tree density first, then solve the remaining capped bone budget.
 
@@ -1089,9 +3939,19 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     value_cap = float(cfg.get("value_cap", 64.0))
     value_floor = float(cfg.get("value_floor", 0.02))
     seed = float(cfg.get("seed_relative_value", 0.5))
-    max_rounds = int(cfg.get("max_calibration_rounds", 4))
+    max_rounds = max(1, int(cfg.get("max_calibration_rounds", 4)))
 
     original_text = source_text if source_text is not None else read_spm(spm_path)
+    if (
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    ):
+        return calibrate_cluster_root_bones(
+            spm_path,
+            cfg,
+            original_text=original_text,
+            log=log,
+        )
     audit = source_audit if source_audit is not None else audit_spm(
         spm_path, text=original_text, analyze_bone_graph=True
     )
@@ -1317,14 +4177,38 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             value_floor,
             value_cap,
         )
+        authored_r = shared_authored_relative_value(
+            audit, calibration_indices
+        )
         probe_round["estimated_relative_value"] = (
             round(estimated_r, 4) if estimated_r is not None else None
         )
+        probe_round["length_estimate_valid"] = estimated_r is not None
+        probe_round["authored_relative_value"] = (
+            round(authored_r, 4) if authored_r is not None else None
+        )
         if estimated_r is not None:
+            initial_r = estimated_r
+            initial_r_source = "absolute_probe_lengths"
             log(
                 f"  [estimate] Relative r={estimated_r:.3f} "
                 f"from {len(calibration_lengths)} branch lengths"
             )
+        elif authored_r is not None:
+            initial_r = authored_r
+            initial_r_source = "shared_authored_relative"
+            log(
+                f"  [estimate] Relative r={authored_r:.3f} "
+                "from the current rendered target generators"
+            )
+        else:
+            initial_r = seed
+            initial_r_source = "configured_seed"
+            log(
+                f"  [estimate] Relative r={seed:.3f} from configured seed "
+                "(probe lengths unavailable)"
+            )
+        probe_round["initial_relative_source"] = initial_r_source
 
         def stop_for_manual(reason, relative_value, measured_total, mode):
             # Put the logical source back immediately. process_spm restores the
@@ -1346,6 +4230,7 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                     "disabled_base_generator_count": len(disabled_base_indices),
                     "density_reduced_for_cap": density_reduced_for_cap,
                     "probe_cache_hit": probe_cache_hit,
+                    "initial_relative_source": initial_r_source,
                     "manual_required": True,
                 },
                 warnings=[reason],
@@ -1357,9 +4242,10 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         # grow super-linearly with the value. The Absolute/1 probe gives a
         # length-based first estimate; proportional correction remains for
         # unusual models whose curved spines differ from their probe chords.
-        r = estimated_r if estimated_r is not None else seed
+        r = initial_r
         final_counts = {}
         total = 0
+        observations = []
         for round_index in range(max_rounds):
             r = max(value_floor, min(value_cap, r))
             write_spm(
@@ -1374,30 +4260,41 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             log(f"  [SpeedTree] XML Relative 검증 시작 (round {round_index + 1})")
             final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
             total = sum(final_counts.values())
+            observations.append((r, total))
             rounds.append({"phase": f"relative round {round_index + 1}", "value": round(r, 4), "total_bones": total})
             log(f"  [calibrate] r={r:.3f} -> {total} bones (target {target_total:.0f}, window {lo:.0f}-{hi:.0f})")
             if lo <= total <= hi:
                 break
-            if cfg.get("fast_skip_problem_spm", True):
-                stop_for_manual(
-                    (
-                        f"first Relative verification produced {total} bones, outside "
-                        f"the accepted window {lo:.0f}-{hi:.0f}; skipped further "
-                        "SpeedTree correction rounds"
-                    ),
-                    r,
-                    total,
-                    "manual_required_relative_outlier",
-                )
-            if total == 0:
-                r *= 3
-                continue
-            new_r = max(value_floor, min(value_cap, r * (target_total / total) ** 0.6))
-            if abs(new_r - r) < 1e-4:
-                break  # hit floor/cap; can't get closer
+            new_r = _next_relative_candidate(
+                observations,
+                target_total=target_total,
+                value_floor=value_floor,
+                value_cap=value_cap,
+            )
+            if abs(new_r - r) < max(1e-6, abs(r) * 1e-6):
+                break
             r = new_r
 
         final_r = max(value_floor, min(value_cap, r))
+        if not (lo <= total <= hi):
+            failure_mode = _relative_failure_mode(
+                observations,
+                lo=lo,
+                hi=hi,
+                value_floor=value_floor,
+                value_cap=value_cap,
+            )
+            stop_for_manual(
+                (
+                    "bounded Relative calibration did not reach the accepted "
+                    f"window {lo:.0f}-{hi:.0f} after {len(observations)} "
+                    f"round(s); final r={final_r:.4f}, bones={total}, "
+                    f"classification={failure_mode}"
+                ),
+                final_r,
+                total,
+                failure_mode,
+            )
 
         if base_priority_applied:
             calibration_mode = "base_disabled_tree_relative"
@@ -1409,16 +4306,6 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
             fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
             log("  [SpeedTree] FBX geometry 검증 시작")
             if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
-                if cfg.get("fast_skip_problem_spm", True):
-                    stop_for_manual(
-                        (
-                            "first FBX geometry verification produced an armature-only "
-                            "file; skipped automatic Absolute/material fallback exports"
-                        ),
-                        final_r,
-                        total,
-                        "manual_required_geometry",
-                    )
                 # Certain root/frond assets export an armature but silently drop
                 # every mesh after Relative bone calibration. Absolute/1 is the
                 # known-good SpeedTree representation for those assets.
@@ -1458,6 +4345,19 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                         "external atlas cutouts produced no Frond geometry; restored embedded material references"
                     )
                 log(f"  [geometry fallback] Absolute/1 -> {total} bones with valid FBX geometry")
+        else:
+            fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
+            log("  [SpeedTree] FBX final geometry verification")
+            if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+                stop_for_manual(
+                    (
+                        "final Relative calibration produced an FBX without "
+                        "render mesh geometry; no Base-linked fallback is safe"
+                    ),
+                    final_r,
+                    total,
+                    "manual_required_geometry",
+                )
 
     # generator report: names may repeat; XML aggregates bones by generator name
     generators_report = dict(sorted(final_counts.items(), key=lambda kv: -kv[1]))
@@ -1484,6 +4384,8 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         "disabled_base_generator_count": len(disabled_base_indices),
         "density_reduced_for_cap": density_reduced_for_cap,
         "probe_cache_hit": probe_cache_hit,
+        "initial_relative_source": initial_r_source,
+        "verified_fbx_geometry": True,
     }
     if absolute_fallback is not None:
         meta["absolute_bones_per_branch"] = absolute_fallback
@@ -1492,11 +4394,224 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     return generators_report, rounds, total, meta, warnings, skipped, True
 
 
-def process_spm(spm_path, cfg, log=print, dry_run=False):
+def _record_final_spm_identity(report, spm_path):
+    path = Path(spm_path)
+    stat = path.stat()
+    report["final_spm_fingerprint"] = file_content_fingerprint(path)
+    report["final_spm_size"] = stat.st_size
+    report["final_spm_mtime_ns"] = stat.st_mtime_ns
+    return report
+
+
+def _bone_receipt_cache_dir(cfg):
+    return cfg.get("spm_calibration_receipt_dir") or (
+        Path(__file__).resolve().parent / "cache" / "spm_calibration"
+    )
+
+
+def _persist_positive_bone_receipt(
+    report,
+    spm_path,
+    source_text,
+    cfg,
+    *,
+    semantic_fingerprint=None,
+):
+    """Best-effort positive cache write; cache I/O never blocks good data."""
+    if report.get("status") not in POSITIVE_CALIBRATION_STATUSES:
+        return report
+    try:
+        if semantic_fingerprint is None:
+            semantic_fingerprint = current_bone_semantic_fingerprint(
+                spm_path,
+                source_text,
+            )
+        receipt_path = write_positive_calibration_receipt(
+            spm_path,
+            _bone_receipt_cache_dir(cfg),
+            bone_semantic_fingerprint_value=semantic_fingerprint,
+            settings_signature=calibration_settings_signature(cfg),
+            bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+            report=report,
+        )
+        report["bone_semantic_fingerprint"] = semantic_fingerprint
+        report["bone_contract_version"] = SPM_BONE_CONTRACT_VERSION
+        report["bone_receipt"] = str(receipt_path) if receipt_path else None
+    except (OSError, ValueError, TypeError) as exc:
+        report.setdefault("warnings", []).append(
+            "Bone calibration receipt cache could not be persisted: "
+            + str(exc)
+        )
+    return report
+
+
+def _apply_non_bone_transforms_from_receipt(
+    spm_path,
+    cfg,
+    *,
+    source_text,
+    source_bytes,
+    source_stat,
+    renames,
+    apply_tree_red,
+    receipt,
+    report,
+    semantic_fingerprint=None,
+    cluster_postcondition=None,
+):
+    """Apply cheap SPM transforms while reusing a proven bone result."""
+    summary = receipt.get("summary") or {}
+    report["generators"] = summary.get("generators") or {}
+    report["rounds"] = summary.get("rounds") or []
+    report["total_bones"] = summary.get("total_bones")
+    report["calibration"] = summary.get("calibration") or {}
+    report["cached_display_summary"] = summary.get("display_summary")
+    report["skipped"].extend(summary.get("skipped") or [])
+    report["bone_fast_path"] = {
+        "status": "hit",
+        "reason": (
+            "bone structure/geometry, semantic contract and bone settings "
+            "are unchanged"
+        ),
+        "prior_status": receipt.get("status"),
+        "receipt_completed_at": receipt.get("completed_at"),
+    }
+
+    final_text = source_text
+    if cfg.get("rename_materials", True) and renames:
+        final_text, applied = apply_material_renames(final_text, renames)
+        report["material_renames"] = applied
+
+    if apply_tree_red:
+        final_text, vertex_report = apply_leaf_parent_red_gradient(final_text)
+        report["vertex_colors"] = vertex_report
+        if vertex_report["errors"]:
+            raise RuntimeError(
+                "SpeedTree leaf-parent VertexColor.R contract failed: "
+                + "; ".join(vertex_report["errors"])
+            )
+    cluster_root_mode = bool(
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    )
+    if cluster_root_mode:
+        postcondition = (
+            cluster_postcondition
+            if cluster_postcondition is not None and final_text == source_text
+            else cluster_root_logical_postcondition(final_text)
+        )
+        report["cluster_root_logical_postcondition"] = postcondition
+        if not postcondition.get("ok"):
+            raise RuntimeError(
+                "Cluster cached root-bone postcondition failed: "
+                + "; ".join(postcondition.get("errors") or ["unknown mismatch"])
+            )
+
+    changed = final_text != source_text
+    if changed:
+        if cfg.get("backup_spm", True):
+            report["backup"] = backup_spm(spm_path)
+        try:
+            write_spm(spm_path, final_text)
+        except Exception:
+            _restore_source_snapshot(
+                spm_path,
+                backup=report.get("backup"),
+                source_bytes=source_bytes,
+                source_stat=source_stat,
+            )
+            raise
+
+    report["non_bone_transform_contracts"] = {
+        "material_name_version": SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION,
+        "vertex_red_version": SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION,
+    }
+    report["spm_transform_changed"] = changed
+    report["status"] = "calibrated" if changed else "already-ok"
+    if not changed:
+        report["source_restored_unchanged"] = True
+    report = _record_final_spm_identity(report, spm_path)
+    return _persist_positive_bone_receipt(
+        report,
+        spm_path,
+        final_text,
+        cfg,
+        semantic_fingerprint=(
+            semantic_fingerprint if final_text == source_text else None
+        ),
+    )
+
+
+def _restore_source_snapshot(
+    spm_path,
+    *,
+    backup,
+    source_bytes,
+    source_stat,
+):
+    if backup:
+        backup_path = Path(backup)
+        _atomic_replace_payload(
+            spm_path,
+            backup_path.read_bytes(),
+            operation="rollback_from_backup",
+            source_stat=backup_path.stat(),
+        )
+    else:
+        _atomic_replace_payload(
+            spm_path,
+            source_bytes,
+            operation="rollback_source_snapshot",
+            source_stat=source_stat,
+        )
+
+
+def process_spm(spm_path, cfg, log=print, dry_run=False, force_rerun=False):
+    """Run one complete SPM transaction under its canonical OS lock."""
+    with spm_exclusive_lock(spm_path, log=log):
+        token = _SPM_WRITE_TRANSACTION.set({})
+        try:
+            return _process_spm_locked(
+                spm_path,
+                cfg,
+                log=log,
+                dry_run=dry_run,
+                force_rerun=force_rerun,
+            )
+        finally:
+            _SPM_WRITE_TRANSACTION.reset(token)
+
+
+def _process_spm_locked(
+    spm_path,
+    cfg,
+    log=print,
+    dry_run=False,
+    force_rerun=False,
+):
     """Material prefix + bone calibration with backup/restore. Returns report."""
     spm_path = Path(spm_path)
+    # A previous run killed mid-rewrite left probe bones in the source. Repair
+    # that before reading it as authoritative input.
+    recovery = recover_interrupted_calibration(spm_path)
+    if recovery.get("diagnostic") and not recovery.get("cleared"):
+        raise SPMAtomicOperationError(recovery["diagnostic"])
+    if recovery.get("recovered"):
+        log(
+            "  [복구] 중단된 캘리브레이션 감지 — 백업에서 원본 SPM 복원: "
+            f"{recovery.get('backup', '')}"
+        )
+    elif (
+        recovery.get("status") != "clean"
+        and not recovery.get("cleared")
+    ):
+        raise RuntimeError(
+            "Interrupted SPM calibration marker cannot be recovered safely: "
+            + str(recovery.get("error") or recovery.get("status"))
+        )
     source_bytes = spm_path.read_bytes()
     source_stat = spm_path.stat()
+    _seed_spm_transaction(spm_path, source_bytes)
     source_text = gzip.decompress(source_bytes).decode("utf-8")
     report = {
         "spm": str(spm_path),
@@ -1509,14 +4624,41 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         "skipped": [],
         "warnings": [],
     }
+    if recovery["status"] != "clean":
+        report["interrupted_calibration_recovery"] = recovery
+        if not recovery.get("recovered") and not recovery.get("cleared"):
+            report["warnings"].append(
+                "이전 캘리브레이션이 중단된 흔적이 있으나 백업으로 복원하지 못했습니다: "
+                + str(recovery.get("error") or recovery.get("status"))
+            )
 
-    audit = audit_spm(spm_path, text=source_text, analyze_bone_graph=True)
+    cluster_root_mode = bool(
+        cfg.get("cluster_root_only_bones", True)
+        and is_cluster_normalization_spm(spm_path)
+    )
+    # Cluster prototypes use their dedicated Tree->first-renderable-Branch
+    # root plan. Building the whole generic Tree/Base bone graph here is both
+    # irrelevant and very expensive on large production SPMs.
+    audit = audit_spm(
+        spm_path,
+        text=source_text,
+        analyze_bone_graph=not cluster_root_mode,
+    )
     readiness = sk_readiness(audit)
     report["sk_readiness"] = readiness
     renames, mat_skipped = plan_material_renames(audit)
     report["skipped"].extend(mat_skipped)
+    apply_tree_red = bool(
+        cfg.get("tree_leaf_parent_red_gradient", True)
+        and classify_asset_kind(spm_path) == "tree"
+        and _contains_leaf_node(source_text)
+    )
 
-    if not readiness["ready"]:
+    # A Cluster source is intentionally allowed to arrive with every authored
+    # Branch bone disabled.  That is the input state repaired by the dedicated
+    # first-renderable-root normalizer below; applying the generic Tree
+    # readiness gate here made the normalizer unreachable.
+    if not readiness["ready"] and not cluster_root_mode:
         report["status"] = "not-sk-ready"
         report["error"] = readiness["error"]
         report["calibration"] = {
@@ -1527,19 +4669,127 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["warnings"].append(
             "Skipped without modifying the SPM because its GUID bone graph is not SK-ready."
         )
-        return report
+        return _record_final_spm_identity(report, spm_path)
 
     if dry_run:
         report["status"] = "dry-run"
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
         report["bone_graph"] = audit.get("bone_graph")
-        return report
+        if cluster_root_mode:
+            report["cluster_root_bone_plan"] = plan_cluster_root_bones(
+                source_text
+            )
+        if apply_tree_red:
+            _planned_text, vertex_report = apply_leaf_parent_red_gradient(source_text)
+            report["vertex_colors"] = vertex_report
+        return _record_final_spm_identity(report, spm_path)
+
+    bone_semantic_input = current_bone_semantic_fingerprint(
+        spm_path,
+        source_text,
+    )
+    report["bone_semantic_fingerprint"] = bone_semantic_input
+    report["bone_contract_version"] = SPM_BONE_CONTRACT_VERSION
+    receipt = None
+    if not force_rerun:
+        receipt = load_positive_calibration_receipt(
+            spm_path,
+            _bone_receipt_cache_dir(cfg),
+            bone_semantic_fingerprint_value=bone_semantic_input,
+            settings_signature=calibration_settings_signature(cfg),
+            bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+        )
+        if receipt is None and not cluster_root_mode:
+            # Existing v1 receipts migrate without an export when the current
+            # file still matches their former projection. Cluster prototypes
+            # use the stronger live fixed-point proof below, avoiding a second
+            # parse of large SPMs.
+            legacy_semantic_input = current_legacy_bone_semantic_fingerprint(
+                spm_path,
+                source_text,
+            )
+            receipt = load_positive_calibration_receipt(
+                spm_path,
+                _bone_receipt_cache_dir(cfg),
+                bone_semantic_fingerprint_value=bone_semantic_input,
+                legacy_bone_semantic_fingerprint_values=(
+                    legacy_semantic_input,
+                ),
+                settings_signature=calibration_settings_signature(cfg),
+                bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+            )
+    if receipt is not None:
+        log(
+            "  [SPM bone fast-path] branch/geometry/bone semantics unchanged; "
+            "SpeedTree XML/FBX export skipped"
+        )
+        return _apply_non_bone_transforms_from_receipt(
+            spm_path,
+            cfg,
+            source_text=source_text,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+            renames=renames,
+            apply_tree_red=apply_tree_red,
+            receipt=receipt,
+            report=report,
+            semantic_fingerprint=bone_semantic_input,
+        )
+
+    if not force_rerun and cluster_root_mode:
+        cluster_postcondition = cluster_root_logical_postcondition(source_text)
+        report["cluster_root_logical_postcondition"] = cluster_postcondition
+        if cluster_postcondition.get("ok"):
+            expected_bones = cluster_postcondition.get(
+                "expected_root_bone_count"
+            )
+            log(
+                "  [SPM bone fast-path] Cluster root settings are already the "
+                "logical fixed point; SpeedTree XML/FBX export skipped"
+            )
+            return _apply_non_bone_transforms_from_receipt(
+                spm_path,
+                cfg,
+                source_text=source_text,
+                source_bytes=source_bytes,
+                source_stat=source_stat,
+                renames=renames,
+                apply_tree_red=apply_tree_red,
+                receipt={
+                    "status": "already-ok",
+                    "completed_at": None,
+                    "summary": {
+                        "display_summary": (
+                            "already-ok"
+                            if expected_bones is None
+                            else f"already-ok · Cluster root {expected_bones}"
+                        ),
+                        "generators": {},
+                        "rounds": [],
+                        "total_bones": expected_bones,
+                        "calibration": {
+                            "mode": cluster_postcondition.get("mode"),
+                            "verification": "live_logical_fixed_point",
+                            "speedtree_export_skipped": True,
+                        },
+                        "skipped": [],
+                    },
+                },
+                report=report,
+                semantic_fingerprint=bone_semantic_input,
+                cluster_postcondition=cluster_postcondition,
+            )
 
     backup = None
     if cfg.get("backup_spm", True):
         backup = backup_spm(spm_path)
         report["backup"] = backup
+    # Written before the first in-place write so a hard kill anywhere below is
+    # recoverable; every return path below clears it in the finally block.
+    report["calibration_marker"] = str(
+        write_calibration_marker(spm_path, backup, _sha256_bytes(source_bytes))
+    )
 
     try:
         generators, rounds, total, meta, warnings, skipped, changed = calibrate_bones(
@@ -1563,23 +4813,60 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
                 write_spm(spm_path, text)
                 report["material_renames"] = applied
 
+        vertex_changed = False
+        if apply_tree_red:
+            text = read_spm(spm_path)
+            text, vertex_report = apply_leaf_parent_red_gradient(text)
+            report["vertex_colors"] = vertex_report
+            if vertex_report["errors"]:
+                raise RuntimeError(
+                    "SpeedTree leaf-parent VertexColor.R contract failed: "
+                    + "; ".join(vertex_report["errors"])
+                )
+            if vertex_report["changed_generator_count"]:
+                write_spm(spm_path, text)
+                vertex_changed = True
+                changed = True
+
+        final_text = read_spm(spm_path)
+        if cluster_root_mode:
+            postcondition = cluster_root_logical_postcondition(final_text)
+            report["cluster_root_logical_postcondition"] = postcondition
+            if not postcondition.get("ok"):
+                raise RuntimeError(
+                    "Cluster final logical bone postcondition failed: "
+                    + "; ".join(
+                        postcondition.get("errors")
+                        or ["unknown logical mismatch"]
+                    )
+                )
+
         # Calibration temporarily writes Absolute/1 and Relative variants. If
         # the final logical XML is identical to the source, restore the exact
         # gzip bytes and timestamps so a no-op ① run does not invalidate a
         # perfectly good .blend merely by touching the SPM.
-        if read_spm(spm_path) == source_text:
-            spm_path.write_bytes(source_bytes)
-            os.utime(
+        if final_text == source_text:
+            _atomic_replace_payload(
                 spm_path,
-                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                source_bytes,
+                operation="restore_byte_identical_noop_source",
+                source_stat=source_stat,
             )
             changed = False
             report["source_restored_unchanged"] = True
 
-        report["status"] = "calibrated" if (changed or report["material_renames"]) else "already-ok"
+        report["status"] = (
+            "calibrated"
+            if (changed or report["material_renames"] or vertex_changed)
+            else "already-ok"
+        )
     except ManualCalibrationRequired as exc:
-        if backup:
-            shutil.copy2(backup, spm_path)
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
         report["status"] = "manual-required"
         report["error"] = str(exc)
         report["rounds"] = exc.rounds
@@ -1589,31 +4876,58 @@ def process_spm(spm_path, cfg, log=print, dry_run=False):
         report["warnings"].append("automatic calibration stopped; original SPM restored")
         report["skipped"].extend(exc.skipped)
     except SpeedTreeExportTimeout as exc:
-        if backup:
-            shutil.copy2(backup, spm_path)
-        else:
-            spm_path.write_bytes(source_bytes)
-            os.utime(
-                spm_path,
-                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
-            )
-        report["status"] = "manual-required"
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
+        report["status"] = "failed"
+        report["failure_kind"] = "process_timeout"
         report["error"] = str(exc)
+        report["diagnostic"] = {
+            **dict(exc.evidence or {}),
+            "failure_kind": "process_timeout",
+            "category": "speedtree_export_timeout",
+            "stage": exc.stage,
+        }
         report["calibration"] = {
-            "mode": "manual_required_export_timeout",
+            "mode": "process_export_timeout",
             "stage": exc.stage,
             "timeout_seconds": exc.timeout_seconds,
-            "manual_required": True,
+            "export_runtime": exc.evidence,
+            "manual_required": False,
         }
         report["warnings"].append(
-            "SpeedTree export was too slow; automatic calibration stopped and original SPM restored"
+            "SpeedTree export made no progress or reached the hard cap; "
+            "automatic calibration stopped and original SPM restored"
         )
     except Exception:
+        _restore_source_snapshot(
+            spm_path,
+            backup=backup,
+            source_bytes=source_bytes,
+            source_stat=source_stat,
+        )
         if backup:
-            shutil.copy2(backup, spm_path)
             report["warnings"].append("calibration failed; SPM restored from backup")
         report["status"] = "failed"
         raise
+    finally:
+        # A writer outside this transaction may have changed the SPM while
+        # SpeedTree/OneDrive still held it. Keep the marker in that case: the
+        # next run must diagnose/recover instead of declaring a false clean
+        # state.
+        if _transaction_target_is_current(spm_path):
+            clear_calibration_marker(spm_path)
+    report = _record_final_spm_identity(report, spm_path)
+    if report.get("status") in POSITIVE_CALIBRATION_STATUSES:
+        report = _persist_positive_bone_receipt(
+            report,
+            spm_path,
+            read_spm(spm_path),
+            cfg,
+        )
     return report
 
 
@@ -1621,6 +4935,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spm", nargs="+")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="ignore a current positive bone receipt and run SpeedTree exports",
+    )
     parser.add_argument("--report")
     args = parser.parse_args()
     cfg = load_config()
@@ -1628,10 +4947,22 @@ def main():
     for spm in args.spm:
         print(f"== {spm}")
         try:
-            rep = process_spm(spm, cfg, dry_run=args.dry_run)
+            rep = process_spm(
+                spm,
+                cfg,
+                dry_run=args.dry_run,
+                force_rerun=args.force_rerun,
+            )
         except Exception as exc:
             print(f"FAILED: {exc}")
             rep = {"spm": spm, "status": "failed", "error": str(exc)}
+            diagnostic = getattr(exc, "diagnostic", None)
+            if diagnostic:
+                rep["diagnostic"] = diagnostic
+                rep["failure_kind"] = diagnostic.get(
+                    "failure_kind",
+                    "process",
+                )
         reports.append(rep)
         print(json.dumps(rep, indent=2, ensure_ascii=False))
     if args.report:

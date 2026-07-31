@@ -9,7 +9,6 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from export_atlas_handoff_queue import build_atlas_queue_from_report, write_csv as write_atlas_queue_csv
-from export_blend_queue import build_blend_queue_from_report, write_csv as write_blend_queue_csv
 from export_prepare_apply_queue import build_prepare_apply_queue_from_report, write_csv as write_prepare_apply_queue_csv
 from export_prepare_plan import build_plan_from_report, write_csv as write_prepare_plan_csv
 from export_review_brief import build_review_brief_from_report
@@ -71,8 +70,6 @@ def export_all_from_report(report, out_dir=None, prefix="", stamp=None, no_stamp
         "prepare_plan_csv": out_dir / f"pcg_prepare_plan{suffix}.csv",
         "prepare_apply_queue_json": out_dir / f"pcg_prepare_apply_queue{suffix}.json",
         "prepare_apply_queue_csv": out_dir / f"pcg_prepare_apply_queue{suffix}.csv",
-        "blend_queue_json": out_dir / f"pcg_blend_queue{suffix}.json",
-        "blend_queue_csv": out_dir / f"pcg_blend_queue{suffix}.csv",
         "texture_plan_json": out_dir / f"pcg_texture_work_plan{suffix}.json",
         "texture_plan_csv": out_dir / f"pcg_texture_work_plan{suffix}.csv",
         "atlas_queue_json": out_dir / f"pcg_atlas_handoff_queue{suffix}.json",
@@ -95,10 +92,6 @@ def export_all_from_report(report, out_dir=None, prefix="", stamp=None, no_stamp
     prepare_apply_queue = build_prepare_apply_queue_from_report(report, paths["audit_json"])
     _write_json(paths["prepare_apply_queue_json"], prepare_apply_queue)
     write_prepare_apply_queue_csv(prepare_apply_queue, paths["prepare_apply_queue_csv"])
-
-    blend_queue = build_blend_queue_from_report(report, paths["audit_json"])
-    _write_json(paths["blend_queue_json"], blend_queue)
-    write_blend_queue_csv(blend_queue, paths["blend_queue_csv"])
 
     texture_plan = build_texture_plan_from_report(report, paths["audit_json"])
     _write_json(paths["texture_plan_json"], texture_plan)
@@ -126,7 +119,6 @@ def export_all_from_report(report, out_dir=None, prefix="", stamp=None, no_stamp
         "pcg_targets": report.get("pcg_targets", {}),
         "prepare_plan": _prepare_summary(prepare_plan),
         "prepare_apply_queue": prepare_apply_queue.get("summary", {}),
-        "blend_queue": blend_queue.get("summary", {}),
         "texture_plan": texture_plan.get("summary", {}),
         "atlas_queue": atlas_queue.get("summary", {}),
         "sbs_queue": sbs_queue.get("summary", {}),
