@@ -1731,6 +1731,34 @@ def _stale_node_table_evidence(binding):
     )
 
 
+INACTIVE_CAUSAL_PATH_REASON = (
+    "generator_causal_path_inactive_unused_base"
+)
+
+
+def _inactive_causal_path_evidence(binding):
+    """True only for a coherent live path below an unused SpeedTree Base."""
+    if not isinstance(binding, dict):
+        return False
+    return (
+        binding.get("causal_path_active") is False
+        and str(binding.get("causal_path_reason") or "")
+        == INACTIVE_CAUSAL_PATH_REASON
+        and binding.get("node_table_stale") is False
+        and binding.get("graph_visible") is True
+        and not int(binding.get("generated_node_count") or 0)
+        and isinstance(binding.get("inactive_base"), dict)
+        and str(
+            (binding.get("inactive_base") or {}).get("generator_type") or ""
+        ).strip().casefold() == "base"
+        and not int(
+            (binding.get("inactive_base") or {}).get(
+                "generated_node_count"
+            ) or 0
+        )
+    )
+
+
 STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
 STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
 STALE_NODE_TABLE_REMEDY = (
@@ -1983,6 +2011,15 @@ def _normalized_generator_delivery(
         # Diagnostic fields retain all declared slots before the export filter.
         "live_declared_slot_bindings": [],
         "live_non_export_participating_bindings": [],
+        # Declared slots whose current Generator is below a coherent, unused
+        # Base path.  They remain authored/normalized but are not required by
+        # the current export.
+        "inactive_causal_bindings": [],
+        "declared_binding_count": len(bindings),
+        "active_required_binding_count": len(bindings),
+        "planned_inactive_binding_count": 0,
+        "current_required_target_mesh_ids": list(normalized_mesh_ids),
+        "binding_outcomes": [],
         "missing_live_bindings": [],
         "binding_mismatches": [],
         "errors": [],
@@ -2142,10 +2179,6 @@ def _normalized_generator_delivery(
         evidence["errors"].append(
             "normalized_and_declared_target_mesh_sets_differ"
         )
-    if normalized_mesh_ids != live_mesh_ids:
-        evidence["errors"].append(
-            "normalized_and_live_target_mesh_sets_differ"
-        )
     missing_assets = sorted(
         set(normalized_mesh_ids).difference(live_asset_mesh_ids)
     )
@@ -2181,6 +2214,54 @@ def _normalized_generator_delivery(
                 ),
                 "declared_count": len(declared_rows),
             })
+
+    planned_inactive_slots = set()
+    for declared_slot, declared_rows in declared_by_slot.items():
+        current_rows = live_by_slot.get(declared_slot) or []
+        if len(declared_rows) != 1 or len(current_rows) != 1:
+            continue
+        declared = declared_rows[0]
+        current = current_rows[0]
+        target_material_id = _positive_asset_id(
+            declared.get("target_material_id")
+        )
+        target_mesh_id = _positive_asset_id(
+            declared.get("target_mesh_id")
+        )
+        current_material_id = _positive_asset_id(current.get("material_id"))
+        current_mesh_id = _positive_asset_id(current.get("mesh_id"))
+        if (
+            _inactive_causal_path_evidence(current)
+            and target_material_id == expected_material_id
+            and current_material_id == target_material_id
+            and target_mesh_id in set(normalized_mesh_ids)
+            and target_mesh_id in set(live_asset_mesh_ids)
+            and current_mesh_id == target_mesh_id
+        ):
+            planned_inactive_slots.add(declared_slot)
+
+    required_bindings = [
+        row for row in bindings
+        if tuple(slot_identity(row)) not in planned_inactive_slots
+    ]
+    current_required_mesh_ids = sorted({
+        _positive_asset_id(row.get("target_mesh_id"))
+        for row in required_bindings
+        if _positive_asset_id(row.get("target_mesh_id")) is not None
+    })
+    evidence["active_required_binding_count"] = len(required_bindings)
+    evidence["planned_inactive_binding_count"] = (
+        len(bindings) - len(required_bindings)
+    )
+    evidence["current_required_target_mesh_ids"] = (
+        current_required_mesh_ids
+    )
+    if current_required_mesh_ids != live_mesh_ids:
+        # Preserve the stable token while publishing the narrowed current
+        # requirement set that was actually compared.
+        evidence["errors"].append(
+            "normalized_and_live_target_mesh_sets_differ"
+        )
     declared_live_bindings = []
     for declared_slot in declared_by_slot:
         declared_live_bindings.extend(
@@ -2193,9 +2274,14 @@ def _normalized_generator_delivery(
         dict(row) for row in declared_live_bindings
         if not export_participates(row)
     ]
+    evidence["inactive_causal_bindings"] = [
+        dict(row) for row in declared_live_bindings
+        if tuple(slot_identity(row)) in planned_inactive_slots
+    ]
 
     for declared in bindings:
         errors = []
+        outcome_reason = None
         target_material_id = _positive_asset_id(
             declared.get("target_material_id")
         )
@@ -2229,7 +2315,9 @@ def _normalized_generator_delivery(
                 # Fail closed either way, but never report a correct Generator
                 # connection as disconnected: a zero node count read out of a
                 # stale <Node> table is missing evidence, not proof.
-                if _stale_node_table_evidence(current):
+                if declared_slot in planned_inactive_slots:
+                    outcome_reason = INACTIVE_CAUSAL_PATH_REASON
+                elif _stale_node_table_evidence(current):
                     errors.append(
                         "generator_export_evidence_stale_node_table"
                     )
@@ -2242,7 +2330,14 @@ def _normalized_generator_delivery(
             "current": dict(current) if current is not None else None,
             "errors": errors,
             "complete": not errors,
+            "status": (
+                "planned_inactive"
+                if outcome_reason and not errors
+                else "completed" if not errors else "failed"
+            ),
+            "reason": outcome_reason,
         }
+        evidence["binding_outcomes"].append(verified)
         if errors:
             evidence["binding_mismatches"].append(verified)
         if "visible_generator_slot_missing" in errors:
