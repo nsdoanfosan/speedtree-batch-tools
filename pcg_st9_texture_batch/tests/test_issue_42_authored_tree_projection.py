@@ -274,6 +274,22 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             "<TexSizeX>0.10000000149011612</TexSizeX>",
             1,
         )
+        comment_a = self.before.replace(
+            "<UnknownRoot>",
+            "<!--authored-one--><UnknownRoot>",
+            1,
+        )
+        comment_b = comment_a.replace("authored-one", "authored-two", 1)
+        processing_instruction_a = self.before.replace(
+            "<UnknownRoot>",
+            "<?future authored-one?><UnknownRoot>",
+            1,
+        )
+        processing_instruction_b = processing_instruction_a.replace(
+            "authored-one",
+            "authored-two",
+            1,
+        )
         for name, left, right in (
             ("GUID-like authored tag", authored_guid_a, authored_guid_b),
             ("authored float", authored_float_a, authored_float_b),
@@ -288,6 +304,12 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 "nested material texture size",
                 nested_texture_size_a,
                 nested_texture_size_b,
+            ),
+            ("XML comment", comment_a, comment_b),
+            (
+                "processing instruction",
+                processing_instruction_a,
+                processing_instruction_b,
             ),
         ):
             with self.subTest(name=name):

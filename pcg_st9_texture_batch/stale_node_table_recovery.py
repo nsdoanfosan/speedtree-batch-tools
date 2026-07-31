@@ -829,16 +829,32 @@ _AUTHORING_GRAPH_V4_SPLINE_NUMBER_TAGS = frozenset({
 })
 
 
+def _v4_tag_name(tag):
+    if tag is ET.Comment:
+        return "{xml-special}comment"
+    if tag is ET.ProcessingInstruction:
+        return "{xml-special}processing-instruction"
+    return str(tag)
+
+
+def _v4_parse(text):
+    parser = ET.XMLParser(target=ET.TreeBuilder(
+        insert_comments=True,
+        insert_pis=True,
+    ))
+    return ET.fromstring(text, parser=parser)
+
+
 def _v4_plain_tag(element, expected):
     """Match a namespace-free SpeedTree tag without collapsing namespaces."""
-    tag = str(element.tag)
+    tag = _v4_tag_name(element.tag)
     return "}" not in tag and tag.casefold() == str(expected).casefold()
 
 
 def _v4_path_key(path):
     keys = []
     for tag in path:
-        tag = str(tag)
+        tag = _v4_tag_name(tag)
         if "}" in tag:
             return None
         keys.append(tag.casefold())
@@ -847,7 +863,7 @@ def _v4_path_key(path):
 
 def _v4_namespace_free_subtree(element):
     return all(
-        "}" not in str(descendant.tag)
+        "}" not in _v4_tag_name(descendant.tag)
         and all("}" not in str(name) for name in descendant.attrib)
         for descendant in element.iter()
     )
@@ -910,7 +926,8 @@ def _v4_generated_atlas_mesh_user_data(element):
 
 def _v4_child_is_excluded(parent_path, child):
     parent_key = _v4_path_key(parent_path)
-    child_key = str(child.tag).casefold() if "}" not in str(child.tag) else None
+    child_tag = _v4_tag_name(child.tag)
+    child_key = child_tag.casefold() if "}" not in child_tag else None
     if parent_key == ("speedtree",):
         return child_key in _AUTHORING_GRAPH_V4_EXCLUDED_ROOT_TAGS
     if parent_key == ("speedtree", "generators", "generator", "properties"):
@@ -987,11 +1004,12 @@ def _v4_ordered_children(element, path):
 
 
 def _v4_projected_subtree(element, path=(), *, truthy_value=False):
-    path = tuple(path) + (str(element.tag),)
+    element_tag = _v4_tag_name(element.tag)
+    path = tuple(path) + (element_tag,)
     path_key = _v4_path_key(path)
     tag_key = (
-        str(element.tag).casefold()
-        if "}" not in str(element.tag)
+        element_tag.casefold()
+        if "}" not in element_tag
         else None
     )
     text = str(element.text or "").strip()
@@ -1062,7 +1080,7 @@ def _v4_projected_subtree(element, path=(), *, truthy_value=False):
     )
     child_truthy = property_name.casefold() == "random seeds:style"
     return {
-        "tag": str(element.tag),
+        "tag": element_tag,
         "attributes": sorted(attributes),
         "text": text,
         "children": [
@@ -1078,11 +1096,11 @@ def _v4_projected_subtree(element, path=(), *, truthy_value=False):
 
 def _authoring_graph_core_projection(text):
     """Project the full authored XML tree under fail-closed core-v4 rules."""
-    root = ET.fromstring(text)
+    root = _v4_parse(text)
     projected = _v4_projected_subtree(root)
     root_children = [
         child for child in root
-        if not _v4_child_is_excluded((str(root.tag),), child)
+        if not _v4_child_is_excluded((_v4_tag_name(root.tag),), child)
     ]
     generators = next(
         (child for child in root_children if _v4_plain_tag(child, "Generators")),
