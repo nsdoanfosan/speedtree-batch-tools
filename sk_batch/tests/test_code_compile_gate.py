@@ -13,12 +13,14 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 from code_compile_gate import (  # noqa: E402
     CompileGateError,
     GUI_PATH,
+    PUSH_JOB_PATH,
     PRODUCTION_SOURCE_MANIFEST_VERSION,
     compile_repository_sources,
     production_source_manifest,
     production_source_revision_state,
     run_gate,
     validate_gui_contracts,
+    validate_push_job_contracts,
     validate_production_source_revision_report,
 )
 
@@ -59,7 +61,7 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_current_repository_passes_without_importing_runtime_modules(self):
         result = run_gate(REPO_ROOT, GUI_PATH)
         self.assertGreater(result.source_count, 0)
-        self.assertEqual(result.contract_count, 3)
+        self.assertEqual(result.contract_count, 4)
         self.assertEqual(
             result.source_count,
             result.production_source_manifest.source_count,
@@ -223,10 +225,10 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_push_contract_values_must_be_consumed(self):
         source = gui_source()
         source = source.replace(
-            '                ok = bool(repair_contract["ready"])\n'
-            '                why = str(repair_contract["reason"])\n',
-            '                ok = False\n'
-            '                why = "ignored"\n',
+            '                    ok = bool(repair_contract["ready"])\n'
+            '                    why = str(repair_contract["reason"])\n',
+            '                    ok = False\n'
+            '                    why = "ignored"\n',
             1,
         )
         with self.assertRaisesRegex(
@@ -234,6 +236,31 @@ class CodeCompileGateTests(unittest.TestCase):
             "does not consume Repair ready/reason values",
         ):
             validate_gui_contracts(source)
+
+    def test_same_generation_evidence_validation_is_a_compile_contract(self):
+        module = ast.parse(gui_source())
+        changed = RenameMethodCall(
+            "_validate_repair_stage_contract",
+            "_validate_repair_stage_contract_disabled",
+        ).visit(module)
+        ast.fix_missing_locations(changed)
+        with self.assertRaisesRegex(
+            CompileGateError,
+            "does not validate same-generation evidence",
+        ):
+            validate_gui_contracts(ast.unparse(changed))
+
+    def test_push_worker_evidence_cli_is_static_compile_contract(self):
+        source = PUSH_JOB_PATH.read_text(encoding="utf-8").replace(
+            'parser.add_argument("--repair-evidence")',
+            'parser.add_argument("--repair-evidence-disabled")',
+            1,
+        )
+        with self.assertRaisesRegex(
+            CompileGateError,
+            "no --repair-evidence contract",
+        ):
+            validate_push_job_contracts(source)
 
     def test_runtime_asset_wave_compiler_regression_fails_at_compile_gate(self):
         source = gui_source().replace(

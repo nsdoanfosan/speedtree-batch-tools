@@ -115,6 +115,24 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
             "cluster_export_pending",
         )
 
+    def test_normalizer_publishes_final_export_postcondition(self):
+        postcondition = {
+            "kind": "sk_batch_export_object_postcondition",
+            "coverage": "exact_export_collection_all_objects",
+            "objects": [{"name": "SK_branch_elm_01_01"}],
+        }
+        finalized, changed = finalize_cluster_pipeline_payload(
+            pending_payload(),
+            export_issues=[],
+            export_postcondition=postcondition,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            finalized["repair_push_export_postcondition"],
+            postcondition,
+        )
+
     def test_existing_final_report_remains_backward_compatible(self):
         payload = {
             "handoff_preflight": {

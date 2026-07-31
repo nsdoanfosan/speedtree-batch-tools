@@ -22,6 +22,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUI_PATH = Path(__file__).resolve().with_name("sk_batch_gui.pyw")
+PUSH_JOB_PATH = (
+    Path(__file__).resolve().parent / "jobs" / "send2ue_push_job.py"
+)
 SOURCE_SUFFIXES = {".py", ".pyw"}
 IGNORED_DIRECTORY_NAMES = {
     ".git",
@@ -471,10 +474,16 @@ def _reads_mapping_key(node: ast.AST, variable: str, key: str) -> bool:
 def _require_repair_push_reuse(methods) -> None:
     required = {
         "_run_full_pipeline",
+        "_build_repair_stage_evidence",
+        "_repair_stage_evidence_if_active",
         "_publish_repair_stage_contract",
         "_repair_stage_contract",
+        "_validate_repair_stage_contract",
+        "_repair_evidence_path_for_push",
         "_job_blender",
         "_push_preflight",
+        "_export_manifest_item",
+        "_job_push",
     }
     missing = sorted(required.difference(methods))
     if missing:
@@ -525,6 +534,17 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair-to-Push reuse contract failed: Blender Repair does not "
             "publish its final result"
         )
+    if not _calls(
+        methods["_job_blender"],
+        "_repair_stage_evidence_if_active",
+    ) or not _calls(
+        methods["_repair_stage_evidence_if_active"],
+        "_build_repair_stage_evidence",
+    ):
+        raise CompileGateError(
+            "Repair-to-Push evidence contract failed: Blender Repair does not "
+            "capture the content-addressed evidence bundle"
+        )
     handoff_calls = _calls(methods["_job_blender"], "_handoff_ready")
     if not any(
         any(keyword.arg == "state_out" for keyword in call.keywords)
@@ -545,6 +565,11 @@ def _require_repair_push_reuse(methods) -> None:
         raise CompileGateError(
             "Repair-to-Push reuse contract failed: Push does not read the "
             "job-scoped Repair result"
+        )
+    if not _calls(push_preflight, "_validate_repair_stage_contract"):
+        raise CompileGateError(
+            "Repair-to-Push evidence contract failed: Push does not validate "
+            "same-generation evidence before reuse"
         )
     reuse_branch = None
     for node in ast.walk(push_preflight):
@@ -598,6 +623,22 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair status efficiency contract failed: the large Repair "
             "report must use the scoped JSON reader"
         )
+    for name in ("_export_manifest_item", "_job_push"):
+        method = methods[name]
+        strings = {
+            node.value
+            for node in ast.walk(method)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+        }
+        if (
+            "--repair-evidence" not in strings
+            or not _calls(method, "_repair_evidence_path_for_push")
+        ):
+            raise CompileGateError(
+                "Repair-to-Push evidence contract failed: "
+                f"{name} does not forward the verified bundle"
+            )
 
 
 def validate_gui_contracts(source: str, filename=str(GUI_PATH)) -> int:
@@ -623,13 +664,56 @@ def validate_gui_contracts(source: str, filename=str(GUI_PATH)) -> int:
     return 3
 
 
-def run_gate(repo_root=REPO_ROOT, gui_path=GUI_PATH) -> CompileGateResult:
+def validate_push_job_contracts(
+    source: str,
+    filename=str(PUSH_JOB_PATH),
+) -> int:
+    """Validate only the Push worker's static CLI/API evidence surface."""
+    try:
+        module = ast.parse(source, filename=filename)
+    except SyntaxError as exc:
+        raise CompileGateError(
+            f"Python compile failed: {filename}: {exc}"
+        ) from exc
+    parse_args = _function(module, "parse_args")
+    main = _function(module, "main")
+    strings = {
+        node.value
+        for node in ast.walk(parse_args)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+    }
+    if "--repair-evidence" not in strings:
+        raise CompileGateError(
+            "Push worker CLI has no --repair-evidence contract"
+        )
+    for function_name in (
+        "validate_repair_push_evidence_bundle",
+        "validate_export_object_postcondition",
+    ):
+        if not _calls(main, function_name):
+            raise CompileGateError(
+                "Push worker does not enforce evidence API: "
+                + function_name
+            )
+    return 1
+
+
+def run_gate(
+    repo_root=REPO_ROOT,
+    gui_path=GUI_PATH,
+    push_job_path=PUSH_JOB_PATH,
+) -> CompileGateResult:
     started = time.perf_counter()
     repo_root = Path(repo_root).resolve()
     manifest = _compile_repository_sources(repo_root)
     contract_count = validate_gui_contracts(
         _read_python_source(Path(gui_path)),
         filename=str(gui_path),
+    )
+    contract_count += validate_push_job_contracts(
+        _read_python_source(Path(push_job_path)),
+        filename=str(push_job_path),
     )
     validate_production_source_manifest(
         manifest,

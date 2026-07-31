@@ -20,6 +20,7 @@ from cluster_export_handoff_contract import (
     cluster_export_contract_issues as inspect_cluster_export_contract,
     finalize_cluster_pipeline_payload,
 )
+from sk_batch.repair_push_evidence import export_object_postcondition
 
 
 def parse_args():
@@ -84,6 +85,7 @@ def finalize_cluster_source_pipeline(recipe):
             payload,
             export_issues=issues,
             expected_source_object=recipe.get("source_object"),
+            export_postcondition=export_object_postcondition(bpy.data),
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc

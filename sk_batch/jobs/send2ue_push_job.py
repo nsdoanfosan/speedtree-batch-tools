@@ -71,6 +71,12 @@ from send2ue_manifest_contract import (
     primary_mesh_asset_path,
     validate_material_handoff_wrapper,
 )
+from repair_push_evidence import (
+    RepairPushEvidenceError,
+    stale_execution_freeze_message,
+    validate_export_object_postcondition,
+    validate_repair_push_evidence_bundle,
+)
 from speedtree_pipeline_contract import shared_contract_api
 from child_progress_contract import (
     SEND2UE_DISK_EXPORT_DONE_MARKER,
@@ -121,6 +127,7 @@ def parse_args():
     parser.add_argument("--report", required=True)
     parser.add_argument("--spm", required=True)
     parser.add_argument("--material-contract", required=True)
+    parser.add_argument("--repair-evidence")
     parser.add_argument("--ue-timeout", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-min", type=float, default=180.0)
     parser.add_argument("--rpc-timeout-max", type=float, default=900.0)
@@ -575,15 +582,58 @@ def main():
         }
         export_collection = bpy.data.collections.get("Export")
         export_objects = list(export_collection.all_objects) if export_collection else []
-        material_consolidation = consolidate_speedtree_group_materials(
-            export_objects,
-            texture_contract=texture_contract,
-        )
+        repair_evidence = None
+        if args.repair_evidence:
+            try:
+                repair_evidence = json.loads(
+                    Path(args.repair_evidence).read_text(encoding="utf-8")
+                )
+                validate_repair_push_evidence_bundle(
+                    repair_evidence,
+                    expected_queue_spm=spm_path,
+                )
+                validate_export_object_postcondition(
+                    repair_evidence.get("export_objects"),
+                    bpy.data,
+                )
+            except (
+                OSError,
+                ValueError,
+                RepairPushEvidenceError,
+            ) as exc:
+                raise RuntimeError(
+                    stale_execution_freeze_message(exc)
+                ) from exc
+            report["repair_evidence"] = {
+                "status": "verified",
+                "schema_version": repair_evidence.get("schema_version"),
+                "bundle_sha256": repair_evidence.get("bundle_sha256"),
+                "export_coverage": (
+                    repair_evidence.get("export_objects") or {}
+                ).get("coverage"),
+                "push_mutators_skipped": True,
+            }
+        if repair_evidence is None:
+            material_consolidation = consolidate_speedtree_group_materials(
+                export_objects,
+                texture_contract=texture_contract,
+            )
+            texture_normalization = normalize_speedtree_material_textures(
+                export_objects,
+                texture_contract=texture_contract,
+            )
+        else:
+            material_consolidation = {
+                "status": "verified_repair_postcondition",
+                "changed_count": 0,
+            }
+            texture_normalization = {
+                "status": "ok",
+                "missing": [],
+                "changed_count": 0,
+                "evidence": "exact_repair_export_postcondition",
+            }
         report["material_consolidation"] = material_consolidation
-        texture_normalization = normalize_speedtree_material_textures(
-            export_objects,
-            texture_contract=texture_contract,
-        )
         report["texture_normalization"] = texture_normalization
         export_meshes = [
             obj for obj in (export_collection.all_objects if export_collection else [])
@@ -605,15 +655,35 @@ def main():
             f"orphan_owned_export_empty:{name}"
             for name in orphan_owned_export_empties
         )
-        removed_empty_slots = remove_unused_empty_material_slots(
-            export_objects
+        removed_empty_slots = (
+            remove_unused_empty_material_slots(export_objects)
+            if repair_evidence is None
+            else []
         )
         report["removed_unused_empty_material_slots"] = removed_empty_slots
         empty_material_slots = export_material_slot_issues(export_objects)
-        vertex_payload_contracts = [
-            pack_speedtree_vertex_payload(obj, mirror_to_nanite_uv=True)
-            for obj in export_meshes
-        ]
+        vertex_payload_contracts = (
+            [
+                pack_speedtree_vertex_payload(
+                    obj,
+                    mirror_to_nanite_uv=True,
+                )
+                for obj in export_meshes
+            ]
+            if repair_evidence is None
+            else [
+                {
+                    "object": row.get("name"),
+                    "status": "ok",
+                    "changed": False,
+                    "evidence": "exact_repair_export_postcondition",
+                }
+                for row in (
+                    repair_evidence.get("export_objects") or {}
+                ).get("objects") or ()
+                if row.get("type") == "MESH"
+            ]
+        )
         blocked_vertex_payloads = [
             item for item in vertex_payload_contracts if item.get("status") == "blocked"
         ]

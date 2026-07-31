@@ -33,6 +33,7 @@ from vertex_color_contract import (
     inspect_object_vertex_colors,
     pack_speedtree_vertex_payload,
 )
+from repair_push_evidence import export_object_postcondition
 from spm_leaf_handoff_contract import (
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
@@ -1097,6 +1098,10 @@ def main():
                 ]
             if assembly_manifest is not None:
                 pipeline_data["cluster_assembly_manifest"] = assembly_manifest
+            if preflight["status"] in {"ok", "source_review"}:
+                pipeline_data["repair_push_export_postcondition"] = (
+                    export_object_postcondition(bpy.data)
+                )
             write_report(pipeline_path, pipeline_data)
         if preflight["status"] == "blocked":
             reasons = []

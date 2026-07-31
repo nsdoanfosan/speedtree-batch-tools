@@ -2456,6 +2456,10 @@ class BlendLiveStatusTests(unittest.TestCase):
                                 "exists": True,
                                 "size": capture.stat().st_size,
                                 "mtime_ns": capture.stat().st_mtime_ns,
+                                "fingerprint": hashlib.blake2b(
+                                    capture.read_bytes(),
+                                    digest_size=16,
+                                ).hexdigest(),
                             }],
                         }],
                         "handoff": {"errors": [], "issues": []},
@@ -2498,6 +2502,28 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
 
         self.assertEqual(app._run_limited.call_count, 4)
+
+    def test_cluster_live_audit_memo_rejects_size_mtime_only_proof(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "capture.tga"
+            artifact.write_bytes(b"same-size-content")
+            stat = artifact.stat()
+            matches, errors = (
+                gui.App._cluster_receipt_live_artifacts_match({
+                    "texture_dependencies": [{
+                        "path": str(artifact),
+                        "exists": True,
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                    }],
+                })
+            )
+
+        self.assertFalse(matches)
+        self.assertTrue(any(
+            "content digest missing" in error for error in errors
+        ))
 
     def test_cluster_live_audit_retries_when_input_changes_mid_audit(self):
         gui = load_gui_module()

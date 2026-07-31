@@ -105,6 +105,7 @@ def finalize_cluster_pipeline_payload(
     *,
     export_issues,
     expected_source_object=None,
+    export_postcondition=None,
 ):
     """Promote a valid pending report only after final Export verification.
 
@@ -123,6 +124,15 @@ def finalize_cluster_pipeline_payload(
     handoff = result.get("handoff_preflight") or {}
     status = str(handoff.get("status") or "")
     if status in FINAL_HANDOFF_STATUSES or not status:
+        if (
+            export_postcondition is not None
+            and result.get("repair_push_export_postcondition")
+            != export_postcondition
+        ):
+            result["repair_push_export_postcondition"] = copy.deepcopy(
+                export_postcondition
+            )
+            return result, True
         return result, False
     if status != PENDING_HANDOFF_STATUS:
         raise ValueError(
@@ -155,6 +165,10 @@ def finalize_cluster_pipeline_payload(
     source_build["final_export_required"] = False
     source_build["final_export_verified"] = True
     result["cluster_source_build_contract"] = source_build
+    if export_postcondition is not None:
+        result["repair_push_export_postcondition"] = copy.deepcopy(
+            export_postcondition
+        )
     return result, True
 
 

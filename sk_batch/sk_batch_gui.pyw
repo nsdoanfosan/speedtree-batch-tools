@@ -147,6 +147,12 @@ from repair_runtime_contract import (
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
 )
+from repair_push_evidence import (
+    RepairPushEvidenceError,
+    build_repair_push_evidence_bundle,
+    stale_execution_freeze_message,
+    validate_repair_push_evidence_bundle,
+)
 from spm_audit import (
     cluster_root_logical_postcondition,
     current_bone_semantic_fingerprint,
@@ -3790,6 +3796,11 @@ class App:
                         for root, repair_contract in repair_contracts.items():
                             if not isinstance(repair_contract, dict):
                                 continue
+                            if repair_contract.get("ready") is True:
+                                self._validate_repair_stage_contract(
+                                    None,
+                                    repair_contract,
+                                )
                             dependency_contract = repair_contract.get(
                                 "push_dependency_contract"
                             )
@@ -3862,6 +3873,7 @@ class App:
                         )
             except (
                 PushDependencyError,
+                RepairPushEvidenceError,
                 OSError,
                 TypeError,
                 ValueError,
@@ -4855,6 +4867,37 @@ class App:
             state_out.update(copy.deepcopy(state))
         return bool(state["current"] and state["push_ready"]), state["reason"]
 
+    def _build_repair_stage_evidence(
+        self,
+        spm,
+        push_dependency_contract=None,
+    ):
+        """Capture immutable Repair inputs for this queue generation."""
+        report_path = repair_pipeline_report_path(spm)
+        pipeline = _read_repair_pipeline_json(report_path)
+        return build_repair_push_evidence_bundle(
+            queue_spm=spm,
+            speedtree_spm=speedtree_output_spm_for(spm),
+            blend=blend_path_for(spm),
+            repair_report=report_path,
+            pipeline=pipeline,
+            push_dependency_contract=push_dependency_contract,
+        )
+
+    def _repair_stage_evidence_if_active(
+        self,
+        spm,
+        push_dependency_contract=None,
+    ):
+        """Capture evidence only for a Repair -> Push pipeline generation."""
+        contracts = getattr(self, "_active_repair_stage_contracts", None)
+        if not isinstance(contracts, dict):
+            return None
+        return self._build_repair_stage_evidence(
+            spm,
+            push_dependency_contract,
+        )
+
     def _publish_repair_stage_contract(
         self,
         spm,
@@ -4863,6 +4906,7 @@ class App:
         reason,
         kind=None,
         push_dependency_contract=None,
+        evidence_bundle=None,
     ):
         """Publish ②'s final result for ③ in the same pipeline only."""
         contracts = getattr(self, "_active_repair_stage_contracts", None)
@@ -4877,6 +4921,8 @@ class App:
             value["push_dependency_contract"] = copy.deepcopy(
                 push_dependency_contract
             )
+        if isinstance(evidence_bundle, dict):
+            value["evidence_bundle"] = copy.deepcopy(evidence_bundle)
         key = _normalized_path(speedtree_output_spm_for(spm))
         with self.state_lock:
             contracts[key] = value
@@ -4890,6 +4936,28 @@ class App:
         with self.state_lock:
             value = contracts.get(key)
             return copy.deepcopy(value) if isinstance(value, dict) else None
+
+    @staticmethod
+    def _validate_repair_stage_contract(spm, repair_contract):
+        """Fail closed when same-generation evidence no longer matches."""
+        if not isinstance(repair_contract, dict):
+            raise RepairPushEvidenceError(
+                "same-generation Repair stage contract is malformed"
+            )
+        if repair_contract.get("ready") is not True:
+            return repair_contract
+        try:
+            validate_repair_push_evidence_bundle(
+                repair_contract.get("evidence_bundle"),
+                expected_queue_spm=(
+                    spm if spm is not None else None
+                ),
+            )
+        except RepairPushEvidenceError as exc:
+            raise RepairPushEvidenceError(
+                stale_execution_freeze_message(exc)
+            ) from exc
+        return repair_contract
 
     @staticmethod
     def _leaf_reference_ready(spm):
@@ -5731,7 +5799,6 @@ class App:
                         for key in (
                             "sha256",
                             "fingerprint",
-                            "exists",
                             "size",
                             "mtime_ns",
                         )
@@ -5813,6 +5880,15 @@ class App:
                     errors.append(f"mtime changed: {candidate}")
                     continue
                 expected_sha256 = record.get("sha256")
+                expected_fingerprint = record.get("fingerprint")
+                if not expected_sha256 and not (
+                    isinstance(expected_fingerprint, str)
+                    and expected_fingerprint
+                ):
+                    errors.append(
+                        f"content digest missing: {candidate}"
+                    )
+                    continue
                 if expected_sha256:
                     current_sha256 = _sha256_snapshot(candidate)["sha256"]
                     if (
@@ -5821,7 +5897,6 @@ class App:
                     ):
                         errors.append(f"sha256 changed: {candidate}")
                         continue
-                expected_fingerprint = record.get("fingerprint")
                 if isinstance(expected_fingerprint, str) and expected_fingerprint:
                     current_fingerprint = file_content_snapshot(
                         candidate
@@ -5901,13 +5976,12 @@ class App:
         *,
         live_artifact_paths=(),
     ):
-        """Hash the owner inputs while keeping stable large files O(1).
+        """Hash every owner input and live artifact by current file bytes.
 
-        SPM and JSON manifests use content hashes. Large Blender/FBX/texture
-        artifacts already covered by the live report use path/size/mtime
-        identities, matching the repository's other content-addressed cache
-        validators. Missing paths remain part of the key, so an artifact
-        appearing later invalidates the memo automatically.
+        Size and mtime remain diagnostics and negative-change hints only. They
+        never authorize a positive memo hit without a content digest.
+        Missing paths remain part of the key, so an artifact appearing later
+        invalidates the memo automatically.
         """
         spm = Path(spm).resolve()
         content_paths = self._cluster_receipt_discovery_input_paths(spm)
@@ -5928,26 +6002,15 @@ class App:
             except FileNotFoundError:
                 records.append({"path": key, "exists": False})
                 continue
-            if (
-                candidate in content_paths
-                or candidate.suffix.casefold() in {".spm", ".json"}
-            ):
-                snapshot = file_content_snapshot(candidate)
-                records.append({
-                    "path": key,
-                    "exists": True,
-                    **snapshot,
-                })
-            else:
-                records.append({
-                    "path": key,
-                    "exists": True,
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                })
+            snapshot = file_content_snapshot(candidate)
+            records.append({
+                "path": key,
+                "exists": True,
+                **snapshot,
+            })
 
         envelope = {
-            "version": 1,
+            "version": 2,
             "scope": self._cluster_receipt_refresh_scope(spm),
             "files": records,
         }
@@ -7045,6 +7108,33 @@ class App:
                         )
                         if relation_outputs_changed:
                             repair_state = self._repair_output_state(spm)
+                    stage_evidence = None
+                    if (
+                        repair_state["current"]
+                        and repair_state["push_ready"]
+                    ):
+                        try:
+                            stage_evidence = (
+                                self._repair_stage_evidence_if_active(
+                                    spm,
+                                    repair_state.get(
+                                        "push_dependency_contract"
+                                    ),
+                                )
+                            )
+                        except (
+                            OSError,
+                            TypeError,
+                            ValueError,
+                            RepairPushEvidenceError,
+                        ) as exc:
+                            repair_state["current"] = False
+                            self.log(
+                                "Current Repair output has no v2 stage "
+                                "evidence; rebuilding instead of falling "
+                                f"through to standalone Push: {spm.name} · "
+                                f"{compact_error_message(exc)}"
+                            )
                     if repair_state["current"]:
                         self._record_live_blend_status(
                             iid,
@@ -7064,6 +7154,7 @@ class App:
                             push_dependency_contract=repair_state.get(
                                 "push_dependency_contract"
                             ),
+                            evidence_bundle=stage_evidence,
                         )
                         self.log(f"건너뜀 (blend 최신{suffix}): {spm.name}")
                         return
@@ -7450,6 +7541,14 @@ class App:
             push_dependency_contract=handoff_state.get(
                 "push_dependency_contract"
             ),
+            evidence_bundle=(
+                self._repair_stage_evidence_if_active(
+                    spm,
+                    handoff_state.get("push_dependency_contract"),
+                )
+                if handoff_ok and not source_review
+                else None
+            ),
         )
         if not handoff_ok and not source_review:
             if cluster_source:
@@ -7562,12 +7661,23 @@ class App:
                 self.log(f"[준비 제외] {spm.name}: {why}")
                 continue
             repair_contract = self._repair_stage_contract(spm)
+            contract_failure_kind = None
             if repair_contract is None:
                 ok, why = self._handoff_ready(spm)
             else:
-                ok = bool(repair_contract["ready"])
-                why = str(repair_contract["reason"])
-                reused_repair_contracts += 1
+                try:
+                    self._validate_repair_stage_contract(
+                        spm,
+                        repair_contract,
+                    )
+                except RepairPushEvidenceError as exc:
+                    ok = False
+                    why = str(exc)
+                    contract_failure_kind = "stale_execution_freeze"
+                else:
+                    ok = bool(repair_contract["ready"])
+                    why = str(repair_contract["reason"])
+                    reused_repair_contracts += 1
             if ok:
                 ready.append(item)
             else:
@@ -7577,13 +7687,16 @@ class App:
                     "push_status",
                     status_text,
                     (
-                        "source_review"
-                        if (
-                            repair_contract is not None
-                            and repair_contract.get("kind")
-                            == "source_review"
+                        contract_failure_kind
+                        or (
+                            "source_review"
+                            if (
+                                repair_contract is not None
+                                and repair_contract.get("kind")
+                                == "source_review"
+                            )
+                            else "preflight_skip"
                         )
-                        else "preflight_skip"
                     ),
                     why,
                     persist=False,
@@ -7738,6 +7851,26 @@ class App:
         )
         return contract_path
 
+    def _repair_evidence_path_for_push(self, spm):
+        """Materialize validated same-generation evidence for Blender."""
+        repair_contract = self._repair_stage_contract(spm)
+        if repair_contract is None or repair_contract.get("ready") is not True:
+            return None
+        try:
+            self._validate_repair_stage_contract(spm, repair_contract)
+        except RepairPushEvidenceError as exc:
+            raise BatchItemError(
+                str(exc),
+                kind="stale_execution_freeze",
+            ) from exc
+        bundle = repair_contract["evidence_bundle"]
+        digest = str(bundle["bundle_sha256"])
+        destination = LOG_DIR / (
+            f"{Path(spm).stem}_repair_push_evidence_{digest[:16]}.json"
+        )
+        atomic_write_json(destination, bundle)
+        return destination
+
     def _current_push_status_text(self, iid, spm):
         """Show current receipt validity without hashing multi-GB blend files."""
         entry = self.state.get(iid, {})
@@ -7822,8 +7955,13 @@ class App:
     def _export_manifest_item(self, iid, spm, batch_stamp):
         spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
+        repair_evidence = self._repair_evidence_path_for_push(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
-        cached = self._cached_manifest_item(iid, source_fingerprint)
+        cached = (
+            None
+            if repair_evidence is not None
+            else self._cached_manifest_item(iid, source_fingerprint)
+        )
         import_report = LOG_DIR / f"{spm.stem}_unreal_{batch_stamp}.json"
         if cached is not None:
             cached = dict(cached)
@@ -7896,6 +8034,11 @@ class App:
             getattr(self, "_active_push_dependency_map", {}) or {}
         ).get(iid):
             cmd.append("--dependency-orchestrated")
+        if repair_evidence is not None:
+            cmd.extend([
+                "--repair-evidence",
+                str(repair_evidence),
+            ])
         wind_override = self._batch_job_item(iid).get(
             "wind_override", "auto"
         )
@@ -8410,8 +8553,12 @@ class App:
     def _job_push(self, iid, spm):
         spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
+        repair_evidence = self._repair_evidence_path_for_push(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
-        if not getattr(self, "force_rerun", False):
+        if (
+            repair_evidence is None
+            and not getattr(self, "force_rerun", False)
+        ):
             cached = self._cached_manifest_item(iid, source_fingerprint)
             if (
                 cached is not None
@@ -8462,6 +8609,11 @@ class App:
             getattr(self, "_active_push_dependency_map", {}) or {}
         ).get(iid):
             cmd.append("--dependency-orchestrated")
+        if repair_evidence is not None:
+            cmd.extend([
+                "--repair-evidence",
+                str(repair_evidence),
+            ])
         cmd.extend(send2ue_rpc_cli_args(self.cfg.get("unreal_project")))
         wind_override = self._batch_job_item(iid).get(
             "wind_override", "auto"
