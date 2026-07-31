@@ -19,6 +19,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from shared_job_queue import InterprocessMutex, QueueError
+
 
 REPO_DIR = Path(__file__).resolve().parent
 ERROR_LOG = Path(
@@ -92,14 +94,18 @@ def record_error(label, text):
         encoded = entry.encode("utf-8")
     try:
         with _ERROR_LOG_LOCK:
-            ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
-            _rotate_error_log_if_needed(len(encoded))
-            with ERROR_LOG.open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                handle.write(entry)
+            # Rotation decisions and the append must observe one process-wide
+            # critical section.  Otherwise two simultaneous pythonw failures
+            # can both rotate the same active file or append past the bound.
+            with InterprocessMutex(ERROR_LOG, timeout=10.0).acquire():
+                ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _rotate_error_log_if_needed(len(encoded))
+                with ERROR_LOG.open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as handle:
+                    handle.write(entry)
         return True
-    except OSError:
+    except (OSError, QueueError):
         return False
 
 

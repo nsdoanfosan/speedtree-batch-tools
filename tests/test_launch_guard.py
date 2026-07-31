@@ -1,9 +1,11 @@
 """A pythonw GUI that dies during import must not look like a no-op launch."""
 import os
+import multiprocessing
 import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +43,57 @@ def load_guard_module():
         str(GUARD),
         run_name="_speedtree_batch_launch_guard_under_test",
     )
+
+
+def _record_error_process(
+    guard_path,
+    log_path,
+    max_bytes,
+    backup_count,
+    marker,
+    start,
+    output,
+    active_rotators,
+    max_active_rotators,
+):
+    module = runpy.run_path(
+        str(guard_path),
+        run_name=f"_launch_guard_process_{os.getpid()}",
+    )
+    globals_map = module["record_error"].__globals__
+    globals_map["ERROR_LOG"] = Path(log_path)
+    globals_map["ERROR_LOG_MAX_BYTES"] = int(max_bytes)
+    globals_map["ERROR_LOG_BACKUP_COUNT"] = int(backup_count)
+    original_rotate = globals_map["_rotate_error_log_if_needed"]
+
+    def observed_rotate(incoming_bytes):
+        with active_rotators.get_lock():
+            active_rotators.value += 1
+            current = active_rotators.value
+        with max_active_rotators.get_lock():
+            max_active_rotators.value = max(
+                max_active_rotators.value,
+                current,
+            )
+        try:
+            # Widen the exact old stat->rotate->append race window.  With the
+            # path mutex this probe is still entered by only one process.
+            time.sleep(0.08)
+            return original_rotate(incoming_bytes)
+        finally:
+            with active_rotators.get_lock():
+                active_rotators.value -= 1
+
+    globals_map["_rotate_error_log_if_needed"] = observed_rotate
+    start.wait(10)
+    try:
+        ok = module["record_error"](
+            marker,
+            f"marker={marker} " + ("x" * 120),
+        )
+        output.put({"marker": marker, "ok": ok})
+    except BaseException as exc:
+        output.put({"marker": marker, "ok": False, "error": repr(exc)})
 
 
 class LaunchGuardTests(unittest.TestCase):
@@ -110,6 +163,57 @@ class LaunchGuardTests(unittest.TestCase):
                 "failure-19",
                 log.read_text(encoding="utf-8", errors="replace"),
             )
+
+    def test_concurrent_launch_guards_rotate_without_loss_or_oversize(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "launch-errors.log"
+                max_bytes = 512
+                backup_count = 4
+                markers = [f"round-{iteration}-process-{index}" for index in range(8)]
+                start = context.Event()
+                output = context.Queue()
+                active_rotators = context.Value("i", 0)
+                max_active_rotators = context.Value("i", 0)
+                processes = [
+                    context.Process(
+                        target=_record_error_process,
+                        args=(
+                            str(GUARD),
+                            str(log),
+                            max_bytes,
+                            backup_count,
+                            marker,
+                            start,
+                            output,
+                            active_rotators,
+                            max_active_rotators,
+                        ),
+                    )
+                    for marker in markers
+                ]
+                for process in processes:
+                    process.start()
+                start.set()
+                for process in processes:
+                    process.join(15)
+                    self.assertEqual(process.exitcode, 0)
+                results = [output.get(timeout=2) for _ in processes]
+                self.assertTrue(all(item["ok"] for item in results), results)
+                self.assertEqual(max_active_rotators.value, 1)
+
+                retained = sorted(Path(tmp).glob("launch-errors.log*"))
+                self.assertLessEqual(len(retained), backup_count + 1)
+                self.assertTrue(
+                    all(path.stat().st_size <= max_bytes for path in retained)
+                )
+                combined = "\n".join(
+                    path.read_text(encoding="utf-8", errors="replace")
+                    for path in retained
+                )
+                for marker in markers:
+                    self.assertIn(marker, combined)
 
     def test_missing_target_is_reported_instead_of_silently_succeeding(self):
         result = run_guard(REPO_DIR / "no_such_gui.pyw")

@@ -4,7 +4,9 @@ import json
 import inspect
 import multiprocessing
 import os
+import socket
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -41,6 +43,123 @@ def _claim_and_exit(state_path, output):
     queue = SharedJobQueue(state_path, lease_seconds=0.2)
     job = queue.claim(f"dead-worker-{os.getpid()}")
     output.put((job["id"], job["lease"]["token"]))
+
+
+def _request_release_in_child(state_path, job_id, start, output):
+    queue = SharedJobQueue(
+        state_path,
+        force_release_min_age_seconds=0.01,
+    )
+    start.wait(10)
+    try:
+        record = queue.request_release(
+            job_id,
+            confirm_job_id=job_id,
+        )
+        output.put({
+            "ok": True,
+            "request_id": record["release_request"]["id"],
+            "requester_pid": os.getpid(),
+        })
+    except BaseException as exc:
+        output.put({"ok": False, "error": repr(exc)})
+
+
+def _lease_owner_ack_release(state_path, ready, stop_worker, output):
+    queue = SharedJobQueue(
+        state_path,
+        lease_seconds=0.4,
+        force_release_min_age_seconds=0.01,
+        max_terminal_jobs=3,
+    )
+    owner_id = f"owner-process-{os.getpid()}"
+    claimed = queue.claim(owner_id)
+    token = claimed["lease"]["token"]
+    worker_stopped = threading.Event()
+
+    def worker():
+        stop_worker.wait(10)
+        worker_stopped.set()
+
+    worker_thread = threading.Thread(target=worker)
+    worker_thread.start()
+    output.put({"phase": "claimed", "job_id": claimed["id"]})
+    ready.set()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            renewed = queue.heartbeat(
+                claimed["id"],
+                token,
+                owner_id=owner_id,
+            )
+        except BaseException as exc:
+            output.put({"phase": "error", "error": repr(exc)})
+            return
+        request = renewed.get("release_request")
+        if request and stop_worker.is_set():
+            worker_thread.join(5)
+            if not worker_stopped.is_set():
+                output.put({"phase": "error", "error": "worker_not_joined"})
+                return
+            acknowledged = queue.acknowledge_release(
+                claimed["id"],
+                token,
+                request_id=request["id"],
+                owner_id=owner_id,
+            )
+            try:
+                queue.complete(claimed["id"], token, owner_id=owner_id)
+            except LeaseConflict:
+                late_complete = "lease_conflict"
+            else:
+                late_complete = "unexpected_success"
+            output.put({
+                "phase": "acknowledged",
+                "record": acknowledged,
+                "late_complete": late_complete,
+            })
+            return
+        time.sleep(0.02)
+    output.put({"phase": "error", "error": "release_request_timeout"})
+
+
+def _lease_owner_exit_without_ack(state_path, ready, exit_owner, output):
+    queue = SharedJobQueue(
+        state_path,
+        lease_seconds=0.15,
+        force_release_min_age_seconds=0.01,
+        max_terminal_jobs=3,
+    )
+    claimed = queue.claim(f"owner-exit-{os.getpid()}")
+    output.put({"phase": "claimed", "job_id": claimed["id"]})
+    ready.set()
+    exit_owner.wait(10)
+
+
+def _lease_owner_complete_after_signal(
+    state_path,
+    ready,
+    finish,
+    output,
+    max_terminal_jobs,
+):
+    queue = SharedJobQueue(
+        state_path,
+        lease_seconds=10,
+        max_terminal_jobs=max_terminal_jobs,
+    )
+    owner_id = f"late-owner-{os.getpid()}"
+    claimed = queue.claim(owner_id)
+    output.put({"phase": "claimed", "job_id": claimed["id"]})
+    ready.set()
+    finish.wait(10)
+    completed = queue.complete(
+        claimed["id"],
+        claimed["lease"]["token"],
+        owner_id=owner_id,
+    )
+    output.put({"phase": "completed", "record": completed})
 
 
 class SharedJobQueueTests(unittest.TestCase):
@@ -229,7 +348,7 @@ class SharedJobQueueTests(unittest.TestCase):
         self.assertEqual(snapshot["next_sequence"], 42)
         self.assertLess(self.state_path.stat().st_size, 10_000)
 
-    def test_force_release_requires_age_exact_confirmation_and_live_owner(self):
+    def test_release_request_does_not_unblock_and_requires_owner_token_ack(self):
         clock_value = [100.0]
         queue = self.queue(
             lease_seconds=1000,
@@ -242,52 +361,259 @@ class SharedJobQueueTests(unittest.TestCase):
         claimed = queue.claim("worker", job_id=running["id"])
 
         clock_value[0] = 130.0
-        with self.assertRaises(ForceReleaseRejected):
-            queue.force_release(
+        with self.assertRaisesRegex(
+            ForceReleaseRejected,
+            "release_min_age_not_met",
+        ):
+            queue.request_release(
                 running["id"],
-                confirm_owner_stopped=running["id"],
+                confirm_job_id=running["id"],
             )
         clock_value[0] = 161.0
-        with self.assertRaises(ForceReleaseRejected):
-            queue.force_release(
+        with self.assertRaisesRegex(
+            ForceReleaseRejected,
+            "release_confirmation_mismatch",
+        ):
+            queue.request_release(
                 running["id"],
-                confirm_owner_stopped="wrong-job",
+                confirm_job_id="wrong-job",
             )
 
-        released = queue.force_release(
+        requested = queue.request_release(
             running["id"],
-            confirm_owner_stopped=running["id"],
+            confirm_job_id=running["id"],
         )
-        self.assertEqual(released["status"], "failed")
+        request_id = requested["release_request"]["id"]
+        self.assertEqual(requested["status"], "running")
+        self.assertEqual(requested["lease"]["token"], claimed["lease"]["token"])
+        self.assertNotIn(
+            "token",
+            requested["release_request"]["original_lease"],
+        )
+        self.assertEqual(
+            set(requested["release_request"]["requester"]),
+            {"pid", "hostname", "process_marker"},
+        )
+        self.assertNotIn("username", json.dumps(requested))
+        self.assertIsNone(queue.claim("next-worker", job_id=waiting["id"]))
+        with self.assertRaisesRegex(LeaseConflict, "lease_conflict"):
+            queue.acknowledge_release(
+                running["id"],
+                "wrong-token",
+                request_id=request_id,
+                owner_id="worker",
+            )
+
+        released = queue.acknowledge_release(
+            running["id"],
+            claimed["lease"]["token"],
+            request_id=request_id,
+            owner_id="worker",
+        )
         self.assertEqual(
             released["failure_reason"],
             "owner_released_by_operator",
         )
-        self.assertTrue(
-            released["operator_release"]["owner_worker_stopped_confirmed"]
-        )
-        self.assertNotIn("username", released["operator_release"])
+        self.assertNotIn("token", released["last_lease"])
+        self.assertEqual(released["release_ack"]["request_id"], request_id)
         with self.assertRaises(LeaseConflict):
             queue.complete(running["id"], claimed["lease"]["token"])
         claimed_next = queue.claim("next-worker", job_id=waiting["id"])
         self.assertEqual(claimed_next["id"], waiting["id"])
 
-    def test_force_release_rejects_an_owner_not_confirmed_alive(self):
+    def test_release_request_rejects_an_owner_not_confirmed_alive(self):
         clock_value = [0.0]
+        process_alive = [True]
         queue = self.queue(
             lease_seconds=1000,
             force_release_min_age_seconds=10,
             clock=lambda: clock_value[0],
-            process_alive=lambda _host, _pid, _marker: False,
+            process_alive=lambda _host, _pid, _marker: process_alive[0],
         )
         job = queue.enqueue("pcg-st9", {})
         queue.claim("worker", job_id=job["id"])
         clock_value[0] = 11.0
-        with self.assertRaises(ForceReleaseRejected):
-            queue.force_release(
+        process_alive[0] = False
+        with self.assertRaisesRegex(
+            ForceReleaseRejected,
+            "release_owner_not_confirmed_alive",
+        ):
+            queue.request_release(
                 job["id"],
-                confirm_owner_stopped=job["id"],
+                confirm_job_id=job["id"],
             )
+
+    def test_two_phase_release_process_race_is_fail_closed_and_audited(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration):
+                state_path = Path(self.temp_dir.name) / f"release-{iteration}.json"
+                queue = SharedJobQueue(
+                    state_path,
+                    lease_seconds=0.4,
+                    force_release_min_age_seconds=0.01,
+                    max_terminal_jobs=3,
+                )
+                running = queue.enqueue("pcg-st9", {"iteration": iteration})
+                ready = context.Event()
+                stop_worker = context.Event()
+                owner_output = context.Queue()
+                owner = context.Process(
+                    target=_lease_owner_ack_release,
+                    args=(str(state_path), ready, stop_worker, owner_output),
+                )
+                owner.start()
+                self.assertTrue(ready.wait(5))
+                self.assertEqual(owner_output.get(timeout=2)["phase"], "claimed")
+
+                for index in range(5):
+                    row = queue.enqueue("cancelled", {"index": index})
+                    queue.cancel(row["id"], reason="retention_pressure")
+                waiting = queue.enqueue("sk-batch", {"next": True})
+                time.sleep(0.03)
+
+                request_start = context.Event()
+                request_output = context.Queue()
+                requester = context.Process(
+                    target=_request_release_in_child,
+                    args=(str(state_path), running["id"], request_start, request_output),
+                )
+                requester.start()
+                request_start.set()
+                request_result = request_output.get(timeout=5)
+                requester.join(10)
+                self.assertEqual(requester.exitcode, 0)
+                self.assertTrue(request_result["ok"], request_result)
+
+                requested = queue.get(running["id"])
+                self.assertEqual(requested["status"], "running")
+                self.assertEqual(
+                    requested["release_request"]["id"],
+                    request_result["request_id"],
+                )
+                self.assertEqual(
+                    requested["release_request"]["requester"]["pid"],
+                    request_result["requester_pid"],
+                )
+                self.assertIsNone(
+                    queue.claim("must-stay-blocked", job_id=waiting["id"])
+                )
+                with self.assertRaises(LeaseConflict):
+                    queue.acknowledge_release(
+                        running["id"],
+                        "not-owner-token",
+                        request_id=request_result["request_id"],
+                    )
+
+                stop_worker.set()
+                owner.join(10)
+                self.assertEqual(owner.exitcode, 0)
+                owner_result = owner_output.get(timeout=2)
+                self.assertEqual(owner_result["phase"], "acknowledged")
+                self.assertEqual(owner_result["late_complete"], "lease_conflict")
+                released = owner_result["record"]
+                self.assertEqual(
+                    released["failure_reason"],
+                    "owner_released_by_operator",
+                )
+                self.assertEqual(
+                    released["release_ack"]["request_id"],
+                    request_result["request_id"],
+                )
+                self.assertNotIn("token", released["last_lease"])
+                self.assertIn("requester", released["release_request"])
+                self.assertIn("acknowledger", released["release_ack"])
+                snapshot = queue.snapshot()
+                retained = {job["id"] for job in snapshot["jobs"]}
+                self.assertIn(running["id"], retained)
+                claimed_next = queue.claim("next-owner", job_id=waiting["id"])
+                self.assertEqual(claimed_next["id"], waiting["id"])
+
+    def test_release_request_owner_exit_uses_owner_lost_without_ack(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration):
+                state_path = Path(self.temp_dir.name) / f"owner-lost-{iteration}.json"
+                queue = SharedJobQueue(
+                    state_path,
+                    lease_seconds=0.15,
+                    force_release_min_age_seconds=0.01,
+                    max_terminal_jobs=3,
+                )
+                running = queue.enqueue("pcg-st9", {})
+                ready = context.Event()
+                exit_owner = context.Event()
+                owner_output = context.Queue()
+                owner = context.Process(
+                    target=_lease_owner_exit_without_ack,
+                    args=(str(state_path), ready, exit_owner, owner_output),
+                )
+                owner.start()
+                self.assertTrue(ready.wait(5))
+                self.assertEqual(owner_output.get(timeout=2)["phase"], "claimed")
+                for index in range(5):
+                    row = queue.enqueue("cancelled", {"index": index})
+                    queue.cancel(row["id"], reason="retention_pressure")
+                waiting = queue.enqueue("next", {})
+                time.sleep(0.03)
+                requested = queue.request_release(
+                    running["id"],
+                    confirm_job_id=running["id"],
+                )
+                request_id = requested["release_request"]["id"]
+                exit_owner.set()
+                owner.join(10)
+                self.assertEqual(owner.exitcode, 0)
+                time.sleep(0.2)
+
+                claimed_next = queue.claim("replacement", job_id=waiting["id"])
+                failed = queue.get(running["id"])
+                self.assertEqual(failed["failure_reason"], "owner_lost")
+                self.assertEqual(failed["release_request"]["id"], request_id)
+                self.assertNotIn("release_ack", failed)
+                self.assertIn("last_expired_lease", failed)
+                self.assertNotIn("token", failed["last_expired_lease"])
+                self.assertEqual(claimed_next["id"], waiting["id"])
+
+    def test_late_finishing_old_sequence_is_retained_by_terminal_time(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration):
+                state_path = Path(self.temp_dir.name) / f"terminal-{iteration}.json"
+                queue = SharedJobQueue(state_path, max_terminal_jobs=3)
+                first = queue.enqueue("long-running", {})
+                ready = context.Event()
+                finish = context.Event()
+                output = context.Queue()
+                owner = context.Process(
+                    target=_lease_owner_complete_after_signal,
+                    args=(str(state_path), ready, finish, output, 3),
+                )
+                owner.start()
+                self.assertTrue(ready.wait(5))
+                self.assertEqual(output.get(timeout=2)["phase"], "claimed")
+                cancelled = []
+                for index in range(5):
+                    row = queue.enqueue("cancelled", {"index": index})
+                    queue.cancel(row["id"], reason="retention_pressure")
+                    cancelled.append(row["id"])
+                    time.sleep(0.01)
+                finish.set()
+                owner.join(10)
+                self.assertEqual(owner.exitcode, 0)
+                self.assertEqual(output.get(timeout=2)["phase"], "completed")
+
+                snapshot = queue.snapshot()
+                terminal = [
+                    job for job in snapshot["jobs"]
+                    if job["status"] in shared_job_queue.TERMINAL_STATUSES
+                ]
+                retained = {job["id"] for job in terminal}
+                self.assertEqual(len(terminal), 3)
+                self.assertIn(first["id"], retained)
+                self.assertNotIn(cancelled[0], retained)
+                completed = next(job for job in terminal if job["id"] == first["id"])
+                self.assertEqual(completed["terminal_at"], completed["finished_at"])
 
     def test_windows_liveness_api_is_bound_once_at_module_load(self):
         source = inspect.getsource(shared_job_queue)
@@ -300,6 +626,52 @@ class SharedJobQueueTests(unittest.TestCase):
             "WinDLL",
             inspect.getsource(shared_job_queue._process_marker),
         )
+
+    def test_pid_reuse_marker_mismatch_is_not_treated_as_same_process(self):
+        with mock.patch(
+            "shared_job_queue._process_marker",
+            return_value="actual-process-marker",
+        ):
+            self.assertFalse(
+                shared_job_queue._local_process_alive(
+                    socket.gethostname(),
+                    os.getpid(),
+                    "stale-process-marker",
+                )
+            )
+
+    def test_remote_process_liveness_is_unknown_and_stale_lease_stays_owned(self):
+        self.assertIsNone(
+            shared_job_queue._local_process_alive(
+                "definitely-remote-host",
+                12345,
+                "remote-marker",
+            )
+        )
+        clock_value = [0.0]
+        queue = self.queue(
+            lease_seconds=5,
+            clock=lambda: clock_value[0],
+            process_alive=lambda _host, _pid, _marker: None,
+        )
+        running = queue.enqueue("remote-owner", {})
+        waiting = queue.enqueue("waiting", {})
+        claimed = queue.claim("remote-owner", job_id=running["id"])
+        clock_value[0] = 10.0
+
+        poll = queue.poll_for_turn(
+            "waiting-owner",
+            job_id=waiting["id"],
+            accepted_apps={"waiting"},
+        )
+        current = next(
+            job for job in poll["snapshot"]["jobs"]
+            if job["id"] == running["id"]
+        )
+        self.assertFalse(poll["claimed"])
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["lease"]["token"], claimed["lease"]["token"])
+        self.assertNotIn("failure_reason", current)
 
     def test_operator_status_omits_payloads_and_machine_paths(self):
         queue = self.queue()
@@ -426,6 +798,57 @@ class SharedJobQueueTests(unittest.TestCase):
         self.assertIsNone(failed["lease"])
         self.assertEqual(claimed_next["id"], next_job["id"])
         self.assertNotEqual(claimed_next["lease"]["token"], dead_token)
+
+    def test_poll_transaction_recovers_running_cleans_dead_head_and_claims(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration):
+                state_path = Path(self.temp_dir.name) / f"poll-all-{iteration}.json"
+                queue = SharedJobQueue(state_path, lease_seconds=0.2)
+                expired = queue.enqueue("expired-running", {})
+                owner_output = context.Queue()
+                owner = context.Process(
+                    target=_claim_and_exit,
+                    args=(str(state_path), owner_output),
+                )
+                owner.start()
+                self.assertEqual(owner_output.get(timeout=5)[0], expired["id"])
+                owner.join(10)
+                self.assertEqual(owner.exitcode, 0)
+
+                dead_output = context.Queue()
+                dead_origin = context.Process(
+                    target=_enqueue_in_child,
+                    args=(str(state_path), iteration, dead_output),
+                )
+                dead_origin.start()
+                dead_head_id = dead_output.get(timeout=5)
+                dead_origin.join(10)
+                self.assertEqual(dead_origin.exitcode, 0)
+                live = queue.enqueue("live", {"iteration": iteration})
+                revision_before = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )["revision"]
+
+                time.sleep(0.3)
+                poll = queue.poll_for_turn(
+                    "live-owner",
+                    job_id=live["id"],
+                    accepted_apps={"live"},
+                )
+
+                self.assertTrue(poll["claimed"])
+                rows = {job["id"]: job for job in poll["snapshot"]["jobs"]}
+                self.assertEqual(rows[expired["id"]]["failure_reason"], "owner_lost")
+                self.assertEqual(
+                    rows[dead_head_id]["abandon_reason"],
+                    "origin_process_exited",
+                )
+                self.assertEqual(rows[live["id"]]["status"], "running")
+                revision_after = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )["revision"]
+                self.assertEqual(revision_after, revision_before + 1)
 
     def test_dead_origin_queued_head_is_abandoned_and_fifo_continues(self):
         context = multiprocessing.get_context("spawn")

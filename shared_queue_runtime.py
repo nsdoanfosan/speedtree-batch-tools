@@ -92,6 +92,13 @@ class SharedQueueLease:
     def heartbeat_error(self) -> Optional[BaseException]:
         return self._heartbeat_error
 
+    @property
+    def release_request(self) -> Optional[Dict[str, Any]]:
+        """Return the operator request most recently observed by heartbeat."""
+
+        request = self.record.get("release_request")
+        return None if not isinstance(request, dict) else copy.deepcopy(request)
+
     def finish(
         self,
         success: bool = True,
@@ -119,6 +126,41 @@ class SharedQueueLease:
             self.record = copy.deepcopy(completed)
             self._runtime._lease_finished(self)
             return copy.deepcopy(completed)
+
+    def acknowledge_release(self, request_id: str) -> Dict[str, Any]:
+        """Acknowledge after the caller has stopped and joined its worker.
+
+        This method first stops and joins the heartbeat thread.  It never
+        attempts the terminal transition while that owner-side activity is
+        still live, and the backend still verifies the current lease token.
+        """
+
+        with self._finish_lock:
+            if self._finished_record is not None:
+                ack = self._finished_record.get("release_ack")
+                if isinstance(ack, dict) and ack.get("request_id") == request_id:
+                    return copy.deepcopy(self._finished_record)
+                raise LeaseConflict(
+                    "lease_conflict: job already finished without this "
+                    "release acknowledgement"
+                )
+            self._stop_event.set()
+            if threading.current_thread() is not self._thread:
+                self._thread.join(
+                    timeout=max(1.0, self._heartbeat_interval * 2)
+                )
+            if self._thread.is_alive():
+                raise RuntimeErrorBase("release_ack_heartbeat_not_joined")
+            released = self._runtime.queue.acknowledge_release(
+                self.job_id,
+                self.token,
+                request_id=request_id,
+                owner_id=self._runtime.owner_id,
+            )
+            self._finished_record = copy.deepcopy(released)
+            self.record = copy.deepcopy(released)
+            self._runtime._lease_finished(self)
+            return copy.deepcopy(released)
 
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.wait(self._heartbeat_interval):
@@ -244,10 +286,37 @@ class SharedQueueRuntime:
                     self._cancel_waiting_ticket(job_id, "wait_cancelled")
                     raise WaitCancelled(f"wait cancelled for job {job_id}")
 
-                # One snapshot answers own status, FIFO position, and whether
-                # a claim is worth attempting.  Only the transition tick does
-                # a second locked read so claim() can re-check atomically.
-                snapshot = self.queue.snapshot()
+                # Recovery, dead-head cleanup, exact-head claim, and the wait
+                # snapshot are one queue transaction.  Holding the runtime
+                # lock across a possible claim also prevents shutdown from
+                # missing a newly acquired lease.
+                with self._lock:
+                    if self._closed or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        self._cancel_waiting_ticket(job_id, "wait_cancelled")
+                        raise WaitCancelled(f"wait cancelled for job {job_id}")
+                    poll = self.queue.poll_for_turn(
+                        self.owner_id,
+                        job_id=job_id,
+                        accepted_apps={self.app_id},
+                    )
+                    snapshot = poll["snapshot"]
+                    if poll["claimed"]:
+                        claimed = next(
+                            job
+                            for job in snapshot["jobs"]
+                            if job["id"] == job_id
+                        )
+                        lease = SharedQueueLease(
+                            self,
+                            claimed,
+                            heartbeat_interval=self.heartbeat_interval,
+                        )
+                        self._pending.pop(job_id, None)
+                        self._active[job_id] = lease
+                        return lease
+
                 wait_status = self._wait_status(job_id, snapshot=snapshot)
                 state = next(
                     (
@@ -276,35 +345,6 @@ class SharedQueueRuntime:
                     raise RuntimeErrorBase(
                         f"job {job_id} became {state['status']} before claim"
                     )
-
-                fifo_head = wait_status["fifo_head"]
-                if fifo_head is not None and fifo_head["id"] == job_id:
-                    # Claim and local registration share the runtime lock so
-                    # shutdown cannot miss a just-acquired lease.
-                    with self._lock:
-                        if self._closed:
-                            self._cancel_waiting_ticket(
-                                job_id,
-                                "runtime_shutdown",
-                            )
-                            raise WaitCancelled(
-                                "runtime shut down while waiting for job "
-                                f"{job_id}"
-                            )
-                        claimed = self.queue.claim(
-                            self.owner_id,
-                            job_id=job_id,
-                            accepted_apps={self.app_id},
-                        )
-                        if claimed is not None:
-                            lease = SharedQueueLease(
-                                self,
-                                claimed,
-                                heartbeat_interval=self.heartbeat_interval,
-                            )
-                            self._pending.pop(job_id, None)
-                            self._active[job_id] = lease
-                            return lease
 
                 if on_wait is not None:
                     on_wait(wait_status)

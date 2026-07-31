@@ -1,8 +1,10 @@
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +28,69 @@ from sk_common import (
     scan_sk_spms,
     terminate_process_tree,
 )
+
+
+def _configure_state_process(state_path, recovery_log):
+    sk_common.STATE_PATH = Path(state_path)
+    sk_common.STATE_RECOVERY_LOG_PATH = Path(recovery_log)
+
+
+def _save_state_process(state_path, recovery_log, state, started, output):
+    _configure_state_process(state_path, recovery_log)
+    started.set()
+    try:
+        sk_common.save_state(state)
+        output.put({"ok": True})
+    except BaseException as exc:
+        output.put({"ok": False, "error": repr(exc)})
+
+
+def _load_state_pause_after_failed_read(
+    state_path,
+    recovery_log,
+    failed_read,
+    resume,
+    output,
+):
+    _configure_state_process(state_path, recovery_log)
+    original_loads = sk_common.json.loads
+
+    def controlled_loads(value):
+        try:
+            return original_loads(value)
+        except (UnicodeError, json.JSONDecodeError):
+            failed_read.set()
+            resume.wait(10)
+            raise
+
+    sk_common.json.loads = controlled_loads
+    try:
+        output.put({"ok": True, "state": sk_common.load_state()})
+    except BaseException as exc:
+        output.put({"ok": False, "error": repr(exc)})
+
+
+def _load_state_pause_after_prune(
+    state_path,
+    recovery_log,
+    pruned,
+    resume,
+    output,
+):
+    _configure_state_process(state_path, recovery_log)
+    original_prune = sk_common._prune_state_entries
+
+    def controlled_prune(state):
+        result = original_prune(state)
+        pruned.set()
+        resume.wait(10)
+        return result
+
+    sk_common._prune_state_entries = controlled_prune
+    try:
+        output.put({"ok": True, "state": sk_common.load_state()})
+    except BaseException as exc:
+        output.put({"ok": False, "error": repr(exc)})
 
 
 class SkCommonOptimizationTests(unittest.TestCase):
@@ -118,6 +183,7 @@ class SkCommonOptimizationTests(unittest.TestCase):
             self.assertEqual(len(quarantined), 1)
             self.assertEqual(quarantined[0].read_bytes(), original)
             notice = recovery_log.read_text(encoding="utf-8")
+            self.assertIn("state_unreadable_quarantined", notice)
             self.assertIn(quarantined[0].name, notice)
             self.assertNotIn(str(root), notice)
 
@@ -136,11 +202,139 @@ class SkCommonOptimizationTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "could not be quarantined",
+                    "state_quarantine_failed.*could not be quarantined",
                 ):
                     sk_common.load_state()
 
             self.assertEqual(state_path.read_bytes(), original)
+
+    def test_quarantine_does_not_move_concurrent_valid_replace(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "sk_batch_state.json"
+                recovery_log = root / "logs" / "state_recovery.log"
+                invalid = b'{"broken":'
+                state_path.write_bytes(invalid)
+                live = root / "tree" / f"SK_new_{iteration}.spm"
+                live.parent.mkdir(parents=True)
+                live.write_bytes(b"live")
+                replacement = {str(live): {"writer": iteration}}
+
+                failed_read = context.Event()
+                resume = context.Event()
+                loader_output = context.Queue()
+                loader = context.Process(
+                    target=_load_state_pause_after_failed_read,
+                    args=(
+                        str(state_path),
+                        str(recovery_log),
+                        failed_read,
+                        resume,
+                        loader_output,
+                    ),
+                )
+                loader.start()
+                self.assertTrue(failed_read.wait(5))
+
+                writer_started = context.Event()
+                writer_output = context.Queue()
+                writer = context.Process(
+                    target=_save_state_process,
+                    args=(
+                        str(state_path),
+                        str(recovery_log),
+                        replacement,
+                        writer_started,
+                        writer_output,
+                    ),
+                )
+                writer.start()
+                self.assertTrue(writer_started.wait(5))
+                time.sleep(0.1)
+                resume.set()
+                loader.join(10)
+                writer.join(10)
+                self.assertEqual(loader.exitcode, 0)
+                self.assertEqual(writer.exitcode, 0)
+                self.assertTrue(loader_output.get(timeout=2)["ok"])
+                self.assertTrue(writer_output.get(timeout=2)["ok"])
+
+                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(persisted, replacement)
+                quarantined = list(
+                    root.glob("sk_batch_state.unreadable-*.json")
+                )
+                self.assertTrue(quarantined)
+                self.assertTrue(
+                    all(path.read_bytes() == invalid for path in quarantined)
+                )
+
+    def test_load_time_prune_cannot_overwrite_concurrent_new_row(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "sk_batch_state.json"
+                recovery_log = root / "logs" / "state_recovery.log"
+                live = root / "tree" / f"SK_live_{iteration}.spm"
+                added = root / "tree" / f"SK_added_{iteration}.spm"
+                dead = root / "tree" / f"SK_dead_{iteration}.spm"
+                live.parent.mkdir(parents=True)
+                live.write_bytes(b"live")
+                added.write_bytes(b"added")
+                initial = {
+                    str(live): {"source": "initial"},
+                    str(dead): {"source": "dead"},
+                }
+                state_path.write_text(json.dumps(initial), encoding="utf-8")
+
+                pruned = context.Event()
+                resume = context.Event()
+                loader_output = context.Queue()
+                loader = context.Process(
+                    target=_load_state_pause_after_prune,
+                    args=(
+                        str(state_path),
+                        str(recovery_log),
+                        pruned,
+                        resume,
+                        loader_output,
+                    ),
+                )
+                loader.start()
+                self.assertTrue(pruned.wait(5))
+
+                writer_started = context.Event()
+                writer_output = context.Queue()
+                writer = context.Process(
+                    target=_save_state_process,
+                    args=(
+                        str(state_path),
+                        str(recovery_log),
+                        {str(added): {"source": "concurrent"}},
+                        writer_started,
+                        writer_output,
+                    ),
+                )
+                writer.start()
+                self.assertTrue(writer_started.wait(5))
+                time.sleep(0.1)
+                resume.set()
+                loader.join(10)
+                writer.join(10)
+                self.assertEqual(loader.exitcode, 0)
+                self.assertEqual(writer.exitcode, 0)
+                self.assertTrue(loader_output.get(timeout=2)["ok"])
+                self.assertTrue(writer_output.get(timeout=2)["ok"])
+
+                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    set(persisted),
+                    {str(live), str(added)},
+                )
+                self.assertNotIn(str(dead), persisted)
 
     def test_state_load_and_save_prune_dead_and_backup_spm_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
