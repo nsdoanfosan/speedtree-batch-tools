@@ -22,6 +22,7 @@ import itertools
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 from contextlib import contextmanager
@@ -38,6 +39,12 @@ from nanite_assembly_materials import (
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
 ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
+MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN = re.compile(
+    r"(?P<prefix>\bsidecar_sha256\s*=\s*)"
+    r"(?P<quote>['\"])(?P<sha256>[0-9a-fA-F]{64})(?P=quote)"
+)
+
+
 class ClusterAssemblyBuildError(RuntimeError):
     """Raised when a content or hierarchy invariant is not proven."""
 
@@ -4352,9 +4359,62 @@ def _generated_material_sidecar(template_data, generated_mesh_name, output_dir):
     temporary.write_text(encoded, encoding="utf-8")
     os.replace(temporary, target_path)
     return {
-        "source_path": str(source_path.resolve()),
+        "source": file_fingerprint(source_path),
         "generated": file_fingerprint(target_path),
     }
+
+
+def _rewrite_generated_material_sidecar_commands(
+    command_groups,
+    source_sidecar,
+    generated_sidecar,
+):
+    source_path = str(source_sidecar.get("path") or "")
+    generated_path = str(generated_sidecar.get("path") or "")
+    source_sha256 = str(source_sidecar.get("sha256") or "").casefold()
+    generated_sha256 = str(generated_sidecar.get("sha256") or "").casefold()
+    if (
+        not source_path
+        or not generated_path
+        or not source_sha256
+        or not generated_sha256
+    ):
+        raise ClusterAssemblyBuildError(
+            "generated Assembly material sidecar binding is incomplete"
+        )
+    source_variants = {source_path, source_path.replace("\\", "/")}
+    generated_text = generated_path.replace("\\", "/")
+
+    def replace_sha(match):
+        current = match.group("sha256").casefold()
+        if current != source_sha256:
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar command SHA does not match its current bytes"
+            )
+        quote = match.group("quote")
+        return match.group("prefix") + quote + generated_sha256 + quote
+
+    rewritten_groups = []
+    for commands in command_groups or []:
+        rewritten = []
+        for command in commands:
+            command_text = str(command)
+            for source in source_variants:
+                command_text = command_text.replace(source, generated_text)
+            if "sidecar_sha256" in command_text:
+                command_text, replacement_count = (
+                    MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN.subn(
+                        replace_sha,
+                        command_text,
+                    )
+                )
+                if replacement_count != 1:
+                    raise ClusterAssemblyBuildError(
+                        "material pipeline command must bind one literal sidecar SHA"
+                    )
+            rewritten.append(command_text)
+        rewritten_groups.append(rewritten)
+    return rewritten_groups
 
 
 def scope_material_pipeline_to_codex_tests(
@@ -4678,25 +4738,29 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
             asset_name,
             generated_output_dir,
         )
+        source_sidecar = sidecar["source"]
+        generated_sidecar = sidecar["generated"]
+        source_sha256 = str(source_sidecar.get("sha256") or "").casefold()
+        template_sha256 = str(
+            template_data.get("_material_pipeline_json_sha256") or ""
+        ).casefold()
+        if template_sha256 and template_sha256 != source_sha256:
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar SHA changed before Assembly ingest-plan build"
+            )
         data["_material_pipeline_json_path"] = sidecar["generated"]["path"]
-        data["_material_pipeline_json_fingerprint"] = sidecar["generated"]
+        data["_material_pipeline_json_sha256"] = generated_sidecar["sha256"]
+        data["_material_pipeline_json_fingerprint"] = generated_sidecar
         row["asset_id"] = asset_id
         for key in ("pre_import_commands", "post_import_commands"):
             row[key] = _rewrite_command_asset_path(
                 row.get(key), source_asset_path, asset_path
             )
-            for commands in row[key]:
-                for index, command in enumerate(commands):
-                    rewritten = str(command)
-                    for old_path in {
-                        sidecar["source_path"],
-                        sidecar["source_path"].replace("\\", "/"),
-                    }:
-                        rewritten = rewritten.replace(
-                            old_path,
-                            sidecar["generated"]["path"].replace("\\", "/"),
-                        )
-                    commands[index] = rewritten
+            row[key] = _rewrite_generated_material_sidecar_commands(
+                row[key],
+                source_sidecar,
+                generated_sidecar,
+            )
         return row
 
     base_contract = manifest.get("base") or {}
