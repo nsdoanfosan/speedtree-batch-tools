@@ -1014,6 +1014,83 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 result["after_sha256"],
             )
 
+    def test_backup_race_immediately_before_launch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            source_captures = 0
+            launches = []
+
+            def capture_then_corrupt_backup(path, expected):
+                nonlocal source_captures
+                snapshot = _capture_immutable_snapshot(path, expected)
+                source_captures += 1
+                if source_captures == 2:
+                    backup = next(root.glob("*.preimage.spm"))
+                    write_spm(
+                        backup,
+                        spm_text(stale=True, graph_property="tampered"),
+                    )
+                return snapshot
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    capture_fn=capture_then_corrupt_backup,
+                    launch_observer=lambda *_args: launches.append(True),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_backup_verification_failed",
+            )
+            self.assertFalse(launches)
+
+    def test_backup_race_immediately_before_continuation_blocks_claim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            guard_calls = 0
+            continuations = []
+
+            def mutate_on_continuation_guard():
+                nonlocal guard_calls
+                guard_calls += 1
+                if guard_calls == 2:
+                    backup = next(root.glob("*.preimage.spm"))
+                    write_spm(
+                        backup,
+                        spm_text(stale=True, graph_property="tampered"),
+                    )
+                return False
+
+            guards = {
+                "is_cancelled": mutate_on_continuation_guard,
+                "is_app_open": lambda: True,
+                "is_job_current": lambda: True,
+            }
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    retry=lambda continuation: continuations.append(
+                        continuation
+                    ),
+                    job_id="backup-race",
+                    generation=1,
+                    guards=guards,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "preimage_backup_verification_failed",
+            )
+            self.assertFalse(continuations)
+            self.assertFalse(list(root.glob("continuation.*.claim.json")))
+
     def test_real_v2_receipt_with_modeler_guid_dialect_reaudits_in_place(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

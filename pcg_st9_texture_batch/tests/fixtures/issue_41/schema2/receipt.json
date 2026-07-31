@@ -1,0 +1,11 @@
+{
+    "recovery_contract": "speedtree_stale_node_table_interactive_recovery_v2",
+    "schema_version": 2,
+    "kind": "speedtree_stale_node_table_preimage_receipt",
+    "source_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "asset_name": "model.spm",
+    "generator_membership": {"fingerprint": "05d90461707e1423d5aecddd6fc46189e640eb7b5d1ef5c4e04743604e579bb0", "count": 2, "version": 1, "contract": "speedtree_generator_membership_projection"},
+    "exact_preimage": {"size": 950, "backup_file": "model.33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12.preimage.spm", "spm_text_sha256": "33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12", "backup_raw_sha256": "33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12", "raw_sha256": "33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12"},
+    "required_target_bindings": {"expected_mesh_ids": [130], "binding_count": 1, "fingerprint": "235118711bc96411aaeb30ea2c6a2d83d99424f422bb8787e695e9ecf3b5574e", "version": 1, "contract": "speedtree_required_target_binding_projection"},
+    "authoring_graph_projection": {"fingerprint": "503419ec5cf22b8852685952389802da7e8593c3a913f9962bc072d393148493", "version": 1, "contract": "speedtree_spm_authoring_graph_projection"}
+}

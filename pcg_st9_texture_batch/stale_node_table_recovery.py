@@ -22,7 +22,9 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from speedtree_pipeline_contract import (
     SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
@@ -55,14 +57,7 @@ TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
 TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
 TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
-_RECEIPT_DIALECTS = {
-    # These tuples are immutable historical contracts.  Do not replace the
-    # literal versions with mutable "current" constants.
-    (2, 1, None, 1, 1, None): "schema2_graph1_target1",
-    (3, 1, 2, 1, 1, None): "schema3_graph1_core2_target1",
-    (4, 1, 3, 1, 2, None): "schema4_graph1_core3_target2",
-    (5, 1, 3, 1, 2, 1): "schema5_graph1_core3_target2_requirements1",
-}
+_CURRENT_RECEIPT_DIALECT_KEY = (5, 1, 3, 1, 2, 1)
 _KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5})
 _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
     # A real Lauraceae receipt uses this tuple, but the historical core-v1
@@ -731,8 +726,8 @@ def _authoring_graph_core_subtree(
     }
 
 
-def _authoring_graph_core_projection(text):
-    """Hash durable authored semantics across an ordinary Modeler Save.
+def _legacy_authoring_graph_core_v3_projection(text):
+    """Reproduce the sealed core-v3 projection without mutable dispatch.
 
     The projection retains stable global/settings subtrees, complete Generator,
     Force, RuleScript, Fan, and Light properties, Link endpoints, complete
@@ -789,7 +784,7 @@ def _authoring_graph_core_projection(text):
     }
     return {
         "contract": "speedtree_spm_authoring_graph_core_projection",
-        "version": AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+        "version": 3,
         "generator_count": len(generators),
         "link_count": len(links),
         "asset_identity_count": len(assets),
@@ -797,6 +792,11 @@ def _authoring_graph_core_projection(text):
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
     }
+
+
+def _authoring_graph_core_projection(text):
+    """Return the current authored-core projection (core-v3 in schema 5)."""
+    return _legacy_authoring_graph_core_v3_projection(text)
 
 
 def _legacy_authoring_graph_core_v2_subtree(
@@ -980,7 +980,8 @@ def _projected_target_binding(row, *, canonical_guid=True):
     }
 
 
-def _target_binding_projection(snapshot, expected_mesh_ids):
+def _target_binding_projection_v2(snapshot, expected_mesh_ids):
+    """Reproduce the sealed target-v2 projection and authoritative fields."""
     requested = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
     requested_set = set(requested)
     rows = []
@@ -1024,6 +1025,11 @@ def _target_binding_projection(snapshot, expected_mesh_ids):
     }
 
 
+def _target_binding_projection(snapshot, expected_mesh_ids):
+    """Return the current target-binding projection (target-v2)."""
+    return _target_binding_projection_v2(snapshot, expected_mesh_ids)
+
+
 def _legacy_target_binding_fingerprint(snapshot, expected_mesh_ids):
     snapshot = snapshot.get("delivery", snapshot)
     expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
@@ -1039,23 +1045,98 @@ def _legacy_target_binding_fingerprint(snapshot, expected_mesh_ids):
 
 def _legacy_target_binding_fingerprints(snapshot, expected_mesh_ids):
     """Accepted v1 fingerprints from both historical GUID/visibility dialects."""
+    return {
+        candidate["fingerprint"]
+        for candidate in _legacy_target_binding_v1_candidates(
+            snapshot,
+            expected_mesh_ids,
+        )
+    }
+
+
+def _legacy_target_binding_v1_candidates(snapshot, expected_mesh_ids):
+    """Return inseparable v1 fingerprint/count/list candidate payloads."""
     snapshot = snapshot.get("delivery", snapshot)
     expected = sorted({_mesh_id(value) for value in expected_mesh_ids} - {None})
     expected_set = set(expected)
-    fingerprints = {
-        _legacy_target_binding_fingerprint(snapshot, expected),
-        _target_binding_projection(snapshot, expected)["fingerprint"],
-    }
-    for canonical_guid in (False, True):
-        rows = [
-            _projected_target_binding(row, canonical_guid=canonical_guid)
-            for row in snapshot.get("leaf_generator_bindings") or []
-            if _mesh_id(row.get("mesh_id")) in expected_set
-            and row.get("graph_visible") is True
-        ]
-        rows.sort(key=_canonical_json_bytes)
-        fingerprints.add(_json_fingerprint(rows))
-    return fingerprints
+    candidates = []
+    seen = set()
+    for visibility in ("all", "graph_visible"):
+        for canonical_guid in (False, True):
+            rows = [
+                _projected_target_binding(row, canonical_guid=canonical_guid)
+                for row in snapshot.get("leaf_generator_bindings") or []
+                if _mesh_id(row.get("mesh_id")) in expected_set
+                and (
+                    visibility == "all"
+                    or row.get("graph_visible") is True
+                )
+            ]
+            rows.sort(key=_canonical_json_bytes)
+            candidate = {
+                "fingerprint": _json_fingerprint(rows),
+                "binding_count": len(rows),
+                "expected_mesh_ids": expected,
+            }
+            key = (
+                candidate["fingerprint"],
+                candidate["binding_count"],
+                tuple(candidate["expected_mesh_ids"]),
+            )
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+    return candidates
+
+
+def _generator_membership_projection_v1(snapshot, _expected_mesh_ids=()):
+    """Recompute membership-v1 independently from the exact backup text."""
+    evidence = _elementtree_node_evidence(snapshot["text"])
+    return [{
+        "fingerprint": evidence["generator_membership_fingerprint"],
+        "count": evidence["generator_count"],
+    }]
+
+
+def _authoring_graph_projection_v1_candidates(snapshot, _expected_mesh_ids=()):
+    return [{
+        "fingerprint": _authoring_graph_projection_v1(snapshot["text"]),
+    }]
+
+
+def _authoring_graph_core_v2_candidates(snapshot, _expected_mesh_ids=()):
+    projection = _legacy_authoring_graph_core_v2_projection(snapshot["text"])
+    return [{
+        key: value for key, value in projection.items()
+        if not key.startswith("_")
+    }]
+
+
+def _authoring_graph_core_v3_candidates(snapshot, _expected_mesh_ids=()):
+    projection = _legacy_authoring_graph_core_v3_projection(snapshot["text"])
+    return [{
+        key: value for key, value in projection.items()
+        if not key.startswith("_")
+    }]
+
+
+def _target_binding_v1_candidates(snapshot, expected_mesh_ids):
+    return _legacy_target_binding_v1_candidates(snapshot, expected_mesh_ids)
+
+
+def _target_binding_v2_candidates(snapshot, expected_mesh_ids):
+    projection = _target_binding_projection_v2(
+        snapshot.get("delivery", snapshot),
+        expected_mesh_ids,
+    )
+    return [{
+        "fingerprint": projection["fingerprint"],
+        "binding_count": projection["binding_count"],
+        "expected_mesh_ids": projection["expected_target_mesh_ids"],
+        "missing_requested_mesh_ids": projection[
+            "missing_requested_mesh_ids"
+        ],
+    }]
 
 
 class _FrozenAudit:
@@ -1563,16 +1644,35 @@ def _preimage_receipt(
     target_scopes,
     backup_name,
 ):
+    dialect = _RECEIPT_DIALECTS[_CURRENT_RECEIPT_DIALECT_KEY]
+    (
+        schema_version,
+        graph_version,
+        core_version,
+        membership_version,
+        target_version,
+        requirements_version,
+    ) = dialect.versions
     target = snapshot["target_projection"]
     authoring = list(target_scopes["authoring_mesh_ids"])
     required_live = list(target_scopes["required_live_mesh_ids"])
+    graph_payload = dialect.graph.candidate_projector(snapshot, authoring)[0]
+    core_payload = dialect.core.candidate_projector(snapshot, authoring)[0]
+    membership_payload = dialect.membership.candidate_projector(
+        snapshot,
+        authoring,
+    )[0]
+    target_payload = dialect.targets.candidate_projector(
+        snapshot,
+        authoring,
+    )[0]
     required_live_projection = _target_binding_projection(
         snapshot["delivery"],
         required_live,
     )
     return {
         "kind": PREIMAGE_RECEIPT_KIND,
-        "schema_version": 5,
+        "schema_version": schema_version,
         "recovery_contract": RECOVERY_CONTRACT,
         **snapshot["source_identity"],
         "exact_preimage": {
@@ -1584,8 +1684,8 @@ def _preimage_receipt(
         },
         "authoring_graph_projection": {
             "contract": "speedtree_spm_authoring_graph_projection",
-            "version": SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
-            "fingerprint": snapshot["authoring_graph_fingerprint"],
+            "version": graph_version,
+            "fingerprint": graph_payload["fingerprint"],
             "excluded": [
                 "generated Nodes table",
                 "Thumbnail",
@@ -1596,30 +1696,28 @@ def _preimage_receipt(
                 "m_sTimelineData",
             ],
         },
-        "authoring_graph_core_projection": {
-            key: value
-            for key, value in snapshot["authoring_graph_core"].items()
-            if not key.startswith("_")
-        },
+        "authoring_graph_core_projection": core_payload,
         "generator_membership": {
             "contract": "speedtree_generator_membership_projection",
-            "version": 1,
-            "count": snapshot["elementtree"]["generator_count"],
-            "fingerprint": snapshot["generator_membership_fingerprint"],
+            "version": membership_version,
+            "count": membership_payload["count"],
+            "fingerprint": membership_payload["fingerprint"],
         },
         "required_target_bindings": {
             "contract": "speedtree_required_target_binding_projection",
-            "version": TARGET_BINDING_PROJECTION_VERSION,
+            "version": target_version,
             "requested_mesh_ids": authoring,
-            "expected_mesh_ids": target["expected_target_mesh_ids"],
-            "binding_count": target["binding_count"],
-            "fingerprint": target["fingerprint"],
-            "missing_requested_mesh_ids": target["missing_requested_mesh_ids"],
+            "expected_mesh_ids": target_payload["expected_mesh_ids"],
+            "binding_count": target_payload["binding_count"],
+            "fingerprint": target_payload["fingerprint"],
+            "missing_requested_mesh_ids": target_payload[
+                "missing_requested_mesh_ids"
+            ],
         },
         "target_requirements": {
             "contract": "speedtree_stale_node_target_requirements",
-            "version": TARGET_REQUIREMENTS_VERSION,
-            "policy": TARGET_REQUIREMENTS_POLICY,
+            "version": requirements_version,
+            "policy": dialect.target_scope_policy,
             "authoring_mesh_ids": authoring,
             "required_live_mesh_ids": required_live,
         },
@@ -1686,7 +1784,14 @@ def _receipt_target_scopes(receipt):
             "authoring_mesh_ids": requested,
             "required_live_mesh_ids": list(requested),
         }
-    if schema_version != 5 or not isinstance(requirements, dict):
+    if schema_version != 5:
+        return None
+    return _target_requirements_v1_scopes(requirements, requested)
+
+
+def _target_requirements_v1_scopes(requirements, requested):
+    """Validate the frozen schema-5 requirements-v1 policy literally."""
+    if not isinstance(requirements, dict):
         return None
     authoring = _receipt_requested_mesh_ids({
         "requested_mesh_ids": requirements.get("authoring_mesh_ids")
@@ -1705,8 +1810,8 @@ def _receipt_target_scopes(receipt):
         requirements.get("contract")
         == "speedtree_stale_node_target_requirements"
         and _strict_receipt_version(requirements.get("version"))
-        == TARGET_REQUIREMENTS_VERSION
-        and requirements.get("policy") == TARGET_REQUIREMENTS_POLICY
+        == 1
+        and requirements.get("policy") == "explicit_sealed_scopes_v1"
         and authoring == requested
         and set(required_live).issubset(authoring)
     ):
@@ -1716,6 +1821,107 @@ def _receipt_target_scopes(receipt):
         "authoring_mesh_ids": authoring,
         "required_live_mesh_ids": required_live,
     }
+
+
+@dataclass(frozen=True)
+class _ProjectionPolicy:
+    block: str
+    candidate_projector: object
+    authoritative_fields: tuple
+
+
+@dataclass(frozen=True)
+class _ReceiptDialect:
+    name: str
+    versions: tuple
+    graph: _ProjectionPolicy
+    core: object
+    membership: _ProjectionPolicy
+    targets: _ProjectionPolicy
+    target_scope_policy: str
+
+
+_GRAPH_V1_POLICY = _ProjectionPolicy(
+    "authoring_graph_projection",
+    _authoring_graph_projection_v1_candidates,
+    ("fingerprint",),
+)
+_CORE_V2_POLICY = _ProjectionPolicy(
+    "authoring_graph_core_projection",
+    _authoring_graph_core_v2_candidates,
+    ("fingerprint", "generator_count", "link_count", "asset_identity_count"),
+)
+_CORE_V3_POLICY = _ProjectionPolicy(
+    "authoring_graph_core_projection",
+    _authoring_graph_core_v3_candidates,
+    (
+        "fingerprint",
+        "generator_count",
+        "link_count",
+        "asset_identity_count",
+        "global_setting_count",
+    ),
+)
+_MEMBERSHIP_V1_POLICY = _ProjectionPolicy(
+    "generator_membership",
+    _generator_membership_projection_v1,
+    ("fingerprint", "count"),
+)
+_TARGET_V1_POLICY = _ProjectionPolicy(
+    "required_target_bindings",
+    _target_binding_v1_candidates,
+    ("fingerprint", "binding_count", "expected_mesh_ids"),
+)
+_TARGET_V2_POLICY = _ProjectionPolicy(
+    "required_target_bindings",
+    _target_binding_v2_candidates,
+    (
+        "fingerprint",
+        "binding_count",
+        "expected_mesh_ids",
+        "missing_requested_mesh_ids",
+    ),
+)
+
+
+_RECEIPT_DIALECTS = MappingProxyType({
+    (2, 1, None, 1, 1, None): _ReceiptDialect(
+        "schema2_graph1_target1",
+        (2, 1, None, 1, 1, None),
+        _GRAPH_V1_POLICY,
+        None,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V1_POLICY,
+        "strict_all_v1",
+    ),
+    (3, 1, 2, 1, 1, None): _ReceiptDialect(
+        "schema3_graph1_core2_target1",
+        (3, 1, 2, 1, 1, None),
+        _GRAPH_V1_POLICY,
+        _CORE_V2_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V1_POLICY,
+        "strict_all_v1",
+    ),
+    (4, 1, 3, 1, 2, None): _ReceiptDialect(
+        "schema4_graph1_core3_target2",
+        (4, 1, 3, 1, 2, None),
+        _GRAPH_V1_POLICY,
+        _CORE_V3_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V2_POLICY,
+        "strict_all_v1",
+    ),
+    (5, 1, 3, 1, 2, 1): _ReceiptDialect(
+        "schema5_graph1_core3_target2_requirements1",
+        (5, 1, 3, 1, 2, 1),
+        _GRAPH_V1_POLICY,
+        _CORE_V3_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V2_POLICY,
+        "explicit_sealed_scopes_v1",
+    ),
+})
 
 
 def _receipt_dialect_versions(receipt):
@@ -1739,7 +1945,7 @@ def _receipt_dialect_versions(receipt):
     )
 
 
-def _resolve_receipt_dialect(receipt, snapshot=None):
+def _resolve_receipt_dialect_spec(receipt, snapshot=None):
     evidence = _public_hash_evidence(snapshot) if snapshot else {}
     if not isinstance(receipt, dict) or "schema_version" not in receipt:
         raise StaleNodeTableRecoveryError(
@@ -1816,6 +2022,11 @@ def _resolve_receipt_dialect(receipt, snapshot=None):
     return dialect
 
 
+def _resolve_receipt_dialect(receipt, snapshot=None):
+    """Return the stable public dialect name after semantic resolution."""
+    return _resolve_receipt_dialect_spec(receipt, snapshot).name
+
+
 def _supported_receipt_projection_versions(receipt):
     try:
         _resolve_receipt_dialect(receipt)
@@ -1881,42 +2092,94 @@ def _validate_receipt_binding(
         )
 
 
-def _verify_preimage_artifacts(artifacts, snapshot=None):
+def _strict_receipt_mesh_id_list(value):
+    if not isinstance(value, list):
+        return None
+    if any(type(item) is not int or item <= 0 for item in value):
+        return None
+    if len(set(value)) != len(value):
+        return None
+    return sorted(value)
+
+
+def _sealed_projection_field(block, field):
+    value = block.get(field)
+    if field in {"expected_mesh_ids", "missing_requested_mesh_ids"}:
+        return _strict_receipt_mesh_id_list(value)
+    if field in {
+        "binding_count",
+        "generator_count",
+        "link_count",
+        "asset_identity_count",
+        "global_setting_count",
+        "count",
+    }:
+        return value if type(value) is int and value >= 0 else None
+    return value
+
+
+def _projection_policy_matches(policy, receipt, backup_snapshot, requested):
+    block = receipt.get(policy.block)
+    if not isinstance(block, dict):
+        return False
+    sealed = {
+        field: _sealed_projection_field(block, field)
+        for field in policy.authoritative_fields
+    }
+    if any(value is None for value in sealed.values()):
+        return False
+    candidates = policy.candidate_projector(backup_snapshot, requested)
+    return any(
+        all(candidate.get(field) == sealed[field] for field in sealed)
+        for candidate in candidates
+    )
+
+
+def _verify_preimage_artifacts(artifacts, snapshot=None, *, capture_fn=None):
+    """Recapture and verify the backup; never substitute operating bytes."""
     receipt = artifacts["receipt"]
     exact = receipt.get("exact_preimage") if isinstance(receipt, dict) else None
     expected_raw_sha = exact.get("raw_sha256") if isinstance(exact, dict) else None
+    evidence = _public_hash_evidence(snapshot) if snapshot else {}
     if not isinstance(expected_raw_sha, str) or not expected_raw_sha:
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
             "the immutable preimage receipt is malformed or incomplete",
-            _public_hash_evidence(snapshot) if snapshot else {},
+            evidence,
         )
     try:
-        backup_bytes = (
-            snapshot["raw_bytes"]
-            if snapshot is not None and "raw_bytes" in snapshot
-            else artifacts["backup_path"].read_bytes()
-        )
         receipt_bytes = artifacts["receipt_path"].read_bytes()
         receipt_on_disk = json.loads(receipt_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StaleNodeTableRecoveryError(
             "preimage_artifacts_missing_or_unreadable",
             "the exact backup or immutable receipt is missing or unreadable",
-            _public_hash_evidence(snapshot) if snapshot else {},
+            evidence,
         ) from exc
-    if _sha256_bytes(backup_bytes) != expected_raw_sha:
+    requested = _receipt_requested_mesh_ids(
+        receipt.get("required_target_bindings")
+    ) or []
+    capture = capture_fn or _capture_immutable_snapshot
+    try:
+        backup_snapshot = capture(artifacts["backup_path"], requested)
+    except StaleNodeTableRecoveryError as exc:
+        raise StaleNodeTableRecoveryError(
+            "preimage_backup_verification_failed",
+            "the immutable preimage backup cannot be recaptured",
+            evidence,
+        ) from exc
+    if backup_snapshot.get("raw_sha256") != expected_raw_sha:
         raise StaleNodeTableRecoveryError(
             "preimage_backup_verification_failed",
             "the immutable preimage backup no longer matches its receipt",
-            _public_hash_evidence(snapshot) if snapshot else {},
+            evidence,
         )
-    _resolve_receipt_dialect(receipt, snapshot)
+    dialect = _resolve_receipt_dialect_spec(receipt, backup_snapshot)
     if receipt_on_disk != receipt:
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
             "the immutable preimage receipt no longer matches sealed evidence",
-            _public_hash_evidence(snapshot) if snapshot else {},
+            evidence,
         )
     receipt_sha256 = _sha256_bytes(receipt_bytes)
     expected_receipt_sha256 = artifacts.get("receipt_sha256")
@@ -1927,103 +2190,34 @@ def _verify_preimage_artifacts(artifacts, snapshot=None):
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
             "the immutable preimage receipt SHA changed",
-            _public_hash_evidence(snapshot) if snapshot else {},
+            evidence,
         )
-    if snapshot is not None and snapshot.get("raw_sha256") == expected_raw_sha:
-        checks = [
-            (
-                snapshot.get("text_sha256"),
-                receipt.get("exact_preimage", {}).get("spm_text_sha256"),
-            ),
-            (
-                snapshot.get("authoring_graph_fingerprint"),
-                receipt.get("authoring_graph_projection", {}).get("fingerprint"),
-            ),
-            (
-                snapshot.get("generator_membership_fingerprint"),
-                receipt.get("generator_membership", {}).get("fingerprint"),
-            ),
-            (
-                snapshot.get("elementtree", {}).get("generator_count"),
-                receipt.get("generator_membership", {}).get("count"),
-            ),
-        ]
-        receipt_target = receipt.get("required_target_bindings") or {}
-        target_version = _strict_receipt_version(receipt_target.get("version"))
-        receipt_requested = receipt_target.get(
-            "requested_mesh_ids",
-            receipt_target.get("expected_mesh_ids"),
-        ) or []
-        checks.append((
-            snapshot.get("target_projection", {}).get("binding_count"),
-            receipt_target.get("binding_count"),
-        ))
-        if "requested_mesh_ids" in receipt_target:
-            checks.append((
-                snapshot.get("target_projection", {}).get(
-                    "expected_target_mesh_ids"
-                ),
-                _receipt_requested_mesh_ids({
-                    "requested_mesh_ids": receipt_target.get(
-                        "expected_mesh_ids"
-                    )
-                }),
-            ))
-        if target_version == 2:
-            checks.append((
-                snapshot.get("target_projection", {}).get(
-                    "missing_requested_mesh_ids"
-                ),
-                receipt_target.get("missing_requested_mesh_ids"),
-            ))
-        if target_version == TARGET_BINDING_PROJECTION_VERSION:
-            checks.append((
-                snapshot.get("target_projection", {}).get("fingerprint"),
-                receipt_target.get("fingerprint"),
-            ))
-        elif receipt_target.get("fingerprint") not in (
-            _legacy_target_binding_fingerprints(snapshot, receipt_requested)
-        ):
-            checks.append((None, receipt_target.get("fingerprint")))
-        receipt_schema_version = _strict_receipt_version(
-            receipt.get("schema_version")
+    exact_valid = bool(
+        exact.get("backup_raw_sha256") == backup_snapshot["raw_sha256"]
+        and exact.get("spm_text_sha256") == backup_snapshot["text_sha256"]
+        and type(exact.get("size")) is int
+        and exact.get("size") == backup_snapshot["size"]
+        and exact.get("backup_file")
+        == Path(artifacts["backup_path"]).name
+    )
+    policies = [dialect.graph, dialect.membership, dialect.targets]
+    if dialect.core is not None:
+        policies.append(dialect.core)
+    projections_valid = all(
+        _projection_policy_matches(
+            policy,
+            receipt,
+            backup_snapshot,
+            requested,
         )
-        receipt_core = receipt.get("authoring_graph_core_projection")
-        if receipt_schema_version in {4, 5}:
-            observed_core = snapshot.get("authoring_graph_core", {})
-            checks.append((
-                observed_core.get("fingerprint"),
-                receipt_core.get("fingerprint"),
-            ))
-        elif receipt_schema_version == 3:
-            observed_core = _legacy_authoring_graph_core_v2_projection(
-                snapshot["text"]
-            )
-            checks.append((
-                observed_core["fingerprint"],
-                receipt_core.get("fingerprint"),
-            ))
-        else:
-            observed_core = None
-        if observed_core is not None:
-            core_count_fields = [
-                "generator_count",
-                "link_count",
-                "asset_identity_count",
-            ]
-            if receipt_schema_version in {4, 5}:
-                core_count_fields.append("global_setting_count")
-            for field in core_count_fields:
-                checks.append((
-                    observed_core.get(field),
-                    receipt_core.get(field),
-                ))
-        if any(observed != expected for observed, expected in checks):
-            raise StaleNodeTableRecoveryError(
-                "preimage_receipt_verification_failed",
-                "the immutable preimage receipt projections do not match its backup",
-                _public_hash_evidence(snapshot),
-            )
+        for policy in policies
+    )
+    if not exact_valid or not projections_valid:
+        raise StaleNodeTableRecoveryError(
+            "preimage_receipt_verification_failed",
+            "the immutable preimage receipt projections do not match its backup",
+            _public_hash_evidence(backup_snapshot),
+        )
     return receipt_sha256
 
 
@@ -2049,7 +2243,6 @@ def _ensure_preimage_artifacts(
     base = f"{Path(snapshot['source_identity']['asset_name']).stem}.{snapshot['raw_sha256']}"
     backup = recovery_root / (base + ".preimage.spm")
     receipt_path = recovery_root / (base + ".receipt.json")
-    expected_receipt = _preimage_receipt(snapshot, target_scopes, backup.name)
 
     if backup.exists():
         if _sha256_bytes(backup.read_bytes()) != snapshot["raw_sha256"]:
@@ -2078,6 +2271,11 @@ def _ensure_preimage_artifacts(
                 _public_hash_evidence(snapshot),
             ) from exc
     else:
+        expected_receipt = _preimage_receipt(
+            snapshot,
+            target_scopes,
+            backup.name,
+        )
         _atomic_write_new(receipt_path, expected_receipt)
         receipt_bytes = receipt_path.read_bytes()
         sealed_receipt = expected_receipt
