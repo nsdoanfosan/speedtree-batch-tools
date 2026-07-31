@@ -1788,6 +1788,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                     "file_path": str(full),
                     "_material_pipeline_json_path": str(sidecar),
                     "_material_pipeline_json_sha256": source_sidecar["sha256"],
+                    "_material_pipeline_expected_mesh_name": "SK_Tree_elm_01",
                 },
                 "property_data": {
                     "unreal": {
@@ -1811,6 +1812,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                         "_p.preflight_mesh_materials("
                         "_asset_path, "
                         f"json_path='{sidecar.as_posix()}', "
+                        "expected_mesh_name='SK_Tree_elm_01', "
                         f"sidecar_sha256='{source_sidecar['sha256']}')"
                     ),
                 ]],
@@ -1819,6 +1821,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                         "_p.process_mesh("
                         "_asset_path, "
                         f"json_path='{sidecar.as_posix()}', "
+                        "expected_mesh_name='SK_Tree_elm_01', "
                         f"sidecar_sha256='{source_sidecar['sha256']}')"
                     ),
                 ]],
@@ -1896,6 +1899,9 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             )
             for generated_asset in plan["assets"]:
                 generated_data = generated_asset["asset_data"]
+                generated_mesh_name = generated_data[
+                    "_cluster_assembly_asset_name"
+                ]
                 generated_fingerprint = generated_data[
                     "_material_pipeline_json_fingerprint"
                 ]
@@ -1908,6 +1914,10 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                     generated_data["_material_pipeline_json_sha256"],
                     generated_sha256,
                 )
+                self.assertEqual(
+                    generated_data["_material_pipeline_expected_mesh_name"],
+                    generated_mesh_name,
+                )
                 commands = json.dumps(
                     generated_asset["pre_import_commands"]
                     + generated_asset["post_import_commands"]
@@ -1915,11 +1925,35 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 self.assertIn(generated_sha256, commands)
                 self.assertNotIn(source_sidecar["sha256"], commands)
                 self.assertIn(
+                    f"expected_mesh_name='{generated_mesh_name}'",
+                    commands,
+                )
+                self.assertNotIn(
+                    "expected_mesh_name='SK_Tree_elm_01'",
+                    commands,
+                )
+                self.assertIn(
                     Path(generated_data["_material_pipeline_json_path"]).as_posix(),
                     commands,
                 )
 
             source_command = template["pre_import_commands"][0][1]
+            template["pre_import_commands"][0][1] = source_command.replace(
+                "expected_mesh_name='SK_Tree_elm_01'",
+                "expected_mesh_name='SK_Tree_wrong_01'",
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "command expected mesh name does not match",
+            ):
+                build_unreal_ingest_plan(
+                    manifest,
+                    template,
+                    "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
+                    "/Game/Codex/Tests/Elm",
+                )
+            template["pre_import_commands"][0][1] = source_command
+
             template["pre_import_commands"][0][1] = source_command.replace(
                 source_sidecar["sha256"],
                 "0" * 64,
