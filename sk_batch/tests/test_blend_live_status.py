@@ -2388,11 +2388,15 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
             spm.parent.mkdir()
             spm.write_bytes(b"spm")
-            (spm.parent / "Cluster").mkdir()
+            cluster = spm.parent / "Cluster"
+            cluster.mkdir()
+            capture = cluster / "cluster_elm_01.tga"
+            capture.write_bytes(b"capture-v1")
 
             def run_audit(command, *_args, **_kwargs):
                 report = Path(command[command.index("--json") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
+                sampled = gui.sampled_file_content_snapshot(capture)
                 report.write_text(
                     json.dumps({"items": [{"cluster_assembly": {
                         "tree_source_identities": [{
@@ -2401,7 +2405,15 @@ class BlendLiveStatusTests(unittest.TestCase):
                                 "exists": True,
                             },
                         }],
-                        "dependencies": [{"role": "branch"}],
+                        "dependencies": [{
+                            "role": "branch",
+                            "texture_dependencies": [{
+                                "path": str(capture),
+                                "exists": True,
+                                "sha256": None,
+                                **sampled,
+                            }],
+                        }],
                         "handoff": {"errors": [], "issues": []},
                     }}]}),
                     encoding="utf-8",
@@ -2438,6 +2450,43 @@ class BlendLiveStatusTests(unittest.TestCase):
             "memo hit" in call.args[0]
             for call in app.log.call_args_list
         ))
+
+    def test_cluster_live_artifact_cache_fingerprint_uses_bounded_reads(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            spm.write_bytes(b"tree")
+            capture = cluster / "cluster_elm_01.tga"
+            capture.write_bytes(b"capture")
+
+            with mock.patch.object(
+                gui,
+                "file_content_snapshot",
+                wraps=gui.file_content_snapshot,
+            ) as full_snapshot, mock.patch.object(
+                gui,
+                "sampled_file_content_snapshot",
+                wraps=gui.sampled_file_content_snapshot,
+            ) as sampled_snapshot:
+                app._cluster_receipt_refresh_input_fingerprint(
+                    spm,
+                    live_artifact_paths=[capture],
+                )
+
+        fully_read = {
+            Path(call.args[0]).resolve()
+            for call in full_snapshot.call_args_list
+        }
+        sampled = {
+            Path(call.args[0]).resolve()
+            for call in sampled_snapshot.call_args_list
+        }
+        self.assertNotIn(capture.resolve(), fully_read)
+        self.assertIn(capture.resolve(), sampled)
 
     def test_cluster_live_audit_memo_invalidates_spm_and_manifest_changes(self):
         gui = load_gui_module()

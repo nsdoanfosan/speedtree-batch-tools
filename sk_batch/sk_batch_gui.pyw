@@ -60,6 +60,11 @@ from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
 )
+from artifact_content_key import (
+    artifact_record_content_key,
+    file_content_key_snapshot,
+    sampled_file_content_snapshot,
+)
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
@@ -6470,6 +6475,7 @@ class App:
                             "mtime_ns",
                             "sha256",
                             "fingerprint",
+                            "fingerprint_algorithm",
                         )
                         if key in value
                     })
@@ -6536,33 +6542,23 @@ class App:
                 ):
                     errors.append(f"mtime changed: {candidate}")
                     continue
-                expected_sha256 = record.get("sha256")
-                expected_fingerprint = record.get("fingerprint")
-                if not expected_sha256 and not (
-                    isinstance(expected_fingerprint, str)
-                    and expected_fingerprint
-                ):
+                content_key = artifact_record_content_key(record)
+                if content_key is None:
                     errors.append(
                         f"content digest missing: {candidate}"
                     )
                     continue
-                if expected_sha256:
-                    current_sha256 = _sha256_snapshot(candidate)["sha256"]
-                    if (
-                        str(expected_sha256).casefold()
-                        != current_sha256.casefold()
-                    ):
-                        errors.append(f"sha256 changed: {candidate}")
-                        continue
-                if isinstance(expected_fingerprint, str) and expected_fingerprint:
-                    current_fingerprint = file_content_snapshot(
-                        candidate
-                    )["fingerprint"]
-                    if (
-                        expected_fingerprint.casefold()
-                        != current_fingerprint.casefold()
-                    ):
-                        errors.append(f"fingerprint changed: {candidate}")
+                current_key = file_content_key_snapshot(
+                    candidate,
+                    content_key["algorithm"],
+                )
+                if (
+                    content_key["digest"].casefold()
+                    != current_key["digest"].casefold()
+                ):
+                    errors.append(
+                        f"{content_key['field']} changed: {candidate}"
+                    )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 errors.append(f"identity unavailable: {candidate}: {exc}")
         return not errors, tuple(errors)
@@ -6633,20 +6629,23 @@ class App:
         *,
         live_artifact_paths=(),
     ):
-        """Hash every owner input and live artifact by current file bytes.
+        """Fingerprint every owner input and live artifact by current bytes.
 
-        Size and mtime remain diagnostics and negative-change hints only. They
-        never authorize a positive memo hit without a content digest.
-        Missing paths remain part of the key, so an artifact appearing later
-        invalidates the memo automatically.
+        Discovery inputs retain full content fingerprints so a genuine input
+        write remains fail-closed.  Additional live artifacts use the shared
+        bounded sampled key, avoiding full reads of large textures on each memo
+        check.  Size and mtime remain diagnostics and negative-change hints;
+        they never authorize a positive hit without a content-derived key.
+        Missing paths remain in the key, so a later appearance invalidates it.
         """
         spm = Path(spm).resolve()
         content_paths = self._cluster_receipt_discovery_input_paths(spm)
 
-        all_paths = {
+        live_paths = {
             Path(path).resolve()
             for path in live_artifact_paths
         }
+        all_paths = set(live_paths)
         all_paths.update(content_paths)
         records = []
         for candidate in sorted(
@@ -6659,7 +6658,11 @@ class App:
             except FileNotFoundError:
                 records.append({"path": key, "exists": False})
                 continue
-            snapshot = file_content_snapshot(candidate)
+            snapshot = (
+                file_content_snapshot(candidate)
+                if candidate in content_paths
+                else sampled_file_content_snapshot(candidate)
+            )
             records.append({
                 "path": key,
                 "exists": True,
@@ -6667,7 +6670,7 @@ class App:
             })
 
         envelope = {
-            "version": 2,
+            "version": 3,
             "scope": self._cluster_receipt_refresh_scope(spm),
             "files": records,
         }
