@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "source_evidence": {
+    "run_stamp": "20260731_205236",
+    "shared_queue_sequence": 43,
+    "phase": "push",
+    "selected_count": 5,
+    "persisted_outcome": "partial",
+    "persisted_failed_count": 5
+  },
+  "targets": [
+    {
+      "target": "SK_bush_blackgum_01.spm",
+      "live_audit_terminal_status": "ok",
+      "delivery_mode": "render_connected",
+      "delivery_decision": "normalize_part",
+      "delivery_reason": "generator_connection_matches_live_export",
+      "delivery_errors": []
+    },
+    {
+      "target": "SK_bush_blackgum_02.spm",
+      "live_audit_terminal_status": "ok",
+      "delivery_mode": "render_connected",
+      "delivery_decision": "normalize_part",
+      "delivery_reason": "generator_connection_matches_live_export",
+      "delivery_errors": []
+    },
+    {
+      "target": "SK_bush_blackgum_03.spm",
+      "live_audit_terminal_status": "ok",
+      "delivery_mode": "render_connected",
+      "delivery_decision": "normalize_part",
+      "delivery_reason": "generator_connection_matches_live_export",
+      "delivery_errors": []
+    },
+    {
+      "target": "SK_bush_blackgum_side_01.spm",
+      "live_audit_terminal_status": "ok",
+      "delivery_mode": "render_connected",
+      "delivery_decision": "normalize_part",
+      "delivery_reason": "generator_connection_matches_live_export",
+      "delivery_errors": []
+    },
+    {
+      "target": "SK_weed_blackgum_01.spm",
+      "live_audit_terminal_status": "ok",
+      "delivery_mode": "connection_incomplete",
+      "delivery_decision": "blocked",
+      "delivery_reason": "generator_connection_contract_incomplete",
+      "delivery_errors": [
+        "generator_not_export_participating",
+        "live_generator_slot_not_declared_exactly_once",
+        "visible_generator_slot_missing"
+      ]
+    }
+  ],
+  "expected_result": {
+    "completed_count": 4,
+    "blocked_count": 1,
+    "planned_excluded_count": 1,
+    "dependency_blocked_count": 0,
+    "failed_count": 0,
+    "blocked_reason_token": "generator_connection_contract_incomplete"
+  },
+  "readiness_contract": {
+    "sync_outcome_authoritative": false,
+    "requires_current_live_delivery": true,
+    "requires_normalization_postcondition": true,
+    "requires_per_target_causal_status": true
+  }
+}

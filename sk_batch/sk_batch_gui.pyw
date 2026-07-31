@@ -168,6 +168,14 @@ WIND_OPTIONS = (
     ("NONE", "NONE"),
 )
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
+PLANNED_EXCLUSION_KINDS = frozenset({
+    "dependency_blocked",
+    "manual_required",
+    "planned_excluded",
+    "preflight_skip",
+    "source_review",
+    "stale_execution_freeze",
+})
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
@@ -1029,6 +1037,52 @@ def cluster_contract_issues(contract):
     ]
 
 
+def cluster_target_delivery_block(contract, target_spm, producer_spm):
+    """Return a target-local live-delivery exclusion, if one is explicit.
+
+    A normalized provider is shared, but its live Generator connection is
+    evaluated for each owner target.  Only ``delivery_blocked_targets`` binds a
+    provider issue to one target; a provider-level issue without that binding
+    remains shared and must fail closed.
+    """
+    dependency = cluster_contract_dependency_for_spm(contract, producer_spm)
+    normalized = (
+        dependency.get("normalized_variants")
+        if isinstance(dependency, dict)
+        else None
+    )
+    if not isinstance(normalized, dict):
+        return None
+    wanted = normalized_folder_key(target_spm)
+    for row in normalized.get("delivery_blocked_targets") or ():
+        if not isinstance(row, dict) or not row.get("spm"):
+            continue
+        if normalized_folder_key(row["spm"]) != wanted:
+            continue
+        reason_token = str(
+            row.get("delivery_reason")
+            or "normalized_generator_delivery_incomplete"
+        ).strip() or "normalized_generator_delivery_incomplete"
+        return {
+            "reason_token": reason_token,
+            "delivery_mode": str(
+                normalized.get("delivery_mode")
+                or dependency.get("normalized_delivery_mode")
+                or ""
+            ),
+            "delivery_errors": sorted({
+                str(value)
+                for value in (
+                    row.get("errors")
+                    or normalized.get("delivery_errors")
+                    or ()
+                )
+                if value
+            }),
+        }
+    return None
+
+
 def cluster_relation_refresh_state(cluster_spm, target_spms):
     """Return whether the provider's committed Atlas delivery is current."""
     from atlas_target_registry import (
@@ -1494,6 +1548,41 @@ class BatchItemError(RuntimeError):
         self.report = report or {}
         self.log_file = log_file
         self.report_file = report_file
+
+
+class TargetPlannedExclusionError(BatchItemError):
+    """One target is blocked without making its shared provider fail."""
+
+    def __init__(
+        self,
+        reason,
+        *,
+        reason_token,
+        target_spm,
+        producer_spm,
+        evidence=None,
+        log_file=None,
+        report_file=None,
+    ):
+        report = {
+            "status": "planned_excluded",
+            "scope": "target",
+            "reason_token": str(reason_token),
+            "target_spm": str(target_spm),
+            "producer_spm": str(producer_spm),
+            "evidence": copy.deepcopy(evidence or {}),
+        }
+        super().__init__(
+            reason,
+            kind="planned_excluded",
+            report=report,
+            log_file=log_file,
+            report_file=report_file,
+        )
+        self.reason_token = str(reason_token)
+        self.target_spm = Path(target_spm)
+        self.producer_spm = Path(producer_spm)
+        self.evidence = copy.deepcopy(evidence or {})
 
 
 class Tooltip:
@@ -3267,6 +3356,16 @@ class App:
         error = None
         status = "completed"
         failed_count = 0
+        summary = {
+            "selected_count": len(job.get("targets") or ()),
+            "completed_count": 0,
+            "blocked_count": 0,
+            "planned_excluded_count": 0,
+            "dependency_blocked_count": 0,
+            "failed_count": 0,
+            "target_outcomes": [],
+            "shared_failures": [],
+        }
         lease = None
         try:
             shared_job_id = job.get("shared_queue_job_id")
@@ -3296,6 +3395,7 @@ class App:
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
                 ))
+            self.__dict__.pop("_phase_result_summary", None)
             self._freeze_batch_production_source_manifest()
             if job["mode"] == "pipeline":
                 completed = self._run_full_pipeline(
@@ -3308,19 +3408,29 @@ class App:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
                 )
-            failed_count = len(
-                getattr(self, "_phase_failed_items", set()) or ()
+            summary = copy.deepcopy(
+                getattr(self, "_phase_result_summary", None)
+                or self._summarize_phase_targets(job["targets"])
             )
+            failed_count = int(summary["failed_count"])
+            blocked_count = int(summary["blocked_count"])
             if self.stop_flag.is_set():
                 status = "stopped"
-            elif completed is False and failed_count:
+            elif failed_count or blocked_count:
                 status = "partial"
             elif completed is False:
                 status = "failed"
-            elif failed_count:
-                status = "partial"
             if status == "partial":
-                error = f"항목 실패/준비 제외 {failed_count}개"
+                tokens = sorted({
+                    str(row.get("reason_token"))
+                    for row in summary["target_outcomes"]
+                    if row.get("reason_token")
+                })
+                error = (
+                    f"completed={summary['completed_count']} "
+                    f"blocked={blocked_count} failed={failed_count}"
+                    + (f" | reasons={','.join(tokens)}" if tokens else "")
+                )
             elif status == "failed":
                 error = compact_error_message(
                     getattr(self, "_phase_abort_reason", None)
@@ -3345,8 +3455,8 @@ class App:
                             "tool": "sk_batch",
                             "local_job_id": job["id"],
                             "outcome": status,
-                            "failed_count": failed_count,
                             "error": error,
+                            **summary,
                         },
                     )
                 except Exception as queue_exc:
@@ -3362,7 +3472,7 @@ class App:
                     "id": job["id"],
                     "error": error,
                     "status": status,
-                    "failed_count": failed_count,
+                    **summary,
                 },
             ))
 
@@ -3382,8 +3492,26 @@ class App:
                     "label": job["label"],
                     "error": error or status,
                     "status": status,
+                    "completed_count": int(
+                        payload.get("completed_count", 0) or 0
+                    ),
+                    "blocked_count": int(
+                        payload.get("blocked_count", 0) or 0
+                    ),
+                    "planned_excluded_count": int(
+                        payload.get("planned_excluded_count", 0) or 0
+                    ),
+                    "dependency_blocked_count": int(
+                        payload.get("dependency_blocked_count", 0) or 0
+                    ),
                     "failed_count": int(
                         payload.get("failed_count", 0) or 0
+                    ),
+                    "target_outcomes": copy.deepcopy(
+                        payload.get("target_outcomes") or []
+                    ),
+                    "shared_failures": copy.deepcopy(
+                        payload.get("shared_failures") or []
                     ),
                 }
             )
@@ -3409,6 +3537,7 @@ class App:
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
             "_phase_failed_items",
+            "_phase_result_summary",
         ):
             self.__dict__.pop(key, None)
         if self.pending_batch_jobs:
@@ -3420,8 +3549,29 @@ class App:
         if status == "stopped":
             self.progress_var.set("대기열 중지됨")
         elif failure_count:
+            tokens = sorted({
+                str(row.get("reason_token"))
+                for failure in self.batch_job_failures
+                for row in failure.get("target_outcomes") or ()
+                if row.get("reason_token")
+            })
+            completed_total = sum(
+                row.get("completed_count", 0)
+                for row in self.batch_job_failures
+            )
+            blocked_total = sum(
+                row.get("blocked_count", 0)
+                for row in self.batch_job_failures
+            )
+            failed_total = sum(
+                row.get("failed_count", 0)
+                for row in self.batch_job_failures
+            )
             self.progress_var.set(
-                f"대기열 완료 · 작업 실패/부분 실패 {failure_count}건 기록"
+                "대기열 완료 · "
+                f"completed {completed_total} · "
+                f"blocked {blocked_total} · failed {failed_total}"
+                + (f" · {', '.join(tokens)}" if tokens else "")
             )
         else:
             self.progress_var.set("대기열 완료")
@@ -3583,6 +3733,281 @@ class App:
             )
         self.log(f"[의존성 차단] {Path(iid).name}: {reason}")
 
+    def _record_pipeline_planned_exclusion(self, target_spm, error):
+        """Persist one target-local block without failing a shared producer."""
+        target = Path(target_spm)
+        iid = str(target)
+        reason_token = str(
+            getattr(error, "reason_token", None)
+            or (getattr(error, "report", {}) or {}).get("reason_token")
+            or "target_live_delivery_blocked"
+        )
+        evidence = copy.deepcopy(
+            getattr(error, "evidence", None)
+            or (getattr(error, "report", {}) or {}).get("evidence")
+            or {}
+        )
+        if getattr(error, "report_file", None):
+            evidence.setdefault("report", str(error.report_file))
+        if getattr(error, "log_file", None):
+            evidence.setdefault("log", str(error.log_file))
+        record = {
+            "target": iid,
+            "target_name": target.name,
+            "outcome": "planned_excluded",
+            "reason_token": reason_token,
+            "evidence": evidence,
+        }
+        with self.state_lock:
+            planned = self.__dict__.setdefault(
+                "_pipeline_planned_exclusions", {}
+            )
+            planned[iid] = copy.deepcopy(record)
+        details = {
+            "reason_token": reason_token,
+            "evidence": copy.deepcopy(evidence),
+        }
+        self._record_phase_status(
+            iid,
+            "blend_status",
+            f"Sync excluded: {reason_token}",
+            "planned_excluded",
+            str(error),
+            details=details,
+            persist=False,
+        )
+        self._record_phase_status(
+            iid,
+            "push_status",
+            f"Push blocked: {reason_token}",
+            "planned_excluded",
+            str(error),
+            details=details,
+            persist=True,
+        )
+        self.log(
+            "[target planned exclusion] "
+            f"{target.name}: {reason_token}; Sync is not Push readiness"
+        )
+
+    def _target_failure_result(self, iid, default_token="item_failed"):
+        state = getattr(self, "state", {}) or {}
+        lock = getattr(self, "state_lock", None)
+        if lock is None:
+            entry = state.get(str(iid))
+        else:
+            with lock:
+                entry = state.get(str(iid))
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        for column in ("push_status", "blend_status", "spm_status"):
+            kind = str(entry.get(f"{column}_kind") or "")
+            error = entry.get(f"{column}_error")
+            error = dict(error) if isinstance(error, dict) else {}
+            if not kind and not error:
+                continue
+            reason_token = str(
+                error.get("reason_token") or kind or default_token
+            )
+            evidence = {
+                key: copy.deepcopy(value)
+                for key, value in error.items()
+                if key not in {"time", "kind", "reason_token"}
+            }
+            return reason_token, evidence
+        return default_token, {}
+
+    def _target_failure_kind(self, iid):
+        state = getattr(self, "state", {}) or {}
+        entry = state.get(str(iid))
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        for column in ("push_status", "blend_status", "spm_status"):
+            kind = str(entry.get(f"{column}_kind") or "")
+            if kind:
+                return kind
+        return ""
+
+    def _summarize_phase_targets(self, targets):
+        """Build the persisted queue result for a non-pipeline phase."""
+        failed_ids = set(
+            getattr(self, "_phase_failed_items", set()) or ()
+        )
+        outcomes = []
+        for item in targets:
+            iid = str(item["spm"])
+            name = Path(iid).name
+            if iid not in failed_ids:
+                outcomes.append({
+                    "target": iid,
+                    "target_name": name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                })
+                continue
+            reason_token, evidence = self._target_failure_result(iid)
+            failure_kind = self._target_failure_kind(iid)
+            outcomes.append({
+                "target": iid,
+                "target_name": name,
+                "outcome": (
+                    "planned_excluded"
+                    if failure_kind in PLANNED_EXCLUSION_KINDS
+                    else "failed"
+                ),
+                "reason_token": reason_token,
+                "evidence": evidence,
+            })
+        completed_count = sum(
+            row["outcome"] == "completed" for row in outcomes
+        )
+        blocked_count = sum(
+            row["outcome"] == "planned_excluded" for row in outcomes
+        )
+        failed_count = sum(
+            row["outcome"] == "failed" for row in outcomes
+        )
+        return {
+            "selected_count": len(outcomes),
+            "completed_count": completed_count,
+            "blocked_count": blocked_count,
+            "planned_excluded_count": blocked_count,
+            "dependency_blocked_count": 0,
+            "failed_count": failed_count,
+            "target_outcomes": outcomes,
+            "shared_failures": [],
+        }
+
+    def _build_pipeline_result_summary(
+        self,
+        selected_targets,
+        root_failed_ids,
+        dependency_blocked_ids,
+        pipeline_abort,
+    ):
+        selected = []
+        seen = set()
+        for item in selected_targets:
+            iid = str(item["spm"])
+            if iid in seen:
+                continue
+            seen.add(iid)
+            selected.append(iid)
+        planned = copy.deepcopy(
+            getattr(self, "_pipeline_planned_exclusions", {}) or {}
+        )
+        failed = set(root_failed_ids) & set(selected)
+        dependency_blocked = set(dependency_blocked_ids) & set(selected)
+        planned_ids = set(planned) & set(selected)
+        if pipeline_abort:
+            failed.update(
+                set(selected)
+                - dependency_blocked
+                - planned_ids
+            )
+
+        outcomes = []
+        dependency_map = {
+            key: tuple(value)
+            for key, value in (
+                getattr(self, "_active_blender_dependency_map", {}) or {}
+            ).items()
+        }
+        for key, value in (
+            getattr(self, "_active_push_dependency_map", {}) or {}
+        ).items():
+            dependency_map[key] = tuple(dict.fromkeys(
+                (*dependency_map.get(key, ()), *value)
+            ))
+        for iid in selected:
+            if iid in planned_ids:
+                outcomes.append(copy.deepcopy(planned[iid]))
+                continue
+            if iid in dependency_blocked:
+                blocked_by = [
+                    value
+                    for value in dependency_map.get(iid, ())
+                    if value in root_failed_ids
+                ]
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "blocked",
+                    "reason_token": "shared_dependency_failed",
+                    "evidence": {"blocked_by": blocked_by},
+                })
+                continue
+            if iid in failed:
+                reason_token, evidence = self._target_failure_result(
+                    iid,
+                    default_token=(
+                        "pipeline_aborted"
+                        if pipeline_abort
+                        else "item_failed"
+                    ),
+                )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": reason_token,
+                    "evidence": evidence,
+                })
+                continue
+            outcomes.append({
+                "target": iid,
+                "target_name": Path(iid).name,
+                "outcome": "completed",
+                "reason_token": None,
+                "evidence": {},
+            })
+
+        shared_failures = []
+        for dependency in sorted(set(root_failed_ids) - set(selected)):
+            affected = [
+                iid
+                for iid in selected
+                if (
+                    iid in dependency_blocked
+                    and dependency in dependency_map.get(iid, ())
+                )
+            ]
+            if not affected:
+                continue
+            reason_token, evidence = self._target_failure_result(
+                dependency,
+                default_token="shared_dependency_failed",
+            )
+            shared_failures.append({
+                "dependency": dependency,
+                "dependency_name": Path(dependency).name,
+                "reason_token": reason_token,
+                "affected_targets": affected,
+                "evidence": evidence,
+            })
+
+        completed_count = sum(
+            row["outcome"] == "completed" for row in outcomes
+        )
+        planned_count = sum(
+            row["outcome"] == "planned_excluded" for row in outcomes
+        )
+        dependency_blocked_count = sum(
+            row["outcome"] == "blocked" for row in outcomes
+        )
+        failed_count = sum(
+            row["outcome"] == "failed" for row in outcomes
+        )
+        return {
+            "selected_count": len(outcomes),
+            "completed_count": completed_count,
+            "blocked_count": planned_count + dependency_blocked_count,
+            "planned_excluded_count": planned_count,
+            "dependency_blocked_count": dependency_blocked_count,
+            "failed_count": failed_count,
+            "target_outcomes": outcomes,
+            "shared_failures": shared_failures,
+        }
+
     def _run_full_pipeline(
         self,
         targets,
@@ -3594,6 +4019,9 @@ class App:
         self._active_repair_stage_contracts = {}
         self._pipeline_root_failed_items = set()
         self._pipeline_blocked_items = set()
+        self._pipeline_planned_exclusions = {}
+        self._active_pipeline_selected_targets = list(targets)
+        self.__dict__.pop("_phase_result_summary", None)
         try:
             return self._run_full_pipeline_stages(
                 targets,
@@ -3609,6 +4037,8 @@ class App:
                 "_pipeline_upstream_failed_items",
                 "_pipeline_root_failed_items",
                 "_pipeline_blocked_items",
+                "_pipeline_planned_exclusions",
+                "_active_pipeline_selected_targets",
             ):
                 self.__dict__.pop(key, None)
 
@@ -3678,6 +4108,7 @@ class App:
         pipeline_abort = None
         root_failed_ids = set()
         blocked_consumer_ids = set()
+        planned_excluded_ids = set()
         for phase, scheduled_targets, label in schedule:
             if self.stop_flag.is_set():
                 break
@@ -3710,7 +4141,14 @@ class App:
                         f"{len(stage_blocked)}개 · root 원인 "
                         f"{len(root_failed_ids)}개"
                     )
-            excluded_ids = root_failed_ids | blocked_consumer_ids
+            planned_excluded_ids = set(
+                getattr(self, "_pipeline_planned_exclusions", {}) or {}
+            )
+            excluded_ids = (
+                root_failed_ids
+                | blocked_consumer_ids
+                | planned_excluded_ids
+            )
             eligible_stage = self._filter_pipeline_excluded_targets(
                 scheduled_targets,
                 excluded_ids,
@@ -3725,7 +4163,35 @@ class App:
                 phase, eligible_stage, emit_done=False
             )
             phase_failed = set(getattr(self, "_phase_failed_items", set()))
-            new_root_failures = phase_failed - blocked_consumer_ids
+            for failed_iid in sorted(phase_failed):
+                failure_kind = self._target_failure_kind(failed_iid)
+                if failure_kind == "dependency_blocked":
+                    blocked_consumer_ids.add(failed_iid)
+                    continue
+                if failure_kind not in PLANNED_EXCLUSION_KINDS:
+                    continue
+                reason_token, evidence = self._target_failure_result(
+                    failed_iid,
+                    default_token=failure_kind,
+                )
+                self._pipeline_planned_exclusions.setdefault(
+                    failed_iid,
+                    {
+                        "target": failed_iid,
+                        "target_name": Path(failed_iid).name,
+                        "outcome": "planned_excluded",
+                        "reason_token": reason_token,
+                        "evidence": evidence,
+                    },
+                )
+            planned_excluded_ids = set(
+                getattr(self, "_pipeline_planned_exclusions", {}) or {}
+            )
+            new_root_failures = (
+                phase_failed
+                - blocked_consumer_ids
+                - planned_excluded_ids
+            )
             if new_root_failures:
                 root_failed_ids.update(new_root_failures)
                 self.log(
@@ -3736,20 +4202,31 @@ class App:
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
                 break
-        excluded_ids = root_failed_ids | blocked_consumer_ids
-        eligible = self._filter_pipeline_excluded_targets(
-            targets,
-            excluded_ids,
+        planned_excluded_ids = set(
+            getattr(self, "_pipeline_planned_exclusions", {}) or {}
         )
+        excluded_ids = (
+            root_failed_ids
+            | blocked_consumer_ids
+            | planned_excluded_ids
+        )
+        summary = self._build_pipeline_result_summary(
+            getattr(self, "_active_pipeline_selected_targets", targets),
+            root_failed_ids,
+            blocked_consumer_ids,
+            pipeline_abort,
+        )
+        self._phase_result_summary = copy.deepcopy(summary)
         if self.stop_flag.is_set():
             final_text = "중지됨"
         elif pipeline_abort:
             final_text = f"전체 자동 중단 — {pipeline_abort}"
         elif excluded_ids:
             final_text = (
-                f"전체 자동 종료 — 성공 {len(eligible)}개 · "
-                f"root 실패 {len(root_failed_ids)}개 · "
-                f"dependency 차단 {len(blocked_consumer_ids)}개"
+                "전체 자동 종료 — "
+                f"completed {summary['completed_count']} · "
+                f"blocked {summary['blocked_count']} · "
+                f"failed {summary['failed_count']}"
             )
         else:
             final_text = "전체 자동 완료"
@@ -3762,9 +4239,9 @@ class App:
             elif excluded_ids:
                 final_text = (
                     f"{terminal_label} 연계 실행 종료 · "
-                    f"성공 {len(eligible)}개 · "
-                    f"root 실패 {len(root_failed_ids)}개 · "
-                    f"dependency 차단 {len(blocked_consumer_ids)}개"
+                    f"completed {summary['completed_count']} · "
+                    f"blocked {summary['blocked_count']} · "
+                    f"failed {summary['failed_count']}"
                 )
             else:
                 final_text = f"{terminal_label} 연계 실행 완료"
@@ -6848,6 +7325,45 @@ class App:
                 "spm": str(producer),
             })
         if blocking:
+            target_block = cluster_target_delivery_block(
+                contract,
+                target,
+                producer,
+            )
+            blocking_codes = {
+                str(issue.get("code") or "")
+                for issue in blocking
+                if isinstance(issue, dict)
+            }
+            if (
+                target_block
+                and not global_issues
+                and blocking_codes
+                <= {"NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE"}
+            ):
+                reason_token = target_block["reason_token"]
+                raise TargetPlannedExclusionError(
+                    "Cluster normalization target excluded by current live "
+                    f"delivery: {target.name}: {reason_token}",
+                    reason_token=reason_token,
+                    target_spm=target,
+                    producer_spm=producer,
+                    evidence={
+                        "audit_report": str(audit_report),
+                        "delivery_mode": target_block["delivery_mode"],
+                        "delivery_errors": target_block[
+                            "delivery_errors"
+                        ],
+                        "issue_codes": sorted(blocking_codes),
+                        "push_readiness": (
+                            "blocked_by_current_live_delivery"
+                        ),
+                        "sync_outcome_authoritative": False,
+                        "normalization_postcondition": "not_run",
+                    },
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
             summary = cluster_issue_summary(blocking)
             stage = "output" if require_normalized else "input"
             raise BatchItemError(
@@ -6877,6 +7393,41 @@ class App:
             "owned_work_items": copy.deepcopy(owned_issues),
         }
 
+    def _cluster_relation_input_plan(
+        self,
+        relation_targets,
+        stamp,
+        producer_spm,
+    ):
+        """Partition one shared provider into runnable and excluded targets."""
+        live_target_contracts = []
+        runnable_relation_targets = []
+        for target in relation_targets:
+            try:
+                live_resolution = (
+                    self._cluster_normalization_stage_observation(
+                        target,
+                        f"{stamp}_normalization_input",
+                        producer_spm,
+                        require_normalized=False,
+                    )
+                )
+            except TargetPlannedExclusionError as exc:
+                self._record_pipeline_planned_exclusion(target, exc)
+                continue
+            live_report = live_resolution.get("live_audit_report")
+            contract = copy.deepcopy(
+                live_resolution.get("selected_contract")
+            )
+            live_target_contracts.append({
+                "target_spm": str(target),
+                "report": str(live_report or ""),
+                "policy": "normalization_stage_input",
+                "contract": contract,
+            })
+            runnable_relation_targets.append(target)
+        return runnable_relation_targets, live_target_contracts
+
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
 
@@ -6900,30 +7451,38 @@ class App:
                 )
 
                 try:
-                    live_target_contracts = []
-                    for target in relation_targets:
-                        live_resolution = (
-                            self._cluster_normalization_stage_observation(
-                                target,
-                                f"{stamp}_normalization_input",
-                                producer_spm,
-                                require_normalized=False,
-                            )
+                    (
+                        relation_targets,
+                        live_target_contracts,
+                    ) = self._cluster_relation_input_plan(
+                        relation_targets,
+                        stamp,
+                        producer_spm,
+                    )
+                    if not relation_targets:
+                        reason = (
+                            "all registered consumers are target-local "
+                            "planned exclusions"
                         )
-                        live_report = live_resolution.get(
-                            "live_audit_report"
+                        self._record_phase_status(
+                            iid,
+                            "blend_status",
+                            "Sync skipped: no runnable consumers",
+                            "skipped",
+                            reason,
+                            details={
+                                "reason_token": (
+                                    "all_consumers_planned_excluded"
+                                ),
+                                "push_readiness": False,
+                            },
+                            persist=True,
                         )
-                        contract = copy.deepcopy(
-                            live_resolution.get(
-                                "selected_contract"
-                            )
+                        self.log(
+                            f"Cluster relation Sync skipped: {spm.name}: "
+                            + reason
                         )
-                        live_target_contracts.append({
-                            "target_spm": str(target),
-                            "report": str(live_report or ""),
-                            "policy": "normalization_stage_input",
-                            "contract": contract,
-                        })
+                        return
                     bark_source_resolution = (
                         resolve_cluster_bark_source_spm(
                             speedtree_spm,
