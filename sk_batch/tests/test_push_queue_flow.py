@@ -1370,7 +1370,153 @@ class PushQueueFlowTests(unittest.TestCase):
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
         ][-1]
-        self.assertIn("실패/준비 제외 2개", final_progress)
+        self.assertIn("root 실패 2개", final_progress)
+        self.assertIn("dependency 차단 0개", final_progress)
+
+    def test_full_pipeline_cluster_failure_blocks_only_mapped_consumer(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {
+            "spm_parallel_jobs": 1,
+            "blender_parallel_jobs": 1,
+            "push_parallel_jobs": 1,
+        }
+        app.force_rerun = True
+        failed_cluster = (
+            Path("Tree_oak") / "Cluster" / "SK_branch_oak_01.spm"
+        )
+        blocked_tree = Path("Tree_oak") / "SK_Tree_oak_01.spm"
+        unrelated_tree = Path("Tree_maple") / "SK_Tree_maple_01.spm"
+        cluster_item = {"spm": failed_cluster, "checked": False}
+        blocked_item = {"spm": blocked_tree, "checked": True}
+        unrelated_item = {"spm": unrelated_tree, "checked": True}
+        expanded = [cluster_item, blocked_item, unrelated_item]
+        app.items = {
+            str(item["spm"]): item for item in expanded
+        }
+        blender_attempts = []
+        push_attempts = []
+        preflight_inputs = []
+        blocked_contracts_at_push_expand = []
+
+        def fail_cluster_spm(_iid, spm):
+            if spm == failed_cluster:
+                raise gui.BatchItemError(
+                    "cluster SPM failed",
+                    kind="data_error",
+                )
+
+        def record_blender(_iid, spm, _item):
+            blender_attempts.append(spm)
+
+        def record_push(_iid, spm):
+            push_attempts.append(spm)
+
+        def record_preflight(targets):
+            preflight_inputs.append(
+                [item["spm"] for item in targets]
+            )
+            return list(targets), None
+
+        def expand_for_push(
+            targets,
+            _all_items,
+            stage_dependency_contracts=None,
+        ):
+            blocked_contracts_at_push_expand.append(
+                app._repair_stage_contract(blocked_tree)
+            )
+            self.assertIsNone(stage_dependency_contracts)
+            return (
+                expanded,
+                {
+                    str(blocked_tree): (str(failed_cluster),),
+                    str(unrelated_tree): (),
+                },
+                {str(failed_cluster)},
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui,
+            "LOG_DIR",
+            Path(temp_dir) / "logs",
+        ), mock.patch.object(
+            gui,
+            "expand_blender_repair_targets",
+            return_value=(
+                expanded,
+                {
+                    str(blocked_tree): (str(failed_cluster),),
+                    str(unrelated_tree): (),
+                },
+                {str(failed_cluster)},
+            ),
+        ), mock.patch.object(
+            gui,
+            "expand_push_targets",
+            side_effect=expand_for_push,
+        ) as expand_push, mock.patch.object(
+            app,
+            "_push_preflight",
+            side_effect=record_preflight,
+        ), mock.patch.object(
+            app,
+            "_job_spm",
+            side_effect=fail_cluster_spm,
+        ), mock.patch.object(
+            app,
+            "_job_blender",
+            side_effect=record_blender,
+        ), mock.patch.object(
+            app,
+            "_job_push",
+            side_effect=record_push,
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_full_pipeline(expanded)
+
+        self.assertFalse(result)
+        self.assertEqual(blender_attempts, [unrelated_tree])
+        self.assertEqual(push_attempts, [unrelated_tree])
+        self.assertEqual(preflight_inputs, [[unrelated_tree]])
+        self.assertEqual(
+            blocked_contracts_at_push_expand,
+            [{
+                "ready": False,
+                "reason": (
+                    "required Cluster stage failed: "
+                    f"{failed_cluster.name}"
+                ),
+                "kind": "dependency_blocked",
+            }],
+        )
+        self.assertEqual(
+            [item["spm"] for item in expand_push.call_args.args[0]],
+            [unrelated_tree],
+        )
+        self.assertEqual(app._active_push_auto_added_ids, set())
+        self.assertEqual(
+            app.state[str(failed_cluster)]["spm_status_kind"],
+            "data_error",
+        )
+        self.assertEqual(
+            app.state[str(blocked_tree)]["blend_status_kind"],
+            "dependency_blocked",
+        )
+        self.assertEqual(
+            app.state[str(blocked_tree)]["push_status_kind"],
+            "dependency_blocked",
+        )
+        self.assertEqual(
+            app._phase_failed_items,
+            {str(failed_cluster), str(blocked_tree)},
+        )
+        final_progress = [
+            payload for kind, payload in list(app.ui_queue.queue)
+            if kind == "progress"
+        ][-1]
+        self.assertIn("성공 1개", final_progress)
+        self.assertIn("root 실패 1개", final_progress)
+        self.assertIn("dependency 차단 1개", final_progress)
 
     def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
         gui = load_gui_module()

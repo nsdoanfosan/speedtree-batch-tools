@@ -3440,6 +3440,66 @@ class App:
         }
         self._enqueue_batch_job(job)
 
+    @staticmethod
+    def _pipeline_dependency_blocks(
+        targets,
+        dependency_map,
+        root_failed_ids,
+    ):
+        """Return exact consumer blocks from the validated dependency map."""
+        failed = {str(value) for value in root_failed_ids}
+        blocked = {}
+        for item in targets:
+            iid = str(item["spm"])
+            causes = tuple(
+                dependency
+                for dependency in dependency_map.get(iid, ())
+                if dependency in failed
+            )
+            if causes:
+                blocked[iid] = causes
+        return blocked
+
+    @staticmethod
+    def _filter_pipeline_excluded_targets(targets, excluded_ids):
+        excluded = {str(value) for value in excluded_ids}
+        return [
+            item for item in targets
+            if str(item["spm"]) not in excluded
+        ]
+
+    def _record_pipeline_dependency_block(
+        self,
+        item,
+        column,
+        blocked_sources,
+        *,
+        persist,
+        publish_repair_contract=False,
+    ):
+        iid = str(item["spm"])
+        names = ", ".join(
+            sorted(Path(value).name for value in blocked_sources)
+        )
+        reason = f"required Cluster stage failed: {names}"
+        self._record_phase_status(
+            iid,
+            column,
+            f"차단: {reason}",
+            "dependency_blocked",
+            reason,
+            details={"blocked_by": list(blocked_sources)},
+            persist=persist,
+        )
+        if publish_repair_contract:
+            self._publish_repair_stage_contract(
+                item["spm"],
+                ready=False,
+                reason=reason,
+                kind="dependency_blocked",
+            )
+        self.log(f"[의존성 차단] {Path(iid).name}: {reason}")
+
     def _run_full_pipeline(
         self,
         targets,
@@ -3449,6 +3509,8 @@ class App:
     ):
         self._active_pipeline_terminal_phase = terminal_phase
         self._active_repair_stage_contracts = {}
+        self._pipeline_root_failed_items = set()
+        self._pipeline_blocked_items = set()
         try:
             return self._run_full_pipeline_stages(
                 targets,
@@ -3462,6 +3524,8 @@ class App:
                 "_active_pipeline_terminal_phase",
                 "_active_repair_stage_contracts",
                 "_pipeline_upstream_failed_items",
+                "_pipeline_root_failed_items",
+                "_pipeline_blocked_items",
             ):
                 self.__dict__.pop(key, None)
 
@@ -3529,44 +3593,80 @@ class App:
         if terminal_phase == "push":
             schedule.append(("push", targets, phase_labels["push"]))
         pipeline_abort = None
-        failed_items = set()
+        root_failed_ids = set()
+        blocked_consumer_ids = set()
         for phase, scheduled_targets, label in schedule:
             if self.stop_flag.is_set():
                 break
-            eligible_stage = [
-                item for item in scheduled_targets
-                if str(item["spm"]) not in failed_items
-            ]
+            stage_blocked = {}
+            if phase == "blender":
+                tree_targets = [
+                    item for item in scheduled_targets
+                    if not is_cluster_source_spm(item["spm"])
+                ]
+                stage_blocked = self._pipeline_dependency_blocks(
+                    tree_targets,
+                    self._active_blender_dependency_map,
+                    root_failed_ids,
+                )
+                for item in tree_targets:
+                    iid = str(item["spm"])
+                    blocked_sources = stage_blocked.get(iid)
+                    if blocked_sources:
+                        self._record_pipeline_dependency_block(
+                            item,
+                            "blend_status",
+                            blocked_sources,
+                            persist=True,
+                            publish_repair_contract=True,
+                        )
+                blocked_consumer_ids.update(stage_blocked)
+                if stage_blocked:
+                    self.log(
+                        f"🌙 {label}: dependency 차단 "
+                        f"{len(stage_blocked)}개 · root 원인 "
+                        f"{len(root_failed_ids)}개"
+                    )
+            excluded_ids = root_failed_ids | blocked_consumer_ids
+            eligible_stage = self._filter_pipeline_excluded_targets(
+                scheduled_targets,
+                excluded_ids,
+            )
             if not eligible_stage:
                 continue
-            self._pipeline_upstream_failed_items = set(failed_items)
+            self._pipeline_root_failed_items = set(root_failed_ids)
+            self._pipeline_blocked_items = set(blocked_consumer_ids)
+            self._pipeline_upstream_failed_items = set(excluded_ids)
             self.log(f"🌙 {label} 시작")
             phase_ok = self._run_batch(
                 phase, eligible_stage, emit_done=False
             )
             phase_failed = set(getattr(self, "_phase_failed_items", set()))
-            if phase_failed:
-                failed_items.update(phase_failed)
+            new_root_failures = phase_failed - blocked_consumer_ids
+            if new_root_failures:
+                root_failed_ids.update(new_root_failures)
                 self.log(
-                    f"🌙 {label}: 실패/준비 제외 {len(phase_failed)}개는 "
-                    "다음 단계로 넘기지 않습니다."
+                    f"🌙 {label}: root 실패 "
+                    f"{len(new_root_failures)}개는 다음 단계로 넘기지 않습니다."
                 )
             self.log(f"🌙 {label} 종료")
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
                 break
-        eligible = [
-            item for item in targets
-            if str(item["spm"]) not in failed_items
-        ]
+        excluded_ids = root_failed_ids | blocked_consumer_ids
+        eligible = self._filter_pipeline_excluded_targets(
+            targets,
+            excluded_ids,
+        )
         if self.stop_flag.is_set():
             final_text = "중지됨"
         elif pipeline_abort:
             final_text = f"전체 자동 중단 — {pipeline_abort}"
-        elif failed_items:
+        elif excluded_ids:
             final_text = (
                 f"전체 자동 종료 — 성공 {len(eligible)}개 · "
-                f"실패/준비 제외 {len(failed_items)}개"
+                f"root 실패 {len(root_failed_ids)}개 · "
+                f"dependency 차단 {len(blocked_consumer_ids)}개"
             )
         else:
             final_text = "전체 자동 완료"
@@ -3576,14 +3676,18 @@ class App:
                 final_text = f"{terminal_label} 연계 실행 중지됨"
             elif pipeline_abort:
                 final_text = f"{terminal_label} 연계 실행 중단 · {pipeline_abort}"
-            elif failed_items:
+            elif excluded_ids:
                 final_text = (
-                    f"{terminal_label} 연계 실행 종료 · 성공 {len(eligible)}개 · "
-                    f"실패/준비 제외 {len(failed_items)}개"
+                    f"{terminal_label} 연계 실행 종료 · "
+                    f"성공 {len(eligible)}개 · "
+                    f"root 실패 {len(root_failed_ids)}개 · "
+                    f"dependency 차단 {len(blocked_consumer_ids)}개"
                 )
             else:
                 final_text = f"{terminal_label} 연계 실행 완료"
-        self._phase_failed_items = set(failed_items)
+        self._pipeline_root_failed_items = set(root_failed_ids)
+        self._pipeline_blocked_items = set(blocked_consumer_ids)
+        self._phase_failed_items = set(excluded_ids)
         self.ui_queue.put(("progress", final_text))
         if emit_done:
             self.ui_queue.put(("done", None))
@@ -3593,7 +3697,7 @@ class App:
         return not (
             self.stop_flag.is_set()
             or pipeline_abort
-            or failed_items
+            or excluded_ids
         )
 
     def stop_batch(self):
@@ -3701,6 +3805,57 @@ class App:
                         stage_dependency_contracts or None
                     ),
                 )
+                upstream_root_failed = set(
+                    getattr(self, "_pipeline_root_failed_items", set())
+                )
+                upstream_blocked = set(
+                    getattr(self, "_pipeline_blocked_items", set())
+                )
+                upstream_excluded = upstream_root_failed | upstream_blocked
+                if upstream_excluded:
+                    expanded_by_id = {
+                        str(item["spm"]): item for item in targets
+                    }
+                    for iid in sorted(upstream_blocked):
+                        item = expanded_by_id.get(iid)
+                        if item is not None:
+                            blocked_sources = tuple(
+                                dependency
+                                for dependency in (
+                                    self._active_blender_dependency_map.get(
+                                        iid, ()
+                                    )
+                                )
+                                if dependency in upstream_root_failed
+                            )
+                            if blocked_sources:
+                                self._record_pipeline_dependency_block(
+                                    item,
+                                    "push_status",
+                                    blocked_sources,
+                                    persist=True,
+                                )
+                    removed_roots = {
+                        iid for iid in upstream_root_failed
+                        if iid in expanded_by_id
+                    }
+                    targets = self._filter_pipeline_excluded_targets(
+                        targets,
+                        upstream_excluded,
+                    )
+                    self._active_push_auto_added_ids.difference_update(
+                        upstream_excluded
+                    )
+                    if removed_roots:
+                        self.log(
+                            "Tree Push dependency: upstream root 실패 "
+                            f"{len(removed_roots)}개 재도입 차단"
+                        )
+                    if upstream_blocked:
+                        self.log(
+                            "Tree Push dependency: blocked consumer "
+                            f"{len(upstream_blocked)}개 Push 제외"
+                        )
             except (
                 PushDependencyError,
                 OSError,
