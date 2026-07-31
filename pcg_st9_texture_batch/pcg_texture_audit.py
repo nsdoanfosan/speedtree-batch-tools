@@ -38,6 +38,7 @@ from speedtree_texture_contract import (
 )
 from speedtree_pipeline_contract import (
     branch_generator_has_render_geometry,
+    generator_guid_key as canonical_generator_guid_key,
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
@@ -414,7 +415,9 @@ def _referenced_material_ids_from_text(text):
 
 
 def _generator_guid_key(value):
-    return str(value or "").strip().casefold()
+    # Canonical, so RFC base64 and the shorter observed Modeler serialization
+    # resolve to the same Generator.
+    return canonical_generator_guid_key(value)
 
 
 def _export_node_counts_from_text(text):

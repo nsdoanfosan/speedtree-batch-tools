@@ -17,6 +17,7 @@ from pathlib import Path
 from cluster_card_pipeline.contract import _read_spm_root
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     spm_file_structural_semantic_fingerprint,
 )
@@ -332,7 +333,7 @@ def _source_binding_repairs(target_spm, material_record):
     atlas_manifest = _atlas_target_relation_manifest(target)
     atlas_bindings = {
         (
-            str(item.get("generator_guid") or "").strip(),
+            generator_guid_key(item.get("generator_guid")),
             str(item.get("slot_prefix") or "").strip(),
         ): item
         for item in (
@@ -361,7 +362,10 @@ def _source_binding_repairs(target_spm, material_record):
     repairs = []
     for pair in live_pairs:
         atlas_binding = atlas_bindings.get(
-            (pair["generator_guid"], pair["slot_prefix"])
+            (
+                generator_guid_key(pair["generator_guid"]),
+                pair["slot_prefix"],
+            )
         )
         if (
             atlas_binding is not None
@@ -399,7 +403,8 @@ def _source_binding_repairs(target_spm, material_record):
                 row
                 for row in _generator_property_pairs(backup_root)
                 if (
-                    row["generator_guid"] == pair["generator_guid"]
+                    generator_guid_key(row["generator_guid"])
+                    == generator_guid_key(pair["generator_guid"])
                     and row["generator_type"].casefold().replace(" ", "")
                     == pair["generator_type"].casefold().replace(" ", "")
                     and row["slot_prefix"] == pair["slot_prefix"]
