@@ -27,12 +27,12 @@
         <Property><Name>Random Seeds:Style</Name><Value>1</Value></Property>
         <SplineProperty><Name>Physics:Bones</Name><Value>0.44190001487731934</Value><CompoundParentSpline Count="0"/><ProfileSpline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>0.24253587424755096</TangentX><TangentY>-0.97014254331588745</TangentY><Length>0</Length></ControlPoint></ProfileSpline></SplineProperty>
       </Properties>
-      <Extra><m_nOrderValue>42</m_nOrderValue><m_vecBackgroundIconColor_R>0.10000000149011612</m_vecBackgroundIconColor_R><m_vecBackgroundIconColor_G>0.20000000298023224</m_vecBackgroundIconColor_G><m_vecBackgroundIconColor_B>0.30000001192092896</m_vecBackgroundIconColor_B><AuthoredExtra>keep</AuthoredExtra></Extra>
+      <Extra><m_nOrderValue>42</m_nOrderValue><m_vecBackgroundIconColor_r>0.10000000149011612</m_vecBackgroundIconColor_r><m_vecBackgroundIconColor_g>0.20000000298023224</m_vecBackgroundIconColor_g><m_vecBackgroundIconColor_b>0.30000001192092896</m_vecBackgroundIconColor_b><AuthoredExtra>keep</AuthoredExtra></Extra>
     </Generator>
   </Generators>
   <Links><Link><GUID>generated-link-after</GUID><SourceGUID>ABCDEFGHIJKLMNOPQRSTU==</SourceGUID><TargetGUID>abcdefghijklmnopqrstu==</TargetGUID><Weight>7</Weight></Link></Links>
   <Assets>
-    <Material_V8 ID="10"><Name>leaf-material</Name><Preview>after-material-preview</Preview><StreamPlaceholder><Data>after-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>2048</TexSizeX><TexSizeY>1024</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID><AtlasMaker Weight="0.5" FullHeight="false" UpdateMeshes="true" MakeUVArea="false" TranslationX="0" TranslationY="0" ScaleX="1" ScaleY="1" Rotation="0"/></Material_V8>
+    <Material_v8 ID="10"><Name>leaf-material</Name><Preview>after-material-preview</Preview><StreamPlaceholder><Data>after-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>2048</TexSizeX><TexSizeY>1024</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID><AtlasMaker Weight="0.5" FullHeight="false" UpdateMeshes="true" MakeUvArea="false" TranslationX="0" TranslationY="0" ScaleX="1" ScaleY="1" Rotation="0"/></Material_v8>
     <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.10000000149011612</Scale><VertexData>authored-vertices</VertexData><Lod_1><Filename/></Lod_1><Lod_2><Filename/></Lod_2></Mesh>
     <GUID>generated-assets-after</GUID>
   </Assets>

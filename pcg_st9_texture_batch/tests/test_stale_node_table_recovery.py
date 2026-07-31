@@ -138,11 +138,11 @@ def authored_scope_text(
             f"</Property></Properties></{tag}>"
         )
     material = (
-        '<Material_V8 ID="10"><Preview>'
+        '<Material_v8 ID="10"><Preview>'
         f"{volatile}</Preview><StreamPlaceholder><Data>{volatile}</Data>"
         "</StreamPlaceholder><Map Name=\"Color\"><TexFilename>"
         f"{material_filename}</TexFilename><TexEnabled>true</TexEnabled>"
-        "</Map><CutoutMeshID>130</CutoutMeshID></Material_V8>"
+        "</Map><CutoutMeshID>130</CutoutMeshID></Material_v8>"
     )
     return spm_text(stale=stale, volatile=volatile).replace(
         "<Generators>",

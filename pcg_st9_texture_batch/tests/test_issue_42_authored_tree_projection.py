@@ -1,5 +1,7 @@
 """Full-tree core-v4 acceptance and fail-closed regressions for #42."""
 
+import gzip
+import hashlib
 import json
 import re
 import sys
@@ -23,6 +25,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 BEFORE = FIXTURES / "issue_42_no_edit_before.xml"
 AFTER = FIXTURES / "issue_42_no_edit_after.xml"
 EVIDENCE = FIXTURES / "issue_42_real_no_edit_evidence.json"
+REAL_FIXTURES = FIXTURES / "issue_42" / "real"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_PATH_RE = re.compile(
     r"(?i)(?:(?<![a-z])[a-z]:[\\/]|users[\\/][^\\/]+)"
@@ -51,43 +54,43 @@ def default_material_map(map_name, seed):
         "Custom": ("0", "0", "0", "0", "true"),
         "Custom2": ("0", "0", "0", "0", "false"),
     }[map_name]
-    scalars = {
-        "TexFilename": "",
-        "TexBrightness": "0",
-        "TexContrast": "0",
-        "TexSaturation": "0",
-        "TexRed": "0",
-        "TexGreen": "0",
-        "TexBlue": "0",
-        "TexMin": "0",
-        "TexMax": "1",
-        "TexEnabled": "true",
-        "TexInvert": "false",
-        "TexInvertRed": "false",
-        "TexInvertGreen": "false",
-        "TexInvertBlue": "false",
-        "Normalize": "false",
-        "TexSizeX": "0",
-        "TexSizeY": "0",
-        "ColorX": specific[0],
-        "ColorY": specific[1],
-        "ColorZ": specific[2],
-        "TexSource": specific[3],
-        "TexToLinear": specific[4],
-    }
+    scalars = (
+        ("ColorX", specific[0]),
+        ("ColorY", specific[1]),
+        ("ColorZ", specific[2]),
+        ("TexFilename", ""),
+        ("TexSource", specific[3]),
+        ("TexBrightness", "0"),
+        ("TexContrast", "0"),
+        ("TexSaturation", "0"),
+        ("TexRed", "0"),
+        ("TexGreen", "0"),
+        ("TexBlue", "0"),
+        ("TexMin", "0"),
+        ("TexMax", "1"),
+        ("TexEnabled", "true"),
+        ("TexToLinear", specific[4]),
+        ("TexInvert", "false"),
+        ("TexInvertRed", "false"),
+        ("TexInvertGreen", "false"),
+        ("TexInvertBlue", "false"),
+        ("Normalize", "false"),
+        ("TexSizeX", "0"),
+        ("TexSizeY", "0"),
+    )
     scalar_xml = "".join(
-        f"<{name}>{value}</{name}>" for name, value in scalars.items()
+        f"<{name}>{value}</{name}>" for name, value in scalars
     )
     generate = (
         '<Generate Type="0">'
         '<File ColorHigh="ffffffff" ColorLow="ff000000" Remap="0">'
         f'{spline("0")}</File>'
         '<Linear Angle="90" CenterX="0" CenterY="0" ColorHigh="ffffffff" ColorLow="ff000000" Distance="1">'
-        f'{spline("0.45")}</Linear>'
+        f'{spline("0.44999998807907104")}</Linear>'
         '<Radial CenterX="0.5" CenterY="0.5" ColorHigh="ffffffff" ColorLow="ff000000" Distance="0.5">'
-        f'{spline("0.45")}</Radial>'
+        f'{spline("0.44999998807907104")}</Radial>'
         f'<Noise CenterX="0.5" CenterY="0.5" ColorHigh="ffffffff" ColorLow="ff000000" Scale="1" Seed="{seed}">'
-        f'{spline("0.45")}</Noise>'
+        f'{spline("0.44999998807907104")}</Noise>'
         '</Generate>'
     )
     return f'<Map Name="{map_name}">{scalar_xml}{generate}</Map>'
@@ -105,7 +108,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
         self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 4)
         self.assertEqual(
             self.before_fingerprint,
-            "66f241477cbae1118ec0f548bc88e3b8a1f3862ae1bd67973d888027e2cdb8d0",
+            "8d5dc57396cfbd31e918f8f89a2c601fe60c46ffb65fc81ad50ea5656b7419bb",
         )
         self.assertEqual(self.before_fingerprint, self.after_fingerprint)
 
@@ -114,13 +117,13 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             _legacy_authoring_graph_core_v3_projection(self.before)[
                 "fingerprint"
             ],
-            "d4d98ee30f3233b4d3cc5c5c4edcde9e58e1c9ec011b87fc155d53c8c6e1cbb5",
+            "73f9a3e4d09489f2818ad169beefba099ffa80ac2c2924b018f700f13504f182",
         )
         self.assertEqual(
             _legacy_authoring_graph_core_v3_projection(self.after)[
                 "fingerprint"
             ],
-            "649db337ae5cb7ca1e1e62de04e33d2bd8720d3d41af3abe10a5facdf589a525",
+            "f6c2ed0da01d5899eef71973612a4c1bcd0688839c7d6d183510070328ce3d9d",
         )
 
     def test_real_evidence_is_sanitized_and_records_three_exact_pairs(self):
@@ -140,6 +143,45 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 pair["before_raw_sha256"],
                 pair["after_raw_sha256"],
             )
+
+    def test_three_sanitized_real_xml_pairs_execute_the_projector(self):
+        manifest_text = (REAL_FIXTURES / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+        manifest = json.loads(manifest_text)
+        self.assertEqual(manifest["issue_number"], 42)
+        self.assertEqual(len(manifest["pairs"]), 3)
+        self.assertNotRegex(
+            manifest_text,
+            r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
+        )
+        for pair in manifest["pairs"]:
+            with self.subTest(pair=pair["pair_id"]):
+                before_bytes = gzip.decompress(
+                    (REAL_FIXTURES / pair["before_fixture"]).read_bytes()
+                )
+                after_bytes = gzip.decompress(
+                    (REAL_FIXTURES / pair["after_fixture"]).read_bytes()
+                )
+                self.assertEqual(
+                    hashlib.sha256(before_bytes).hexdigest(),
+                    pair["sanitized_before_xml_sha256"],
+                )
+                self.assertEqual(
+                    hashlib.sha256(after_bytes).hexdigest(),
+                    pair["sanitized_after_xml_sha256"],
+                )
+                before_text = before_bytes.decode("utf-8")
+                after_text = after_bytes.decode("utf-8")
+                self.assertNotRegex(
+                    before_text + after_text,
+                    r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
+                )
+                self.assertEqual(
+                    project(before_text),
+                    pair["expected_core_fingerprint"],
+                )
+                self.assertEqual(project(before_text), project(after_text))
 
     def test_authored_attack_matrix_changes_the_fingerprint(self):
         replacements = {
@@ -201,10 +243,10 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 default_a = default_material_map(map_name, 123)
                 default_b = default_material_map(map_name, 987654321)
                 with_default_a = self.after.replace(
-                    "</Material_V8>", default_a + "</Material_V8>", 1
+                    "</Material_v8>", default_a + "</Material_v8>", 1
                 )
                 with_default_b = self.after.replace(
-                    "</Material_V8>", default_b + "</Material_V8>", 1
+                    "</Material_v8>", default_b + "</Material_v8>", 1
                 )
                 self.assertEqual(
                     project(with_default_a),
@@ -215,12 +257,12 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                     self.after_fingerprint,
                 )
                 near_default = self.after.replace(
-                    "</Material_V8>",
+                    "</Material_v8>",
                     default_a.replace(
                         "<TexBrightness>0</TexBrightness>",
                         "<TexBrightness>0.25</TexBrightness>",
                         1,
-                    ) + "</Material_V8>",
+                    ) + "</Material_v8>",
                     1,
                 )
                 self.assertNotEqual(
@@ -340,14 +382,115 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 self.assertNotEqual(project(left), project(right))
 
     def test_asset_partition_preserves_order_within_each_kind(self):
-        first = '<Material_V8 ID="20"><Name>first</Name></Material_V8>'
-        second = '<Material_V8 ID="21"><Name>second</Name></Material_V8>'
+        first = '<Material_v8 ID="20"><Name>first</Name></Material_v8>'
+        second = '<Material_v8 ID="21"><Name>second</Name></Material_v8>'
         ordered = self.after.replace(
-            '<Material_V8 ID="10">',
-            first + second + '<Material_V8 ID="10">',
+            '<Material_v8 ID="10">',
+            first + second + '<Material_v8 ID="10">',
             1,
         )
         swapped = ordered.replace(first + second, second + first, 1)
+        self.assertNotEqual(project(ordered), project(swapped))
+
+    def test_normalization_allowlist_near_negatives_fail_closed(self):
+        cases = []
+
+        lowercase_preview_a = self.after.replace(
+            "<Preview>after-material-preview</Preview>",
+            "<preview>authored-one</preview>",
+            1,
+        )
+        lowercase_preview_b = lowercase_preview_a.replace(
+            "authored-one", "authored-two", 1
+        )
+        cases.append(("case-sensitive Preview QName", lowercase_preview_a,
+                      lowercase_preview_b))
+
+        preview_tail_a = self.after.replace(
+            "</Preview><StreamPlaceholder>",
+            "</Preview>authored-one<StreamPlaceholder>",
+            1,
+        )
+        preview_tail_b = preview_tail_a.replace(
+            "authored-one", "authored-two", 1
+        )
+        cases.append(("excluded child significant tail", preview_tail_a,
+                      preview_tail_b))
+
+        unknown_spline_a = self.before.replace(
+            "</UnknownRoot>",
+            "<Spline><ControlPoint><TangentX>0.1</TangentX>"
+            "</ControlPoint></Spline></UnknownRoot>",
+            1,
+        )
+        unknown_spline_b = unknown_spline_a.replace(
+            "<TangentX>0.1</TangentX>",
+            "<TangentX>0.10000000149011612</TangentX>",
+            1,
+        )
+        cases.append(("unscoped spline numeric spelling", unknown_spline_a,
+                      unknown_spline_b))
+
+        random_seed_extra_a = self.before.replace(
+            "<Name>Random Seeds:Style</Name><Value>919820633</Value>",
+            "<Name>Random Seeds:Style</Name><Value>919820633</Value>"
+            "<Authored>keep</Authored>",
+            1,
+        )
+        random_seed_extra_b = random_seed_extra_a.replace(
+            "<Value>919820633</Value>", "<Value>1</Value>", 1
+        )
+        cases.append(("Random Seeds extra child", random_seed_extra_a,
+                      random_seed_extra_b))
+
+        duplicate_parent_a = self.after.replace(
+            '<CompoundParentSpline Count="0"/>',
+            '<CompoundParentSpline Count="0"/>'
+            '<CompoundParentSpline Count="0"/>',
+            1,
+        )
+        duplicate_parent_b = duplicate_parent_a.replace(
+            '<CompoundParentSpline Count="0"/>',
+            '<CompoundParentSpline Count="0" Authored="one"/>',
+            1,
+        )
+        cases.append(("duplicate parent spline", duplicate_parent_a,
+                      duplicate_parent_b))
+
+        for name, left, right in cases:
+            with self.subTest(name=name):
+                self.assertNotEqual(project(left), project(right))
+
+        guid_case = self.before.replace(
+            "<TargetGUID>abcdefghijklmnopqrstuA==</TargetGUID>",
+            "<TargetGUID>ABCDEFGHIJKLMNOPQRSTUA==</TargetGUID>",
+            1,
+        )
+        guid_padding = self.before.replace(
+            "<TargetGUID>abcdefghijklmnopqrstuA==</TargetGUID>",
+            "<TargetGUID>abcdefghijklmnopqrstu==</TargetGUID>",
+            1,
+        )
+        self.assertNotEqual(project(guid_case), self.before_fingerprint)
+        self.assertEqual(project(guid_padding), self.before_fingerprint)
+
+        default_map = default_material_map("Specular", 123)
+        duplicate_map = self.after.replace(
+            "</Material_v8>",
+            default_map + default_map + "</Material_v8>",
+            1,
+        )
+        self.assertNotEqual(project(duplicate_map), self.after_fingerprint)
+
+        material = '<Material_v8 ID="10">'
+        mesh = '<Mesh ID="130">'
+        barrier = '<FutureAsset Authored="one"/>'
+        ordered = self.after.replace(material, barrier + material, 1)
+        swapped = ordered.replace(
+            barrier + material,
+            material,
+            1,
+        ).replace(mesh, barrier + mesh, 1)
         self.assertNotEqual(project(ordered), project(swapped))
 
 

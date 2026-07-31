@@ -27,14 +27,14 @@
         <Property><Name>Random Seeds:Style</Name><Value>919820633</Value></Property>
         <SplineProperty><Name>Physics:Bones</Name><Value>0.4419</Value><CompoundParentSpline Count="1"><Spline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>1</TangentX><TangentY>0</TangentY><Length>0</Length></ControlPoint><ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX><TangentY>0</TangentY><Length>0</Length></ControlPoint></Spline></CompoundParentSpline><ProfileSpline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>0.24253584444522858</TangentX><TangentY>-0.9701424241065979</TangentY><Length>0</Length></ControlPoint></ProfileSpline></SplineProperty>
       </Properties>
-      <Extra><m_nOrderValue>7</m_nOrderValue><m_vecBackgroundIconColor_R>0.1</m_vecBackgroundIconColor_R><m_vecBackgroundIconColor_G>0.2</m_vecBackgroundIconColor_G><m_vecBackgroundIconColor_B>0.3</m_vecBackgroundIconColor_B><AuthoredExtra>keep</AuthoredExtra></Extra>
+      <Extra><m_nOrderValue>7</m_nOrderValue><m_vecBackgroundIconColor_r>0.1</m_vecBackgroundIconColor_r><m_vecBackgroundIconColor_g>0.2</m_vecBackgroundIconColor_g><m_vecBackgroundIconColor_b>0.3</m_vecBackgroundIconColor_b><AuthoredExtra>keep</AuthoredExtra></Extra>
     </Generator>
   </Generators>
   <Links><Link><GUID>generated-link-before</GUID><SourceGUID>ABCDEFGHIJKLMNOPQRSTUA==</SourceGUID><TargetGUID>abcdefghijklmnopqrstuA==</TargetGUID><Weight>7</Weight></Link></Links>
   <Assets>
     <GUID>generated-assets-before</GUID>
     <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.1</Scale><UserData>{"generator":"Atlas Leaf Mesh Builder","group":"leaf","kind":"mesh","scope":"0123456789abcdef0123456789abcdef"}</UserData><VertexData>authored-vertices</VertexData></Mesh>
-    <Material_V8 ID="10"><Name>leaf-material</Name><Preview>before-material-preview</Preview><StreamPlaceholder><Data>before-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>0</TexSizeX><TexSizeY>0</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID></Material_V8>
+    <Material_v8 ID="10"><Name>leaf-material</Name><Preview>before-material-preview</Preview><StreamPlaceholder><Data>before-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>0</TexSizeX><TexSizeY>0</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID></Material_v8>
   </Assets>
   <CoreCollisionObjects><Object><Radius>1</Radius></Object></CoreCollisionObjects>
   <GlobalSettings><WindQuality>Best</WindQuality></GlobalSettings>
