@@ -5007,10 +5007,17 @@ def validate_unreal_bounds_contract(
     awaiting art-direction adjustment.  In that production contract the base
     contains only the non-replaced tree geometry, so Full/base size is not a
     unit probe.  The completed native Assembly remains required to reconstruct
-    the Full SK within tolerance.
+    the Full SK within tolerance.  Per-axis ratios remain the strict default;
+    an all-normalized external-prototype contract may use the Full mesh's
+    largest span as the denominator so a small, centered overhang on a thin
+    axis is not mistaken for a unit or attachment error.
     """
     full_size = _bounds_size(full_bounds, "Full SK")
     base_size = _bounds_size(base_bounds, "Assembly base")
+    relative_tolerance = _positive_number(
+        assembly_relative_tolerance,
+        "Nanite Assembly relative tolerance",
+    )
 
     axis_scale_ratios = [
         full_size[index] / base_size[index] for index in range(3)
@@ -5068,7 +5075,7 @@ def validate_unreal_bounds_contract(
         "normalized_prototype_dominance_allowed": bool(
             allow_normalized_prototype_dominance
         ),
-        "assembly_relative_tolerance": float(assembly_relative_tolerance),
+        "assembly_relative_tolerance": relative_tolerance,
     }
     if assembly_bounds is None:
         if base_scale_outside_limit:
@@ -5078,42 +5085,93 @@ def validate_unreal_bounds_contract(
         return result
 
     assembly_size = _bounds_size(assembly_bounds, "Nanite Assembly")
-    relative_errors = [
-        abs(assembly_size[index] - full_size[index]) / full_size[index]
-        for index in range(3)
+    absolute_errors = [
+        abs(assembly_size[index] - full_size[index]) for index in range(3)
     ]
-    if max(relative_errors) > float(assembly_relative_tolerance):
+    relative_errors = [
+        absolute_errors[index] / full_size[index] for index in range(3)
+    ]
+    full_span_reference = max(full_size)
+    full_span_relative_errors = [
+        value / full_span_reference for value in absolute_errors
+    ]
+    axis_relative_size_ok = max(relative_errors) <= relative_tolerance
+    normalized_full_span_size_ok = (
+        bool(allow_normalized_prototype_dominance)
+        and max(full_span_relative_errors) <= relative_tolerance
+    )
+    if not axis_relative_size_ok and not normalized_full_span_size_ok:
         raise ClusterAssemblyBuildError(
             "Nanite Assembly bounds do not reconstruct the Full SK: "
             f"full_size={full_size} assembly_size={assembly_size} "
-            f"relative_errors={relative_errors}"
+            f"relative_errors={relative_errors} "
+            f"full_span_relative_errors={full_span_relative_errors}"
         )
+    size_validation_mode = (
+        "axis_relative"
+        if axis_relative_size_ok
+        else "full_span_relative_normalized_prototype"
+    )
     full_origin = full_bounds.get("origin")
     assembly_origin = assembly_bounds.get("origin")
     origin_relative_errors = None
+    origin_absolute_errors = None
+    origin_full_span_relative_errors = None
+    origin_validation_mode = None
     if (
         isinstance(full_origin, (list, tuple))
         and len(full_origin) == 3
         and isinstance(assembly_origin, (list, tuple))
         and len(assembly_origin) == 3
     ):
-        origin_relative_errors = [
+        origin_absolute_errors = [
             abs(float(assembly_origin[index]) - float(full_origin[index]))
-            / full_size[index]
             for index in range(3)
         ]
-        if max(origin_relative_errors) > float(assembly_relative_tolerance):
+        origin_relative_errors = [
+            origin_absolute_errors[index] / full_size[index]
+            for index in range(3)
+        ]
+        origin_full_span_relative_errors = [
+            value / full_span_reference for value in origin_absolute_errors
+        ]
+        axis_relative_origin_ok = (
+            max(origin_relative_errors) <= relative_tolerance
+        )
+        normalized_full_span_origin_ok = (
+            bool(allow_normalized_prototype_dominance)
+            and max(origin_full_span_relative_errors) <= relative_tolerance
+        )
+        if not axis_relative_origin_ok and not normalized_full_span_origin_ok:
             raise ClusterAssemblyBuildError(
                 "Nanite Assembly bounds center does not match the Full SK: "
                 f"full_origin={list(full_origin)} "
-                f"assembly_origin={list(assembly_origin)}"
+                f"assembly_origin={list(assembly_origin)} "
+                f"relative_errors={origin_relative_errors} "
+                f"full_span_relative_errors={origin_full_span_relative_errors}"
             )
+        origin_validation_mode = (
+            "axis_relative"
+            if axis_relative_origin_ok
+            else "full_span_relative_normalized_prototype"
+        )
     result.update(
         {
             "status": "complete",
             "assembly": assembly_bounds,
+            "assembly_full_span_reference": full_span_reference,
+            "assembly_size_absolute_errors": absolute_errors,
             "assembly_size_relative_errors": relative_errors,
+            "assembly_size_full_span_relative_errors": (
+                full_span_relative_errors
+            ),
+            "assembly_size_validation_mode": size_validation_mode,
+            "assembly_origin_absolute_errors": origin_absolute_errors,
             "assembly_origin_relative_errors": origin_relative_errors,
+            "assembly_origin_full_span_relative_errors": (
+                origin_full_span_relative_errors
+            ),
+            "assembly_origin_validation_mode": origin_validation_mode,
         }
     )
     return result

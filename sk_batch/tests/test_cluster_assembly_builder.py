@@ -2252,11 +2252,73 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             "origin": [0.0, 0.0, 1700.0],
             "size": [1600.0, 1500.0, 3600.0],
         }
+        for normalized_prototypes in (False, True):
+            with self.subTest(normalized_prototypes=normalized_prototypes):
+                with self.assertRaisesRegex(
+                    ClusterAssemblyBuildError,
+                    "do not reconstruct the Full SK",
+                ):
+                    validate_unreal_bounds_contract(
+                        full,
+                        base,
+                        displaced,
+                        allow_normalized_prototype_dominance=(
+                            normalized_prototypes
+                        ),
+                    )
+
+    def test_normalized_prototype_bounds_allow_thin_axis_overhang(self):
+        full = {
+            "origin": [
+                -1.0982780456542969,
+                -5.082328796386719,
+                24.226932525634766,
+            ],
+            "size": [164.37466430664062, 179.83251953125, 57.84678649902344],
+        }
+        base = {
+            "origin": [
+                -3.556598663330078,
+                -5.708957672119141,
+                18.99129867553711,
+            ],
+            "size": [138.00582885742188, 149.26934814453125, 47.375518798828125],
+        }
+        assembly = {
+            "origin": [
+                0.8774795532226562,
+                -6.514362335205078,
+                22.903104782104492,
+            ],
+            "size": [175.61282348632812, 193.51742553710938, 73.70487976074219],
+        }
+
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
             "do not reconstruct the Full SK",
         ):
-            validate_unreal_bounds_contract(full, base, displaced)
+            validate_unreal_bounds_contract(full, base, assembly)
+
+        report = validate_unreal_bounds_contract(
+            full,
+            base,
+            assembly,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(
+            report["assembly_size_validation_mode"],
+            "full_span_relative_normalized_prototype",
+        )
+        self.assertGreater(max(report["assembly_size_relative_errors"]), 0.27)
+        self.assertLess(
+            max(report["assembly_size_full_span_relative_errors"]),
+            0.09,
+        )
+        self.assertEqual(
+            report["assembly_origin_validation_mode"],
+            "axis_relative",
+        )
 
     def test_unreal_plan_keeps_full_and_assembly_separate(self):
         manifest = {
