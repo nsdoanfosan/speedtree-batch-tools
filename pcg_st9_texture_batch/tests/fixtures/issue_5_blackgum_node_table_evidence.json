@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "contract": "speedtree_blackgum_node_table_evidence_v1",
+  "issue_url": "https://github.com/nsdoanfosan/speedtree-batch-tools/issues/5",
+  "issue_number": 5,
+  "scope_note": "Asset-only evidence. Tool/diagnostic code for interpreting this data lives in issue #4 and must not be edited from here.",
+  "recorded_utc": "2026-07-31T17:23:45Z",
+  "parser": {
+    "module": "pcg_texture_audit",
+    "snapshot_function": "live_generator_delivery_snapshot",
+    "snapshot_contract": "speedtree_live_generator_delivery_snapshot_v1",
+    "node_table_state_function": "_node_table_state",
+    "cluster_assembly_contract_schema_version": 1,
+    "stale_delivery_reason": "live_export_evidence_unavailable_stale_node_table",
+    "stale_delivery_error": "generator_export_evidence_stale_node_table"
+  },
+  "delivery_context": {
+    "observed_utc": "2026-07-31T17:23:45Z",
+    "error": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+    "role": "cluster",
+    "declared_target_mesh_ids": [130, 131, 132, 133],
+    "live_export_participating_target_mesh_ids_before_resave": [],
+    "downstream_effect": "dependency_blocked"
+  },
+  "stale_assets": [
+    {
+      "asset_id": "SK_bush_blackgum_02",
+      "asset_relative_path": "SK_bush_blackgum_02.spm",
+      "before": {
+        "captured_utc": "2026-07-31T17:23:45Z",
+        "current_generator_count": 29,
+        "node_table_generator_count": 38,
+        "orphan_generator_guid_count": 19,
+        "orphan_node_count": 3784,
+        "total_node_count": 4197,
+        "stale": true,
+        "spm_text_sha256": null,
+        "source": "issue_5_body_table_and_pcg_texture_audit_node_table_state_docstring"
+      },
+      "after": {
+        "status": "pending",
+        "resaved": false,
+        "captured_utc": null,
+        "current_generator_count": null,
+        "node_table_generator_count": null,
+        "orphan_generator_guid_count": null,
+        "orphan_node_count": null,
+        "total_node_count": null,
+        "stale": null,
+        "spm_text_sha256": null
+      },
+      "audit_outcome": "blocked_pending_manual_modeler_resave"
+    },
+    {
+      "asset_id": "SK_bush_blackgum_03",
+      "asset_relative_path": "SK_bush_blackgum_03.spm",
+      "before": {
+        "captured_utc": "2026-07-31T17:23:45Z",
+        "current_generator_count": 24,
+        "node_table_generator_count": 34,
+        "orphan_generator_guid_count": null,
+        "orphan_node_count": 5416,
+        "total_node_count": 6325,
+        "stale": true,
+        "spm_text_sha256": null,
+        "source": "issue_5_body_table"
+      },
+      "after": {
+        "status": "pending",
+        "resaved": false,
+        "captured_utc": null,
+        "current_generator_count": null,
+        "node_table_generator_count": null,
+        "orphan_generator_guid_count": null,
+        "orphan_node_count": null,
+        "total_node_count": null,
+        "stale": null,
+        "spm_text_sha256": null
+      },
+      "audit_outcome": "blocked_pending_manual_modeler_resave"
+    }
+  ],
+  "coherent_reference_assets": [
+    {
+      "asset_id": "SK_cluster_blackgum_01",
+      "asset_relative_path": "SK_cluster_blackgum_01.spm",
+      "current_generator_count": 25,
+      "node_table_generator_count": 25,
+      "orphan_generator_guid_count": 0,
+      "orphan_node_count": 0,
+      "stale": false
+    },
+    {
+      "asset_id": "SK_bush_blackgum_01",
+      "asset_relative_path": "SK_bush_blackgum_01.spm",
+      "current_generator_count": 32,
+      "node_table_generator_count": 32,
+      "orphan_generator_guid_count": 0,
+      "orphan_node_count": 0,
+      "stale": false
+    }
+  ],
+  "resave_tool": {
+    "name": "SpeedTree Modeler",
+    "version": "v10.1.0",
+    "executed": false,
+    "executed_utc": null,
+    "operator": null
+  },
+  "audit_outcome": "blocked_pending_manual_resave",
+  "reproduction_checklist": [
+    "Resolve the configured SpeedTree asset root (see sk_batch.sk_common.DEFAULTS['root']; do not hardcode a new path) and locate SK_bush_blackgum_02.spm and SK_bush_blackgum_03.spm there.",
+    "For each file, call pcg_texture_audit.live_generator_delivery_snapshot(path) and read result['node_table'].",
+    "Confirm node_table_generator_count, orphan_generator_guid_count (where known) and orphan_node_count/total_node_count match this fixture's 'before' block, and result['node_table']['stale'] is True for both files.",
+    "Confirm SK_cluster_blackgum_01.spm and SK_bush_blackgum_01.spm remain coherent (stale: False) as regression references.",
+    "Confirm pcg_cluster_assembly_contract._classify_stale_node_table_block() resolves the Cluster row's delivery_reason to live_export_evidence_unavailable_stale_node_table rather than a plain disconnection."
+  ],
+  "completion_checklist": [
+    {
+      "item": "both_affected_spms_report_zero_orphan_node_ownership",
+      "status": "pending",
+      "verified_by": "live_generator_delivery_snapshot(path)['node_table']['orphan_node_count'] == 0 for both files"
+    },
+    {
+      "item": "required_current_generator_guids_receive_valid_live_export_evidence",
+      "status": "pending",
+      "verified_by": "leaf_generator_bindings rows for the declared Generators report export_evidence == 'node_table' with export_participates true where expected"
+    },
+    {
+      "item": "live_export_participating_target_mesh_ids_equals_normalized_declared_set",
+      "status": "pending",
+      "verified_by": "live_export_participating_target_mesh_ids == [130, 131, 132, 133]"
+    },
+    {
+      "item": "stale_node_table_validation_block_no_longer_occurs_after_resave",
+      "status": "pending",
+      "verified_by": "delivery_reason is no longer live_export_evidence_unavailable_stale_node_table on rerun"
+    },
+    {
+      "item": "no_validation_bypass_or_fail_open_special_case_introduced",
+      "status": "not_applicable_to_this_asset_only_fixture",
+      "verified_by": "tracked in issue #4; #5 stays asset-only per owner scope note"
+    }
+  ],
+  "notes": [
+    "orphan_generator_guid_count is null wherever the source evidence did not report it explicitly; it must not be guessed from node_table_generator_count minus current_generator_count, since a current Generator can legitimately own zero nodes.",
+    "spm_text_sha256 is intentionally null for 'before' and 'after': the SPM assets live outside this repository (external configured asset root) and were not available to hash while preparing this fixture. Populate it from live_generator_delivery_snapshot(path)['spm_text_sha256'] when captured against the real files.",
+    "The 'after' slots must stay pending (resaved: false, all counts null) until a real SpeedTree Modeler open/resave has actually been performed and re-audited; do not fill them in from expectation."
+  ]
+}
