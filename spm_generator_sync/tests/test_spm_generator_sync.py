@@ -2169,6 +2169,76 @@ class GeneratorSyncTests(unittest.TestCase):
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected)
 
+    def test_rollback_failure_preserves_original_error_and_stable_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            target_before = target.read_bytes()
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+            sync.assign_follower(
+                manifest,
+                master.name,
+                target.name,
+                mapping,
+                confirmed=True,
+            )
+            sync.save_manifest(folder, manifest)
+            manifest_before = (folder / sync.MANIFEST_NAME).read_bytes()
+            real_copy2 = sync.shutil.copy2
+
+            def fail_target_restore(source, destination, *args, **kwargs):
+                source = Path(source)
+                destination = Path(destination)
+                if (
+                    source.parent.name.startswith("generator_sync_")
+                    and destination == target
+                ):
+                    raise OSError("restore access denied")
+                return real_copy2(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                sync.shutil,
+                "copy2",
+                side_effect=fail_target_restore,
+            ):
+                with self.assertRaises(sync.TransactionRollbackError) as raised:
+                    sync.apply_group_transaction(
+                        folder,
+                        master.name,
+                        verify_speedtree=False,
+                        verify_callback=lambda _path: (_ for _ in ()).throw(
+                            RuntimeError("post_write_validation_failed")
+                        ),
+                    )
+
+            error = raised.exception
+            self.assertEqual(error.reason_token, "transaction_rollback_failed")
+            self.assertIn("post_write_validation_failed", error.original_error)
+            self.assertTrue(error.rollback_errors)
+            self.assertIn("restore access denied", str(error.rollback_errors))
+            self.assertIn("transaction_rollback_failed", str(error))
+            self.assertNotEqual(target.read_bytes(), target_before)
+            self.assertEqual(
+                (folder / sync.MANIFEST_NAME).read_bytes(),
+                manifest_before,
+            )
+
     def test_transaction_preserves_concurrent_manifest_edit_and_rolls_back_spm(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

@@ -1980,6 +1980,159 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_committed_success_wins_over_late_cancel_request(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            completed = []
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-commit", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def commit_then_late_cancel(report):
+                report.cancel_event.set()
+                return {"commit_marker": "manifest_committed"}
+
+            app._start_job(
+                "commit race",
+                commit_then_late_cancel,
+                completed.append,
+            )
+            deadline = time.monotonic() + 3
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertEqual(
+                completed,
+                [{"commit_marker": "manifest_committed"}],
+            )
+            self.assertEqual(app.job_cancellations, [])
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(shared_results[0][0], True)
+            self.assertEqual(shared_results[0][1]["outcome"], "completed")
+        finally:
+            root.destroy()
+
+    def test_cancel_event_does_not_mask_rollback_failure(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-rollback", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def rollback_fails(report):
+                report.cancel_event.set()
+                raise RuntimeError(
+                    "[transaction_rollback_failed] restore denied"
+                )
+
+            with mock.patch.object(GUI.messagebox, "showerror"):
+                app._start_job("rollback race", rollback_fails, lambda _value: None)
+                deadline = time.monotonic() + 3
+                while app.active_job is not None and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(app.job_cancellations, [])
+            self.assertEqual(len(app.job_failures), 1)
+            self.assertIn("transaction_rollback_failed", app.job_failures[0][1])
+            self.assertEqual(shared_results[0][0], False)
+            self.assertEqual(shared_results[0][1]["outcome"], "failed")
+        finally:
+            root.destroy()
+
+    def test_shared_wait_cancel_has_before_launch_reason_and_never_runs_func(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            ran = []
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-wait", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    cancel_event.set()
+                    raise GUI.WaitCancelled("cancelled while queued")
+
+                def cancel(self, _job_id, *, reason):
+                    return None
+
+            app.shared_queue_runtime = Runtime()
+
+            app._start_job(
+                "wait cancel",
+                lambda _report: ran.append(True),
+                lambda _value: None,
+            )
+            deadline = time.monotonic() + 3
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertEqual(ran, [])
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(
+                app.job_cancellations,
+                [("wait cancel", "cancelled_before_launch")],
+            )
+        finally:
+            root.destroy()
+
     def test_chatty_output_is_rendered_in_bounded_tk_batches(self):
         root = tk.Tk()
         root.withdraw()
@@ -2033,6 +2186,131 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     pass
             root.destroy()
 
+    def test_one_hundred_thousand_producer_lines_use_bounded_coalesced_buffer(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            completed = []
+
+            def work(report):
+                for index in range(100_000):
+                    report.output("stdout", f"producer-line-{index}")
+                report.output("stderr", "final-stderr-evidence")
+                return "ok"
+
+            app._start_job("100k producer", work, completed.append)
+            app.worker.join(timeout=10)
+            self.assertFalse(app.worker.is_alive())
+            self.assertLessEqual(
+                len(app.active_job["output_buffer"]),
+                GUI.PROCESS_OUTPUT_BUFFER_LINES,
+            )
+            self.assertLessEqual(app.job_queue.qsize(), 4)
+
+            deadline = time.monotonic() + 8
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.001)
+
+            self.assertEqual(completed, ["ok"])
+            rendered = app.process_output.get("1.0", "end")
+            self.assertIn("process_output_omitted", rendered)
+            self.assertIn("final-stderr-evidence", rendered)
+        finally:
+            root.destroy()
+
+    def test_shutdown_completion_does_not_expire_after_virtual_five_seconds(self):
+        scheduled = []
+        completed = []
+
+        class Root:
+            def after(self, delay, callback):
+                scheduled.append((delay, callback))
+                return len(scheduled)
+
+            def after_idle(self, callback):
+                return self.after(0, callback)
+
+        class Worker:
+            alive = True
+
+            def is_alive(self):
+                return self.alive
+
+        app = GUI.App.__new__(GUI.App)
+        app.root = Root()
+        app.worker = Worker()
+        app.active_job = {"cancel_event": threading.Event()}
+        pending_ran = []
+        app.pending_jobs = deque([
+            {
+                "cancel_event": threading.Event(),
+                "func": lambda _report: pending_ran.append(True),
+            }
+        ])
+        app.shared_queue_runtime = mock.Mock()
+
+        app.shutdown_shared_queue(on_complete=lambda: completed.append("done"))
+        self.assertTrue(app.active_job["cancel_event"].is_set())
+        self.assertEqual(pending_ran, [])
+
+        for _poll in range(121):
+            _delay, callback = scheduled.pop(0)
+            callback()
+        self.assertEqual(completed, [], "virtual 6.05s must not force close")
+
+        app.worker.alive = False
+        _delay, callback = scheduled.pop(0)
+        callback()
+        self.assertEqual(completed, ["done"])
+        app.shared_queue_runtime.shutdown.assert_called_once_with()
+
+    def test_shutdown_surfaces_fail_closed_termination_reason_before_completion(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.worker = None
+            app.pending_jobs = deque()
+            app.active_job = {
+                "cancel_event": threading.Event(),
+                "worker_terminal_payload": RuntimeError(
+                    "[process_kill_grace_expired] pid=4242"
+                ),
+            }
+            app.shared_queue_runtime = mock.Mock()
+            completed = []
+
+            with mock.patch.object(GUI.messagebox, "showerror") as showerror:
+                app.shutdown_shared_queue(
+                    on_complete=lambda: completed.append(True)
+                )
+                deadline = time.monotonic() + 2
+                while not completed and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(completed, [True])
+            showerror.assert_called_once()
+            self.assertIn(
+                "process_kill_grace_expired",
+                showerror.call_args.args[1],
+            )
+        finally:
+            root.destroy()
+
     def test_window_shutdown_terminates_active_speedtree_process(self):
         root = tk.Tk()
         root.withdraw()
@@ -2076,19 +2354,28 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
 
                 app._start_job("slow SpeedTree", work, lambda _result: None)
                 self.assertTrue(ready.wait(3))
-                started = time.monotonic()
-                app.shutdown_shared_queue()
-                elapsed = time.monotonic() - started
+                closing_job = app.active_job
+                shutdown_completed = []
+                app.shutdown_shared_queue(
+                    on_complete=lambda: shutdown_completed.append(True)
+                )
+                deadline = time.monotonic() + 8
+                while not shutdown_completed and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
 
-            self.assertLess(elapsed, 5.0)
-            self.assertFalse(app.worker.is_alive())
+            self.assertEqual(shutdown_completed, [True])
+            self.assertTrue(app.worker is None or not app.worker.is_alive())
             done_events = []
             while not app.job_queue.empty():
                 event = app.job_queue.get_nowait()
                 if event[0] == "done":
                     done_events.append(event)
-            self.assertEqual(len(done_events), 1)
-            cancelled = done_events[0][3]
+            cancelled = (
+                done_events[0][3]
+                if done_events
+                else closing_job.get("terminal_payload")
+            )
             self.assertIsInstance(cancelled, GUI.engine.SyncCancelled)
             self.assertIn(
                 cancelled.termination_state,

@@ -137,6 +137,24 @@ class SyncCancelled(SyncError):
         }
 
 
+class TransactionRollbackError(SyncError):
+    """A transaction failed and at least one restore step also failed."""
+
+    reason_token = "transaction_rollback_failed"
+
+    def __init__(self, original: BaseException, rollback_errors: list[dict]):
+        self.original_error = f"{type(original).__name__}: {original}"
+        self.rollback_errors = tuple(dict(item) for item in rollback_errors)
+        evidence = "; ".join(
+            f"{item['operation']}:{item['path']}:{item['error']}"
+            for item in self.rollback_errors
+        )
+        super().__init__(
+            f"[{self.reason_token}] original={self.original_error}; "
+            f"rollback={evidence}"
+        )
+
+
 def _raise_if_cancelled(cancel_requested) -> None:
     if cancel_requested is not None and cancel_requested():
         raise SyncCancelled("cancelled_at_safe_boundary")
@@ -2957,7 +2975,9 @@ def verify_speedtree_export(
                 timeout=timeout,
                 output_callback=output_callback,
                 cancel_requested=cancel_requested,
-                creationflags=0x08000000 if os.name == "nt" else 0,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                ),
             )
         except ProcessCancelled as exc:
             raise SyncCancelled(
@@ -2967,9 +2987,23 @@ def verify_speedtree_export(
             ) from exc
         if result.returncode != 0 or not output.is_file():
             detail = (result.stderr or result.stdout or "")[-1000:]
+            omitted_chars = (
+                result.stderr_omitted_chars
+                if result.stderr
+                else result.stdout_omitted_chars
+            )
+            evidence = (
+                f" [process_output_tail_omitted chars={omitted_chars}]"
+                if omitted_chars else ""
+            )
+            reason_token = (
+                "speedtree_process_nonzero"
+                if result.returncode != 0
+                else "speedtree_export_output_missing"
+            )
             raise SyncError(
-                f"SpeedTree 10.1 XML 검증 실패: {spm_path.name} "
-                f"(code {result.returncode}) {detail}"
+                f"[{reason_token}] SpeedTree 10.1 XML 검증 실패: "
+                f"{spm_path.name} (code {result.returncode}){evidence} {detail}"
             )
         try:
             ET.parse(output)
@@ -3537,15 +3571,48 @@ def apply_group_transaction(
         save_manifest(folder, manifest)
         if progress_callback is not None:
             progress_callback("관계 정보 저장 완료", 100)
-    except Exception:
+    except Exception as original_exc:
+        rollback_errors = []
         for path, backup in backups:
             if backup.exists():
-                shutil.copy2(backup, path)
+                try:
+                    shutil.copy2(backup, path)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "restore_spm",
+                        "path": str(path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
         if manifest_write_attempted:
             if manifest_existed and manifest_backup.is_file():
-                shutil.copy2(manifest_backup, manifest_path)
+                try:
+                    shutil.copy2(manifest_backup, manifest_path)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "restore_manifest",
+                        "path": str(manifest_path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
             elif not manifest_existed:
-                manifest_path.unlink(missing_ok=True)
+                try:
+                    manifest_path.unlink(missing_ok=True)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "operation": "remove_new_manifest",
+                        "path": str(manifest_path),
+                        "error": (
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                    })
+        if rollback_errors:
+            raise TransactionRollbackError(
+                original_exc,
+                rollback_errors,
+            ) from original_exc
         raise
     return {
         "status": "applied",

@@ -28,7 +28,7 @@ from cluster_blend_sync import (
     run_cluster_relation_transaction,
 )
 from cluster_source_prepare import prepare_cluster_source_if_required
-from shared_queue_runtime import SharedQueueRuntime
+from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 
 
 def _load_sibling_engine():
@@ -60,6 +60,8 @@ CONFIG_PATH = TOOL_DIR / "spm_generator_sync_config.json"
 CACHE_PATH = TOOL_DIR / "spm_generator_sync_cache.json"
 REPORT_DIR = TOOL_DIR / "reports"
 CACHE_VERSION = 4
+PROCESS_OUTPUT_BUFFER_LINES = 4096
+PROCESS_OUTPUT_LINE_CHARS = 4096
 DEFAULT_TREE_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
@@ -470,6 +472,9 @@ class App:
         self.job_last_output_at = None
         self.job_stage = "대기"
         self.closing = False
+        self._shutdown_callbacks = []
+        self._shutdown_poll_scheduled = False
+        self._shutdown_complete = False
         self.refresh_generation = 0
         self.shared_queue_runtime = SharedQueueRuntime(
             "spm_generator_sync"
@@ -2759,6 +2764,12 @@ class App:
             self.job_last_output_at = None
         if not hasattr(self, "closing"):
             self.closing = False
+        if not hasattr(self, "_shutdown_callbacks"):
+            self._shutdown_callbacks = []
+        if not hasattr(self, "_shutdown_poll_scheduled"):
+            self._shutdown_poll_scheduled = False
+        if not hasattr(self, "_shutdown_complete"):
+            self._shutdown_complete = False
 
     @staticmethod
     def _cancel_state_label(state):
@@ -2902,6 +2913,14 @@ class App:
             "shared_queue": bool(shared_queue),
             "cancel_event": threading.Event(),
             "cancel_state": "queued",
+            "output_buffer": deque(),
+            "output_lock": threading.Lock(),
+            "output_wakeup_queued": False,
+            "output_omitted_lines": 0,
+            "output_omitted_chars": 0,
+            "output_total_omitted_lines": 0,
+            "output_total_omitted_chars": 0,
+            "output_omission_summary_rendered": False,
         }
         self.pending_jobs.append(job)
         self.queue_run_total += 1
@@ -2959,12 +2978,33 @@ class App:
             ))
 
         def output(channel, line):
-            self.job_queue.put((
-                "output",
-                job["id"],
-                str(channel),
-                str(line),
-            ))
+            channel = str(channel)
+            line = str(line)
+            omitted_chars = 0
+            if len(line) > PROCESS_OUTPUT_LINE_CHARS:
+                omitted_chars = len(line) - PROCESS_OUTPUT_LINE_CHARS
+                marker = (
+                    f"[process_output_line_truncated omitted_chars="
+                    f"{omitted_chars}] "
+                )
+                keep = max(0, PROCESS_OUTPUT_LINE_CHARS - len(marker))
+                line = marker + (line[-keep:] if keep else "")
+            should_wake = False
+            with job["output_lock"]:
+                if len(job["output_buffer"]) >= PROCESS_OUTPUT_BUFFER_LINES:
+                    _old_channel, old_line = job["output_buffer"].popleft()
+                    job["output_omitted_lines"] += 1
+                    job["output_omitted_chars"] += len(old_line)
+                    job["output_total_omitted_lines"] += 1
+                    job["output_total_omitted_chars"] += len(old_line)
+                job["output_omitted_chars"] += omitted_chars
+                job["output_total_omitted_chars"] += omitted_chars
+                job["output_buffer"].append((channel, line))
+                if not job["output_wakeup_queued"]:
+                    job["output_wakeup_queued"] = True
+                    should_wake = True
+            if should_wake:
+                self.job_queue.put(("output_ready", job["id"]))
 
         def raise_if_cancelled():
             if job["cancel_event"].is_set():
@@ -3021,15 +3061,19 @@ class App:
                             0,
                         )
 
-                    lease = shared_runtime.wait_for_turn(
-                        shared_job_id,
-                        on_wait=report_wait,
-                        cancel_event=job["cancel_event"],
-                    )
+                    try:
+                        lease = shared_runtime.wait_for_turn(
+                            shared_job_id,
+                            on_wait=report_wait,
+                            cancel_event=job["cancel_event"],
+                        )
+                    except WaitCancelled as exc:
+                        raise engine.SyncCancelled(
+                            "cancelled_before_launch"
+                        ) from exc
                     report("공용 대기열 진입 · 단독 실행", 1)
                 raise_if_cancelled()
                 payload = job["func"](report)
-                raise_if_cancelled()
                 queue_success = not (
                     isinstance(payload, dict)
                     and (
@@ -3050,14 +3094,10 @@ class App:
                             ),
                         },
                     )
+                job["worker_terminal_ok"] = True
+                job["worker_terminal_payload"] = payload
                 self.job_queue.put(("done", job["id"], True, payload))
             except Exception as exc:
-                if job["cancel_event"].is_set() and not isinstance(
-                    exc, engine.SyncCancelled
-                ):
-                    exc = engine.SyncCancelled(
-                        "cancelled_at_safe_boundary"
-                    )
                 cancelled = isinstance(exc, engine.SyncCancelled)
                 if cancelled:
                     job["cancel_state"] = exc.termination_state
@@ -3092,11 +3132,51 @@ class App:
                         # removed the ticket.  Preserve the causal failure;
                         # queue recovery remains the runtime's responsibility.
                         pass
+                job["worker_terminal_ok"] = False
+                job["worker_terminal_payload"] = exc
                 self.job_queue.put(("done", job["id"], False, exc))
 
-        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker = threading.Thread(target=run, daemon=False)
         self.worker.start()
         self.root.after(100, self._poll_job)
+
+    def _drain_process_output(self, job, maximum):
+        """Drain a bounded batch and keep at most one wake-up queued."""
+
+        entries = []
+        maximum = max(1, int(maximum))
+        requeue = False
+        with job["output_lock"]:
+            job["output_wakeup_queued"] = False
+            omitted_lines = job["output_omitted_lines"]
+            omitted_chars = job["output_omitted_chars"]
+            job["output_omitted_lines"] = 0
+            job["output_omitted_chars"] = 0
+            if omitted_lines or omitted_chars:
+                entries.append((
+                    "system",
+                    "[process_output_omitted] "
+                    f"lines={omitted_lines} chars={omitted_chars}",
+                ))
+            while job["output_buffer"] and len(entries) < maximum:
+                entries.append(job["output_buffer"].popleft())
+            if job["output_buffer"]:
+                job["output_wakeup_queued"] = True
+                requeue = True
+        if requeue:
+            self.job_queue.put(("output_ready", job["id"]))
+        return entries
+
+    @staticmethod
+    def _job_output_pending(job):
+        if job is None or "output_lock" not in job:
+            return False
+        with job["output_lock"]:
+            return bool(
+                job["output_buffer"]
+                or job["output_omitted_lines"]
+                or job["output_omitted_chars"]
+            )
 
     def _poll_job(self):
         self._ensure_job_queue_state()
@@ -3137,6 +3217,23 @@ class App:
                 self.job_last_progress_at = now
                 self.job_last_output_at = now
                 output_batch.append((channel, line))
+            elif event[0] == "output_ready":
+                _kind, job_id = event
+                if (
+                    self.active_job is None
+                    or job_id != self.active_job["id"]
+                ):
+                    continue
+                if len(output_batch) >= 500:
+                    self.job_queue.put(event)
+                    break
+                now = time.monotonic()
+                self.job_last_progress_at = now
+                self.job_last_output_at = now
+                output_batch.extend(self._drain_process_output(
+                    self.active_job,
+                    max(1, 500 - len(output_batch)),
+                ))
             elif event[0] == "done":
                 _kind, job_id, _ok, _payload = event
                 if (
@@ -3146,6 +3243,30 @@ class App:
                     completed = event
 
         self._append_process_output_batch(output_batch)
+
+        if (
+            completed is not None
+            and self._job_output_pending(self.active_job)
+        ):
+            self.job_queue.put(completed)
+            self.root.after(10, self._poll_job)
+            return
+        if (
+            completed is not None
+            and self.active_job is not None
+            and not self.active_job.get("output_omission_summary_rendered")
+            and (
+                self.active_job.get("output_total_omitted_lines", 0)
+                or self.active_job.get("output_total_omitted_chars", 0)
+            )
+        ):
+            self.active_job["output_omission_summary_rendered"] = True
+            self._append_process_output(
+                "system",
+                "[process_output_omitted] total "
+                f"lines={self.active_job['output_total_omitted_lines']} "
+                f"chars={self.active_job['output_total_omitted_chars']}",
+            )
 
         elapsed = max(0, int(time.monotonic() - (self.job_started_at or time.monotonic())))
         elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
@@ -3196,6 +3317,8 @@ class App:
 
         _kind, _job_id, ok, payload = completed
         job = self.active_job
+        job["terminal_ok"] = bool(ok)
+        job["terminal_payload"] = payload
         self.queue_run_completed += 1
         has_followup = bool(self.pending_jobs)
         self._job_has_followup = has_followup
@@ -3416,29 +3539,67 @@ class App:
             return
         self._apply_followers(self.followers_from_selection())
 
-    def shutdown_shared_queue(self):
-        """Cancel local work, stop this job's child, then close queue tickets."""
+    def shutdown_shared_queue(self, *, on_complete=None):
+        """Begin two-phase shutdown and complete only after the owner exits."""
 
         self._ensure_job_queue_state()
-        self.closing = True
-        active = self.active_job
-        if active is not None:
-            cancel_event = active.get("cancel_event")
-            if cancel_event is not None:
-                active["cancel_state"] = "requested_on_close"
-                cancel_event.set()
-        for job in list(self.pending_jobs):
-            cancel_event = job.get("cancel_event")
-            if cancel_event is not None:
-                cancel_event.set()
-            job["cancel_state"] = "cancelled_on_close"
-        self.pending_jobs.clear()
-        runtime = getattr(self, "shared_queue_runtime", None)
-        if runtime is not None:
-            runtime.shutdown()
+        if callable(on_complete):
+            if self._shutdown_complete:
+                self.root.after_idle(on_complete)
+                return
+            self._shutdown_callbacks.append(on_complete)
+        if not self.closing:
+            self.closing = True
+            active = self.active_job
+            if active is not None:
+                cancel_event = active.get("cancel_event")
+                if cancel_event is not None:
+                    active["cancel_state"] = "requested_on_close"
+                    cancel_event.set()
+            for job in list(self.pending_jobs):
+                cancel_event = job.get("cancel_event")
+                if cancel_event is not None:
+                    cancel_event.set()
+                job["cancel_state"] = "cancelled_on_close"
+            self.pending_jobs.clear()
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                runtime.shutdown()
+        self._schedule_shutdown_completion_poll()
+
+    def _schedule_shutdown_completion_poll(self):
+        if self._shutdown_complete or self._shutdown_poll_scheduled:
+            return
+        self._shutdown_poll_scheduled = True
+        self.root.after(50, self._poll_shutdown_completion)
+
+    def _poll_shutdown_completion(self):
+        self._shutdown_poll_scheduled = False
         worker = getattr(self, "worker", None)
         if worker is not None and worker.is_alive():
-            worker.join(timeout=5.0)
+            self._schedule_shutdown_completion_poll()
+            return
+        active = getattr(self, "active_job", None)
+        terminal_payload = (
+            active.get("worker_terminal_payload")
+            if isinstance(active, dict) else None
+        )
+        if (
+            terminal_payload is not None
+            and not isinstance(terminal_payload, engine.SyncCancelled)
+            and not getattr(self, "_shutdown_failure_reported", False)
+        ):
+            self._shutdown_failure_reported = True
+            messagebox.showerror(
+                "종료 정리 실패",
+                str(terminal_payload),
+                parent=self.root,
+            )
+        self._shutdown_complete = True
+        callbacks = list(self._shutdown_callbacks)
+        self._shutdown_callbacks.clear()
+        for callback in callbacks:
+            callback()
 
 
 def main():
@@ -3446,9 +3607,16 @@ def main():
     app = App(root)
 
     def close():
-        app.shutdown_shared_queue()
-        app.persist_config()
-        root.destroy()
+        if getattr(app, "_standalone_close_requested", False):
+            return
+        app._standalone_close_requested = True
+        root.withdraw()
+
+        def finalize():
+            app.persist_config()
+            root.destroy()
+
+        app.shutdown_shared_queue(on_complete=finalize)
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
