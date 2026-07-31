@@ -2613,6 +2613,137 @@ class BlendLiveStatusTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
+    def test_cluster_live_audit_reports_artifact_mismatch_without_input_churn(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            (owner / "Cluster").mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            artifact = owner / "textures" / "T_Leaf_elm_01_color.tga"
+            spm.write_bytes(b"tree")
+            artifact.parent.mkdir()
+            artifact.write_bytes(b"pixels")
+            raw_audit = {
+                "payload": {},
+                "audit_report": str(Path(temporary) / "live.json"),
+                "log_file": str(Path(temporary) / "live.log"),
+            }
+            artifact_error = f"content digest missing: {artifact}"
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                return_value=raw_audit,
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(False, (artifact_error,)),
+            )
+
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260731_230101",
+                )
+
+            message = str(caught.exception)
+            compact = gui.compact_error_message(message)
+            iid = str(spm)
+            app._record_phase_status(
+                iid,
+                "blend_status",
+                f"failed: {compact}",
+                caught.exception.kind,
+                compact,
+                persist=False,
+            )
+            app._phase_failed_items = {iid}
+            job_summary = app._summarize_phase_targets([{"spm": spm}])
+
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+        self.assertIn("Live artifact mismatch", message)
+        self.assertIn(str(artifact), message)
+        self.assertNotIn("inputs kept changing", message)
+        self.assertIn("Live artifact mismatch", compact)
+        self.assertIn(
+            "Live artifact mismatch",
+            app.state[iid]["blend_status_error"]["message"],
+        )
+        self.assertIn(
+            "Live artifact mismatch",
+            job_summary["target_outcomes"][0]["evidence"]["message"],
+        )
+
+    def test_cluster_live_audit_reports_changed_input_path_separately(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            manifest = cluster / "SK_cluster_elm_01.atlas_leaf_targets.json"
+            spm.write_bytes(b"tree")
+            manifest.write_text('{"version": 1}', encoding="utf-8")
+            audit_calls = {"count": 0}
+
+            def run_uncached(*_args, **_kwargs):
+                audit_calls["count"] += 1
+                manifest.write_text(
+                    json.dumps({"version": audit_calls["count"] + 1}),
+                    encoding="utf-8",
+                )
+                return {
+                    "payload": {},
+                    "audit_report": str(Path(temporary) / "live.json"),
+                    "log_file": str(Path(temporary) / "live.log"),
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=run_uncached,
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ()),
+            )
+
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260731_230201",
+                )
+
+            message = str(caught.exception)
+            compact = gui.compact_error_message(message)
+            iid = str(spm)
+            app._record_phase_status(
+                iid,
+                "blend_status",
+                f"failed: {compact}",
+                caught.exception.kind,
+                compact,
+                persist=False,
+            )
+            app._phase_failed_items = {iid}
+            job_summary = app._summarize_phase_targets([{"spm": spm}])
+
+        self.assertEqual(audit_calls["count"], 2)
+        self.assertIn("Input fingerprint changed during audit", message)
+        self.assertIn(str(manifest).casefold(), message.casefold())
+        self.assertNotIn("Live artifact mismatch", message)
+        self.assertIn("Input fingerprint changed during audit", compact)
+        self.assertIn(
+            "Input fingerprint changed during audit",
+            app.state[iid]["blend_status_error"]["message"],
+        )
+        self.assertIn(
+            "Input fingerprint changed during audit",
+            job_summary["target_outcomes"][0]["evidence"]["message"],
+        )
+
     def test_cluster_live_audit_fingerprint_contains_assets_not_runtime_code(
         self,
     ):
