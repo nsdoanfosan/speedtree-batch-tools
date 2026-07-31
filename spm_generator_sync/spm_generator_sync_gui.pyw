@@ -1921,6 +1921,30 @@ class App:
                     )
                 ),
             )
+            planned_reasons = list(row.get("refresh_reasons") or ())
+            planned_categories = list(
+                row.get("refresh_reason_categories") or ()
+            )
+            relation_result["planned_refresh_reasons"] = planned_reasons
+            relation_result[
+                "planned_refresh_reason_categories"
+            ] = planned_categories
+            relation_result["refresh_reasons"] = sorted(set(
+                planned_reasons
+                + list(
+                    relation_result.get("preflight_refresh_reasons")
+                    or ()
+                )
+            ))
+            relation_result["refresh_reason_categories"] = sorted(set(
+                planned_categories
+                + list(
+                    relation_result.get(
+                        "preflight_refresh_reason_categories"
+                    )
+                    or ()
+                )
+            ))
             relation_result["source_preparation"] = preparation
             results.append(relation_result)
         report("Cluster SPM 메시/Generator 검증 완료", 95)
@@ -2402,6 +2426,14 @@ class App:
                 "master_hash",
                 "cluster_count",
                 "scale_skipped",
+                "preflight_refresh_required",
+                "preflight_refresh_reasons",
+                "preflight_refresh_reason_categories",
+                "planned_refresh_reasons",
+                "planned_refresh_reason_categories",
+                "refresh_reasons",
+                "refresh_reason_categories",
+                "source_content_identity",
             )
             if result.get(key) is not None
         }
@@ -2620,6 +2652,12 @@ class App:
                             str(path)
                             for path in row.get("on_target_spms") or ()
                         ],
+                        "refresh_reasons": list(
+                            row.get("refresh_reasons") or ()
+                        ),
+                        "refresh_reason_categories": list(
+                            row.get("refresh_reason_categories") or ()
+                        ),
                         "result": self._connected_result_summary(result),
                     })
                     raise_if_cancelled()
@@ -2635,6 +2673,12 @@ class App:
                             str(path)
                             for path in row.get("on_target_spms") or ()
                         ],
+                        "refresh_reasons": list(
+                            row.get("refresh_reasons") or ()
+                        ),
+                        "refresh_reason_categories": list(
+                            row.get("refresh_reason_categories") or ()
+                        ),
                         "reason": str(exc),
                     })
                 unit_index += 1

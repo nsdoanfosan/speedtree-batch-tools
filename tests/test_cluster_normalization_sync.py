@@ -4,15 +4,109 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from cluster_atlas_source_index import (
+    COLLECTION_CONTENT_KEY_ALGORITHM,
+    COLLECTION_PROJECTION_VERSION,
+    MESH_CONTENT_KEY_ALGORITHM,
+    SOURCE_INDEX_KIND,
+    SOURCE_INDEX_VERSION,
+    canonical_sha256,
+)
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
+    inspect_normalization_source_identity,
+    normalization_receipt_path,
     resolve_normalization_recipe,
 )
 
 
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def persisted_source_index(
+    blend,
+    *,
+    collection="Atlas_Cluster_Cards",
+    export_scope_id="test-cluster-scope",
+    state="populated",
+):
+    rows = [] if state == "empty" else [{
+        "object_name": f"{blend.stem}_Card",
+        "mesh_data_name": f"{blend.stem}_Card_Mesh",
+        "group_collection": collection,
+        "group_material": f"M_{blend.stem}",
+        "user_collections": [collection],
+        "stable_source_identity": {
+            "kind": "fixture",
+            "digest": hashlib.sha256(b"fixture-object").hexdigest(),
+        },
+        "mesh_content_key": {
+            "algorithm": MESH_CONTENT_KEY_ALGORITHM,
+            "digest": hashlib.sha256(b"fixture-mesh").hexdigest(),
+        },
+        "vertices": 4,
+        "edges": 4,
+        "loops": 4,
+        "polygons": 1,
+    }]
+    projection = {
+        "projection_version": COLLECTION_PROJECTION_VERSION,
+        "collection_name": collection,
+        "export_scope_id": export_scope_id,
+        "state": state,
+        "mesh_object_count": len(rows),
+        "mesh_objects": rows,
+    }
+    blend_hash = sha256(blend)
+    return {
+        "kind": SOURCE_INDEX_KIND,
+        "version": SOURCE_INDEX_VERSION,
+        "status": "ok",
+        "indexed_by_blender": True,
+        "blend": str(Path(blend).absolute()),
+        "blend_sha256": blend_hash,
+        "atlas_source_index": {
+            "schema_version": 1,
+            "status": "ok",
+            "indexed_by_blender": True,
+            "blend": str(Path(blend).absolute()),
+            "blend_sha256": blend_hash,
+            "image_count": 0,
+            "images": [],
+        },
+        "authoritative_collection": {
+            **projection,
+            "content_key": {
+                "algorithm": COLLECTION_CONTENT_KEY_ALGORITHM,
+                "digest": canonical_sha256(projection),
+            },
+        },
+        "refresh_reasons": [],
+        "publication": {
+            "status": "bound",
+            "target_count": 1,
+            "targets": [{
+                "target_spm": str(blend.with_suffix(".spm")),
+                "export_scope_id": export_scope_id,
+                "mesh_count": len(rows),
+                "state": state,
+                "manifest": None,
+            }],
+        },
+    }
+
+
+def seal_receipt_source_identity(blend, receipt_path, recipe):
+    receipt_path = Path(receipt_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["blend"] = str(Path(blend).absolute())
+    receipt["source_blender_index"] = persisted_source_index(
+        blend,
+        collection=recipe["plan_collection"],
+    )
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
 
 def write_spm(path, material_name, material_id):
@@ -612,6 +706,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            seal_receipt_source_identity(blend, receipt, first)
 
             current = resolve_normalization_recipe(
                 blend,
@@ -621,6 +716,48 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
 
             self.assertFalse(current["normalization_required"])
+
+    def test_saved_atlas_collection_change_refreshes_without_normalizer_rebuild(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            first = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            capture_manifest = write_capture_manifest(first)
+            receipt = Path(first["receipt_path"])
+            receipt.write_text(
+                json.dumps({
+                    "kind": "speedtree_cluster_sync_normalization",
+                    "status": "ready",
+                    "recipe_sha256": first["recipe_sha256"],
+                    "source_spm_sha256": first["source_spm_sha256"],
+                    "unit_probe_sha256": first["unit_probe_sha256"],
+                    "output_blend_sha256": sha256(blend),
+                    "capture_manifest": str(capture_manifest.absolute()),
+                    "capture_manifest_sha256": sha256(capture_manifest),
+                }),
+                encoding="utf-8",
+            )
+            seal_receipt_source_identity(blend, receipt, first)
+            blend.write_bytes(b"saved-atlas-collection-edited")
+
+            freshness = inspect_normalization_source_identity(blend)
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            self.assertFalse(freshness["current"])
+            self.assertIn(
+                "blender_source_content_changed",
+                freshness["refresh_reasons"],
+            )
+            self.assertFalse(recipe["normalization_required"])
 
     def test_texture_normalize_raw_drift_reuses_semantic_receipt_only_with_proof(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -656,6 +793,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            seal_receipt_source_identity(blend, receipt, first)
             backup_dir = (
                 source.parent
                 / "reports"
@@ -774,6 +912,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            seal_receipt_source_identity(blend, receipt, first)
             second_target = target.with_name("SK_Tree_elm_02.spm")
             write_spm_with_frond_material(
                 second_target,
@@ -850,6 +989,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            seal_receipt_source_identity(blend, receipt, first)
             second_target = target.with_name("SK_Tree_elm_02.spm")
             write_spm_with_frond_material(
                 second_target,
@@ -865,6 +1005,36 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
 
             self.assertFalse(migrated["normalization_required"])
+
+    def test_source_identity_inspection_is_current_then_detects_saved_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = Path(temporary) / "Cluster"
+            cluster.mkdir()
+            blend = cluster / "SK_cluster.blend"
+            blend.write_bytes(b"saved-blend-v1")
+            receipt_path = normalization_receipt_path(blend)
+            receipt_path.parent.mkdir()
+            receipt_path.write_text(
+                json.dumps({
+                    "kind": "speedtree_cluster_sync_normalization",
+                    "status": "ready",
+                    "blend": str(blend.absolute()),
+                    "output_blend_sha256": sha256(blend),
+                    "source_blender_index": persisted_source_index(blend),
+                }),
+                encoding="utf-8",
+            )
+
+            current = inspect_normalization_source_identity(blend)
+            blend.write_bytes(b"saved-blend-v2")
+            changed = inspect_normalization_source_identity(blend)
+
+            self.assertTrue(current["current"])
+            self.assertFalse(changed["current"])
+            self.assertIn(
+                "blender_source_content_changed",
+                changed["refresh_reasons"],
+            )
 
     def test_changed_source_rejects_stale_bwr_before_blender(self):
         with tempfile.TemporaryDirectory() as temporary:

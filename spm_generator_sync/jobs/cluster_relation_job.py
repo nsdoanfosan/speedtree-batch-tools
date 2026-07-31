@@ -20,6 +20,10 @@ from cluster_export_handoff_contract import (
     cluster_export_contract_issues as inspect_cluster_export_contract,
     finalize_cluster_pipeline_payload,
 )
+from cluster_atlas_source_index import (
+    bind_index_to_export_results,
+    build_current_atlas_source_index,
+)
 from sk_batch.repair_push_evidence import export_object_postcondition
 
 
@@ -338,6 +342,53 @@ def normalize_cluster_blend(recipe):
     }
 
 
+def capture_normalization_source_index(recipe):
+    """Capture Atlas' saved Blender index before any export mutation."""
+    if not recipe:
+        return None
+    receipt_path = Path(recipe["receipt_path"]).expanduser().absolute()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    previous = receipt.get("source_blender_index") or {}
+    previous_collection = previous.get("authoritative_collection") or {}
+    return build_current_atlas_source_index(
+        Path(recipe["blend"]).expanduser().absolute(),
+        recipe["plan_collection"],
+        atlas_asset_name=recipe["material_name"],
+        expected_scope_id=previous_collection.get("export_scope_id"),
+    )
+
+
+def persist_normalization_source_index(recipe, identity):
+    """Commit source identity only after Atlas publication has succeeded."""
+    if not recipe or identity is None:
+        return None
+    publication = identity.get("publication") or {}
+    targets = publication.get("targets")
+    if (
+        publication.get("status") != "bound"
+        or not isinstance(targets, list)
+        or not targets
+        or publication.get("target_count") != len(targets)
+    ):
+        raise RuntimeError(
+            "Atlas source identity cannot be persisted before publication binding"
+        )
+    receipt_path = Path(recipe["receipt_path"]).expanduser().absolute()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    changed = receipt.get("source_blender_index") != identity
+    if changed:
+        legacy = receipt.pop("source_blend_content_identity", None)
+        if legacy is not None:
+            receipt["superseded_source_blend_content_identity"] = legacy
+        receipt["source_blender_index"] = identity
+        atomic_write_json(receipt_path, receipt)
+    return {
+        "receipt": str(receipt_path),
+        "changed": changed,
+        **identity,
+    }
+
+
 def configure_cluster_export_properties(
     props,
     recipe,
@@ -531,10 +582,18 @@ def sync_targets(blend, requested, normalization_recipe=None):
     from atlas_leaf_mesh_builder.target_registry import load_target_registry
 
     normalization = normalize_cluster_blend(normalization_recipe)
+    source_index = capture_normalization_source_index(
+        normalization_recipe
+    )
+    runtime_recipe = dict(normalization_recipe or {})
+    if source_index is not None:
+        runtime_recipe["plan_collection"] = source_index[
+            "authoritative_collection"
+        ]["collection_name"]
     props = bpy.context.scene.atlas_leaf_builder
     export_configuration = configure_cluster_export_properties(
         props,
-        normalization_recipe,
+        runtime_recipe,
         first_target_spm=requested[0],
     )
     registry = load_target_registry(blend)
@@ -553,12 +612,12 @@ def sync_targets(blend, requested, normalization_recipe=None):
     if scene_targets != registered:
         raise RuntimeError("Blender Atlas target list did not match the external JSON")
     bindings_by_key = validate_recipe_registry_contract(
-        normalization_recipe,
+        runtime_recipe,
         requested,
     )
     recipe_mapping_update = apply_recipe_source_material_mappings(
         props,
-        normalization_recipe,
+        runtime_recipe,
         effective_targets=requested,
     )
     connection_targets = [
@@ -609,6 +668,16 @@ def sync_targets(blend, requested, normalization_recipe=None):
     unresolved = [str(path) for path in requested if key(path) not in completed]
     if unresolved:
         raise RuntimeError("Atlas build returned no result for: " + ", ".join(unresolved))
+    source_content_identity = None
+    if source_index is not None:
+        bound_source_index = bind_index_to_export_results(
+            source_index,
+            results,
+        )
+        source_content_identity = persist_normalization_source_index(
+            normalization_recipe,
+            bound_source_index,
+        )
     cluster_source_pipeline = finalize_cluster_source_pipeline(
         normalization_recipe
     )
@@ -617,6 +686,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "blend": str(blend),
         "target_spms": [str(path) for path in requested],
         "normalization": normalization,
+        "source_content_identity": source_content_identity,
         "cluster_export_configuration": export_configuration,
         "recipe_source_material_mapping_update": recipe_mapping_update,
         "source_material_mapping_update": mapping_update,
