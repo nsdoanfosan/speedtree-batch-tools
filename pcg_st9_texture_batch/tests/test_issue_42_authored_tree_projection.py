@@ -99,7 +99,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
         self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 4)
         self.assertEqual(
             self.before_fingerprint,
-            "6e4ad1850d620c8ab9a3eb6dc7de0c6beb5daf4e41d315ebb9e3bdc91326cbd8",
+            "66f241477cbae1118ec0f548bc88e3b8a1f3862ae1bd67973d888027e2cdb8d0",
         )
         self.assertEqual(self.before_fingerprint, self.after_fingerprint)
 
@@ -108,13 +108,13 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             _legacy_authoring_graph_core_v3_projection(self.before)[
                 "fingerprint"
             ],
-            "72b097063628b8a1dfc84feb288f67e9fefee1fb5d4a6f4603877ad6ae36f311",
+            "d4d98ee30f3233b4d3cc5c5c4edcde9e58e1c9ec011b87fc155d53c8c6e1cbb5",
         )
         self.assertEqual(
             _legacy_authoring_graph_core_v3_projection(self.after)[
                 "fingerprint"
             ],
-            "adb7358f85895e339e70cc353cabbbd4ea15bf1666a9b5d69801400fc1c6ba14",
+            "649db337ae5cb7ca1e1e62de04e33d2bd8720d3d41af3abe10a5facdf589a525",
         )
 
     def test_real_evidence_is_sanitized_and_records_three_exact_pairs(self):
@@ -149,6 +149,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
             "link subtree": ("<Weight>7</Weight>", "<Weight>8</Weight>"),
             "material texture": ("<TexFilename>leaf.png</TexFilename>", "<TexFilename>other.png</TexFilename>"),
             "mesh geometry": ("<VertexData>authored-vertices</VertexData>", "<VertexData>changed-vertices</VertexData>"),
+            "collision setting": ("<Radius>1</Radius>", "<Radius>2</Radius>"),
             "global setting": ("<WindQuality>Best</WindQuality>", "<WindQuality>Fast</WindQuality>"),
             "unknown root": ("<AuthoredValue>preserve</AuthoredValue>", "<AuthoredValue>changed</AuthoredValue>"),
         }

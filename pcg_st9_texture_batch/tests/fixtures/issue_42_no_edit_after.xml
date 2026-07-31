@@ -35,6 +35,7 @@
     <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.10000000149011612</Scale><VertexData>authored-vertices</VertexData><Lod_1><Filename/></Lod_1><Lod_2><Filename/></Lod_2></Mesh>
     <GUID>generated-assets-after</GUID>
   </Assets>
+  <CoreCollisionObjects><Object><Radius>1</Radius></Object></CoreCollisionObjects>
   <GlobalSettings><WindQuality>Best</WindQuality></GlobalSettings>
   <UnknownRoot><AuthoredValue>preserve</AuthoredValue></UnknownRoot>
   <Nodes><Node>rebuilt-node-table</Node></Nodes>

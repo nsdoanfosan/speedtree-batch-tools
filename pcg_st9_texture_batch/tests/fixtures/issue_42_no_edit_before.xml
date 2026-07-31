@@ -35,6 +35,7 @@
     <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.1</Scale><UserData>{"generator":"Atlas Leaf Mesh Builder","group":"leaf","kind":"mesh","scope":"0123456789abcdef0123456789abcdef"}</UserData><VertexData>authored-vertices</VertexData></Mesh>
     <Material_V8 ID="10"><Name>leaf-material</Name><Preview>before-material-preview</Preview><StreamPlaceholder><Data>before-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>0</TexSizeX><TexSizeY>0</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID></Material_V8>
   </Assets>
+  <CoreCollisionObjects><Object><Radius>1</Radius></Object></CoreCollisionObjects>
   <GlobalSettings><WindQuality>Best</WindQuality></GlobalSettings>
   <UnknownRoot><AuthoredValue>preserve</AuthoredValue></UnknownRoot>
   <Nodes><Node>stale-node-table</Node></Nodes>
