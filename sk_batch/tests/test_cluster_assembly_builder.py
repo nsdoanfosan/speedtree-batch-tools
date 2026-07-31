@@ -1760,6 +1760,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            source_sidecar = file_fingerprint(sidecar)
             manifest = {
                 "status": "ready",
                 "full_asset_stem": "SK_Tree_elm_01",
@@ -1786,6 +1787,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                     "asset_path": "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
                     "file_path": str(full),
                     "_material_pipeline_json_path": str(sidecar),
+                    "_material_pipeline_json_sha256": source_sidecar["sha256"],
                 },
                 "property_data": {
                     "unreal": {
@@ -1805,9 +1807,21 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 },
                 "pre_import_commands": [[
                     "_asset_path = '/Game/Codex/Tests/Elm/SK_Tree_elm_01'",
-                    f"json_path='{sidecar.as_posix()}'",
+                    (
+                        "_p.preflight_mesh_materials("
+                        "_asset_path, "
+                        f"json_path='{sidecar.as_posix()}', "
+                        f"sidecar_sha256='{source_sidecar['sha256']}')"
+                    ),
                 ]],
-                "post_import_commands": [],
+                "post_import_commands": [[
+                    (
+                        "_p.process_mesh("
+                        "_asset_path, "
+                        f"json_path='{sidecar.as_posix()}', "
+                        f"sidecar_sha256='{source_sidecar['sha256']}')"
+                    ),
+                ]],
             }
             plan = build_unreal_ingest_plan(
                 manifest,
@@ -1880,6 +1894,47 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 generated_sidecar.as_posix(),
                 plan["assets"][0]["pre_import_commands"][0][1],
             )
+            for generated_asset in plan["assets"]:
+                generated_data = generated_asset["asset_data"]
+                generated_fingerprint = generated_data[
+                    "_material_pipeline_json_fingerprint"
+                ]
+                generated_sha256 = generated_fingerprint["sha256"]
+                self.assertNotEqual(
+                    generated_sha256,
+                    source_sidecar["sha256"],
+                )
+                self.assertEqual(
+                    generated_data["_material_pipeline_json_sha256"],
+                    generated_sha256,
+                )
+                commands = json.dumps(
+                    generated_asset["pre_import_commands"]
+                    + generated_asset["post_import_commands"]
+                )
+                self.assertIn(generated_sha256, commands)
+                self.assertNotIn(source_sidecar["sha256"], commands)
+                self.assertIn(
+                    Path(generated_data["_material_pipeline_json_path"]).as_posix(),
+                    commands,
+                )
+
+            source_command = template["pre_import_commands"][0][1]
+            template["pre_import_commands"][0][1] = source_command.replace(
+                source_sidecar["sha256"],
+                "0" * 64,
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "command SHA does not match",
+            ):
+                build_unreal_ingest_plan(
+                    manifest,
+                    template,
+                    "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
+                    "/Game/Codex/Tests/Elm",
+                )
+            template["pre_import_commands"][0][1] = source_command
 
             branch.write_bytes(b"tampered")
             with self.assertRaisesRegex(

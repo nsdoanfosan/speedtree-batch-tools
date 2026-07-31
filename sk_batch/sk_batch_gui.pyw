@@ -6628,6 +6628,7 @@ class App:
         spm,
         *,
         live_artifact_paths=(),
+        _records_out=None,
     ):
         """Fingerprint every owner input and live artifact by current bytes.
 
@@ -6669,6 +6670,9 @@ class App:
                 **snapshot,
             })
 
+        if _records_out is not None:
+            _records_out[:] = copy.deepcopy(records)
+
         envelope = {
             "version": 3,
             "scope": self._cluster_receipt_refresh_scope(spm),
@@ -6681,6 +6685,55 @@ class App:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+    @staticmethod
+    def _cluster_receipt_changed_input_paths(before_records, after_records):
+        """Return paths whose fingerprint-envelope records differ."""
+        before_by_path = {
+            str(record.get("path")): record
+            for record in before_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        after_by_path = {
+            str(record.get("path")): record
+            for record in after_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        return tuple(sorted(
+            path
+            for path in set(before_by_path) | set(after_by_path)
+            if before_by_path.get(path) != after_by_path.get(path)
+        ))
+
+    @staticmethod
+    def _cluster_receipt_stability_failure_message(
+        *,
+        fingerprint_changed,
+        changed_input_paths=(),
+        artifact_errors=(),
+    ):
+        """Describe each failed half of the live-audit stability gate."""
+        artifact_errors = tuple(artifact_errors or ())
+        if fingerprint_changed and artifact_errors:
+            heading = (
+                "Input fingerprint changed + live artifact mismatch "
+                "during audit"
+            )
+        elif fingerprint_changed:
+            heading = "Input fingerprint changed during audit"
+        else:
+            heading = "Live artifact mismatch"
+
+        details = []
+        if fingerprint_changed:
+            changed_detail = ", ".join(changed_input_paths[:3])
+            details.append(
+                "changed paths: "
+                + (changed_detail or "unavailable from fingerprint records")
+            )
+        if artifact_errors:
+            details.append("; ".join(artifact_errors[:3]))
+        return heading + (f": {'; '.join(details)}" if details else "")
 
     def _refresh_stale_cluster_receipt(
         self,
@@ -6712,6 +6765,7 @@ class App:
                 cached_live_artifact_paths = (
                     (cached or {}).get("live_artifact_paths") or ()
                 )
+            pre_discovery_records = []
             try:
                 current_cache_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
@@ -6720,7 +6774,10 @@ class App:
                     )
                 )
                 pre_discovery_fingerprint = (
-                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                    self._cluster_receipt_refresh_input_fingerprint(
+                        spm,
+                        _records_out=pre_discovery_records,
+                    )
                 )
             except (OSError, RuntimeError) as exc:
                 raise BatchItemError(
@@ -6793,6 +6850,7 @@ class App:
         cache_entry = None
         try:
             attempt_pre_fingerprint = pre_discovery_fingerprint
+            attempt_pre_records = pre_discovery_records
             for attempt in range(2):
                 raw_audit = self._refresh_stale_cluster_receipt_uncached(
                     spm,
@@ -6803,19 +6861,27 @@ class App:
                     ),
                     _raw_only=True,
                 )
+                post_discovery_records = []
                 post_discovery_fingerprint = (
-                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                    self._cluster_receipt_refresh_input_fingerprint(
+                        spm,
+                        _records_out=post_discovery_records,
+                    )
                 )
                 artifacts_match, artifact_errors = (
                     self._cluster_receipt_live_artifacts_match(
                         raw_audit.get("payload") or {}
                     )
                 )
-                stable = bool(
+                fingerprint_changed = (
                     attempt_pre_fingerprint
-                    == post_discovery_fingerprint
+                    != post_discovery_fingerprint
+                )
+                stable = bool(
+                    not fingerprint_changed
                     and artifacts_match
                 )
+                observed_discovery_records = post_discovery_records
                 if stable:
                     live_artifact_paths = (
                         self._cluster_receipt_live_artifact_paths(
@@ -6829,17 +6895,24 @@ class App:
                             live_artifact_paths=live_artifact_paths,
                         )
                     )
+                    final_discovery_records = []
                     final_discovery_fingerprint = (
-                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                        self._cluster_receipt_refresh_input_fingerprint(
+                            spm,
+                            _records_out=final_discovery_records,
+                        )
                     )
                     final_artifacts_match, final_artifact_errors = (
                         self._cluster_receipt_live_artifacts_match(
                             raw_audit.get("payload") or {}
                         )
                     )
-                    stable = bool(
+                    fingerprint_changed = (
                         final_discovery_fingerprint
-                        == attempt_pre_fingerprint
+                        != attempt_pre_fingerprint
+                    )
+                    stable = bool(
+                        not fingerprint_changed
                         and final_artifacts_match
                     )
                     if stable:
@@ -6854,26 +6927,36 @@ class App:
                         }
                         break
                     artifact_errors = final_artifact_errors
+                    observed_discovery_records = final_discovery_records
+                changed_input_paths = (
+                    self._cluster_receipt_changed_input_paths(
+                        attempt_pre_records,
+                        observed_discovery_records,
+                    )
+                    if fingerprint_changed
+                    else ()
+                )
+                failure_message = (
+                    self._cluster_receipt_stability_failure_message(
+                        fingerprint_changed=fingerprint_changed,
+                        changed_input_paths=changed_input_paths,
+                        artifact_errors=artifact_errors,
+                    )
+                )
                 if attempt == 0:
-                    retry_reason = (
-                        "; ".join(artifact_errors[:3])
-                        if artifact_errors
-                        else "asset SPM/manifest content changed"
-                    )
                     self.log(
-                        "Cluster Assembly live audit asset input changed "
-                        f"during audit; retrying once: {spm.name} · "
-                        f"{retry_reason}"
+                        f"{failure_message}; retrying once: {spm.name}"
                     )
+                    attempt_pre_records = []
                     attempt_pre_fingerprint = (
-                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                        self._cluster_receipt_refresh_input_fingerprint(
+                            spm,
+                            _records_out=attempt_pre_records,
+                        )
                     )
                     continue
-                detail = "; ".join(artifact_errors[:3])
                 raise BatchItemError(
-                    "Cluster Assembly live audit inputs kept changing; "
-                    f"result was not cached: {spm.name}"
-                    + (f": {detail}" if detail else ""),
+                    f"{failure_message}; result was not cached: {spm.name}",
                     kind="internal_error",
                     log_file=raw_audit.get("log_file"),
                     report_file=raw_audit.get("audit_report"),
