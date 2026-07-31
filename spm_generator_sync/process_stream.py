@@ -558,6 +558,7 @@ def run_streaming_process(
     cleanup_state = "process_tree_clean"
     oversized_line_fragments = 0
     root_exit_observed_at = None
+    owned_tree_seen_after_exit = False
     last_activity = started
     activity_unset = object()
     activity_state = activity_unset
@@ -614,12 +615,18 @@ def run_streaming_process(
                 if root_exit_observed_at is None:
                     root_exit_observed_at = time.monotonic()
                 ownership_done = owner is None or owner.is_empty()
+                if not ownership_done:
+                    # Remembered rather than sampled: a descendant that exits
+                    # in the same instant the grace expires must not change
+                    # which cleanup path runs, or the reported cleanup_state
+                    # becomes a race.
+                    owned_tree_seen_after_exit = True
                 if len(eof_channels) == 2 and ownership_done:
                     final_status = "completed"
                     break
                 if (
                     owner is not None
-                    and not ownership_done
+                    and (not ownership_done or owned_tree_seen_after_exit)
                     and time.monotonic() - root_exit_observed_at
                     >= max(0.0, float(exit_pipe_grace))
                 ):
