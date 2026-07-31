@@ -305,6 +305,23 @@ python pcg_texture_audit.py --json reports\audit.json --csv reports\audit.csv
 python export_all_queues.py --pcg-targets pcg_targets.json --out-dir reports --prefix pcg01 --no-stamp
 ```
 
+### Stale saved Node-table recovery
+
+`NORMALIZED_GENERATOR_NODE_TABLE_STALE` uses an interactive recovery boundary:
+
+```bat
+python -m pcg_st9_texture_batch.stale_node_table_recovery ^
+  "<SPM>" ^
+  --expected-mesh-id 130 --expected-mesh-id 131 ^
+  --expected-mesh-id 132 --expected-mesh-id 133
+```
+
+The command opens the operating SPM in the configured SpeedTree Modeler and
+waits for the user to save it. It does not edit SPM XML, simulate UI input, or
+claim an unattended Modeler save. After a stable content-hash change, it runs a
+fresh Node-table and target-binding audit. Library callers may supply a retry
+callback; that callback is invoked only after the re-audit passes.
+
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),
 `export_atlas_handoff_queue.py`(Blender 핸드오프),
