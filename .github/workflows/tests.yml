@@ -60,9 +60,10 @@ jobs:
       # Production code imports PIL lazily and there is no requirements file,
       # but test_pcg_texture_batch / test_pcg_step3_freshness import Pillow and
       # test_pipeline_plan_cli / test_push_dependency_schedule import pytest at
-      # module level, so unittest cannot even load them without these.
+      # module level, and cluster_assembly_builder.fit_trs_transform needs numpy,
+      # so unittest cannot even load or run them without these.
       - name: test-only dependencies
-        run: python -m pip install --disable-pip-version-check --quiet pillow pytest
+        run: python -m pip install --disable-pip-version-check --quiet pillow pytest numpy
 
       # Several suites build an expected path from tempfile.TemporaryDirectory()
       # and compare it against a value the production code has resolved(). On a
@@ -94,7 +95,12 @@ jobs:
           $failed = @()
           $total = 0
           Get-ChildItem -Recurse -Directory -Filter tests |
-            Where-Object { $_.FullName -notmatch '__pycache__' } |
+            Where-Object {
+              # work/ holds the vendored substance-tools checkout, whose own
+              # suites are not this repository's to run or to gate on.
+              $_.FullName -notmatch '__pycache__' -and
+              $_.FullName -notmatch '[\/]work[\/]'
+            } |
             Sort-Object FullName |
             ForEach-Object {
               $rel = Resolve-Path -Relative $_.FullName
