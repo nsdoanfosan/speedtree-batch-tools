@@ -2396,7 +2396,7 @@ def _snapshot_gate(
         ),
         "generator_membership_continuity": (
             snapshot["generator_membership_fingerprint"]
-            == preimage_receipt["generator_membership"]["fingerprint"]
+            == expected_membership_fingerprint
         ),
         "required_target_binding_continuity": (
             target_binding_continuity
@@ -3452,6 +3452,10 @@ def _claim_and_resume_once(
             "continuation target scopes are incomplete or inconsistent",
             after["source_identity"],
         )
+    # Lifecycle guards are effectful callbacks.  Run them before the final
+    # operating-source recapture so a guard-side mutation cannot escape the
+    # source SHA/gate checks below.
+    _check_guards(guards, after["source_identity"])
     current = capture_fn(spm, target_scopes["authoring_mesh_ids"])
     if (
         current["raw_sha256"] != after["raw_sha256"]
@@ -3493,10 +3497,9 @@ def _claim_and_resume_once(
         "verified_after_raw_sha256": after["raw_sha256"],
         "preimage_receipt_sha256": artifacts["receipt_sha256"],
     }
-    # All source/gate work is complete before the last lifecycle and immutable
-    # backup checks.  Nothing effectful may intervene between that final backup
-    # verification and publishing the once-only claim.
-    _check_guards(guards, after["source_identity"])
+    # All source/gate work is complete before the last immutable backup check.
+    # Nothing effectful may intervene between that verification and publishing
+    # the once-only claim.
     _verify_preimage_artifacts(artifacts, preimage_snapshot)
     try:
         _atomic_write_new(claim, claim_payload)
@@ -3666,6 +3669,10 @@ def recover_stale_node_table(
             authoring_mesh_ids=authoring_mesh_ids,
             required_live_mesh_ids=required_live_mesh_ids,
         )
+        # Lifecycle guards are effectful callbacks.  Run them before the final
+        # operating-source recapture so their side effects are covered by the
+        # SHA comparison below.
+        _check_guards(guards, identity)
         # The exact source must still be the sealed preimage before Modeler is
         # opened; receipt creation is not authority if the source raced it.
         prelaunch = capture_fn(spm, authoring)
@@ -3678,7 +3685,6 @@ def recover_stale_node_table(
                 "the source changed after preimage sealing and before launch",
                 _public_hash_evidence(prelaunch),
             )
-        _check_guards(guards, identity)
         # This is the final effectful prelaunch check.  Modeler starts
         # immediately after the exact immutable backup is recaptured.
         _verify_preimage_artifacts(artifacts, prelaunch)
