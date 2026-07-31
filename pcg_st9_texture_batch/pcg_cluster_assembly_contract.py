@@ -1720,6 +1720,187 @@ def _delivery_binding_slot_identity(binding):
     )
 
 
+def _stale_node_table_evidence(binding):
+    """True when a live row's zero export count came from a stale node table."""
+    if not isinstance(binding, dict):
+        return False
+    return (
+        str(binding.get("export_evidence") or "") == "node_table_stale"
+        and binding.get("graph_visible") is True
+        and not int(binding.get("generated_node_count") or 0)
+    )
+
+
+INACTIVE_CAUSAL_PATH_REASON = (
+    "generator_causal_path_inactive_unused_base"
+)
+
+
+def _inactive_causal_path_evidence(binding):
+    """True only for a coherent live path below an unused SpeedTree Base."""
+    if not isinstance(binding, dict):
+        return False
+    return (
+        binding.get("causal_path_active") is False
+        and str(binding.get("causal_path_reason") or "")
+        == INACTIVE_CAUSAL_PATH_REASON
+        and binding.get("node_table_stale") is False
+        and binding.get("graph_visible") is True
+        and not int(binding.get("generated_node_count") or 0)
+        and isinstance(binding.get("inactive_base"), dict)
+        and str(
+            (binding.get("inactive_base") or {}).get("generator_type") or ""
+        ).strip().casefold() == "base"
+        and not int(
+            (binding.get("inactive_base") or {}).get(
+                "generated_node_count"
+            ) or 0
+        )
+    )
+
+
+STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
+STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
+STALE_NODE_TABLE_REMEDY = (
+    "대상 SPM의 저장된 <Node> 테이블이 현재 Generator 그래프와 맞지 않습니다"
+    " (없는 Generator에 노드가 남아 있음). Generator 연결 자체는 정상이며 export"
+    " 참여 여부를 판정할 근거가 없는 상태입니다. SpeedTree Modeler에서 해당 SPM을"
+    " 열고 다시 저장해 노드 테이블을 재생성한 뒤 다시 실행하세요."
+)
+
+
+def _stale_node_table_recovery_contract():
+    """Describe the safe recovery boundary without claiming unattended save."""
+    return {
+        "schema_version": 2,
+        "mode": STALE_NODE_TABLE_RECOVERY_MODE,
+        "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
+        "modeler_auto_save": False,
+        "modeler_process_kill": False,
+        "direct_spm_xml_edit": False,
+        "ui_input_simulation": False,
+        "automatic_rollback": False,
+        "requires_user_save": True,
+        "requires_exact_preimage_backup": True,
+        "requires_immutable_preimage_receipt": True,
+        "authoring_graph_projection_version": 1,
+        "watches_content_hash_change": True,
+        "requires_repeated_stat_size_sha_parse_quiescence": True,
+        "same_immutable_snapshot_crosschecks": [
+            "regex",
+            "xml.etree.ElementTree",
+            "target_delivery",
+            "normalization",
+        ],
+        "automatic_reaudit": True,
+        "stale_false_alone_allows_retry": False,
+        "source_sha_rechecked_before_continuation": True,
+        "continuation_scope": "initiating_job_generation_and_after_sha",
+        "continuation_once_only": True,
+        "queue_or_manifest_mutation_before_continuation": False,
+        "continuation_guards": [
+            "cancellation",
+            "app_open",
+            "job_generation_current",
+        ],
+        "retry_only_after_valid_reaudit": True,
+        "blocked_event_privacy": "asset_name_after_sha_reason_tokens_only",
+    }
+
+
+def _classify_stale_node_table_block(
+    evidence,
+    declared_live_bindings,
+    normalized_mesh_ids,
+    live_mesh_ids,
+):
+    """Name a stale-node-table block for what it is, without unblocking it.
+
+    The delivery still fails closed; only the reported cause changes, so an
+    operator is pointed at regenerating the target's node table instead of at a
+    Generator connection that the same evidence shows is already correct.
+    """
+    errors = set(evidence.get("errors") or ())
+    if "generator_export_evidence_stale_node_table" not in errors:
+        return
+    stale_mesh_ids = {
+        _positive_asset_id(row.get("mesh_id"))
+        for row in declared_live_bindings or ()
+        if _stale_node_table_evidence(row)
+    }
+    stale_mesh_ids.discard(None)
+    unexplained_mesh_ids = (
+        set(normalized_mesh_ids) - set(live_mesh_ids) - stale_mesh_ids
+    )
+    consequences = {"generator_export_evidence_stale_node_table"}
+    if not unexplained_mesh_ids and set(live_mesh_ids) <= set(
+        normalized_mesh_ids
+    ):
+        # Every missing live mesh ID is accounted for by a row whose export
+        # evidence is unavailable, so the differing sets are a consequence of
+        # the stale table rather than an independent fault.
+        consequences.add("normalized_and_live_target_mesh_sets_differ")
+    evidence["stale_node_table_target_mesh_ids"] = sorted(stale_mesh_ids)
+    evidence["stale_node_table_recovery"] = (
+        _stale_node_table_recovery_contract()
+    )
+    if errors <= consequences:
+        evidence["delivery_reason"] = STALE_NODE_TABLE_REASON
+        evidence["delivery_remedy"] = STALE_NODE_TABLE_REMEDY
+
+
+def _normalized_delivery_blocked_issue(dependency):
+    """Name a blocked normalized-delivery dependency for what blocks it.
+
+    A stale node table can explain every blocked target, some of them, or
+    none. Only the all-explained case may rename the issue code (an
+    independent fault must keep pointing at itself), but a partially stale
+    block still has to publish which targets and fix are stale instead of
+    computing that evidence and never surfacing it to an operator.
+    """
+    variants = dependency.get("normalized_variants") or {}
+    blocked_targets = variants.get("delivery_blocked_targets") or []
+    stale_only_targets = [
+        row for row in blocked_targets
+        if isinstance(row, dict)
+        and row.get("delivery_reason") == STALE_NODE_TABLE_REASON
+    ]
+    stale_evidence_targets = [
+        row for row in blocked_targets
+        if isinstance(row, dict)
+        and (
+            row.get("delivery_reason") == STALE_NODE_TABLE_REASON
+            or bool(row.get("stale_node_table_target_mesh_ids"))
+        )
+    ]
+    issue = {
+        "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+        "role": dependency["role"],
+        "spm": str(dependency["spm"]),
+        "delivery_mode": dependency.get("normalized_delivery_mode"),
+        "errors": variants.get("delivery_errors") or [],
+    }
+    if stale_only_targets and len(stale_only_targets) == len(blocked_targets):
+        # Every blocked target is blocked only because its saved node
+        # table cannot answer the export question.  Still blocked, but
+        # the operator now gets the real cause and the fix.
+        issue["code"] = "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+        issue["remedy"] = STALE_NODE_TABLE_REMEDY
+        issue["recovery"] = _stale_node_table_recovery_contract()
+        issue["blocked_targets"] = stale_only_targets
+    elif stale_evidence_targets:
+        # Only part of the block is explained by stale node-table evidence.
+        # That can mean separate target SPMs have different causes, or that
+        # one target contains both a stale slot and an independent slot fault.
+        # Keep the generic code while carrying the stale subset and its fix.
+        issue["stale_node_table_targets"] = stale_evidence_targets
+        issue["stale_node_table_remedy"] = STALE_NODE_TABLE_REMEDY
+        issue["stale_node_table_recovery"] = (
+            _stale_node_table_recovery_contract()
+        )
+    return issue
+
+
 def _finalize_normalized_generator_delivery(evidence):
     """Fail closed when published delivery fields contradict their evidence."""
     complete = evidence.get("generator_connection_complete") is True
@@ -1819,6 +2000,10 @@ def _normalized_generator_delivery(
         "live_snapshot_contract": None,
         "live_snapshot_sha256": None,
         "live_snapshot_total_node_count": None,
+        # Coherence of the target's saved <Node> table, when the producer
+        # reports it.  Absent means the producer predates the field.
+        "live_node_table": None,
+        "delivery_remedy": None,
         "generator_bindings": bindings,
         # Compatibility field: only expected-material rows that currently
         # participate in export, matching the old visible_only consumer scope.
@@ -1826,6 +2011,15 @@ def _normalized_generator_delivery(
         # Diagnostic fields retain all declared slots before the export filter.
         "live_declared_slot_bindings": [],
         "live_non_export_participating_bindings": [],
+        # Declared slots whose current Generator is below a coherent, unused
+        # Base path.  They remain authored/normalized but are not required by
+        # the current export.
+        "inactive_causal_bindings": [],
+        "declared_binding_count": len(bindings),
+        "active_required_binding_count": len(bindings),
+        "planned_inactive_binding_count": 0,
+        "current_required_target_mesh_ids": list(normalized_mesh_ids),
+        "binding_outcomes": [],
         "missing_live_bindings": [],
         "binding_mismatches": [],
         "errors": [],
@@ -1934,6 +2128,13 @@ def _normalized_generator_delivery(
                 "live Generator delivery snapshot contains an invalid Mesh ID"
             )
         live_asset_mesh_ids = sorted(set(parsed_live_mesh_ids))
+        live_node_table = live_snapshot.get("node_table")
+        if live_node_table is not None and not isinstance(
+            live_node_table, dict
+        ):
+            raise ValueError(
+                "live Generator delivery node table is not an object"
+            )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         evidence["errors"].append(
             "production_spm_live_audit_failed:" + str(exc)
@@ -1942,6 +2143,9 @@ def _normalized_generator_delivery(
     evidence["live_snapshot_contract"] = live_snapshot["contract"]
     evidence["live_snapshot_sha256"] = snapshot_sha256
     evidence["live_snapshot_total_node_count"] = total_node_count
+    evidence["live_node_table"] = (
+        dict(live_node_table) if isinstance(live_node_table, dict) else None
+    )
     slot_identity = _delivery_binding_slot_identity
 
     def export_participates(row):
@@ -1974,10 +2178,6 @@ def _normalized_generator_delivery(
     if normalized_mesh_ids != declared_mesh_ids:
         evidence["errors"].append(
             "normalized_and_declared_target_mesh_sets_differ"
-        )
-    if normalized_mesh_ids != live_mesh_ids:
-        evidence["errors"].append(
-            "normalized_and_live_target_mesh_sets_differ"
         )
     missing_assets = sorted(
         set(normalized_mesh_ids).difference(live_asset_mesh_ids)
@@ -2014,6 +2214,54 @@ def _normalized_generator_delivery(
                 ),
                 "declared_count": len(declared_rows),
             })
+
+    planned_inactive_slots = set()
+    for declared_slot, declared_rows in declared_by_slot.items():
+        current_rows = live_by_slot.get(declared_slot) or []
+        if len(declared_rows) != 1 or len(current_rows) != 1:
+            continue
+        declared = declared_rows[0]
+        current = current_rows[0]
+        target_material_id = _positive_asset_id(
+            declared.get("target_material_id")
+        )
+        target_mesh_id = _positive_asset_id(
+            declared.get("target_mesh_id")
+        )
+        current_material_id = _positive_asset_id(current.get("material_id"))
+        current_mesh_id = _positive_asset_id(current.get("mesh_id"))
+        if (
+            _inactive_causal_path_evidence(current)
+            and target_material_id == expected_material_id
+            and current_material_id == target_material_id
+            and target_mesh_id in set(normalized_mesh_ids)
+            and target_mesh_id in set(live_asset_mesh_ids)
+            and current_mesh_id == target_mesh_id
+        ):
+            planned_inactive_slots.add(declared_slot)
+
+    required_bindings = [
+        row for row in bindings
+        if tuple(slot_identity(row)) not in planned_inactive_slots
+    ]
+    current_required_mesh_ids = sorted({
+        _positive_asset_id(row.get("target_mesh_id"))
+        for row in required_bindings
+        if _positive_asset_id(row.get("target_mesh_id")) is not None
+    })
+    evidence["active_required_binding_count"] = len(required_bindings)
+    evidence["planned_inactive_binding_count"] = (
+        len(bindings) - len(required_bindings)
+    )
+    evidence["current_required_target_mesh_ids"] = (
+        current_required_mesh_ids
+    )
+    if current_required_mesh_ids != live_mesh_ids:
+        # Preserve the stable token while publishing the narrowed current
+        # requirement set that was actually compared.
+        evidence["errors"].append(
+            "normalized_and_live_target_mesh_sets_differ"
+        )
     declared_live_bindings = []
     for declared_slot in declared_by_slot:
         declared_live_bindings.extend(
@@ -2026,9 +2274,14 @@ def _normalized_generator_delivery(
         dict(row) for row in declared_live_bindings
         if not export_participates(row)
     ]
+    evidence["inactive_causal_bindings"] = [
+        dict(row) for row in declared_live_bindings
+        if tuple(slot_identity(row)) in planned_inactive_slots
+    ]
 
     for declared in bindings:
         errors = []
+        outcome_reason = None
         target_material_id = _positive_asset_id(
             declared.get("target_material_id")
         )
@@ -2059,7 +2312,17 @@ def _normalized_generator_delivery(
             if current_mesh_id != target_mesh_id:
                 errors.append("visible_generator_mesh_mismatch")
             if not export_participates(current):
-                errors.append("generator_not_export_participating")
+                # Fail closed either way, but never report a correct Generator
+                # connection as disconnected: a zero node count read out of a
+                # stale <Node> table is missing evidence, not proof.
+                if declared_slot in planned_inactive_slots:
+                    outcome_reason = INACTIVE_CAUSAL_PATH_REASON
+                elif _stale_node_table_evidence(current):
+                    errors.append(
+                        "generator_export_evidence_stale_node_table"
+                    )
+                else:
+                    errors.append("generator_not_export_participating")
         verified = {
             "slot_identity": list(declared_slot),
             "target_material_id": target_material_id,
@@ -2067,7 +2330,14 @@ def _normalized_generator_delivery(
             "current": dict(current) if current is not None else None,
             "errors": errors,
             "complete": not errors,
+            "status": (
+                "planned_inactive"
+                if outcome_reason and not errors
+                else "completed" if not errors else "failed"
+            ),
+            "reason": outcome_reason,
         }
+        evidence["binding_outcomes"].append(verified)
         if errors:
             evidence["binding_mismatches"].append(verified)
         if "visible_generator_slot_missing" in errors:
@@ -2090,6 +2360,12 @@ def _normalized_generator_delivery(
             })
 
     evidence["errors"] = sorted(set(evidence["errors"]))
+    _classify_stale_node_table_block(
+        evidence,
+        declared_live_bindings,
+        normalized_mesh_ids,
+        live_mesh_ids,
+    )
     if bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"
@@ -2376,6 +2652,25 @@ def _atlas_normalized_variants(
             for row in target_deliveries
             for error in row.get("errors") or []
         })
+        # Carry the per-target cause so a blocked handoff can name a stale node
+        # table instead of only listing the error tokens it produced.
+        contract["delivery_blocked_targets"] = [
+            {
+                "spm": row.get("spm"),
+                "delivery_reason": row.get("delivery_reason"),
+                "delivery_remedy": row.get("delivery_remedy"),
+                "errors": list(row.get("errors") or []),
+                "stale_node_table_target_mesh_ids": list(
+                    row.get("stale_node_table_target_mesh_ids") or []
+                ),
+                "live_node_table": row.get("live_node_table"),
+                "stale_node_table_recovery": row.get(
+                    "stale_node_table_recovery"
+                ),
+            }
+            for row in target_deliveries
+            if row.get("delivery_decision") == "blocked"
+        ]
         if contract.get("production_normalization") is not None:
             registered = {
                 _normalized_identity_path(path): Path(path)
@@ -3551,17 +3846,7 @@ def build_cluster_assembly_contract(
                 **dependency["normalized_variants_stale"],
             })
         if dependency.get("normalized_delivery_blocked"):
-            issues.append({
-                "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "delivery_mode": dependency.get(
-                    "normalized_delivery_mode"
-                ),
-                "errors": (
-                    dependency.get("normalized_variants") or {}
-                ).get("delivery_errors") or [],
-            })
+            issues.append(_normalized_delivery_blocked_issue(dependency))
         tga_validation = dependency.get("tga_basename_validation") or {}
         if tga_validation.get("status") not in {"ok", "not_applicable"}:
             issues.append({

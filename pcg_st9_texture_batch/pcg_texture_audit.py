@@ -41,7 +41,13 @@ from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
-from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
+from speedtree_legacy_cluster_contract import (
+    HANDOFF_STAT_MISMATCH_REASON,
+    SNAPSHOT_SCAN_FAILED_REASON,
+    inspect_legacy_cluster_state,
+    make_decoded_spm_handoff,
+    peek_generator_foregrounds,
+)
 from sk_batch.sk_common import scan_cluster_spm_sources
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -115,6 +121,8 @@ TEX_FILENAME_RE = re.compile(
     re.IGNORECASE | re.DOTALL)
 GENERATOR_BLOCK_RE = re.compile(
     r"<Generator\b[^>]*>.*?</Generator>", re.IGNORECASE | re.DOTALL)
+# Open/close tags only, for walks that do not need each block's body.
+GENERATOR_BOUNDARY_RE = re.compile(r"<(/?)Generator\b[^>]*>", re.IGNORECASE)
 GENERATOR_TYPE_RE = re.compile(
     r'<Generator\b[^>]*\bType="([^"]*)"', re.IGNORECASE)
 GENERATOR_NAME_RE = re.compile(
@@ -180,6 +188,13 @@ SOURCE_RESOLUTION_SUFFIX_RE = re.compile(
 _SPM_ANALYSIS_CACHE = {}
 _PERSISTENT_SPM_ANALYSIS = None
 _PERSISTENT_SPM_ANALYSIS_DIRTY = False
+# One unconsumed cold decode per worker/task context. This preserves the real
+# material-first call order without a process-global cross-worker overwrite.
+# The folder-audit wrapper resets it in ``finally``; a later cold parse in the
+# same context replaces it, so retention is bounded to max_workers documents.
+_PENDING_DECODED_HANDOFF = contextvars.ContextVar(
+    "pcg_pending_decoded_spm_handoff", default=None
+)
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
@@ -281,6 +296,20 @@ def _file_cache_key(path):
     if report_cache is not None:
         report_cache["file_cache_keys"][path_key] = result
     return result
+
+
+def _take_pending_decoded_handoff(path, cache_key):
+    handoff = _PENDING_DECODED_HANDOFF.get()
+    if handoff is None:
+        return None
+    _, size, mtime_ns = cache_key
+    expected_path = str(Path(path).resolve()).casefold()
+    handoff_path, handoff_size, handoff_mtime_ns = handoff.spm_key
+    if (str(handoff_path).casefold(), handoff_size, handoff_mtime_ns) != (
+            expected_path, size, mtime_ns):
+        return None
+    _PENDING_DECODED_HANDOFF.set(None)
+    return handoff
 
 
 def _persistent_spm_analysis():
@@ -418,6 +447,58 @@ def _export_node_counts_from_text(text):
     return counts, total_nodes
 
 
+def _generator_guid_keys_from_text(text):
+    """GUID keys of every Generator in the document.
+
+    Matches only block boundaries, so this stays cheap next to the walks that
+    have to read each block's properties.
+    """
+    keys = set()
+    body_start = None
+    for match in GENERATOR_BOUNDARY_RE.finditer(text):
+        if match.group(1):  # </Generator>
+            if body_start is None:
+                continue
+            guid_match = ELEMENT_GUID_RE.search(text, body_start, match.start())
+            key = _generator_guid_key(
+                guid_match.group(1) if guid_match else ""
+            )
+            if key:
+                keys.add(key)
+            body_start = None
+        elif body_start is None:
+            body_start = match.end()
+    return keys
+
+
+def _node_table_state(export_node_counts, total_nodes, generator_guid_keys):
+    """Report whether the saved ``<Node>`` table still describes this graph.
+
+    SpeedTree serializes generated nodes next to the Generator graph.  A table
+    that still attributes nodes to Generators the document no longer contains is
+    a leftover from an earlier graph, and then "this Generator owns zero nodes"
+    is no longer evidence that it produces no geometry -- it only proves the
+    table was never regenerated for it.
+
+    Production evidence for why this matters: ``SK_bush_blackgum_02.spm`` keeps
+    4197 nodes of which 3784 (90%) belong to 19 GUIDs that have no Generator,
+    while its five attached, non-hidden leaf Generators own zero nodes each.
+    """
+    counts = export_node_counts or {}
+    known = set(generator_guid_keys or ())
+    orphan_guids = sorted(set(counts) - known)
+    orphan_node_count = sum(int(counts.get(guid) or 0) for guid in orphan_guids)
+    return {
+        "total_node_count": int(total_nodes or 0),
+        "generator_count": len(known),
+        "node_table_generator_count": len(counts),
+        "orphan_generator_guids": orphan_guids,
+        "orphan_node_count": orphan_node_count,
+        # A coherent saved table cannot attribute nodes to a deleted Generator.
+        "stale": bool(orphan_node_count),
+    }
+
+
 def _visible_material_ids_from_text(text, export_node_counts=None, total_nodes=0):
     """Material IDs referenced by generators that would actually export.
 
@@ -542,6 +623,7 @@ def _leaf_generator_bindings_from_text(
     ``Leaf Mesh`` Generator points at its Material ID.
     """
     generators = []
+    generator_state_by_guid = {}
     hidden_by_guid = {}
     for generator_index, block_match in enumerate(
             GENERATOR_BLOCK_RE.finditer(text)):
@@ -557,12 +639,21 @@ def _leaf_generator_bindings_from_text(
         type_match = GENERATOR_TYPE_RE.search(block)
         generator_type = html.unescape(type_match.group(1).strip()) \
             if type_match else ""
-        if not _is_leaf_mesh_generator_type(generator_type):
-            continue
         header = block.split("<Properties", 1)[0]
         name_match = GENERATOR_NAME_RE.search(header)
         generator_name = html.unescape(name_match.group(1).strip()) \
             if name_match else ""
+        if guid_key:
+            generator_state_by_guid[guid_key] = {
+                "generator_index": generator_index,
+                "generator_name": generator_name,
+                "generator_type": generator_type,
+                "generated_node_count": int(
+                    (export_node_counts or {}).get(guid_key, 0)
+                ),
+            }
+        if not _is_leaf_mesh_generator_type(generator_type):
+            continue
         properties = []
         for property_match in PROPERTY_BLOCK_RE.finditer(block):
             property_block = property_match.group(0)
@@ -607,20 +698,86 @@ def _leaf_generator_bindings_from_text(
             guid = parent.get(guid, "")
         return False
 
+    node_table = _node_table_state(
+        export_node_counts, total_nodes, hidden_by_guid
+    )
+
+    def causal_path_evidence(generator):
+        """Describe whether an upstream Base is used by the live model.
+
+        A graph-visible leaf with zero Nodes is not necessarily defective.
+        SpeedTree can retain a complete Base/Branch/Leaf authoring path that
+        the current model does not reference.  A coherent saved Node table
+        proves that state when the upstream Base and its descendants all own
+        zero Nodes.  Stale or absent Node evidence never earns this exclusion.
+        """
+        unavailable = {
+            "causal_path_active": None,
+            "causal_path_reason": "generator_causal_path_evidence_unavailable",
+            "causal_path": [],
+            "inactive_base": None,
+        }
+        guid_key = generator.get("guid_key")
+        if not guid_key or not total_nodes or node_table["stale"]:
+            return unavailable
+
+        path = []
+        inactive_base = None
+        ancestor_key = parent.get(guid_key, "")
+        seen = set()
+        while ancestor_key and ancestor_key not in seen:
+            seen.add(ancestor_key)
+            ancestor = generator_state_by_guid.get(ancestor_key)
+            if ancestor is None:
+                break
+            row = dict(ancestor)
+            path.append(row)
+            if (
+                _normalized_generator_type(row.get("generator_type"))
+                == "base"
+                and int(row.get("generated_node_count") or 0) == 0
+            ):
+                inactive_base = dict(row)
+                break
+            ancestor_key = parent.get(ancestor_key, "")
+
+        if inactive_base is not None:
+            return {
+                "causal_path_active": False,
+                "causal_path_reason": (
+                    "generator_causal_path_inactive_unused_base"
+                ),
+                "causal_path": path,
+                "inactive_base": inactive_base,
+            }
+        return {
+            "causal_path_active": True,
+            "causal_path_reason": "generator_causal_path_active",
+            "causal_path": path,
+            "inactive_base": None,
+        }
+
     bindings = []
     for generator in generators:
         graph_visible = not effectively_hidden(generator)
         generated_node_count = int(
             (export_node_counts or {}).get(generator["guid_key"], 0)
         )
-        export_participates = bool(
-            graph_visible
-            and (
-                not total_nodes
-                or not generator["guid_key"]
-                or generated_node_count > 0
-            )
+        counted_by_node_table = bool(
+            not total_nodes
+            or not generator["guid_key"]
+            or generated_node_count > 0
         )
+        export_participates = bool(graph_visible and counted_by_node_table)
+        # A zero count read out of a stale table proves nothing either way.
+        # Keep failing closed, but say which of the two it is so an operator is
+        # not sent to fix a Generator connection that is already correct.
+        export_evidence = (
+            "node_table"
+            if counted_by_node_table or not node_table["stale"]
+            else "node_table_stale"
+        )
+        causal_evidence = causal_path_evidence(generator)
         by_name = {name.lower(): (name, value)
                    for name, value in generator["properties"]}
         for property_name, material_id in generator["properties"]:
@@ -645,20 +802,15 @@ def _leaf_generator_bindings_from_text(
                 "graph_visible": graph_visible,
                 "generated_node_count": generated_node_count,
                 "export_participates": export_participates,
+                "export_evidence": export_evidence,
+                "node_table_stale": bool(node_table["stale"]),
+                **causal_evidence,
             })
     return bindings
 
 
-def live_generator_delivery_snapshot(path):
-    """Return one uncached document snapshot for delivery validation.
-
-    Normal audit queries intentionally share a size/mtime keyed parse cache.
-    That cache is useful for a board scan but cannot be authority after an
-    external Atlas writer mutates Generator properties.  Read and parse the
-    target exactly once here so Generator rows, export participation, and Mesh
-    asset IDs all come from the same current document.
-    """
-    text = read_pipeline_spm_text(path)
+def generator_delivery_snapshot_from_spm_text(text, path):
+    """Build delivery evidence from one caller-owned immutable text snapshot."""
     export_node_counts, total_nodes = _export_node_counts_from_text(text)
     bindings = _leaf_generator_bindings_from_text(
         text,
@@ -679,7 +831,29 @@ def live_generator_delivery_snapshot(path):
         "total_node_count": total_nodes,
         "leaf_generator_bindings": [dict(row) for row in bindings],
         "mesh_asset_ids": mesh_asset_ids,
+        # Lets a consumer tell "this Generator exports nothing" apart from
+        # "the saved node table cannot answer that question".
+        "node_table": _node_table_state(
+            export_node_counts,
+            total_nodes,
+            _generator_guid_keys_from_text(text),
+        ),
     }
+
+
+def live_generator_delivery_snapshot(path):
+    """Return one uncached document snapshot for delivery validation.
+
+    Normal audit queries intentionally share a size/mtime keyed parse cache.
+    That cache is useful for a board scan but cannot be authority after an
+    external Atlas writer mutates Generator properties.  Read and parse the
+    target exactly once here so Generator rows, export participation, and Mesh
+    asset IDs all come from the same current document.
+    """
+    return generator_delivery_snapshot_from_spm_text(
+        read_pipeline_spm_text(path),
+        path,
+    )
 
 
 def _material_cutout_mesh_ids(block):
@@ -703,20 +877,36 @@ def _material_is_managed_leaf_output(block):
             or ("atlas leaf mesh builder" in low and '"generator"' in low))
 
 
-def _spm_analysis(path):
-    """Decompress and parse one SPM once for all read-only audit queries."""
+def _spm_analysis(path, *, include_decoded_handoff=False):
+    """Decompress and parse one SPM once for all read-only audit queries.
+
+    ``include_decoded_handoff`` is reserved for the immediate
+    ``leaf_generator_bindings`` caller. A cold parse then returns an owned,
+    path/stat/generation-bound handoff beside the compact analysis. A
+    material-first caller leaves that handoff only in its worker context until
+    bindings consume it or the folder-task ``finally`` releases it; the
+    long-lived analysis cache never owns the decoded document.
+    """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
     cache_key = _file_cache_key(path)
     cached = _SPM_ANALYSIS_CACHE.get(cache_key)
     if cached is not None:
+        if include_decoded_handoff:
+            return cached, _take_pending_decoded_handoff(path, cache_key)
         return cached
 
     path_key, size, mtime_ns = cache_key
     persistent = _persistent_spm_analysis()
     disk_entry = persistent.get(path_key)
+    # Schema 4 lacks only the two node-table-staleness keys added to each
+    # binding row (export_evidence/node_table_stale, issue #4). Rejecting it
+    # outright forces a full re-decode of every previously-cached SPM the
+    # moment this file bumps schema -- confirmed to blow a warm ~11s scan past
+    # 124s on a 431-file cache. Reuse it; those two keys are simply absent
+    # until the SPM's stat next changes and it gets a fresh parse.
     if disk_entry and disk_entry.get("size") == size \
             and disk_entry.get("mtime_ns") == mtime_ns \
-            and disk_entry.get("leaf_binding_schema") == 4:
+            and disk_entry.get("leaf_binding_schema") in (4, 5):
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
@@ -725,8 +915,12 @@ def _spm_analysis(path):
             "leaf_generator_bindings": disk_entry.get(
                 "leaf_generator_bindings", []),
             "mesh_asset_ids": set(disk_entry.get("mesh_asset_ids", [])),
+            "generator_foregrounds_snapshot": _disk_generator_foregrounds(
+                disk_entry),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
+        if include_decoded_handoff:
+            return analysis, _take_pending_decoded_handoff(path, cache_key)
         return analysis
 
     text = read_maybe_gzip_text(path)
@@ -774,6 +968,15 @@ def _spm_analysis(path):
         "visible_material_ids": visible,
         "leaf_generator_bindings": leaf_bindings,
         "mesh_asset_ids": mesh_assets,
+        # Not computed here: only ~40% of SPMs in a typical folder carry a
+        # valid legacy Cluster marker receipt, and the Generator-foreground
+        # scan is only worth its cost for those. Eagerly running it for every
+        # SPM regressed a synthetic 103-file/41-receipt profile from 3.96s to
+        # 4.52s. leaf_generator_bindings() below hands the decoded text to
+        # inspect_legacy_cluster_state(), which scans it lazily -- only when
+        # a valid receipt makes that worthwhile -- and only ever reads this
+        # SPM once either way.
+        "generator_foregrounds_snapshot": None,
     }
     # A modified file receives a new stat key. Drop only stale entries for
     # this exact path so long-running GUI refreshes do not grow indefinitely.
@@ -792,10 +995,53 @@ def _spm_analysis(path):
             "visible_material_ids": sorted(visible),
             "leaf_generator_bindings": leaf_bindings,
             "mesh_asset_ids": sorted(mesh_assets),
-            "leaf_binding_schema": 4,
+            "leaf_binding_schema": 5,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+    handoff = make_decoded_spm_handoff(
+        path, text, size=size, mtime_ns=mtime_ns)
+    _PENDING_DECODED_HANDOFF.set(handoff)
+    if include_decoded_handoff:
+        return analysis, _take_pending_decoded_handoff(path, cache_key)
     return analysis
+
+
+def _disk_generator_foregrounds(disk_entry):
+    """Reconstruct the shared foregrounds snapshot from a persisted entry.
+
+    Returns ``None`` when the entry predates the legacy-marker snapshot (any
+    pre-existing schema-4 or schema-5 cache), so the caller falls back to a
+    lazy, single, narrowed read instead of silently treating "not persisted
+    yet" as "no markers".
+    """
+    if disk_entry.get("legacy_marker_schema") != 1:
+        return None
+    foregrounds = disk_entry.get("generator_foregrounds")
+    if foregrounds is None:
+        return None
+    return foregrounds, set(disk_entry.get("duplicate_generator_guids", []))
+
+
+def _backfill_generator_foregrounds_cache(cache_key, snapshot):
+    """Persist a lazily-computed legacy-marker snapshot onto its SPM's entry.
+
+    Called only when a disk hit for material/leaf data existed without a
+    legacy-marker snapshot (pre-existing schema-4/5 cache) and something
+    downstream needed one anyway (speedtree_legacy_cluster_contract already
+    paid for a fresh, narrowed read/decode). Enrich the existing entry in
+    place rather than forcing a full material re-parse.
+    """
+    global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    path_key, size, mtime_ns = cache_key
+    persistent = _persistent_spm_analysis()
+    entry = persistent.get(path_key)
+    if not entry or entry.get("size") != size or entry.get("mtime_ns") != mtime_ns:
+        return
+    foregrounds, duplicate_guids = snapshot
+    entry["legacy_marker_schema"] = 1
+    entry["generator_foregrounds"] = foregrounds
+    entry["duplicate_generator_guids"] = sorted(duplicate_guids)
+    _PERSISTENT_SPM_ANALYSIS_DIRTY = True
 
 
 def canonical_material_name(name):
@@ -1016,8 +1262,40 @@ def visible_material_names(path):
 
 def leaf_generator_bindings(path, visible_only=False):
     """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
-    bindings = _spm_analysis(path)["leaf_generator_bindings"]
-    legacy_state = inspect_legacy_cluster_state(path)
+    cache_key = _file_cache_key(path)
+    analysis, decoded_handoff = _spm_analysis(
+        path, include_decoded_handoff=True)
+    bindings = analysis["leaf_generator_bindings"]
+    snapshot = analysis.get("generator_foregrounds_snapshot")
+    legacy_state = inspect_legacy_cluster_state(
+        path,
+        foregrounds_snapshot=snapshot,
+        decoded_handoff=decoded_handoff,
+    )
+    fatal_reasons = [
+        reason for reason in legacy_state.get("reason_tokens", [])
+        if reason in {
+            HANDOFF_STAT_MISMATCH_REASON,
+            SNAPSHOT_SCAN_FAILED_REASON,
+        }
+    ]
+    if fatal_reasons:
+        reason = fatal_reasons[0]
+        evidence = (
+            legacy_state.get("handoff_evidence")
+            if reason == HANDOFF_STAT_MISMATCH_REASON
+            else legacy_state.get("failure_evidence")
+        ) or {}
+        raise RuntimeError(
+            f"{reason}: {json.dumps(evidence, sort_keys=True)}"
+        )
+    if snapshot is None:
+        # If the legacy audit above actually scanned (only happens when the
+        # SPM holds a valid receipt), backfill so it is never read again.
+        computed = peek_generator_foregrounds(path)
+        if computed is not None:
+            analysis["generator_foregrounds_snapshot"] = computed
+            _backfill_generator_foregrounds_cache(cache_key, computed)
     legacy_guids = set(legacy_state["classified_generator_guids"])
     drift_guids = set(legacy_state["marker_drift_guids"])
     evidence = legacy_state.get("evidence_by_guid") or {}
@@ -6083,12 +6361,21 @@ def canonical_cluster_provider_map(root):
 
 
 
+def _audit_one_with_handoff_scope(audit_one, folder):
+    """Bound an unconsumed decoded handoff to one folder task."""
+    _PENDING_DECODED_HANDOFF.set(None)
+    try:
+        return audit_one(folder)
+    finally:
+        _PENDING_DECODED_HANDOFF.set(None)
+
+
 def _audit_report_folders(folders, audit_one, progress_callback=None):
     items = []
     total_folders = len(folders)
     if total_folders <= 1:
         for folder in folders:
-            items.append(audit_one(folder))
+            items.append(_audit_one_with_handoff_scope(audit_one, folder))
             if progress_callback is not None:
                 progress_callback(1, total_folders, folder)
         return items
@@ -6102,7 +6389,9 @@ def _audit_report_folders(folders, audit_one, progress_callback=None):
         thread_name_prefix="pcg-audit",
     ) as executor:
         futures = {
-            executor.submit(audit_one, folder): (index, folder)
+            executor.submit(
+                _audit_one_with_handoff_scope, audit_one, folder
+            ): (index, folder)
             for index, folder in enumerate(folders)
         }
         completed = 0

@@ -305,6 +305,33 @@ python pcg_texture_audit.py --json reports\audit.json --csv reports\audit.csv
 python export_all_queues.py --pcg-targets pcg_targets.json --out-dir reports --prefix pcg01 --no-stamp
 ```
 
+### Stale saved Node-table recovery
+
+`NORMALIZED_GENERATOR_NODE_TABLE_STALE` uses an interactive recovery boundary:
+
+```bat
+python -m pcg_st9_texture_batch.stale_node_table_recovery ^
+  "<SPM>" ^
+  --expected-mesh-id 130 --expected-mesh-id 131 ^
+  --expected-mesh-id 132 --expected-mesh-id 133
+```
+
+Before Modeler is opened, the command captures an exact byte-for-byte preimage
+under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
+SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
+membership, and required target-binding fingerprints. It then waits for the
+user to save the file and requires repeated identical stat/size/SHA snapshots
+with successful parsing. Regex, independent ElementTree, target delivery, and
+normalization evidence all come from those same immutable bytes.
+
+The command does not edit SPM XML, automate Save or keystrokes, kill Modeler,
+roll back automatically, or continue merely because `stale=false`. Library
+callers may resume the initiating job only once, bound to its generation and
+the verified after SHA, after cancellation/app-close/stale-job guards and a
+final source-SHA recheck. A privacy-safe blocked-event receipt records only the
+asset name, after SHA, and stable reason tokens. Missing/corrupt preimage or
+receipt evidence fails before Modeler launch.
+
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),
 `export_atlas_handoff_queue.py`(Blender 핸드오프),

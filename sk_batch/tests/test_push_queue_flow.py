@@ -13,6 +13,7 @@ from unittest import mock
 
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(SK_BATCH_DIR))
 
 
@@ -37,6 +38,358 @@ class PushQueueFlowTests(unittest.TestCase):
         app.cfg = {}
         app.log = mock.Mock()
         return app
+
+    @staticmethod
+    def issue16_fixture():
+        return json.loads(
+            (FIXTURE_DIR / "issue16_blackgum_source_run.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_issue16_captured_live_delivery_is_four_runnable_one_blocked(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        fixture = self.issue16_fixture()
+        provider = Path("blackgum") / "cluster" / "SK_cluster_blackgum_01.spm"
+        runnable = []
+        blocked = []
+
+        for row in fixture["targets"]:
+            target = Path("blackgum") / row["target"]
+            blocked_targets = []
+            handoff_errors = []
+            if row["delivery_decision"] == "blocked":
+                blocked_targets.append({
+                    "spm": str(target),
+                    "delivery_reason": row["delivery_reason"],
+                    "errors": row["delivery_errors"],
+                })
+                handoff_errors.append({
+                    "code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+                    "role": "cluster",
+                    "spm": str(provider),
+                    "delivery_mode": row["delivery_mode"],
+                    "errors": row["delivery_errors"],
+                })
+            contract = {
+                "tree_source_identities": [{"spm": str(target)}],
+                "dependencies": [{
+                    "spm": str(provider),
+                    "normalized_delivery_mode": row["delivery_mode"],
+                    "normalized_delivery_blocked": bool(blocked_targets),
+                    "normalized_variants_required": True,
+                    "normalized_variants": {
+                        "status": "current",
+                        "delivery_mode": row["delivery_mode"],
+                        "delivery_errors": row["delivery_errors"],
+                        "delivery_blocked_targets": blocked_targets,
+                        "variants": [{"name": "Cluster"}],
+                    },
+                }],
+                "handoff": {
+                    "status": "blocked" if handoff_errors else "ready",
+                    "errors": handoff_errors,
+                },
+                # Operational Sync completed, but that is not Push readiness.
+                "relationship_sync": {"outcome": "completed"},
+            }
+            raw_audit = {
+                "selected_contract": contract,
+                "audit_report": Path("captured_live_audit.json"),
+                "payload": {"items": [{}]},
+            }
+            with mock.patch.object(
+                app,
+                "_refresh_stale_cluster_receipt_uncached",
+                return_value=raw_audit,
+            ):
+                if row["delivery_decision"] == "blocked":
+                    with self.assertRaises(
+                        gui.TargetPlannedExclusionError
+                    ) as caught:
+                        app._cluster_normalization_stage_observation(
+                            target,
+                            "captured",
+                            provider,
+                            require_normalized=False,
+                        )
+                    blocked.append(caught.exception.reason_token)
+                else:
+                    observation = (
+                        app._cluster_normalization_stage_observation(
+                            target,
+                            "captured",
+                            provider,
+                            require_normalized=False,
+                        )
+                    )
+                    runnable.append(Path(observation["target_spm"]).name)
+
+        self.assertEqual(len(runnable), 4)
+        self.assertEqual(blocked, [
+            fixture["expected_result"]["blocked_reason_token"]
+        ])
+
+    def test_issue16_planned_exclusion_does_not_fan_out_shared_provider(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        fixture = self.issue16_fixture()
+        roots = [
+            Path("blackgum") / row["target"]
+            for row in fixture["targets"]
+        ]
+        weed = next(path for path in roots if "weed" in path.name.casefold())
+        provider = (
+            Path("blackgum") / "cluster" / "SK_cluster_blackgum_01.spm"
+        )
+        provider_item = {
+            "spm": provider,
+            "checked": False,
+            "referenced_by_spms": tuple(roots),
+        }
+        root_items = [{"spm": path, "checked": True} for path in roots]
+        expanded = [provider_item, *root_items]
+        dependency_map = {
+            str(path): (str(provider),) for path in roots
+        }
+        calls = []
+
+        def fake_batch(phase, phase_targets, emit_done=False):
+            names = [item["spm"].name for item in phase_targets]
+            calls.append((phase, names))
+            if phase == "blender" and names == [provider.name]:
+                def observe(target, *_args, **_kwargs):
+                    if target == weed:
+                        raise gui.TargetPlannedExclusionError(
+                            "current live delivery blocks only the weed target",
+                            reason_token=(
+                                fixture["expected_result"][
+                                    "blocked_reason_token"
+                                ]
+                            ),
+                            target_spm=weed,
+                            producer_spm=provider,
+                            evidence={
+                                "sync_outcome": "completed",
+                                "sync_outcome_authoritative": False,
+                                "normalization_postcondition": "not_run",
+                            },
+                        )
+                    return {
+                        "target_spm": str(target),
+                        "live_audit_report": "captured.json",
+                        "selected_contract": {"handoff": {"status": "ready"}},
+                    }
+
+                with mock.patch.object(
+                    app,
+                    "_cluster_normalization_stage_observation",
+                    side_effect=observe,
+                ):
+                    runnable, contracts = app._cluster_relation_input_plan(
+                        roots,
+                        "captured",
+                        provider,
+                    )
+                self.assertEqual(
+                    list(runnable),
+                    [path for path in roots if path != weed],
+                )
+                self.assertEqual(len(contracts), 4)
+            app._phase_failed_items = set()
+            app._phase_abort_reason = None
+            return True
+
+        app._run_batch = mock.Mock(side_effect=fake_batch)
+        with mock.patch.object(
+            gui,
+            "expand_blender_repair_targets",
+            return_value=(expanded, dependency_map, {str(provider)}),
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_full_pipeline(root_items)
+
+        self.assertFalse(result)
+        downstream_blender = [
+            names for phase, names in calls
+            if phase == "blender" and names != [provider.name]
+        ]
+        self.assertEqual(
+            downstream_blender,
+            [[path.name for path in roots if path != weed]],
+        )
+        summary = app._phase_result_summary
+        self.assertEqual(
+            {
+                key: summary[key]
+                for key in (
+                    "completed_count",
+                    "blocked_count",
+                    "planned_excluded_count",
+                    "dependency_blocked_count",
+                    "failed_count",
+                )
+            },
+            {
+                key: fixture["expected_result"][key]
+                for key in (
+                    "completed_count",
+                    "blocked_count",
+                    "planned_excluded_count",
+                    "dependency_blocked_count",
+                    "failed_count",
+                )
+            },
+        )
+        weed_outcome = next(
+            row for row in summary["target_outcomes"]
+            if row["target_name"] == weed.name
+        )
+        self.assertEqual(weed_outcome["outcome"], "planned_excluded")
+        self.assertEqual(
+            weed_outcome["reason_token"],
+            fixture["expected_result"]["blocked_reason_token"],
+        )
+        self.assertIn("Sync excluded", app.state[str(weed)]["blend_status"])
+        self.assertIn("Push blocked", app.state[str(weed)]["push_status"])
+        self.assertEqual(
+            app.state[str(weed)]["push_status_error"]["reason_token"],
+            fixture["expected_result"]["blocked_reason_token"],
+        )
+
+    def test_issue16_shared_queue_result_persists_causal_counts_and_token(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        fixture = self.issue16_fixture()
+        targets = [
+            {"spm": Path("blackgum") / row["target"], "checked": True}
+            for row in fixture["targets"]
+        ]
+        blocked_name = "SK_weed_blackgum_01.spm"
+        target_outcomes = [
+            {
+                "target": str(item["spm"]),
+                "target_name": item["spm"].name,
+                "outcome": (
+                    "planned_excluded"
+                    if item["spm"].name == blocked_name
+                    else "completed"
+                ),
+                "reason_token": (
+                    fixture["expected_result"]["blocked_reason_token"]
+                    if item["spm"].name == blocked_name
+                    else None
+                ),
+                "evidence": (
+                    {"sync_outcome_authoritative": False}
+                    if item["spm"].name == blocked_name
+                    else {}
+                ),
+            }
+            for item in targets
+        ]
+        expected = {
+            "selected_count": 5,
+            "completed_count": 4,
+            "blocked_count": 1,
+            "planned_excluded_count": 1,
+            "dependency_blocked_count": 0,
+            "failed_count": 0,
+            "target_outcomes": target_outcomes,
+            "shared_failures": [],
+        }
+
+        class Lease:
+            def __init__(self):
+                self.finished = False
+                self.result = None
+                self.success = None
+
+            def finish(self, success=True, result=None):
+                self.finished = True
+                self.success = success
+                self.result = result
+
+        lease = Lease()
+        app.shared_queue_runtime = mock.Mock(
+            wait_for_turn=mock.Mock(return_value=lease)
+        )
+
+        def run_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = expected
+            app._phase_failed_items = {
+                str(item["spm"])
+                for item in targets
+                if item["spm"].name == blocked_name
+            }
+            return False
+
+        app._run_full_pipeline = mock.Mock(side_effect=run_pipeline)
+        job = {
+            "id": 16,
+            "label": "Issue 16 replay",
+            "mode": "pipeline",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": targets,
+            "shared_queue_job_id": "source-run-replay",
+        }
+        with mock.patch.object(
+            app,
+            "_freeze_batch_production_source_manifest",
+        ):
+            app._run_queued_batch_job(job)
+
+        self.assertFalse(lease.success)
+        self.assertEqual(lease.result["outcome"], "partial")
+        for key, value in fixture["expected_result"].items():
+            if key == "blocked_reason_token":
+                continue
+            self.assertEqual(lease.result[key], value)
+        blocked = next(
+            row for row in lease.result["target_outcomes"]
+            if row["outcome"] == "planned_excluded"
+        )
+        self.assertEqual(
+            blocked["reason_token"],
+            fixture["expected_result"]["blocked_reason_token"],
+        )
+        self.assertIn(
+            fixture["expected_result"]["blocked_reason_token"],
+            lease.result["error"],
+        )
+
+    def test_truly_shared_failure_is_recorded_once_with_affected_targets(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        provider = Path("cluster") / "SK_shared_cluster.spm"
+        roots = [Path("SK_tree_a.spm"), Path("SK_tree_b.spm")]
+        app._active_blender_dependency_map = {
+            str(root): (str(provider),) for root in roots
+        }
+        app.state[str(provider)] = {
+            "blend_status_kind": "data_error",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "shared provider failed its own postcondition",
+            },
+        }
+
+        summary = app._build_pipeline_result_summary(
+            [{"spm": root} for root in roots],
+            {str(provider)},
+            {str(root) for root in roots},
+            None,
+        )
+
+        self.assertEqual(summary["completed_count"], 0)
+        self.assertEqual(summary["blocked_count"], 2)
+        self.assertEqual(summary["failed_count"], 0)
+        self.assertEqual(len(summary["shared_failures"]), 1)
+        self.assertEqual(
+            summary["shared_failures"][0]["affected_targets"],
+            [str(root) for root in roots],
+        )
 
     def test_blender_window_guard_skips_own_tk_windows_before_title_query(self):
         gui = load_gui_module()
@@ -1438,8 +1791,9 @@ class PushQueueFlowTests(unittest.TestCase):
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
         ][-1]
-        self.assertIn("root 실패 2개", final_progress)
-        self.assertIn("dependency 차단 0개", final_progress)
+        self.assertIn("completed 1", final_progress)
+        self.assertIn("blocked 0", final_progress)
+        self.assertIn("failed 2", final_progress)
 
     def test_full_pipeline_cluster_failure_blocks_only_mapped_consumer(self):
         gui = load_gui_module()
@@ -1552,7 +1906,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "ready": False,
                 "reason": (
                     "required Cluster stage failed: "
-                    f"{failed_cluster.name}"
+                    f"{failed_cluster.name} — 원인: cluster SPM failed"
                 ),
                 "kind": "dependency_blocked",
             }],
@@ -1582,9 +1936,9 @@ class PushQueueFlowTests(unittest.TestCase):
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
         ][-1]
-        self.assertIn("성공 1개", final_progress)
-        self.assertIn("root 실패 1개", final_progress)
-        self.assertIn("dependency 차단 1개", final_progress)
+        self.assertIn("completed 1", final_progress)
+        self.assertIn("blocked 1", final_progress)
+        self.assertIn("failed 1", final_progress)
 
     def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
         gui = load_gui_module()

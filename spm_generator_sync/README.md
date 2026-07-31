@@ -127,6 +127,34 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
   선택 자식을 백업합니다.
 - 저장·무결성 검사·SpeedTree 검증 중 하나라도 실패하면 변경 대상 자식을 백업으로 복구합니다.
 
+### 프로세스 출력과 취소 상태
+
+- SpeedTree stdout/stderr는 프로세스가 끝날 때까지 모아 두지 않고 기존 GUI 작업 큐로
+  줄 단위 스트리밍합니다. 줄바꿈 없이 끝난 마지막 부분 줄도 보존합니다.
+- 두 파이프는 별도 reader가 동시에 비우며, Tk 위젯 갱신은 항상 메인 스레드의
+  `_poll_job()`에서 제한된 묶음으로 처리합니다. producer→Tk 전달은 작업별 최근
+  4,096줄과 단일 `output_ready` wake-up으로 제한하고 UI 로그는 최근 3,000줄을
+  유지합니다. 누락이 생기면 `[process_output_omitted]` 증거를 마지막에도 남깁니다.
+- 프로세스 진단 stdout/stderr는 채널별 256 KiB tail만 결과에 보존합니다. 줄바꿈 없는
+  한 줄은 16 KiB fragment로 나누므로 reader pending과 최종 capture가 입력 크기에 따라
+  무한히 증가하지 않습니다.
+- `현재 작업 취소`는 해당 FIFO 작업의 취소 이벤트만 설정합니다. 실행 전 또는 단계 사이에는
+  안전 경계에서 중단합니다. Windows에서는 root를 suspended로 시작해 private
+  `KILL_ON_JOB_CLOSE` Job Object에 배정한 뒤 resume하므로 child/grandchild도 같은 소유
+  단위에 들어갑니다. root 종료 요청 뒤 tree/pipe EOF가 제한 시간 안에 끝나지 않을 때만
+  `TerminateJobObject` fallback을 사용하며 무관한 sibling process는 건드리지 않습니다.
+- 결과는 `cancelled_before_launch`, `cancelled_at_safe_boundary`,
+  `cancelled_after_exit`, `cancelled_terminated`, `cancelled_killed`로 구분합니다.
+  취소는 실패로 합산하지 않으며, 연결 전체 실행 보고서와 공용 큐 결과에는
+  `status: cancelled`와 `termination_state`를 기록합니다.
+- 이미 관찰된 nonzero exit와 함수가 반환한 committed success는 늦은 cancel보다 우선합니다.
+  tree 종료 실패는 취소로 바꾸지 않고 `process_*_failed`/`process_*_grace_expired`, rollback
+  복원 실패는 `[transaction_rollback_failed]` reason token과 원인·복원 경로 evidence로
+  실패 처리합니다.
+- 창을 닫으면 대기 작업을 취소하고 활성 작업에 같은 cooperative cancel 이벤트를 보낸 뒤,
+  Tk `after()`로 worker/lease 완료를 계속 확인합니다. 고정 5초 뒤 파괴하지 않으며 worker가
+  실제 종료된 뒤에만 설정 저장과 standalone/통합 root 파괴를 수행합니다.
+
 공식 근거:
 
 - [Reference generator 설정](https://docs.unity3d.com/speedtree-modeler/manual/add-and-set-up-a-reference-generator.html)

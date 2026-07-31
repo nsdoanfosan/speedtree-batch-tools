@@ -14,13 +14,24 @@ import ctypes
 import os
 import runpy
 import sys
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
 
+from shared_job_queue import InterprocessMutex, QueueError
+
 
 REPO_DIR = Path(__file__).resolve().parent
-ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
+ERROR_LOG = Path(
+    os.environ.get(
+        "SPEEDTREE_BATCH_TOOLS_ERROR_LOG",
+        str(REPO_DIR / "speedtree_batch_tools_error.log"),
+    )
+).expanduser()
+ERROR_LOG_MAX_BYTES = 256 * 1024
+ERROR_LOG_BACKUP_COUNT = 2
+_ERROR_LOG_LOCK = threading.RLock()
 MB_ICONERROR = 0x10
 CODE_COMPILE_GATE = REPO_DIR / "sk_batch" / "code_compile_gate.py"
 CODE_COMPILE_GATE_TARGETS = {
@@ -29,16 +40,72 @@ CODE_COMPILE_GATE_TARGETS = {
 }
 
 
-def record_error(label, text):
-    """Append one failure to the shared log; never raise from the reporter."""
+def _rotated_log_path(index):
+    return ERROR_LOG.with_name(f"{ERROR_LOG.name}.{index}")
+
+
+def _trim_log_file(path):
+    if path.stat().st_size <= ERROR_LOG_MAX_BYTES:
+        return
+    with path.open("rb") as handle:
+        handle.seek(-ERROR_LOG_MAX_BYTES, os.SEEK_END)
+        tail = handle.read()
+    # Drop an incomplete UTF-8 prefix and begin at the next whole line when
+    # possible.  This file is already a rotated diagnostic backup.
+    text = tail.decode("utf-8", errors="ignore")
+    newline = text.find("\n")
+    if newline >= 0:
+        text = text[newline + 1:]
+    path.write_text(text, encoding="utf-8")
+
+
+def _rotate_error_log_if_needed(incoming_bytes):
     try:
-        with ERROR_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"\n[{datetime.now().isoformat(timespec='seconds')}] {label}\n"
-            )
-            handle.write(text)
+        current_bytes = ERROR_LOG.stat().st_size
+    except FileNotFoundError:
+        return
+    if current_bytes + incoming_bytes <= ERROR_LOG_MAX_BYTES:
+        return
+    oldest = _rotated_log_path(ERROR_LOG_BACKUP_COUNT)
+    try:
+        oldest.unlink()
+    except FileNotFoundError:
+        pass
+    for index in range(ERROR_LOG_BACKUP_COUNT - 1, 0, -1):
+        source = _rotated_log_path(index)
+        if source.exists():
+            os.replace(source, _rotated_log_path(index + 1))
+    os.replace(ERROR_LOG, _rotated_log_path(1))
+    _trim_log_file(_rotated_log_path(1))
+
+
+def record_error(label, text):
+    """Append one failure with fixed-size rotation; never raise."""
+
+    header = f"\n[{datetime.now().isoformat(timespec='seconds')}] {label}\n"
+    detail = str(text)
+    entry = header + detail
+    encoded = entry.encode("utf-8", errors="replace")
+    if len(encoded) > ERROR_LOG_MAX_BYTES:
+        header_bytes = header.encode("utf-8", errors="replace")
+        tail_budget = max(0, ERROR_LOG_MAX_BYTES - len(header_bytes))
+        detail_tail = detail.encode("utf-8", errors="replace")[-tail_budget:]
+        entry = header + detail_tail.decode("utf-8", errors="ignore")
+        encoded = entry.encode("utf-8")
+    try:
+        with _ERROR_LOG_LOCK:
+            # Rotation decisions and the append must observe one process-wide
+            # critical section.  Otherwise two simultaneous pythonw failures
+            # can both rotate the same active file or append past the bound.
+            with InterprocessMutex(ERROR_LOG, timeout=10.0).acquire():
+                ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _rotate_error_log_if_needed(len(encoded))
+                with ERROR_LOG.open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as handle:
+                    handle.write(entry)
         return True
-    except OSError:
+    except (OSError, QueueError):
         return False
 
 

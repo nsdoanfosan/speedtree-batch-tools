@@ -13,7 +13,11 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISREG
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parent
@@ -31,6 +35,7 @@ from cluster_spm_pair_contract import (
     inspect_cluster_spm_pair,
     resolve_cluster_spm_pair,
 )
+from shared_job_queue import InterprocessMutex
 
 
 def _default_addon_dir():
@@ -52,6 +57,8 @@ PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 LOG_DIR = TOOL_DIR / "logs"
+STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
+STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
 PUSH_MANIFEST_SCHEMA_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
 DEFAULT_SEND2UE_DIR = Path(
@@ -275,17 +282,170 @@ def save_config(cfg):
     _atomic_write_json(CONFIG_PATH, cfg)
 
 
+def _append_bounded_state_recovery_log(message):
+    """Persist a small path-safe recovery notice without unbounded growth."""
+
+    try:
+        existing = STATE_RECOVERY_LOG_PATH.read_bytes()
+    except OSError:
+        existing = b""
+    encoded = str(message).encode("utf-8", errors="replace")
+    payload = existing + encoded
+    if len(payload) > STATE_RECOVERY_LOG_MAX_BYTES:
+        payload = payload[-STATE_RECOVERY_LOG_MAX_BYTES:]
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            payload = payload[newline + 1:]
+    try:
+        atomic_write_bytes(STATE_RECOVERY_LOG_PATH, payload)
+    except OSError:
+        pass
+
+
+def _state_mutex():
+    """Build the path-scoped process mutex after test/runtime path overrides."""
+
+    return InterprocessMutex(Path(STATE_PATH), timeout=10.0)
+
+
+def _state_bytes_unchanged(expected):
+    try:
+        return STATE_PATH.read_bytes() == expected
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _quarantine_unreadable_state(exc, expected_bytes):
+    """Move the exact unreadable snapshot aside, or request a re-read."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    quarantine = STATE_PATH.with_name(
+        f"{STATE_PATH.stem}.unreadable-{stamp}-{uuid.uuid4().hex[:8]}"
+        f"{STATE_PATH.suffix}"
+    )
+    if not _state_bytes_unchanged(expected_bytes):
+        return None
+    try:
+        os.replace(STATE_PATH, quarantine)
+    except FileNotFoundError:
+        return None
+    except OSError as move_exc:
+        raise RuntimeError(
+            "state_quarantine_failed: unreadable SK Batch state could not "
+            "be quarantined; refusing to start with empty state"
+        ) from move_exc
+
+    notice = (
+        f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] "
+        f"state_unreadable_quarantined name={quarantine.name} "
+        f"({type(exc).__name__})\n"
+    )
+    _append_bounded_state_recovery_log(notice)
+    try:
+        warnings.warn(notice.strip(), RuntimeWarning, stacklevel=2)
+    except RuntimeWarning:
+        pass
+    return quarantine
+
+
+def _state_entry_is_persistable(key):
+    """Drop only confirmed dead/backup SPM rows; preserve unknown metadata."""
+
+    if not isinstance(key, str):
+        return True
+    candidate = Path(key).expanduser()
+    if candidate.suffix.casefold() != ".spm":
+        return True
+    if not is_live_spm(candidate, require_file=False):
+        return False
+    try:
+        return S_ISREG(candidate.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A temporarily unavailable drive or permission boundary is not proof
+        # that a production asset is dead.
+        return True
+
+
+def _prune_state_entries(state):
+    if not isinstance(state, dict):
+        raise ValueError("SK Batch state root must be a JSON object")
+    return {
+        key: value
+        for key, value in state.items()
+        if _state_entry_is_persistable(key)
+    }
+
+
 def load_state():
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    with _JSON_WRITE_LOCK:
+        with _state_mutex().acquire():
+            for _attempt in range(8):
+                try:
+                    raw = STATE_PATH.read_bytes()
+                except FileNotFoundError:
+                    return {}
+                except OSError as exc:
+                    raise RuntimeError(
+                        "state_read_failed: SK Batch state could not be read"
+                    ) from exc
+                try:
+                    loaded = json.loads(raw)
+                    pruned = _prune_state_entries(loaded)
+                except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    quarantine = _quarantine_unreadable_state(exc, raw)
+                    if quarantine is None:
+                        continue
+                    return {}
+                if pruned != loaded:
+                    if not _state_bytes_unchanged(raw):
+                        continue
+                    _atomic_write_json(STATE_PATH, pruned)
+                return pruned
+    raise RuntimeError(
+        "state_changed_during_load: SK Batch state changed repeatedly"
+    )
 
 
 def save_state(state):
-    _atomic_write_json(STATE_PATH, state)
+    incoming = _prune_state_entries(state)
+    with _JSON_WRITE_LOCK:
+        with _state_mutex().acquire():
+            current = {}
+            try:
+                raw = STATE_PATH.read_bytes()
+            except FileNotFoundError:
+                raw = None
+            except OSError as exc:
+                raise RuntimeError(
+                    "state_read_failed: SK Batch state could not be read"
+                ) from exc
+            if raw is not None:
+                try:
+                    current = _prune_state_entries(json.loads(raw))
+                except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    quarantine = _quarantine_unreadable_state(exc, raw)
+                    if quarantine is None:
+                        raise RuntimeError(
+                            "state_changed_during_save: SK Batch state changed "
+                            "before quarantine"
+                        )
+            # State rows are asset-keyed independent updates.  Merging the
+            # latest locked snapshot prevents a stale producer from deleting
+            # a valid row created by another process; confirmed dead/backup
+            # rows were already removed from both sides.
+            merged = dict(current)
+            merged.update(incoming)
+            if raw is not None and STATE_PATH.exists():
+                if not _state_bytes_unchanged(raw):
+                    raise RuntimeError(
+                        "state_changed_during_save: SK Batch state changed "
+                        "during the locked transaction"
+                    )
+            _atomic_write_json(STATE_PATH, merged)
 
 
 def file_content_fingerprint(path, digest_size=16):

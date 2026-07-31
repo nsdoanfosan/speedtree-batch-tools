@@ -1,14 +1,24 @@
+import multiprocessing
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from shared_job_queue import LeaseConflict
 from shared_queue_runtime import (
     RuntimeClosed,
     SharedQueueRuntime,
     WaitCancelled,
 )
+
+
+def _enqueue_runtime_head_then_exit(state_path, output):
+    runtime = SharedQueueRuntime("dead-origin", state_path)
+    job = runtime.enqueue("dead head", {"origin_pid": os.getpid()})
+    output.put(job["id"])
 
 
 class SharedQueueRuntimeTests(unittest.TestCase):
@@ -147,6 +157,88 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(observed[0]["queued_count"], 1)
         first_lease.finish()
 
+    def test_blocked_poll_tick_reads_one_snapshot_without_claim_or_get(self):
+        first_runtime = self.runtime("app-a")
+        waiting_runtime = self.runtime("app-b")
+        first = first_runtime.enqueue("running", {})
+        waiting = waiting_runtime.enqueue("waiting", {})
+        first_lease = first_runtime.wait_for_turn(first["id"])
+        cancel = threading.Event()
+
+        with mock.patch.object(
+            waiting_runtime.queue,
+            "poll_for_turn",
+            wraps=waiting_runtime.queue.poll_for_turn,
+        ) as poll, mock.patch.object(
+            waiting_runtime.queue,
+            "snapshot",
+            wraps=waiting_runtime.queue.snapshot,
+        ) as snapshot, mock.patch.object(
+            waiting_runtime.queue,
+            "claim",
+            wraps=waiting_runtime.queue.claim,
+        ) as claim, mock.patch.object(
+            waiting_runtime.queue,
+            "get",
+            wraps=waiting_runtime.queue.get,
+        ) as get:
+            with self.assertRaises(WaitCancelled):
+                waiting_runtime.wait_for_turn(
+                    waiting["id"],
+                    on_wait=lambda _status: cancel.set(),
+                    cancel_event=cancel,
+                    poll_interval=0.01,
+                )
+
+        self.assertEqual(poll.call_count, 1)
+        self.assertEqual(snapshot.call_count, 0)
+        self.assertEqual(claim.call_count, 0)
+        self.assertEqual(get.call_count, 0)
+        first_lease.finish()
+
+    def test_wait_for_turn_abandons_dead_origin_head_without_foreign_waiter(self):
+        context = multiprocessing.get_context("spawn")
+        for iteration in range(3):
+            with self.subTest(iteration=iteration):
+                state_path = Path(self.temp_dir.name) / f"dead-{iteration}.json"
+                output = context.Queue()
+                process = context.Process(
+                    target=_enqueue_runtime_head_then_exit,
+                    args=(str(state_path), output),
+                )
+                process.start()
+                dead_id = output.get(timeout=5)
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+
+                runtime = SharedQueueRuntime("live-runtime", state_path)
+                self.runtimes.append(runtime)
+                live = runtime.enqueue("live second", {"iteration": iteration})
+                result = {}
+
+                def wait_live():
+                    try:
+                        result["lease"] = runtime.wait_for_turn(
+                            live["id"],
+                            poll_interval=0.01,
+                        )
+                    except BaseException as exc:
+                        result["error"] = exc
+
+                waiter = threading.Thread(target=wait_live)
+                waiter.start()
+                waiter.join(3)
+                self.assertFalse(waiter.is_alive(), "runtime FIFO remained stuck")
+                self.assertNotIn("error", result)
+                self.assertEqual(result["lease"].job_id, live["id"])
+                snapshot = runtime.queue.snapshot()
+                dead = next(job for job in snapshot["jobs"] if job["id"] == dead_id)
+                current = next(job for job in snapshot["jobs"] if job["id"] == live["id"])
+                self.assertEqual(dead["status"], "abandoned")
+                self.assertEqual(dead["abandon_reason"], "origin_process_exited")
+                self.assertEqual(current["status"], "running")
+                result["lease"].finish()
+
     def test_cancel_event_cancels_waiting_ticket(self):
         first_runtime = self.runtime("app-a")
         waiting_runtime = self.runtime("app-b")
@@ -193,6 +285,46 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertGreater(after, before)
         self.assertIsNone(lease.heartbeat_error)
         lease.finish()
+
+    def test_release_request_is_observed_and_late_ack_is_fail_closed(self):
+        runtime = self.runtime(
+            lease_seconds=0.3,
+            heartbeat_interval=0.02,
+        )
+        runtime.queue.force_release_min_age_seconds = 0.01
+        first = runtime.enqueue("owner ack", {})
+        second = runtime.enqueue("normal completion wins", {})
+        lease = runtime.wait_for_turn(first["id"])
+        time.sleep(0.02)
+        requested = runtime.queue.request_release(
+            first["id"],
+            confirm_job_id=first["id"],
+        )
+        request_id = requested["release_request"]["id"]
+        deadline = time.monotonic() + 1
+        while lease.release_request is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(lease.release_request["id"], request_id)
+
+        released = lease.acknowledge_release(request_id)
+        self.assertEqual(
+            released["failure_reason"],
+            "owner_released_by_operator",
+        )
+        self.assertEqual(lease.acknowledge_release(request_id), released)
+
+        second_lease = runtime.wait_for_turn(second["id"])
+        time.sleep(0.02)
+        second_request = runtime.queue.request_release(
+            second["id"],
+            confirm_job_id=second["id"],
+        )
+        normally_finished = second_lease.finish()
+        self.assertEqual(normally_finished["status"], "completed")
+        with self.assertRaisesRegex(LeaseConflict, "lease_conflict"):
+            second_lease.acknowledge_release(
+                second_request["release_request"]["id"]
+            )
 
     def test_failed_lease_releases_fifo_and_finish_is_idempotent(self):
         runtime = self.runtime()

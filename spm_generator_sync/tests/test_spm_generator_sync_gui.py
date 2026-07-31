@@ -1,13 +1,15 @@
+import gc
 import importlib.machinery
 import importlib.util
 import queue
+import sys
 import tempfile
 import threading
 import time
 import unittest
 import tkinter as tk
 from tkinter import ttk
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from unittest import mock
 
@@ -51,6 +53,12 @@ class ClipboardRecorder:
 
 
 class GeneratorSyncGuiCacheTests(unittest.TestCase):
+    def tearDown(self):
+        # Tk variables participate in reference cycles.  Force their finalizers
+        # on the test runner's main thread before a later background-job test
+        # can become the thread that happens to trigger cyclic collection.
+        gc.collect()
+
     def test_initial_fast_refresh_defers_physical_validation(self):
         app = GUI.App.__new__(GUI.App)
         app.persist_config = mock.Mock()
@@ -60,20 +68,33 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         app.sk_only_var.get.return_value = True
         app.render_board = mock.Mock()
         app.status_var = mock.Mock()
+        app._start_job = mock.Mock(return_value=17)
 
         with mock.patch.object(
             GUI.engine,
             "scan_tree_folders",
             return_value=[],
         ) as scan:
-            app.refresh(fast=True)
-
-        scan.assert_called_once_with(
-            Path(r"D:\Trees"),
-            sk_only=True,
-            verify_physical=False,
+            job_id = app.refresh(fast=True)
+            self.assertEqual(job_id, 17)
+            scan.assert_not_called()
+            _label, work, done = app._start_job.call_args.args
+            report = mock.Mock()
+            result = work(report)
+            scan.assert_called_once_with(
+                Path(r"D:\Trees"),
+                sk_only=True,
+                verify_physical=False,
+                progress_callback=report,
+            )
+        self.assertEqual(result["board"], [])
+        self.assertIsNone(result["render_analysis"])
+        done(result)
+        app.render_board.assert_called_once_with(
+            fast=True,
+            prepared_analysis=None,
         )
-        app.render_board.assert_called_once_with(fast=True)
+        self.assertFalse(app._start_job.call_args.kwargs["shared_queue"])
 
     def test_gui_uses_full_sibling_engine_module(self):
         self.assertEqual(
@@ -990,6 +1011,778 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_slow_refresh_runs_off_tk_thread_and_keeps_events_flowing(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.tree = ttk.Treeview(
+                root,
+                columns=("role", "bases", "structure", "status", "last"),
+            )
+            app.item_meta = {}
+            app.document_cache = OrderedDict()
+            app.signature_cache = OrderedDict()
+            app.analysis_cache = OrderedDict()
+            entered = threading.Event()
+            release = threading.Event()
+            tk_event = threading.Event()
+            worker_thread_ids = []
+
+            def slow_scan(
+                _root,
+                *,
+                sk_only,
+                verify_physical,
+                progress_callback,
+            ):
+                self.assertTrue(sk_only)
+                self.assertTrue(verify_physical)
+                worker_thread_ids.append(threading.get_ident())
+                progress_callback("폴더 검사 1/2 · Tree_elm", 10)
+                entered.set()
+                release.wait(2)
+                return []
+
+            with mock.patch.object(
+                GUI.engine,
+                "scan_tree_folders",
+                side_effect=slow_scan,
+            ), mock.patch.object(GUI, "save_analysis_cache"):
+                app.refresh()
+                root.after(0, tk_event.set)
+                deadline = time.monotonic() + 2
+                while (
+                    (not entered.is_set() or not tk_event.is_set())
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+                self.assertTrue(entered.is_set())
+                self.assertTrue(tk_event.is_set())
+                self.assertNotEqual(
+                    worker_thread_ids,
+                    [threading.get_ident()],
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    "마지막 진행" not in app.progress_text_var.get()
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+                self.assertIn("마지막 진행", app.progress_text_var.get())
+                release.set()
+                deadline = time.monotonic() + 2
+                while (
+                    app.active_job is not None
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertIsNone(app.active_job)
+            self.assertEqual(app.board, [])
+            self.assertEqual(app.tree.get_children(), ())
+        finally:
+            release.set()
+            root.destroy()
+
+    def test_full_refresh_prepares_spm_analysis_before_real_tk_render(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "SK_tree_01.spm"
+            follower = folder / "SK_tree_02.spm"
+            master.write_bytes(b"master")
+            follower.write_bytes(b"follower")
+            board = [{
+                "folder": str(folder),
+                "spms": [master.name, follower.name],
+                "manifest": {
+                    "version": 1,
+                    "independent": [],
+                    "groups": [{
+                        "master": master.name,
+                        "base_categories": {},
+                        "followers": [{
+                            "file": follower.name,
+                            "base_map": {},
+                            "base_map_confirmed": True,
+                            "last_sync": None,
+                            "last_master_hash": None,
+                            "last_target_hash": None,
+                        }],
+                    }],
+                },
+                "master_candidates": [],
+                "cluster_blends": [],
+            }]
+            root = tk.Tk()
+            root.withdraw()
+            analysis_entered = threading.Event()
+            analysis_release = threading.Event()
+            tk_event = threading.Event()
+            analysis_threads = []
+            try:
+                app = GUI.App.__new__(GUI.App)
+                app.root = root
+                app.job_queue = queue.Queue()
+                app.worker = None
+                app.job_started_at = None
+                app.job_stage = "대기"
+                app.status_var = tk.StringVar(root, value="대기")
+                app.progress_text_var = tk.StringVar(
+                    root, value="작업 대기"
+                )
+                app.progress_bar = ttk.Progressbar(root, maximum=100)
+                app.root_var = tk.StringVar(root, value=str(folder))
+                app.sk_only_var = tk.BooleanVar(root, value=True)
+                app.persist_config = mock.Mock()
+                app.tree = ttk.Treeview(
+                    root,
+                    columns=(
+                        "role", "bases", "structure", "status", "last",
+                    ),
+                )
+                app.item_meta = {}
+                app.board = []
+                app.document_cache = OrderedDict()
+                app.signature_cache = OrderedDict()
+                app.analysis_cache = OrderedDict()
+                app.master_status = mock.Mock(
+                    side_effect=AssertionError(
+                        "full master analysis returned to Tk"
+                    )
+                )
+                app.cached_follower_analysis = mock.Mock(
+                    side_effect=AssertionError(
+                        "full follower analysis returned to Tk"
+                    )
+                )
+
+                def from_path(_path, *, full):
+                    self.assertFalse(full)
+                    analysis_threads.append(threading.get_ident())
+                    if not analysis_entered.is_set():
+                        analysis_entered.set()
+                        analysis_release.wait(2)
+                    return object()
+
+                delta = {
+                    "missing": 0,
+                    "master_sync": 0,
+                    "missing_bases": 0,
+                    "target_local": 0,
+                    "remove": 0,
+                    "missing_details": [],
+                    "master_sync_details": [],
+                    "target_local_details": [],
+                    "remove_details": [],
+                }
+                with mock.patch.object(
+                    GUI.engine, "scan_tree_folders", return_value=board
+                ), mock.patch.object(
+                    GUI.engine.SPMDocument,
+                    "from_path",
+                    side_effect=from_path,
+                ), mock.patch.object(
+                    GUI.engine,
+                    "base_sync_signature",
+                    return_value="master-hash",
+                ), mock.patch.object(
+                    GUI.engine,
+                    "compare_base_structure",
+                    return_value=delta,
+                ), mock.patch.object(
+                    GUI.engine, "assess_scale_risk", return_value={}
+                ), mock.patch.object(
+                    GUI.engine,
+                    "target_sync_signature",
+                    return_value="target-hash",
+                ), mock.patch.object(GUI, "save_analysis_cache"):
+                    app.refresh()
+                    root.after(0, tk_event.set)
+                    deadline = time.monotonic() + 2
+                    while (
+                        (
+                            not analysis_entered.is_set()
+                            or not tk_event.is_set()
+                            or not app.job_stage.startswith("보드 분석")
+                        )
+                        and time.monotonic() < deadline
+                    ):
+                        root.update()
+                        time.sleep(0.01)
+
+                    self.assertTrue(analysis_entered.is_set())
+                    self.assertTrue(tk_event.is_set())
+                    self.assertEqual(
+                        app.job_stage.split(" · ", 1)[0],
+                        "보드 분석 1/2",
+                    )
+                    self.assertLess(
+                        float(app.progress_bar.cget("value")),
+                        100.0,
+                    )
+                    self.assertIsNotNone(app.job_last_progress_at)
+                    analysis_release.set()
+                    deadline = time.monotonic() + 3
+                    while (
+                        (app.active_job is not None or app.pending_jobs)
+                        and time.monotonic() < deadline
+                    ):
+                        root.update()
+                        time.sleep(0.01)
+
+                self.assertIsNone(app.active_job)
+                self.assertTrue(analysis_threads)
+                self.assertNotIn(threading.get_ident(), analysis_threads)
+                self.assertEqual(
+                    float(app.progress_bar.cget("value")),
+                    100.0,
+                )
+                self.assertEqual(len(app.item_meta), 3)
+                app.master_status.assert_not_called()
+                app.cached_follower_analysis.assert_not_called()
+            finally:
+                analysis_release.set()
+                root.destroy()
+
+    def test_completion_popup_waits_for_its_own_refresh_job(self):
+        """Post-Sync refresh runs before its deferred completion modal."""
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+            popup_states = []
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", return_value=[]
+            ), mock.patch.object(
+                GUI.messagebox, "showinfo"
+            ) as showinfo:
+                showinfo.side_effect = lambda *_args, **_kwargs: (
+                    popup_states.append(
+                        (app.active_job, bool(app.pending_jobs))
+                    )
+                )
+
+                def done(_result):
+                    app.refresh()
+                    app._show_job_info("작업 완료", "상세 내용")
+
+                app._start_job(
+                    "작업 실행 중",
+                    lambda _report: {"status": "ok"},
+                    done,
+                    queue_label="테스트 작업",
+                )
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            showinfo.assert_called_once()
+            self.assertEqual(popup_states, [(None, False)])
+        finally:
+            root.destroy()
+
+    def test_deferred_info_flush_is_single_shot_and_rearmed_after_busy(self):
+        app = GUI.App.__new__(GUI.App)
+        app.root = mock.Mock()
+        app.active_job = {"id": 1}
+        app.pending_jobs = deque()
+        app.deferred_job_infos = deque([("완료", "상세")])
+        app._deferred_job_info_flush_scheduled = False
+
+        app._schedule_deferred_job_infos()
+        app._schedule_deferred_job_infos()
+
+        app.root.after_idle.assert_called_once()
+        first_flush = app.root.after_idle.call_args.args[0]
+        with mock.patch.object(GUI.messagebox, "showinfo") as showinfo:
+            first_flush()
+            showinfo.assert_not_called()
+            self.assertEqual(len(app.deferred_job_infos), 1)
+            self.assertFalse(app._deferred_job_info_flush_scheduled)
+
+            app.active_job = None
+            app._schedule_deferred_job_infos()
+            self.assertEqual(app.root.after_idle.call_count, 2)
+            app.root.after_idle.call_args.args[0]()
+
+            showinfo.assert_called_once_with(
+                "완료", "상세", parent=app.root
+            )
+            self.assertFalse(app.deferred_job_infos)
+
+    def test_completion_popup_waits_for_real_queued_job_and_refresh(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+            gate = threading.Event()
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", return_value=[]
+            ), mock.patch.object(
+                GUI.messagebox, "showinfo"
+            ) as showinfo:
+
+                def done(_result):
+                    app.refresh()
+                    app._show_job_info("작업 완료", "상세 내용")
+
+                app._start_job(
+                    "작업 실행 중",
+                    lambda _report: gate.wait(2) or {"status": "ok"},
+                    done,
+                    queue_label="테스트 작업 A",
+                )
+                app._start_job(
+                    "두 번째 작업",
+                    lambda _report: {"status": "ok"},
+                    lambda _result: None,
+                    queue_label="테스트 작업 B",
+                )
+                showinfo.assert_not_called()
+                gate.set()
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            showinfo.assert_called_once()
+        finally:
+            root.destroy()
+
+    def test_stale_refresh_generation_is_discarded_without_rendering(self):
+        """When refresh() is re-triggered before the first scan finishes,
+        the stale first scan's result must not overwrite the board with
+        out-of-date data once the newer refresh has already superseded it.
+        """
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.root_var = tk.StringVar(root, value=r"D:\Trees")
+            app.sk_only_var = tk.BooleanVar(root, value=True)
+            app.persist_config = mock.Mock()
+            app.render_board = mock.Mock()
+            app.item_meta = {}
+            app.board = []
+            first_entered = threading.Event()
+            release_first = threading.Event()
+
+            stale_board = [{"folder": "stale", "spms": [], "cluster_blends": []}]
+            fresh_board = [{"folder": "fresh", "spms": [], "cluster_blends": []}]
+
+            def scan_side_effect(_root, *, sk_only, verify_physical, progress_callback):
+                if not first_entered.is_set():
+                    first_entered.set()
+                    release_first.wait(2)
+                    return stale_board
+                return fresh_board
+
+            with mock.patch.object(
+                GUI.engine, "scan_tree_folders", side_effect=scan_side_effect
+            ):
+                app.refresh(fast=True)
+                deadline = time.monotonic() + 2
+                while (
+                    not first_entered.is_set()
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+                self.assertTrue(first_entered.is_set())
+
+                app.refresh(fast=True)
+                release_first.set()
+
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(app.board, fresh_board)
+            self.assertEqual(app.render_board.call_count, 1)
+        finally:
+            root.destroy()
+
+    def test_callback_failure_rechecks_live_followup_before_error_modal(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            followup_completed = []
+
+            def callback(_payload):
+                app._start_job(
+                    "후속 refresh",
+                    lambda _report: "refreshed",
+                    followup_completed.append,
+                    shared_queue=False,
+                )
+                raise RuntimeError("callback failed after queueing refresh")
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                app._start_job(
+                    "mutation",
+                    lambda _report: "mutated",
+                    callback,
+                    shared_queue=False,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(followup_completed, ["refreshed"])
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_shared_ticket_is_deferred_until_local_refresh_finishes(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        entered = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            lease = mock.Mock()
+            lease.finished = False
+            runtime = mock.Mock()
+            enqueue_threads = []
+
+            def enqueue(_label, _payload):
+                enqueue_threads.append(threading.get_ident())
+                return {"id": "shared-1", "sequence": 17}
+
+            runtime.enqueue.side_effect = enqueue
+            runtime.wait_for_turn.return_value = lease
+            app.shared_queue_runtime = runtime
+            order = []
+
+            def local_refresh(_report):
+                order.append("refresh-start")
+                entered.set()
+                gate.wait(2)
+                order.append("refresh-end")
+                return "refresh"
+
+            app._start_job(
+                "local refresh",
+                local_refresh,
+                lambda _payload: None,
+                shared_queue=False,
+            )
+            deadline = time.monotonic() + 2
+            while not entered.is_set() and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+            self.assertTrue(entered.is_set())
+
+            app._start_job(
+                "mutation",
+                lambda _report: order.append("mutation") or "done",
+                lambda _payload: None,
+                queue_label="mutation",
+                shared_queue=True,
+            )
+            runtime.enqueue.assert_not_called()
+
+            gate.set()
+            deadline = time.monotonic() + 3
+            while (
+                (app.active_job is not None or app.pending_jobs)
+                and time.monotonic() < deadline
+            ):
+                root.update()
+                time.sleep(0.01)
+
+            runtime.enqueue.assert_called_once()
+            runtime.wait_for_turn.assert_called_once_with(
+                "shared-1",
+                on_wait=mock.ANY,
+                cancel_event=mock.ANY,
+            )
+            self.assertNotIn(threading.get_ident(), enqueue_threads)
+            self.assertEqual(
+                order,
+                ["refresh-start", "refresh-end", "mutation"],
+            )
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_deferred_enqueue_failure_counts_and_starts_next_local_job(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = RuntimeError("queue unavailable")
+            app.shared_queue_runtime = runtime
+            completed = []
+
+            app._start_job(
+                "local refresh",
+                lambda _report: gate.wait(2) and "refresh",
+                completed.append,
+                shared_queue=False,
+            )
+            app._start_job(
+                "blocked mutation",
+                lambda _report: "must not run",
+                completed.append,
+                shared_queue=True,
+            )
+            app._start_job(
+                "next local refresh",
+                lambda _report: "next-local",
+                completed.append,
+                shared_queue=False,
+            )
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                gate.set()
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(completed, ["refresh", "next-local"])
+            self.assertEqual(app.queue_run_total, 3)
+            self.assertEqual(app.queue_run_completed, 3)
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_not_called()
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_wait_failure_cancels_unclaimed_shared_ticket(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = [
+                {"id": "shared-wait-failure", "sequence": 18},
+                {"id": "shared-after-failure", "sequence": 19},
+            ]
+            lease = mock.Mock()
+            lease.finished = False
+            runtime.wait_for_turn.side_effect = [
+                RuntimeError("queue wait failed"),
+                lease,
+            ]
+            app.shared_queue_runtime = runtime
+            failed_func = mock.Mock(return_value="must not run")
+            next_completed = []
+
+            with mock.patch.object(GUI.messagebox, "showerror"):
+                app._start_job(
+                    "mutation",
+                    failed_func,
+                    lambda _payload: None,
+                    shared_queue=True,
+                )
+                app._start_job(
+                    "next mutation",
+                    lambda _report: "continued",
+                    next_completed.append,
+                    shared_queue=True,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    (app.active_job is not None or app.pending_jobs)
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            runtime.cancel.assert_called_once_with(
+                "shared-wait-failure",
+                reason="worker_wait_failed",
+            )
+            failed_func.assert_not_called()
+            runtime.wait_for_turn.assert_has_calls([
+                mock.call(
+                    "shared-wait-failure",
+                    on_wait=mock.ANY,
+                    cancel_event=mock.ANY,
+                ),
+                mock.call(
+                    "shared-after-failure",
+                    on_wait=mock.ANY,
+                    cancel_event=mock.ANY,
+                ),
+            ])
+            lease.finish.assert_called_once()
+            self.assertEqual(next_completed, ["continued"])
+            self.assertEqual(app.queue_run_completed, 2)
+            self.assertEqual(len(app.job_failures), 1)
+        finally:
+            root.destroy()
+
+    def test_lone_enqueue_failure_reports_once_and_balances_counters(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.job_started_at = None
+            app.job_stage = "대기"
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(
+                root, value="작업 대기"
+            )
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            runtime = mock.Mock()
+            runtime.enqueue.side_effect = RuntimeError("queue unavailable")
+            app.shared_queue_runtime = runtime
+
+            with mock.patch.object(
+                GUI.messagebox, "showerror"
+            ) as showerror:
+                job_id = app._start_job(
+                    "mutation",
+                    lambda _report: "must not run",
+                    lambda _payload: None,
+                    shared_queue=True,
+                )
+                deadline = time.monotonic() + 3
+                while (
+                    app.active_job is not None
+                    and time.monotonic() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(job_id, 1)
+            self.assertIsNone(app.active_job)
+            self.assertFalse(app.pending_jobs)
+            self.assertEqual(app.queue_run_total, 1)
+            self.assertEqual(app.queue_run_completed, 1)
+            self.assertEqual(len(app.job_failures), 1)
+            showerror.assert_called_once()
+        finally:
+            root.destroy()
+
     def test_background_jobs_queue_fifo_and_continue_after_failure(self):
         root = tk.Tk()
         root.withdraw()
@@ -1056,6 +1849,540 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertEqual(len(app.job_failures), 1)
             self.assertIn("대기열 완료", app.status_var.get())
             showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_process_output_streams_through_tk_queue_without_blocking(self):
+        root = tk.Tk()
+        root.withdraw()
+        gate = threading.Event()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            entered = threading.Event()
+            tk_event = threading.Event()
+            completed = []
+
+            def work(report):
+                report.output("stdout", "first line")
+                report.output("stderr", "warning line")
+                entered.set()
+                gate.wait(2)
+                return "ok"
+
+            app._start_job("stream", work, completed.append)
+            root.after(0, tk_event.set)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                root.update()
+                text = app.process_output.get("1.0", "end")
+                if entered.is_set() and tk_event.is_set() and "warning line" in text:
+                    break
+                time.sleep(0.01)
+
+            self.assertTrue(entered.is_set())
+            self.assertTrue(tk_event.is_set())
+            self.assertTrue(app.worker.is_alive())
+            text = app.process_output.get("1.0", "end")
+            self.assertIn("[stdout] first line", text)
+            self.assertIn("[stderr] warning line", text)
+            self.assertIn("마지막 출력", app.progress_text_var.get())
+            self.assertLess(
+                float(app.progress_bar.cget("value")),
+                100.0,
+            )
+
+            gate.set()
+            deadline = time.monotonic() + 2
+            while not completed and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+            self.assertEqual(completed, ["ok"])
+            self.assertEqual(
+                float(app.progress_bar.cget("value")),
+                100.0,
+            )
+        finally:
+            gate.set()
+            root.destroy()
+
+    def test_cancelled_fifo_job_is_not_reported_as_failure(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            entered = threading.Event()
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-1", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    self.cancel_event = cancel_event
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def work(report):
+                entered.set()
+                while not report.cancel_requested():
+                    time.sleep(0.01)
+                report.raise_if_cancelled()
+
+            with mock.patch.object(GUI.messagebox, "showerror") as showerror:
+                app._start_job("cancel me", work, lambda _result: None)
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(app.request_active_job_cancel())
+                deadline = time.monotonic() + 3
+                while app.active_job is not None and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertIsNone(app.active_job)
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(
+                app.job_cancellations[0][1],
+                "cancelled_at_safe_boundary",
+            )
+            self.assertIn("취소됨", app.status_var.get())
+            self.assertEqual(shared_results[0][0], False)
+            self.assertEqual(shared_results[0][1]["outcome"], "cancelled")
+            self.assertEqual(
+                shared_results[0][1]["termination_state"],
+                "cancelled_at_safe_boundary",
+            )
+            showerror.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_committed_success_wins_over_late_cancel_request(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            completed = []
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-commit", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def commit_then_late_cancel(report):
+                report.cancel_event.set()
+                return {"commit_marker": "manifest_committed"}
+
+            app._start_job(
+                "commit race",
+                commit_then_late_cancel,
+                completed.append,
+            )
+            deadline = time.monotonic() + 3
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertEqual(
+                completed,
+                [{"commit_marker": "manifest_committed"}],
+            )
+            self.assertEqual(app.job_cancellations, [])
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(shared_results[0][0], True)
+            self.assertEqual(shared_results[0][1]["outcome"], "completed")
+        finally:
+            root.destroy()
+
+    def test_cancel_event_does_not_mask_rollback_failure(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            shared_results = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-rollback", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+
+            def rollback_fails(report):
+                report.cancel_event.set()
+                raise RuntimeError(
+                    "[transaction_rollback_failed] restore denied"
+                )
+
+            with mock.patch.object(GUI.messagebox, "showerror"):
+                app._start_job("rollback race", rollback_fails, lambda _value: None)
+                deadline = time.monotonic() + 3
+                while app.active_job is not None and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(app.job_cancellations, [])
+            self.assertEqual(len(app.job_failures), 1)
+            self.assertIn("transaction_rollback_failed", app.job_failures[0][1])
+            self.assertEqual(shared_results[0][0], False)
+            self.assertEqual(shared_results[0][1]["outcome"], "failed")
+        finally:
+            root.destroy()
+
+    def test_shared_wait_cancel_has_before_launch_reason_and_never_runs_func(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            ran = []
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-wait", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    cancel_event.set()
+                    raise GUI.WaitCancelled("cancelled while queued")
+
+                def cancel(self, _job_id, *, reason):
+                    return None
+
+            app.shared_queue_runtime = Runtime()
+
+            app._start_job(
+                "wait cancel",
+                lambda _report: ran.append(True),
+                lambda _value: None,
+            )
+            deadline = time.monotonic() + 3
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertEqual(ran, [])
+            self.assertEqual(app.job_failures, [])
+            self.assertEqual(
+                app.job_cancellations,
+                [("wait cancel", "cancelled_before_launch")],
+            )
+        finally:
+            root.destroy()
+
+    def test_chatty_output_is_rendered_in_bounded_tk_batches(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            completed = []
+            ticks = []
+            tick_after = [None]
+
+            def work(report):
+                for index in range(4000):
+                    report.output(
+                        "stderr" if index % 2 else "stdout",
+                        f"line {index}",
+                    )
+                return "ok"
+
+            def tick():
+                ticks.append(time.monotonic())
+                if app.active_job is not None:
+                    tick_after[0] = root.after(1, tick)
+                else:
+                    tick_after[0] = None
+
+            app._start_job("chatty", work, completed.append)
+            tick_after[0] = root.after(0, tick)
+            deadline = time.monotonic() + 5
+            while not completed and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.001)
+
+            self.assertEqual(completed, ["ok"])
+            self.assertGreater(len(ticks), 2)
+            self.assertLessEqual(app.process_output_line_count, 3200)
+            self.assertIn("line 3999", app.process_output.get("1.0", "end"))
+        finally:
+            if "tick_after" in locals() and tick_after[0] is not None:
+                try:
+                    root.after_cancel(tick_after[0])
+                except tk.TclError:
+                    pass
+            root.destroy()
+
+    def test_one_hundred_thousand_producer_lines_use_bounded_coalesced_buffer(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.process_output = tk.Text(root, state="disabled")
+            for tag in ("stdout", "stderr", "system"):
+                app.process_output.tag_configure(tag)
+            app.process_output_line_count = 0
+            completed = []
+
+            def work(report):
+                for index in range(100_000):
+                    report.output("stdout", f"producer-line-{index}")
+                report.output("stderr", "final-stderr-evidence")
+                return "ok"
+
+            app._start_job("100k producer", work, completed.append)
+            app.worker.join(timeout=10)
+            self.assertFalse(app.worker.is_alive())
+            self.assertLessEqual(
+                len(app.active_job["output_buffer"]),
+                GUI.PROCESS_OUTPUT_BUFFER_LINES,
+            )
+            self.assertLessEqual(app.job_queue.qsize(), 4)
+
+            deadline = time.monotonic() + 8
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.001)
+
+            self.assertEqual(completed, ["ok"])
+            rendered = app.process_output.get("1.0", "end")
+            self.assertIn("process_output_omitted", rendered)
+            self.assertIn("final-stderr-evidence", rendered)
+        finally:
+            root.destroy()
+
+    def test_shutdown_completion_does_not_expire_after_virtual_five_seconds(self):
+        scheduled = []
+        completed = []
+
+        class Root:
+            def after(self, delay, callback):
+                scheduled.append((delay, callback))
+                return len(scheduled)
+
+            def after_idle(self, callback):
+                return self.after(0, callback)
+
+        class Worker:
+            alive = True
+
+            def is_alive(self):
+                return self.alive
+
+        app = GUI.App.__new__(GUI.App)
+        app.root = Root()
+        app.worker = Worker()
+        app.active_job = {"cancel_event": threading.Event()}
+        pending_ran = []
+        app.pending_jobs = deque([
+            {
+                "cancel_event": threading.Event(),
+                "func": lambda _report: pending_ran.append(True),
+            }
+        ])
+        app.shared_queue_runtime = mock.Mock()
+
+        app.shutdown_shared_queue(on_complete=lambda: completed.append("done"))
+        self.assertTrue(app.active_job["cancel_event"].is_set())
+        self.assertEqual(pending_ran, [])
+
+        for _poll in range(121):
+            _delay, callback = scheduled.pop(0)
+            callback()
+        self.assertEqual(completed, [], "virtual 6.05s must not force close")
+
+        app.worker.alive = False
+        _delay, callback = scheduled.pop(0)
+        callback()
+        self.assertEqual(completed, ["done"])
+        app.shared_queue_runtime.shutdown.assert_called_once_with()
+
+    def test_shutdown_surfaces_fail_closed_termination_reason_before_completion(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.worker = None
+            app.pending_jobs = deque()
+            app.active_job = {
+                "cancel_event": threading.Event(),
+                "worker_terminal_payload": RuntimeError(
+                    "[process_kill_grace_expired] pid=4242"
+                ),
+            }
+            app.shared_queue_runtime = mock.Mock()
+            completed = []
+
+            with mock.patch.object(GUI.messagebox, "showerror") as showerror:
+                app.shutdown_shared_queue(
+                    on_complete=lambda: completed.append(True)
+                )
+                deadline = time.monotonic() + 2
+                while not completed and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(completed, [True])
+            showerror.assert_called_once()
+            self.assertIn(
+                "process_kill_grace_expired",
+                showerror.call_args.args[1],
+            )
+        finally:
+            root.destroy()
+
+    def test_window_shutdown_terminates_active_speedtree_process(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            ready = threading.Event()
+
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                script = folder / "slow.spm"
+                options = folder / "Options_HI_Xml.ini"
+                script.write_text(
+                    "import time\nprint('ready', flush=True)\ntime.sleep(30)\n",
+                    encoding="utf-8",
+                )
+                options.write_text(
+                    "[Options]\nTextureSkipWriting=true\n",
+                    encoding="utf-8",
+                )
+
+                def work(report):
+                    def output(channel, line):
+                        report.output(channel, line)
+                        if line == "ready":
+                            ready.set()
+
+                    return GUI.engine.verify_speedtree_export(
+                        script,
+                        Path(sys.executable),
+                        options,
+                        output_callback=output,
+                        cancel_requested=report.cancel_requested,
+                    )
+
+                app._start_job("slow SpeedTree", work, lambda _result: None)
+                self.assertTrue(ready.wait(3))
+                closing_job = app.active_job
+                shutdown_completed = []
+                app.shutdown_shared_queue(
+                    on_complete=lambda: shutdown_completed.append(True)
+                )
+                deadline = time.monotonic() + 8
+                while not shutdown_completed and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+
+            self.assertEqual(shutdown_completed, [True])
+            self.assertTrue(app.worker is None or not app.worker.is_alive())
+            done_events = []
+            while not app.job_queue.empty():
+                event = app.job_queue.get_nowait()
+                if event[0] == "done":
+                    done_events.append(event)
+            cancelled = (
+                done_events[0][3]
+                if done_events
+                else closing_job.get("terminal_payload")
+            )
+            self.assertIsInstance(cancelled, GUI.engine.SyncCancelled)
+            self.assertIn(
+                cancelled.termination_state,
+                {"cancelled_terminated", "cancelled_killed"},
+            )
+            self.assertIsNotNone(cancelled.pid)
+            self.assertIsNotNone(cancelled.returncode)
         finally:
             root.destroy()
 
