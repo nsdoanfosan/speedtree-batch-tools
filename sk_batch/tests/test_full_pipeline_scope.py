@@ -274,17 +274,17 @@ class FullPipelineScopeTests(unittest.TestCase):
 
         app._run_queued_batch_job(job)
 
+        kind, payload = app.ui_queue.get_nowait()
+        self.assertEqual(kind, "batch_job_done")
+        self.assertEqual(payload["id"], 8)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["completed_count"], 0)
+        self.assertEqual(payload["blocked_count"], 0)
+        self.assertEqual(payload["failed_count"], 1)
+        self.assertIn("completed=0 blocked=0 failed=1", payload["error"])
         self.assertEqual(
-            app.ui_queue.get_nowait(),
-            (
-                "batch_job_done",
-                {
-                    "id": 8,
-                    "error": "항목 실패/준비 제외 1개",
-                    "status": "partial",
-                    "failed_count": 1,
-                },
-            ),
+            payload["target_outcomes"][0]["outcome"],
+            "failed",
         )
 
     def test_queued_worker_reports_stop_without_marking_completion(self):
@@ -308,18 +308,13 @@ class FullPipelineScopeTests(unittest.TestCase):
 
         app._run_queued_batch_job(job)
 
-        self.assertEqual(
-            app.ui_queue.get_nowait(),
-            (
-                "batch_job_done",
-                {
-                    "id": 9,
-                    "error": None,
-                    "status": "stopped",
-                    "failed_count": 0,
-                },
-            ),
-        )
+        kind, payload = app.ui_queue.get_nowait()
+        self.assertEqual(kind, "batch_job_done")
+        self.assertEqual(payload["id"], 9)
+        self.assertEqual(payload["status"], "stopped")
+        self.assertEqual(payload["completed_count"], 1)
+        self.assertEqual(payload["blocked_count"], 0)
+        self.assertEqual(payload["failed_count"], 0)
 
     def test_queued_worker_uses_one_terminal_event_and_suppresses_legacy_done(self):
         gui = load_gui_module()
@@ -343,18 +338,13 @@ class FullPipelineScopeTests(unittest.TestCase):
             selected_scope=True,
             emit_done=False,
         )
-        self.assertEqual(
-            app.ui_queue.get_nowait(),
-            (
-                "batch_job_done",
-                {
-                    "id": 7,
-                    "error": None,
-                    "status": "completed",
-                    "failed_count": 0,
-                },
-            ),
-        )
+        kind, payload = app.ui_queue.get_nowait()
+        self.assertEqual(kind, "batch_job_done")
+        self.assertEqual(payload["id"], 7)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["completed_count"], 1)
+        self.assertEqual(payload["blocked_count"], 0)
+        self.assertEqual(payload["failed_count"], 0)
         self.assertTrue(app.ui_queue.empty())
 
     def test_full_pipeline_reports_an_empty_list_not_an_empty_selection(self):
