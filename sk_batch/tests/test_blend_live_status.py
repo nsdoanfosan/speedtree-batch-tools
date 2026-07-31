@@ -159,6 +159,26 @@ class FakeCheckedRows:
 
 
 class BlendLiveStatusTests(unittest.TestCase):
+    def test_population_scan_persists_analysis_before_snapshot_work(self):
+        gui = load_gui_module()
+        events = []
+
+        with mock.patch.object(
+            gui, "scan_sk_spms", return_value=[]
+        ), mock.patch.object(
+            gui,
+            "scan_cluster_spm_sources",
+            side_effect=lambda _root: events.append("population") or [],
+        ), mock.patch.object(
+            gui,
+            "save_leaf_contract_cache",
+            side_effect=lambda: events.append("persist"),
+        ):
+            result = gui.App._collect_scan_result(Path("unused"), {})
+
+        self.assertEqual(events, ["population", "persist"])
+        self.assertEqual(result["cluster_sources"], [])
+
     def setUp(self):
         self._isolated_logs = tempfile.TemporaryDirectory()
 

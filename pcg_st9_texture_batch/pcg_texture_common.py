@@ -1,5 +1,6 @@
 """Shared helpers for the PCG ST9 texture batch status board."""
 import json
+import os
 import re
 from pathlib import Path
 
@@ -8,6 +9,32 @@ CONFIG_PATH = TOOL_DIR / "pcg_texture_config.json"
 STATE_PATH = TOOL_DIR / "pcg_texture_state.json"
 TARGETS_PATH = TOOL_DIR / "pcg_targets.json"
 REPORT_DIR = TOOL_DIR / "reports"
+SHARED_CACHE_DIR_ENV = "SPEEDTREE_BATCH_TOOLS_CACHE_DIR"
+
+
+def default_shared_cache_dir():
+    """Return the per-user cache shared by every checkout/worktree."""
+    override = os.environ.get(SHARED_CACHE_DIR_ENV)
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        root = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        )
+    else:
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+        root = (
+            Path(xdg_cache_home)
+            if xdg_cache_home
+            else Path.home() / ".cache"
+        )
+    return root / "SpeedTreeBatchTools" / "cache"
+
+
+SHARED_CACHE_DIR = default_shared_cache_dir()
 
 DEFAULT_CONFIG = {
     "tree_root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",

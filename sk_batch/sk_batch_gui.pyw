@@ -2115,6 +2115,10 @@ class App:
     def _collect_scan_result(cls, root, snapshot_caches):
         spms = scan_sk_spms(root)
         cluster_sources = scan_cluster_spm_sources(root)
+        # The population scan above can cold-parse hundreds of SPMs. Persist
+        # that shared analysis immediately instead of waiting for a later
+        # live-status change that may never occur before process exit.
+        save_leaf_contract_cache()
         all_spms = list(spms)
         snapshot_aliases = {}
         for row in cluster_sources:

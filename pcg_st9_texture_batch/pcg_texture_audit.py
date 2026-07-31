@@ -72,6 +72,7 @@ if __package__ in (None, ""):
     from pcg_texture_common import (
         IMAGE_EXTS,
         REPORT_DIR,
+        SHARED_CACHE_DIR,
         is_backup_path,
         json_safe_path,
         load_config,
@@ -84,6 +85,7 @@ else:
     from .pcg_texture_common import (
         IMAGE_EXTS,
         REPORT_DIR,
+        SHARED_CACHE_DIR,
         is_backup_path,
         json_safe_path,
         load_config,
@@ -197,9 +199,9 @@ _PENDING_DECODED_HANDOFF = contextvars.ContextVar(
 )
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
-SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
-SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
-BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v2.json"
+SPM_ANALYSIS_CACHE_PATH = SHARED_CACHE_DIR / "spm_analysis_v5.json"
+SBS_GRAPH_CACHE_PATH = SHARED_CACHE_DIR / "sbs_graph_names_v1.json"
+BLEND_IMAGE_CACHE_PATH = SHARED_CACHE_DIR / "blend_image_names_v2.json"
 _PERSISTENT_SBS_GRAPHS = None
 _PERSISTENT_SBS_GRAPHS_DIRTY = False
 _PERSISTENT_BLEND_IMAGES = None
