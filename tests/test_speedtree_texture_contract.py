@@ -39,7 +39,14 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _write_spm(self, path, material_name, refs):
+    def _write_spm(
+        self,
+        path,
+        material_name,
+        refs,
+        *,
+        generator_material_ids=("7",),
+    ):
         maps = "".join(
             (
                 f'<Map Name="{map_name}"><TexFilename>{ref}</TexFilename>'
@@ -51,9 +58,86 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
         path.write_text(
             '<SpeedTree><Materials><Material_v8 ID="7" '
             f'Name="{material_name}">{maps}</Material_v8>'
-            "</Materials></SpeedTree>",
+            "</Materials><Generators>"
+            + "".join(
+                '<Generator Type="Branch"><Properties><Property>'
+                '<Name>Materials:Branch:0:Material</Name>'
+                f'<Value>{material_id}</Value>'
+                '</Property></Properties></Generator>'
+                for material_id in generator_material_ids
+            )
+            + "</Generators></SpeedTree>",
             encoding="utf-8",
         )
+
+    def _write_material_scope_spm(self, path, materials, generator_rows):
+        material_xml = []
+        for material_id, material_name, refs in materials:
+            maps = "".join(
+                (
+                    f'<Map Name="{map_name}"><TexFilename>{ref}'
+                    '</TexFilename></Map>'
+                )
+                for map_name, ref in refs
+            )
+            material_xml.append(
+                f'<Material_v8 ID="{material_id}" Name="{material_name}">'
+                f'{maps}</Material_v8>'
+            )
+        generator_xml = "".join(
+            '<Generator Type="Branch">'
+            f'<Hidden>{str(hidden).lower()}</Hidden>'
+            '<Properties><Property>'
+            f'<Name>{property_name}</Name><Value>{material_id}</Value>'
+            '</Property></Properties></Generator>'
+            for property_name, material_id, hidden in generator_rows
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '<SpeedTree><Materials>' + "".join(material_xml)
+            + '</Materials><Generators>' + generator_xml
+            + '</Generators></SpeedTree>',
+            encoding="utf-8",
+        )
+
+    def _write_material_scope_manifest(self, root, spm, targets):
+        texture_root = root / "texture"
+        texture_root.mkdir(parents=True, exist_ok=True)
+        outputs = []
+        for material_id, material_name, texture_base in targets:
+            files = {}
+            for role in REQUIRED_TEXTURE_ROLES:
+                output = texture_root / f"{texture_base}_{role}.tga"
+                output.write_bytes(
+                    f"{material_id}:{role}".encode("ascii")
+                )
+                files[role] = output.name
+            outputs.append({
+                "texture_base": texture_base,
+                "required_roles": list(REQUIRED_TEXTURE_ROLES),
+                "files": files,
+                "material_targets": [{
+                    "spm": str(spm.resolve()),
+                    "material_id": material_id,
+                    "material_name": material_name,
+                }],
+                "producer": {
+                    "tool": "PCG ST9 Texture",
+                    "source": "material-scope-test",
+                },
+            })
+        manifest = texture_root / "pcg_st9_canonical_outputs.json"
+        manifest.write_text(
+            json.dumps({
+                "kind": "pcg_st9_canonical_output_manifest",
+                "schema_version": 1,
+                "asset_root": str(root.resolve()),
+                "texture_root": str(texture_root.resolve()),
+                "outputs": outputs,
+            }),
+            encoding="utf-8",
+        )
+        return manifest
 
     def _write_manifest(
         self,
@@ -595,6 +679,230 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
             self.assertIn(
                 "production_spm_outside_manifest_asset",
                 {row["reason"] for row in plan["issues"]},
+            )
+
+    def test_generator_scope_skips_only_detached_elm_and_willow_materials(self):
+        fixtures = (
+            {
+                "folder": "Tree_elm",
+                "materials": (
+                    ("1", "M_Bark_elm_01_old"),
+                    ("2", "M_Leaf_elm_01"),
+                    ("3", "M_bark_common_end_01"),
+                    ("4", "M_Bark_elm_01"),
+                ),
+                "generator_rows": (
+                    ("Materials:Branch:0:Material", "0", False),
+                    ("Cap:Material:0:Material", "3", False),
+                    ("Materials:Branch:0:Material", "4", True),
+                ),
+                "mapped": ("3", "4"),
+                "skipped": ("1", "2"),
+            },
+            {
+                "folder": "Tree_Weeping_Willow",
+                "materials": (
+                    ("1", "M_Bark_legacy"),
+                    ("2", "M_bark_common_end_01"),
+                    ("3", "M_bark_weeping_willow_01"),
+                    ("4", "M_bark_weeping_willow_02"),
+                ),
+                "generator_rows": (
+                    ("Materials:Branch:0:Material", "2", False),
+                    ("Materials:Branch:0:Material", "3", False),
+                ),
+                "mapped": ("2", "3"),
+                "skipped": ("1", "4"),
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for fixture in fixtures:
+                with self.subTest(fixture=fixture["folder"]):
+                    root = Path(temporary) / fixture["folder"]
+                    source = root / "Cluster" / "SK_branch_01.spm"
+                    materials = [
+                        (
+                            material_id,
+                            material_name,
+                            (("Color", f"old/{material_name}.tif"),),
+                        )
+                        for material_id, material_name in fixture["materials"]
+                    ]
+                    self._write_material_scope_spm(
+                        source,
+                        materials,
+                        fixture["generator_rows"],
+                    )
+                    manifest = self._write_material_scope_manifest(
+                        root,
+                        source,
+                        [
+                            (
+                                material_id,
+                                next(
+                                    name for row_id, name
+                                    in fixture["materials"]
+                                    if row_id == material_id
+                                ),
+                                f"T_{fixture['folder']}_{material_id}",
+                            )
+                            for material_id in fixture["mapped"]
+                        ],
+                    )
+
+                    plan = build_spm_canonical_texture_plan(
+                        source, manifest
+                    )
+
+                    self.assertEqual(plan["status"], "ok", plan["issues"])
+                    self.assertEqual(
+                        {row["material_id"] for row in plan["bindings"]},
+                        set(fixture["mapped"]),
+                    )
+                    self.assertEqual(
+                        {
+                            row["material_id"]
+                            for row in plan[
+                                "skipped_unreferenced_materials"
+                            ]
+                        },
+                        set(fixture["skipped"]),
+                    )
+                    self.assertTrue(all(
+                        row["material_name"] and row["refs"]
+                        for row in plan[
+                            "skipped_unreferenced_materials"
+                        ]
+                    ))
+                    self.assertEqual(
+                        set(plan["generator_material_scope"][
+                            "referenced_material_ids"
+                        ]),
+                        {row[1] for row in fixture["generator_rows"]},
+                    )
+
+    def test_adding_generator_reference_restores_unmapped_material_blocker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree_elm"
+            source = root / "Cluster" / "SK_branch_elm_01.spm"
+            materials = (
+                ("1", "M_Bark_elm_01_old", (("Color", "old/bark.tif"),)),
+                ("2", "M_Leaf_elm_01", (("Color", "old/leaf.tif"),)),
+                ("3", "M_bark_common_end_01", (("Color", "old/end.tif"),)),
+                ("4", "M_Bark_elm_01", (("Color", "old/live.tif"),)),
+            )
+            rows = (
+                ("Cap:Material:0:Material", "3", False),
+                ("Materials:Branch:0:Material", "4", False),
+            )
+            self._write_material_scope_spm(source, materials, rows)
+            manifest = self._write_material_scope_manifest(
+                root,
+                source,
+                (
+                    ("3", "M_bark_common_end_01", "T_bark_common_end_01"),
+                    ("4", "M_Bark_elm_01", "T_Bark_elm_01"),
+                ),
+            )
+            self.assertEqual(
+                build_spm_canonical_texture_plan(source, manifest)["status"],
+                "ok",
+            )
+
+            self._write_material_scope_spm(
+                source,
+                materials,
+                rows + (("Materials:Branch:1:Material", "2", True),),
+            )
+            blocked = build_spm_canonical_texture_plan(source, manifest)
+
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertIn(
+                "material_canonical_output_unmapped",
+                {row["reason"] for row in blocked["issues"]},
+            )
+            self.assertNotIn(
+                "2",
+                {
+                    row["material_id"]
+                    for row in blocked["skipped_unreferenced_materials"]
+                },
+            )
+
+    def test_missing_or_ambiguous_generator_scope_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree_test"
+            source = root / "Cluster" / "SK_branch_test.spm"
+            unreadable = build_spm_canonical_texture_plan(
+                root / "Cluster" / "missing.spm"
+            )
+            self.assertEqual(unreadable["status"], "blocked")
+            self.assertEqual(
+                unreadable["issues"][0]["reason"],
+                "generator_material_scope_unreadable",
+            )
+
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                (("Color", "old/leaf.tif"),),
+                generator_material_ids=(),
+            )
+            empty = build_spm_canonical_texture_plan(source)
+            self.assertEqual(empty["status"], "blocked")
+            self.assertEqual(
+                empty["issues"][0]["reason"],
+                "generator_material_scope_empty",
+            )
+
+            source.write_text(
+                '<SpeedTree><Materials><Material_v8 ID="7" '
+                'Name="M_leaf_test"><Map Name="Color">'
+                '<TexFilename>old/leaf.tif</TexFilename></Map>'
+                '</Material_v8></Materials><Generators>'
+                '<Generator Type="Branch"><Properties><Property>'
+                '<Name>Materials:Branch:0:Material</Name>'
+                '</Property></Properties></Generator>'
+                '</Generators></SpeedTree>',
+                encoding="utf-8",
+            )
+            ambiguous = build_spm_canonical_texture_plan(source)
+            self.assertEqual(ambiguous["status"], "blocked")
+            self.assertEqual(
+                ambiguous["issues"][0]["reason"],
+                "generator_material_scope_ambiguous",
+            )
+
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                (("Color", "old/leaf.tif"),),
+                generator_material_ids=("99",),
+            )
+            missing_material = build_spm_canonical_texture_plan(source)
+            self.assertEqual(missing_material["status"], "blocked")
+            self.assertEqual(
+                missing_material["generator_material_scope"][
+                    "missing_referenced_material_ids"
+                ],
+                ["99"],
+            )
+            self.assertEqual(
+                missing_material["issues"][0]["reason"],
+                "generator_material_scope_ambiguous",
+            )
+
+            source.write_text(
+                source.read_text(encoding="utf-8")
+                + '<Generator Type="Branch"><Properties>',
+                encoding="utf-8",
+            )
+            truncated = build_spm_canonical_texture_plan(source)
+            self.assertEqual(truncated["status"], "blocked")
+            self.assertFalse(
+                truncated["generator_material_scope"][
+                    "generator_structure_complete"
+                ]
             )
 
     def test_blender_cluster_bake_preserves_all_eight_speedtree_map_slots(self):
