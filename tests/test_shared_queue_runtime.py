@@ -286,6 +286,28 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertIsNone(lease.heartbeat_error)
         lease.finish()
 
+    def test_synchronous_renewal_rejects_operator_release_request(self):
+        runtime = self.runtime(
+            lease_seconds=0.5,
+            heartbeat_interval=0.2,
+        )
+        runtime.queue.force_release_min_age_seconds = 0.0
+        job = runtime.enqueue("interactive recovery", {})
+        lease = runtime.wait_for_turn(job["id"])
+        before = runtime.queue.get(job["id"])["lease"]["heartbeat_at"]
+
+        self.assertTrue(lease.renew_and_check_current())
+        after = runtime.queue.get(job["id"])["lease"]["heartbeat_at"]
+        self.assertGreaterEqual(after, before)
+
+        runtime.queue.request_release(
+            job["id"],
+            confirm_job_id=job["id"],
+        )
+        self.assertFalse(lease.renew_and_check_current())
+        self.assertIsNotNone(lease.release_request)
+        lease.finish(success=False, result={"reason": "release requested"})
+
     def test_release_request_is_observed_and_late_ack_is_fail_closed(self):
         runtime = self.runtime(
             lease_seconds=0.3,

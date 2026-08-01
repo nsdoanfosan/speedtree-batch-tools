@@ -22,6 +22,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -3314,6 +3315,7 @@ def wait_for_valid_resave(
     capture_fn=_capture_immutable_snapshot,
     sleep_fn=time.sleep,
     monotonic_fn=time.monotonic,
+    guards=None,
 ):
     """Require repeated stat/size/SHA/parse quiescence and every safety gate."""
     target_scopes, scope_error = _resolve_target_scopes(
@@ -3339,6 +3341,10 @@ def wait_for_valid_resave(
     last_errors = ["file_content_not_changed"]
     last_snapshot = None
     while monotonic_fn() < deadline:
+        # A valid Save may never arrive.  Poll lifecycle authority alongside
+        # the file so Stop, app shutdown, stale job generations, and an
+        # optional queue-lease loss do not strand the worker until timeout.
+        _check_guards(guards, preimage_snapshot["source_identity"])
         try:
             snapshot = capture_fn(
                 spm_path,
@@ -3370,6 +3376,7 @@ def wait_for_valid_resave(
         )
         last_errors = verdict["errors"]
         if candidate_reads >= stable_reads and verdict["valid"]:
+            _check_guards(guards, snapshot["source_identity"])
             return snapshot, verdict
         sleep_fn(poll_interval)
     evidence = _public_hash_evidence(last_snapshot or preimage_snapshot)
@@ -3410,6 +3417,10 @@ def _check_guards(guards, identity):
             token = "initiating_app_closed"
         elif not guards["is_job_current"]():
             token = "initiating_job_generation_stale"
+        elif callable(guards.get("is_queue_current")) and not guards[
+            "is_queue_current"
+        ]():
+            token = "initiating_queue_lease_lost"
         else:
             return
     except Exception as exc:
@@ -3440,6 +3451,8 @@ def _claim_and_resume_once(
     authoring_mesh_ids,
     required_live_mesh_ids,
     capture_fn,
+    continuation_commit_lock,
+    on_continuation_claimed,
 ):
     target_scopes, scope_error = _resolve_target_scopes(
         expected_mesh_ids,
@@ -3452,63 +3465,93 @@ def _claim_and_resume_once(
             "continuation target scopes are incomplete or inconsistent",
             after["source_identity"],
         )
-    # Lifecycle guards are effectful callbacks.  Run them before the final
-    # operating-source recapture so a guard-side mutation cannot escape the
-    # source SHA/gate checks below.
-    _check_guards(guards, after["source_identity"])
-    current = capture_fn(spm, target_scopes["authoring_mesh_ids"])
-    if (
-        current["raw_sha256"] != after["raw_sha256"]
-        or current["text_sha256"] != after["text_sha256"]
-    ):
-        raise StaleNodeTableRecoveryError(
-            "source_changed_before_continuation",
-            "the source SHA changed after validation and before continuation",
-            _public_hash_evidence(current, verified_after_sha256=after["text_sha256"]),
-        )
-    current_verdict = _snapshot_gate(
-        current,
-        artifacts["receipt"],
-        expected_mesh_ids,
-        authoring_mesh_ids=authoring_mesh_ids,
-        required_live_mesh_ids=required_live_mesh_ids,
-        preimage_snapshot=preimage_snapshot,
+    commit_context = (
+        continuation_commit_lock
+        if continuation_commit_lock is not None
+        else nullcontext()
     )
-    if not current_verdict["valid"]:
-        raise StaleNodeTableRecoveryError(
-            "source_revalidation_failed_before_continuation",
-            "the source no longer passes the frozen recovery gates",
-            _public_hash_evidence(current, reason_tokens=current_verdict["errors"]),
+    # The GUI uses the same lock when it commits Stop.  Therefore either Stop
+    # becomes visible to this final guard before any claim exists, or the
+    # immutable claim plus its published UI state commits first.  The retry
+    # callback itself runs outside the lock after that linearization point.
+    with commit_context:
+        # Lifecycle guards are effectful callbacks.  Run them before the final
+        # operating-source recapture so a guard-side mutation cannot escape
+        # the source SHA/gate checks below.
+        _check_guards(guards, after["source_identity"])
+        current = capture_fn(spm, target_scopes["authoring_mesh_ids"])
+        if (
+            current["raw_sha256"] != after["raw_sha256"]
+            or current["text_sha256"] != after["text_sha256"]
+        ):
+            raise StaleNodeTableRecoveryError(
+                "source_changed_before_continuation",
+                "the source SHA changed after validation and before continuation",
+                _public_hash_evidence(
+                    current,
+                    verified_after_sha256=after["text_sha256"],
+                ),
+            )
+        current_verdict = _snapshot_gate(
+            current,
+            artifacts["receipt"],
+            expected_mesh_ids,
+            authoring_mesh_ids=authoring_mesh_ids,
+            required_live_mesh_ids=required_live_mesh_ids,
+            preimage_snapshot=preimage_snapshot,
         )
-    job_key = _json_fingerprint({
-        "job_id": str(job_id),
-        "job_generation": str(job_generation),
-        "source_identity_sha256": after["source_identity"]["source_identity_sha256"],
-        "verified_after_raw_sha256": after["raw_sha256"],
-    })
-    claim = recovery_root / ("continuation." + job_key + ".claim.json")
-    claim_payload = {
-        "kind": CONTINUATION_CLAIM_KIND,
-        "schema_version": 1,
-        **after["source_identity"],
-        "job_identity_sha256": _sha256_bytes(str(job_id).encode("utf-8")),
-        "job_generation": str(job_generation),
-        "verified_after_sha256": after["text_sha256"],
-        "verified_after_raw_sha256": after["raw_sha256"],
-        "preimage_receipt_sha256": artifacts["receipt_sha256"],
-    }
-    # All source/gate work is complete before the last immutable backup check.
-    # Nothing effectful may intervene between that verification and publishing
-    # the once-only claim.
-    _verify_preimage_artifacts(artifacts, preimage_snapshot)
-    try:
-        _atomic_write_new(claim, claim_payload)
-    except FileExistsError as exc:
-        raise StaleNodeTableRecoveryError(
-            "continuation_already_claimed",
-            "this job/generation/after-SHA continuation was already claimed",
-            _public_hash_evidence(after, job_generation=str(job_generation)),
-        ) from exc
+        if not current_verdict["valid"]:
+            raise StaleNodeTableRecoveryError(
+                "source_revalidation_failed_before_continuation",
+                "the source no longer passes the frozen recovery gates",
+                _public_hash_evidence(
+                    current,
+                    reason_tokens=current_verdict["errors"],
+                ),
+            )
+        job_key = _json_fingerprint({
+            "job_id": str(job_id),
+            "job_generation": str(job_generation),
+            "source_identity_sha256": after["source_identity"][
+                "source_identity_sha256"
+            ],
+            "verified_after_raw_sha256": after["raw_sha256"],
+        })
+        claim = recovery_root / ("continuation." + job_key + ".claim.json")
+        claim_payload = {
+            "kind": CONTINUATION_CLAIM_KIND,
+            "schema_version": 1,
+            **after["source_identity"],
+            "job_identity_sha256": _sha256_bytes(str(job_id).encode("utf-8")),
+            "job_generation": str(job_generation),
+            "verified_after_sha256": after["text_sha256"],
+            "verified_after_raw_sha256": after["raw_sha256"],
+            "preimage_receipt_sha256": artifacts["receipt_sha256"],
+        }
+        # All source/gate work is complete before the last immutable backup
+        # check.  Nothing effectful may intervene between that verification
+        # and publishing the once-only claim.
+        _verify_preimage_artifacts(artifacts, preimage_snapshot)
+        try:
+            _atomic_write_new(claim, claim_payload)
+        except FileExistsError as exc:
+            raise StaleNodeTableRecoveryError(
+                "continuation_already_claimed",
+                "this job/generation/after-SHA continuation was already claimed",
+                _public_hash_evidence(after, job_generation=str(job_generation)),
+            ) from exc
+        if on_continuation_claimed is not None:
+            try:
+                on_continuation_claimed(copy.deepcopy(claim_payload))
+            except Exception as exc:
+                raise StaleNodeTableRecoveryError(
+                    "continuation_claim_publish_failed",
+                    "the once-only claim exists but its UI commit hook failed",
+                    _public_hash_evidence(
+                        after,
+                        job_generation=str(job_generation),
+                    ),
+                ) from exc
     continuation = {
         "contract": RECOVERY_CONTRACT,
         "asset_name": after["source_identity"]["asset_name"],
@@ -3576,6 +3619,9 @@ def recover_stale_node_table(
     launch_fn=launch_modeler_for_manual_save,
     sleep_fn=time.sleep,
     monotonic_fn=time.monotonic,
+    expected_preimage_raw_sha256=None,
+    continuation_commit_lock=None,
+    on_continuation_claimed=None,
 ):
     """Seal, open, watch, audit, and resume a bound job at most once."""
     spm = Path(spm_path).expanduser().resolve(strict=False)
@@ -3604,6 +3650,34 @@ def recover_stale_node_table(
             "recovery requires one complete target-scope mode",
             identity,
         )
+    expected_preimage_sha = str(
+        expected_preimage_raw_sha256 or ""
+    ).strip().casefold()
+    if expected_preimage_sha and not SHA256_RE.fullmatch(
+        expected_preimage_sha
+    ):
+        raise StaleNodeTableRecoveryError(
+            "invalid_expected_preimage_sha256",
+            "the evidence-bound preimage SHA-256 is invalid",
+            identity,
+        )
+    if on_continuation_claimed is not None and not callable(
+        on_continuation_claimed
+    ):
+        raise StaleNodeTableRecoveryError(
+            "continuation_claim_hook_invalid",
+            "the continuation claim hook must be callable",
+            identity,
+        )
+    if continuation_commit_lock is not None and not (
+        hasattr(continuation_commit_lock, "__enter__")
+        and hasattr(continuation_commit_lock, "__exit__")
+    ):
+        raise StaleNodeTableRecoveryError(
+            "continuation_commit_lock_invalid",
+            "the continuation commit lock must be a context manager",
+            identity,
+        )
     authoring = target_scopes["authoring_mesh_ids"]
     required_live = target_scopes["required_live_mesh_ids"]
     _validate_retry_contract(
@@ -3624,6 +3698,18 @@ def recover_stale_node_table(
     try:
         lock, token = _acquire_session_lock(root, identity)
         baseline = capture_fn(spm, authoring)
+        if (
+            expected_preimage_sha
+            and baseline["raw_sha256"] != expected_preimage_sha
+        ):
+            raise StaleNodeTableRecoveryError(
+                "audit_preimage_identity_changed",
+                "the current SPM bytes no longer match the blocking audit",
+                _public_hash_evidence(
+                    baseline,
+                    expected_preimage_raw_sha256=expected_preimage_sha,
+                ),
+            )
         baseline_verdict = validate_repaired_snapshot(
             baseline["delivery"],
             authoring,
@@ -3702,6 +3788,7 @@ def recover_stale_node_table(
             capture_fn=capture_fn,
             sleep_fn=sleep_fn,
             monotonic_fn=monotonic_fn,
+            guards=guards,
         )
         retry_result = None
         claim_name = None
@@ -3721,6 +3808,8 @@ def recover_stale_node_table(
                 authoring_mesh_ids,
                 required_live_mesh_ids,
                 capture_fn,
+                continuation_commit_lock,
+                on_continuation_claimed,
             )
         return {
             "contract": RECOVERY_CONTRACT,
