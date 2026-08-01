@@ -116,6 +116,7 @@ from spm_leaf_handoff_contract import (
 )
 from speedtree_pipeline_contract import (
     build_preflight_envelope,
+    is_live_spm,
     source_identity,
     validate_preflight_envelope,
 )
@@ -283,7 +284,7 @@ def material_preflight_mesh_reference_block(spm):
 def is_cluster_source_spm(spm):
     path = Path(spm)
     return (
-        path.suffix.casefold() == ".spm"
+        is_live_spm(path, require_file=False)
         and path.parent.name.casefold() == "cluster"
     )
 
@@ -362,8 +363,7 @@ def owner_cluster_spm_paths(spm):
             for cluster_dir in cluster_dirs
             for candidate in cluster_dir.iterdir()
             if (
-                candidate.is_file()
-                and candidate.suffix.casefold() == ".spm"
+                is_live_spm(candidate)
                 and not candidate.name.startswith("~")
             )
         ))
@@ -2144,8 +2144,16 @@ class App:
 
     @classmethod
     def _collect_scan_result(cls, root, snapshot_caches):
-        spms = scan_sk_spms(root)
-        cluster_sources = scan_cluster_spm_sources(root)
+        spms = [
+            spm
+            for spm in scan_sk_spms(root)
+            if is_live_spm(spm, require_file=False)
+        ]
+        cluster_sources = [
+            row
+            for row in scan_cluster_spm_sources(root)
+            if is_live_spm(row.get("authoring_spm"), require_file=False)
+        ]
         # The population scan above can cold-parse hundreds of SPMs. Persist
         # that shared analysis immediately instead of waiting for a later
         # live-status change that may never occur before process exit.
@@ -2347,12 +2355,20 @@ class App:
             self._table_full_values = {}
         else:
             self._table_full_values.clear()
-        cluster_sources = prepared.get("cluster_sources") or []
+        cluster_sources = [
+            row
+            for row in (prepared.get("cluster_sources") or [])
+            if is_live_spm(row.get("authoring_spm"), require_file=False)
+        ]
         cluster_by_source = {
             _normalized_path(row["authoring_spm"]): row
             for row in cluster_sources
         }
-        spms = list(prepared["spms"]) + [
+        spms = [
+            spm
+            for spm in prepared["spms"]
+            if is_live_spm(spm, require_file=False)
+        ] + [
             row["authoring_spm"] for row in cluster_sources
         ]
         snapshots = prepared["snapshots"]
@@ -3202,6 +3218,7 @@ class App:
         inventory = {
             iid: self._snapshot_batch_item(item)
             for iid, item in self.items.items()
+            if is_live_spm(item.get("spm"), require_file=False)
         }
         targets = [
             inventory[iid] for iid in target_iids if iid in inventory
@@ -4882,13 +4899,14 @@ class App:
                 else:
                     self._job_push(iid, spm)
             except Exception as exc:
-                reason = compact_error_message(exc)
+                full_reason = str(exc)
+                reason = compact_error_message(full_reason)
                 kind = getattr(exc, "kind", "data_error")
                 if phase == "blender":
                     self._publish_repair_stage_contract(
                         spm,
                         ready=False,
-                        reason=reason,
+                        reason=full_reason,
                         kind=kind,
                     )
                 if phase == "push" and kind == "data_error" and "시간 초과" in reason:
@@ -4913,7 +4931,7 @@ class App:
                     column,
                     status_text,
                     kind,
-                    reason,
+                    full_reason,
                     details=details,
                     persist=phase != "check",
                 )
@@ -5250,6 +5268,7 @@ class App:
             file_fingerprint,
             validate_file_fingerprint,
             validate_manifest_artifacts,
+            validate_receipt_pass_through_manifest,
         )
 
         def receipt_fingerprints_match(expected, actual):
@@ -5322,6 +5341,8 @@ class App:
                 return True, ""
 
             current_receipt_record = None
+            current_receipt_path = None
+            current_contract = {}
             current_handoff = {}
             if resolution and resolution.get("selected_receipt"):
                 current_receipt_path = Path(resolution["selected_receipt"])
@@ -5351,6 +5372,20 @@ class App:
                 )
 
             if embedded.get("status") == "pass_through":
+                if isinstance(
+                    embedded.get("pass_through_provenance"), dict
+                ):
+                    if current_receipt_path is None:
+                        raise RuntimeError(
+                            "current Cluster pass-through receipt is "
+                            "unavailable for provenance validation"
+                        )
+                    validate_receipt_pass_through_manifest(
+                        embedded,
+                        receipt_path=current_receipt_path,
+                        target_contract=current_contract,
+                        target_spm=spm,
+                    )
                 if current_receipt_record is not None and any((
                     current_handoff.get("roles"),
                     current_handoff.get("cluster_dependencies"),
@@ -5372,11 +5407,17 @@ class App:
                             "pcg_receipt"
                         )
                     )
+                    receipt_bound_pass_through = isinstance(
+                        embedded.get("pass_through_provenance"), dict
+                    )
                     if (
-                        not rendered_unused
-                        or not receipt_fingerprints_match(
-                            embedded_receipt,
-                            current_receipt_record,
+                        not receipt_bound_pass_through
+                        and (
+                            not rendered_unused
+                            or not receipt_fingerprints_match(
+                                embedded_receipt,
+                                current_receipt_record,
+                            )
                         )
                     ):
                         raise RuntimeError(
@@ -5435,7 +5476,7 @@ class App:
         except (OSError, ValueError, RuntimeError) as exc:
             return False, (
                 "Cluster Assembly input changed after Repair → "
-                "② Blender Repair 다시 실행: " + compact_error_message(exc)
+                "② Blender Repair 다시 실행: " + str(exc)
             )
 
     def _repair_runtime_addon_dir(self):
@@ -8043,6 +8084,24 @@ class App:
                             saved_status = str(
                                 saved_manifest.get("status") or ""
                             )
+                            if isinstance(
+                                saved_manifest.get(
+                                    "pass_through_provenance"
+                                ),
+                                dict,
+                            ):
+                                from cluster_assembly_builder import (
+                                    validate_receipt_pass_through_manifest,
+                                )
+
+                                validate_receipt_pass_through_manifest(
+                                    saved_manifest,
+                                    receipt_path=cluster_receipt_resolution[
+                                        "live_audit_report"
+                                    ],
+                                    target_contract=live_contract,
+                                    target_spm=spm,
+                                )
                             status_mismatch = (
                                 live_status == "pass_through"
                                 and saved_status != "pass_through"
@@ -8060,6 +8119,7 @@ class App:
                                 repair_state["current"] = False
                         except (
                             OSError,
+                            RuntimeError,
                             TypeError,
                             ValueError,
                         ):

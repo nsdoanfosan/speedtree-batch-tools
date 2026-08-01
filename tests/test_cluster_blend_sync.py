@@ -118,6 +118,38 @@ def write_material_spm(path, material, material_id, mesh_ids):
 
 
 class ClusterBlendSyncTests(unittest.TestCase):
+    def test_cluster_consumers_exclude_backup_registry_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_backup_habitat"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            authored = owner / "SK_authored_backup_habitat_01.spm"
+            rollback = (
+                owner
+                / (
+                    "SK_weed_reed_02.texture_slot_backup_"
+                    "20260801_010203_123456.spm"
+                )
+            )
+            authored.write_bytes(b"authored")
+            rollback.write_bytes(b"rollback")
+            source = cluster / "SK_cluster_habitat_01.spm"
+            source.write_bytes(b"source")
+            blend = source.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            save_target_registry(blend, [authored, rollback])
+
+            rows = discover_cluster_blend_relations(
+                owner,
+                verify_physical=False,
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                [row["target_spm"] for row in rows[0]["targets"]],
+                [authored.absolute()],
+            )
+
     def test_shallow_discovery_does_not_hash_physical_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"

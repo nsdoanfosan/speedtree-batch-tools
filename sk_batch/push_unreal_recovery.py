@@ -26,6 +26,7 @@ from sk_common import (
     file_content_fingerprint,
     file_content_snapshot,
 )
+from speedtree_pipeline_contract import is_live_spm
 
 
 RECOVERY_SCHEMA_VERSION = 1
@@ -282,6 +283,11 @@ def load_parent_manifest(path):
         if item.get("schema_version") != PUSH_MANIFEST_SCHEMA_VERSION:
             raise PushUnrealRecoveryError(
                 f"parent item schema is incompatible: {queue_id}"
+            )
+        if not is_live_spm(queue_id, require_file=False):
+            raise PushUnrealRecoveryError(
+                "parent Push manifest contains an ineligible SPM artifact: "
+                + queue_id
             )
         by_id[queue_id] = item
     return manifest_path.resolve(), manifest, by_id

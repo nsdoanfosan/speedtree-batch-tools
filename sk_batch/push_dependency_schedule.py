@@ -17,6 +17,7 @@ from cluster_assembly_builder import (
     validate_manifest_artifacts,
 )
 from cluster_blend_sync import discover_cluster_blend_relations
+from speedtree_pipeline_contract import is_live_spm
 
 
 class PushDependencyError(RuntimeError):
@@ -38,7 +39,7 @@ def normalized_path_key(path):
 def is_cluster_source_spm(spm):
     path = Path(spm)
     return (
-        path.suffix.casefold() == ".spm"
+        is_live_spm(path, require_file=False)
         and path.parent.name.casefold() == "cluster"
     )
 
@@ -329,6 +330,8 @@ def _item_path_lookup(all_items):
     for item in values:
         if not isinstance(item, dict):
             continue
+        if not is_live_spm(item.get("spm"), require_file=False):
+            continue
         for field in ("spm", "authoring_spm", "output_spm"):
             value = item.get(field)
             if value:
@@ -347,7 +350,12 @@ def expand_push_targets(
     Explicitly selected Cluster rows are preserved and duplicate dependencies
     shared by multiple Trees are scheduled only once.
     """
-    selected_targets = list(selected_targets)
+    selected_targets = [
+        item
+        for item in selected_targets
+        if isinstance(item, dict)
+        and is_live_spm(item.get("spm"), require_file=False)
+    ]
     lookup = _item_path_lookup(all_items)
     dependency_items = []
     explicit_cluster_items = []

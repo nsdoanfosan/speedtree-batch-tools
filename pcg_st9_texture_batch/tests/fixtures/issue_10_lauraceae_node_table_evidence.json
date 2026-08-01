@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "contract": "speedtree_lauraceae_node_table_evidence_v1",
+  "issue_url": "https://github.com/nsdoanfosan/speedtree-batch-tools/issues/10",
+  "issue_number": 10,
+  "recorded_utc": "2026-07-31T17:05:11Z",
+  "result_status": "resave_reaudit_valid",
+  "resave_tool": {
+    "name": "SpeedTree Modeler",
+    "version": "10.1.0",
+    "interaction": "Computer Use",
+    "action": "Selected each exact asset tab and invoked Save once with Ctrl+S."
+  },
+  "authoring_graph_contract": {
+    "core_projection_version": 2,
+    "exact_projection_changed_on_normal_save": true,
+    "continuity_rule": "The stable core fingerprint must match even when the diagnostic exact XML projection changes.",
+    "normalized_save_representations": [
+      "Generation:Collections labels rebuilt from the current asset table",
+      "Generator graph-editor presentation metadata and regenerated Link object GUIDs",
+      "redundant default parent splines",
+      "spline floating-point reserialization below five decimal places",
+      "nonzero Random Seeds:Style values serialized as 1"
+    ],
+    "still_fail_closed_for": [
+      "Generator identity, type, name, visibility, or other property changes",
+      "nondefault curve changes",
+      "Link endpoint changes",
+      "Material or Mesh identity changes"
+    ]
+  },
+  "target_scope_contract": {
+    "authoring_continuity": "All graph-visible bindings within the requested Mesh-ID candidates are fingerprinted.",
+    "live_delivery": "Only post-save graph-visible bindings with current Node-table export participation are required for normalization.",
+    "generator_membership": "All Generator identities are fingerprinted independently of the target delivery scope."
+  },
+  "assets": [
+    {
+      "asset_name": "SK_tree_Lauraceae_11.spm",
+      "required_mesh_ids": [43, 45, 46, 47],
+      "before": {
+        "raw_sha256": "2f996ddb1b180247dd002c942a309bb62a5352712dc5eb3816a1fc5f6c40b3cc",
+        "text_sha256": "577d4e5f35c9acbb79db48f4f1046621ee6e5eb8828299b25825a0b51d7bc38c",
+        "generator_count": 34,
+        "node_table_owner_count": 33,
+        "total_node_count": 60103,
+        "orphan_owner_count": 4,
+        "orphan_node_count": 29986,
+        "stale": true,
+        "regex_elementtree_parity": true
+      },
+      "sealed_preimage": {
+        "receipt_schema_version": 2,
+        "receipt_sha256": "e5cf531acf26dced2065e58ec1e249b9223b737eb2d1bbe6eafcadfb58281401",
+        "exact_backup_verified": true
+      },
+      "after": {
+        "raw_sha256": "9489f6e02f3de7dc9bf5f860a7de71484026347c1c66f66f53ce9993b1dac47e",
+        "text_sha256": "53e68aec69d48f66fddfdfb90ff23cf74fc442f9029bbe6ff440fef551759df1",
+        "generator_count": 34,
+        "node_table_owner_count": 33,
+        "total_node_count": 11618,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "stale": false,
+        "target_binding_count": 11,
+        "material_scope_count": 2
+      },
+      "gates": {
+        "valid": true,
+        "regex_elementtree_parity": true,
+        "authoring_graph_core_continuity": true,
+        "authoring_graph_exact_projection_continuity": false,
+        "generator_membership_continuity": true,
+        "required_target_binding_continuity": true,
+        "normalization_evidence_complete": true
+      }
+    },
+    {
+      "asset_name": "SK_tree_Lauraceae_12.spm",
+      "required_mesh_ids": [53, 55, 56, 57],
+      "before": {
+        "raw_sha256": "141d375f74e3be6289ab28b81b1e40897e58d520e565e7daf53b4cd195f4ae7b",
+        "text_sha256": "f1fe5eeced16751fb03a6945458c6ca1e49e89f595c3cfaffecd4dd17e496547",
+        "generator_count": 31,
+        "node_table_owner_count": 30,
+        "total_node_count": 60101,
+        "orphan_owner_count": 4,
+        "orphan_node_count": 30034,
+        "stale": true,
+        "regex_elementtree_parity": true
+      },
+      "sealed_preimage": {
+        "receipt_schema_version": 3,
+        "receipt_sha256": "ba054e6d4d05e779241b1e498e040b7fcc75937603b5a3c540c20068e8673d62",
+        "exact_backup_verified": true
+      },
+      "after": {
+        "raw_sha256": "1872f0abebb076e2be2b7b7f418979625177a25c7cc4100f16e5a910dd0c6ce6",
+        "text_sha256": "d856beac42328c0df38021ed9417e657a689b47a74dc74fd1a0f07a890d9ccd8",
+        "generator_count": 31,
+        "node_table_owner_count": 30,
+        "total_node_count": 9631,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "stale": false,
+        "target_binding_count": 11,
+        "material_scope_count": 2
+      },
+      "gates": {
+        "valid": true,
+        "regex_elementtree_parity": true,
+        "authoring_graph_core_continuity": true,
+        "authoring_graph_exact_projection_continuity": false,
+        "generator_membership_continuity": true,
+        "required_target_binding_continuity": true,
+        "normalization_evidence_complete": true
+      }
+    }
+  ],
+  "validation": {
+    "focused_test_command": "python -m unittest pcg_st9_texture_batch.tests.test_stale_node_table_recovery pcg_st9_texture_batch.tests.test_issue_10_lauraceae_node_table_evidence",
+    "focused_test_result": "passed: 31 tests",
+    "compile_gate_command": "python sk_batch/code_compile_gate.py",
+    "compile_gate_result": "passed: 173 Python sources, 4 contract groups, revision d7a4eb5e861e3a2b"
+  },
+  "remaining_external_verification": [
+    "Cluster normalization and the Unreal push were not rerun; the recovery contract leaves that downstream closure gate pending."
+  ]
+}
