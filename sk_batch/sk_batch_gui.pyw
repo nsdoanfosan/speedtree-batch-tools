@@ -1091,8 +1091,32 @@ def cluster_target_delivery_block(contract, target_spm, producer_spm):
             row.get("delivery_reason")
             or "normalized_generator_delivery_incomplete"
         ).strip() or "normalized_generator_delivery_incomplete"
+        live_node_table = row.get("live_node_table")
+        live_node_table = (
+            live_node_table if isinstance(live_node_table, dict) else {}
+        )
+        # Persist counts and the affected Mesh IDs, but not raw Generator
+        # GUIDs.  The operator needs enough evidence to identify and repair
+        # the authored SPM without copying identity-bearing GUID values into
+        # the shared queue/state files.
+        live_node_table_summary = {
+            key: copy.deepcopy(live_node_table.get(key))
+            for key in (
+                "stale",
+                "generator_count",
+                "node_table_generator_count",
+                "orphan_node_count",
+                "total_node_count",
+            )
+            if key in live_node_table
+        }
+        live_node_table_summary["orphan_generator_guid_count"] = len(
+            live_node_table.get("orphan_generator_guids") or ()
+        )
         return {
             "reason_token": reason_token,
+            "target_spm": str(row["spm"]),
+            "target_name": Path(str(row["spm"])).name,
             "delivery_mode": str(
                 normalized.get("delivery_mode")
                 or dependency.get("normalized_delivery_mode")
@@ -1107,8 +1131,43 @@ def cluster_target_delivery_block(contract, target_spm, producer_spm):
                 )
                 if value
             }),
+            "delivery_remedy": str(
+                row.get("delivery_remedy") or ""
+            ).strip(),
+            "stale_node_table_target_mesh_ids": [
+                copy.deepcopy(value)
+                for value in row.get("stale_node_table_target_mesh_ids") or ()
+            ],
+            "live_node_table": live_node_table_summary,
         }
     return None
+
+
+def target_planned_exclusion_summary(target_spm, reason_token, evidence):
+    """Render a target-first exclusion summary suitable for a narrow GUI row."""
+    target = Path(target_spm)
+    evidence = evidence if isinstance(evidence, dict) else {}
+    parts = [target.name]
+    live_node_table = evidence.get("live_node_table")
+    live_node_table = (
+        live_node_table if isinstance(live_node_table, dict) else {}
+    )
+    if live_node_table.get("stale") is True:
+        parts.append("stale Node table")
+        parts.append(
+            "orphan GUIDs "
+            + str(live_node_table.get("orphan_generator_guid_count") or 0)
+        )
+        orphan_nodes = live_node_table.get("orphan_node_count")
+        total_nodes = live_node_table.get("total_node_count")
+        if orphan_nodes is not None or total_nodes is not None:
+            parts.append(f"orphan Nodes {orphan_nodes or 0}/{total_nodes or 0}")
+        mesh_ids = evidence.get("stale_node_table_target_mesh_ids") or ()
+        if mesh_ids:
+            parts.append("Mesh IDs " + ",".join(str(value) for value in mesh_ids))
+        parts.append("action=regenerate/save this SPM in Modeler, then re-audit")
+    parts.append(f"reason={reason_token}")
+    return " | ".join(parts)
 
 
 def cluster_relation_refresh_state(cluster_spm, target_spms):
@@ -1541,6 +1600,20 @@ def cluster_issue_summary(issues, limit=5):
             lines.append(str(issue))
             continue
         fields = [str(issue.get("code") or "CLUSTER_DATA_INVALID")]
+        # Put the authored target before provider-role/error metadata so the
+        # target remains visible even when a narrow board cell truncates the
+        # rest of the diagnostic.
+        blocked_target_rows = [
+            row
+            for row in issue.get("blocked_targets") or ()
+            if isinstance(row, dict) and row.get("spm")
+        ]
+        targets = [
+            Path(str(row.get("spm"))).name
+            for row in blocked_target_rows
+        ]
+        if targets:
+            fields.append("targets=" + ", ".join(targets[:3]))
         role = str(issue.get("role") or "")
         if role:
             fields.append(f"role={role}")
@@ -1558,13 +1631,40 @@ def cluster_issue_summary(issues, limit=5):
         ]
         if errors:
             fields.append("errors=" + ", ".join(errors[:3]))
-        targets = [
-            Path(str(row.get("spm"))).name
-            for row in issue.get("blocked_targets") or ()
-            if isinstance(row, dict) and row.get("spm")
-        ]
-        if targets:
-            fields.append("targets=" + ", ".join(targets[:3]))
+        stale_target_evidence = []
+        for row in blocked_target_rows[:3]:
+            live_node_table = row.get("live_node_table")
+            if not isinstance(live_node_table, dict):
+                continue
+            if live_node_table.get("stale") is not True:
+                continue
+            evidence = {
+                "live_node_table": {
+                    "stale": True,
+                    "orphan_generator_guid_count": len(
+                        live_node_table.get("orphan_generator_guids") or ()
+                    ),
+                    "orphan_node_count": live_node_table.get(
+                        "orphan_node_count"
+                    ),
+                    "total_node_count": live_node_table.get(
+                        "total_node_count"
+                    ),
+                },
+                "stale_node_table_target_mesh_ids": row.get(
+                    "stale_node_table_target_mesh_ids"
+                ) or (),
+            }
+            stale_target_evidence.append(
+                target_planned_exclusion_summary(
+                    row["spm"],
+                    row.get("delivery_reason")
+                    or "live_export_evidence_unavailable_stale_node_table",
+                    evidence,
+                )
+            )
+        if stale_target_evidence:
+            fields.append("target_evidence=" + "; ".join(stale_target_evidence))
         # A block can be partly explained by a stale node table even when
         # an independent fault keeps the overall code generic. Surface that
         # subset and its fix instead of only the file that failed.
@@ -4365,10 +4465,15 @@ class App:
             "reason_token": reason_token,
             "evidence": copy.deepcopy(evidence),
         }
+        status_summary = target_planned_exclusion_summary(
+            target,
+            reason_token,
+            evidence,
+        )
         self._record_phase_status(
             iid,
             "blend_status",
-            f"Sync excluded: {reason_token}",
+            f"Sync excluded: {status_summary}",
             "planned_excluded",
             str(error),
             details=details,
@@ -4377,7 +4482,7 @@ class App:
         self._record_phase_status(
             iid,
             "push_status",
-            f"Push blocked: {reason_token}",
+            f"Push blocked: {status_summary}",
             "planned_excluded",
             str(error),
             details=details,
@@ -4385,7 +4490,7 @@ class App:
         )
         self.log(
             "[target planned exclusion] "
-            f"{target.name}: {reason_token}; Sync is not Push readiness"
+            f"{status_summary}; Sync is not Push readiness"
         )
 
     def _target_failure_result(self, iid, default_token="item_failed"):
@@ -8042,28 +8147,40 @@ class App:
                 target_block
                 and not global_issues
                 and blocking_codes
-                <= {"NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE"}
+                <= {
+                    "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+                    "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
+                }
             ):
                 reason_token = target_block["reason_token"]
+                evidence = {
+                    "audit_report": str(audit_report),
+                    "target_spm": target_block["target_spm"],
+                    "target_name": target_block["target_name"],
+                    "delivery_mode": target_block["delivery_mode"],
+                    "delivery_errors": target_block["delivery_errors"],
+                    "delivery_remedy": target_block["delivery_remedy"],
+                    "stale_node_table_target_mesh_ids": target_block[
+                        "stale_node_table_target_mesh_ids"
+                    ],
+                    "live_node_table": target_block["live_node_table"],
+                    "issue_codes": sorted(blocking_codes),
+                    "push_readiness": "blocked_by_current_live_delivery",
+                    "sync_outcome_authoritative": False,
+                    "normalization_postcondition": "not_run",
+                }
+                summary = target_planned_exclusion_summary(
+                    target,
+                    reason_token,
+                    evidence,
+                )
                 raise TargetPlannedExclusionError(
                     "Cluster normalization target excluded by current live "
-                    f"delivery: {target.name}: {reason_token}",
+                    f"delivery: {summary}",
                     reason_token=reason_token,
                     target_spm=target,
                     producer_spm=producer,
-                    evidence={
-                        "audit_report": str(audit_report),
-                        "delivery_mode": target_block["delivery_mode"],
-                        "delivery_errors": target_block[
-                            "delivery_errors"
-                        ],
-                        "issue_codes": sorted(blocking_codes),
-                        "push_readiness": (
-                            "blocked_by_current_live_delivery"
-                        ),
-                        "sync_outcome_authoritative": False,
-                        "normalization_postcondition": "not_run",
-                    },
+                    evidence=evidence,
                     log_file=log_file,
                     report_file=audit_report,
                 )
