@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "source_issue": 58,
+  "description": "Sanitized BWR target with no exact receipt and a rolling global manifest that declares another SPM.",
+  "asset_folder": "weed_ivy_sample",
+  "target_spm": "SK_Weed_branch_Ivy_roof_hang_02.spm",
+  "foreign_spm": "SK_Weed_Ivy_roof_angle_01.spm",
+  "foreign_global": {
+    "atlas_manifest_schema_version": 1,
+    "spm": "{foreign_target}",
+    "blend_file": "{root}\\cluster\\SK_branch_ivy.blend",
+    "source_collection": "Atlas_Branch_Plans",
+    "export_scope_id": "scope-foreign-ivy",
+    "material_groups": [{
+      "material": "M_branch_ivy",
+      "material_id": 9,
+      "mesh_ids": [23]
+    }],
+    "generator_connection": {
+      "requested": true,
+      "complete": true,
+      "bindings": [{
+        "generator_guid": "foreign-ivy-guid",
+        "generator_name": "Frond Foreign",
+        "slot_prefix": "Material:Frond:0",
+        "target_material_id": 9,
+        "target_mesh_id": 23
+      }]
+    }
+  }
+}

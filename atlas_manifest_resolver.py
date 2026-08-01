@@ -7,13 +7,11 @@ Atlas writes three operational copies of a target relationship:
 * ``speedtree_import_manifest.json`` (rolling global target record).
 
 They are considered in that order.  Coherent lower-precedence mirrors remain
-selected so a writer can update every current operational record.  A disjoint
-lower-precedence record from another source/scope is superseded by the current
-higher-precedence authority instead of being merged into the desired-state
-set.  Disjoint records at the same precedence may coexist, but any two
-operational records that overlap and disagree on source identity, material
-ownership, material-group content, or a Generator binding fail closed.
-Precedence never turns an overlapping disagreement into a last-writer win.
+selected so a writer can update every current operational record.  Disjoint
+scope records may coexist because one target can consume multiple Atlas
+providers.  Any two operational records that overlap and disagree on source
+identity, material ownership, material-group content, or a Generator binding
+fail closed.  Precedence never turns a disagreement into a last-writer win.
 
 Historical ``speedtree_import_manifest_M_*.json`` files and non-target-
 suffixed scope identity files are evidence only.  They are never returned as
@@ -523,27 +521,6 @@ def resolve_atlas_manifests(
                 })
             continue
 
-        higher_precedence = [
-            row
-            for row in selected
-            if row["precedence"] < candidate["precedence"]
-        ]
-        coherent_higher_source = next((
-            row
-            for row in higher_precedence
-            if row["source_identity"] == candidate["source_identity"]
-        ), None)
-        if higher_precedence and not overlaps and coherent_higher_source is None:
-            authority = higher_precedence[0]
-            resolution["shadowed"].append({
-                **_public_record(candidate, include_payload=False),
-                "reason": "superseded_by_higher_precedence_authority",
-                "superseded_by": authority["path"],
-                "superseded_by_kind": authority["kind"],
-                "superseded_by_precedence": authority["precedence"],
-            })
-            continue
-
         candidate["reason"] = (
             "coherent_operational_mirror" if overlaps else "selected_authority"
         )
@@ -571,3 +548,274 @@ def selected_manifest_payload(resolution):
     """Return the highest-precedence selected payload, or an empty mapping."""
     selected = resolution.get("selected") or []
     return dict(selected[0].get("payload") or {}) if selected else {}
+
+
+def _integer_text(value):
+    try:
+        return str(int(str(value).strip()))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _group_mesh_ids(group):
+    values = group.get("mesh_ids") or []
+    if not values:
+        adoption = group.get("source_material_adoption") or {}
+        values = adoption.get("final_material_mesh_ids") or []
+    return sorted({
+        value for value in (_integer_text(item) for item in values) if value
+    })
+
+
+def _source_path_values(payload, group):
+    """Return the authoritative source paths carried by one material group."""
+    mappings = []
+    for field, child in (
+        ("files", group.get("blender_cluster_bake_texture")),
+        ("files", group.get("canonical_texture_output")),
+        ("source_paths", group.get("source_texture_fallback")),
+    ):
+        if isinstance(child, dict) and isinstance(child.get(field), dict):
+            mappings.append(child[field])
+    groups = _material_groups(payload)
+    if len(groups) == 1 and isinstance(payload.get("source_textures"), dict):
+        mappings.append(payload["source_textures"])
+    values = []
+    for mapping in mappings:
+        values.extend(
+            str(value).strip()
+            for value in mapping.values()
+            if str(value or "").strip()
+        )
+    return values
+
+
+def resolve_manifest_material_ownership(
+    resolution,
+    live_materials,
+    *,
+    target_spm=None,
+):
+    """Prove exact material/mesh/source ownership from the selected set.
+
+    The resolver remains the sole candidate-selection authority.  This helper
+    adds read-only live evidence after selection, so a rolling per-target copy
+    cannot erase other legitimate providers and a marker alone cannot bless a
+    material whose ID, cutout meshes, or connected source files disagree.
+    """
+    target = Path(
+        target_spm or resolution.get("target_spm") or ""
+    ).expanduser().resolve(strict=False)
+    selected_groups = []
+    for selected in resolution.get("selected") or []:
+        payload = selected.get("payload") or {}
+        for group in _material_groups(payload):
+            selected_groups.append((selected, payload, group))
+
+    proven = []
+    unproven = []
+    for material in live_materials or []:
+        name = str(
+            material.get("material_name") or material.get("name") or ""
+        ).strip()
+        material_id = _integer_text(
+            material.get("material_id")
+            if material.get("material_id") is not None
+            else material.get("id")
+        )
+        mesh_ids = sorted({
+            value
+            for value in (
+                _integer_text(item)
+                for item in (
+                    material.get("cutout_mesh_ids")
+                    or material.get("mesh_ids")
+                    or []
+                )
+            )
+            if value
+        })
+        refs = material.get("refs") or material.get("source_refs") or []
+        if isinstance(refs, dict):
+            refs = refs.values()
+        live_signature = sorted({
+            normalized_manifest_path(value, relative_to=target.parent)
+            for value in refs
+            if str(value or "").strip()
+        })
+
+        candidates = []
+        mismatch_reasons = set()
+        for selected, payload, group in selected_groups:
+            if str(group.get("material") or "").strip().casefold() != name.casefold():
+                continue
+            if _integer_text(group.get("material_id")) != material_id:
+                mismatch_reasons.add("material_id_mismatch")
+                continue
+            if _group_mesh_ids(group) != mesh_ids:
+                mismatch_reasons.add("material_mesh_set_mismatch")
+                continue
+            declared_signature = sorted({
+                normalized_manifest_path(value, relative_to=target.parent)
+                for value in _source_path_values(payload, group)
+            })
+            if not live_signature or not declared_signature:
+                mismatch_reasons.add("source_signature_missing")
+                continue
+            if declared_signature != live_signature:
+                mismatch_reasons.add("source_signature_mismatch")
+                continue
+            candidates.append({
+                "material_name": name,
+                "material_id": material_id,
+                "mesh_ids": mesh_ids,
+                "source_signature": live_signature,
+                "manifest_path": selected.get("path", ""),
+                "manifest_kind": selected.get("kind", ""),
+                "manifest_precedence": selected.get("precedence"),
+                "source_identity": copy.deepcopy(
+                    selected.get("source_identity") or {}
+                ),
+                "material_group": copy.deepcopy(group),
+            })
+        if candidates:
+            candidates.sort(key=lambda row: (
+                int(row.get("manifest_precedence") or 0),
+                str(row.get("manifest_path") or "").casefold(),
+            ))
+            proven.append(candidates[0])
+        else:
+            unproven.append({
+                "material_name": name,
+                "material_id": material_id,
+                "mesh_ids": mesh_ids,
+                "source_signature": live_signature,
+                "reasons": sorted(mismatch_reasons) or [
+                    "matching_manifest_material_group_missing"
+                ],
+            })
+
+    if not live_materials:
+        status = "not_applicable"
+    elif unproven:
+        status = "unproven"
+    else:
+        status = "proven"
+    return {
+        "status": status,
+        "materials": proven,
+        "unproven": unproven,
+    }
+
+
+def _binding_identity_matches(declared, live):
+    slot = str(declared.get("slot_prefix") or "").strip().casefold()
+    if slot != str(live.get("slot_prefix") or "").strip().casefold():
+        return False
+    for field in ("generator_guid", "generator_index", "generator_name"):
+        left = declared.get(field)
+        right = live.get(field)
+        if left not in {None, ""} and right not in {None, ""}:
+            return str(left).strip().casefold() == str(right).strip().casefold()
+    return False
+
+
+def diagnose_manifest_generator_candidates(resolution, live_bindings):
+    """Separate stale manifest declarations from live SPM asset defects."""
+    live = [dict(row) for row in live_bindings or []]
+    candidates = []
+    conflicting = []
+    for selected in resolution.get("selected") or []:
+        payload = selected.get("payload") or {}
+        connection = payload.get("generator_connection") or {}
+        requested = connection.get("requested") is True
+        row = {
+            "path": selected.get("path", ""),
+            "kind": selected.get("kind", ""),
+            "precedence": selected.get("precedence"),
+            "requested": requested,
+            "declared_complete": connection.get("complete") is True,
+            "status": "no_generator_claim",
+            "reasons": [],
+            "binding_results": [],
+        }
+        if not requested:
+            candidates.append(row)
+            continue
+
+        declared_bindings = [
+            binding
+            for binding in connection.get("bindings") or []
+            if isinstance(binding, dict)
+        ]
+        if not declared_bindings:
+            row["reasons"].append("declared_generator_bindings_missing")
+        for declared in declared_bindings:
+            matches = [
+                current for current in live
+                if _binding_identity_matches(declared, current)
+            ]
+            errors = []
+            current = matches[0] if len(matches) == 1 else None
+            if current is None:
+                errors.append(
+                    "generator_slot_ambiguous" if len(matches) > 1
+                    else "generator_slot_missing"
+                )
+            else:
+                target_material_id = _integer_text(
+                    declared.get("target_material_id")
+                )
+                target_mesh_id = _integer_text(declared.get("target_mesh_id"))
+                if target_material_id and target_material_id != _integer_text(
+                    current.get("material_id")
+                ):
+                    errors.append("target_material_mismatch")
+                if target_mesh_id and target_mesh_id != _integer_text(
+                    current.get("mesh_id")
+                ):
+                    errors.append("target_mesh_mismatch")
+            row["binding_results"].append({
+                "declared": copy.deepcopy(declared),
+                "current": copy.deepcopy(current),
+                "errors": errors,
+            })
+            row["reasons"].extend(errors)
+
+        exporting_meshes = {}
+        for current in live:
+            if not current.get(
+                "export_participates", current.get("visible", True)
+            ):
+                continue
+            material_id = _integer_text(current.get("material_id"))
+            mesh_id = _integer_text(current.get("mesh_id"))
+            if material_id and mesh_id:
+                exporting_meshes.setdefault(material_id, set()).add(mesh_id)
+        for group in _material_groups(payload):
+            material_id = _integer_text(group.get("material_id"))
+            declared_meshes = set(_group_mesh_ids(group))
+            missing = sorted(
+                declared_meshes - exporting_meshes.get(material_id, set())
+            )
+            if missing:
+                row["reasons"].append(
+                    "declared_mesh_not_export_participating"
+                )
+                row.setdefault("non_export_participating_mesh_ids", []).extend(
+                    missing
+                )
+
+        row["reasons"] = sorted(set(row["reasons"]))
+        row["status"] = (
+            "manifest_candidate_live_conflict"
+            if row["reasons"] else "live_coherent"
+        )
+        candidates.append(row)
+        if row["status"] == "manifest_candidate_live_conflict":
+            conflicting.append(copy.deepcopy(row))
+    return {
+        "status": "conflicting" if conflicting else "coherent",
+        "candidates": candidates,
+        "conflicting": conflicting,
+    }

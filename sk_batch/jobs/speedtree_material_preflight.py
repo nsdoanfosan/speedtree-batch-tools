@@ -46,7 +46,12 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
     canonical_material_name as pcg_canonical_material_name,
+    extract_material_image_refs,
     texture_base_for_material,
+)
+from atlas_manifest_resolver import (  # noqa: E402
+    resolve_atlas_manifests,
+    resolve_manifest_material_ownership,
 )
 from pcg_st9_texture_batch.pcg_texture_common import (  # noqa: E402
     DEFAULT_CONFIG as PCG_DEFAULT_CONFIG,
@@ -310,6 +315,22 @@ def augment_texture_readiness_contract(
             _material_contract_key(material.get("material_name")),
             [],
         ).append(material)
+    atlas_resolution = resolve_atlas_manifests(production_spm)
+    atlas_ownership = resolve_manifest_material_ownership(
+        atlas_resolution,
+        [
+            row
+            for row in extract_material_image_refs(production_spm)
+            if row.get("managed_leaf_output")
+        ],
+        target_spm=production_spm,
+    )
+    atlas_ownership_by_key = {}
+    for proof in atlas_ownership.get("materials") or []:
+        atlas_ownership_by_key.setdefault(
+            _material_contract_key(proof.get("material_name")),
+            [],
+        ).append(proof)
     asset_root = _production_asset_root(production_spm)
     provisional_declarations = atlas_provisional_source_declarations(
         asset_root
@@ -342,6 +363,24 @@ def augment_texture_readiness_contract(
             _material_contract_key(binding.get("material")),
             [],
         )
+        ownership_matches = atlas_ownership_by_key.get(
+            _material_contract_key(binding.get("material")),
+            [],
+        )
+        ownership_proof = (
+            ownership_matches[0] if len(ownership_matches) == 1 else None
+        )
+        if ownership_proof is not None:
+            exact_material_id = str(
+                ownership_proof.get("material_id") or ""
+            )
+            exact_spm_matches = [
+                row
+                for row in spm_matches
+                if str(row.get("material_id") or "") == exact_material_id
+            ]
+            if len(exact_spm_matches) == 1:
+                spm_matches = exact_spm_matches
         bake_receipt = {}
         bake_issue = ""
         spm_source_paths = {}
@@ -362,25 +401,33 @@ def augment_texture_readiness_contract(
                 _path_key(path)
                 for path in spm_source_paths.values()
             }:
+                origin_output = {
+                    "slot_files": [
+                        {
+                            "map_index": int(slot.get("map_index", -1)),
+                            "map": str(slot.get("map") or ""),
+                            "role": str(slot.get("role") or ""),
+                            "path": str(slot.get("resolved_ref") or ""),
+                        }
+                        for slot in spm_slots
+                    ],
+                }
+                manifest_group = (
+                    (ownership_proof or {}).get("material_group") or {}
+                )
+                manifest_bake = manifest_group.get(
+                    "blender_cluster_bake_texture"
+                )
+                if isinstance(manifest_bake, dict):
+                    origin_output = {
+                        **manifest_bake,
+                        "slot_files": origin_output["slot_files"],
+                    }
                 bake_receipt, bake_issue = (
                     resolve_blender_cluster_bake_origin(
                         production_spm,
                         spm_material,
-                        {
-                            "slot_files": [
-                                {
-                                    "map_index": int(
-                                        slot.get("map_index", -1)
-                                    ),
-                                    "map": str(slot.get("map") or ""),
-                                    "role": str(slot.get("role") or ""),
-                                    "path": str(
-                                        slot.get("resolved_ref") or ""
-                                    ),
-                                }
-                                for slot in spm_slots
-                            ],
-                        },
+                        origin_output,
                         asset_root,
                     )
                 )
@@ -407,6 +454,11 @@ def augment_texture_readiness_contract(
                 "origin_state": TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
                 "origin_receipt": bake_receipt,
                 "source_paths": spm_source_paths,
+                "atlas_manifest_ownership": {
+                    key: value
+                    for key, value in (ownership_proof or {}).items()
+                    if key != "material_group"
+                },
             })
             continue
         if (
@@ -644,6 +696,23 @@ def preflight_contract_issues(report):
                 details={
                     "material_names": ownership.get("material_names") or [],
                     "validation": "shadow_only_no_mutation_change",
+                },
+            )
+        )
+    elif ownership.get("status") == "manifest_conflict":
+        issues.append(
+            _issue(
+                "ATLAS_MANIFEST_CANDIDATE_CONFLICT",
+                "atlas_manifest",
+                report.get("spm"),
+                ownership.get("reason")
+                or "Atlas manifest candidates conflict",
+                details={
+                    "material_names": ownership.get("material_names") or [],
+                    "atlas_manifest_resolution": ownership.get(
+                        "atlas_manifest_resolution"
+                    )
+                    or {},
                 },
             )
         )

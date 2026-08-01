@@ -35,6 +35,12 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     save_spm_analysis_cache,
     visible_material_ids,
 )
+from atlas_manifest_resolver import (  # noqa: E402
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
+    resolve_manifest_material_ownership,
+)
 from speedtree_pipeline_contract import open_spm_binary  # noqa: E402
 from speedtree_texture_contract import normalize_material_key  # noqa: E402
 
@@ -111,11 +117,38 @@ def _atlas_replacement_required(
     )
 
 
-def _managed_ownership_provenance(managed_materials):
-    """Expose that the fast status path has marker evidence, not repair proof."""
+def _managed_ownership_provenance(managed_materials, proof=None):
+    """Require resolver-selected material/mesh/source proof beyond a marker."""
     names = [str(item.get("name") or "") for item in managed_materials]
     if not names:
         return {"status": "not_applicable", "material_names": []}
+    if (proof or {}).get("status") == "proven":
+        materials = []
+        for row in proof.get("materials") or []:
+            materials.append({
+                key: copy.deepcopy(value)
+                for key, value in row.items()
+                if key != "material_group"
+            })
+        return {
+            "status": "manifest_proven",
+            "material_names": names,
+            "materials": materials,
+            "reason": (
+                "Resolver-selected exact target receipts prove every managed "
+                "material ID, cutout mesh set, and connected source_signature"
+            ),
+        }
+    if (proof or {}).get("status") == "manifest_conflict":
+        return {
+            "status": "manifest_conflict",
+            "material_names": names,
+            "issue_code": "ATLAS_MANIFEST_CANDIDATE_CONFLICT",
+            "reason": str(proof.get("reason") or "Atlas manifest conflict"),
+            "atlas_manifest_resolution": copy.deepcopy(
+                proof.get("atlas_manifest_resolution") or {}
+            ),
+        }
     return {
         "status": "marker_only",
         "material_names": names,
@@ -479,6 +512,7 @@ def _inspect_spm_fast_cached(path_text, _size, _mtime_ns):
             "name": str(row.get("material_name") or ""),
             "managed": bool(row.get("managed_leaf_output")),
             "mesh_ids": cutout_ids,
+            "refs": list(row.get("refs") or []),
         }
 
     slots = []
@@ -611,6 +645,7 @@ def _inspect_spm_fast_cached(path_text, _size, _mtime_ns):
         "managed_ownership_provenance": _managed_ownership_provenance(
             managed_materials
         ),
+        "_managed_materials": copy.deepcopy(managed_materials),
         "expected_visible_material_names": expected_visible_material_names,
         "slots": slots,
     }
@@ -630,7 +665,28 @@ def inspect_spm_leaf_contract(spm_path):
             "replacement_needed": False,
             "expected_visible_material_names": [],
         }
-    return copy.deepcopy(_inspect_spm_fast_cached(path_text, size, mtime_ns))
+    contract = copy.deepcopy(_inspect_spm_fast_cached(path_text, size, mtime_ns))
+    managed_materials = contract.pop("_managed_materials", [])
+    if not managed_materials:
+        return contract
+    try:
+        resolution = resolve_atlas_manifests(path)
+        proof = resolve_manifest_material_ownership(
+            resolution,
+            managed_materials,
+            target_spm=path,
+        )
+        proof["atlas_manifest_resolution"] = resolution_evidence(resolution)
+    except AtlasManifestResolutionError as exc:
+        proof = {
+            "status": "manifest_conflict",
+            "reason": str(exc),
+            "atlas_manifest_resolution": copy.deepcopy(exc.resolution),
+        }
+    contract["managed_ownership_provenance"] = (
+        _managed_ownership_provenance(managed_materials, proof)
+    )
+    return contract
 
 
 def leaf_contract_user_message(contract):

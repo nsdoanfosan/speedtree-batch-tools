@@ -24,6 +24,7 @@ BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 from atlas_manifest_resolver import (
+    diagnose_manifest_generator_candidates,
     resolution_evidence,
     resolve_atlas_manifests,
 )
@@ -2295,14 +2296,22 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
         binding["slot_identity"] = list(_binding_slot_identity(binding))
         return binding
 
+    decorated_bindings = [decorate(binding) for binding in bindings]
     source_bindings = [
-        decorate(binding) for binding in bindings
+        binding for binding in decorated_bindings
         if str(binding.get("material_id")) in set(requested_ids)
     ]
     managed_bindings = [
-        decorate(binding) for binding in bindings
+        binding for binding in decorated_bindings
         if str(binding.get("material_id")) in managed_ids
     ]
+    manifest_diagnostics = diagnose_manifest_generator_candidates(
+        atlas_resolution,
+        decorated_bindings,
+    )
+    manifest_candidate_conflict = (
+        manifest_diagnostics.get("status") == "conflicting"
+    )
     current_by_slot = {
         tuple(binding["slot_identity"]): binding
         for binding in (source_bindings + managed_bindings)
@@ -2370,7 +2379,9 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
     all_errors = unique(
         error for status in statuses for result in status["slot_results"]
         for error in result["errors"])
-    if source_bindings:
+    if manifest_candidate_conflict:
+        reason = "atlas_manifest_candidate_conflict"
+    elif source_bindings:
         reason = "source_material_still_connected"
     elif complete:
         reason = "managed_material_and_mesh_connected"
@@ -2398,8 +2409,12 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
         "managed_generator_bindings": managed_bindings,
         "generator_bindings": source_bindings + managed_bindings,
         "generator_connection_complete": complete,
-        "generator_connection_update_needed": not complete,
+        "generator_connection_update_needed": (
+            not complete and not manifest_candidate_conflict
+        ),
         "generator_connection_reason": reason,
+        "atlas_manifest_candidate_conflict": manifest_candidate_conflict,
+        "atlas_manifest_generator_diagnostics": manifest_diagnostics,
         "atlas_manifest_resolution": resolution_evidence(
             atlas_resolution
         ),
