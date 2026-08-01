@@ -194,6 +194,18 @@ UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
     "unreal_crash",
     "not_run",
 })
+BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
+    "data_error",
+    "internal_error",
+    "not_run",
+    "not_run_unreal",
+    "process",
+    "process_timeout",
+    "push_timeout",
+    "rpc_timeout",
+    "unreal_crash",
+    "unreal_unavailable",
+})
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
@@ -1895,19 +1907,21 @@ class App:
                                 "· wind JSON(핸드오프 산출물) 존재\n"
                                 "· 언리얼 에디터 실행 여부\n"
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
-        self.btn_retry_unreal = ttk.Button(
+        self.btn_retry_failed = ttk.Button(
             actions,
-            text="↻ 실패 Unreal만 재시도",
-            command=self.start_failed_unreal_retry,
+            text="↻ 실패 Blender/Unreal 재시도",
+            command=self.start_failed_results_retry,
         )
-        self.btn_retry_unreal.pack(side="left", padx=(2, 6))
+        self.btn_retry_failed.pack(side="left", padx=(2, 6))
         Tooltip(
-            self.btn_retry_unreal,
-            "체크된 항목 중 이전 Unreal ingest에서 실패한 항목만 재시도합니다.\n"
-            "Blender/Send2UE export는 다시 돌리지 않습니다. 기존 FBX·JSON·Assembly "
-            "산출물과 export-time 입력이 그대로인지 검증하고, 현재 Unreal 코드로 "
-            "새 immutable manifest를 만들어 실행합니다.\n"
-            "산출물·입력·schema가 바뀌었으면 안전하게 중단하고 ③ 전체 Push를 요구합니다.",
+            self.btn_retry_failed,
+            "체크된 최근 실패를 원인별로 나눠 재시도합니다.\n"
+            "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
+            "③ Unreal Push까지 실행\n"
+            "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
+            "산출물과 입력 identity를 검증한 뒤 현재 Unreal 코드로만 재시도\n"
+            "재시도 가능한 실패가 아니거나 identity 검증에 실패한 항목은 정확한 "
+            "이유를 기록하고 안전하게 제외합니다.",
         )
         self.btn_all = ttk.Button(
             actions,
@@ -2285,7 +2299,7 @@ class App:
         state = "disabled" if scanning else "normal"
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push",
-            "btn_retry_unreal", "btn_all",
+            "btn_retry_failed", "btn_all",
             "btn_pick_root", "btn_scan", "btn_select_all", "btn_clear_all",
             "btn_recent_24h",
         ):
@@ -3245,7 +3259,7 @@ class App:
         # visible inventory, so only those controls are frozen.
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push",
-            "btn_retry_unreal", "btn_all",
+            "btn_retry_failed", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
         ):
             button = getattr(self, name, None)
@@ -3286,6 +3300,9 @@ class App:
                         "label": str(job["label"]),
                         "mode": str(job.get("mode") or ""),
                         "phase": str(job.get("phase") or ""),
+                        "retry": copy.deepcopy(
+                            job.get("retry_metadata") or {}
+                        ),
                         "target_spms": [
                             str(item.get("spm") or "")
                             for item in job.get("targets") or []
@@ -3333,6 +3350,9 @@ class App:
         )
         self.force_rerun = job["force_rerun"]
         self.active_push_transport = job["push_transport"]
+        self._active_retry_metadata = copy.deepcopy(
+            job.get("retry_metadata") or {}
+        )
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
@@ -3538,6 +3558,9 @@ class App:
                             "local_job_id": job["id"],
                             "outcome": status,
                             "error": error,
+                            "retry": copy.deepcopy(
+                                job.get("retry_metadata") or {}
+                            ),
                             **summary,
                         },
                     )
@@ -3554,6 +3577,9 @@ class App:
                     "id": job["id"],
                     "error": error,
                     "status": status,
+                    "retry": copy.deepcopy(
+                        job.get("retry_metadata") or {}
+                    ),
                     **summary,
                 },
             ))
@@ -3612,12 +3638,14 @@ class App:
             "_active_batch_inventory",
             "_active_batch_items",
             "_active_production_source_manifest",
+            "_active_retry_metadata",
             "_active_blender_dependency_map",
             "_active_pipeline_terminal_phase",
             "_active_repair_stage_contracts",
             "_pipeline_upstream_failed_items",
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
+            "_headless_progress_label",
             "_phase_failed_items",
             "_phase_result_summary",
         ):
@@ -3692,8 +3720,8 @@ class App:
         }
         self._enqueue_batch_job(job)
 
-    def start_failed_unreal_retry(self):
-        """Queue selected failed ingest items without scheduling Blender export."""
+    def start_failed_results_retry(self):
+        """Partition selected Push failures into export and Unreal-only jobs."""
         self._close_cell_editor()
         selected_iids = [
             iid for iid, item in self.items.items() if item["checked"]
@@ -3703,62 +3731,96 @@ class App:
             return
 
         grouped = {}
+        export_iids = []
         skipped = []
         for iid in selected_iids:
             entry = self.state.get(iid, {})
             kind = str(entry.get("push_status_kind") or "")
-            if kind not in UNREAL_RECOVERY_FAILURE_KINDS:
-                skipped.append(f"{Path(iid).name}: Unreal 실패 상태 아님")
+            blend_kind = str(entry.get("blend_status_kind") or "")
+            blend_status = str(entry.get("blend_status") or "").strip()
+            visible_blender_failure = (
+                blend_kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS
+                and blend_status.startswith(("실패:", "중단:"))
+            )
+            if visible_blender_failure:
+                export_iids.append(iid)
                 continue
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
-            if not manifest_value or not checkpoint_value:
-                skipped.append(f"{Path(iid).name}: 실패 manifest/checkpoint 없음")
-                continue
-            try:
-                manifest_path, manifest, items_by_id = (
-                    load_unreal_recovery_parent_manifest(manifest_value)
-                )
-                checkpoint = json.loads(
-                    Path(checkpoint_value).read_text(encoding="utf-8")
-                )
-                checkpoint_status = str(
-                    ((checkpoint.get("items") or {}).get(iid) or {}).get(
-                        "status"
+
+            # A parent manifest/checkpoint pair is authoritative evidence that
+            # this item reached Unreal ingest.  Never silently fall back to a
+            # Blender rerun when that evidence is incomplete or invalid: the
+            # immutable recovery contract must fail closed.
+            if manifest_value or checkpoint_value:
+                if kind not in UNREAL_RECOVERY_FAILURE_KINDS:
+                    skipped.append(
+                        f"{Path(iid).name}: Unreal ingest 재시도 상태 아님 ({kind or '상태 없음'})"
                     )
-                    or ""
-                )
-                if checkpoint_status not in UNREAL_RECOVERY_FAILURE_KINDS:
-                    raise PushUnrealRecoveryError(
-                        "parent checkpoint does not record a retryable Unreal failure"
+                    continue
+                if not manifest_value or not checkpoint_value:
+                    skipped.append(
+                        f"{Path(iid).name}: Unreal parent manifest/checkpoint 불완전"
                     )
-                if iid not in items_by_id:
-                    raise PushUnrealRecoveryError(
-                        "selected item is absent from its parent manifest"
+                    continue
+                try:
+                    manifest_path, manifest, items_by_id = (
+                        load_unreal_recovery_parent_manifest(manifest_value)
                     )
-            except (OSError, ValueError, PushUnrealRecoveryError) as exc:
-                skipped.append(f"{Path(iid).name}: {compact_error_message(exc, 120)}")
-                continue
-            key = str(manifest_path)
-            group = grouped.setdefault(
-                key,
-                {
-                    "parent_manifest": key,
-                    "parent_report": str(
-                        manifest.get("report_path")
-                        or paths.get("batch_report")
+                    checkpoint = json.loads(
+                        Path(checkpoint_value).read_text(encoding="utf-8")
+                    )
+                    checkpoint_status = str(
+                        ((checkpoint.get("items") or {}).get(iid) or {}).get(
+                            "status"
+                        )
                         or ""
-                    ),
-                    "selected_queue_ids": [],
-                    "source_records": {},
-                    "items_by_id": items_by_id,
-                },
-            )
-            group["selected_queue_ids"].append(iid)
+                    )
+                    if checkpoint_status not in UNREAL_RECOVERY_FAILURE_KINDS:
+                        raise PushUnrealRecoveryError(
+                            "parent checkpoint does not record a retryable Unreal failure"
+                        )
+                    if iid not in items_by_id:
+                        raise PushUnrealRecoveryError(
+                            "selected item is absent from its parent manifest"
+                        )
+                except (OSError, ValueError, PushUnrealRecoveryError) as exc:
+                    skipped.append(
+                        f"{Path(iid).name}: {compact_error_message(exc, 120)}"
+                    )
+                    continue
+                key = str(manifest_path)
+                group = grouped.setdefault(
+                    key,
+                    {
+                        "parent_manifest": key,
+                        "parent_report": str(
+                            manifest.get("report_path")
+                            or paths.get("batch_report")
+                            or ""
+                        ),
+                        "selected_queue_ids": [],
+                        "source_records": {},
+                        "items_by_id": items_by_id,
+                    },
+                )
+                group["selected_queue_ids"].append(iid)
+                continue
+
+            if kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS:
+                export_iids.append(iid)
+                continue
+            if kind == "manual_required":
+                reason = "수동 조치가 필요한 Blender/export 실패"
+            elif kind == "dependency_blocked":
+                reason = "의존 항목 실패로 차단됨 · 원인 항목을 함께 선택해야 함"
+            else:
+                reason = f"재시도 가능한 실패 상태 아님 ({kind or '상태 없음'})"
+            skipped.append(f"{Path(iid).name}: {reason}")
 
         recovery_requests = []
-        eligible_iids = []
+        unreal_iids = []
         for group in grouped.values():
             try:
                 required_ids = unreal_recovery_dependency_closure(
@@ -3809,7 +3871,7 @@ class App:
                     for iid in group["selected_queue_ids"]
                 )
                 continue
-            eligible_iids.extend(group["selected_queue_ids"])
+            unreal_iids.extend(group["selected_queue_ids"])
             recovery_requests.append({
                 key: copy.deepcopy(value)
                 for key, value in group.items()
@@ -3818,11 +3880,15 @@ class App:
 
         if skipped:
             self.log(
-                "Unreal 재시도 제외:\n  - " + "\n  - ".join(skipped)
+                "실패 재시도 제외:\n  - " + "\n  - ".join(skipped)
             )
+        eligible_set = set(export_iids) | set(unreal_iids)
+        eligible_iids = [
+            iid for iid in selected_iids if iid in eligible_set
+        ]
         if not eligible_iids:
             messagebox.showinfo(
-                "실패 Unreal 재시도",
+                "실패 Blender/Unreal 재시도",
                 "재시도 가능한 선택 항목이 없습니다.\n\n"
                 + "\n".join(skipped[:8]),
             )
@@ -3831,20 +3897,72 @@ class App:
         cfg = dict(self._collect_cfg())
         save_config(cfg)
         inventory, targets = self._snapshot_batch_request(eligible_iids)
-        job = {
-            "label": f"실패 Unreal만 현재 코드로 재시도 · {len(targets)}개",
-            "mode": "unreal_recovery",
-            "phase": "push",
-            "terminal_phase": "push",
-            "selected_scope": True,
-            "targets": targets,
-            "inventory": inventory,
-            "cfg": cfg,
-            "force_rerun": False,
-            "push_transport": "headless",
-            "recovery_requests": recovery_requests,
-        }
-        self._enqueue_batch_job(job)
+        targets_by_id = {str(item["spm"]): item for item in targets}
+        action_kind = "failed_blender_export_and_unreal_retry"
+
+        # Run immutable Unreal recovery first.  A later Blender/export retry
+        # may legitimately rewrite other artifacts; it must not do so before
+        # the recovery partition proves the parent identities it selected.
+        unreal_targets = [
+            targets_by_id[iid] for iid in unreal_iids if iid in targets_by_id
+        ]
+        if unreal_targets:
+            unreal_ids = [str(item["spm"]) for item in unreal_targets]
+            self._enqueue_batch_job({
+                "label": (
+                    "실패 재시도 · Unreal-only current-code · "
+                    f"{len(unreal_targets)}개"
+                ),
+                "mode": "unreal_recovery",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": unreal_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": False,
+                "push_transport": "headless",
+                "recovery_requests": recovery_requests,
+                "retry_metadata": {
+                    "schema_version": 1,
+                    "kind": action_kind,
+                    "partition": "unreal_ingest",
+                    "execution_path": "immutable_unreal_only",
+                    "selected_queue_ids": unreal_ids,
+                },
+            })
+
+        export_targets = [
+            targets_by_id[iid] for iid in export_iids if iid in targets_by_id
+        ]
+        if export_targets:
+            export_ids = [str(item["spm"]) for item in export_targets]
+            self._enqueue_batch_job({
+                "label": (
+                    "실패 재시도 · Blender/Send2UE→Unreal · "
+                    f"{len(export_targets)}개"
+                ),
+                "mode": "pipeline",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": export_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "retry_metadata": {
+                    "schema_version": 1,
+                    "kind": action_kind,
+                    "partition": "blender_export",
+                    "execution_path": "blender_send2ue_then_unreal",
+                    "selected_queue_ids": export_ids,
+                },
+            })
+
+    def start_failed_unreal_retry(self):
+        """Backward-compatible entry point for existing UI integrations."""
+        return self.start_failed_results_retry()
 
     def start_full_pipeline(self):
         self._close_cell_editor()
@@ -9263,7 +9381,8 @@ class App:
             self.ui_queue.put(
                 (
                     "progress",
-                    f"Unreal Push {completed}/{total} · "
+                    f"{getattr(self, '_headless_progress_label', 'Unreal Push')} "
+                    f"{completed}/{total} · "
                     f"headless 처리 중 {active}개",
                 )
             )
@@ -9318,13 +9437,19 @@ class App:
         failed_items = set()
         recovered_by_id = {}
         selected_ids = {str(item["spm"]) for item in targets}
+        retry_metadata = copy.deepcopy(
+            getattr(self, "_active_retry_metadata", {}) or {}
+        )
         runtime_code_paths = self._push_unreal_code_paths()
         rebindable_code_paths = self._push_rebindable_unreal_code_paths()
         parent_lineage = []
         pending_order = []
         total = len(selected_ids)
         self.ui_queue.put(("batch_progress", (0, total)))
-        self.ui_queue.put(("progress", f"Unreal 재시도 산출물 검증 0/{total}"))
+        self.ui_queue.put((
+            "progress",
+            f"실패 재시도 · Unreal-only 산출물 검증 0/{total}",
+        ))
         prepared_selected = 0
 
         for request in recovery_requests:
@@ -9375,7 +9500,7 @@ class App:
                         or {}
                     )
                     item_report = LOG_DIR / (
-                        f"{Path(queue_id).stem}_unreal_recovery_{batch_stamp}.json"
+                        f"{Path(queue_id).stem}_failed_retry_unreal_{batch_stamp}.json"
                     )
                     recovered = recover_manifest_item(
                         parent_item,
@@ -9424,7 +9549,8 @@ class App:
                 self.ui_queue.put(
                     (
                         "progress",
-                        f"Unreal 재시도 산출물 검증 {prepared_selected}/{total}",
+                        "실패 재시도 · Unreal-only 산출물 검증 "
+                        f"{prepared_selected}/{total}",
                     )
                 )
             except Exception as exc:
@@ -9446,7 +9572,7 @@ class App:
                     )
                     failed_items.add(queue_id)
                 self.log(
-                    "[Unreal recovery blocked] "
+                    "[Failed retry Unreal-only blocked] "
                     + ", ".join(Path(value).name for value in request_selected)
                     + f": {reason}"
                 )
@@ -9486,15 +9612,25 @@ class App:
         if not pending:
             self._phase_failed_items = failed_items or selected_ids
             if emit_done:
-                self.ui_queue.put(("progress", "Unreal 재시도 차단 · 전체 Push 필요"))
+                self.ui_queue.put((
+                    "progress",
+                    "실패 재시도 · Unreal-only 차단 · Blender→Push 필요",
+                ))
                 self.ui_queue.put(("done", None))
             return False
 
         active_source = getattr(self, "_active_production_source_manifest", None)
         metadata = {
+            "retry": retry_metadata or {
+                "schema_version": 1,
+                "kind": "failed_blender_export_and_unreal_retry",
+                "partition": "unreal_ingest",
+                "execution_path": "immutable_unreal_only",
+                "selected_queue_ids": sorted(selected_ids),
+            },
             "recovery": {
                 "schema_version": 1,
-                "kind": "failed_unreal_current_code_retry",
+                "kind": "failed_results_retry_unreal_only",
                 "parents": parent_lineage,
                 "selected_queue_ids": sorted(selected_ids),
                 "production_source_revision": (
@@ -9509,15 +9645,24 @@ class App:
             emit_done=emit_done,
             batch_stamp=batch_stamp,
             manifest_metadata=metadata,
-            progress_label="실패 Unreal 재시도",
-            file_prefix="unreal_recovery",
+            progress_label="실패 재시도 · Unreal-only",
+            file_prefix="failed_retry_unreal",
         )
 
     def _run_headless_push_batch(self, targets, emit_done=True):
         batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         total = len(targets)
+        retry_metadata = copy.deepcopy(
+            getattr(self, "_active_retry_metadata", {}) or {}
+        )
+        export_retry = retry_metadata.get("partition") == "blender_export"
+        progress_label = (
+            "실패 재시도 · Blender/Send2UE→Unreal"
+            if export_retry
+            else "Unreal Push"
+        )
         self._headless_progress_snapshot = None
-        self.ui_queue.put(("progress", f"Unreal Push export 준비 0/{total}"))
+        self.ui_queue.put(("progress", f"{progress_label} export 준비 0/{total}"))
         dependency_map = dict(
             getattr(self, "_active_push_dependency_map", {}) or {}
         )
@@ -9579,7 +9724,7 @@ class App:
                 self.ui_queue.put(
                     (
                         "progress",
-                        f"Unreal Push export {completed}/{total} · "
+                        f"{progress_label} export {completed}/{total} · "
                         "headless 준비",
                     )
                 )
@@ -9683,10 +9828,10 @@ class App:
             failure_count = len(failed_items)
             if emit_done:
                 text = (
-                    "Unreal Push 완료 (cache)"
+                    f"{progress_label} 완료 (cache)"
                     if not failure_count
                     else (
-                        f"Unreal Push 종료 — 성공 {success_count}개 · "
+                        f"{progress_label} 종료 — 성공 {success_count}개 · "
                         f"실패/준비 제외 {failure_count}개"
                     )
                 )
@@ -9700,6 +9845,15 @@ class App:
             failed_items,
             emit_done=emit_done,
             batch_stamp=batch_stamp,
+            manifest_metadata=(
+                {"retry": retry_metadata} if retry_metadata else None
+            ),
+            progress_label=progress_label,
+            file_prefix=(
+                "failed_retry_blender_export"
+                if export_retry
+                else "headless_queue"
+            ),
         )
 
     def _run_headless_import_items(
@@ -9715,6 +9869,7 @@ class App:
         file_prefix="headless_queue",
     ):
         """Run already-materialized immutable items through Unreal only."""
+        self._headless_progress_label = progress_label
         manifest_path = LOG_DIR / f"{file_prefix}_{batch_stamp}.json"
         checkpoint_path = LOG_DIR / f"{file_prefix}_{batch_stamp}_checkpoint.json"
         report_path = LOG_DIR / f"{file_prefix}_{batch_stamp}_report.json"
