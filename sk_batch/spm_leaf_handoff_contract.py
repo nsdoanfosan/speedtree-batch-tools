@@ -859,7 +859,7 @@ def inspect_spm_mesh_file_references(spm_path):
 
 
 def save_leaf_contract_cache():
-    """Persist shared compact SPM metadata after a background status pass."""
+    """Persist shared compact SPM metadata after a scan or status pass."""
     return save_spm_analysis_cache()
 
 

@@ -18,10 +18,20 @@ PCG_ST9_Texture_Batch.bat
 ## 시작 시 표 갱신
 
 보드는 마지막으로 성공한 live 감사 결과를
-`reports\_cache\board_snapshot_v1.json`에 표시 전용으로 저장한다. 다음 실행에서는
+`%LOCALAPPDATA%\SpeedTreeBatchTools\cache\board_snapshot_v1.json`에 표시 전용으로 저장한다. 다음 실행에서는
 이전 표를 먼저 보여 주고 `live 검증 중` 상태에서 모든 변경 버튼을 잠근다. 이
 스냅샷은 완료 영수증이나 실행 허가로 사용하지 않는다. 설정, Tree root 또는 PCG
 대상이 달라도 이전 표라는 사실을 표시할 뿐 작업 성공으로 판정하지 않는다.
+
+SPM/SBS/Blend 분석 캐시도 같은 사용자별 디렉터리에 저장하므로 checkout과
+worktree가 같은 파일을 재사용한다. 테스트나 격리 실행은
+`SPEEDTREE_BATCH_TOOLS_CACHE_DIR` 환경 변수에 절대 디렉터리 경로를 지정해 이
+위치를 바꿀 수 있다. Windows 외 환경에서는 `$XDG_CACHE_HOME/SpeedTreeBatchTools/cache`
+(미설정 시 `~/.cache/SpeedTreeBatchTools/cache`)를 사용한다.
+
+`board_snapshot_v1.json`은 UTF-8 직렬화 기준 최대 16 MiB이며 최신 파일 1개만
+유지한다. 새 스냅샷이 한도를 넘으면 디스크에 쓰지 않고 기존의 마지막 정상
+스냅샷을 유지하며, 한도를 넘는 기존 파일은 읽기 단계에서 표시 캐시로 거부한다.
 
 새 live 기본 감사가 끝나면 ①–③ 상태 열을 먼저 교체한다. 비용이 큰
 `Blend ↔ SPM` 관계 열 계산과 분석 캐시 저장은 그 뒤 백그라운드에서 완료하며,

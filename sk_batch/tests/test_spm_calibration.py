@@ -3,6 +3,8 @@ import re
 import sys
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +15,7 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 
 import spm_audit
 from spm_audit import bone_lengths_from_xml, estimate_relative_value_from_probe
+from spm_generator_sync.process_stream import ProcessCancelled, ProcessResult
 
 
 def graph_generator(
@@ -450,12 +453,11 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "XML")
         self.assertEqual(caught.exception.timeout_seconds, 120.0)
 
-    def test_speedtree_export_never_waits_on_an_inherited_pipe(self):
-        """A Modeler descendant can hold a pipe open after the exe exits.
+    def test_speedtree_export_tempfile_fallback_never_creates_a_pipe(self):
+        """The rollout fallback preserves the former no-PIPE contract.
 
-        Waiting on EOF there turns a finished export into a full-timeout
-        failure, so the run helper must hand the child regular files and wait
-        on the process handle only.
+        It remains selectable until a complete production calibration batch
+        has exercised the owned-streaming default end to end.
         """
         captured = {}
         events = []
@@ -490,7 +492,10 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             spm_audit.subprocess, "Popen", side_effect=fake_popen
         ):
             returncode, stdout, stderr = spm_audit.run_speedtree_export(
-                ["SpeedTree.exe", "model.spm"], ".", 120
+                ["SpeedTree.exe", "model.spm"],
+                ".",
+                120,
+                stream_output=False,
             )
 
         self.assertEqual((returncode, stdout, stderr), (0, "exported\n", ""))
@@ -537,7 +542,10 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             with mock.patch.object(spm_audit.subprocess, "run", side_effect=fake_run):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     spm_audit.run_speedtree_export(
-                        ["SpeedTree.exe", "model.spm"], ".", 5
+                        ["SpeedTree.exe", "model.spm"],
+                        ".",
+                        5,
+                        stream_output=False,
                     )
 
         if os.name == "nt":
@@ -584,6 +592,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                 0.02,
                 absolute_timeout=0.25,
                 poll_interval=0.01,
+                stream_output=False,
             )
 
         self.assertEqual(result.returncode, 0)
@@ -628,6 +637,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                     0.025,
                     absolute_timeout=0.2,
                     poll_interval=0.01,
+                    stream_output=False,
                 )
 
         self.assertEqual(caught.exception.evidence["timeout_reason"], "stalled")
@@ -674,6 +684,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                     0.03,
                     absolute_timeout=0.075,
                     poll_interval=0.01,
+                    stream_output=False,
                 )
 
         self.assertEqual(caught.exception.evidence["timeout_reason"], "hard_cap")
@@ -724,6 +735,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                     tmp,
                     1,
                     absolute_timeout=2,
+                    stream_output=False,
                 )
 
             self.assertEqual(result.returncode, 0)
@@ -763,6 +775,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                 ["SpeedTree.exe", "model.spm"],
                 ".",
                 1,
+                stream_output=False,
             )
 
         self.assertEqual(result.returncode, 7)
@@ -798,11 +811,143 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                 ],
                 tmp,
                 1,
+                stream_output=False,
             )
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.evidence["result"], "output_missing")
         self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object ownership")
+    def test_streaming_export_completes_when_descendant_holds_pipe_open(self):
+        """Scale the observed 16s completion / 120s false-timeout regression."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "verify.xml"
+            lines = []
+            parent_code = (
+                "import pathlib,subprocess,sys,time; "
+                "out=pathlib.Path(sys.argv[sys.argv.index('-export')+1]); "
+                "subprocess.Popen([sys.executable,'-c',"
+                "'import time; time.sleep(30)']); "
+                "print('modeler-finished',flush=True); "
+                "time.sleep(0.16); out.write_text('done',encoding='utf-8')"
+            )
+            started = time.monotonic()
+            result = spm_audit.run_speedtree_export(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    parent_code,
+                    "model.spm",
+                    "-export",
+                    str(output),
+                ],
+                tmp,
+                0.4,
+                absolute_timeout=4,
+                poll_interval=0.01,
+                output_callback=lambda channel, line: lines.append(
+                    (channel, line)
+                ),
+            )
+            exported_payload = output.read_text(encoding="utf-8")
+
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(elapsed, 0.4)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(exported_payload, "done")
+        self.assertIn(("stdout", "modeler-finished"), lines)
+        self.assertEqual(
+            result.evidence["process_io_contract"],
+            "owned_streaming_pipes",
+        )
+        self.assertEqual(
+            result.evidence["attempts"][0]["cleanup_state"],
+            "process_tree_forced_after_root_exit",
+        )
+
+    def test_streaming_export_honors_cooperative_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "verify.xml"
+            cancel = threading.Event()
+
+            def observe(_channel, line):
+                if line == "modeler-ready":
+                    cancel.set()
+
+            with self.assertRaises(ProcessCancelled) as caught:
+                spm_audit.run_speedtree_export(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        (
+                            "import time; print('modeler-ready',flush=True); "
+                            "time.sleep(30)"
+                        ),
+                        "model.spm",
+                        "-export",
+                        str(output),
+                    ],
+                    tmp,
+                    5,
+                    absolute_timeout=10,
+                    poll_interval=0.01,
+                    output_callback=observe,
+                    cancel_requested=cancel.is_set,
+                )
+            self.assertFalse(output.exists())
+
+        self.assertTrue(caught.exception.result.status.startswith("cancelled_"))
+
+    def test_streaming_export_preserves_access_violation_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "verify.xml"
+            commands = []
+            returncodes = iter((0xC0000005, 0))
+
+            def fake_stream(command, **kwargs):
+                self.assertNotIn("capture_output", kwargs)
+                commands.append(list(command))
+                staged = Path(command[command.index("-export") + 1])
+                staged.write_text(
+                    f"attempt-{len(commands)}",
+                    encoding="utf-8",
+                )
+                return ProcessResult(
+                    status="completed",
+                    returncode=next(returncodes),
+                    pid=5000 + len(commands),
+                    stdout=f"stdout-{len(commands)}",
+                    stderr="",
+                    elapsed=0.01,
+                )
+
+            with mock.patch.object(
+                spm_audit,
+                "run_streaming_process",
+                side_effect=fake_stream,
+            ):
+                result = spm_audit.run_speedtree_export(
+                    [
+                        "SpeedTree.exe",
+                        "model.spm",
+                        "-export",
+                        str(output),
+                    ],
+                    tmp,
+                    1,
+                    absolute_timeout=2,
+                )
+
+            self.assertEqual(output.read_text(encoding="utf-8"), "attempt-2")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(result.evidence["retry_count"], 1)
+        self.assertTrue(result.evidence["attempts"][0]["access_violation"])
 
     def test_mtime_only_change_is_not_export_progress(self):
         self.assertFalse(

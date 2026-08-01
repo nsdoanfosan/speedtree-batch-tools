@@ -31,6 +31,7 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
+from artifact_content_key import sampled_file_content_snapshot
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     generator_guid_key,
@@ -120,6 +121,26 @@ def _sha256_cached(path_text, size, mtime_ns):
 
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
+    if not hash_content:
+        try:
+            sampled = sampled_file_content_snapshot(candidate)
+        except OSError:
+            return {
+                "path": str(candidate),
+                "exists": False,
+                "size": None,
+                "mtime_ns": None,
+                "sha256": None,
+            }
+        return {
+            "path": str(candidate),
+            "exists": True,
+            "size": sampled["size"],
+            "mtime_ns": sampled["mtime_ns"],
+            "sha256": None,
+            "fingerprint": sampled["fingerprint"],
+            "fingerprint_algorithm": sampled["fingerprint_algorithm"],
+        }
     try:
         stat = candidate.stat()
     except OSError:
@@ -136,10 +157,7 @@ def file_fingerprint(path, hash_content=True):
         "exists": True,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": (
-            _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns)
-            if hash_content else None
-        ),
+        "sha256": _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns),
     }
 
 

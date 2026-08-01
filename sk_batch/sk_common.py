@@ -106,6 +106,10 @@ DEFAULT_CONFIG = {
     "priority": "belownormal",   # idle | belownormal | normal
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
     "spm_verify_timeout": 120,
+    # Default to the shared owned-streaming Modeler contract. Set false only
+    # as an operational fallback to the former regular-temp-file path while a
+    # full production calibration batch is being observed end to end.
+    "spm_stream_modeler_output": True,
     # Whole-worker lifetime includes waiting for the machine-wide serialized
     # SpeedTree exporter.  The per-export timeout above starts only after the
     # worker owns that gate.
