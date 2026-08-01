@@ -702,7 +702,152 @@ def normalize_isolated_canonical_bark_name(
     }
 
 
-def _xml_material_evidence(path, canonical_name, expected_basenames):
+def _receipt_export_materials(normalization_report):
+    canonical = str(normalization_report.get("canonical_material") or "").strip()
+    outputs = normalization_report.get("outputs")
+    if not canonical or not isinstance(outputs, list) or not outputs:
+        raise BarkNormalizationError(
+            "normalization report has no canonical material/texture evidence")
+
+    declared = []
+    material_ids = set()
+    for output in outputs:
+        if not isinstance(output, dict):
+            raise BarkNormalizationError(
+                "normalization report has an invalid material output")
+        material_id = str(output.get("material_id") or "").strip()
+        output_material = str(
+            output.get("output_material") or canonical
+        ).strip()
+        source_material = str(output.get("source_material") or "").strip()
+        if not material_id or material_id.casefold() in material_ids:
+            raise BarkNormalizationError(
+                "normalization report material IDs are missing or duplicated")
+        if not output_material:
+            raise BarkNormalizationError(
+                "normalization report has an unnamed material output")
+        material_ids.add(material_id.casefold())
+
+        preserved_alias = (
+            normalize_export_name(output_material)
+            != normalize_export_name(canonical)
+        )
+        if preserved_alias and (
+            output.get("source_material_name_preserved") is not True
+            or not source_material
+            or source_material.casefold() != output_material.casefold()
+        ):
+            raise BarkNormalizationError(
+                "normalization report has an undeclared preserved material alias: "
+                f"{output_material}")
+
+        textures = output.get("canonical_textures")
+        if not isinstance(textures, list) or not textures:
+            raise BarkNormalizationError(
+                "normalization report has no canonical texture rows for "
+                f"{output_material}")
+        maps = {}
+        for texture in textures:
+            if not isinstance(texture, dict):
+                raise BarkNormalizationError(
+                    "normalization report has an invalid canonical texture row")
+            map_name = str(texture.get("map") or "").strip()
+            expected_path = str(texture.get("isolated") or "").strip()
+            expected_hash = str(texture.get("sha256") or "").strip().casefold()
+            map_key = map_name.casefold()
+            if (
+                not map_name
+                or not expected_path
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+                or map_key in maps
+            ):
+                raise BarkNormalizationError(
+                    "normalization report canonical texture roles, paths, or "
+                    f"hashes are invalid for {output_material}")
+            maps[map_key] = {
+                "map": map_name,
+                "path": Path(expected_path),
+                "path_key": _path_key(expected_path),
+                "sha256": expected_hash,
+            }
+        declared.append({
+            "material_id": material_id,
+            "output_material": output_material,
+            "preserved_alias": preserved_alias,
+            "textures": maps,
+        })
+    return canonical, declared
+
+
+def _metadata_source_path(metadata_path, source):
+    source = str(source or "").strip().replace("/", os.sep).replace(
+        "\\", os.sep
+    )
+    path = Path(source)
+    if not path.is_absolute():
+        path = Path(metadata_path).parent / path
+    return Path(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _validated_metadata_sources(path, material, textures, exported_name):
+    sources = []
+    source_maps = set()
+    for element in material.iter():
+        authored_source = str(element.attrib.get("Source") or "").strip()
+        if not authored_source:
+            continue
+        map_name = str(element.attrib.get("Name") or "").strip()
+        map_key = map_name.casefold()
+        if not map_name or map_key in source_maps:
+            raise BarkNormalizationError(
+                f"source-bearing texture roles are missing or duplicated "
+                f"for {exported_name} in {path.name}")
+        source_maps.add(map_key)
+        expected = textures.get(map_key)
+        if expected is None:
+            raise BarkNormalizationError(
+                f"source-bearing role {map_name} for {exported_name} in "
+                f"{path.name} is outside the normalization receipt")
+        candidates = expected if isinstance(expected, list) else [expected]
+        source_path = _metadata_source_path(path, authored_source)
+        matching = next(
+            (
+                candidate for candidate in candidates
+                if _path_key(source_path) == candidate["path_key"]
+            ),
+            None,
+        )
+        if matching is None:
+            raise BarkNormalizationError(
+                f"source-bearing role {map_name} for {exported_name} in "
+                f"{path.name} does not match its receipt path: "
+                f"{source_path}")
+        if not source_path.is_file():
+            raise BarkNormalizationError(
+                f"receipt-authorized export texture is missing: "
+                f"{source_path}")
+        actual_hash = _sha256_file(source_path)
+        if actual_hash.casefold() != matching["sha256"]:
+            raise BarkNormalizationError(
+                f"receipt-authorized export texture hash changed: "
+                f"{source_path}")
+        sources.append({
+            "map": map_name,
+            "source": authored_source,
+            "resolved_path": str(source_path),
+            "sha256": actual_hash,
+        })
+    if not sources:
+        raise BarkNormalizationError(
+            f"receipt material has no source-bearing textures in "
+            f"{path.name}: {exported_name}")
+    return sorted(
+        sources,
+        key=lambda row: (row["map"].casefold(), row["resolved_path"]),
+    )
+
+
+def _xml_material_evidence(path, canonical, declared_outputs):
     path = Path(path)
     if not path.is_file():
         raise BarkNormalizationError(f"export metadata is missing: {path}")
@@ -712,58 +857,119 @@ def _xml_material_evidence(path, canonical_name, expected_basenames):
         raise BarkNormalizationError(f"invalid export metadata XML: {path}") from exc
     materials = [
         element for element in root.iter()
-        if element.tag.rsplit("}", 1)[-1].casefold() in {"material", "material_v8"}
-        and _export_material_base(element.attrib.get("Name")).casefold()
-        == str(canonical_name).casefold()
+        if element.tag.rsplit("}", 1)[-1].casefold()
+        in {"material", "material_v8"}
     ]
-    if not materials:
-        raise BarkNormalizationError(
-            f"expected canonical bark material in {path.name}, found 0")
-    canonical_identity = normalize_export_name(canonical_name)
-    species_identity = canonical_identity
-    if species_identity.startswith("bark_"):
-        species_identity = species_identity[5:]
-    if species_identity.endswith("_01"):
-        species_identity = species_identity[:-3]
-    species_token = re.sub(r"[^a-z0-9]+", "", species_identity.casefold())
     rows = []
-    exact_set_found = False
-    for material in materials:
-        sources = {
-            Path(element.attrib.get("Source") or "").name.casefold()
-            for element in material.iter()
-            if element.attrib.get("Source")
-        }
-        exact = set(expected_basenames).issubset(sources)
-        exact_set_found = exact_set_found or exact
-        same_species = bool(
-            sources
-            and species_token
-            and all(
-                species_token in re.sub(
-                    r"[^a-z0-9]+", "", value.casefold()
-                )
-                for value in sources
-            )
-        )
-        if not exact and not same_species:
+    matched = set()
+    authorized_paths = {
+        texture["path_key"]
+        for output in declared_outputs
+        for texture in output["textures"].values()
+    }
+    authorized_basenames = {
+        texture["path"].name.casefold()
+        for output in declared_outputs
+        for texture in output["textures"].values()
+    }
+    declared_names = {
+        output["output_material"].casefold() for output in declared_outputs
+    }
+    canonical_textures = {}
+    for output in declared_outputs:
+        for map_key, texture in output["textures"].items():
+            canonical_textures.setdefault(map_key, []).append(texture)
+    for output in declared_outputs:
+        material_matches = [
+            material
+            for material in materials
+            if str(material.attrib.get("ID") or "").strip().casefold()
+            == output["material_id"].casefold()
+        ]
+        if len(material_matches) != 1:
             raise BarkNormalizationError(
-                f"canonical bark alias in {path.name} uses another "
-                f"texture family: {sorted(sources)}"
-            )
+                f"expected receipt material ID {output['material_id']} in "
+                f"{path.name}, found {len(material_matches)}")
+        material = material_matches[0]
+        matched.add(id(material))
+        exported_name = _export_material_base(material.attrib.get("Name"))
+        if exported_name.casefold() != output["output_material"].casefold():
+            raise BarkNormalizationError(
+                f"undeclared canonical bark alias in {path.name}: "
+                f"{material.attrib.get('Name')}")
+
+        sources = _validated_metadata_sources(
+            path,
+            material,
+            output["textures"],
+            exported_name,
+        )
         rows.append({
             "material": material.attrib.get("Name"),
-            "texture_basenames": sorted(sources),
-            "exact_normalized_set": exact,
-            "same_species_alias": same_species,
+            "material_id": output["material_id"],
+            "preserved_alias": output["preserved_alias"],
+            "receipt_scope": "normalization_output",
+            "source_maps": sources,
+            "texture_basenames": sorted({
+                Path(row["resolved_path"]).name.casefold() for row in sources
+            }),
         })
-    if not exact_set_found:
-        raise BarkNormalizationError(
-            f"canonical bark textures did not propagate to {path.name}: "
-            f"{sorted(expected_basenames)}")
+
+    canonical_count = 0
+    declared_ids = {
+        output["material_id"].casefold() for output in declared_outputs
+    }
+    for material in materials:
+        if id(material) in matched:
+            continue
+        exported_name = _export_material_base(material.attrib.get("Name"))
+        if exported_name.casefold() == str(canonical).casefold():
+            canonical_count += 1
+            canonical_id = str(material.attrib.get("ID") or "").strip()
+            if (
+                canonical_count > 1
+                or not canonical_id
+                or canonical_id.casefold() in declared_ids
+            ):
+                raise BarkNormalizationError(
+                    f"canonical bark material is ambiguous in {path.name}")
+            sources = _validated_metadata_sources(
+                path,
+                material,
+                canonical_textures,
+                exported_name,
+            )
+            rows.append({
+                "material": material.attrib.get("Name"),
+                "material_id": canonical_id,
+                "preserved_alias": False,
+                "receipt_scope": "canonical_material",
+                "source_maps": sources,
+                "texture_basenames": sorted({
+                    Path(row["resolved_path"]).name.casefold()
+                    for row in sources
+                }),
+            })
+            continue
+        source_paths = [
+            _metadata_source_path(path, element.attrib.get("Source"))
+            for element in material.iter()
+            if element.attrib.get("Source")
+        ]
+        if (
+            exported_name.casefold() in declared_names
+            or any(_path_key(source) in authorized_paths for source in source_paths)
+            or any(
+                source.name.casefold() in authorized_basenames
+                for source in source_paths
+            )
+        ):
+            raise BarkNormalizationError(
+                f"undeclared canonical bark alias in {path.name}: "
+                f"{material.attrib.get('Name')}")
+
     return {
         "path": str(path),
-        "material": materials[0].attrib.get("Name"),
         "materials": rows,
         "material_count": len(rows),
         "texture_basenames": sorted({
@@ -777,30 +983,19 @@ def validate_canonical_bark_export_bundle(
     """Fail closed unless FBX, STMAT and XML all carry the canonical bark.
 
     The FBX must contain a canonical material-to-mesh connection and UV data.
-    STMAT/XML must reference the exact isolated canonical texture basenames.
+    Each source-bearing STMAT/XML map must match the current normalization
+    receipt's material ID, preserved alias, role, exact path, and content hash.
+    Receipt roles that SpeedTree does not emit are not invented as evidence.
     """
     if normalization_report.get("status") != "normalized":
         raise BarkNormalizationError(
             "an applied bark normalization report is required")
-    canonical = normalization_report.get("canonical_material")
+    canonical, declared_outputs = _receipt_export_materials(
+        normalization_report
+    )
     output_materials = {
-        str(output.get("output_material") or canonical)
-        for output in normalization_report.get("outputs") or []
-        if str(output.get("output_material") or canonical)
+        output["output_material"] for output in declared_outputs
     }
-    texture_rows = [
-        texture
-        for output in normalization_report.get("outputs") or []
-        for texture in output.get("canonical_textures") or []
-    ]
-    expected_basenames = {
-        Path(row["isolated"]).name.casefold()
-        for row in texture_rows
-        if row.get("export_enabled", True)
-    }
-    if not canonical or not output_materials or not expected_basenames:
-        raise BarkNormalizationError(
-            "normalization report has no canonical material/texture evidence")
 
     fbx = Path(fbx)
     fbx_report = inspect_fbx_material_mesh_pairs(fbx)
@@ -821,18 +1016,42 @@ def validate_canonical_bark_export_bundle(
     if not has_uv:
         raise BarkNormalizationError("FBX has no UV layer evidence")
 
-    stmat_reports = [
-        _xml_material_evidence(
-            stmat, material, expected_basenames
+    stmat_report = _xml_material_evidence(
+        stmat,
+        canonical,
+        declared_outputs,
+    )
+    xml_report = _xml_material_evidence(
+        xml,
+        canonical,
+        declared_outputs,
+    )
+    stmat_signature = {
+        (
+            str(material["material_id"]).casefold(),
+            _export_material_base(material["material"]).casefold(),
+            source["map"].casefold(),
+            _path_key(source["resolved_path"]),
+            source["sha256"].casefold(),
         )
-        for material in sorted(output_materials, key=str.casefold)
-    ]
-    xml_reports = [
-        _xml_material_evidence(
-            xml, material, expected_basenames
+        for material in stmat_report["materials"]
+        for source in material["source_maps"]
+    }
+    xml_signature = {
+        (
+            str(material["material_id"]).casefold(),
+            _export_material_base(material["material"]).casefold(),
+            source["map"].casefold(),
+            _path_key(source["resolved_path"]),
+            source["sha256"].casefold(),
         )
-        for material in sorted(output_materials, key=str.casefold)
-    ]
+        for material in xml_report["materials"]
+        for source in material["source_maps"]
+    }
+    if stmat_signature != xml_signature:
+        raise BarkNormalizationError(
+            "STMat/XML receipt-authorized source-bearing texture evidence "
+            "does not match")
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ready_for_downstream_blender_mapping",
@@ -844,16 +1063,8 @@ def validate_canonical_bark_export_bundle(
             "material_mesh_pairs": pairs,
             "uv_layer_evidence": True,
         },
-        "stmat": (
-            stmat_reports[0]
-            if len(stmat_reports) == 1
-            else {"materials": stmat_reports}
-        ),
-        "xml": (
-            xml_reports[0]
-            if len(xml_reports) == 1
-            else {"materials": xml_reports}
-        ),
+        "stmat": stmat_report,
+        "xml": xml_report,
         "material_slot_propagated": True,
         "texture_set_propagated": True,
         "uv_preserved": True,
