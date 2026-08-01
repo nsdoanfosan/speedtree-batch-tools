@@ -534,6 +534,215 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 _authoring_graph_core_projection(changed)["fingerprint"],
             )
 
+    def test_issue_13_roots_spline_float_fixture_is_field_and_bound_limited(self):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue_13_tree02_roots_spline_float_reserialization.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        fields = {row["tag"]: row for row in fixture["fields"]}
+
+        def document(
+            tangent_x,
+            tangent_y,
+            *,
+            property_name=fixture["property_name"],
+            tangent_x_tag="TangentX",
+        ):
+            points = []
+            for index in range(7):
+                point_x = tangent_x if index == 6 else "1"
+                point_y = tangent_y if index == 6 else "0"
+                points.append(
+                    "<ControlPoint><X>0</X><Y>1</Y>"
+                    f"<{tangent_x_tag}>{point_x}</{tangent_x_tag}>"
+                    f"<TangentY>{point_y}</TangentY><Length>0</Length>"
+                    "</ControlPoint>"
+                )
+            return (
+                "<SpeedTree><Generators><Generator Type=\"Branch\">"
+                "<Name>Roots</Name><GUID>roots-guid</GUID><Hidden>false</Hidden>"
+                "<Properties><SplineProperty>"
+                f"<Name>{property_name}</Name><Value>0</Value>"
+                "<CompoundParentSpline Count=\"1\"><Spline DrawMode=\"false\">"
+                + "".join(points)
+                + "</Spline></CompoundParentSpline><ProfileSpline DrawMode=\"false\" />"
+                "</SplineProperty></Properties></Generator></Generators></SpeedTree>"
+            )
+
+        before = document(
+            fields["TangentX"]["before"],
+            fields["TangentY"]["before"],
+        )
+        after = document(
+            fields["TangentX"]["after"],
+            fields["TangentY"]["after"],
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(after)["fingerprint"],
+        )
+        for row in fixture["fields"]:
+            self.assertEqual(
+                f"{round(float(row['before']), 5):.5f}",
+                row["canonical_value"],
+            )
+            self.assertEqual(
+                f"{round(float(row['after']), 5):.5f}",
+                row["canonical_value"],
+            )
+
+        outside_bound = document(
+            fields["TangentX"]["outside_bound"],
+            fields["TangentY"]["after"],
+        )
+        self.assertNotEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(outside_bound)["fingerprint"],
+        )
+
+        unsupported_property_before = document(
+            fields["TangentX"]["before"],
+            fields["TangentY"]["before"],
+            property_name="Spine:Orientation:Unproven value",
+        )
+        unsupported_property_after = document(
+            fields["TangentX"]["after"],
+            fields["TangentY"]["after"],
+            property_name="Spine:Orientation:Unproven value",
+        )
+        self.assertNotEqual(
+            _authoring_graph_core_projection(unsupported_property_before)[
+                "fingerprint"
+            ],
+            _authoring_graph_core_projection(unsupported_property_after)[
+                "fingerprint"
+            ],
+        )
+
+        unsupported_field_before = document(
+            fields["TangentX"]["before"],
+            fields["TangentY"]["before"],
+            tangent_x_tag="AuthoredTangentX",
+        )
+        unsupported_field_after = document(
+            fields["TangentX"]["after"],
+            fields["TangentY"]["after"],
+            tangent_x_tag="AuthoredTangentX",
+        )
+        self.assertNotEqual(
+            _authoring_graph_core_projection(unsupported_field_before)[
+                "fingerprint"
+            ],
+            _authoring_graph_core_projection(unsupported_field_after)[
+                "fingerprint"
+            ],
+        )
+
+    def test_issue_13_black_locast_evidence_is_sanitized_and_fail_closed(self):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue_13_black_locast_modeler_recovery_evidence.json"
+        )
+        fixture_text = fixture_path.read_text(encoding="utf-8")
+        evidence = json.loads(fixture_text)
+
+        for forbidden in ("C:\\", "D:\\", "/Users/", "\\Users\\", "PARK"):
+            self.assertNotIn(forbidden, fixture_text)
+        self.assertFalse(evidence["sanitization"]["contains_raw_spm_or_xml"])
+        self.assertFalse(evidence["sanitization"]["contains_absolute_paths"])
+        self.assertFalse(evidence["safety_boundary"]["direct_spm_xml_edit"])
+        self.assertFalse(evidence["safety_boundary"]["save_automation"])
+        self.assertFalse(evidence["safety_boundary"]["automated_keystrokes"])
+        self.assertFalse(evidence["safety_boundary"]["automatic_rollback"])
+        self.assertFalse(evidence["safety_boundary"]["continuation_authorized"])
+
+        results = evidence["results"]
+        tree02 = results["SK_tree_black_locast_02.spm"]
+        self.assertEqual(
+            tree02["disposition"],
+            "read_only_reaudit_no_modeler_action_this_run",
+        )
+        self.assertFalse(tree02["whole_file_sealed_claim"])
+
+        bush02 = results["SK_bush_black_locast_02.spm"]
+        self.assertEqual(bush02["disposition"], "accepted_sealed_resave")
+        self.assertTrue(bush02["membership_unchanged"])
+        self.assertTrue(bush02["authoring_graph_core_v4_unchanged"])
+        self.assertFalse(bush02["after"]["stale"])
+        self.assertEqual(bush02["after"]["orphan_owner_count"], 0)
+        self.assertEqual(bush02["after"]["orphan_node_count"], 0)
+        self.assertTrue(bush02["after"]["required_live_projection_complete"])
+
+        bush03 = results["SK_bush_black_locast_03.spm"]
+        self.assertEqual(bush03["disposition"], "rejected_unaccepted_postimage")
+        self.assertEqual(
+            bush03["stop_reason"],
+            "authoring_graph_changed_during_resave",
+        )
+        self.assertTrue(bush03["stale_node_table_repair_passed"])
+        self.assertFalse(bush03["sealed_authoring_contract_passed"])
+        self.assertFalse(bush03["canonicalization_accepted"])
+        self.assertFalse(bush03["continuation_authorized"])
+        self.assertFalse(bush03["after"]["stale"])
+        self.assertEqual(bush03["after"]["orphan_owner_count"], 0)
+        self.assertEqual(bush03["after"]["orphan_node_count"], 0)
+        self.assertTrue(bush03["after"]["required_live_projection_complete"])
+        changes = bush03["uncovered_core_changes"]
+        self.assertEqual(
+            {row["property_name"] for row in changes},
+            {f"Leaves:Type:{index}:Material" for index in range(4)},
+        )
+        self.assertEqual(len(changes), 4)
+        for row in changes:
+            self.assertEqual(row["xml_node_type"], "Property/Value scalar integer")
+            self.assertEqual(row["before"], -1)
+            self.assertEqual(row["after"], 0)
+            self.assertEqual(row["paired_mesh_before"], -10)
+            self.assertEqual(row["paired_mesh_after"], -10)
+
+        for asset in (bush02, bush03):
+            for artifact in ("preimage", "receipt"):
+                file_name = asset[artifact]["file_name"]
+                self.assertNotIn("/", file_name)
+                self.assertNotIn("\\", file_name)
+        rejected_copy = bush03["rejected_postimage_evidence"]
+        self.assertEqual(
+            rejected_copy["raw_sha256"], bush03["after"]["raw_sha256"]
+        )
+        self.assertEqual(rejected_copy["size"], bush03["after"]["size"])
+        self.assertTrue(rejected_copy["byte_identical_to_canonical_source_at_capture"])
+
+        tree04 = results["SK_tree_black_locast_04.spm"]
+        self.assertEqual(
+            tree04["disposition"],
+            "not_attempted_after_bush03_stop",
+        )
+        audit = {
+            row["asset_name"]: row for row in evidence["takeover_audit"]
+        }
+        self.assertEqual(
+            tree04["raw_sha256"],
+            audit["SK_tree_black_locast_04.spm"]["raw_sha256"],
+        )
+        self.assertTrue(tree04["stale"])
+
+        investigation = evidence["detached_contract_investigation"]
+        self.assertEqual(investigation["issue"], 102)
+        self.assertEqual(
+            investigation["branch"],
+            "codex/issue-102-leaf-material-canonicalization",
+        )
+        self.assertFalse(investigation["asset_branch_contract_change"])
+        self.assertFalse(evidence["stop_disposition"]["next_asset_opened"])
+        self.assertTrue(
+            evidence["stop_disposition"][
+                "canonical_postimage_preserved_but_not_accepted"
+            ]
+        )
+
     def test_authoring_core_preserves_root_and_material_authored_values(self):
         before = authored_scope_text(
             stale=True,
