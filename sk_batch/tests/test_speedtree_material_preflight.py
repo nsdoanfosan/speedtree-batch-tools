@@ -733,11 +733,22 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 "managed_leaf_output": True,
             }]
 
-            def prove_origin(_spm, material, output, _asset_root):
+            def prove_origin(
+                _spm,
+                material,
+                output,
+                _asset_root,
+                *,
+                consumption_context,
+            ):
                 self.assertEqual(material["material_id"], "17")
                 self.assertEqual(
                     output["origin_receipt"]["proof"],
                     "selected-exact-target",
+                )
+                self.assertEqual(
+                    consumption_context,
+                    preflight.BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
                 )
                 return ({"slot_files": output["slot_files"]}, "")
 
@@ -753,6 +764,10 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 preflight,
                 "resolve_blender_cluster_bake_origin",
                 side_effect=prove_origin,
+            ), mock.patch.object(
+                preflight,
+                "validate_blender_cluster_bake_receipt_for_consumption",
+                return_value="",
             ):
                 result = preflight.augment_texture_readiness_contract(
                     preflight.resolve_texture_bindings(stmat),
