@@ -674,9 +674,9 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
     def test_complete_target_spm_material_is_a_content_driven_role_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            spm = root / "SK_tree_willow_01.spm"
-            assembly_spm = root / "tree_willow_01.spm"
-            fbx = root / "tree_willow_01.fbx"
+            spm = root / "SK_tree_provider_current_01.spm"
+            assembly_spm = root / "tree_provider_current_01.spm"
+            fbx = root / "tree_provider_current_01.fbx"
             receipt = root / "receipt.json"
             spm.write_bytes(b"sk")
             assembly_spm.write_bytes(b"authoritative")
@@ -685,12 +685,12 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 receipt,
                 spm,
                 fbx,
-                [("leaf", "M_leaf_wilow_01", "pending_export")],
+                [("leaf", "M_leaf_provider_legacy_01", "pending_export")],
                 assembly_spm=assembly_spm,
                 normalized_by_role={
                     "leaf": {
                         "status": "ready",
-                        "material": "M_leaf_wilow_01",
+                        "material": "M_leaf_provider_legacy_01",
                         "variants": [{
                             "ordinal": 1,
                             "source_partition_mode": "PER_DEFORM_ROOT",
@@ -698,7 +698,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                     },
                 },
                 target_material_by_role={
-                    "leaf": "leaf_willow_01",
+                    "leaf": "leaf_provider_current_01",
                 },
             )
             payload = json.loads(receipt.read_text(encoding="utf-8"))
@@ -708,7 +708,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 [
                     role_object(
                         fbx,
-                        material="leaf_willow_01_Mat",
+                        material="leaf_provider_current_01_Mat",
                     )
                 ],
                 fbx,
@@ -719,23 +719,26 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             self.assertEqual(
                 identities["leaf"],
-                ["leaf_willow_01", "M_leaf_wilow_01"],
+                ["leaf_provider_current_01", "M_leaf_provider_legacy_01"],
             )
             self.assertEqual(handoff["status"], "ready")
             leaf = next(
                 row for row in handoff["roles"] if row["role"] == "leaf"
             )
-            self.assertEqual(leaf["role_identity"], "leaf_willow_01")
+            self.assertEqual(
+                leaf["role_identity"],
+                "leaf_provider_current_01",
+            )
             self.assertEqual(leaf["status"], "complete_pair")
             self.assertEqual(
                 leaf["role_identity_aliases"],
-                ["M_leaf_wilow_01"],
+                ["M_leaf_provider_legacy_01"],
             )
             self.assertEqual(
                 handoff["assembly"]["part_builder_inputs"][0][
                     "role_identity_aliases"
                 ],
-                ["M_leaf_wilow_01"],
+                ["M_leaf_provider_legacy_01"],
             )
 
     def test_actionable_role_without_normalized_variants_is_blocked(self):

@@ -399,12 +399,12 @@ class FbxRoleContractTests(unittest.TestCase):
             fbx = Path(temp_dir) / "tree.fbx"
             write_ascii_fbx(
                 fbx,
-                material_names=["leaf_weeping_willow_01_Mat"],
-                mesh_names=["leaf_weeping_willow_01"],
+                material_names=["leaf_provider_current_01_Mat"],
+                mesh_names=["leaf_provider_current_01"],
                 pairs=[
                     (
-                        "leaf_weeping_willow_01_Mat",
-                        "leaf_weeping_willow_01",
+                        "leaf_provider_current_01_Mat",
+                        "leaf_provider_current_01",
                     )
                 ],
             )
@@ -412,15 +412,15 @@ class FbxRoleContractTests(unittest.TestCase):
 
             leaf = classify_fbx_role(
                 report,
-                "M_leaf_weeping_wilow_01",
-                ["leaf_weeping_willow_01"],
+                "M_leaf_provider_legacy_01",
+                ["leaf_provider_current_01"],
             )
 
             self.assertEqual(leaf["status"], "complete_pair")
             self.assertEqual(leaf["decision"], "normalize_part")
             self.assertEqual(
                 leaf["role_identity_aliases"],
-                ["leaf_weeping_willow_01"],
+                ["leaf_provider_current_01"],
             )
 
     @unittest.skipUnless(REAL_ELM_SOURCE_FBX.is_file(), "Tree Elm source FBX unavailable")
