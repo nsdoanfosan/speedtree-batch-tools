@@ -434,7 +434,7 @@ class LiteralHistoricalReceiptTests(unittest.TestCase):
             )
         self.assertEqual(
             recovery._receipt_dialect_versions(receipt),
-            (5, 1, 3, 1, 2, 1),
+            (6, 1, 4, 1, 2, 1),
         )
 
 

@@ -329,7 +329,7 @@ python -m pcg_st9_texture_batch.stale_node_table_recovery ^
 `--expected-mesh-id` is the backward-compatible strict mode: every listed ID
 is sealed as both an authoring-binding target and a required live/export target.
 When issue acceptance requires authoring continuity without universal export,
-use the explicit schema-5 scope mode instead:
+use the explicit sealed-scope mode instead:
 
 ```bat
 python -m pcg_st9_texture_batch.stale_node_table_recovery ^
@@ -361,13 +361,15 @@ current projection constants:
 | 3 | 1 | 2 | 1 | 1 | — | supported |
 | 4 | 1 | 3 | 1 | 2 | — | supported |
 | 5 | 1 | 3 | 1 | 2 | 1 | supported |
+| 6 | 1 | 4 | 1 | 2 | 1 | supported (current) |
 
 Each supported tuple resolves through an immutable semantic registry entry
 that owns its frozen graph/core/membership/target projector callables and the
 authoritative fields that must match as one candidate. In particular, a
 target-v1 fingerprint cannot borrow a binding count or Mesh-ID list from a
 different historical candidate. The current writer also selects the explicit
-schema-5 tuple instead of assembling versions from mutable current constants.
+current dialect tuple (schema 6 here) instead of assembling versions from
+mutable current constants.
 Independent literal `backup.spm`, `receipt.json`, `after.spm`, and
 `expected.json` fixtures under `tests/fixtures/issue_41/` exercise both
 read-only `verify_sealed_resave()` and interrupted pre-save restart paths;
@@ -393,7 +395,8 @@ Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
 SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
 membership, required target-binding fingerprints, and immutable schema-5
-authoring/live scope requirements. It then waits for the
+authoring/live scope requirements. New receipts use schema 6 with the same
+sealed-scope contract. It then waits for the
 user to save the file and requires repeated identical stat/size/SHA snapshots
 with successful parsing. Regex, independent ElementTree, target delivery, and
 normalization evidence all come from those same immutable bytes. All authoring
@@ -408,6 +411,25 @@ the verified after SHA, after cancellation/app-close/stale-job guards and a
 final source-SHA recheck. A privacy-safe blocked-event receipt records only the
 asset name, after SHA, and stable reason tokens. Missing/corrupt preimage or
 receipt evidence fails before Modeler launch.
+
+Core projection v4 hashes the complete ordered XML tree and removes or
+canonicalizes only path-specific no-edit Save rewrites reproduced across three
+exact before/after SPM pairs. It excludes the root session/generated blocks
+`Thumbnail`, `ThumbnailSize`, `Preview`, `Statistics`, `TreeInfo`,
+`QuickSaveSettings2`, `m_sTimelineData`, `Window`, and `Nodes`; generated GUIDs
+only at the proven Light/Fan/RuleScript/Force/Link/Assets paths; false-only
+generated collection rows at Generator and Force property paths; exact default
+AtlasMaker, material-map, atlas-mesh UserData, empty LOD, and redundant parent
+spline shapes; and Material preview/stream caches. It canonicalizes Generator
+and Link endpoint GUID spellings, the observed spline/mesh/color float rewrites,
+derived material texture sizes, and the stable direct-Assets kind partition
+while preserving order within every partition. Namespace-qualified or unknown
+elements, authored properties, arbitrary UserData, non-default shapes,
+non-false collection rows, full Link subtrees, material filenames, mesh data,
+and all other root/settings content remain fingerprinted. Historical schemas 4
+and 5 continue to verify with the frozen core-v3 projector, while a successful
+reaudit derives current core-v4 evidence from the exact backup without rewriting
+the sealed receipt.
 
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),

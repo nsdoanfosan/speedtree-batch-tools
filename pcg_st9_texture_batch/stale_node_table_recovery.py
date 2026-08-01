@@ -28,6 +28,7 @@ from types import MappingProxyType
 
 from speedtree_pipeline_contract import (
     SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
+    canonical_generator_guid,
     canonical_path_key,
     generator_guid_key,
 )
@@ -51,14 +52,14 @@ RECOVERY_CONTRACT = "speedtree_stale_node_table_interactive_recovery_v2"
 PREIMAGE_RECEIPT_KIND = "speedtree_stale_node_table_preimage_receipt"
 BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
-AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 3
+AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 4
 TARGET_BINDING_PROJECTION_VERSION = 2
 TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
 TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
 TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
-_CURRENT_RECEIPT_DIALECT_KEY = (5, 1, 3, 1, 2, 1)
-_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5})
+_CURRENT_RECEIPT_DIALECT_KEY = (6, 1, 4, 1, 2, 1)
+_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6})
 _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
     # A real Lauraceae receipt uses this tuple, but the historical core-v1
     # implementation is unavailable.  Its sanitized evidence fixture records
@@ -727,7 +728,7 @@ def _authoring_graph_core_subtree(
 
 
 def _legacy_authoring_graph_core_v3_projection(text):
-    """Reproduce the sealed core-v3 projection without mutable dispatch.
+    """Reproduce the historical core-v3 projection without widening it.
 
     The projection retains stable global/settings subtrees, complete Generator,
     Force, RuleScript, Fan, and Light properties, Link endpoints, complete
@@ -794,11 +795,784 @@ def _legacy_authoring_graph_core_v3_projection(text):
     }
 
 
+_AUTHORING_GRAPH_V4_EXCLUDED_ROOT_TAGS = frozenset({
+    "Thumbnail",
+    "ThumbnailSize",
+    "Preview",
+    "Statistics",
+    "TreeInfo",
+    "QuickSaveSettings2",
+    "m_sTimelineData",
+    "Window",
+    "Nodes",
+})
+_AUTHORING_GRAPH_V4_GENERATED_GUID_PATHS = frozenset({
+    ("SpeedTree", "Light", "GUID"),
+    ("SpeedTree", "Fan", "GUID"),
+    ("SpeedTree", "RuleScript", "GUID"),
+    ("SpeedTree", "Force", "GUID"),
+    ("SpeedTree", "Forces", "Force", "GUID"),
+    ("SpeedTree", "Links", "Link", "GUID"),
+    ("SpeedTree", "Assets", "GUID"),
+})
+_AUTHORING_GRAPH_V4_CANONICAL_GUID_PATHS = frozenset({
+    ("SpeedTree", "Generators", "Generator", "GUID"),
+    ("SpeedTree", "Links", "Link", "SourceGUID"),
+    ("SpeedTree", "Links", "Link", "TargetGUID"),
+})
+_AUTHORING_GRAPH_V4_SPLINE_NUMBER_TAGS = frozenset({
+    "X",
+    "Y",
+    "TangentX",
+    "TangentY",
+    "Length",
+})
+_AUTHORING_GRAPH_V4_SPLINE_PROPERTY_PATHS = frozenset({
+    ("SpeedTree", "Fan", "Properties", "SplineProperty"),
+    (
+        "SpeedTree", "Generators", "Generator", "Properties",
+        "SplineProperty",
+    ),
+})
+_AUTHORING_GRAPH_V4_SPLINE_PROPERTY_NAMES = frozenset({
+    "Branch Motion:Level 1:Distance",
+    "Branch Motion:Level 2:Distance",
+    "Global Motion:Distance",
+    "Growth:Noise:Speed:Amount",
+    "Growth:Noise:Wobble:Amount",
+    "Growth:Transitions:Curl",
+    "Growth:Transitions:Fold",
+    "Growth:Transitions:Gravity",
+    "Growth:Transitions:Roll",
+    "Leaf Motion:Ripple 1:Distance",
+    "Leaf Motion:Ripple 1:Frequency",
+    "Leaf Motion:Ripple 2:Distance",
+    "Leaf Motion:Ripple 2:Frequency",
+    "Leaf Motion:Tumble 1:Flip",
+    "Leaf Motion:Tumble 1:Frequency",
+    "Leaf Motion:Tumble 1:Twist",
+    "Leaf Motion:Tumble 1:Twitch:Frequency",
+    "Leaf Motion:Tumble 1:Twitch:Throw",
+    "Leaf Motion:Tumble 2:Twitch:Frequency",
+    "Local Orientation:Align",
+    "Physics:Bones",
+    "Skin:Radius:Absolute",
+    "Spine:Noise:Late:Amount",
+    "Spine:Orientation:Start angle",
+    "Spine:Path:Amount",
+    "VFX Branch Motion:Shared:Bend",
+    "VFX Branch Motion:Shared:Turbulence",
+    "VFX Branch Motion:Shared:Twist",
+    "VFX Leaf Motion:Group 1:Turbulence:Frequency",
+})
+_AUTHORING_GRAPH_V4_RANDOM_SEED_PROPERTY_PATH = (
+    "SpeedTree",
+    "Generators",
+    "Generator",
+    "Properties",
+    "Property",
+)
+
+
+def _v4_tag_name(tag):
+    if tag is ET.Comment:
+        return "{xml-special}comment"
+    if tag is ET.ProcessingInstruction:
+        return "{xml-special}processing-instruction"
+    return str(tag)
+
+
+def _v4_parse(text):
+    parser = ET.XMLParser(target=ET.TreeBuilder(
+        insert_comments=True,
+        insert_pis=True,
+    ))
+    return ET.fromstring(text, parser=parser)
+
+
+def _v4_plain_tag(element, expected):
+    """Match a namespace-free SpeedTree tag without collapsing namespaces."""
+    tag = _v4_tag_name(element.tag)
+    return "}" not in tag and tag == str(expected)
+
+
+def _v4_path_key(path):
+    keys = []
+    for tag in path:
+        tag = _v4_tag_name(tag)
+        if "}" in tag:
+            return None
+        keys.append(tag)
+    return tuple(keys)
+
+
+def _v4_namespace_free_subtree(element):
+    return all(
+        "}" not in _v4_tag_name(descendant.tag)
+        and all("}" not in str(name) for name in descendant.attrib)
+        for descendant in element.iter()
+    )
+
+
+def _v4_has_significant_text_or_tail(element):
+    return bool(
+        str(element.text or "").strip()
+        or str(element.tail or "").strip()
+    )
+
+
+def _v4_has_significant_tail(element):
+    return bool(str(element.tail or "").strip())
+
+
+def _v4_generator_guid_spelling(value):
+    """Canonicalize only the proven truncated/padded spelling difference."""
+    text = str(value or "")
+    if text != text.strip():
+        return text
+    return canonical_generator_guid(text)
+
+
+def _v4_direct_child_text(element, name):
+    matches = [child for child in element if _v4_plain_tag(child, name)]
+    if len(matches) != 1:
+        return None
+    child = matches[0]
+    if child.attrib or list(child):
+        return None
+    return str(child.text or "")
+
+
+def _v4_physics_bones_spline_property(element, path_key):
+    return bool(
+        path_key in _AUTHORING_GRAPH_V4_SPLINE_PROPERTY_PATHS
+        and _v4_plain_tag(element, "SplineProperty")
+        and not element.attrib
+        and _v4_direct_child_text(element, "Name")
+        in _AUTHORING_GRAPH_V4_SPLINE_PROPERTY_NAMES
+        and sum(_v4_plain_tag(child, "Value") for child in element) <= 1
+    )
+
+
+def _v4_random_seed_style_property(element, path_key):
+    children = list(element)
+    return bool(
+        path_key == _AUTHORING_GRAPH_V4_RANDOM_SEED_PROPERTY_PATH
+        and _v4_plain_tag(element, "Property")
+        and not element.attrib
+        and len(children) == 2
+        and _v4_plain_tag(children[0], "Name")
+        and _v4_plain_tag(children[1], "Value")
+        and not any(child.attrib or list(child) for child in children)
+        and str(children[0].text or "") == "Random Seeds:Style"
+    )
+
+
+def _v4_default_modeler_lod(element):
+    children = list(element)
+    return bool(
+        not element.attrib
+        and not _v4_has_significant_text_or_tail(element)
+        and len(children) == 1
+        and _v4_plain_tag(children[0], "Filename")
+        and not children[0].attrib
+        and not list(children[0])
+        and not _v4_has_significant_text_or_tail(children[0])
+    )
+
+
+def _v4_default_parent_spline(element):
+    if (
+        set(element.attrib) != {"Count"}
+        or element.attrib.get("Count") not in {"0", "1"}
+        or _v4_has_significant_text_or_tail(element)
+    ):
+        return False
+    children = list(element)
+    if element.attrib["Count"] == "0":
+        return not children
+    if len(children) != 1 or not _v4_plain_tag(children[0], "Spline"):
+        return False
+    spline = children[0]
+    if (
+        spline.attrib != {"DrawMode": "false"}
+        or _v4_has_significant_text_or_tail(spline)
+        or len(spline) != 2
+    ):
+        return False
+    expected = (
+        ("0", "1", "1", "0", "0"),
+        ("1", "1", "1", "0", "0"),
+    )
+    fields = ("X", "Y", "TangentX", "TangentY", "Length")
+    for point, expected_values in zip(spline, expected):
+        if (
+            not _v4_plain_tag(point, "ControlPoint")
+            or point.attrib
+            or _v4_has_significant_text_or_tail(point)
+            or len(point) != len(fields)
+        ):
+            return False
+        for child, field, expected_value in zip(
+            point, fields, expected_values
+        ):
+            if (
+                not _v4_plain_tag(child, field)
+                or child.attrib
+                or list(child)
+                or _v4_has_significant_tail(child)
+                or str(child.text or "") != expected_value
+            ):
+                return False
+    return True
+
+
+def _v4_default_modeler_atlas_maker(element):
+    expected = {
+        "Weight": "0.5",
+        "FullHeight": "false",
+        "UpdateMeshes": "true",
+        "MakeUvArea": "false",
+        "TranslationX": "0",
+        "TranslationY": "0",
+        "ScaleX": "1",
+        "ScaleY": "1",
+        "Rotation": "0",
+    }
+    return bool(
+        element.attrib == expected
+        and not list(element)
+        and not _v4_has_significant_text_or_tail(element)
+    )
+
+
+def _v4_default_map_spline(element, length):
+    if (
+        not _v4_plain_tag(element, "Spline")
+        or element.attrib != {"DrawMode": "false"}
+        or _v4_has_significant_text_or_tail(element)
+        or len(element) != 2
+    ):
+        return False
+    fields = ("X", "Y", "TangentX", "TangentY", "Length")
+    expected = (
+        ("0", "0", "1", "0", length),
+        ("1", "1", "1", "0", length),
+    )
+    for point, expected_values in zip(element, expected):
+        if (
+            not _v4_plain_tag(point, "ControlPoint")
+            or point.attrib
+            or _v4_has_significant_text_or_tail(point)
+            or len(point) != len(fields)
+        ):
+            return False
+        for child, field, expected_value in zip(
+            point, fields, expected_values
+        ):
+            if (
+                not _v4_plain_tag(child, field)
+                or child.attrib
+                or list(child)
+                or _v4_has_significant_tail(child)
+                or str(child.text or "") != expected_value
+            ):
+                return False
+    return True
+
+
+def _v4_default_map_generate(element):
+    if (
+        not _v4_plain_tag(element, "Generate")
+        or element.attrib != {"Type": "0"}
+        or _v4_has_significant_text_or_tail(element)
+    ):
+        return False
+    expected = (
+        (
+            "File",
+            {"ColorHigh": "ffffffff", "ColorLow": "ff000000", "Remap": "0"},
+            "0",
+        ),
+        (
+            "Linear",
+            {
+                "Angle": "90",
+                "CenterX": "0",
+                "CenterY": "0",
+                "ColorHigh": "ffffffff",
+                "ColorLow": "ff000000",
+                "Distance": "1",
+            },
+            "0.44999998807907104",
+        ),
+        (
+            "Radial",
+            {
+                "CenterX": "0.5",
+                "CenterY": "0.5",
+                "ColorHigh": "ffffffff",
+                "ColorLow": "ff000000",
+                "Distance": "0.5",
+            },
+            "0.44999998807907104",
+        ),
+        (
+            "Noise",
+            {
+                "CenterX": "0.5",
+                "CenterY": "0.5",
+                "ColorHigh": "ffffffff",
+                "ColorLow": "ff000000",
+                "Scale": "1",
+            },
+            "0.44999998807907104",
+        ),
+    )
+    if len(element) != len(expected):
+        return False
+    for child, (tag, attributes, length) in zip(element, expected):
+        if not _v4_plain_tag(child, tag):
+            return False
+        observed = dict(child.attrib)
+        if tag == "Noise":
+            seed = observed.pop("Seed", None)
+            if seed is None or not re.fullmatch(r"[+-]?\d+", seed):
+                return False
+        if (
+            observed != attributes
+            or _v4_has_significant_text_or_tail(child)
+            or len(child) != 1
+            or not _v4_default_map_spline(child[0], length)
+        ):
+            return False
+    return True
+
+
+def _v4_default_material_map(element):
+    map_name = element.attrib.get("Name")
+    specific = {
+        "Specular": {
+            "ColorX": "0.75",
+            "ColorY": "0.75",
+            "ColorZ": "0.75",
+            "TexSource": "0",
+            "TexToLinear": "true",
+        },
+        "Metallic": {
+            "ColorX": "0",
+            "ColorY": "0",
+            "ColorZ": "0",
+            "TexSource": "1",
+            "TexToLinear": "false",
+        },
+        "Custom": {
+            "ColorX": "0",
+            "ColorY": "0",
+            "ColorZ": "0",
+            "TexSource": "0",
+            "TexToLinear": "true",
+        },
+        "Custom2": {
+            "ColorX": "0",
+            "ColorY": "0",
+            "ColorZ": "0",
+            "TexSource": "0",
+            "TexToLinear": "false",
+        },
+    }.get(map_name)
+    if (
+        not _v4_plain_tag(element, "Map")
+        or element.attrib != {"Name": map_name}
+        or specific is None
+        or _v4_has_significant_text_or_tail(element)
+    ):
+        return False
+    expected_scalars = (
+        ("ColorX", specific["ColorX"]),
+        ("ColorY", specific["ColorY"]),
+        ("ColorZ", specific["ColorZ"]),
+        ("TexFilename", ""),
+        ("TexSource", specific["TexSource"]),
+        ("TexBrightness", "0"),
+        ("TexContrast", "0"),
+        ("TexSaturation", "0"),
+        ("TexRed", "0"),
+        ("TexGreen", "0"),
+        ("TexBlue", "0"),
+        ("TexMin", "0"),
+        ("TexMax", "1"),
+        ("TexEnabled", "true"),
+        ("TexToLinear", specific["TexToLinear"]),
+        ("TexInvert", "false"),
+        ("TexInvertRed", "false"),
+        ("TexInvertGreen", "false"),
+        ("TexInvertBlue", "false"),
+        ("Normalize", "false"),
+        ("TexSizeX", "0"),
+        ("TexSizeY", "0"),
+    )
+    expected_tags = tuple(name for name, _value in expected_scalars) + (
+        "Generate",
+    )
+    children = list(element)
+    if tuple(_v4_tag_name(child.tag) for child in children) != expected_tags:
+        return False
+    for child, (_name, expected_value) in zip(
+        children[:-1], expected_scalars
+    ):
+        if (
+            child.attrib
+            or list(child)
+            or _v4_has_significant_tail(child)
+            or str(child.text or "") != expected_value
+        ):
+            return False
+    return _v4_default_map_generate(children[-1])
+
+
+def _v4_float32_token(value):
+    raw_text = str(value or "")
+    text = raw_text.strip()
+    if raw_text != text:
+        return raw_text
+    if not re.fullmatch(
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+        text,
+    ):
+        return text
+    try:
+        number = float(text)
+        if not math.isfinite(number):
+            return text
+        return "float32:" + struct.pack("!f", number).hex()
+    except (OverflowError, TypeError, ValueError):
+        return text
+
+
+def _v4_generated_collection_default(element, prefix):
+    if (
+        not _v4_plain_tag(element, "Property")
+        or element.attrib
+        or _v4_has_significant_text_or_tail(element)
+    ):
+        return False
+    children = list(element)
+    if len(children) != 2 or not (
+        _v4_plain_tag(children[0], "Name")
+        and _v4_plain_tag(children[1], "Value")
+    ):
+        return False
+    if any(
+        child.attrib or list(child) or _v4_has_significant_tail(child)
+        for child in children
+    ):
+        return False
+    name = str(children[0].text or "")
+    value = str(children[1].text or "")
+    return bool(name.startswith(prefix) and name != prefix and value == "false")
+
+
+def _v4_generated_atlas_mesh_user_data(element):
+    if (
+        not _v4_plain_tag(element, "UserData")
+        or element.attrib
+        or list(element)
+    ):
+        return False
+    try:
+        payload = json.loads(str(element.text or "").strip())
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and set(payload) == {"generator", "group", "kind", "scope"}
+        and payload.get("generator") == "Atlas Leaf Mesh Builder"
+        and payload.get("kind") == "mesh"
+        and isinstance(payload.get("group"), str)
+        and bool(payload["group"].strip())
+        and isinstance(payload.get("scope"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", payload["scope"])
+    )
+
+
+def _v4_child_is_excluded(parent_path, child, siblings=None):
+    siblings = tuple(siblings or ())
+    parent_key = _v4_path_key(parent_path)
+    child_tag = _v4_tag_name(child.tag)
+    child_key = child_tag if "}" not in child_tag else None
+    if parent_key == ("SpeedTree",):
+        return bool(
+            child_key in _AUTHORING_GRAPH_V4_EXCLUDED_ROOT_TAGS
+            and not _v4_has_significant_tail(child)
+        )
+    if parent_key == ("SpeedTree", "Generators", "Generator", "Properties"):
+        name = _v4_direct_child_text(child, "Name")
+        duplicate_count = sum(
+            _v4_plain_tag(candidate, "Property")
+            and _v4_direct_child_text(candidate, "Name") == name
+            for candidate in siblings
+        )
+        return _v4_generated_collection_default(
+            child,
+            "Generation:Collections:",
+        ) and duplicate_count == 1
+    if parent_key in {
+        ("SpeedTree", "Forces", "Force", "Properties"),
+        ("SpeedTree", "Force", "Properties"),
+    }:
+        name = _v4_direct_child_text(child, "Name")
+        duplicate_count = sum(
+            _v4_plain_tag(candidate, "Property")
+            and _v4_direct_child_text(candidate, "Name") == name
+            for candidate in siblings
+        )
+        return (
+            _v4_generated_collection_default(child, "Mesh:Collections:")
+            and duplicate_count == 1
+        )
+    if parent_key == ("SpeedTree", "Assets", "Material_v8"):
+        if child_key in {"Preview", "StreamPlaceholder"}:
+            return not _v4_has_significant_tail(child)
+        if (
+            child_key == "AtlasMaker"
+            and _v4_namespace_free_subtree(child)
+            and _v4_default_modeler_atlas_maker(child)
+        ):
+            return sum(
+                _v4_plain_tag(candidate, "AtlasMaker")
+                for candidate in siblings
+            ) == 1
+        if (
+            child_key == "Map"
+            and _v4_namespace_free_subtree(child)
+            and _v4_default_material_map(child)
+        ):
+            map_name = child.attrib.get("Name")
+            return sum(
+                _v4_plain_tag(candidate, "Map")
+                and candidate.attrib.get("Name") == map_name
+                for candidate in siblings
+            ) == 1
+    if parent_key == ("SpeedTree", "Assets", "Mesh"):
+        if child_key == "UserData" and _v4_generated_atlas_mesh_user_data(child):
+            return sum(
+                _v4_plain_tag(candidate, "UserData")
+                for candidate in siblings
+            ) == 1
+        if (
+            child_key in {"Lod_1", "Lod_2"}
+            and _v4_namespace_free_subtree(child)
+            and _v4_default_modeler_lod(child)
+        ):
+            return sum(
+                _v4_plain_tag(candidate, child_key)
+                for candidate in siblings
+            ) == 1
+    if (
+        parent_key
+        == (
+            "SpeedTree",
+            "Generators",
+            "Generator",
+            "Properties",
+            "SplineProperty",
+        )
+        and child_key == "CompoundParentSpline"
+        and _v4_namespace_free_subtree(child)
+        and _v4_default_parent_spline(child)
+    ):
+        return sum(
+            _v4_plain_tag(candidate, "CompoundParentSpline")
+            for candidate in siblings
+        ) == 1
+    return False
+
+
+def _v4_ordered_children(element, path):
+    siblings = list(element)
+    children = [
+        child for child in siblings
+        if not _v4_child_is_excluded(path, child, siblings)
+    ]
+    if _v4_path_key(path) == ("SpeedTree", "Assets"):
+        # A no-edit Modeler Save stably partitions direct Assets children by
+        # kind. Unknown/future children are a fail-closed barrier: if any are
+        # present, preserve the complete direct-child order unchanged.
+        known_tags = {
+            "Material_v8", "Mesh", "Roughness",
+            "GUID", "Name", "Hidden", "Properties",
+        }
+        if any(_v4_tag_name(child.tag) not in known_tags for child in children):
+            return children
+        materials = [
+            child for child in children if _v4_plain_tag(child, "Material_v8")
+        ]
+        meshes = [child for child in children if _v4_plain_tag(child, "Mesh")]
+        others = [
+            child for child in children
+            if not _v4_plain_tag(child, "Material_v8")
+            and not _v4_plain_tag(child, "Mesh")
+        ]
+        return materials + meshes + others
+    return children
+
+
+def _v4_projected_subtree(
+    element,
+    path=(),
+    *,
+    truthy_value=False,
+    physics_bones_context=False,
+):
+    element_tag = _v4_tag_name(element.tag)
+    path = tuple(path) + (element_tag,)
+    path_key = _v4_path_key(path)
+    tag_key = element_tag if "}" not in element_tag else None
+    raw_text = str(element.text or "")
+    text = "" if list(element) and not raw_text.strip() else raw_text
+    if path_key in _AUTHORING_GRAPH_V4_GENERATED_GUID_PATHS:
+        text = "<modeler-generated-guid>"
+    elif path_key in _AUTHORING_GRAPH_V4_CANONICAL_GUID_PATHS:
+        text = _v4_generator_guid_spelling(text)
+    elif path_key in {
+        (
+            "SpeedTree", "Generators", "Generator", "Extra",
+            "m_nOrderValue",
+        ),
+    }:
+        text = "<modeler-graph-order>"
+    elif path_key in {
+        (
+            "SpeedTree", "Generators", "Generator", "Extra",
+            "m_vecBackgroundIconColor_r",
+        ),
+        (
+            "SpeedTree", "Generators", "Generator", "Extra",
+            "m_vecBackgroundIconColor_g",
+        ),
+        (
+            "SpeedTree", "Generators", "Generator", "Extra",
+            "m_vecBackgroundIconColor_b",
+        ),
+    }:
+        text = _v4_float32_token(text)
+    elif (
+        physics_bones_context
+        and path_key
+        and path_key[:-1] in _AUTHORING_GRAPH_V4_SPLINE_PROPERTY_PATHS
+        and path_key[-1] == "Value"
+    ):
+        text = _v4_float32_token(text)
+    elif (
+        physics_bones_context
+        and path_key
+        and (
+            path_key[:-3] in _AUTHORING_GRAPH_V4_SPLINE_PROPERTY_PATHS
+            and path_key[-3:-1] == ("ProfileSpline", "ControlPoint")
+            or path_key[:-4] in _AUTHORING_GRAPH_V4_SPLINE_PROPERTY_PATHS
+            and path_key[-4:-1]
+            == ("CompoundParentSpline", "Spline", "ControlPoint")
+        )
+        and tag_key in _AUTHORING_GRAPH_V4_SPLINE_NUMBER_TAGS
+    ):
+        text = (
+            _normalized_spline_number(text)
+            if text == text.strip()
+            else text
+        )
+    elif path_key == ("SpeedTree", "Assets", "Mesh", "Scale"):
+        text = _v4_float32_token(text)
+    elif (
+        path_key
+        in {
+            ("SpeedTree", "Assets", "Material_v8", "Map", "TexSizeX"),
+            ("SpeedTree", "Assets", "Material_v8", "Map", "TexSizeY"),
+        }
+    ):
+        text = "<derived-texture-size>"
+    elif truthy_value and tag_key == "Value":
+        try:
+            text = "0" if float(text) == 0 else "1"
+        except (TypeError, ValueError):
+            pass
+
+    attributes = []
+    for name, value in element.attrib.items():
+        attributes.append((str(name), str(value)))
+
+    child_truthy = _v4_random_seed_style_property(element, path_key)
+    child_physics_bones = (
+        physics_bones_context
+        or _v4_physics_bones_spline_property(element, path_key)
+    )
+    projected = {
+        "tag": element_tag,
+        "attributes": sorted(attributes),
+        "text": text,
+        "children": [
+            _v4_projected_subtree(
+                child,
+                path,
+                truthy_value=child_truthy,
+                physics_bones_context=child_physics_bones,
+            )
+            for child in _v4_ordered_children(element, path)
+        ],
+    }
+    tail = str(element.tail or "")
+    if tail.strip():
+        projected["tail"] = tail
+    return projected
+
+
 def _authoring_graph_core_projection(text):
-    """Return the current authored-core projection (core-v3 in schema 5)."""
-    return _legacy_authoring_graph_core_v3_projection(text)
-
-
+    """Project the full authored XML tree under fail-closed core-v4 rules."""
+    root = _v4_parse(text)
+    projected = _v4_projected_subtree(root)
+    root_children = [
+        child for child in root
+        if not _v4_child_is_excluded((_v4_tag_name(root.tag),), child)
+    ]
+    generators = next(
+        (child for child in root_children if _v4_plain_tag(child, "Generators")),
+        None,
+    )
+    links = next(
+        (child for child in root_children if _v4_plain_tag(child, "Links")),
+        None,
+    )
+    assets = next(
+        (child for child in root_children if _v4_plain_tag(child, "Assets")),
+        None,
+    )
+    generator_count = sum(
+        _v4_plain_tag(child, "Generator") for child in (generators or ())
+    )
+    link_count = sum(_v4_plain_tag(child, "Link") for child in (links or ()))
+    asset_identity_count = sum(
+        not any(_v4_plain_tag(child, name) for name in (
+            "Name", "GUID", "Hidden", "Properties",
+        ))
+        for child in (assets or ())
+    )
+    global_setting_count = sum(
+        not any(_v4_plain_tag(child, name) for name in (
+            "Generators", "Links", "Assets",
+        ))
+        for child in root_children
+    )
+    rows = {"root": projected}
+    return {
+        "contract": "speedtree_spm_authoring_graph_core_projection",
+        "version": 4,
+        "generator_count": generator_count,
+        "link_count": link_count,
+        "asset_identity_count": asset_identity_count,
+        "global_setting_count": global_setting_count,
+        "fingerprint": _json_fingerprint(rows),
+        "_rows": rows,
+    }
 def _legacy_authoring_graph_core_v2_subtree(
     element,
     *,
@@ -1133,6 +1907,14 @@ def _authoring_graph_core_v2_candidates(snapshot, _expected_mesh_ids=()):
 
 def _authoring_graph_core_v3_candidates(snapshot, _expected_mesh_ids=()):
     projection = _legacy_authoring_graph_core_v3_projection(snapshot["text"])
+    return [{
+        key: value for key, value in projection.items()
+        if not key.startswith("_")
+    }]
+
+
+def _authoring_graph_core_v4_candidates(snapshot, _expected_mesh_ids=()):
+    projection = _authoring_graph_core_projection(snapshot["text"])
     return [{
         key: value for key, value in projection.items()
         if not key.startswith("_")
@@ -1824,13 +2606,13 @@ def _receipt_target_scopes(receipt):
             "authoring_mesh_ids": requested,
             "required_live_mesh_ids": list(requested),
         }
-    if schema_version != 5:
+    if schema_version not in {5, 6}:
         return None
     return _target_requirements_v1_scopes(requirements, requested)
 
 
 def _target_requirements_v1_scopes(requirements, requested):
-    """Validate the frozen schema-5 requirements-v1 policy literally."""
+    """Validate the frozen requirements-v1 policy literally."""
     if not isinstance(requirements, dict):
         return None
     authoring = _receipt_requested_mesh_ids({
@@ -1894,6 +2676,17 @@ _CORE_V2_POLICY = _ProjectionPolicy(
 _CORE_V3_POLICY = _ProjectionPolicy(
     "authoring_graph_core_projection",
     _authoring_graph_core_v3_candidates,
+    (
+        "fingerprint",
+        "generator_count",
+        "link_count",
+        "asset_identity_count",
+        "global_setting_count",
+    ),
+)
+_CORE_V4_POLICY = _ProjectionPolicy(
+    "authoring_graph_core_projection",
+    _authoring_graph_core_v4_candidates,
     (
         "fingerprint",
         "generator_count",
@@ -1971,6 +2764,15 @@ _RECEIPT_DIALECTS = MappingProxyType({
         _TARGET_V2_POLICY,
         "explicit_sealed_scopes_v1",
     ),
+    (6, 1, 4, 1, 2, 1): _ReceiptDialect(
+        "schema6_graph1_core4_target2_requirements1",
+        (6, 1, 4, 1, 2, 1),
+        _GRAPH_V1_POLICY,
+        _CORE_V4_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V2_POLICY,
+        "explicit_sealed_scopes_v1",
+    ),
 })
 
 
@@ -2029,7 +2831,7 @@ def _resolve_receipt_dialect_spec(receipt, snapshot=None):
             "authoring_graph_core_projection",
             "speedtree_spm_authoring_graph_core_projection",
         ),)
-    if schema_version == 5:
+    if schema_version in {5, 6}:
         required_blocks += ((
             "target_requirements",
             "speedtree_stale_node_target_requirements",

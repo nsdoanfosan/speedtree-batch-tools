@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SpeedTree>
+  <Thumbnail>before-cache</Thumbnail>
+  <ThumbnailSize>before-size</ThumbnailSize>
+  <Preview>before-preview</Preview>
+  <Statistics><TriangleCount>101</TriangleCount></Statistics>
+  <TreeInfo>before-tree-info</TreeInfo>
+  <QuickSaveSettings2>before-quick-save</QuickSaveSettings2>
+  <m_sTimelineData>before-timeline</m_sTimelineData>
+  <Window><X>10</X></Window>
+  <Light><GUID>generated-light-before</GUID><Properties><Property><Name>Light:Intensity</Name><Value>1</Value></Property></Properties></Light>
+  <Fan><GUID>generated-fan-before</GUID><Properties><Property><Name>Fan:Strength</Name><Value>2</Value></Property></Properties></Fan>
+  <RuleScript><GUID>generated-rule-before</GUID><Properties><Property><Name>Rule:Enabled</Name><Value>true</Value></Property></Properties></RuleScript>
+  <Force><GUID>generated-force-before</GUID><Properties><Property><Name>Force:Strength</Name><Value>3</Value></Property></Properties></Force>
+  <Forces>
+    <Force><GUID>generated-nested-force-before</GUID><Properties><Property><Name>Mesh:Collections:old</Name><Value>false</Value></Property><Property><Name>Force:Falloff</Name><Value>4</Value></Property></Properties></Force>
+  </Forces>
+  <Generators>
+    <Generator Type="Tree">
+      <Name>Tree</Name>
+      <GUID>ABCDEFGHIJKLMNOPQRSTUA==</GUID>
+      <Hidden>false</Hidden>
+      <Properties>
+        <Property><Name>Custom:Density</Name><Value>1</Value></Property>
+        <Property><Name>Generation:Collections:old</Name><Value>false</Value></Property>
+        <Property><Name>Generation:Collections:authored</Name><Value>true</Value></Property>
+        <Property><Name>Random Seeds:Style</Name><Value>919820633</Value></Property>
+        <SplineProperty><Name>Physics:Bones</Name><Value>0.4419</Value><CompoundParentSpline Count="1"><Spline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>1</TangentX><TangentY>0</TangentY><Length>0</Length></ControlPoint><ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX><TangentY>0</TangentY><Length>0</Length></ControlPoint></Spline></CompoundParentSpline><ProfileSpline DrawMode="false"><ControlPoint><X>0</X><Y>1</Y><TangentX>0.24253584444522858</TangentX><TangentY>-0.9701424241065979</TangentY><Length>0</Length></ControlPoint></ProfileSpline></SplineProperty>
+      </Properties>
+      <Extra><m_nOrderValue>7</m_nOrderValue><m_vecBackgroundIconColor_r>0.1</m_vecBackgroundIconColor_r><m_vecBackgroundIconColor_g>0.2</m_vecBackgroundIconColor_g><m_vecBackgroundIconColor_b>0.3</m_vecBackgroundIconColor_b><AuthoredExtra>keep</AuthoredExtra></Extra>
+    </Generator>
+  </Generators>
+  <Links><Link><GUID>generated-link-before</GUID><SourceGUID>ABCDEFGHIJKLMNOPQRSTUA==</SourceGUID><TargetGUID>abcdefghijklmnopqrstuA==</TargetGUID><Weight>7</Weight></Link></Links>
+  <Assets>
+    <GUID>generated-assets-before</GUID>
+    <Mesh ID="130"><Name>leaf-mesh</Name><Scale>0.1</Scale><UserData>{"generator":"Atlas Leaf Mesh Builder","group":"leaf","kind":"mesh","scope":"0123456789abcdef0123456789abcdef"}</UserData><VertexData>authored-vertices</VertexData></Mesh>
+    <Material_v8 ID="10"><Name>leaf-material</Name><Preview>before-material-preview</Preview><StreamPlaceholder><Data>before-stream</Data></StreamPlaceholder><Map Name="Color"><TexFilename>leaf.png</TexFilename><TexEnabled>true</TexEnabled><TexSizeX>0</TexSizeX><TexSizeY>0</TexSizeY></Map><CutoutMeshID>130</CutoutMeshID></Material_v8>
+  </Assets>
+  <CoreCollisionObjects><Object><Radius>1</Radius></Object></CoreCollisionObjects>
+  <GlobalSettings><WindQuality>Best</WindQuality></GlobalSettings>
+  <UnknownRoot><AuthoredValue>preserve</AuthoredValue></UnknownRoot>
+  <Nodes><Node>stale-node-table</Node></Nodes>
+</SpeedTree>

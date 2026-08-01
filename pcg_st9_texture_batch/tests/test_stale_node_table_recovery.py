@@ -33,6 +33,7 @@ from stale_node_table_recovery import (  # noqa: E402
     _capture_immutable_snapshot,
     _ensure_preimage_artifacts,
     _legacy_authoring_graph_core_v2_projection,
+    _legacy_authoring_graph_core_v3_projection,
     _legacy_target_binding_fingerprint,
     _release_session_lock,
     _resolve_receipt_dialect,
@@ -139,11 +140,11 @@ def authored_scope_text(
             f"</Property></Properties></{tag}>"
         )
     material = (
-        '<Material_V8 ID="10"><Preview>'
+        '<Material_v8 ID="10"><Preview>'
         f"{volatile}</Preview><StreamPlaceholder><Data>{volatile}</Data>"
         "</StreamPlaceholder><Map Name=\"Color\"><TexFilename>"
         f"{material_filename}</TexFilename><TexEnabled>true</TexEnabled>"
-        "</Map><CutoutMeshID>130</CutoutMeshID></Material_V8>"
+        "</Map><CutoutMeshID>130</CutoutMeshID></Material_v8>"
     )
     return spm_text(stale=stale, volatile=volatile).replace(
         "<Generators>",
@@ -423,7 +424,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         )
         before_extra = (
             "<Property><Name>Generation:Collections:old cutout</Name>"
-            "<Value>7</Value></Property>"
+            "<Value>false</Value></Property>"
             "<Property><Name>Random Seeds:Style</Name>"
             "<Value>919820633</Value></Property>"
             "<SplineProperty><Name>Physics:Bones</Name>"
@@ -441,7 +442,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         )
         after_extra = (
             "<Property><Name>Generation:Collections:new cutout</Name>"
-            "<Value>9</Value></Property>"
+            "<Value>false</Value></Property>"
             "<Property><Name>Random Seeds:Style</Name><Value>1</Value></Property>"
             "<SplineProperty><Name>Physics:Bones</Name>"
             "<Value>0.44190001487731934</Value>"
@@ -775,7 +776,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             [130],
         )
         self.assertTrue(result["reaudit"]["normalization"]["applicable"])
-        self.assertEqual(receipt["schema_version"], 5)
+        self.assertEqual(receipt["schema_version"], 6)
         self.assertEqual(
             receipt["target_requirements"]["required_live_mesh_ids"],
             [130],
@@ -883,7 +884,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                     caught.exception.evidence["last_reason_tokens"],
                 )
 
-    def test_schema5_scope_tamper_and_caller_mismatch_fail_closed(self):
+    def test_schema6_scope_tamper_and_caller_mismatch_fail_closed(self):
         for mutation in ("policy", "outside_subset", "version", "caller"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 folder = Path(temporary)
@@ -951,6 +952,15 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 else:
                     receipt = dict(artifacts["receipt"])
                     receipt["schema_version"] = 4
+                    receipt["authoring_graph_core_projection"] = {
+                        key: value
+                        for key, value in (
+                            _legacy_authoring_graph_core_v3_projection(
+                                baseline["text"]
+                            )
+                        ).items()
+                        if not key.startswith("_")
+                    }
                     receipt.pop("target_requirements")
                 artifacts["receipt_path"].write_text(
                     json.dumps(receipt, sort_keys=True),
@@ -973,7 +983,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 "preimage_receipt_verification_failed",
             )
 
-    def test_schema5_restart_reuses_sealed_scope_receipt(self):
+    def test_schema6_restart_reuses_sealed_scope_receipt(self):
         after = spm_text(stale=False, volatile="two")
         for mesh_id in (131, 132, 133):
             after = after.replace(_node(f"g-{mesh_id}"), "", 1)
@@ -1007,6 +1017,56 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             )
         self.assertEqual(result["status"], "repaired_reaudit_valid")
 
+    def test_schema5_core_v3_receipt_reaudits_byte_for_byte_under_v4(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+            artifacts = _ensure_preimage_artifacts(
+                baseline,
+                (),
+                root,
+                authoring_mesh_ids=TARGET_MESH_IDS,
+                required_live_mesh_ids=TARGET_MESH_IDS,
+            )
+            receipt = json.loads(json.dumps(artifacts["receipt"]))
+            receipt["schema_version"] = 5
+            receipt["authoring_graph_core_projection"] = {
+                key: value
+                for key, value in (
+                    _legacy_authoring_graph_core_v3_projection(
+                        baseline["text"]
+                    )
+                ).items()
+                if not key.startswith("_")
+            }
+            artifacts["receipt_path"].write_text(
+                json.dumps(receipt, sort_keys=True),
+                encoding="utf-8",
+            )
+            sealed_receipt_bytes = artifacts["receipt_path"].read_bytes()
+            write_spm(spm, spm_text(stale=False, volatile="two"))
+
+            result = verify_sealed_resave(
+                spm,
+                artifacts["backup_path"],
+                artifacts["receipt_path"],
+                (),
+                authoring_mesh_ids=TARGET_MESH_IDS,
+                required_live_mesh_ids=TARGET_MESH_IDS,
+            )
+
+            self.assertEqual(
+                artifacts["receipt_path"].read_bytes(),
+                sealed_receipt_bytes,
+            )
+        self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
+        self.assertEqual(
+            result["reaudit"]["authoring_graph_core_projection_version"],
+            4,
+        )
+
     def test_exact_backup_and_immutable_receipt_exist_before_modeler_launch(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -1021,12 +1081,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 self.assertEqual(backups[0].read_bytes(), preimage)
                 receipt_text = receipts[0].read_text(encoding="utf-8")
                 receipt = json.loads(receipt_text)
-                self.assertEqual(receipt["schema_version"], 5)
+                self.assertEqual(receipt["schema_version"], 6)
                 self.assertEqual(
                     receipt["authoring_graph_projection"]["version"], 1
                 )
                 self.assertEqual(
-                    receipt["authoring_graph_core_projection"]["version"], 3
+                    receipt["authoring_graph_core_projection"]["version"], 4
                 )
                 self.assertEqual(receipt["generator_membership"]["version"], 1)
                 self.assertEqual(receipt["required_target_bindings"]["version"], 2)
@@ -1463,7 +1523,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             self.assertEqual(reused["receipt_path"].read_bytes(), sealed_bytes)
             self.assertEqual(reused["receipt_sha256"], sealed_sha)
 
-    def test_legacy_v3_core_is_rebuilt_from_its_exact_backup(self):
+    def test_schema3_core_v2_is_rebuilt_before_current_v4_projection(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -1497,7 +1557,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertFalse(result["modeler_launched"])
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            3,
+            4,
         )
 
     def test_receipt_schema_versions_require_exact_integer_types(self):
@@ -1595,7 +1655,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 "preimage_backup_verification_failed",
             )
 
-    def test_schema5_authoritative_projection_fields_are_verified(self):
+    def test_schema6_authoritative_projection_fields_are_verified(self):
         mutations = (
             ("membership_count", "generator_membership", "count", 99),
             ("binding_count", "required_target_bindings", "binding_count", 99),
