@@ -25,6 +25,12 @@ from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     validate_isolated_bark_recipe_bundle,
 )
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    validate_delivery_scope_intent,
+    validate_resolved_delivery_scope,
+)
+from speedtree_pipeline_contract import read_spm_text
 
 
 def parse_args():
@@ -157,6 +163,31 @@ def validate_recipe_registry_contract(recipe, effective_paths):
                 "Cluster normalization material binding must declare "
                 "connect_generators as an explicit boolean."
             )
+    connected = [
+        row for row in bindings if row.get("connect_generators") is True
+    ]
+    scoped = [
+        row for row in connected
+        if row.get("generator_delivery_scope_intent") is not None
+    ]
+    if scoped and len(scoped) != len(connected):
+        raise RuntimeError(
+            "Explicit Generator delivery scope must cover every connected "
+            "target; mixed explicit/legacy recipes are rejected."
+        )
+    for binding in scoped:
+        try:
+            validate_delivery_scope_intent(
+                binding["generator_delivery_scope_intent"],
+                target_spm=binding["target_spm"],
+                material_id=binding["source_material_id"],
+                provider_blend=recipe["blend"],
+            )
+        except GeneratorDeliveryScopeError as exc:
+            raise RuntimeError(
+                "Cluster normalization Generator delivery scope is invalid "
+                f"for {binding.get('target_spm')}: {exc}"
+            ) from exc
     by_target = {key(row["target_spm"]): row for row in bindings}
     return {target: by_target[target] for target in effective}
 
@@ -505,6 +536,10 @@ def apply_recipe_source_material_mappings(
                 binding.get("source_binding_repairs") or []
             ),
         }
+        if binding.get("generator_delivery_scope_intent") is not None:
+            request["generator_delivery_scope_intent"] = binding[
+                "generator_delivery_scope_intent"
+            ]
         if mapping.get(target) == request:
             preserved.append(target)
         else:
@@ -526,6 +561,42 @@ def apply_recipe_source_material_mappings(
         "preserved": preserved,
         "assets_only": assets_only,
     }
+
+
+def validate_producer_delivery_scope_results(results, bindings_by_key):
+    """Require an exact producer seal whenever the recipe carried intent."""
+    for result in results:
+        binding = bindings_by_key.get(key(result.get("spm_path")))
+        if not binding:
+            continue
+        intent = binding.get("generator_delivery_scope_intent")
+        if intent is None:
+            continue
+        target_spm = Path(result["spm_path"]).expanduser().absolute()
+        text_sha256 = hashlib.sha256(
+            read_spm_text(target_spm).encode("utf-8")
+        ).hexdigest()
+        try:
+            validated = validate_resolved_delivery_scope(
+                result.get("generator_connection"),
+                target_spm=target_spm,
+                material_id=binding["source_material_id"],
+                provider_blend=binding["generator_delivery_scope_intent"][
+                    "target"
+                ]["provider_blend"],
+                target_spm_postwrite_sha256=text_sha256,
+            )
+        except GeneratorDeliveryScopeError as exc:
+            raise RuntimeError(
+                "Atlas producer did not return an exact sealed Generator "
+                f"delivery scope for {target_spm}: {exc}"
+            ) from exc
+        expected_hash = str(intent.get("intent_sha256") or "").casefold()
+        if validated["intent_sha256"] != expected_hash:
+            raise RuntimeError(
+                "Atlas producer echoed a different Generator delivery intent "
+                f"for {target_spm}."
+            )
 
 
 def sync_targets(blend, requested, normalization_recipe=None):
@@ -621,6 +692,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
     unresolved = [str(path) for path in requested if key(path) not in completed]
     if unresolved:
         raise RuntimeError("Atlas build returned no result for: " + ", ".join(unresolved))
+    validate_producer_delivery_scope_results(results, bindings_by_key)
     cluster_source_pipeline = finalize_cluster_source_pipeline(
         normalization_recipe
     )
