@@ -3122,6 +3122,7 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+                item_callback=mock.ANY,
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3170,7 +3171,10 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIs(app.report, report)
         self.assertEqual(app.texplan_cache, {})
         self.assertEqual(app._set_busy.call_args_list, [
-            mock.call(True), mock.call(False),
+            mock.call(True),
+            # Primary live paint is usable for read-only review before the
+            # relation worker and queued refresh complete.
+            mock.call(False), mock.call(False),
             mock.call(True), mock.call(False),
         ])
         self.assertEqual(app.populate.call_count, 3)
@@ -3259,6 +3263,40 @@ class GuiLabelTests(unittest.TestCase):
         app._update_summary.assert_called_once_with()
         app._start_sync_state_migration.assert_called_once_with()
         self.assertIn("live audit는 완료", app.log.call_args.args[0])
+
+    def test_initial_refresh_failure_logs_traceback_and_unlocks_parent_ui(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app.root = object()
+        app.worker = mock.Mock()
+        app._initial_refreshing = True
+        app._display_only_snapshot = False
+        app.status_var = mock.Mock()
+        app._set_busy = mock.Mock()
+        app._lock_mutation_controls = mock.Mock()
+        failure = RuntimeError("all inactive delivery classification failed")
+
+        with mock.patch.object(
+            self.gui,
+            "record_exception",
+            return_value=True,
+        ) as record_exception, mock.patch.object(
+            self.gui.messagebox,
+            "showerror",
+        ) as showerror:
+            app._initial_refresh_done(None, failure)
+
+        record_exception.assert_called_once_with(
+            "PCG ST9 Texture initial refresh",
+            failure,
+        )
+        showerror.assert_called_once()
+        self.assertIs(showerror.call_args.kwargs["parent"], app.root)
+        self.assertIn("전체 traceback:", showerror.call_args.args[1])
+        self.assertIsNone(app.worker)
+        self.assertFalse(app._initial_refreshing)
+        self.assertTrue(app._display_only_snapshot)
+        app._set_busy.assert_called_once_with(False)
+        app._lock_mutation_controls.assert_called_once_with()
 
     def test_manual_refresh_runs_audit_in_worker(self):
         class FakeRoot:
@@ -4301,6 +4339,7 @@ class GuiLabelTests(unittest.TestCase):
         app.tree = FakeTree()
         app.log = mock.Mock()
         app._prepare_finished = mock.Mock()
+        app._validate_live_mutation_items = mock.Mock(return_value=True)
         app._ui = lambda fn: fn()
         row = {
             "item": {"folder": r"D:\Trees\tree_test", "name": "tree_test"},
@@ -4321,6 +4360,7 @@ class GuiLabelTests(unittest.TestCase):
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
         app._prepare_finished.assert_called_once_with(1, 0)
+        app._validate_live_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
         app = self.gui.App.__new__(self.gui.App)

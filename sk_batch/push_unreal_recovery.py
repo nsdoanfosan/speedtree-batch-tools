@@ -388,28 +388,33 @@ def _checkout_asset_paths(item):
     return result
 
 
-def recover_manifest_item(
+def validate_unreal_only_recovery_evidence(
     parent_item,
     *,
-    parent_manifest_path,
-    parent_report_path,
     parent_source_record,
     current_source_record,
     current_source_fingerprint,
-    runtime_code_paths,
-    rebindable_code_paths=None,
-    report_path,
-    selected,
-    recovered_at=None,
+    rebindable_code_paths,
 ):
-    """Create one current-code item after validating immutable parent evidence."""
+    """Prove that one parent export is eligible for Unreal-only recovery.
+
+    Selection and execution deliberately call the same validator.  A parent
+    manifest label alone is never eligibility: the source snapshot, immutable
+    source hashes, and every exported artifact must still match.
+    """
+    if not isinstance(parent_item, dict):
+        raise PushUnrealRecoveryError("parent manifest item is incomplete")
     if parent_item.get("schema_version") != PUSH_MANIFEST_SCHEMA_VERSION:
         raise PushUnrealRecoveryError("parent item schema is incompatible")
     parent_source_record = (
-        parent_source_record if isinstance(parent_source_record, dict) else {}
+        parent_source_record
+        if isinstance(parent_source_record, dict)
+        else {}
     )
     current_source_record = (
-        current_source_record if isinstance(current_source_record, dict) else {}
+        current_source_record
+        if isinstance(current_source_record, dict)
+        else {}
     )
     parent_fingerprint = str(parent_item.get("source_fingerprint") or "")
     if parent_source_record.get("fingerprint") != parent_fingerprint:
@@ -426,13 +431,45 @@ def recover_manifest_item(
     validate_source_snapshots(
         parent_source_record.get("snapshot"),
         current_source_record.get("snapshot"),
+        rebindable_code_paths=rebindable_code_paths,
+    )
+    validate_item_artifacts(parent_item)
+    return True
+
+
+def recover_manifest_item(
+    parent_item,
+    *,
+    parent_manifest_path,
+    parent_report_path,
+    parent_source_record,
+    current_source_record,
+    current_source_fingerprint,
+    runtime_code_paths,
+    rebindable_code_paths=None,
+    report_path,
+    selected,
+    recovered_at=None,
+):
+    """Create one current-code item after validating immutable parent evidence."""
+    parent_source_record = (
+        parent_source_record if isinstance(parent_source_record, dict) else {}
+    )
+    current_source_record = (
+        current_source_record if isinstance(current_source_record, dict) else {}
+    )
+    parent_fingerprint = str(parent_item.get("source_fingerprint") or "")
+    validate_unreal_only_recovery_evidence(
+        parent_item,
+        parent_source_record=parent_source_record,
+        current_source_record=current_source_record,
+        current_source_fingerprint=current_source_fingerprint,
         rebindable_code_paths=(
             runtime_code_paths
             if rebindable_code_paths is None
             else rebindable_code_paths
         ),
     )
-    validate_item_artifacts(parent_item)
 
     current_code_files = [code_file_identity(path) for path in runtime_code_paths]
     old_code_revision = code_revision(parent_item.get("code_files") or [])

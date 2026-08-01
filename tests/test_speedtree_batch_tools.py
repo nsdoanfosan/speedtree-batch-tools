@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import speedtree_error_log
+
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 LAUNCHER_PATH = REPO_DIR / "speedtree_batch_tools_gui.pyw"
@@ -42,6 +44,171 @@ class IntegratedLauncherTests(unittest.TestCase):
             with self.subTest(tool=tool.label):
                 module = self.launcher.load_tool_module(tool)
                 self.assertTrue(callable(module.App))
+
+    def test_top_level_pcg_tab_navigation_initializes_real_entry_point(self):
+        pcg_index = 2
+        pcg_spec = self.launcher.TOOLS[pcg_index]
+        pcg_module = self.launcher.load_tool_module(pcg_spec)
+        embedded_app = object()
+
+        class FakeRoot:
+            def __init__(self):
+                self.idle_callbacks = []
+
+            def after_idle(self, callback):
+                self.idle_callbacks.append(callback)
+
+            def update_idletasks(self):
+                pass
+
+        class FakeNotebook:
+            def __init__(self):
+                self.selected = 0
+
+            def select(self, index=None):
+                if index is None:
+                    return self.selected
+                self.selected = index
+
+        class FakeVar:
+            def set(self, value):
+                self.value = value
+
+        owner = object.__new__(self.launcher.IntegratedApp)
+        owner.root = FakeRoot()
+        owner.notebook = FakeNotebook()
+        owner.tabs = [object(), object(), object()]
+        owner.apps = {}
+        owner.load_states = ["loaded", "pending", "pending"]
+        owner.status_var = FakeVar()
+        owner._clear_tab = mock.Mock()
+
+        self.assertEqual(owner.select_tab(pcg_index), "break")
+        self.assertEqual(owner.notebook.selected, pcg_index)
+        self.assertEqual(owner.load_states[pcg_index], "scheduled")
+        self.assertEqual(len(owner.root.idle_callbacks), 1)
+
+        loading_label = mock.Mock()
+        with mock.patch.object(
+            self.launcher,
+            "load_tool_module",
+            return_value=pcg_module,
+        ) as load_module, mock.patch.object(
+            pcg_module,
+            "App",
+            return_value=embedded_app,
+        ) as app_class, mock.patch.object(
+            self.launcher.ttk,
+            "Label",
+            return_value=loading_label,
+        ):
+            owner.root.idle_callbacks.pop()()
+
+        load_module.assert_called_once_with(pcg_spec)
+        app_class.assert_called_once_with(owner.tabs[pcg_index])
+        self.assertIs(owner.apps[pcg_index], embedded_app)
+        self.assertEqual(owner.load_states[pcg_index], "loaded")
+
+    def test_failed_pcg_tab_initialization_keeps_parent_navigation_ready(self):
+        pcg_index = 2
+        pcg_spec = self.launcher.TOOLS[pcg_index]
+        failure = RuntimeError("embedded App construction failed")
+        failing_module = type(
+            "PCGModule",
+            (),
+            {"App": mock.Mock(side_effect=failure)},
+        )()
+
+        class FakeRoot:
+            def update_idletasks(self):
+                pass
+
+            def after_idle(self, callback):
+                self.callback = callback
+
+        class FakeNotebook:
+            def select(self, index=None):
+                if index is not None:
+                    self.selected = index
+                return getattr(self, "selected", 0)
+
+        class FakeVar:
+            def set(self, value):
+                self.value = value
+
+        owner = object.__new__(self.launcher.IntegratedApp)
+        owner.root = FakeRoot()
+        owner.notebook = FakeNotebook()
+        owner.tabs = [object(), object(), object()]
+        owner.apps = {}
+        owner.load_states = ["loaded", "pending", "scheduled"]
+        owner.status_var = FakeVar()
+        owner._clear_tab = mock.Mock()
+        owner._show_load_error = mock.Mock()
+
+        with mock.patch.object(
+            self.launcher,
+            "load_tool_module",
+            return_value=failing_module,
+        ), mock.patch.object(
+            self.launcher,
+            "record_error",
+            return_value=True,
+        ) as record_error, mock.patch.object(
+            self.launcher.ttk,
+            "Label",
+            return_value=mock.Mock(),
+        ):
+            owner._load_tool(pcg_index)
+
+        self.assertEqual(owner.load_states[pcg_index], "failed")
+        self.assertNotIn(pcg_index, owner.apps)
+        record_error.assert_called_once_with(pcg_spec.label, failure)
+        owner._show_load_error.assert_called_once_with(pcg_index, failure)
+        self.assertEqual(owner.select_tab(0), "break")
+        self.assertEqual(owner.notebook.selected, 0)
+
+    def test_shared_ui_error_formatter_retains_complete_traceback(self):
+        try:
+            raise RuntimeError("pcg-tab-init-regression")
+        except RuntimeError as exc:
+            detail = speedtree_error_log.format_exception_traceback(exc)
+
+        self.assertIn("Traceback (most recent call last)", detail)
+        self.assertIn(
+            "test_shared_ui_error_formatter_retains_complete_traceback",
+            detail,
+        )
+        self.assertIn("RuntimeError: pcg-tab-init-regression", detail)
+
+    def test_shared_ui_error_recorder_forwards_complete_traceback(self):
+        captured = {}
+
+        def recorder(label, detail):
+            captured["label"] = label
+            captured["detail"] = detail
+            return True
+
+        try:
+            raise RuntimeError("async-pcg-init-failure")
+        except RuntimeError as exc:
+            with mock.patch.object(
+                speedtree_error_log,
+                "_bounded_error_recorder",
+                return_value=recorder,
+            ):
+                result = speedtree_error_log.record_exception(
+                    "PCG ST9 Texture initial refresh",
+                    exc,
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            captured["label"],
+            "PCG ST9 Texture initial refresh",
+        )
+        self.assertIn("Traceback (most recent call last)", captured["detail"])
+        self.assertIn("RuntimeError: async-pcg-init-failure", captured["detail"])
 
     def test_tab_adapter_absorbs_window_setters(self):
         adapter = self.launcher.ToolTab

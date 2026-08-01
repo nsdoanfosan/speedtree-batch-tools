@@ -151,6 +151,190 @@ class PushQueueFlowTests(unittest.TestCase):
             fixture["expected_result"]["blocked_reason_token"]
         ])
 
+    @staticmethod
+    def densiflora_stale_contract(target, provider, *, bind_target=True):
+        blocked_row = {
+            "spm": str(target),
+            "delivery_reason": (
+                "live_export_evidence_unavailable_stale_node_table"
+            ),
+            "delivery_remedy": (
+                "Open the target SPM in SpeedTree Modeler, regenerate/save "
+                "the Node table, then re-audit."
+            ),
+            "errors": [
+                "generator_export_evidence_stale_node_table",
+                "normalized_and_live_target_mesh_sets_differ",
+            ],
+            "stale_node_table_target_mesh_ids": [16, 17, 18, 19],
+            "live_node_table": {
+                "stale": True,
+                "generator_count": 48,
+                "node_table_generator_count": 43,
+                "orphan_generator_guids": ["orphan-a", "orphan-b"],
+                "orphan_node_count": 216495,
+                "total_node_count": 223675,
+            },
+        }
+        issue = {
+            "code": "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
+            "role": "cluster",
+            "spm": str(provider),
+            "errors": list(blocked_row["errors"]),
+            "remedy": blocked_row["delivery_remedy"],
+            "blocked_targets": [blocked_row],
+        }
+        return {
+            "tree_source_identities": [{"target_spm": str(target)}],
+            "dependencies": [{
+                "spm": str(provider),
+                "normalized_delivery_mode": "connection_incomplete",
+                "normalized_delivery_blocked": True,
+                "normalized_variants_required": True,
+                "normalized_variants": {
+                    "status": "ready",
+                    "delivery_mode": "connection_incomplete",
+                    "delivery_errors": list(blocked_row["errors"]),
+                    "delivery_blocked_targets": (
+                        [blocked_row] if bind_target else []
+                    ),
+                    "variants": [{"name": "Cluster"}],
+                },
+            }],
+            "handoff": {
+                "status": "blocked",
+                "errors": [issue],
+            },
+        }
+
+    def test_issue16_stale_node_target_is_excluded_with_operator_evidence(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = (
+            Path("densiflora") / "SK_tree_densiflora_03.spm"
+        ).resolve()
+        provider = (
+            Path("densiflora")
+            / "cluster"
+            / "SK_cluster_densiflora_01.spm"
+        ).resolve()
+        contract = self.densiflora_stale_contract(target, provider)
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": Path("densiflora_stale_live_audit.json"),
+            "log_file": Path("densiflora_stale_live_audit.log"),
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ):
+            with self.assertRaises(
+                gui.TargetPlannedExclusionError
+            ) as caught:
+                app._cluster_normalization_stage_observation(
+                    target,
+                    "densiflora",
+                    provider,
+                    require_normalized=False,
+                )
+
+        error = caught.exception
+        evidence = error.evidence
+        self.assertEqual(
+            error.reason_token,
+            "live_export_evidence_unavailable_stale_node_table",
+        )
+        self.assertEqual(evidence["target_name"], target.name)
+        self.assertEqual(
+            evidence["issue_codes"],
+            ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+        )
+        self.assertEqual(
+            evidence["stale_node_table_target_mesh_ids"],
+            [16, 17, 18, 19],
+        )
+        self.assertEqual(
+            evidence["live_node_table"],
+            {
+                "stale": True,
+                "generator_count": 48,
+                "node_table_generator_count": 43,
+                "orphan_node_count": 216495,
+                "total_node_count": 223675,
+                "orphan_generator_guid_count": 2,
+            },
+        )
+        self.assertNotIn("orphan-a", json.dumps(evidence))
+
+        with mock.patch.object(gui, "save_state"):
+            app._record_pipeline_planned_exclusion(target, error)
+        entry = app.state[str(target)]
+        for column in ("blend_status", "push_status"):
+            status = entry[column]
+            self.assertIn(target.name, status)
+            self.assertIn("stale Node table", status)
+            self.assertIn("orphan GUIDs 2", status)
+            self.assertIn("orphan Nodes 216495/223675", status)
+            self.assertIn("Mesh IDs 16,17,18,19", status)
+            self.assertIn("action=regenerate/save", status)
+        self.assertEqual(
+            entry["push_status_error"]["evidence"]["delivery_remedy"],
+            (
+                "Open the target SPM in SpeedTree Modeler, regenerate/save "
+                "the Node table, then re-audit."
+            ),
+        )
+        self.assertNotIn(str(provider), app.state)
+
+    def test_issue16_unbound_stale_node_issue_remains_shared_and_diagnostic(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = (
+            Path("densiflora") / "SK_tree_densiflora_03.spm"
+        ).resolve()
+        provider = (
+            Path("densiflora")
+            / "cluster"
+            / "SK_cluster_densiflora_01.spm"
+        ).resolve()
+        contract = self.densiflora_stale_contract(
+            target,
+            provider,
+            bind_target=False,
+        )
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": Path("unbound_stale_live_audit.json"),
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ):
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._cluster_normalization_stage_observation(
+                    target,
+                    "densiflora",
+                    provider,
+                    require_normalized=False,
+                )
+
+        message = str(caught.exception)
+        self.assertIn(target.name, message)
+        self.assertLess(
+            message.index(f"targets={target.name}"),
+            message.index("role=cluster"),
+        )
+        self.assertIn("orphan GUIDs 2", message)
+        self.assertIn("orphan Nodes 216495/223675", message)
+        self.assertIn("Mesh IDs 16,17,18,19", message)
+        self.assertIn("action=regenerate/save", message)
+
     def test_issue16_planned_exclusion_does_not_fan_out_shared_provider(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2823,6 +3007,15 @@ class PushQueueFlowTests(unittest.TestCase):
         app._enqueue_batch_job = mock.Mock(
             side_effect=lambda job: jobs.append(job)
         )
+        app._failed_retry_repair_state = mock.Mock(return_value={
+            "current": True,
+            "push_ready": True,
+            "kind": "ready",
+            "reason": "current content-addressed Repair output",
+        })
+        app._validate_failed_retry_unreal_item_current = mock.Mock(
+            return_value={}
+        )
         return jobs
 
     @staticmethod
@@ -2883,6 +3076,11 @@ class PushQueueFlowTests(unittest.TestCase):
             jobs[0]["retry_metadata"]["execution_path"],
             "immutable_unreal_only",
         )
+        app._validate_failed_retry_unreal_item_current.assert_called_once()
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]
+        self.assertEqual(
+            eligibility["items"][0]["classification"], "unreal_only"
+        )
 
     def test_failed_results_retry_blender_only_rebuilds_then_pushes(self):
         gui = load_gui_module()
@@ -2892,6 +3090,10 @@ class PushQueueFlowTests(unittest.TestCase):
         app.state[iid] = {
             "blend_status_kind": "data_error",
             "blend_status": "실패: Blender Repair failed",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "Blender Repair failed",
+            },
             # A previous Push receipt must not override the current visible
             # Blender failure.
             "push_status_kind": "imported_ok",
@@ -2899,6 +3101,12 @@ class PushQueueFlowTests(unittest.TestCase):
                 "manifest": "previous.json",
                 "checkpoint": "previous_checkpoint.json",
             },
+        }
+        app._failed_retry_repair_state.return_value = {
+            "current": False,
+            "push_ready": False,
+            "kind": "inspection_incomplete",
+            "reason": "failed Blender attempt has no current output",
         }
 
         with mock.patch.object(gui, "save_config"):
@@ -2931,6 +3139,55 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertTrue(jobs[0]["force_rerun"])
+
+    def test_failed_results_retry_stale_blender_forces_full_pipeline(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "stale_blender.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        # Saved success labels are deliberately contradictory. The current
+        # report/source fingerprint decision is the retry authority.
+        app.state[iid] = {
+            "blend_status": "최신 ✓",
+            "push_status_kind": "imported_ok",
+            "push_status": "완료 (현재 최신)",
+        }
+        app._failed_retry_repair_state.return_value = {
+            "current": False,
+            "push_ready": False,
+            "kind": "stale_content",
+            "reason": "current source fingerprint differs from Repair report",
+        }
+
+        with mock.patch.object(gui, "save_config"):
+            app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "pipeline")
+        self.assertTrue(jobs[0]["force_rerun"])
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]
+        self.assertEqual(
+            eligibility["items"][0]["reason_code"],
+            "blender_output_not_current",
+        )
+
+    def test_failed_results_retry_current_blender_success_is_excluded(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "current_blender.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {
+            # Text must not turn a content-current result into a retry.
+            "blend_status": "Blender 갱신 필요 — stale saved label",
+            "push_status_kind": "imported_ok",
+        }
+
+        with mock.patch.object(gui, "messagebox") as messages:
+            app.start_failed_results_retry()
+
+        self.assertEqual(jobs, [])
+        messages.showinfo.assert_called_once()
+        self.assertIn("current Blender success 제외", app.log.call_args.args[0])
 
     def test_failed_results_retry_mixed_selection_routes_without_duplicates(self):
         gui = load_gui_module()
@@ -2977,6 +3234,88 @@ class PushQueueFlowTests(unittest.TestCase):
         ]
         self.assertCountEqual(routed, [unreal_iid, export_iid])
         self.assertEqual(len(routed), len(set(routed)))
+
+    def test_failed_results_retry_dependency_overlap_promotes_to_rebuild(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        provider = "provider.spm"
+        tree = "tree.spm"
+        jobs = self.configure_failed_retry_start(app, [provider, tree])
+
+        def repair_state(iid):
+            if iid == provider:
+                return {
+                    "current": False,
+                    "push_ready": False,
+                    "kind": "stale_content",
+                    "reason": "provider source fingerprint changed",
+                }
+            return {
+                "current": True,
+                "push_ready": True,
+                "kind": "ready",
+                "reason": "current",
+            }
+
+        app._failed_retry_repair_state.side_effect = repair_state
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = root / "parent.json"
+            checkpoint = root / "checkpoint.json"
+            manifest.write_text(
+                json.dumps({
+                    "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                    "report_path": str(root / "parent_report.json"),
+                    "items": [
+                        {
+                            "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                            "queue_id": provider,
+                            "source_fingerprint": "provider-source-v1",
+                            "fingerprint": "provider-item-v1",
+                            "depends_on_queue_ids": [],
+                        },
+                        {
+                            "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                            "queue_id": tree,
+                            "source_fingerprint": "tree-source-v1",
+                            "fingerprint": "tree-item-v1",
+                            "depends_on_queue_ids": [provider],
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            checkpoint.write_text(
+                json.dumps({"items": {tree: {"status": "data_error"}}}),
+                encoding="utf-8",
+            )
+            app.state = {
+                provider: {"push_status_kind": "imported_ok"},
+                tree: {
+                    "push_status_kind": "data_error",
+                    "push_paths": {
+                        "manifest": str(manifest),
+                        "checkpoint": str(checkpoint),
+                    },
+                },
+            }
+
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual([job["mode"] for job in jobs], ["pipeline"])
+        routed = [str(item["spm"]) for item in jobs[0]["targets"]]
+        self.assertEqual(routed, [provider, tree])
+        self.assertEqual(len(routed), len(set(routed)))
+        app._validate_failed_retry_unreal_item_current.assert_not_called()
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]["items"]
+        self.assertEqual(
+            {row["queue_id"]: row["reason_code"] for row in eligibility},
+            {
+                provider: "blender_output_not_current",
+                tree: "unreal_dependency_requires_rebuild",
+            },
+        )
 
     def test_failed_results_retry_incomplete_unreal_evidence_fails_closed(self):
         gui = load_gui_module()
