@@ -17,6 +17,7 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
 ①~③은 실행 전 확인창을 띄우며, SPM/SBS/기존 출력은 수정 전에 백업한다.
 """
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +32,11 @@ from tkinter import filedialog, messagebox, ttk
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_DIR = TOOL_DIR.parent
+GUI_SOURCE_PATH = Path(__file__).resolve()
+GUI_SOURCE_SHA256 = hashlib.sha256(GUI_SOURCE_PATH.read_bytes()).hexdigest()
+GUI_MODULE_LOADED_AT = datetime.now().astimezone().isoformat(
+    timespec="milliseconds"
+)
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
@@ -1554,7 +1560,13 @@ class App:
         self.startup_latency = StartupLatencyTracker(
             selected_perf=getattr(
                 root, "_speedtree_tab_selected_perf", time.perf_counter()
-            )
+            ),
+            source_provenance={
+                "path": str(GUI_SOURCE_PATH),
+                "sha256": GUI_SOURCE_SHA256,
+                "module_loaded_at": GUI_MODULE_LOADED_AT,
+                "process_id": os.getpid(),
+            },
         )
         self.cfg = load_config()
         self.report = None

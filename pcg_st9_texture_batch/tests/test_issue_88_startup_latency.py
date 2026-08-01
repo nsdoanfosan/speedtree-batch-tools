@@ -66,6 +66,11 @@ class StartupLatencyReceiptTests(unittest.TestCase):
                 selected_perf=10.0,
                 clock=lambda: next(ticks),
                 receipt_path=receipt,
+                source_provenance={
+                    "path": "C:/repo/pcg_texture_gui.pyw",
+                    "sha256": "a" * 64,
+                    "process_id": 123,
+                },
             )
             tracker.mark(
                 "cached_board_paint",
@@ -87,6 +92,9 @@ class StartupLatencyReceiptTests(unittest.TestCase):
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 2)
             self.assertEqual(payload["status"], "complete")
+            self.assertEqual(
+                payload["source_provenance"]["sha256"], "a" * 64
+            )
             self.assertEqual(
                 payload["milestones"]["tab_selected"][
                     "from_tab_selection_seconds"

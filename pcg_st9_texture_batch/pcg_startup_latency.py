@@ -48,6 +48,7 @@ class StartupLatencyTracker:
         selected_perf=None,
         clock=time.perf_counter,
         receipt_path=STARTUP_LATENCY_RECEIPT_PATH,
+        source_provenance=None,
     ):
         self._clock = clock
         now = float(clock())
@@ -63,6 +64,7 @@ class StartupLatencyTracker:
             "started_at": datetime.now(timezone.utc).astimezone().isoformat(
                 timespec="milliseconds"
             ),
+            "source_provenance": dict(source_provenance or {}),
             "phase_order": list(STARTUP_PHASE_ORDER),
             "phase_budgets_seconds": dict(STARTUP_PHASE_BUDGET_SECONDS),
             "phases": [],
