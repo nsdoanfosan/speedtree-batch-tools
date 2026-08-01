@@ -95,15 +95,23 @@ def write_ascii_fbx(path, material_name="M_bark_elm_01_Mat", with_pair=True,
     )
 
 
-def write_export_xml(path, material="M_bark_elm_01_Mat",
+def write_export_xml(path, material="M_bark_elm_01_Mat", material_id="1",
                      textures=("T_bark_elm_01_color.tga",
-                               "T_bark_elm_01_normal.tga")):
+                               "T_bark_elm_01_normal.tga"), maps=None):
+    if maps is None:
+        names = ("Color", "Normal", "Gloss", "AO", "Height")
+        texture_root = path.parent.parent / "isolated" / "Tree_elm" / "texture"
+        maps = tuple(zip(
+            names,
+            (str(texture_root / value) for value in textures),
+        ))
     maps = "".join(
-        f'<Map Name="Map{index}" Source="X:/{value}"/>'
-        for index, value in enumerate(textures)
+        f'<Map Name="{name}" Source="{source}"/>'
+        for name, source in maps
     )
     path.write_text(
-        f'<SpeedTree><Materials><Material Name="{material}">{maps}'
+        f'<SpeedTree><Materials><Material ID="{material_id}" '
+        f'Name="{material}">{maps}'
         '</Material></Materials></SpeedTree>',
         encoding="utf-8",
     )
@@ -193,6 +201,92 @@ class BarkNormalizationTests(unittest.TestCase):
             self.isolation,
         )
         return plan, apply_isolated_bark_normalization(plan)
+
+    def preserved_alias_export_bundle(self, species, stem):
+        texture_dir = self.root / "production" / species / "texture"
+        texture_dir.mkdir(parents=True, exist_ok=True)
+        texture_paths = {}
+        for role in (
+                "color", "opacity", "normal", "extra", "subsurface",
+                "height"):
+            texture = texture_dir / f"T_bark_{species}_01_{role}.tga"
+            texture.write_bytes(f"{species}-{role}".encode("utf-8"))
+            texture_paths[role] = texture
+
+        map_roles = (
+            ("Color", "color"),
+            ("Opacity", "opacity"),
+            ("Normal", "normal"),
+            ("Gloss", "extra"),
+            ("SubsurfaceColor", "subsurface"),
+            ("SubsurfaceAmount", "subsurface"),
+            ("AO", "extra"),
+            ("Height", "height"),
+        )
+        output = {
+            "source_material": "M_bark_common_end_01",
+            "output_material": "M_bark_common_end_01",
+            "source_material_name_preserved": True,
+            "material_id": "2",
+            "canonical_textures": [
+                {
+                    "map": map_name,
+                    "source": str(texture_paths[role]),
+                    "isolated": str(texture_paths[role]),
+                    "sha256": sha256(texture_paths[role]),
+                    "spm_ref": f"../texture/{texture_paths[role].name}",
+                    "export_enabled": True,
+                }
+                for map_name, role in map_roles
+            ],
+            "production_texture_handoff": {
+                "status": "rebased",
+            },
+        }
+        report = {
+            "status": "normalized",
+            "canonical_material": f"M_bark_{species}_01",
+            "outputs": [output],
+            "production_sources_mutated": False,
+        }
+        export = self.root / "export" / stem
+        export.mkdir(parents=True)
+        fbx = export / f"{stem}.fbx"
+        stmat = export / f"{stem}.stmat"
+        xml = export / f"{stem}.xml"
+        write_ascii_fbx(fbx, material_name="M_bark_common_end_01_Mat")
+        source_maps = tuple(
+            (map_name, str(texture_paths[role]))
+            for map_name, role in map_roles
+            if map_name in {"Color", "Normal", "Gloss", "AO", "Height"}
+        )
+        write_export_xml(
+            stmat,
+            material="M_bark_common_end_01_Mat",
+            material_id="2",
+            maps=source_maps,
+        )
+        write_export_xml(
+            xml,
+            material="M_bark_common_end_01_Mat",
+            material_id="2",
+            maps=source_maps,
+        )
+        canonical_maps = "".join(
+            f'<Map Name="{map_name}" Source="{source}"/>'
+            for map_name, source in source_maps
+        )
+        canonical_block = (
+            f'<Material ID="3" Name="M_bark_{species}_01_Mat">'
+            f"{canonical_maps}</Material>"
+        )
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                "</Materials>",
+                canonical_block + "</Materials>",
+            )
+            metadata.write_text(payload, encoding="utf-8")
+        return fbx, stmat, xml, report, texture_paths
 
     def test_isolated_spm_gets_canonical_slot_without_structure_or_source_mutation(self):
         plan, report = self.normalize()
@@ -394,19 +488,25 @@ class BarkNormalizationTests(unittest.TestCase):
 
     def test_export_bundle_allows_disabled_opaque_maps_to_be_omitted(self):
         _plan, report = self.normalize()
+        opacity = self.copy_root / "texture" / "T_bark_elm_01_opacity.tga"
+        subsurface = (
+            self.copy_root / "texture" / "T_bark_elm_01_subsurface.tga"
+        )
+        opacity.write_bytes(b"opacity")
+        subsurface.write_bytes(b"subsurface")
         report["outputs"][0]["canonical_textures"].extend([
             {
                 "map": "Opacity",
-                "isolated": str(
-                    self.copy_root / "texture" / "T_bark_elm_01_opacity.tga"
-                ),
+                "source": str(opacity),
+                "isolated": str(opacity),
+                "sha256": sha256(opacity),
                 "export_enabled": False,
             },
             {
                 "map": "SubsurfaceColor",
-                "isolated": str(
-                    self.copy_root / "texture" / "T_bark_elm_01_subsurface.tga"
-                ),
+                "source": str(subsurface),
+                "isolated": str(subsurface),
+                "sha256": sha256(subsurface),
                 "export_enabled": False,
             },
         ])
@@ -427,42 +527,202 @@ class BarkNormalizationTests(unittest.TestCase):
             result["status"], "ready_for_downstream_blender_mapping"
         )
 
-    def test_export_bundle_allows_same_species_canonical_alias_slots(self):
-        _plan, report = self.normalize()
-        export = self.root / "export"
-        export.mkdir()
-        fbx = export / "branch_elm_01.fbx"
-        stmat = export / "branch_elm_01.stmat"
-        xml = export / "branch_elm_01.xml"
-        write_ascii_fbx(fbx)
-        expected = (
-            '<Material Name="M_bark_elm_01_Mat">'
-            '<Map Source="X:/T_bark_elm_01_color.tga"/>'
-            '<Map Source="X:/T_bark_elm_01_normal.tga"/>'
-            '</Material>'
+    def test_export_bundle_accepts_willow_branch_alias_receipts(self):
+        for stem in (
+                "SK_branch_weeping_willow_01",
+                "SK_branch_weeping_willow_side_01"):
+            with self.subTest(stem=stem):
+                fbx, stmat, xml, report, _textures = (
+                    self.preserved_alias_export_bundle(
+                        "weeping_willow",
+                        stem,
+                    )
+                )
+
+                result = validate_canonical_bark_export_bundle(
+                    fbx, stmat, xml, report
+                )
+
+                self.assertEqual(
+                    result["status"],
+                    "ready_for_downstream_blender_mapping",
+                )
+                self.assertEqual(
+                    result["output_materials"],
+                    ["M_bark_common_end_01"],
+                )
+                self.assertEqual(result["stmat"]["material_count"], 2)
+                alias = next(
+                    row for row in result["stmat"]["materials"]
+                    if row["receipt_scope"] == "normalization_output"
+                )
+                self.assertEqual(
+                    {
+                        row["map"]
+                        for row in alias["source_maps"]
+                    },
+                    {"Color", "Normal", "Gloss", "AO", "Height"},
+                )
+
+    def test_export_bundle_accepts_black_locast_shaped_alias_receipt(self):
+        fbx, stmat, xml, report, _textures = (
+            self.preserved_alias_export_bundle(
+                "black_locast",
+                "SK_branch_black_locast_01",
+            )
         )
-        alias = (
-            '<Material Name="M_Bark_elm_01_Mat">'
-            '<Map Source="X:/legacy/T_Bark_elm_01_color.tga"/>'
-            '<Map Source="X:/legacy/T_Bark_elm_01_normal.tga"/>'
-            '</Material>'
-        )
-        payload = (
-            f"<SpeedTree><Materials>{alias}{expected}"
-            "</Materials></SpeedTree>"
-        )
-        stmat.write_text(payload, encoding="utf-8")
-        xml.write_text(payload, encoding="utf-8")
 
         result = validate_canonical_bark_export_bundle(
             fbx, stmat, xml, report
         )
 
-        self.assertEqual(result["stmat"]["material_count"], 2)
-        self.assertTrue(any(
-            row["exact_normalized_set"]
-            for row in result["stmat"]["materials"]
-        ))
+        self.assertEqual(
+            result["canonical_material"],
+            "M_bark_black_locast_01",
+        )
+        self.assertEqual(
+            result["stmat"]["materials"][0]["material"],
+            "M_bark_common_end_01_Mat",
+        )
+
+    def test_export_bundle_rejects_undeclared_preserved_alias(self):
+        fbx, stmat, xml, report, _textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "undeclared_alias",
+            )
+        )
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                "M_bark_common_end_01_Mat",
+                "M_bark_undeclared_01_Mat",
+            )
+            metadata.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "undeclared canonical bark alias"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_source_role_outside_receipt(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "outside_receipt",
+            )
+        )
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                "</Material>",
+                f'<Map Name="Detail" Source="{textures["color"]}"/>'
+                "</Material>",
+            )
+            metadata.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "outside the normalization receipt"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_wrong_receipt_role(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "wrong_role",
+            )
+        )
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                str(textures["normal"]),
+                str(textures["color"]),
+            )
+            metadata.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "does not match its receipt path"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_stmat_xml_source_role_drift(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "metadata_role_drift",
+            )
+        )
+        height = f'<Map Name="Height" Source="{textures["height"]}"/>'
+        payload = xml.read_text(encoding="utf-8").replace(height, "")
+        xml.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "STMat/XML.*does not match"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_wrong_receipt_path(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "wrong_path",
+            )
+        )
+        alternate = self.root / "alternate" / textures["color"].name
+        alternate.parent.mkdir()
+        shutil.copy2(textures["color"], alternate)
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                str(textures["color"]),
+                str(alternate),
+            )
+            metadata.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "does not match its receipt path"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_changed_receipt_texture_content(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "changed_hash",
+            )
+        )
+        textures["color"].write_bytes(b"changed-after-receipt")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "texture hash changed"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_wrong_receipt_hash(self):
+        fbx, stmat, xml, report, _textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "wrong_hash",
+            )
+        )
+        report["outputs"][0]["canonical_textures"][0]["sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "texture hash changed"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+
+    def test_export_bundle_rejects_wrong_texture_family(self):
+        fbx, stmat, xml, report, textures = (
+            self.preserved_alias_export_bundle(
+                "weeping_willow",
+                "wrong_family",
+            )
+        )
+        wrong = textures["normal"].with_name(
+            "T_bark_black_locast_01_normal.tga"
+        )
+        shutil.copy2(textures["normal"], wrong)
+        for metadata in (stmat, xml):
+            payload = metadata.read_text(encoding="utf-8").replace(
+                str(textures["normal"]),
+                str(wrong),
+            )
+            metadata.write_text(payload, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                BarkNormalizationError, "does not match its receipt path"):
+            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
 
     def test_export_bundle_fails_closed_on_unbound_material(self):
         _plan, report = self.normalize()
@@ -520,7 +780,7 @@ class BarkNormalizationTests(unittest.TestCase):
         write_export_xml(xml)
 
         with self.assertRaisesRegex(
-                BarkNormalizationError, "another texture family"):
+                BarkNormalizationError, "does not match its receipt path"):
             validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
 
     @unittest.skipUnless(
