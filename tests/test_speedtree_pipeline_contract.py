@@ -470,6 +470,36 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 with self.subTest(directory=directory):
                     self.assertFalse(is_live_spm(backup))
 
+    def test_only_explicit_tool_owned_sibling_spms_are_ineligible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = write_spm(root / "SK_authored_backup_habitat_01.spm")
+            rollback = write_spm(
+                root
+                / (
+                    "SK_weed_reed_02.texture_slot_backup_"
+                    "20260801_010203_123456.spm"
+                )
+            )
+            artifacts = (
+                rollback,
+                write_spm(root / "SK_tree.apply_rollback_backup.spm"),
+                write_spm(root / "SK_tree.skbatch-rescue.spm"),
+                write_spm(root / "SK_tree.preimage.spm"),
+                write_spm(root / "__spm_sync_verify_token_SK_tree.spm"),
+                write_spm(root / ".__spm_pass_repair_token_SK_tree.spm"),
+            )
+
+            self.assertTrue(is_live_spm(authored))
+            for artifact in artifacts:
+                with self.subTest(artifact=artifact.name):
+                    self.assertFalse(is_live_spm(artifact))
+
+            # Eligibility affects operational discovery only.  Recovery tools
+            # can still address and read the exact rollback path explicitly.
+            self.assertTrue(rollback.is_file())
+            self.assertGreater(len(rollback.read_bytes()), 0)
+
     def test_pcg_production_group_uses_numeric_suffix_not_token_allowlist(self):
         self.assertEqual(
             derived_material_base(

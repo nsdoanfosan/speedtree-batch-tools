@@ -583,7 +583,7 @@ class ContentDecisionTests(unittest.TestCase):
         merged = SimpleNamespace(
             data=SimpleNamespace(
                 materials=[
-                    SimpleNamespace(name="M_leaf_weeping_willow_01"),
+                    SimpleNamespace(name="M_leaf_provider_current_01"),
                 ],
                 polygons=[
                     SimpleNamespace(index=0, material_index=0),
@@ -596,10 +596,10 @@ class ContentDecisionTests(unittest.TestCase):
             merged,
             [{
                 "role": "leaf",
-                "role_identity": "M_leaf_weeping_wilow_01",
-                "role_identity_aliases": ["leaf_weeping_willow_01"],
+                "role_identity": "M_leaf_provider_legacy_01",
+                "role_identity_aliases": ["leaf_provider_current_01"],
                 "assignments": [{
-                    "material": "leaf_weeping_willow_01_Mat",
+                    "material": "leaf_provider_current_01_Mat",
                 }],
                 "normalized_variants": {
                     "status": "ready",
@@ -612,7 +612,7 @@ class ContentDecisionTests(unittest.TestCase):
         self.assertEqual(rendered["leaf"]["material_slots"], [0])
         self.assertEqual(rendered["leaf"]["polygon_indices"], [0, 1])
         self.assertIn(
-            "leaf_weeping_willow_01",
+            "leaf_provider_current_01",
             rendered["leaf"]["matched_material_identities"],
         )
 

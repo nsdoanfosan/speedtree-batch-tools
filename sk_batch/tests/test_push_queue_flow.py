@@ -39,6 +39,26 @@ class PushQueueFlowTests(unittest.TestCase):
         app.log = mock.Mock()
         return app
 
+    def test_queue_snapshot_drops_ineligible_backup_board_row(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        live = Path("Weed_reed") / "SK_weed_reed_02.spm"
+        rollback = (
+            Path("Weed_reed")
+            / "SK_weed_reed_02.texture_slot_backup_20260801_010203_123456.spm"
+        )
+        app.items = {
+            str(live): {"spm": live, "checked": True},
+            str(rollback): {"spm": rollback, "checked": True},
+        }
+
+        inventory, targets = app._snapshot_batch_request(
+            [str(rollback), str(live)]
+        )
+
+        self.assertEqual(set(inventory), {str(live)})
+        self.assertEqual([item["spm"] for item in targets], [live])
+
     @staticmethod
     def issue16_fixture():
         return json.loads(
@@ -2750,6 +2770,368 @@ class PushQueueFlowTests(unittest.TestCase):
             cluster.name,
             app.state[str(root)]["push_status_error"]["message"],
         )
+
+    def test_cached_manifest_item_finds_recovered_item_after_provider(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "recovery.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "items": [
+                            {"queue_id": "provider", "fingerprint": "provider-v2"},
+                            {"queue_id": "tree", "fingerprint": "tree-v2"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            app.state["tree"] = {
+                "push_export_cache": {
+                    "source_fingerprint": "source-v2",
+                    "manifest": str(manifest_path),
+                    "fingerprint": "tree-v2",
+                }
+            }
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ):
+                item = app._cached_manifest_item("tree", "source-v2")
+
+        self.assertEqual(item["queue_id"], "tree")
+
+    def configure_failed_retry_start(self, app, selected_ids):
+        app.items = {
+            iid: {"spm": Path(iid), "checked": True}
+            for iid in selected_ids
+        }
+        app._close_cell_editor = mock.Mock()
+        app._collect_cfg = mock.Mock(return_value={"push_transport": "rpc"})
+        app._snapshot_batch_request = mock.Mock(
+            side_effect=lambda target_ids: (
+                dict(app.items),
+                [
+                    {"spm": Path(iid), "checked": True}
+                    for iid in target_ids
+                ],
+            )
+        )
+        jobs = []
+        app._enqueue_batch_job = mock.Mock(
+            side_effect=lambda job: jobs.append(job)
+        )
+        return jobs
+
+    @staticmethod
+    def write_unreal_retry_parent(gui, root, queue_id, status="data_error"):
+        manifest_path = root / "parent.json"
+        checkpoint_path = root / "checkpoint.json"
+        manifest_path.write_text(
+            json.dumps({
+                "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                "report_path": str(root / "parent_report.json"),
+                "items": [{
+                    "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                    "queue_id": queue_id,
+                    "source_fingerprint": "source-v1",
+                    "fingerprint": "item-v1",
+                    "depends_on_queue_ids": [],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        checkpoint_path.write_text(
+            json.dumps({
+                "items": {queue_id: {"status": status}},
+            }),
+            encoding="utf-8",
+        )
+        return manifest_path, checkpoint_path
+
+    def test_failed_results_retry_unreal_only_uses_immutable_job(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "unreal_failed.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, checkpoint = self.write_unreal_retry_parent(
+                gui, root, iid
+            )
+            app.state[iid] = {
+                "push_status_kind": "data_error",
+                "push_paths": {
+                    "manifest": str(manifest),
+                    "checkpoint": str(checkpoint),
+                },
+                "push_source_fingerprint_cache": {
+                    "fingerprint": "source-v1",
+                    "snapshot": {},
+                },
+            }
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "unreal_recovery")
+        self.assertFalse(jobs[0]["force_rerun"])
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["execution_path"],
+            "immutable_unreal_only",
+        )
+
+    def test_failed_results_retry_blender_only_rebuilds_then_pushes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "export_failed.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {
+            "blend_status_kind": "data_error",
+            "blend_status": "실패: Blender Repair failed",
+            # A previous Push receipt must not override the current visible
+            # Blender failure.
+            "push_status_kind": "imported_ok",
+            "push_paths": {
+                "manifest": "previous.json",
+                "checkpoint": "previous_checkpoint.json",
+            },
+        }
+
+        with mock.patch.object(gui, "save_config"):
+            app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "pipeline")
+        self.assertEqual(jobs[0]["terminal_phase"], "push")
+        self.assertTrue(jobs[0]["force_rerun"])
+        self.assertEqual(jobs[0]["push_transport"], "headless")
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["execution_path"],
+            "blender_send2ue_then_unreal",
+        )
+
+    def test_failed_results_retry_send2ue_export_uses_blender_pipeline(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "send2ue_export_failed.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {
+            "push_status_kind": "data_error",
+            "push_status": "실패: Send2UE export failed",
+            "push_paths": {"report": "export_failed.json"},
+        }
+
+        with mock.patch.object(gui, "save_config"):
+            app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "pipeline")
+        self.assertTrue(jobs[0]["force_rerun"])
+
+    def test_failed_results_retry_mixed_selection_routes_without_duplicates(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        unreal_iid = "unreal_failed.spm"
+        export_iid = "export_failed.spm"
+        jobs = self.configure_failed_retry_start(
+            app, [export_iid, unreal_iid]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, checkpoint = self.write_unreal_retry_parent(
+                gui, root, unreal_iid
+            )
+            app.state = {
+                export_iid: {
+                    "push_status_kind": "data_error",
+                    "push_paths": {"report": "export_failed.json"},
+                },
+                unreal_iid: {
+                    "push_status_kind": "data_error",
+                    "push_paths": {
+                        "manifest": str(manifest),
+                        "checkpoint": str(checkpoint),
+                    },
+                    "push_source_fingerprint_cache": {
+                        "fingerprint": "source-v1",
+                        "snapshot": {},
+                    },
+                },
+            }
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual(
+            [job["mode"] for job in jobs],
+            ["unreal_recovery", "pipeline"],
+        )
+        routed = [
+            str(item["spm"])
+            for job in jobs
+            for item in job["targets"]
+        ]
+        self.assertCountEqual(routed, [unreal_iid, export_iid])
+        self.assertEqual(len(routed), len(set(routed)))
+
+    def test_failed_results_retry_incomplete_unreal_evidence_fails_closed(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "incomplete_parent.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {
+            "push_status_kind": "data_error",
+            "push_paths": {"manifest": "parent.json"},
+        }
+
+        with mock.patch.object(gui, "messagebox") as messages:
+            app.start_failed_results_retry()
+
+        self.assertEqual(jobs, [])
+        messages.showinfo.assert_called_once()
+        self.assertIn("manifest/checkpoint 불완전", app.log.call_args.args[0])
+
+    def test_partial_retry_job_keeps_other_partition_in_fifo(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_batch_job = {
+            "id": 1,
+            "label": "Unreal-only retry",
+        }
+        app.pending_batch_jobs = deque([{
+            "id": 2,
+            "label": "Blender export retry",
+        }])
+        app.batch_job_failures = []
+        app.worker = mock.Mock()
+        app._start_next_batch_job = mock.Mock()
+        app._ensure_batch_queue_state = mock.Mock()
+
+        app._finish_batch_job({
+            "id": 1,
+            "status": "partial",
+            "error": "failed=1",
+            "completed_count": 0,
+            "blocked_count": 0,
+            "failed_count": 1,
+            "target_outcomes": [],
+            "shared_failures": [],
+        })
+
+        self.assertEqual(len(app.batch_job_failures), 1)
+        self.assertEqual(len(app.pending_batch_jobs), 1)
+        app._start_next_batch_job.assert_called_once_with()
+
+    def test_failed_unreal_recovery_never_calls_blender_export(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {}
+        app._active_production_source_manifest = mock.Mock(
+            content_hash="production-v2"
+        )
+        provider = {
+            "schema_version": 1,
+            "queue_id": "provider.spm",
+            "source_fingerprint": "provider-source-v1",
+            "fingerprint": "provider-item-v1",
+            "blend": "provider.blend",
+            "depends_on_queue_ids": [],
+        }
+        tree = {
+            "schema_version": 1,
+            "queue_id": "tree.spm",
+            "source_fingerprint": "tree-source-v1",
+            "fingerprint": "tree-item-v1",
+            "blend": "tree.blend",
+            "depends_on_queue_ids": ["provider.spm"],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent_path = Path(temp_dir) / "parent.json"
+            parent_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "report_path": str(Path(temp_dir) / "parent_report.json"),
+                        "items": [provider, tree],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            request = {
+                "parent_manifest": str(parent_path),
+                "parent_report": str(Path(temp_dir) / "parent_report.json"),
+                "selected_queue_ids": ["tree.spm"],
+                "source_records": {
+                    "provider.spm": {
+                        "fingerprint": "provider-source-v1",
+                        "snapshot": {},
+                    },
+                    "tree.spm": {
+                        "fingerprint": "tree-source-v1",
+                        "snapshot": {},
+                    },
+                },
+            }
+
+            def recovered(parent_item, **kwargs):
+                result = dict(parent_item)
+                result.update(
+                    {
+                        "source_fingerprint": "current-source",
+                        "fingerprint": parent_item["queue_id"] + "-v2",
+                        "verify_existing_assets": not kwargs["selected"],
+                        "recovery": {
+                            "parent_manifest": str(parent_path),
+                            "old_code_revision": "old",
+                            "new_code_revision": "new",
+                        },
+                    }
+                )
+                return result
+
+            app._push_unreal_code_paths = mock.Mock(return_value=[])
+            app._push_rebindable_unreal_code_paths = mock.Mock(return_value=[])
+            app._source_push_fingerprint = mock.Mock(return_value="current-source")
+            app._run_headless_import_items = mock.Mock(return_value=True)
+            app._export_manifest_item = mock.Mock(
+                side_effect=AssertionError("recovery must not run Blender export")
+            )
+            app.state = {
+                "provider.spm": {
+                    "push_source_fingerprint_cache": {
+                        "fingerprint": "current-source",
+                        "snapshot": {},
+                    }
+                },
+                "tree.spm": {
+                    "push_source_fingerprint_cache": {
+                        "fingerprint": "current-source",
+                        "snapshot": {},
+                    }
+                },
+            }
+            with mock.patch.object(
+                gui, "recover_manifest_item", side_effect=recovered
+            ), mock.patch.object(gui, "save_state"):
+                result = app._run_failed_unreal_recovery(
+                    [{"spm": Path("tree.spm"), "checked": True}],
+                    [request],
+                    emit_done=False,
+                )
+
+        self.assertTrue(result)
+        app._export_manifest_item.assert_not_called()
+        pending = app._run_headless_import_items.call_args.args[0]
+        self.assertEqual(
+            [item["queue_id"] for item in pending],
+            ["provider.spm", "tree.spm"],
+        )
+        self.assertTrue(pending[0]["verify_existing_assets"])
+        self.assertFalse(pending[1]["verify_existing_assets"])
 
 
 if __name__ == "__main__":

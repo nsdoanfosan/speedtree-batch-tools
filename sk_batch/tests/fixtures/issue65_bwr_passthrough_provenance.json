@@ -1,0 +1,149 @@
+{
+  "fixture_kind": "sanitized_issue_65_embedded_live_audit_authoritative",
+  "description": "A multi-target live receipt whose requested weed target has role metadata but a target-specific pass-through decision.",
+  "requested_target": "$TARGET_SPM",
+  "other_target": "$OTHER_TARGET_SPM",
+  "receipt": {
+    "cluster_assembly_receipt_persistence": {
+      "status": "ok",
+      "live_audit_complete": true
+    },
+    "items": [
+      {
+        "cluster_assembly": {
+          "schema_version": 1,
+          "folder": "$TARGET_FOLDER",
+          "tree_source_identities": [
+            {
+              "target_spm": {
+                "path": "$TARGET_SPM"
+              },
+              "authoritative_tree_source": {
+                "path": "$TARGET_SPM"
+              }
+            }
+          ],
+          "dependencies": [
+            {
+              "role": "cluster",
+              "name": "SK_cluster_sanitized_01",
+              "spm": "$DEPENDENCY_SPM",
+              "decision": "pass_through",
+              "normalized_delivery_mode": "asset_registration_only",
+              "spm_fingerprint": {
+                "path": "$DEPENDENCY_SPM"
+              }
+            }
+          ],
+          "handoff": {
+            "receipt_kind": "pcg_cluster_assembly_handoff",
+            "schema_version": 1,
+            "status": "pass_through",
+            "tree_source_identities": [
+              {
+                "target_spm": {
+                  "path": "$TARGET_SPM"
+                },
+                "authoritative_tree_source": {
+                  "path": "$TARGET_SPM"
+                }
+              }
+            ],
+            "cluster_dependencies": [
+              {
+                "role": "cluster",
+                "name": "SK_cluster_sanitized_01",
+                "spm": "$DEPENDENCY_SPM",
+                "decision": "pass_through",
+                "normalized_delivery_mode": "asset_registration_only",
+                "spm_fingerprint": {
+                  "path": "$DEPENDENCY_SPM"
+                }
+              }
+            ],
+            "roles": [
+              {
+                "role": "cluster",
+                "name": "SK_cluster_sanitized_01",
+                "decision": "pass_through",
+                "normalized_variants": {
+                  "status": "ready",
+                  "delivery_mode": "asset_registration_only"
+                },
+                "targets": [
+                  {
+                    "spm": "$TARGET_SPM"
+                  }
+                ]
+              }
+            ],
+            "full_skeletal_mesh_preserved": true,
+            "separate_nanite_assembly_requested": true,
+            "requires_actual_fbx_revalidation": true,
+            "issues": [],
+            "errors": []
+          }
+        }
+      },
+      {
+        "cluster_assembly": {
+          "schema_version": 1,
+          "folder": "$OTHER_FOLDER",
+          "tree_source_identities": [
+            {
+              "target_spm": {
+                "path": "$OTHER_TARGET_SPM"
+              },
+              "authoritative_tree_source": {
+                "path": "$OTHER_TARGET_SPM"
+              }
+            }
+          ],
+          "dependencies": [
+            {
+              "role": "leaf",
+              "name": "SK_leaf_other_01",
+              "decision": "normalize_part"
+            }
+          ],
+          "handoff": {
+            "receipt_kind": "pcg_cluster_assembly_handoff",
+            "schema_version": 1,
+            "status": "ready",
+            "tree_source_identities": [
+              {
+                "target_spm": {
+                  "path": "$OTHER_TARGET_SPM"
+                }
+              }
+            ],
+            "cluster_dependencies": [
+              {
+                "role": "leaf",
+                "name": "SK_leaf_other_01",
+                "decision": "normalize_part"
+              }
+            ],
+            "roles": [
+              {
+                "role": "leaf",
+                "name": "SK_leaf_other_01",
+                "decision": "normalize_part",
+                "targets": [
+                  {
+                    "spm": "$OTHER_TARGET_SPM"
+                  }
+                ]
+              }
+            ],
+            "full_skeletal_mesh_preserved": true,
+            "separate_nanite_assembly_requested": true,
+            "requires_actual_fbx_revalidation": true,
+            "issues": [],
+            "errors": []
+          }
+        }
+      }
+    ]
+  }
+}

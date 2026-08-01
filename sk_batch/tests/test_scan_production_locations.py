@@ -27,7 +27,17 @@ from speedtree_pipeline_contract import (  # noqa: E402
 PRODUCTION = (
     "Tree_elm/SK_Tree_elm_01.spm",
     "Tree_elm/SK_Tree_elm_02.spm",
+    "Tree_elm/SK_authored_backup_habitat_01.spm",
     "Weed_ivy/SK_Weed_Ivy_roof_40degree_01.spm",
+    "Weed_reed/SK_weed_reed_02.spm",
+    "Weed_reed/SK_weed_reed_03.spm",
+    "Weed_sorrel/SK_weed_sorrel_01.spm",
+)
+
+SIBLING_ROLLBACK_ARTIFACTS = (
+    "Weed_reed/SK_weed_reed_02.texture_slot_backup_20260801_010203_111111.spm",
+    "Weed_reed/SK_weed_reed_03.texture_slot_backup_20260801_010204_222222.spm",
+    "Weed_sorrel/SK_weed_sorrel_01.texture_slot_backup_20260801_010205_333333.spm",
 )
 
 # Every one of these was observed in the live vegetation root.
@@ -50,7 +60,9 @@ class ProductionLocationScanTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        for relative in PRODUCTION + WORK_ARTIFACTS + CLUSTER:
+        for relative in (
+            PRODUCTION + WORK_ARTIFACTS + SIBLING_ROLLBACK_ARTIFACTS + CLUSTER
+        ):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"<SpeedTreeRaw/>")
@@ -71,6 +83,14 @@ class ProductionLocationScanTests(unittest.TestCase):
         for artifact in WORK_ARTIFACTS:
             with self.subTest(artifact=artifact):
                 self.assertNotIn(artifact, found)
+
+    def test_cold_scan_excludes_sibling_texture_slot_rollbacks(self):
+        found = {
+            path.relative_to(self.root).as_posix()
+            for path in scan_sk_spms(self.root)
+        }
+        self.assertTrue(set(PRODUCTION).issubset(found))
+        self.assertTrue(set(SIBLING_ROLLBACK_ARTIFACTS).isdisjoint(found))
 
     def test_cluster_files_are_left_to_the_pair_inventory(self):
         found = {
@@ -107,7 +127,11 @@ class ProductionLocationScanTests(unittest.TestCase):
         found = {
             path.name for path in scan_sk_spms(self.root / "Tree_elm")
         }
-        self.assertEqual(found, {"SK_Tree_elm_01.spm", "SK_Tree_elm_02.spm"})
+        self.assertEqual(found, {
+            "SK_Tree_elm_01.spm",
+            "SK_Tree_elm_02.spm",
+            "SK_authored_backup_habitat_01.spm",
+        })
 
     def test_missing_root_returns_nothing_instead_of_raising(self):
         self.assertEqual(scan_sk_spms(self.root / "no_such_root"), [])

@@ -32,10 +32,23 @@ BACKUP_DIRECTORY_NAMES = frozenset(
         "_skbatch_backup",
         "_pcgtex_backups",
         "_atlas_cluster_normalization_backups",
+        "_auto_capture_backups",
+        "_codex_backups",
+        "_physical_10cm_backups",
     }
 )
 BACKUP_FILENAME_RE = re.compile(
-    r"\.(?:codex_backup|skbatch_backup|pcgtex_backup)", re.IGNORECASE
+    r"(?:"
+    r"\.(?:codex_backup|skbatch_backup|pcgtex_backup|skbatch-rescue)"
+    r"(?:[._-][^.]*)*\.spm$"
+    r"|\.texture_slot_backup_\d{8}_\d{6}(?:_\d{6})?\.spm$"
+    r"|\.apply_rollback_backup\.spm$"
+    r"|\.preimage\.spm$"
+    r"|\.pre_xml_root_fix_\d{8}(?:_\d{6}(?:_\d{6})?)?\.spm$"
+    r"|^__spm_sync_(?:preflight|verify)_.+\.spm$"
+    r"|^\.__spm_pass_repair_.+\.spm$"
+    r")",
+    re.IGNORECASE,
 )
 # A SpeedTree 16-byte Generator GUID appears in two observed serialization
 # spellings.  The shorter Modeler dialect omits a final ``A`` data character --
@@ -117,7 +130,15 @@ def branch_generator_has_render_geometry(properties):
 
 
 def is_live_spm(path, require_file=True):
-    """Classify an active SPM while excluding every pipeline backup namespace."""
+    """Shared operational eligibility predicate for authored SPM consumers.
+
+    Tool-owned backup, rollback, recovery, preflight, and verification files
+    remain directly addressable by their recovery code, but they must never be
+    rediscovered as board rows, queue targets, registry owners, Push
+    dependencies, or Cluster consumers.  Patterns stay deliberately explicit:
+    an ordinary authored asset is not excluded merely because its name contains
+    a word such as ``backup``.
+    """
     candidate = _canonical_path(path)
     if candidate.suffix.casefold() != ".spm":
         return False
