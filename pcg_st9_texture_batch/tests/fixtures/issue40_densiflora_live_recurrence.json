@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "source_issue": 40,
+  "observation_date": "2026-08-01",
+  "description": "Sanitized four-authored/one-live Densiflora Node-table shape.",
+  "target_spm": "SK_tree_densiflora_02.spm",
+  "node_table": {
+    "stale": false,
+    "orphan_owner_count": 0,
+    "orphan_node_count": 0,
+    "total_node_count": 1419
+  },
+  "material": {
+    "material_id": 1,
+    "material_name": "M_cluster_densiflora_fixture_01",
+    "mesh_ids": [14, 15, 16, 17]
+  },
+  "generator_bindings": [
+    {
+      "generator_name": "Frond Fixture 14",
+      "generator_guid": "fixture-frond-generator-14",
+      "generator_type": "Frond",
+      "slot_prefix": "Material:Frond:0",
+      "material_id": 1,
+      "mesh_id": 14,
+      "graph_visible": true,
+      "generated_node_count": 1419
+    },
+    {
+      "generator_name": "Frond Fixture 15",
+      "generator_guid": "fixture-frond-generator-15",
+      "generator_type": "Frond",
+      "slot_prefix": "Material:Frond:1",
+      "material_id": 1,
+      "mesh_id": 15,
+      "graph_visible": false,
+      "generated_node_count": 0
+    },
+    {
+      "generator_name": "Frond Fixture 16",
+      "generator_guid": "fixture-frond-generator-16",
+      "generator_type": "Frond",
+      "slot_prefix": "Material:Frond:2",
+      "material_id": 1,
+      "mesh_id": 16,
+      "graph_visible": false,
+      "generated_node_count": 0
+    },
+    {
+      "generator_name": "Frond Fixture 17",
+      "generator_guid": "fixture-frond-generator-17",
+      "generator_type": "Frond",
+      "slot_prefix": "Material:Frond:3",
+      "material_id": 1,
+      "mesh_id": 17,
+      "graph_visible": false,
+      "generated_node_count": 0
+    }
+  ],
+  "legacy_strict_audit": {
+    "declared_mesh_ids": [14, 15, 16, 17],
+    "live_export_participating_mesh_ids": [14],
+    "errors": [
+      "generator_not_export_participating",
+      "normalized_and_live_target_mesh_sets_differ"
+    ]
+  },
+  "manifest_resolution_boundary": {
+    "source_issue": 58,
+    "candidate_conflict_present_in_live_environment": true,
+    "fixture_assumption": "exact_cluster_01_scope_selected",
+    "selected_declared_mesh_ids": [14, 15, 16, 17],
+    "candidate_resolution_is_prerequisite": true
+  },
+  "recovery_scope_contract": {
+    "source_issue": 40,
+    "authoring_mesh_ids": [14, 15, 16, 17],
+    "required_live_mesh_ids": [14],
+    "post_manifest_selection_scope_split_remains": true
+  }
+}
