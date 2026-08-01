@@ -2,6 +2,7 @@
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +14,10 @@ REGISTRY_SUFFIX = ".atlas_leaf_targets.json"
 
 class TargetRegistryError(RuntimeError):
     pass
+
+
+class TargetRegistryPublishError(TargetRegistryError):
+    """A structured pre-commit atomic registry publication failure."""
 
 
 def registry_path_for_blend(blend_path):
@@ -79,11 +84,40 @@ def save_target_registry(blend_path, target_spms):
         "updated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = registry_path.with_name(registry_path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    temporary = registry_path.with_name(
+        f".{registry_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    os.replace(temporary, registry_path)
+    try:
+        with temporary.open(
+            "x",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            handle.write(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(temporary, registry_path)
+        except PermissionError as exc:
+            error = TargetRegistryPublishError(
+                "Atlas target registry atomic publish failed before commit: "
+                f"{temporary} -> {registry_path}: {exc}"
+            )
+            error.connected_retry_contract = {
+                "operation_phase": "registry_publish",
+                "committed": False,
+                "rollback_succeeded": False,
+                "temporary_output_isolated": True,
+                "error_code": int(
+                    getattr(exc, "winerror", None)
+                    or getattr(exc, "errno", None)
+                    or 0
+                ),
+            }
+            raise error from exc
+    finally:
+        temporary.unlink(missing_ok=True)
     payload["registry_path"] = str(registry_path)
     return payload
