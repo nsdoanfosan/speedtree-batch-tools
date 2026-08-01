@@ -1760,6 +1760,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            source_sidecar = file_fingerprint(sidecar)
             manifest = {
                 "status": "ready",
                 "full_asset_stem": "SK_Tree_elm_01",
@@ -1786,6 +1787,8 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                     "asset_path": "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
                     "file_path": str(full),
                     "_material_pipeline_json_path": str(sidecar),
+                    "_material_pipeline_json_sha256": source_sidecar["sha256"],
+                    "_material_pipeline_expected_mesh_name": "SK_Tree_elm_01",
                 },
                 "property_data": {
                     "unreal": {
@@ -1805,9 +1808,23 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 },
                 "pre_import_commands": [[
                     "_asset_path = '/Game/Codex/Tests/Elm/SK_Tree_elm_01'",
-                    f"json_path='{sidecar.as_posix()}'",
+                    (
+                        "_p.preflight_mesh_materials("
+                        "_asset_path, "
+                        f"json_path='{sidecar.as_posix()}', "
+                        "expected_mesh_name='SK_Tree_elm_01', "
+                        f"sidecar_sha256='{source_sidecar['sha256']}')"
+                    ),
                 ]],
-                "post_import_commands": [],
+                "post_import_commands": [[
+                    (
+                        "_p.process_mesh("
+                        "_asset_path, "
+                        f"json_path='{sidecar.as_posix()}', "
+                        "expected_mesh_name='SK_Tree_elm_01', "
+                        f"sidecar_sha256='{source_sidecar['sha256']}')"
+                    ),
+                ]],
             }
             plan = build_unreal_ingest_plan(
                 manifest,
@@ -1880,6 +1897,78 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
                 generated_sidecar.as_posix(),
                 plan["assets"][0]["pre_import_commands"][0][1],
             )
+            for generated_asset in plan["assets"]:
+                generated_data = generated_asset["asset_data"]
+                generated_mesh_name = generated_data[
+                    "_cluster_assembly_asset_name"
+                ]
+                generated_fingerprint = generated_data[
+                    "_material_pipeline_json_fingerprint"
+                ]
+                generated_sha256 = generated_fingerprint["sha256"]
+                self.assertNotEqual(
+                    generated_sha256,
+                    source_sidecar["sha256"],
+                )
+                self.assertEqual(
+                    generated_data["_material_pipeline_json_sha256"],
+                    generated_sha256,
+                )
+                self.assertEqual(
+                    generated_data["_material_pipeline_expected_mesh_name"],
+                    generated_mesh_name,
+                )
+                commands = json.dumps(
+                    generated_asset["pre_import_commands"]
+                    + generated_asset["post_import_commands"]
+                )
+                self.assertIn(generated_sha256, commands)
+                self.assertNotIn(source_sidecar["sha256"], commands)
+                self.assertIn(
+                    f"expected_mesh_name='{generated_mesh_name}'",
+                    commands,
+                )
+                self.assertNotIn(
+                    "expected_mesh_name='SK_Tree_elm_01'",
+                    commands,
+                )
+                self.assertIn(
+                    Path(generated_data["_material_pipeline_json_path"]).as_posix(),
+                    commands,
+                )
+
+            source_command = template["pre_import_commands"][0][1]
+            template["pre_import_commands"][0][1] = source_command.replace(
+                "expected_mesh_name='SK_Tree_elm_01'",
+                "expected_mesh_name='SK_Tree_wrong_01'",
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "command expected mesh name does not match",
+            ):
+                build_unreal_ingest_plan(
+                    manifest,
+                    template,
+                    "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
+                    "/Game/Codex/Tests/Elm",
+                )
+            template["pre_import_commands"][0][1] = source_command
+
+            template["pre_import_commands"][0][1] = source_command.replace(
+                source_sidecar["sha256"],
+                "0" * 64,
+            )
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "command SHA does not match",
+            ):
+                build_unreal_ingest_plan(
+                    manifest,
+                    template,
+                    "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
+                    "/Game/Codex/Tests/Elm",
+                )
+            template["pre_import_commands"][0][1] = source_command
 
             branch.write_bytes(b"tampered")
             with self.assertRaisesRegex(
@@ -2163,11 +2252,73 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             "origin": [0.0, 0.0, 1700.0],
             "size": [1600.0, 1500.0, 3600.0],
         }
+        for normalized_prototypes in (False, True):
+            with self.subTest(normalized_prototypes=normalized_prototypes):
+                with self.assertRaisesRegex(
+                    ClusterAssemblyBuildError,
+                    "do not reconstruct the Full SK",
+                ):
+                    validate_unreal_bounds_contract(
+                        full,
+                        base,
+                        displaced,
+                        allow_normalized_prototype_dominance=(
+                            normalized_prototypes
+                        ),
+                    )
+
+    def test_normalized_prototype_bounds_allow_thin_axis_overhang(self):
+        full = {
+            "origin": [
+                -1.0982780456542969,
+                -5.082328796386719,
+                24.226932525634766,
+            ],
+            "size": [164.37466430664062, 179.83251953125, 57.84678649902344],
+        }
+        base = {
+            "origin": [
+                -3.556598663330078,
+                -5.708957672119141,
+                18.99129867553711,
+            ],
+            "size": [138.00582885742188, 149.26934814453125, 47.375518798828125],
+        }
+        assembly = {
+            "origin": [
+                0.8774795532226562,
+                -6.514362335205078,
+                22.903104782104492,
+            ],
+            "size": [175.61282348632812, 193.51742553710938, 73.70487976074219],
+        }
+
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
             "do not reconstruct the Full SK",
         ):
-            validate_unreal_bounds_contract(full, base, displaced)
+            validate_unreal_bounds_contract(full, base, assembly)
+
+        report = validate_unreal_bounds_contract(
+            full,
+            base,
+            assembly,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(
+            report["assembly_size_validation_mode"],
+            "full_span_relative_normalized_prototype",
+        )
+        self.assertGreater(max(report["assembly_size_relative_errors"]), 0.27)
+        self.assertLess(
+            max(report["assembly_size_full_span_relative_errors"]),
+            0.09,
+        )
+        self.assertEqual(
+            report["assembly_origin_validation_mode"],
+            "axis_relative",
+        )
 
     def test_unreal_plan_keeps_full_and_assembly_separate(self):
         manifest = {

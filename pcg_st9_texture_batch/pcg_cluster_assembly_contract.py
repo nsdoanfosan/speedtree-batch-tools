@@ -31,6 +31,7 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
+from artifact_content_key import sampled_file_content_snapshot
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     generator_guid_key,
@@ -120,6 +121,26 @@ def _sha256_cached(path_text, size, mtime_ns):
 
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
+    if not hash_content:
+        try:
+            sampled = sampled_file_content_snapshot(candidate)
+        except OSError:
+            return {
+                "path": str(candidate),
+                "exists": False,
+                "size": None,
+                "mtime_ns": None,
+                "sha256": None,
+            }
+        return {
+            "path": str(candidate),
+            "exists": True,
+            "size": sampled["size"],
+            "mtime_ns": sampled["mtime_ns"],
+            "sha256": None,
+            "fingerprint": sampled["fingerprint"],
+            "fingerprint_algorithm": sampled["fingerprint_algorithm"],
+        }
     try:
         stat = candidate.stat()
     except OSError:
@@ -136,10 +157,7 @@ def file_fingerprint(path, hash_content=True):
         "exists": True,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": (
-            _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns)
-            if hash_content else None
-        ),
+        "sha256": _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns),
     }
 
 
@@ -918,15 +936,176 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
     }
 
 
-def _canonical_cluster_texture_refs(values, preferred_folder):
+def _preferred_basename_candidates(preferred_folder, basename):
+    """Return every file whose complete filename matches case-insensitively."""
+    preferred_folder = Path(preferred_folder)
+    if not preferred_folder.is_dir() or not basename:
+        return []
+    return [
+        candidate.resolve()
+        for candidate in preferred_folder.iterdir()
+        if (
+            candidate.is_file()
+            and candidate.name.casefold() == str(basename).casefold()
+        )
+    ]
+
+
+def _origin_alias_proof(value, candidate, origin_receipts):
+    """Return current path/hash proof for one old authored texture alias."""
+    value_key = _normalized_identity_path(value)
+    candidate_key = _normalized_identity_path(candidate)
+    current = file_fingerprint(candidate, hash_content=True)
+    current_sha = str(current.get("sha256") or "").casefold()
+    if not current.get("exists") or not current_sha:
+        return None
+    matches = []
+    for receipt in origin_receipts or []:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("kind")
+            != "blender_cluster_bake_texture_origin_receipt"
+            or receipt.get("source_origin") != "blender_cluster_bake"
+        ):
+            continue
+        contract_sha = str(
+            receipt.get("physical_capture_contract_sha256") or ""
+        ).casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", contract_sha) is None:
+            continue
+        for alias in receipt.get("path_aliases") or []:
+            if not isinstance(alias, dict):
+                continue
+            proof_sha = str(alias.get("sha256") or "").casefold()
+            if (
+                _normalized_identity_path(alias.get("legacy_path") or "")
+                != value_key
+                or _normalized_identity_path(
+                    alias.get("canonical_path") or ""
+                ) != candidate_key
+                or Path(str(alias.get("canonical_path") or "")).name.casefold()
+                != Path(value).name.casefold()
+                or proof_sha != current_sha
+            ):
+                continue
+            manifest = file_fingerprint(
+                receipt.get("physical_capture_manifest"),
+                hash_content=True,
+            )
+            if not manifest.get("exists") or not manifest.get("sha256"):
+                continue
+            matches.append({
+                "source_spm": receipt.get("source_spm"),
+                "material_id": receipt.get("material_id"),
+                "material_name": receipt.get("material_name"),
+                "origin_contract_sha256": contract_sha,
+                "origin_manifest": manifest,
+            })
+    contract_hashes = {
+        row["origin_contract_sha256"] for row in matches
+    }
+    if not matches or len(contract_hashes) != 1:
+        return None
+    manifests = []
+    seen_manifests = set()
+    identities = []
+    for row in matches:
+        manifest = row["origin_manifest"]
+        key = _normalized_identity_path(manifest["path"])
+        if key not in seen_manifests:
+            seen_manifests.add(key)
+            manifests.append(manifest)
+        identity = {
+            "source_spm": row["source_spm"],
+            "material_id": row["material_id"],
+            "material_name": row["material_name"],
+        }
+        if identity not in identities:
+            identities.append(identity)
+    return {
+        "sha256": current_sha,
+        "origin_contract_sha256": next(iter(contract_hashes)),
+        "origin_manifests": manifests,
+        "origin_identities": identities,
+    }
+
+
+def _cluster_texture_origin_receipts(
+    audit,
+    dependency_usage,
+    preferred_folder,
+):
+    """Rebuild live origin proof for the exact consuming SPM materials."""
+    receipts = []
+    material_names_by_spm = dependency_usage.get(
+        "material_names_by_spm"
+    ) or {}
+    material_ids_by_spm = dependency_usage.get(
+        "material_ids_by_spm"
+    ) or {}
+
+    def mapped_values(mapping, spm):
+        return list(
+            mapping.get(str(spm), [])
+            or mapping.get(str(spm).casefold(), [])
+        )
+
+    for spm_value in dependency_usage.get("spms") or []:
+        spm = Path(spm_value)
+        material_names = {
+            normalize_export_name(value)
+            for value in mapped_values(material_names_by_spm, spm)
+        }
+        material_ids = {
+            str(value) for value in mapped_values(material_ids_by_spm, spm)
+            if value not in {None, ""}
+        }
+        if not material_names and not material_ids:
+            continue
+        for material in audit.extract_material_image_refs(spm):
+            if material_ids and str(
+                material.get("material_id") or ""
+            ) not in material_ids:
+                continue
+            if material_names and normalize_export_name(
+                material.get("material_name")
+            ) not in material_names:
+                continue
+            refs = list(material.get("refs") or [])
+            try:
+                receipt = audit.cluster_render_origin_receipt(
+                    Path(preferred_folder).parent,
+                    spm,
+                    refs,
+                    material_id=material.get("material_id"),
+                    material_name=material.get("material_name"),
+                    path_alias_folder=preferred_folder,
+                )
+            except (OSError, ValueError):
+                receipt = {}
+            if receipt:
+                receipts.append(receipt)
+    return receipts
+
+
+def _canonical_cluster_texture_refs(
+    values,
+    preferred_folder,
+    *,
+    origin_receipts=None,
+    resolution_out=None,
+):
     """Collapse path aliases for the same Cluster texture to one authority.
 
     Older SPMs can retain an absolute path from a previous OneDrive layout
     alongside the current path.  Those rows describe the same texture when
     their filenames match; recording both makes a newly written hash receipt
     stale immediately because the legacy alias no longer exists.  Prefer an
-    existing file in the Cluster output folder, then any existing alias.  A
-    genuinely missing unique texture remains in the result and still blocks.
+    existing file in the Cluster output folder, then any existing alias.  An
+    old-only alias may introduce the exact-basename sibling as a candidate
+    only when a live physical-capture origin receipt binds the authored path
+    to that sibling and its current SHA-256.  A missing, ambiguous, or
+    unproven alias remains in the result and still blocks.
     """
     preferred_key = os.path.normcase(os.path.abspath(str(preferred_folder)))
     groups = {}
@@ -949,8 +1128,65 @@ def _canonical_cluster_texture_refs(values, preferred_folder):
 
     selected = []
     ignored_aliases = []
+    resolution_groups = []
     for key in group_order:
         candidates = groups[key]
+        name_key = key[1] if key[0] == "name" else ""
+        siblings = _preferred_basename_candidates(
+            preferred_folder,
+            Path(candidates[0]).name if name_key else "",
+        )
+        direct_current = [
+            path for path in candidates
+            if (
+                path.is_file()
+                and os.path.normcase(os.path.abspath(str(path.parent)))
+                == preferred_key
+            )
+        ]
+        resolution = {
+            "basename": Path(candidates[0]).name if name_key else None,
+            "authored_refs": [str(path) for path in candidates],
+        }
+        if len(siblings) > 1:
+            resolution.update({
+                "status": "path_alias_ambiguous",
+                "candidates": [str(path) for path in siblings],
+            })
+        elif direct_current:
+            resolution.update({
+                "status": "direct_current_ref",
+                "selected": str(direct_current[0]),
+            })
+        elif len(siblings) == 1:
+            sibling = siblings[0]
+            proofs = [
+                (path, _origin_alias_proof(
+                    path, sibling, origin_receipts
+                ))
+                for path in candidates
+            ]
+            proofs = [(path, proof) for path, proof in proofs if proof]
+            if proofs:
+                candidates.append(sibling)
+                resolution.update({
+                    "status": "resolved_current_sibling",
+                    "selected": str(sibling),
+                    "aliases": [str(path) for path, _proof in proofs],
+                    "proof": proofs[0][1],
+                })
+            else:
+                resolution.update({
+                    "status": "path_alias_unproven",
+                    "candidate": str(sibling),
+                })
+        else:
+            resolution.update({
+                "status": "path_alias_missing",
+                "candidate": str(
+                    Path(preferred_folder) / Path(candidates[0]).name
+                ) if name_key else None,
+            })
 
         def rank(path):
             parent_key = os.path.normcase(os.path.abspath(str(path.parent)))
@@ -968,12 +1204,19 @@ def _canonical_cluster_texture_refs(values, preferred_folder):
             if _normalized_identity_path(path)
             != _normalized_identity_path(authority)
         )
+        resolution["selected"] = str(authority)
+        resolution_groups.append(resolution)
+    if isinstance(resolution_out, dict):
+        resolution_out.update({
+            "policy": "exact_current_sibling_with_live_origin_sha256_v1",
+            "groups": resolution_groups,
+        })
     return selected, ignored_aliases
 
 
 def _tga_basename_validation(
         output_spm, dependency_usage, legacy_output_spm=None,
-        resolved_refs=None, ignored_aliases=None):
+        resolved_refs=None, ignored_aliases=None, alias_resolution=None):
     expected = Path(output_spm).stem.casefold()
     accepted = {expected}
     if legacy_output_spm:
@@ -997,16 +1240,31 @@ def _tga_basename_validation(
             for base in accepted
         )
     ]
-    if missing:
-        status = "missing"
-    elif invalid:
+    unresolved_aliases = [
+        row
+        for row in (alias_resolution or {}).get("groups") or []
+        if row.get("status") in {
+            "path_alias_missing",
+            "path_alias_unproven",
+            "path_alias_ambiguous",
+        }
+    ]
+    if invalid:
         status = "basename_mismatch"
+        diagnostic = "basename_or_suffix_mismatch"
+    elif missing or unresolved_aliases:
+        status = "missing"
+        diagnostic = "path_alias_missing"
     elif refs:
         status = "ok"
+        diagnostic = None
     else:
         status = "not_found"
+        diagnostic = "texture_ref_not_found"
     return {
         "status": status,
+        "diagnostic": diagnostic,
+        "reason": diagnostic,
         "expected_base": Path(output_spm).stem,
         "accepted_legacy_base": (
             Path(legacy_output_spm).stem if legacy_output_spm else None
@@ -1017,6 +1275,8 @@ def _tga_basename_validation(
         ],
         "missing": missing,
         "invalid": invalid,
+        "unresolved_aliases": unresolved_aliases,
+        "alias_resolution": alias_resolution or {},
     }
 
 
@@ -3644,10 +3904,14 @@ def build_cluster_assembly_contract(
         capture_texture_refs = _normalized_capture_texture_refs(
             normalized_variants
         )
+        texture_alias_resolution = {}
+        texture_origin_receipts = []
         if capture_texture_refs:
             texture_refs, ignored_texture_aliases = (
                 _canonical_cluster_texture_refs(
-                    capture_texture_refs, output_spm.parent
+                    capture_texture_refs,
+                    output_spm.parent,
+                    resolution_out=texture_alias_resolution,
                 )
             )
             texture_contract_source = "atlas_physical_capture"
@@ -3657,12 +3921,36 @@ def build_cluster_assembly_contract(
                 if dependency_usage.get("connected_refs") is not None
                 else dependency_usage.get("source_refs") or []
             )
+            preferred_texture_parent = os.path.normcase(
+                os.path.abspath(str(output_spm.parent))
+            )
+            needs_alias_proof = any(
+                os.path.normcase(os.path.abspath(str(Path(value).parent)))
+                != preferred_texture_parent
+                for value in raw_texture_refs
+            )
+            if needs_alias_proof:
+                texture_origin_receipts = _cluster_texture_origin_receipts(
+                    audit,
+                    dependency_usage,
+                    output_spm.parent,
+                )
             texture_refs, ignored_texture_aliases = (
                 _canonical_cluster_texture_refs(
-                    raw_texture_refs, output_spm.parent
+                    raw_texture_refs,
+                    output_spm.parent,
+                    origin_receipts=texture_origin_receipts,
+                    resolution_out=texture_alias_resolution,
                 )
             )
-            texture_contract_source = "connected_spm_material"
+            texture_contract_source = (
+                "connected_spm_material_origin_receipt"
+                if any(
+                    row.get("status") == "resolved_current_sibling"
+                    for row in texture_alias_resolution.get("groups") or []
+                )
+                else "connected_spm_material"
+            )
         if decision == "reference_only":
             tga_validation = {
                 "status": "not_applicable",
@@ -3679,6 +3967,8 @@ def build_cluster_assembly_contract(
                 ],
                 "missing": [],
                 "invalid": [],
+                "unresolved_aliases": [],
+                "alias_resolution": texture_alias_resolution,
             }
         else:
             tga_validation = _tga_basename_validation(
@@ -3687,6 +3977,7 @@ def build_cluster_assembly_contract(
                 legacy_output_spm=pair_row["legacy_output_spm"],
                 resolved_refs=texture_refs,
                 ignored_aliases=ignored_texture_aliases,
+                alias_resolution=texture_alias_resolution,
             )
         texture_origin_kind = (
             "blender_cluster_bake"
@@ -3721,6 +4012,7 @@ def build_cluster_assembly_contract(
             ],
             "texture_origin_kind": texture_origin_kind,
             "texture_contract_source": texture_contract_source,
+            "texture_alias_resolution": texture_alias_resolution,
             "tga_basename_validation": tga_validation,
             "referenced_by_spms": list(dependency_usage.get("spms") or []),
             "target_material_names": list(
@@ -3918,6 +4210,8 @@ def build_cluster_assembly_contract(
             "source_mesh_ids": row["source_mesh_ids"],
             "texture_dependencies": row["texture_dependencies"],
             "texture_origin_kind": row["texture_origin_kind"],
+            "texture_contract_source": row["texture_contract_source"],
+            "texture_alias_resolution": row["texture_alias_resolution"],
             "tga_basename_validation": row["tga_basename_validation"],
             "referenced_by_spms": row["referenced_by_spms"],
             "normalized_variants": row.get("normalized_variants"),
@@ -4353,6 +4647,21 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
             # proof that the receipt snapshot itself is stale.  If the texture
             # later appears, the next audit can produce a new ready snapshot.
             if isinstance(row, dict) and row.get("exists")
+        )
+        alias_resolution = (
+            dependency.get("texture_alias_resolution")
+            or (
+                dependency.get("tga_basename_validation") or {}
+            ).get("alias_resolution")
+            or {}
+        )
+        expected_artifacts.extend(
+            manifest
+            for group in alias_resolution.get("groups") or []
+            for manifest in (group.get("proof") or {}).get(
+                "origin_manifests"
+            ) or []
+            if isinstance(manifest, dict) and manifest.get("exists")
         )
         variants = dependency.get("normalized_variants") or {}
         if variants:

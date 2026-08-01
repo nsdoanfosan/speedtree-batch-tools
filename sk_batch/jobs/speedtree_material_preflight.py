@@ -46,6 +46,7 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
     canonical_material_name as pcg_canonical_material_name,
+    live_generator_delivery_snapshot,
     texture_base_for_material,
 )
 from pcg_st9_texture_batch.pcg_texture_common import (  # noqa: E402
@@ -185,6 +186,196 @@ def _production_asset_root(spm_path):
     return cluster.parent if cluster is not None else spm.parent
 
 
+def _capture_live_material_export_evidence(spm_path):
+    """Read one uncached post-export Generator snapshot, or fail closed."""
+    requested = str(Path(spm_path).resolve()) if spm_path else ""
+    if not requested:
+        return {
+            "status": "unavailable",
+            "capture_stage": "post_speedtree_export",
+            "requested_spm": "",
+            "error": "live export evidence SPM was not supplied",
+        }
+    try:
+        snapshot = live_generator_delivery_snapshot(requested)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "status": "inspection_error",
+            "capture_stage": "post_speedtree_export",
+            "requested_spm": requested,
+            "error": str(exc),
+        }
+    return {
+        "status": "ok",
+        "capture_stage": "post_speedtree_export",
+        "requested_spm": requested,
+        "snapshot": snapshot,
+    }
+
+
+def _material_live_export_scope(
+    binding,
+    spm_matches,
+    leaf_contract,
+    all_material_contract,
+    live_evidence,
+):
+    """Classify only exact fresh nonparticipation as nonblocking.
+
+    Absence from an expected-material list is not enough: a stale Node table,
+    an unknown material identity, or a partially populated binding remains a
+    blocker.  The narrow exception requires every live Frond/Leaf Mesh row for
+    the uniquely matched material to carry explicit, coherent false values for
+    all three participation fields.
+    """
+    material_name = str(binding.get("material") or "")
+    material_key = _material_contract_key(material_name)
+    expected_leaf = list(
+        (leaf_contract or {}).get("expected_visible_material_names") or []
+    )
+    expected_all = list(
+        (all_material_contract or {}).get("expected_materials") or []
+    )
+    base = {
+        "status": "fail_closed",
+        "reason": "material_export_scope_evidence_ambiguous",
+        "material": material_name,
+        "expected_visible_material_names": expected_leaf,
+        "expected_all_export_material_names": expected_all,
+        "bindings": [],
+    }
+    if any(
+        _material_contract_key(name) == material_key
+        for name in expected_leaf + expected_all
+    ):
+        return {
+            **base,
+            "reason": "material_is_expected_to_export",
+        }
+    if len(spm_matches) != 1:
+        return {
+            **base,
+            "reason": "material_identity_not_unique",
+            "spm_material_match_count": len(spm_matches),
+        }
+
+    material_id = str(spm_matches[0].get("material_id") or "").strip()
+    base["material_id"] = material_id
+    if not material_id:
+        return {
+            **base,
+            "reason": "material_id_unavailable",
+        }
+    if (live_evidence or {}).get("status") != "ok":
+        return {
+            **base,
+            "reason": "live_export_evidence_unavailable",
+            "evidence_status": (live_evidence or {}).get("status") or "",
+            "evidence_error": (live_evidence or {}).get("error") or "",
+        }
+
+    snapshot = live_evidence.get("snapshot") or {}
+    if snapshot.get("contract") != "speedtree_live_generator_delivery_snapshot_v1":
+        return {
+            **base,
+            "reason": "live_export_evidence_contract_ambiguous",
+        }
+    snapshot_spm = str(snapshot.get("spm") or "")
+    requested_spm = str(live_evidence.get("requested_spm") or "")
+    if _path_key(snapshot_spm) != _path_key(requested_spm):
+        return {
+            **base,
+            "reason": "live_export_evidence_source_mismatch",
+            "snapshot_spm": snapshot_spm,
+            "requested_spm": requested_spm,
+        }
+
+    node_table = snapshot.get("node_table") or {}
+    base["node_table"] = {
+        "stale": node_table.get("stale"),
+        "total_node_count": node_table.get("total_node_count"),
+        "orphan_node_count": node_table.get("orphan_node_count"),
+    }
+    base["spm_text_sha256"] = str(snapshot.get("spm_text_sha256") or "")
+    if node_table.get("stale") is not False:
+        return {
+            **base,
+            "reason": "live_export_evidence_stale_node_table",
+        }
+    try:
+        total_node_count = int(node_table.get("total_node_count") or 0)
+    except (TypeError, ValueError):
+        total_node_count = 0
+    if total_node_count <= 0:
+        return {
+            **base,
+            "reason": "live_export_evidence_node_table_empty",
+        }
+
+    rows = [
+        row
+        for row in snapshot.get("leaf_generator_bindings") or []
+        if str(row.get("material_id") or "").strip().casefold()
+        == material_id.casefold()
+    ]
+    fields = (
+        "visible",
+        "graph_visible",
+        "export_participates",
+    )
+    summarized = [
+        {
+            "generator_guid": row.get("generator_guid", ""),
+            "generator_name": row.get("generator_name", ""),
+            "generator_type": row.get("generator_type", ""),
+            "slot_prefix": row.get("slot_prefix", ""),
+            "visible": row.get("visible"),
+            "graph_visible": row.get("graph_visible"),
+            "generated_node_count": row.get("generated_node_count"),
+            "export_participates": row.get("export_participates"),
+            "export_evidence": row.get("export_evidence", ""),
+            "node_table_stale": row.get("node_table_stale"),
+        }
+        for row in rows
+    ]
+    base["bindings"] = summarized
+    if not rows:
+        return {
+            **base,
+            "reason": "material_live_binding_evidence_missing",
+        }
+    if any(
+        any(row.get(field) is True for field in fields)
+        for row in rows
+    ):
+        return {
+            **base,
+            "reason": "material_live_binding_visible_or_exporting",
+        }
+    if any(
+        any(row.get(field) is not False for field in fields)
+        for row in rows
+    ):
+        return {
+            **base,
+            "reason": "material_live_binding_state_ambiguous",
+        }
+    if any(
+        row.get("export_evidence") != "node_table"
+        or row.get("node_table_stale") is not False
+        for row in rows
+    ):
+        return {
+            **base,
+            "reason": "material_live_binding_evidence_stale_or_ambiguous",
+        }
+    return {
+        **base,
+        "status": "proven_inactive",
+        "reason": "fresh_live_export_nonparticipation",
+    }
+
+
 def _is_cluster_capture_source_set(paths):
     """True for maps stored directly in an asset Cluster output folder."""
     try:
@@ -290,6 +481,9 @@ def augment_texture_readiness_contract(
     production_spm,
     *,
     source_texture_roots=None,
+    leaf_contract=None,
+    all_material_contract=None,
+    export_evidence_spm=None,
 ):
     """Add provisional/raw and Blender-bake provenance to STMAT readiness."""
     readiness = dict(readiness or {})
@@ -321,6 +515,10 @@ def augment_texture_readiness_contract(
     )
     warnings = list(readiness.get("warnings") or [])
     missing = list(readiness.get("missing") or [])
+    live_evidence = _capture_live_material_export_evidence(
+        export_evidence_spm
+    )
+    readiness["live_material_export_evidence"] = live_evidence
 
     for binding in bindings:
         if binding.get("status") != "not_managed":
@@ -478,9 +676,13 @@ def augment_texture_readiness_contract(
                     "state": state,
                 })
         if rejected:
-            binding["status"] = "blocked_source"
-            binding["texture_contract_status"] = "blocked_source"
-            binding["source_rejections"] = rejected
+            export_scope = _material_live_export_scope(
+                binding,
+                spm_matches,
+                leaf_contract,
+                all_material_contract,
+                live_evidence,
+            )
             missing_row = {
                 "material": binding.get("material"),
                 "material_index": binding.get("material_index"),
@@ -491,7 +693,37 @@ def augment_texture_readiness_contract(
                 "expected_texture_base": expected_base,
                 "expected_t_paths": expected_t_paths,
                 "source_rejections": rejected,
+                "export_scope": export_scope,
             }
+            if export_scope.get("status") == "proven_inactive":
+                warning = (
+                    f"{binding.get('material')}: unsafe provisional source "
+                    "is retained for diagnostics, but fresh live export "
+                    "evidence proves this material is inactive"
+                )
+                binding.update({
+                    # Preserve ``not_managed`` so downstream repair keeps the
+                    # declared sources instead of treating the non-exporting
+                    # diagnostic row as an unresolved managed set.
+                    "texture_contract_status":
+                        "inactive_provisional_source_diagnostic",
+                    "source_rejections": rejected,
+                    "export_scope": export_scope,
+                    "warning": warning,
+                })
+                warnings.append({
+                    **missing_row,
+                    "status": "inactive_provisional_source_diagnostic",
+                    "issue_code":
+                        "INACTIVE_MATERIAL_PROVISIONAL_SOURCE",
+                    "warning": warning,
+                })
+                continue
+
+            binding["status"] = "blocked_source"
+            binding["texture_contract_status"] = "blocked_source"
+            binding["source_rejections"] = rejected
+            binding["export_scope"] = export_scope
             missing.append(missing_row)
             continue
 
@@ -536,6 +768,12 @@ def augment_texture_readiness_contract(
     elif warnings:
         readiness["status"] = (
             "source_fallback_needs_pcg_generation"
+            if any(
+                warning.get("status")
+                == "source_fallback_needs_pcg_generation"
+                for warning in warnings
+            )
+            else "nonblocking_diagnostics"
         )
     return readiness
 
@@ -757,7 +995,8 @@ def preflight_contract_issues(report):
     for warning in readiness.get("warnings") or []:
         issues.append(
             _issue(
-                "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
+                warning.get("issue_code")
+                or "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
                 "material",
                 warning.get("material"),
                 warning.get("warning")
@@ -774,6 +1013,9 @@ def preflight_contract_issues(report):
                     "expected_t_paths": warning.get("expected_t_paths")
                     or {},
                     "remediation": warning.get("remediation") or "",
+                    "source_rejections": warning.get("source_rejections")
+                    or [],
+                    "export_scope": warning.get("export_scope") or {},
                 },
             )
         )
@@ -790,6 +1032,9 @@ def preflight_contract_issues(report):
                     "expected_texture_base": missing.get("expected_texture_base")
                     or missing.get("texture_base")
                     or "",
+                    "source_rejections": missing.get("source_rejections")
+                    or [],
+                    "export_scope": missing.get("export_scope") or {},
                 },
             )
         )
@@ -946,11 +1191,18 @@ def main():
                     )
                     or []
                 ),
+                leaf_contract=leaf_contract,
+                all_material_contract=all_material,
+                export_evidence_spm=speedtree_spm,
             )
             report["material_export_contract"] = material
             report["all_export_material_contract"] = all_material
             report["texture_source_contract"] = textures
             report["texture_readiness_contract"] = texture_readiness
+            report["live_material_export_evidence"] = (
+                texture_readiness.get("live_material_export_evidence")
+                or {}
+            )
             leaf_missing = list(material.get("missing_materials") or [])
             missing = list(dict.fromkeys(
                 leaf_missing + list(all_material.get("missing_materials") or [])
@@ -971,6 +1223,7 @@ def main():
                     "ok",
                     "not_applicable",
                     "source_fallback_needs_pcg_generation",
+                    "nonblocking_diagnostics",
                 }
             ):
                 report["status"] = "ok"

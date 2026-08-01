@@ -60,6 +60,11 @@ from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
 )
+from artifact_content_key import (
+    artifact_record_content_key,
+    file_content_key_snapshot,
+    sampled_file_content_snapshot,
+)
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
@@ -122,6 +127,12 @@ from push_dependency_schedule import (
     exact_dependency_contract_from_validated_manifest,
     expand_push_targets,
 )
+from push_unreal_recovery import (
+    PushUnrealRecoveryError,
+    dependency_closure as unreal_recovery_dependency_closure,
+    load_parent_manifest as load_unreal_recovery_parent_manifest,
+    recover_manifest_item,
+)
 from send2ue_manifest_contract import (
     is_actionable_cluster_assembly_manifest,
 )
@@ -175,6 +186,12 @@ PLANNED_EXCLUSION_KINDS = frozenset({
     "preflight_skip",
     "source_review",
     "stale_execution_freeze",
+})
+UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
+    "data_error",
+    "manual_required",
+    "unreal_crash",
+    "not_run",
 })
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
@@ -1878,6 +1895,20 @@ class App:
                                 "· wind JSON(핸드오프 산출물) 존재\n"
                                 "· 언리얼 에디터 실행 여부\n"
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
+        self.btn_retry_unreal = ttk.Button(
+            actions,
+            text="↻ 실패 Unreal만 재시도",
+            command=self.start_failed_unreal_retry,
+        )
+        self.btn_retry_unreal.pack(side="left", padx=(2, 6))
+        Tooltip(
+            self.btn_retry_unreal,
+            "체크된 항목 중 이전 Unreal ingest에서 실패한 항목만 재시도합니다.\n"
+            "Blender/Send2UE export는 다시 돌리지 않습니다. 기존 FBX·JSON·Assembly "
+            "산출물과 export-time 입력이 그대로인지 검증하고, 현재 Unreal 코드로 "
+            "새 immutable manifest를 만들어 실행합니다.\n"
+            "산출물·입력·schema가 바뀌었으면 안전하게 중단하고 ③ 전체 Push를 요구합니다.",
+        )
         self.btn_all = ttk.Button(
             actions,
             text="🌙 목록 전체 자동 ①→②→③",
@@ -2115,6 +2146,10 @@ class App:
     def _collect_scan_result(cls, root, snapshot_caches):
         spms = scan_sk_spms(root)
         cluster_sources = scan_cluster_spm_sources(root)
+        # The population scan above can cold-parse hundreds of SPMs. Persist
+        # that shared analysis immediately instead of waiting for a later
+        # live-status change that may never occur before process exit.
+        save_leaf_contract_cache()
         all_spms = list(spms)
         snapshot_aliases = {}
         for row in cluster_sources:
@@ -2241,7 +2276,8 @@ class App:
     def _set_scan_controls(self, scanning):
         state = "disabled" if scanning else "normal"
         for name in (
-            "btn_check", "btn_spm", "btn_blender", "btn_push", "btn_all",
+            "btn_check", "btn_spm", "btn_blender", "btn_push",
+            "btn_retry_unreal", "btn_all",
             "btn_pick_root", "btn_scan", "btn_select_all", "btn_clear_all",
             "btn_recent_24h",
         ):
@@ -3191,7 +3227,8 @@ class App:
         # captured and queued. Root replacement/rescan would invalidate the
         # visible inventory, so only those controls are frozen.
         for name in (
-            "btn_check", "btn_spm", "btn_blender", "btn_push", "btn_all",
+            "btn_check", "btn_spm", "btn_blender", "btn_push",
+            "btn_retry_unreal", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
         ):
             button = getattr(self, name, None)
@@ -3426,6 +3463,12 @@ class App:
                     selected_scope=job["selected_scope"],
                     emit_done=False,
                 )
+            elif job["mode"] == "unreal_recovery":
+                completed = self._run_failed_unreal_recovery(
+                    job["targets"],
+                    job.get("recovery_requests") or [],
+                    emit_done=False,
+                )
             else:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
@@ -3629,6 +3672,160 @@ class App:
             "cfg": cfg,
             "force_rerun": bool(self.force_var.get()),
             "push_transport": cfg.get("push_transport", "rpc"),
+        }
+        self._enqueue_batch_job(job)
+
+    def start_failed_unreal_retry(self):
+        """Queue selected failed ingest items without scheduling Blender export."""
+        self._close_cell_editor()
+        selected_iids = [
+            iid for iid, item in self.items.items() if item["checked"]
+        ]
+        if not selected_iids:
+            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+            return
+
+        grouped = {}
+        skipped = []
+        for iid in selected_iids:
+            entry = self.state.get(iid, {})
+            kind = str(entry.get("push_status_kind") or "")
+            if kind not in UNREAL_RECOVERY_FAILURE_KINDS:
+                skipped.append(f"{Path(iid).name}: Unreal 실패 상태 아님")
+                continue
+            paths = entry.get("push_paths") or {}
+            manifest_value = paths.get("manifest")
+            checkpoint_value = paths.get("checkpoint")
+            if not manifest_value or not checkpoint_value:
+                skipped.append(f"{Path(iid).name}: 실패 manifest/checkpoint 없음")
+                continue
+            try:
+                manifest_path, manifest, items_by_id = (
+                    load_unreal_recovery_parent_manifest(manifest_value)
+                )
+                checkpoint = json.loads(
+                    Path(checkpoint_value).read_text(encoding="utf-8")
+                )
+                checkpoint_status = str(
+                    ((checkpoint.get("items") or {}).get(iid) or {}).get(
+                        "status"
+                    )
+                    or ""
+                )
+                if checkpoint_status not in UNREAL_RECOVERY_FAILURE_KINDS:
+                    raise PushUnrealRecoveryError(
+                        "parent checkpoint does not record a retryable Unreal failure"
+                    )
+                if iid not in items_by_id:
+                    raise PushUnrealRecoveryError(
+                        "selected item is absent from its parent manifest"
+                    )
+            except (OSError, ValueError, PushUnrealRecoveryError) as exc:
+                skipped.append(f"{Path(iid).name}: {compact_error_message(exc, 120)}")
+                continue
+            key = str(manifest_path)
+            group = grouped.setdefault(
+                key,
+                {
+                    "parent_manifest": key,
+                    "parent_report": str(
+                        manifest.get("report_path")
+                        or paths.get("batch_report")
+                        or ""
+                    ),
+                    "selected_queue_ids": [],
+                    "source_records": {},
+                    "items_by_id": items_by_id,
+                },
+            )
+            group["selected_queue_ids"].append(iid)
+
+        recovery_requests = []
+        eligible_iids = []
+        for group in grouped.values():
+            try:
+                required_ids = unreal_recovery_dependency_closure(
+                    group["items_by_id"], group["selected_queue_ids"]
+                )
+                for queue_id in required_ids:
+                    parent_item = group["items_by_id"][queue_id]
+                    state_entry = self.state.get(queue_id, {})
+                    source_record = copy.deepcopy(
+                        state_entry.get("push_source_fingerprint_cache") or {}
+                    )
+                    if source_record.get("fingerprint") != parent_item.get(
+                        "source_fingerprint"
+                    ):
+                        source_record = copy.deepcopy(
+                            (
+                                state_entry.get("push_recovery_source_proofs")
+                                or {}
+                            ).get(str(parent_item.get("source_fingerprint") or ""))
+                            or {}
+                        )
+                    if source_record.get("fingerprint") != parent_item.get(
+                        "source_fingerprint"
+                    ):
+                        recovery = parent_item.get("recovery") or {}
+                        snapshot = recovery.get("current_source_snapshot")
+                        if (
+                            snapshot
+                            and recovery.get("current_source_fingerprint")
+                            == parent_item.get("source_fingerprint")
+                        ):
+                            source_record = {
+                                "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+                                "fingerprint": parent_item["source_fingerprint"],
+                                "snapshot": copy.deepcopy(snapshot),
+                            }
+                    if source_record.get("fingerprint") != parent_item.get(
+                        "source_fingerprint"
+                    ):
+                        raise PushUnrealRecoveryError(
+                            "parent source proof is unavailable for "
+                            + Path(queue_id).name
+                        )
+                    group["source_records"][queue_id] = source_record
+            except PushUnrealRecoveryError as exc:
+                skipped.extend(
+                    f"{Path(iid).name}: {compact_error_message(exc, 120)}"
+                    for iid in group["selected_queue_ids"]
+                )
+                continue
+            eligible_iids.extend(group["selected_queue_ids"])
+            recovery_requests.append({
+                key: copy.deepcopy(value)
+                for key, value in group.items()
+                if key != "items_by_id"
+            })
+
+        if skipped:
+            self.log(
+                "Unreal 재시도 제외:\n  - " + "\n  - ".join(skipped)
+            )
+        if not eligible_iids:
+            messagebox.showinfo(
+                "실패 Unreal 재시도",
+                "재시도 가능한 선택 항목이 없습니다.\n\n"
+                + "\n".join(skipped[:8]),
+            )
+            return
+
+        cfg = dict(self._collect_cfg())
+        save_config(cfg)
+        inventory, targets = self._snapshot_batch_request(eligible_iids)
+        job = {
+            "label": f"실패 Unreal만 현재 코드로 재시도 · {len(targets)}개",
+            "mode": "unreal_recovery",
+            "phase": "push",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": targets,
+            "inventory": inventory,
+            "cfg": cfg,
+            "force_rerun": False,
+            "push_transport": "headless",
+            "recovery_requests": recovery_requests,
         }
         self._enqueue_batch_job(job)
 
@@ -4685,13 +4882,14 @@ class App:
                 else:
                     self._job_push(iid, spm)
             except Exception as exc:
-                reason = compact_error_message(exc)
+                full_reason = str(exc)
+                reason = compact_error_message(full_reason)
                 kind = getattr(exc, "kind", "data_error")
                 if phase == "blender":
                     self._publish_repair_stage_contract(
                         spm,
                         ready=False,
-                        reason=reason,
+                        reason=full_reason,
                         kind=kind,
                     )
                 if phase == "push" and kind == "data_error" and "시간 초과" in reason:
@@ -4716,7 +4914,7 @@ class App:
                     column,
                     status_text,
                     kind,
-                    reason,
+                    full_reason,
                     details=details,
                     persist=phase != "check",
                 )
@@ -5053,6 +5251,7 @@ class App:
             file_fingerprint,
             validate_file_fingerprint,
             validate_manifest_artifacts,
+            validate_receipt_pass_through_manifest,
         )
 
         def receipt_fingerprints_match(expected, actual):
@@ -5125,6 +5324,8 @@ class App:
                 return True, ""
 
             current_receipt_record = None
+            current_receipt_path = None
+            current_contract = {}
             current_handoff = {}
             if resolution and resolution.get("selected_receipt"):
                 current_receipt_path = Path(resolution["selected_receipt"])
@@ -5154,6 +5355,20 @@ class App:
                 )
 
             if embedded.get("status") == "pass_through":
+                if isinstance(
+                    embedded.get("pass_through_provenance"), dict
+                ):
+                    if current_receipt_path is None:
+                        raise RuntimeError(
+                            "current Cluster pass-through receipt is "
+                            "unavailable for provenance validation"
+                        )
+                    validate_receipt_pass_through_manifest(
+                        embedded,
+                        receipt_path=current_receipt_path,
+                        target_contract=current_contract,
+                        target_spm=spm,
+                    )
                 if current_receipt_record is not None and any((
                     current_handoff.get("roles"),
                     current_handoff.get("cluster_dependencies"),
@@ -5175,11 +5390,17 @@ class App:
                             "pcg_receipt"
                         )
                     )
+                    receipt_bound_pass_through = isinstance(
+                        embedded.get("pass_through_provenance"), dict
+                    )
                     if (
-                        not rendered_unused
-                        or not receipt_fingerprints_match(
-                            embedded_receipt,
-                            current_receipt_record,
+                        not receipt_bound_pass_through
+                        and (
+                            not rendered_unused
+                            or not receipt_fingerprints_match(
+                                embedded_receipt,
+                                current_receipt_record,
+                            )
                         )
                     ):
                         raise RuntimeError(
@@ -5238,7 +5459,7 @@ class App:
         except (OSError, ValueError, RuntimeError) as exc:
             return False, (
                 "Cluster Assembly input changed after Repair → "
-                "② Blender Repair 다시 실행: " + compact_error_message(exc)
+                "② Blender Repair 다시 실행: " + str(exc)
             )
 
     def _repair_runtime_addon_dir(self):
@@ -6466,6 +6687,7 @@ class App:
                             "mtime_ns",
                             "sha256",
                             "fingerprint",
+                            "fingerprint_algorithm",
                         )
                         if key in value
                     })
@@ -6532,33 +6754,23 @@ class App:
                 ):
                     errors.append(f"mtime changed: {candidate}")
                     continue
-                expected_sha256 = record.get("sha256")
-                expected_fingerprint = record.get("fingerprint")
-                if not expected_sha256 and not (
-                    isinstance(expected_fingerprint, str)
-                    and expected_fingerprint
-                ):
+                content_key = artifact_record_content_key(record)
+                if content_key is None:
                     errors.append(
                         f"content digest missing: {candidate}"
                     )
                     continue
-                if expected_sha256:
-                    current_sha256 = _sha256_snapshot(candidate)["sha256"]
-                    if (
-                        str(expected_sha256).casefold()
-                        != current_sha256.casefold()
-                    ):
-                        errors.append(f"sha256 changed: {candidate}")
-                        continue
-                if isinstance(expected_fingerprint, str) and expected_fingerprint:
-                    current_fingerprint = file_content_snapshot(
-                        candidate
-                    )["fingerprint"]
-                    if (
-                        expected_fingerprint.casefold()
-                        != current_fingerprint.casefold()
-                    ):
-                        errors.append(f"fingerprint changed: {candidate}")
+                current_key = file_content_key_snapshot(
+                    candidate,
+                    content_key["algorithm"],
+                )
+                if (
+                    content_key["digest"].casefold()
+                    != current_key["digest"].casefold()
+                ):
+                    errors.append(
+                        f"{content_key['field']} changed: {candidate}"
+                    )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 errors.append(f"identity unavailable: {candidate}: {exc}")
         return not errors, tuple(errors)
@@ -6628,21 +6840,25 @@ class App:
         spm,
         *,
         live_artifact_paths=(),
+        _records_out=None,
     ):
-        """Hash every owner input and live artifact by current file bytes.
+        """Fingerprint every owner input and live artifact by current bytes.
 
-        Size and mtime remain diagnostics and negative-change hints only. They
-        never authorize a positive memo hit without a content digest.
-        Missing paths remain part of the key, so an artifact appearing later
-        invalidates the memo automatically.
+        Discovery inputs retain full content fingerprints so a genuine input
+        write remains fail-closed.  Additional live artifacts use the shared
+        bounded sampled key, avoiding full reads of large textures on each memo
+        check.  Size and mtime remain diagnostics and negative-change hints;
+        they never authorize a positive hit without a content-derived key.
+        Missing paths remain in the key, so a later appearance invalidates it.
         """
         spm = Path(spm).resolve()
         content_paths = self._cluster_receipt_discovery_input_paths(spm)
 
-        all_paths = {
+        live_paths = {
             Path(path).resolve()
             for path in live_artifact_paths
         }
+        all_paths = set(live_paths)
         all_paths.update(content_paths)
         records = []
         for candidate in sorted(
@@ -6655,15 +6871,22 @@ class App:
             except FileNotFoundError:
                 records.append({"path": key, "exists": False})
                 continue
-            snapshot = file_content_snapshot(candidate)
+            snapshot = (
+                file_content_snapshot(candidate)
+                if candidate in content_paths
+                else sampled_file_content_snapshot(candidate)
+            )
             records.append({
                 "path": key,
                 "exists": True,
                 **snapshot,
             })
 
+        if _records_out is not None:
+            _records_out[:] = copy.deepcopy(records)
+
         envelope = {
-            "version": 2,
+            "version": 3,
             "scope": self._cluster_receipt_refresh_scope(spm),
             "files": records,
         }
@@ -6674,6 +6897,55 @@ class App:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+    @staticmethod
+    def _cluster_receipt_changed_input_paths(before_records, after_records):
+        """Return paths whose fingerprint-envelope records differ."""
+        before_by_path = {
+            str(record.get("path")): record
+            for record in before_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        after_by_path = {
+            str(record.get("path")): record
+            for record in after_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        return tuple(sorted(
+            path
+            for path in set(before_by_path) | set(after_by_path)
+            if before_by_path.get(path) != after_by_path.get(path)
+        ))
+
+    @staticmethod
+    def _cluster_receipt_stability_failure_message(
+        *,
+        fingerprint_changed,
+        changed_input_paths=(),
+        artifact_errors=(),
+    ):
+        """Describe each failed half of the live-audit stability gate."""
+        artifact_errors = tuple(artifact_errors or ())
+        if fingerprint_changed and artifact_errors:
+            heading = (
+                "Input fingerprint changed + live artifact mismatch "
+                "during audit"
+            )
+        elif fingerprint_changed:
+            heading = "Input fingerprint changed during audit"
+        else:
+            heading = "Live artifact mismatch"
+
+        details = []
+        if fingerprint_changed:
+            changed_detail = ", ".join(changed_input_paths[:3])
+            details.append(
+                "changed paths: "
+                + (changed_detail or "unavailable from fingerprint records")
+            )
+        if artifact_errors:
+            details.append("; ".join(artifact_errors[:3]))
+        return heading + (f": {'; '.join(details)}" if details else "")
 
     def _refresh_stale_cluster_receipt(
         self,
@@ -6705,6 +6977,7 @@ class App:
                 cached_live_artifact_paths = (
                     (cached or {}).get("live_artifact_paths") or ()
                 )
+            pre_discovery_records = []
             try:
                 current_cache_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
@@ -6713,7 +6986,10 @@ class App:
                     )
                 )
                 pre_discovery_fingerprint = (
-                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                    self._cluster_receipt_refresh_input_fingerprint(
+                        spm,
+                        _records_out=pre_discovery_records,
+                    )
                 )
             except (OSError, RuntimeError) as exc:
                 raise BatchItemError(
@@ -6786,6 +7062,7 @@ class App:
         cache_entry = None
         try:
             attempt_pre_fingerprint = pre_discovery_fingerprint
+            attempt_pre_records = pre_discovery_records
             for attempt in range(2):
                 raw_audit = self._refresh_stale_cluster_receipt_uncached(
                     spm,
@@ -6796,19 +7073,27 @@ class App:
                     ),
                     _raw_only=True,
                 )
+                post_discovery_records = []
                 post_discovery_fingerprint = (
-                    self._cluster_receipt_refresh_input_fingerprint(spm)
+                    self._cluster_receipt_refresh_input_fingerprint(
+                        spm,
+                        _records_out=post_discovery_records,
+                    )
                 )
                 artifacts_match, artifact_errors = (
                     self._cluster_receipt_live_artifacts_match(
                         raw_audit.get("payload") or {}
                     )
                 )
-                stable = bool(
+                fingerprint_changed = (
                     attempt_pre_fingerprint
-                    == post_discovery_fingerprint
+                    != post_discovery_fingerprint
+                )
+                stable = bool(
+                    not fingerprint_changed
                     and artifacts_match
                 )
+                observed_discovery_records = post_discovery_records
                 if stable:
                     live_artifact_paths = (
                         self._cluster_receipt_live_artifact_paths(
@@ -6822,17 +7107,24 @@ class App:
                             live_artifact_paths=live_artifact_paths,
                         )
                     )
+                    final_discovery_records = []
                     final_discovery_fingerprint = (
-                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                        self._cluster_receipt_refresh_input_fingerprint(
+                            spm,
+                            _records_out=final_discovery_records,
+                        )
                     )
                     final_artifacts_match, final_artifact_errors = (
                         self._cluster_receipt_live_artifacts_match(
                             raw_audit.get("payload") or {}
                         )
                     )
-                    stable = bool(
+                    fingerprint_changed = (
                         final_discovery_fingerprint
-                        == attempt_pre_fingerprint
+                        != attempt_pre_fingerprint
+                    )
+                    stable = bool(
+                        not fingerprint_changed
                         and final_artifacts_match
                     )
                     if stable:
@@ -6847,26 +7139,36 @@ class App:
                         }
                         break
                     artifact_errors = final_artifact_errors
+                    observed_discovery_records = final_discovery_records
+                changed_input_paths = (
+                    self._cluster_receipt_changed_input_paths(
+                        attempt_pre_records,
+                        observed_discovery_records,
+                    )
+                    if fingerprint_changed
+                    else ()
+                )
+                failure_message = (
+                    self._cluster_receipt_stability_failure_message(
+                        fingerprint_changed=fingerprint_changed,
+                        changed_input_paths=changed_input_paths,
+                        artifact_errors=artifact_errors,
+                    )
+                )
                 if attempt == 0:
-                    retry_reason = (
-                        "; ".join(artifact_errors[:3])
-                        if artifact_errors
-                        else "asset SPM/manifest content changed"
-                    )
                     self.log(
-                        "Cluster Assembly live audit asset input changed "
-                        f"during audit; retrying once: {spm.name} · "
-                        f"{retry_reason}"
+                        f"{failure_message}; retrying once: {spm.name}"
                     )
+                    attempt_pre_records = []
                     attempt_pre_fingerprint = (
-                        self._cluster_receipt_refresh_input_fingerprint(spm)
+                        self._cluster_receipt_refresh_input_fingerprint(
+                            spm,
+                            _records_out=attempt_pre_records,
+                        )
                     )
                     continue
-                detail = "; ".join(artifact_errors[:3])
                 raise BatchItemError(
-                    "Cluster Assembly live audit inputs kept changing; "
-                    f"result was not cached: {spm.name}"
-                    + (f": {detail}" if detail else ""),
+                    f"{failure_message}; result was not cached: {spm.name}",
                     kind="internal_error",
                     log_file=raw_audit.get("log_file"),
                     report_file=raw_audit.get("audit_report"),
@@ -7765,6 +8067,24 @@ class App:
                             saved_status = str(
                                 saved_manifest.get("status") or ""
                             )
+                            if isinstance(
+                                saved_manifest.get(
+                                    "pass_through_provenance"
+                                ),
+                                dict,
+                            ):
+                                from cluster_assembly_builder import (
+                                    validate_receipt_pass_through_manifest,
+                                )
+
+                                validate_receipt_pass_through_manifest(
+                                    saved_manifest,
+                                    receipt_path=cluster_receipt_resolution[
+                                        "live_audit_report"
+                                    ],
+                                    target_contract=live_contract,
+                                    target_spm=spm,
+                                )
                             status_mismatch = (
                                 live_status == "pass_through"
                                 and saved_status != "pass_through"
@@ -7782,6 +8102,7 @@ class App:
                                 repair_state["current"] = False
                         except (
                             OSError,
+                            RuntimeError,
                             TypeError,
                             ValueError,
                         ):
@@ -8491,6 +8812,30 @@ class App:
             ),
         ]
 
+    def _push_unreal_code_paths(self):
+        """Code executed or consumed by the current Unreal ingest contract."""
+        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        return [
+            TOOL_DIR / "unreal_ingest.py",
+            send2ue_dir / "dependencies" / "unreal.py",
+            TOOL_DIR / "dynamic_wind_handoff_policy.py",
+            TOOL_DIR / "cluster_assembly_builder.py",
+            TOOL_DIR / "nanite_assembly_materials.py",
+            send2ue_dir / "resources" / "pipeline" / "ue_material_setup.py",
+        ]
+
+    def _push_rebindable_unreal_code_paths(self):
+        """Runtime code whose derived bindings can be rebuilt without Blender."""
+        paths = self._push_unreal_code_paths()
+        # Dynamic-wind policy resolves Blender object facts while exporting;
+        # changing it requires a full Push.  The remaining modules consume the
+        # frozen artifact/sidecar contract or are regenerated below.
+        return [
+            path
+            for path in paths
+            if Path(path).name != "dynamic_wind_handoff_policy.py"
+        ]
+
     def _push_source_dependency_paths(self, spm=None):
         """Return code plus the per-asset Repair/Assembly contract."""
         paths = list(self._push_dependency_paths())
@@ -8646,8 +8991,12 @@ class App:
             return None
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            item = (manifest.get("items") or [])[0]
-        except (OSError, ValueError, IndexError, TypeError):
+            item = next(
+                candidate
+                for candidate in (manifest.get("items") or [])
+                if str((candidate or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError):
             return None
         if str(item.get("queue_id")) != iid or not manifest_item_files_match(item):
             return None
@@ -8844,12 +9193,33 @@ class App:
                 "report": str(item.get("report_path", "")),
                 "batch_report": str(item.get("batch_report", "")),
             }
+            recovery = item.get("recovery") or {}
+            if recovery:
+                details.update({
+                    "parent_manifest": str(
+                        recovery.get("parent_manifest") or ""
+                    ),
+                    "parent_report": str(
+                        recovery.get("parent_report") or ""
+                    ),
+                    "old_code_revision": str(
+                        recovery.get("old_code_revision") or ""
+                    ),
+                    "new_code_revision": str(
+                        recovery.get("new_code_revision") or ""
+                    ),
+                })
             if log_file:
                 details["log"] = str(log_file)
             if status == "imported_ok":
-                self.state.setdefault(queue_id, {})["push_import_fingerprint"] = item[
-                    "fingerprint"
-                ]
+                entry = self.state.setdefault(queue_id, {})
+                entry["push_import_fingerprint"] = item["fingerprint"]
+                if recovery:
+                    entry["push_export_cache"] = {
+                        "source_fingerprint": item["source_fingerprint"],
+                        "manifest": str(item.get("batch_manifest", "")),
+                        "fingerprint": item["fingerprint"],
+                    }
             self._set_push_state(
                 queue_id,
                 status,
@@ -8916,6 +9286,215 @@ class App:
         checkpoint["updated_at"] = datetime.now().isoformat(timespec="seconds")
         atomic_write_json(checkpoint_path, checkpoint)
         return checkpoint
+
+    def _run_failed_unreal_recovery(
+        self,
+        targets,
+        recovery_requests,
+        emit_done=True,
+    ):
+        """Rebind verified cached exports to current code and run Unreal only."""
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self._headless_progress_snapshot = None
+        self._phase_abort_reason = None
+        failed_items = set()
+        recovered_by_id = {}
+        selected_ids = {str(item["spm"]) for item in targets}
+        runtime_code_paths = self._push_unreal_code_paths()
+        rebindable_code_paths = self._push_rebindable_unreal_code_paths()
+        parent_lineage = []
+        pending_order = []
+        total = len(selected_ids)
+        self.ui_queue.put(("batch_progress", (0, total)))
+        self.ui_queue.put(("progress", f"Unreal 재시도 산출물 검증 0/{total}"))
+        prepared_selected = 0
+
+        for request in recovery_requests:
+            request_selected = {
+                str(value) for value in request.get("selected_queue_ids") or []
+            }
+            try:
+                parent_path, parent_manifest, parent_items = (
+                    load_unreal_recovery_parent_manifest(
+                        request.get("parent_manifest")
+                    )
+                )
+                required_ids = unreal_recovery_dependency_closure(
+                    parent_items, request_selected
+                )
+                source_records = request.get("source_records") or {}
+                group_items = {}
+                for queue_id, parent_item in parent_items.items():
+                    if queue_id not in required_ids:
+                        continue
+                    self.ui_queue.put(
+                        (
+                            "cell",
+                            (
+                                queue_id,
+                                "push_status",
+                                "기존 산출물 검증 · 현재 코드 재결합 중...",
+                            ),
+                        )
+                    )
+                    parent_source_record = copy.deepcopy(
+                        source_records.get(queue_id) or {}
+                    )
+                    with self.state_lock:
+                        self.state.setdefault(queue_id, {}).setdefault(
+                            "push_recovery_source_proofs", {}
+                        )[str(parent_item.get("source_fingerprint") or "")] = (
+                            copy.deepcopy(parent_source_record)
+                        )
+                    blend = Path(parent_item.get("blend") or "")
+                    current_fingerprint = self._source_push_fingerprint(
+                        blend, queue_id
+                    )
+                    current_record = copy.deepcopy(
+                        self.state.get(queue_id, {}).get(
+                            "push_source_fingerprint_cache"
+                        )
+                        or {}
+                    )
+                    item_report = LOG_DIR / (
+                        f"{Path(queue_id).stem}_unreal_recovery_{batch_stamp}.json"
+                    )
+                    recovered = recover_manifest_item(
+                        parent_item,
+                        parent_manifest_path=parent_path,
+                        parent_report_path=(
+                            request.get("parent_report")
+                            or parent_manifest.get("report_path")
+                            or ""
+                        ),
+                        parent_source_record=parent_source_record,
+                        current_source_record=current_record,
+                        current_source_fingerprint=current_fingerprint,
+                        runtime_code_paths=runtime_code_paths,
+                        rebindable_code_paths=rebindable_code_paths,
+                        report_path=item_report,
+                        selected=queue_id in request_selected,
+                    )
+                    existing = recovered_by_id.get(queue_id)
+                    if existing is not None and existing.get(
+                        "fingerprint"
+                    ) != recovered.get("fingerprint"):
+                        raise PushUnrealRecoveryError(
+                            "conflicting parent recovery contracts for "
+                            + Path(queue_id).name
+                        )
+                    group_items[queue_id] = recovered
+                recovered_by_id.update(group_items)
+                pending_order.extend(
+                    queue_id
+                    for queue_id in parent_items
+                    if queue_id in group_items
+                )
+                parent_lineage.append({
+                    "manifest": str(parent_path),
+                    "report": str(
+                        request.get("parent_report")
+                        or parent_manifest.get("report_path")
+                        or ""
+                    ),
+                    "selected_queue_ids": sorted(request_selected),
+                })
+                prepared_selected += len(request_selected)
+                self.ui_queue.put(
+                    ("batch_progress", (prepared_selected, total))
+                )
+                self.ui_queue.put(
+                    (
+                        "progress",
+                        f"Unreal 재시도 산출물 검증 {prepared_selected}/{total}",
+                    )
+                )
+            except Exception as exc:
+                reason = compact_error_message(exc)
+                for queue_id in request_selected:
+                    self._set_push_state(
+                        queue_id,
+                        "recovery_blocked",
+                        self._failure_status_text(
+                            "재시도 차단 · " + reason,
+                            "recovery_blocked",
+                        ),
+                        details={
+                            "parent_manifest": str(
+                                request.get("parent_manifest") or ""
+                            ),
+                        },
+                        message=reason,
+                    )
+                    failed_items.add(queue_id)
+                self.log(
+                    "[Unreal recovery blocked] "
+                    + ", ".join(Path(value).name for value in request_selected)
+                    + f": {reason}"
+                )
+
+        pending = [
+            recovered_by_id[queue_id]
+            for queue_id in pending_order
+            if queue_id in recovered_by_id
+        ]
+        deduplicated = []
+        seen = set()
+        for item in pending:
+            queue_id = str(item["queue_id"])
+            if queue_id in seen:
+                continue
+            seen.add(queue_id)
+            deduplicated.append(item)
+            details = {
+                "parent_manifest": str(
+                    (item.get("recovery") or {}).get("parent_manifest") or ""
+                ),
+                "old_code_revision": str(
+                    (item.get("recovery") or {}).get("old_code_revision") or ""
+                ),
+                "new_code_revision": str(
+                    (item.get("recovery") or {}).get("new_code_revision") or ""
+                ),
+            }
+            self._set_push_state(
+                queue_id,
+                "exported_pending_unreal",
+                "기존 export 검증 완료 · 현재 코드 Unreal 대기",
+                details=details,
+            )
+        pending = deduplicated
+
+        if not pending:
+            self._phase_failed_items = failed_items or selected_ids
+            if emit_done:
+                self.ui_queue.put(("progress", "Unreal 재시도 차단 · 전체 Push 필요"))
+                self.ui_queue.put(("done", None))
+            return False
+
+        active_source = getattr(self, "_active_production_source_manifest", None)
+        metadata = {
+            "recovery": {
+                "schema_version": 1,
+                "kind": "failed_unreal_current_code_retry",
+                "parents": parent_lineage,
+                "selected_queue_ids": sorted(selected_ids),
+                "production_source_revision": (
+                    active_source.content_hash if active_source is not None else ""
+                ),
+            }
+        }
+        return self._run_headless_import_items(
+            pending,
+            targets,
+            failed_items,
+            emit_done=emit_done,
+            batch_stamp=batch_stamp,
+            manifest_metadata=metadata,
+            progress_label="실패 Unreal 재시도",
+            file_prefix="unreal_recovery",
+        )
 
     def _run_headless_push_batch(self, targets, emit_done=True):
         batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -9098,9 +9677,30 @@ class App:
                 self.ui_queue.put(("done", None))
             return not failure_count
 
-        manifest_path = LOG_DIR / f"headless_queue_{batch_stamp}.json"
-        checkpoint_path = LOG_DIR / f"headless_queue_{batch_stamp}_checkpoint.json"
-        report_path = LOG_DIR / f"headless_queue_{batch_stamp}_report.json"
+        return self._run_headless_import_items(
+            pending,
+            targets,
+            failed_items,
+            emit_done=emit_done,
+            batch_stamp=batch_stamp,
+        )
+
+    def _run_headless_import_items(
+        self,
+        pending,
+        targets,
+        failed_items,
+        *,
+        emit_done,
+        batch_stamp,
+        manifest_metadata=None,
+        progress_label="Unreal Push",
+        file_prefix="headless_queue",
+    ):
+        """Run already-materialized immutable items through Unreal only."""
+        manifest_path = LOG_DIR / f"{file_prefix}_{batch_stamp}.json"
+        checkpoint_path = LOG_DIR / f"{file_prefix}_{batch_stamp}_checkpoint.json"
+        report_path = LOG_DIR / f"{file_prefix}_{batch_stamp}_report.json"
         for item in pending:
             item["batch_manifest"] = str(manifest_path)
             item["batch_report"] = str(report_path)
@@ -9114,6 +9714,10 @@ class App:
             ),
             "items": pending,
         }
+        reserved = set(manifest)
+        for key, value in (manifest_metadata or {}).items():
+            if key not in reserved:
+                manifest[key] = copy.deepcopy(value)
         atomic_write_json(manifest_path, manifest)
         item_by_id = {str(item["queue_id"]): item for item in pending}
 
@@ -9138,7 +9742,9 @@ class App:
                 "SK_BATCH_REPORT_PATH": str(report_path.resolve()),
             }
         )
-        max_restarts = max(0, int(self.cfg.get("headless_batch_max_restarts", 10)))
+        max_restarts = max(
+            0, int(self.cfg.get("headless_batch_max_restarts", 10))
+        )
         complete = False
         last_log = None
         checkpoint = {}
@@ -9148,7 +9754,7 @@ class App:
             self.ui_queue.put(
                 (
                     "progress",
-                    "Unreal Push headless 시작 · "
+                    f"{progress_label} headless 시작 · "
                     f"시도 {launch_index + 1}/{max_restarts + 1}",
                 )
             )
@@ -9156,7 +9762,7 @@ class App:
                 f"UnrealEditor-Cmd headless 시작 ({launch_index + 1}/{max_restarts + 1})"
             )
             attempt_log = LOG_DIR / (
-                f"headless_unreal_{batch_stamp}_{launch_index + 1}.log"
+                f"{file_prefix}_unreal_{batch_stamp}_{launch_index + 1}.log"
             )
             last_log = attempt_log
             try:
@@ -9232,7 +9838,8 @@ class App:
             save_state(self.state)
         if emit_done:
             success_count = sum(
-                1 for item in targets
+                1
+                for item in targets
                 if str(item["spm"]) not in failed_items
             )
             failure_count = len(failed_items)
@@ -9240,14 +9847,12 @@ class App:
                 progress_text = self._phase_abort_reason
             elif failure_count:
                 progress_text = (
-                    f"Unreal Push 종료 — 성공 {success_count}개 · "
+                    f"{progress_label} 종료 — 성공 {success_count}개 · "
                     f"실패/준비 제외 {failure_count}개"
                 )
             else:
-                progress_text = "Unreal Push 완료"
-            self.ui_queue.put(
-                ("progress", progress_text)
-            )
+                progress_text = f"{progress_label} 완료"
+            self.ui_queue.put(("progress", progress_text))
             self.ui_queue.put(("done", None))
         return complete and not failed_items
 

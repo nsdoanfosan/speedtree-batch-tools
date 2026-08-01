@@ -18,10 +18,20 @@ PCG_ST9_Texture_Batch.bat
 ## 시작 시 표 갱신
 
 보드는 마지막으로 성공한 live 감사 결과를
-`reports\_cache\board_snapshot_v1.json`에 표시 전용으로 저장한다. 다음 실행에서는
+`%LOCALAPPDATA%\SpeedTreeBatchTools\cache\board_snapshot_v1.json`에 표시 전용으로 저장한다. 다음 실행에서는
 이전 표를 먼저 보여 주고 `live 검증 중` 상태에서 모든 변경 버튼을 잠근다. 이
 스냅샷은 완료 영수증이나 실행 허가로 사용하지 않는다. 설정, Tree root 또는 PCG
 대상이 달라도 이전 표라는 사실을 표시할 뿐 작업 성공으로 판정하지 않는다.
+
+SPM/SBS/Blend 분석 캐시도 같은 사용자별 디렉터리에 저장하므로 checkout과
+worktree가 같은 파일을 재사용한다. 테스트나 격리 실행은
+`SPEEDTREE_BATCH_TOOLS_CACHE_DIR` 환경 변수에 절대 디렉터리 경로를 지정해 이
+위치를 바꿀 수 있다. Windows 외 환경에서는 `$XDG_CACHE_HOME/SpeedTreeBatchTools/cache`
+(미설정 시 `~/.cache/SpeedTreeBatchTools/cache`)를 사용한다.
+
+`board_snapshot_v1.json`은 UTF-8 직렬화 기준 최대 16 MiB이며 최신 파일 1개만
+유지한다. 새 스냅샷이 한도를 넘으면 디스크에 쓰지 않고 기존의 마지막 정상
+스냅샷을 유지하며, 한도를 넘는 기존 파일은 읽기 단계에서 표시 캐시로 거부한다.
 
 새 live 기본 감사가 끝나면 ①–③ 상태 열을 먼저 교체한다. 비용이 큰
 `Blend ↔ SPM` 관계 열 계산과 분석 캐시 저장은 그 뒤 백그라운드에서 완료하며,
@@ -319,7 +329,7 @@ python -m pcg_st9_texture_batch.stale_node_table_recovery ^
 `--expected-mesh-id` is the backward-compatible strict mode: every listed ID
 is sealed as both an authoring-binding target and a required live/export target.
 When issue acceptance requires authoring continuity without universal export,
-use the explicit schema-5 scope mode instead:
+use the explicit sealed-scope mode instead:
 
 ```bat
 python -m pcg_st9_texture_batch.stale_node_table_recovery ^
@@ -341,11 +351,52 @@ omitting the live decision, selecting a live ID outside the authoring scope, or
 changing the caller scope after sealing fails closed before Modeler launch.
 Receipts from schemas 2 through 4 remain strict-all and are never rewritten.
 
+The immutable receipt compatibility matrix is literal and independent of the
+current projection constants:
+
+| Receipt schema | Graph | Core | Membership | Targets | Requirements | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2 | 1 | — | 1 | 1 | — | supported |
+| 3 | 1 | 1 | 1 | 1 | — | known, unsupported |
+| 3 | 1 | 2 | 1 | 1 | — | supported |
+| 4 | 1 | 3 | 1 | 2 | — | supported |
+| 5 | 1 | 3 | 1 | 2 | 1 | supported |
+| 6 | 1 | 4 | 1 | 2 | 1 | supported (current) |
+
+Each supported tuple resolves through an immutable semantic registry entry
+that owns its frozen graph/core/membership/target projector callables and the
+authoritative fields that must match as one candidate. In particular, a
+target-v1 fingerprint cannot borrow a binding count or Mesh-ID list from a
+different historical candidate. The current writer also selects the explicit
+current dialect tuple (schema 6 here) instead of assembling versions from
+mutable current constants.
+Independent literal `backup.spm`, `receipt.json`, `after.spm`, and
+`expected.json` fixtures under `tests/fixtures/issue_41/` exercise both
+read-only `verify_sealed_resave()` and interrupted pre-save restart paths;
+their receipt bytes are not produced by the production helpers.
+
+Every supported historical fingerprint and its authoritative counts/Mesh-ID
+lists are recomputed from the exact backup before the current projection is
+derived. A valid sealed receipt is reused byte-for-byte; it is never upgraded
+or rewritten in place. Unknown receipt schemas fail with
+`preimage_receipt_schema_unsupported`; known or unknown unreproducible inner
+projection tuples fail with `preimage_receipt_projection_version_unsupported`;
+malformed content, fake fingerprints, and source/scope mismatches fail with
+`preimage_receipt_verification_failed`. Backup-byte mismatch remains
+`preimage_backup_verification_failed`.
+
+Backup authority always comes from a fresh immutable capture of the backup
+path itself. Operating-source snapshot bytes are never substituted for backup
+bytes, and the backup is recaptured immediately before Modeler launch and
+again immediately before any continuation claim. A backup race at either
+boundary fails closed without launch, callback, or claim creation.
+
 Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
 SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
 membership, required target-binding fingerprints, and immutable schema-5
-authoring/live scope requirements. It then waits for the
+authoring/live scope requirements. New receipts use schema 6 with the same
+sealed-scope contract. It then waits for the
 user to save the file and requires repeated identical stat/size/SHA snapshots
 with successful parsing. Regex, independent ElementTree, target delivery, and
 normalization evidence all come from those same immutable bytes. All authoring
@@ -360,6 +411,25 @@ the verified after SHA, after cancellation/app-close/stale-job guards and a
 final source-SHA recheck. A privacy-safe blocked-event receipt records only the
 asset name, after SHA, and stable reason tokens. Missing/corrupt preimage or
 receipt evidence fails before Modeler launch.
+
+Core projection v4 hashes the complete ordered XML tree and removes or
+canonicalizes only path-specific no-edit Save rewrites reproduced across three
+exact before/after SPM pairs. It excludes the root session/generated blocks
+`Thumbnail`, `ThumbnailSize`, `Preview`, `Statistics`, `TreeInfo`,
+`QuickSaveSettings2`, `m_sTimelineData`, `Window`, and `Nodes`; generated GUIDs
+only at the proven Light/Fan/RuleScript/Force/Link/Assets paths; false-only
+generated collection rows at Generator and Force property paths; exact default
+AtlasMaker, material-map, atlas-mesh UserData, empty LOD, and redundant parent
+spline shapes; and Material preview/stream caches. It canonicalizes Generator
+and Link endpoint GUID spellings, the observed spline/mesh/color float rewrites,
+derived material texture sizes, and the stable direct-Assets kind partition
+while preserving order within every partition. Namespace-qualified or unknown
+elements, authored properties, arbitrary UserData, non-default shapes,
+non-false collection rows, full Link subtrees, material filenames, mesh data,
+and all other root/settings content remain fingerprinted. Historical schemas 4
+and 5 continue to verify with the frozen core-v3 projector, while a successful
+reaudit derives current core-v4 evidence from the exact backup without rewriting
+the sealed receipt.
 
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),

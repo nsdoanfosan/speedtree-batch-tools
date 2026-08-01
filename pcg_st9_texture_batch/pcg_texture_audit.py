@@ -73,6 +73,7 @@ if __package__ in (None, ""):
     from pcg_texture_common import (
         IMAGE_EXTS,
         REPORT_DIR,
+        SHARED_CACHE_DIR,
         is_backup_path,
         json_safe_path,
         load_config,
@@ -85,6 +86,7 @@ else:
     from .pcg_texture_common import (
         IMAGE_EXTS,
         REPORT_DIR,
+        SHARED_CACHE_DIR,
         is_backup_path,
         json_safe_path,
         load_config,
@@ -198,9 +200,9 @@ _PENDING_DECODED_HANDOFF = contextvars.ContextVar(
 )
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
-SPM_ANALYSIS_CACHE_PATH = REPORT_DIR / "_cache" / "spm_analysis_v5.json"
-SBS_GRAPH_CACHE_PATH = REPORT_DIR / "_cache" / "sbs_graph_names_v1.json"
-BLEND_IMAGE_CACHE_PATH = REPORT_DIR / "_cache" / "blend_image_names_v2.json"
+SPM_ANALYSIS_CACHE_PATH = SHARED_CACHE_DIR / "spm_analysis_v5.json"
+SBS_GRAPH_CACHE_PATH = SHARED_CACHE_DIR / "sbs_graph_names_v1.json"
+BLEND_IMAGE_CACHE_PATH = SHARED_CACHE_DIR / "blend_image_names_v2.json"
 _PERSISTENT_SBS_GRAPHS = None
 _PERSISTENT_SBS_GRAPHS_DIRTY = False
 _PERSISTENT_BLEND_IMAGES = None
@@ -4227,8 +4229,16 @@ def cluster_render_origin_receipt(
     *,
     material_id=None,
     material_name=None,
+    path_alias_folder=None,
 ):
-    """Return exact SPM-material + Blender physical-capture provenance."""
+    """Return exact SPM-material + Blender physical-capture provenance.
+
+    ``path_alias_folder`` is a fail-closed compatibility boundary for old
+    absolute SPM references.  It may rebind a material slot only to the one
+    current sibling with the exact same filename.  The normal Blender capture
+    resolver still has to prove that exact path, slot role, and current file
+    hash against a live physical-capture manifest.
+    """
     identity = _spm_material_identity_and_slot_rows(
         spm,
         refs,
@@ -4237,6 +4247,39 @@ def cluster_render_origin_receipt(
     )
     if not identity:
         return {}
+    alias_folder = None
+    if path_alias_folder is not None:
+        alias_folder = _resolve_for_membership(path_alias_folder)
+        if not alias_folder.is_dir():
+            return {}
+    resolved_slot_rows = []
+    path_aliases = []
+    for row in identity["slot_rows"]:
+        resolved_row = dict(row)
+        authored_path = _resolve_for_membership(row["path"])
+        if (
+            alias_folder is not None
+            and _path_identity(authored_path.parent)
+            != _path_identity(alias_folder)
+        ):
+            candidates = [
+                candidate.resolve()
+                for candidate in alias_folder.iterdir()
+                if (
+                    candidate.is_file()
+                    and candidate.name.casefold()
+                    == authored_path.name.casefold()
+                )
+            ]
+            if len(candidates) != 1:
+                return {}
+            resolved_row["path"] = str(candidates[0])
+            path_aliases.append({
+                "ref": row["ref"],
+                "legacy_path": str(authored_path),
+                "canonical_path": str(candidates[0]),
+            })
+        resolved_slot_rows.append(resolved_row)
     material = {
         "material_id": identity["material_id"],
         "material_name": identity["material_name"],
@@ -4248,7 +4291,7 @@ def cluster_render_origin_receipt(
                 "authored_ref": row["ref"],
                 "resolved_ref": row["path"],
             }
-            for row in identity["slot_rows"]
+            for row in resolved_slot_rows
         ],
     }
     output = {
@@ -4258,7 +4301,7 @@ def cluster_render_origin_receipt(
                 "map": row["slot_name"],
                 "path": row["path"],
             }
-            for row in identity["slot_rows"]
+            for row in resolved_slot_rows
         ],
     }
     spm = Path(spm)
@@ -4294,6 +4337,20 @@ def cluster_render_origin_receipt(
             "sha256": row["sha256"],
         }
         for row in normalized.get("slot_files") or []
+    ]
+    sha_by_path = {
+        _path_identity(row.get("path") or ""): row.get("sha256")
+        for row in normalized.get("slot_files") or []
+    }
+    normalized["path_aliases"] = [
+        {
+            **row,
+            "basename": Path(row["canonical_path"]).name,
+            "sha256": sha_by_path.get(
+                _path_identity(row["canonical_path"])
+            ),
+        }
+        for row in path_aliases
     ]
     return normalized
 

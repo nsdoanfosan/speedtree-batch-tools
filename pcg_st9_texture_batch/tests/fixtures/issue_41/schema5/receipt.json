@@ -1,0 +1,9 @@
+{
+  "kind":"speedtree_stale_node_table_preimage_receipt","schema_version":5,"recovery_contract":"speedtree_stale_node_table_interactive_recovery_v2","asset_name":"model.spm","source_identity_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "exact_preimage":{"raw_sha256":"33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12","spm_text_sha256":"33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12","size":950,"backup_file":"model.33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12.preimage.spm","backup_raw_sha256":"33d8d88b86e7860490d56ceb8e0dc58e201853e3d1a23fd2a02002801d94af12"},
+  "authoring_graph_projection":{"contract":"speedtree_spm_authoring_graph_projection","version":1,"fingerprint":"503419ec5cf22b8852685952389802da7e8593c3a913f9962bc072d393148493"},
+  "authoring_graph_core_projection":{"contract":"speedtree_spm_authoring_graph_core_projection","version":3,"generator_count":2,"link_count":1,"asset_identity_count":1,"global_setting_count":0,"fingerprint":"3e1708b32695440ddb8d1adea32c904d2b56f6df79022c67a77bd1e3ec437a3a"},
+  "generator_membership":{"contract":"speedtree_generator_membership_projection","version":1,"count":2,"fingerprint":"05d90461707e1423d5aecddd6fc46189e640eb7b5d1ef5c4e04743604e579bb0"},
+  "required_target_bindings":{"contract":"speedtree_required_target_binding_projection","version":2,"requested_mesh_ids":[130],"expected_mesh_ids":[130],"binding_count":1,"fingerprint":"235118711bc96411aaeb30ea2c6a2d83d99424f422bb8787e695e9ecf3b5574e","missing_requested_mesh_ids":[]},
+  "target_requirements":{"contract":"speedtree_stale_node_target_requirements","version":1,"policy":"explicit_sealed_scopes_v1","authoring_mesh_ids":[130],"required_live_mesh_ids":[130]}
+}

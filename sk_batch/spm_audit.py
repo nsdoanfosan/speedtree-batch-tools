@@ -48,6 +48,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +93,7 @@ from speedtree_pipeline_contract import (
     read_spm_text as read_pipeline_spm_text,
 )
 from speedtree_export_options_contract import require_texture_skip_writing
+from spm_generator_sync.process_stream import run_streaming_process
 
 GEN_RE = re.compile(r"<Generator\b[^>]*>.*?</Generator>", re.DOTALL)
 GEN_TYPE_RE = re.compile(r'<Generator\b[^>]*Type="([^"]+)"')
@@ -119,6 +121,14 @@ SPM_REPLACE_INITIAL_BACKOFF_SECONDS = 0.05
 SPM_REPLACE_MAX_BACKOFF_SECONDS = 1.0
 _SPM_WRITE_TRANSACTION = contextvars.ContextVar(
     "spm_write_transaction",
+    default=None,
+)
+_SPEEDTREE_EXPORT_OUTPUT_CALLBACK = contextvars.ContextVar(
+    "speedtree_export_output_callback",
+    default=None,
+)
+_SPEEDTREE_EXPORT_CANCEL_REQUESTED = contextvars.ContextVar(
+    "speedtree_export_cancel_requested",
     default=None,
 )
 BONE_VALUE_RE = re.compile(
@@ -2686,7 +2696,7 @@ class _SpeedTreeProgressDeadline(subprocess.TimeoutExpired):
         self.reason = evidence.get("timeout_reason")
 
 
-def _run_speedtree_export_attempt(
+def _run_speedtree_export_attempt_tempfiles(
     cmd,
     *,
     popen_kwargs,
@@ -2821,6 +2831,138 @@ def _run_speedtree_export_attempt(
                 )
 
 
+def _run_speedtree_export_attempt_streaming(
+    cmd,
+    *,
+    cwd,
+    creationflags,
+    soft_timeout,
+    absolute_timeout,
+    poll_interval,
+    staged_output,
+    attempt,
+    output_callback,
+    cancel_requested,
+    popen_factory,
+):
+    """Run one attempt through the shared owned-streaming process contract."""
+    started = time.monotonic()
+    signatures = None
+    activity_revision = 0
+    progress_event_count = 0
+    progress_events = deque(maxlen=64)
+
+    def record_progress(signals, *, cpu_seconds=None, output=None):
+        nonlocal progress_event_count
+        progress_event_count += 1
+        progress_events.append(
+            {
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "signals": list(signals),
+                "cpu_seconds": cpu_seconds,
+                "output": output,
+            }
+        )
+
+    def activity_probe(process):
+        nonlocal signatures, activity_revision
+        current = {
+            "cpu_seconds": _process_cpu_seconds(process),
+            "output": _file_progress_signature(staged_output),
+        }
+        changed = []
+        if signatures is not None:
+            old_cpu = signatures.get("cpu_seconds")
+            new_cpu = current.get("cpu_seconds")
+            if (
+                old_cpu is not None
+                and new_cpu is not None
+                and new_cpu > old_cpu
+            ):
+                changed.append("child_cpu")
+            if _content_signature_advanced(
+                signatures.get("output"),
+                current.get("output"),
+            ):
+                changed.append("output")
+        signatures = current
+        if changed:
+            activity_revision += 1
+            record_progress(
+                changed,
+                cpu_seconds=current.get("cpu_seconds"),
+                output=current.get("output"),
+            )
+        return activity_revision
+
+    def forward_output(channel, line):
+        record_progress([channel])
+        if output_callback is not None:
+            output_callback(channel, line)
+
+    stream_kwargs = {
+        "cwd": cwd,
+        "timeout": absolute_timeout,
+        "inactivity_timeout": soft_timeout,
+        "activity_probe": activity_probe,
+        "output_callback": forward_output,
+        "cancel_requested": cancel_requested,
+        "poll_interval": poll_interval,
+        "creationflags": creationflags,
+    }
+    if popen_factory is not None:
+        stream_kwargs["popen_factory"] = popen_factory
+    try:
+        result = run_streaming_process(cmd, **stream_kwargs)
+    except subprocess.TimeoutExpired as exc:
+        now = time.monotonic()
+        reason = (
+            "hard_cap"
+            if getattr(exc, "timeout_reason", None) == "absolute"
+            else "stalled"
+        )
+        evidence = {
+            "attempt": attempt,
+            "timeout_reason": reason,
+            "soft_timeout_seconds": soft_timeout,
+            "absolute_max_seconds": absolute_timeout,
+            "elapsed_seconds": round(now - started, 3),
+            "last_progress_age_seconds": round(
+                float(getattr(exc, "last_activity_age", now - started)),
+                3,
+            ),
+            "progress_event_count": progress_event_count,
+            "progress_events": list(progress_events),
+            "termination_state": getattr(exc, "termination_state", None),
+        }
+        raise _SpeedTreeProgressDeadline(
+            cmd,
+            soft_timeout,
+            stdout=exc.output or "",
+            stderr=exc.stderr or "",
+            evidence=evidence,
+        ) from exc
+
+    return (
+        result.returncode,
+        result.stdout,
+        result.stderr,
+        {
+            "attempt": attempt,
+            "duration_seconds": round(result.elapsed, 3),
+            "returncode": int(result.returncode),
+            "returncode_hex": (
+                f"0x{(int(result.returncode) & 0xFFFFFFFF):08X}"
+            ),
+            "progress_event_count": progress_event_count,
+            "progress_events": list(progress_events),
+            "cleanup_state": result.cleanup_state,
+            "stdout_omitted_chars": result.stdout_omitted_chars,
+            "stderr_omitted_chars": result.stderr_omitted_chars,
+        },
+    )
+
+
 def run_speedtree_export(
     cmd,
     cwd,
@@ -2829,15 +2971,23 @@ def run_speedtree_export(
     absolute_timeout=SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
     poll_interval=0.5,
     crash_retries=SPEEDTREE_EXPORT_CRASH_RETRIES,
+    stream_output=True,
+    output_callback=None,
+    cancel_requested=None,
+    popen_factory=None,
 ):
-    """Run one Modeler export, waiting on the process handle, not on pipe EOF.
+    """Run one Modeler export under the repository's single launch rule.
 
     SpeedTree is a GUI executable even under ``-export``: descendants can keep
     an inherited stdout/stderr pipe open after the Modeler process itself has
-    exited.  ``subprocess.run(capture_output=True)`` then blocks on EOF until
-    the timeout fires and a finished 16s export is reported as a 120s failure.
-    Regular temporary files remove that failure mode; this mirrors the add-on's
-    ``speedtree_cli._run_process`` contract.
+    exited.  The default PIPE path is safe only through
+    ``process_stream.run_streaming_process``: concurrent drain threads,
+    pre-resume owned-tree assignment, and a bounded post-exit EOF wait prevent
+    a finished 16s export from becoming a false 120s timeout.  The
+    ``stream_output=False`` fallback and the repair add-on's
+    ``speedtree_cli._run_process`` use regular temporary files and wait on the
+    root handle instead.  Neither contract permits
+    ``subprocess.run(capture_output=True)`` for Modeler.
     """
     absolute_timeout = max(
         0.001,
@@ -2848,11 +2998,17 @@ def run_speedtree_export(
     )
     soft_timeout = min(absolute_timeout, max(0.001, float(timeout)))
     crash_retries = max(0, min(2, int(crash_retries)))
+    if output_callback is None:
+        output_callback = _SPEEDTREE_EXPORT_OUTPUT_CALLBACK.get()
+    if cancel_requested is None:
+        cancel_requested = _SPEEDTREE_EXPORT_CANCEL_REQUESTED.get()
     popen_kwargs = {"cwd": str(cwd), "stdin": subprocess.DEVNULL}
+    creationflags = 0
     if os.name == "nt":
-        popen_kwargs["creationflags"] = 0x08000000 | getattr(  # CREATE_NO_WINDOW
+        creationflags = 0x08000000 | getattr(  # CREATE_NO_WINDOW
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
+        popen_kwargs["creationflags"] = creationflags
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -2872,6 +3028,11 @@ def run_speedtree_export(
         "soft_timeout_seconds": soft_timeout,
         "absolute_max_seconds": absolute_timeout,
         "max_access_violation_retries": crash_retries,
+        "process_io_contract": (
+            "owned_streaming_pipes"
+            if stream_output
+            else "regular_tempfiles"
+        ),
         "attempts": [],
     }
     with speedtree_export_gate():
@@ -2893,14 +3054,30 @@ def run_speedtree_export(
                     stdout,
                     stderr,
                     attempt_evidence,
-                ) = _run_speedtree_export_attempt(
-                    attempt_cmd,
-                    popen_kwargs=popen_kwargs,
-                    soft_timeout=min(soft_timeout, remaining_absolute),
-                    absolute_timeout=remaining_absolute,
-                    poll_interval=poll_interval,
-                    staged_output=staged_output,
-                    attempt=attempt,
+                ) = (
+                    _run_speedtree_export_attempt_streaming(
+                        attempt_cmd,
+                        cwd=str(cwd),
+                        creationflags=creationflags,
+                        soft_timeout=min(soft_timeout, remaining_absolute),
+                        absolute_timeout=remaining_absolute,
+                        poll_interval=poll_interval,
+                        staged_output=staged_output,
+                        attempt=attempt,
+                        output_callback=output_callback,
+                        cancel_requested=cancel_requested,
+                        popen_factory=popen_factory,
+                    )
+                    if stream_output
+                    else _run_speedtree_export_attempt_tempfiles(
+                        attempt_cmd,
+                        popen_kwargs=popen_kwargs,
+                        soft_timeout=min(soft_timeout, remaining_absolute),
+                        absolute_timeout=remaining_absolute,
+                        poll_interval=poll_interval,
+                        staged_output=staged_output,
+                        attempt=attempt,
+                    )
                 )
             except _SpeedTreeProgressDeadline as exc:
                 evidence["attempts"].append(exc.evidence)
@@ -2918,6 +3095,13 @@ def run_speedtree_export(
                     stderr=exc.stderr,
                     evidence=evidence,
                 ) from exc
+            except BaseException:
+                if staged_output is not None:
+                    _unlink_with_backoff(
+                        staged_output,
+                        operation="speedtree_export:discard_interrupted_partial",
+                    )
+                raise
             attempt_evidence["stdout_tail"] = stdout[-500:]
             attempt_evidence["stderr_tail"] = stderr[-500:]
             attempt_evidence["access_violation"] = (
@@ -3498,7 +3682,12 @@ def export_verify_xml(spm_path, cfg, out_path):
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
         result = run_speedtree_export(
-            cmd, Path(spm_path).parent, timeout
+            cmd,
+            Path(spm_path).parent,
+            timeout,
+            stream_output=bool(
+                cfg.get("spm_stream_modeler_output", True)
+            ),
         )
     except subprocess.TimeoutExpired as exc:
         raise SpeedTreeExportTimeout(
@@ -3557,7 +3746,12 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     timeout = float(cfg.get("spm_verify_timeout", 120))
     try:
         result = run_speedtree_export(
-            cmd, Path(spm_path).parent, timeout
+            cmd,
+            Path(spm_path).parent,
+            timeout,
+            stream_output=bool(
+                cfg.get("spm_stream_modeler_output", True)
+            ),
         )
     except subprocess.TimeoutExpired as exc:
         raise SpeedTreeExportTimeout(
@@ -4566,20 +4760,43 @@ def _restore_source_snapshot(
         )
 
 
-def process_spm(spm_path, cfg, log=print, dry_run=False, force_rerun=False):
-    """Run one complete SPM transaction under its canonical OS lock."""
-    with spm_exclusive_lock(spm_path, log=log):
-        token = _SPM_WRITE_TRANSACTION.set({})
-        try:
-            return _process_spm_locked(
-                spm_path,
-                cfg,
-                log=log,
-                dry_run=dry_run,
-                force_rerun=force_rerun,
-            )
-        finally:
-            _SPM_WRITE_TRANSACTION.reset(token)
+def process_spm(
+    spm_path,
+    cfg,
+    log=print,
+    dry_run=False,
+    force_rerun=False,
+    cancel_requested=None,
+):
+    """Run one complete SPM transaction under its canonical OS lock.
+
+    Modeler lines are forwarded through ``log`` as they arrive. Embedded
+    callers may supply ``cancel_requested`` for cooperative owned-tree
+    cancellation; the standalone GUI additionally owns this Python wrapper's
+    complete tree and can stop it from the parent process.
+    """
+
+    def modeler_output(channel, line):
+        log(f"  [SpeedTree {channel}] {line}")
+
+    output_token = _SPEEDTREE_EXPORT_OUTPUT_CALLBACK.set(modeler_output)
+    cancel_token = _SPEEDTREE_EXPORT_CANCEL_REQUESTED.set(cancel_requested)
+    try:
+        with spm_exclusive_lock(spm_path, log=log):
+            transaction_token = _SPM_WRITE_TRANSACTION.set({})
+            try:
+                return _process_spm_locked(
+                    spm_path,
+                    cfg,
+                    log=log,
+                    dry_run=dry_run,
+                    force_rerun=force_rerun,
+                )
+            finally:
+                _SPM_WRITE_TRANSACTION.reset(transaction_token)
+    finally:
+        _SPEEDTREE_EXPORT_CANCEL_REQUESTED.reset(cancel_token)
+        _SPEEDTREE_EXPORT_OUTPUT_CALLBACK.reset(output_token)
 
 
 def _process_spm_locked(
