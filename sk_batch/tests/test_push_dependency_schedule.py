@@ -89,6 +89,38 @@ def test_tree_selection_adds_exact_rendered_cluster_sources_first(tmp_path):
     assert auto_added == {str(path) for path in cluster_spms}
 
 
+def test_sibling_rollback_never_enters_dependency_schedule(tmp_path):
+    owner = tmp_path / "Weed_reed"
+    owner.mkdir()
+    live = owner / "SK_weed_reed_02.spm"
+    rollback = (
+        owner
+        / "SK_weed_reed_02.texture_slot_backup_20260801_010203_123456.spm"
+    )
+    live.write_bytes(b"live")
+    rollback.write_bytes(b"rollback")
+    live_item = {"spm": live, "checked": True}
+    rollback_item = {"spm": rollback, "checked": True}
+
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        return_value={
+            "kind": schedule.MANIFEST_KIND,
+            "status": "pass_through",
+            "parts": [],
+        },
+    ):
+        ordered, dependencies, auto_added = schedule.expand_push_targets(
+            [rollback_item, live_item],
+            {str(rollback): rollback_item, str(live): live_item},
+        )
+
+    assert ordered == [live_item]
+    assert dependencies == {str(live): ()}
+    assert auto_added == set()
+
+
 def test_shared_dependency_is_deduplicated_and_explicit_selection_is_preserved(
     tmp_path,
 ):

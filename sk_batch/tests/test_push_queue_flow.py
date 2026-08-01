@@ -39,6 +39,26 @@ class PushQueueFlowTests(unittest.TestCase):
         app.log = mock.Mock()
         return app
 
+    def test_queue_snapshot_drops_ineligible_backup_board_row(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        live = Path("Weed_reed") / "SK_weed_reed_02.spm"
+        rollback = (
+            Path("Weed_reed")
+            / "SK_weed_reed_02.texture_slot_backup_20260801_010203_123456.spm"
+        )
+        app.items = {
+            str(live): {"spm": live, "checked": True},
+            str(rollback): {"spm": rollback, "checked": True},
+        }
+
+        inventory, targets = app._snapshot_batch_request(
+            [str(rollback), str(live)]
+        )
+
+        self.assertEqual(set(inventory), {str(live)})
+        self.assertEqual([item["spm"] for item in targets], [live])
+
     @staticmethod
     def issue16_fixture():
         return json.loads(
