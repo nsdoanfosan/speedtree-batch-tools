@@ -5,6 +5,7 @@ only mutates files when --prepare-sk is passed.
 """
 import argparse
 import contextvars
+import copy
 import csv
 import functools
 import gzip
@@ -16,6 +17,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +45,8 @@ from speedtree_texture_contract import (
 from speedtree_pipeline_contract import (
     branch_generator_has_render_geometry,
     generator_guid_key as canonical_generator_guid_key,
+    is_live_spm,
+    production_spm_folders,
     read_spm_text as read_pipeline_spm_text,
     shared_contract_api,
 )
@@ -50,9 +55,10 @@ from speedtree_legacy_cluster_contract import (
     SNAPSHOT_SCAN_FAILED_REASON,
     inspect_legacy_cluster_state,
     make_decoded_spm_handoff,
+    marker_receipt_path,
     peek_generator_foregrounds,
+    problem_marker_receipt_path,
 )
-from sk_batch.sk_common import scan_cluster_spm_sources
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from pcg_canonical_outputs import (
@@ -85,6 +91,12 @@ if __package__ in (None, ""):
     from pcg_cluster_assembly_contract import (
         persist_cluster_assembly_receipts,
     )
+    from pcg_startup_cache import (
+        ContentAddressedJsonCache,
+        bounded_recursive_files,
+        content_identity,
+        path_key as startup_path_key,
+    )
 else:
     from .pcg_texture_common import (
         IMAGE_EXTS,
@@ -97,6 +109,12 @@ else:
     )
     from .pcg_cluster_assembly_contract import (
         persist_cluster_assembly_receipts,
+    )
+    from .pcg_startup_cache import (
+        ContentAddressedJsonCache,
+        bounded_recursive_files,
+        content_identity,
+        path_key as startup_path_key,
     )
 
 if __package__ in (None, ""):
@@ -204,12 +222,15 @@ _PENDING_DECODED_HANDOFF = contextvars.ContextVar(
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = SHARED_CACHE_DIR / "spm_analysis_v5.json"
-SBS_GRAPH_CACHE_PATH = SHARED_CACHE_DIR / "sbs_graph_names_v1.json"
+SBS_GRAPH_CACHE_PATH = SHARED_CACHE_DIR / "sbs_graph_names_v2.json"
 BLEND_IMAGE_CACHE_PATH = SHARED_CACHE_DIR / "blend_image_names_v2.json"
+PROVIDER_MAP_CACHE_PATH = SHARED_CACHE_DIR / "pcg_provider_map_v1.json"
+PROVIDER_MAP_CACHE_KIND = "pcg_canonical_provider_map"
 _PERSISTENT_SBS_GRAPHS = None
 _PERSISTENT_SBS_GRAPHS_DIRTY = False
 _PERSISTENT_BLEND_IMAGES = None
 _PERSISTENT_BLEND_IMAGES_DIRTY = False
+_PERSISTENT_CACHE_LOCK = threading.RLock()
 _DIRECTORY_FILE_INDEX_CACHE = {}
 _IMAGE_EQUAL_CACHE = {}
 _REPORT_SCAN_CACHE = contextvars.ContextVar("pcg_report_scan_cache", default=None)
@@ -270,15 +291,21 @@ def unique(seq):
     return out
 
 
+def _new_report_scan_cache():
+    return {
+        "file_cache_keys": {},
+        "root_spms": {},
+        "path_exists": {},
+        "content_snapshots": {},
+        "legacy_cluster_states": {},
+    }
+
+
 def _report_scan_cached(func):
     """Give one report a stable, thread-safe snapshot of repeated filesystem reads."""
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
-        token = _REPORT_SCAN_CACHE.set({
-            "file_cache_keys": {},
-            "root_spms": {},
-            "path_exists": {},
-        })
+        token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache())
         try:
             return func(*args, **kwargs)
         finally:
@@ -364,15 +391,16 @@ def save_spm_analysis_cache():
 
 def _persistent_sbs_graphs():
     global _PERSISTENT_SBS_GRAPHS
-    if _PERSISTENT_SBS_GRAPHS is not None:
+    with _PERSISTENT_CACHE_LOCK:
+        if _PERSISTENT_SBS_GRAPHS is not None:
+            return _PERSISTENT_SBS_GRAPHS
+        try:
+            payload = json.loads(SBS_GRAPH_CACHE_PATH.read_text(encoding="utf-8"))
+            entries = payload.get("entries", {}) if payload.get("version") == 1 else {}
+            _PERSISTENT_SBS_GRAPHS = entries if isinstance(entries, dict) else {}
+        except Exception:
+            _PERSISTENT_SBS_GRAPHS = {}
         return _PERSISTENT_SBS_GRAPHS
-    try:
-        payload = json.loads(SBS_GRAPH_CACHE_PATH.read_text(encoding="utf-8"))
-        entries = payload.get("entries", {}) if payload.get("version") == 1 else {}
-        _PERSISTENT_SBS_GRAPHS = entries if isinstance(entries, dict) else {}
-    except Exception:
-        _PERSISTENT_SBS_GRAPHS = {}
-    return _PERSISTENT_SBS_GRAPHS
 
 
 def _persistent_blend_images():
@@ -392,19 +420,30 @@ def _persistent_blend_images():
     return _PERSISTENT_BLEND_IMAGES
 
 
-def _cached_sbs_graph_names(sbs_path):
+def _cached_sbs_graph_names(sbs_path, metrics=None):
     global _PERSISTENT_SBS_GRAPHS_DIRTY
     from sbs_auto import list_m_graphs
-    cache_key = _file_cache_key(sbs_path)
-    path_key, size, mtime_ns = cache_key
-    entry = _persistent_sbs_graphs().get(path_key)
-    if entry and entry.get("size") == size and entry.get("mtime_ns") == mtime_ns:
+    report_cache = _REPORT_SCAN_CACHE.get()
+    memo = (
+        report_cache.get("content_snapshots")
+        if report_cache is not None else None
+    )
+    identity = content_identity([sbs_path], memo=memo, max_files=1)
+    identity_sha256 = identity["sha256"]
+    cache_key = startup_path_key(sbs_path)
+    with _PERSISTENT_CACHE_LOCK:
+        entry = _persistent_sbs_graphs().get(cache_key)
+    if entry and entry.get("identity_sha256") == identity_sha256:
+        if metrics is not None:
+            metrics["cache_hits"] = metrics.get("cache_hits", 0) + 1
         return entry.get("names", [])
+    if metrics is not None:
+        metrics["cache_misses"] = metrics.get("cache_misses", 0) + 1
     names = list_m_graphs(sbs_path)
-    if size or mtime_ns:
-        _persistent_sbs_graphs()[path_key] = {
-            "size": size,
-            "mtime_ns": mtime_ns,
+    with _PERSISTENT_CACHE_LOCK:
+        _persistent_sbs_graphs()[cache_key] = {
+            "identity_sha256": identity_sha256,
+            "content_identity": identity,
             "names": names,
         }
         _PERSISTENT_SBS_GRAPHS_DIRTY = True
@@ -1275,7 +1314,7 @@ def leaf_generator_bindings(path, visible_only=False):
         path, include_decoded_handoff=True)
     bindings = analysis["leaf_generator_bindings"]
     snapshot = analysis.get("generator_foregrounds_snapshot")
-    legacy_state = inspect_legacy_cluster_state(
+    legacy_state = _report_legacy_cluster_state(
         path,
         foregrounds_snapshot=snapshot,
         decoded_handoff=decoded_handoff,
@@ -1325,6 +1364,45 @@ def leaf_generator_bindings(path, visible_only=False):
     if visible_only:
         return [dict(row) for row in bindings if row.get("visible")]
     return [dict(row) for row in bindings]
+
+
+def _report_legacy_cluster_state(
+        path, foregrounds_snapshot=None, decoded_handoff=None):
+    """Inspect receipt lineage once per SPM inside one folder audit.
+
+    ``inspect_legacy_cluster_state`` deliberately validates three filesystem
+    identities before every LRU lookup.  The same folder pipeline asks for
+    that immutable result through several independent consumers, so on
+    Windows those redundant ``resolve``/``stat`` calls dominated warm audits.
+    A worker-local report cache keeps the first exact inspection result for
+    the rest of that folder task; a new cache is installed for every refresh,
+    and mutation authority is still guarded by the later content-identity
+    recapture in the GUI worker.
+    """
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is None:
+        return inspect_legacy_cluster_state(
+            path,
+            foregrounds_snapshot=foregrounds_snapshot,
+            decoded_handoff=decoded_handoff,
+        )
+    spm = Path(path)
+    cache_key = (
+        _file_cache_key(spm),
+        _file_cache_key(marker_receipt_path(spm)),
+        _file_cache_key(problem_marker_receipt_path(spm)),
+    )
+    cache = report_cache["legacy_cluster_states"]
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+    result = inspect_legacy_cluster_state(
+        spm,
+        foregrounds_snapshot=foregrounds_snapshot,
+        decoded_handoff=decoded_handoff,
+    )
+    cache[cache_key] = copy.deepcopy(result)
+    return result
 
 
 def leaf_generator_material_ids(path, visible_only=False):
@@ -2835,7 +2913,7 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
             guid = str(binding.get("generator_guid") or "")
             if material_id and guid:
                 legacy_material_guids.setdefault(material_id, set()).add(guid)
-        legacy_state = inspect_legacy_cluster_state(spm)
+        legacy_state = _report_legacy_cluster_state(spm)
         for row in extract_material_image_refs(spm):
             key = canonical_material_name(row.get("material_name")).lower()
             target_materials.setdefault(key, []).append(row)
@@ -2996,7 +3074,7 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
                 "spm": str(spm),
                 **{
                     key: value
-                    for key, value in inspect_legacy_cluster_state(spm).items()
+                    for key, value in _report_legacy_cluster_state(spm).items()
                     if key not in {"spm", "evidence_by_guid"}
                 },
             }
@@ -3936,11 +4014,32 @@ def atlas_blend_stems(cfg):
     }
 
 
-def folder_m_graph_names(sbs_files):
+def folder_m_graph_names(sbs_files, metrics=None, parallel=False):
     """Collect managed graphs and index common aliases by their canonical T_ name."""
     graphs = {}
-    for sbs in sbs_files:
-        for name in _cached_sbs_graph_names(sbs):
+    ordered = list(sbs_files)
+    names_by_path = {}
+    if parallel and len(ordered) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(ordered)),
+            thread_name_prefix="pcg-sbs-index",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _cached_sbs_graph_names, sbs, metrics
+                ): sbs
+                for sbs in ordered
+            }
+            for future in as_completed(futures):
+                names_by_path[startup_path_key(futures[future])] = (
+                    future.result()
+                )
+    for sbs in ordered:
+        names = (
+            names_by_path[startup_path_key(sbs)]
+            if names_by_path else _cached_sbs_graph_names(sbs, metrics=metrics)
+        )
+        for name in names:
             pair = (name, str(sbs))
             is_current = name.lower().startswith("t_")
             if is_current:
@@ -6315,27 +6414,52 @@ def write_csv(report, csv_path):
         writer.writerows(rows)
 
 
-def global_m_graph_names(items, cfg):
-    """Find material graphs in tree-local and shared source-texture SBS files."""
+def global_m_graph_names(items, cfg, metrics=None):
+    """Find material graphs through a bounded content-validated inventory."""
     paths = []
     for item in items:
         paths.extend(Path(path) for path in item.get("sbs_files") or [])
     roots = [Path(cfg.get("tree_root", ""))]
     roots.extend(Path(path) for path in cfg.get("source_texture_roots", []))
-    for root in roots:
-        if not root.exists():
-            continue
-        paths.extend(
-            path for path in root.rglob("*.sbs")
-            if path.is_file() and not is_backup_path(path)
-            and ".autosave" not in str(path).lower()
-        )
-    return folder_m_graph_names(unique(paths))
+    discovered, discovery = bounded_recursive_files(
+        roots,
+        suffix=".sbs",
+        exclude_path=lambda path: (
+            is_backup_path(path) or ".autosave" in str(path).casefold()
+        ),
+        max_directories=int(
+            cfg.get("pcg_startup_max_sbs_directories", 20_000)
+        ),
+        max_files=int(cfg.get("pcg_startup_max_sbs_files", 5_000)),
+    )
+    paths.extend(discovered)
+    if metrics is not None:
+        metrics.update(discovery)
+        metrics["unique_file_count"] = len(unique(paths))
+    return folder_m_graph_names(
+        unique(paths), metrics=metrics, parallel=True
+    )
 
 
-def attach_global_m_graphs(items, cfg):
+def attach_global_m_graphs(items, cfg, metrics=None):
     """Attach canonical shared SBS graphs without treating old M_ outputs as inputs."""
-    graphs = global_m_graph_names(items, cfg)
+    needs_global = any(
+        not entry.get("m_graph") or entry.get("legacy_m_graph")
+        for item in items
+        for entry in item.get("cluster_items") or ()
+    )
+    if not needs_global:
+        if metrics is not None:
+            metrics.update({
+                "directory_count": 0,
+                "file_count": 0,
+                "unique_file_count": 0,
+                "strategy": "skipped_all_rows_have_canonical_graphs",
+            })
+        return {}
+    graphs = global_m_graph_names(items, cfg, metrics=metrics)
+    if metrics is not None:
+        metrics.setdefault("strategy", "bounded_content_identity_inventory")
     changed = set()
     for item in items:
         for entry in item.get("cluster_items") or []:
@@ -6414,40 +6538,159 @@ def resolve_shared_atlas_entries(items, cfg):
     return sorted(changed)
 
 
-def canonical_cluster_provider_map(root):
-    """Map every owner to the batch pipeline's connected canonical providers."""
+def _provider_inventory(root):
+    """Capture every production SPM that can affect provider connectivity."""
+    folders = list(production_spm_folders(root) or ())
+    if len(folders) > 4_096:
+        raise RuntimeError(
+            "PCG provider discovery exceeded the production-folder bound "
+            f"(4096): {len(folders)}"
+        )
+    paths = []
+    for folder in folders:
+        try:
+            candidates = list(Path(folder).iterdir())
+        except OSError as exc:
+            raise RuntimeError(
+                f"PCG provider inventory could not enumerate {folder}: {exc}"
+            ) from exc
+        paths.extend(
+            path for path in candidates
+            if path.suffix.casefold() == ".spm" and is_live_spm(path)
+        )
+    report_cache = _REPORT_SCAN_CACHE.get()
+    memo = (
+        report_cache.get("content_snapshots")
+        if report_cache is not None else None
+    )
+    identity = content_identity(
+        paths,
+        membership=(startup_path_key(path) for path in paths),
+        memo=memo,
+        max_files=10_000,
+    )
+    identity["_source_paths"] = [
+        str(path.absolute())
+        for path in sorted(paths, key=lambda path: str(path).casefold())
+    ]
+    return identity
+
+
+def _validated_cached_provider_map(value, inventory):
+    if not isinstance(value, dict):
+        return None
+    current_paths = {
+        row["path"] for row in inventory.get("files") or ()
+    }
     result = {}
-    for row in scan_cluster_spm_sources(root):
-        owner = Path(row["owner_folder"]).resolve()
-        provider = Path(
-            row.get("authoring_spm")
-            or row.get("output_spm")
-            or row.get("source_spm")
-        ).resolve()
+    for owner_key, raw_providers in value.items():
+        if not isinstance(owner_key, str) or not isinstance(raw_providers, list):
+            return None
+        providers = []
+        for raw_provider in raw_providers:
+            provider = Path(raw_provider).expanduser().absolute()
+            if startup_path_key(provider) not in current_paths:
+                return None
+            expected_owner = startup_path_key(provider.parent.parent)
+            if expected_owner != owner_key:
+                return None
+            providers.append(provider)
+        result[owner_key] = sorted(
+            providers, key=lambda path: str(path).casefold()
+        )
+    return result
+
+
+def canonical_cluster_provider_map(root, metrics=None):
+    """Map canonical provider candidates through a content-validated cache."""
+    inventory = _provider_inventory(root)
+    namespace = startup_path_key(root)
+    cache = ContentAddressedJsonCache(
+        PROVIDER_MAP_CACHE_PATH,
+        PROVIDER_MAP_CACHE_KIND,
+        max_entries=8,
+    )
+    cached = cache.get(namespace, inventory["sha256"])
+    validated = _validated_cached_provider_map(cached, inventory)
+    if validated is not None:
+        if metrics is not None:
+            metrics.update({
+                "cache_hit": True,
+                "discovery_strategy": "content_identity_cache",
+                "inventory_file_count": inventory["file_count"],
+                "provider_count": sum(len(rows) for rows in validated.values()),
+            })
+        return validated
+
+    # A folder audit already performs the authoritative connection and
+    # generator validation.  Provider discovery only needs the canonical pair
+    # candidates; re-running the complete fleet connection audit here was the
+    # multi-minute pre-folder startup bottleneck.
+    result = {}
+    pairs = {}
+    for raw_source in inventory.get("_source_paths") or ():
+        source = Path(raw_source)
+        if source.parent.name.casefold() != "cluster":
+            continue
+        try:
+            pair = resolve_cluster_spm_pair(source)
+        except Exception:
+            continue
+        pairs.setdefault(pair["pair_id"], pair)
+    for pair in pairs.values():
+        canonical = Path(pair["canonical_spm"])
+        mirror = Path(pair["mirror_spm"])
+        provider = (canonical if canonical.is_file() else mirror).resolve()
+        owner = provider.parent.parent.resolve()
         providers = result.setdefault(str(owner).casefold(), [])
         if provider not in providers:
             providers.append(provider)
     for providers in result.values():
         providers.sort(key=lambda path: str(path).casefold())
+    cache.put(
+        namespace,
+        inventory["sha256"],
+        {
+            owner_key: [str(path) for path in providers]
+            for owner_key, providers in result.items()
+        },
+    )
+    if metrics is not None:
+        metrics.update({
+            "cache_hit": False,
+            "discovery_strategy": "bounded_canonical_pair_inventory",
+            "inventory_file_count": inventory["file_count"],
+            "provider_count": sum(len(rows) for rows in result.values()),
+        })
     return result
 
 
 
 def _audit_one_with_handoff_scope(audit_one, folder):
-    """Bound an unconsumed decoded handoff to one folder task."""
+    """Bound decoded handoff and repeated filesystem reads to one folder."""
+    report_token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache())
     _PENDING_DECODED_HANDOFF.set(None)
     try:
         return audit_one(folder)
     finally:
         _PENDING_DECODED_HANDOFF.set(None)
+        _REPORT_SCAN_CACHE.reset(report_token)
 
 
-def _audit_report_folders(folders, audit_one, progress_callback=None):
+def _audit_report_folders(
+    folders,
+    audit_one,
+    progress_callback=None,
+    item_callback=None,
+):
     items = []
     total_folders = len(folders)
     if total_folders <= 1:
         for folder in folders:
-            items.append(_audit_one_with_handoff_scope(audit_one, folder))
+            item = _audit_one_with_handoff_scope(audit_one, folder)
+            items.append(item)
+            if item_callback is not None:
+                item_callback(item, folder)
             if progress_callback is not None:
                 progress_callback(1, total_folders, folder)
         return items
@@ -6470,6 +6713,8 @@ def _audit_report_folders(folders, audit_one, progress_callback=None):
         for future in as_completed(futures):
             index, folder = futures[future]
             indexed_items[index] = future.result()
+            if item_callback is not None:
+                item_callback(indexed_items[index], folder)
             completed += 1
             if progress_callback is not None:
                 progress_callback(completed, total_folders, folder)
@@ -6479,19 +6724,41 @@ def _audit_report_folders(folders, audit_one, progress_callback=None):
 @_report_scan_cached
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
-        target_mesh_names=None, progress_callback=None):
+        target_mesh_names=None, progress_callback=None, item_callback=None):
+    startup_started = time.perf_counter()
+    phase_started = startup_started
+    startup_phases = []
+
+    def finish_phase(name, **counts):
+        nonlocal phase_started
+        now = time.perf_counter()
+        startup_phases.append({
+            "phase": str(name),
+            "duration_seconds": round(max(0.0, now - phase_started), 6),
+            "from_audit_start_seconds": round(
+                max(0.0, now - startup_started), 6
+            ),
+            "counts": counts,
+        })
+        phase_started = now
+
     pcg_targets = focus_pcg_targets(
         pcg_targets,
         cfg.get("pcg_focus_data_assets"),
         cfg.get("pcg_positive_weight_only", True),
     )
     folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
+    finish_phase("candidate_discovery", folder_count=len(folders))
     blend_source_session = BlendSourceIndexSession(_persistent_blend_images())
+    provider_metrics = {}
     provider_map = (
-        canonical_cluster_provider_map(cfg["tree_root"])
+        canonical_cluster_provider_map(
+            cfg["tree_root"], metrics=provider_metrics
+        )
         if cfg.get("tree_root")
         else {}
     )
+    finish_phase("provider_discovery", **provider_metrics)
     requested_target_mesh_names = sorted({
         normalize_local_asset_stem(name)
         for name in target_mesh_names or []
@@ -6502,7 +6769,9 @@ def make_report(
         or requested_target_mesh_names
     )
     def audit_one(folder):
-        with use_blend_source_index(blend_source_session):
+        with use_blend_source_index(
+            blend_source_session, audit_scope=folder
+        ):
             return audit_folder(
                 folder, cfg, include_refs=include_refs,
                 target_mesh_names=folder_target_mesh_names(
@@ -6521,30 +6790,76 @@ def make_report(
         if progress_callback is not None else None
     )
     items = _audit_report_folders(
-        folders, audit_one, progress_callback=discovery_progress
+        folders,
+        audit_one,
+        progress_callback=discovery_progress,
+        item_callback=item_callback,
     )
+    finish_phase("primary_folder_audit", folder_count=len(folders))
     pending = blend_source_session.pending_requests()
+    revalidated_folder_count = 0
     if pending:
+        affected_scope_keys = blend_source_session.pending_audit_scopes()
         ensure_blend_source_index(cfg, blend_source_session)
+        finish_phase(
+            "blend_source_index",
+            request_count=len(pending),
+            cache_hit=False,
+        )
         # The index child proved the requested bytes at its exit boundary.
         # Re-hash on the authoritative final pass so a same-size/mtime-restored
         # replacement cannot inherit that row between discovery and result.
         blend_source_session.begin_pass()
-        items = _audit_report_folders(
-            folders, audit_one, progress_callback=progress_callback
+        affected_folders = [
+            folder for folder in folders
+            if startup_path_key(folder) in affected_scope_keys
+        ]
+        # A legacy/unscoped caller is never allowed to make the second pass
+        # narrower by accident.
+        if not affected_scope_keys or not affected_folders:
+            affected_folders = list(folders)
+        replacements = _audit_report_folders(
+            affected_folders, audit_one, progress_callback=None
         )
+        replacement_by_folder = {
+            startup_path_key(item["folder"]): item for item in replacements
+        }
+        items = [
+            replacement_by_folder.get(startup_path_key(item["folder"]), item)
+            for item in items
+        ]
+        revalidated_folder_count = len(affected_folders)
         unresolved = blend_source_session.pending_requests()
         if unresolved:
             raise BlendSourceIndexError(
                 "final PCG audit discovered unindexed blend candidates: "
                 + ", ".join(row["blend"] for row in unresolved)
             )
-    elif progress_callback is not None:
+        if progress_callback is not None:
+            for args in buffered_progress:
+                progress_callback(*args)
+    else:
+        finish_phase(
+            "blend_source_index",
+            request_count=0,
+            cache_hit=True,
+        )
+    finish_phase(
+        "bounded_folder_revalidation",
+        folder_count=revalidated_folder_count,
+        full_fleet_repeat=(
+            bool(folders) and revalidated_folder_count == len(folders)
+        ),
+    )
+    if not pending and progress_callback is not None:
         for args in buffered_progress:
             progress_callback(*args)
-    attach_global_m_graphs(items, cfg)
+    sbs_metrics = {"cache_hits": 0, "cache_misses": 0}
+    attach_global_m_graphs(items, cfg, metrics=sbs_metrics)
+    finish_phase("global_sbs_discovery", **sbs_metrics)
     resolve_shared_atlas_entries(items, cfg)
     refresh_texture_output_contract_states(items, cfg)
+    finish_phase("primary_postprocess", item_count=len(items))
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
     target_source_map = target_mesh_source_map(pcg_targets)
     pcg_target_mesh_names = set(target_mesh_map)
@@ -6651,9 +6966,29 @@ def make_report(
         for source in target_source_map.values()
         for placement in source.get("level_instances", [])
     ]
+    startup_total = max(0.0, time.perf_counter() - startup_started)
+    startup_cache_state = (
+        "warm"
+        if provider_metrics.get("cache_hit") is True
+        and sbs_metrics.get("cache_misses", 0) == 0
+        and not pending
+        else "cold_or_invalidated"
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "config": cfg,
+        "startup_timing": {
+            "schema_version": 1,
+            "kind": "pcg_primary_live_audit_timing",
+            "cache_state": startup_cache_state,
+            "wall_seconds": round(startup_total, 6),
+            "folder_count": len(folders),
+            "blend_index_request_count": len(pending),
+            "revalidated_folder_count": revalidated_folder_count,
+            "provider_metrics": provider_metrics,
+            "sbs_metrics": sbs_metrics,
+            "phases": startup_phases,
+        },
         "pcg_targets": {
             "source": pcg_targets.get("source") if pcg_targets else None,
             "graph": pcg_targets.get("graph") if pcg_targets else None,

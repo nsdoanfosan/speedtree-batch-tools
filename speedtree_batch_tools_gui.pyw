@@ -15,6 +15,7 @@ import inspect
 import os
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -668,6 +669,8 @@ class IntegratedApp:
         selected = self.notebook.select()
         if selected:
             index = self.notebook.index(selected)
+            if self.load_states[index] in {"pending", "scheduled"}:
+                self._record_tab_selection_perf(index, overwrite=True)
             self._schedule_load(index)
             state = self.load_states[index]
             if state == "loaded":
@@ -677,9 +680,29 @@ class IntegratedApp:
             else:
                 self.status_var.set(f"{TOOLS[index].label} 불러오는 중...")
 
+    def _record_tab_selection_perf(self, index, *, overwrite=False):
+        tab = self.tabs[index]
+        recorded = getattr(tab, "_speedtree_tab_selected_perf", None)
+        fallback = getattr(self, "_tab_selection_perf", {})
+        if not overwrite and (recorded is not None or index in fallback):
+            return recorded if recorded is not None else fallback[index]
+        selected_perf = time.perf_counter()
+        try:
+            tab._speedtree_tab_selected_perf = selected_perf
+        except (AttributeError, TypeError):
+            # Lightweight integration-test and alternate host tab objects may
+            # not expose an instance dictionary. Real Tk frames retain the
+            # value directly so the embedded PCG app can start timing at the
+            # user's selection event.
+            fallback = dict(fallback)
+            fallback[index] = selected_perf
+            self._tab_selection_perf = fallback
+        return selected_perf
+
     def _schedule_load(self, index):
         if self.load_states[index] != "pending":
             return
+        self._record_tab_selection_perf(index)
         self.load_states[index] = "scheduled"
         self.root.after_idle(lambda target=index: self._load_tool(target))
 

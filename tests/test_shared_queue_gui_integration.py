@@ -224,6 +224,9 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
         app._set_busy = mock.Mock()
         app.log = mock.Mock()
         app._run_step3_planning = mock.Mock()
+        app.items["D:/Tree"]["item"]["_gui_live_evidence"] = {
+            "sha256": "current-test-evidence",
+        }
         fake_thread = mock.Mock()
         fake_thread.start.side_effect = lambda: events.append(("thread_start",))
 
