@@ -17,6 +17,7 @@ sys.path.insert(0, str(PCG))
 sys.path.insert(0, str(REPO))
 
 from sk_batch.jobs import speedtree_material_preflight as preflight
+from pcg_st9_texture_batch import pcg_cluster_assembly_contract as assembly
 from pcg_texture_audit import (
     cluster_render_origin_receipt,
     preserved_cluster_materials,
@@ -29,6 +30,7 @@ from spm_texture_normalize import (
 )
 from speedtree_texture_contract import (
     BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+    BLENDER_BAKE_PREVIEW_FALLBACK_CAPABILITY,
     inspect_spm_texture_slots,
     resolve_blender_cluster_bake_origin,
     validate_blender_cluster_bake_receipt_for_consumption,
@@ -45,6 +47,10 @@ from speedtree_preview_texture_contract import (
 class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
     def test_shared_cross_reader_fixture_digest_and_order(self):
         receipt = json.loads(SHARED_FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            BLENDER_BAKE_PREVIEW_FALLBACK_CAPABILITY,
+            PREVIEW_FALLBACK_CAPABILITY,
+        )
         validate_preview_receipt(
             receipt,
             requested_usage=PREVIEW_ONLY_USAGE,
@@ -286,6 +292,23 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
             )
             self.assertEqual(fallback["map_index"], 6)
             self.assertEqual(tuple(fallback), FALLBACK_CANONICAL_FIELDS)
+            second_readiness = (
+                preflight.augment_texture_readiness_contract(
+                    preflight.resolve_texture_bindings(fixture["stmat"]),
+                    fixture["stmat"],
+                    fixture["target"],
+                    source_texture_roots=[],
+                )
+            )
+            self.assertEqual(
+                second_readiness["bindings"][0]["origin_receipt"],
+                receipt,
+            )
+            self.assertEqual(fixture["target"].read_bytes(), before_bytes)
+            self.assertEqual(
+                fixture["target"].stat().st_mtime_ns,
+                before_mtime_ns,
+            )
             preserved = [
                 row
                 for row in preserved_cluster_materials(fixture["root"])
@@ -364,6 +387,21 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
                     receipt,
                     requested_usage="production_canonical",
                 )
+            legacy_path = fixture["cluster"] / "legacy_subsurface.tga"
+            receipt["path_aliases"] = [{
+                "legacy_path": str(legacy_path),
+                "canonical_path": str(
+                    fixture["paths"]["SubsurfaceColor"].resolve()
+                ),
+                "sha256": hashlib.sha256(
+                    fixture["paths"]["SubsurfaceColor"].read_bytes()
+                ).hexdigest(),
+            }]
+            self.assertIsNone(assembly._origin_alias_proof(
+                legacy_path,
+                fixture["paths"]["SubsurfaceColor"],
+                [receipt],
+            ))
 
     def test_unknown_schema_capability_and_digest_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -418,6 +456,26 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
                 ),
                 "blender_cluster_bake_receipt_schema_unsupported",
             )
+            output["origin_receipt"] = {
+                "kind": "blender_cluster_bake_texture_origin_receipt",
+                "version": 1,
+                "physical_capture_manifest": str(fixture["manifest"]),
+                "receipt_capabilities": ["unknown"],
+            }
+            rebuilt, rebuild_issue = resolve_blender_cluster_bake_origin(
+                fixture["target"],
+                material,
+                output,
+                fixture["root"],
+                consumption_context=(
+                    BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
+                ),
+            )
+            self.assertEqual(rebuilt, {})
+            self.assertEqual(
+                rebuild_issue,
+                "blender_cluster_bake_receipt_schema_unsupported",
+            )
 
     def test_unowned_preview_fallback_remains_blocked(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -445,22 +503,22 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
             payload = json.loads(
                 fixture["manifest"].read_text(encoding="utf-8")
             )
-            amount = next(
+            selected = next(
                 row
                 for row in payload["maps"]
-                if row["role"] == "SubsurfaceAmount"
+                if row["role"] == "SubsurfaceColor"
             )
             payload["maps"] = [
                 row
                 for row in payload["maps"]
-                if row["role"] != "SubsurfaceAmount"
+                if row["role"] != "SubsurfaceColor"
             ]
             fixture["manifest"].write_text(
                 json.dumps(payload),
                 encoding="utf-8",
             )
             other = dict(payload)
-            other["maps"] = [amount]
+            other["maps"] = [selected]
             (fixture["cluster"] / "other_auto_capture_manifest.json").write_text(
                 json.dumps(other),
                 encoding="utf-8",
@@ -479,6 +537,39 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
 
             self.assertEqual(receipt, {})
             self.assertEqual(issue, "blender_cluster_bake_map_role_mismatch")
+
+    def test_fallback_does_not_search_an_alternate_amount_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.make_fixture(temporary)
+            payload = json.loads(
+                fixture["manifest"].read_text(encoding="utf-8")
+            )
+            payload["maps"] = [
+                row
+                for row in payload["maps"]
+                if row["role"] != "SubsurfaceAmount"
+            ]
+            fixture["manifest"].write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            material, output = self.resolver_inputs(fixture)
+
+            receipt, issue = resolve_blender_cluster_bake_origin(
+                fixture["target"],
+                material,
+                output,
+                fixture["root"],
+                consumption_context=(
+                    BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
+                ),
+            )
+
+            self.assertEqual(issue, "")
+            self.assertEqual(
+                receipt["preview_role_fallbacks"][0]["manifest_role"],
+                "subsurfacecolor",
+            )
 
     def test_core_role_swap_remains_blocked(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -558,12 +649,12 @@ class Issue82PreviewSubsurfaceFallbackTests(unittest.TestCase):
                     payload = json.loads(
                         fixture["manifest"].read_text(encoding="utf-8")
                     )
-                    amount = next(
+                    selected = next(
                         row
                         for row in payload["maps"]
-                        if row["role"] == "SubsurfaceAmount"
+                        if row["role"] == "SubsurfaceColor"
                     )
-                    payload["maps"].append(dict(amount))
+                    payload["maps"].append(dict(selected))
                     fixture["manifest"].write_text(
                         json.dumps(payload),
                         encoding="utf-8",

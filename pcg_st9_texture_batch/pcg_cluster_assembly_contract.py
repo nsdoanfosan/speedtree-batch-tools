@@ -965,6 +965,10 @@ def _origin_alias_proof(value, candidate, origin_receipts):
             not isinstance(receipt, dict)
             or receipt.get("kind")
             != "blender_cluster_bake_texture_origin_receipt"
+            or int(receipt.get("version") or 0) != 1
+            or receipt.get("preview_role_fallbacks")
+            or "preview_role_fallbacks_schema_version" in receipt
+            or "receipt_capabilities" in receipt
             or receipt.get("source_origin") != "blender_cluster_bake"
         ):
             continue

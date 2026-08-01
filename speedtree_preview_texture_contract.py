@@ -71,7 +71,6 @@ def build_preview_role_fallback(
     slot_role,
     slot_path,
     selected_rows,
-    declared_rows,
     material_id,
     material_name,
     contract_hash,
@@ -93,26 +92,18 @@ def build_preview_role_fallback(
         or _map_role(map_name) != SUBSURFACE_AMOUNT_ROLE
         or not isinstance(selected_rows, list)
         or len(selected_rows) != 1
-        or not isinstance(declared_rows, dict)
     ):
         return None
     selected = selected_rows[0]
-    declared_slot = declared_rows.get(SUBSURFACE_AMOUNT_ROLE)
-    if not isinstance(selected, dict) or not isinstance(declared_slot, dict):
+    if not isinstance(selected, dict):
         return None
     if (
         selected.get("role") != SUBSURFACE_COLOR_ROLE
         or selected.get("raw_role") != SUBSURFACE_COLOR_ROLE
-        or declared_slot.get("role") != SUBSURFACE_AMOUNT_ROLE
-        or declared_slot.get("raw_role") != SUBSURFACE_AMOUNT_ROLE
     ):
         return None
     selected_path = str(selected.get("path") or "").strip()
-    declared_slot_path = str(declared_slot.get("path") or "").strip()
     selected_sha256 = str(selected.get("sha256") or "").strip().casefold()
-    declared_slot_sha256 = str(
-        declared_slot.get("sha256") or ""
-    ).strip().casefold()
     material_id = str(material_id or "").strip()
     material_name = str(material_name or "").strip()
     contract_hash = str(contract_hash or "").strip().casefold()
@@ -125,11 +116,8 @@ def build_preview_role_fallback(
         or not material_id
         or not material_name
         or not selected_path
-        or not declared_slot_path
         or _path_identity(slot_path) != _path_identity(selected_path)
-        or _path_identity(declared_slot_path) == _path_identity(selected_path)
         or not _SHA256_RE.fullmatch(selected_sha256)
-        or not _SHA256_RE.fullmatch(declared_slot_sha256)
         or not _SHA256_RE.fullmatch(contract_hash)
     ):
         return None

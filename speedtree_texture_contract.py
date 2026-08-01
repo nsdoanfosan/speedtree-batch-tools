@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from speedtree_preview_texture_contract import (
+    PREVIEW_FALLBACK_CAPABILITY,
     PREVIEW_FALLBACK_SCHEMA_FIELD,
     PREVIEW_ONLY_USAGE,
     PREVIEW_ROLE_FALLBACKS_FIELD,
@@ -52,6 +53,7 @@ TEXTURE_ORIGIN_NEEDS_PCG_GENERATION = (
 )
 BLENDER_BAKE_CONSUMPTION_STRICT = "strict"
 BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW = "speedtree_preview"
+BLENDER_BAKE_PREVIEW_FALLBACK_CAPABILITY = PREVIEW_FALLBACK_CAPABILITY
 BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW = PREVIEW_ONLY_USAGE
 PCG_ST9_REMEDIATION = (
     "PCG ST9 Texture에서 누락된 canonical T_* output을 생성한 뒤 "
@@ -405,11 +407,6 @@ def validate_blender_cluster_bake_receipt_for_consumption(
                 and row["sha256"] == fallback["sha256"]
             )
         ]
-        amount_rows = [
-            row
-            for row in declared
-            if row["raw_role"] == SUBSURFACE_AMOUNT_ROLE
-        ]
         matching_slots = [
             row
             for row in slot_files
@@ -432,9 +429,6 @@ def validate_blender_cluster_bake_receipt_for_consumption(
             != str(receipt.get("material_name") or "")
             or fallback["contract_hash"] != contract_hash
             or len(selected) != 1
-            or len(amount_rows) != 1
-            or _path_key(amount_rows[0]["path"])
-            == _path_key(selected_path)
             or len(matching_slots) != 1
         ):
             return "blender_cluster_bake_preview_fallback_evidence_mismatch"
@@ -505,6 +499,24 @@ def resolve_blender_cluster_bake_origin(
         return {}, "blender_cluster_bake_capture_boundary_mismatch"
 
     stored = output.get("origin_receipt")
+    if (
+        isinstance(stored, dict)
+        and (
+            PREVIEW_ROLE_FALLBACKS_FIELD in stored
+            or PREVIEW_FALLBACK_SCHEMA_FIELD in stored
+            or RECEIPT_CAPABILITIES_FIELD in stored
+            or RECEIPT_CLAIM_FIELD in stored
+        )
+    ):
+        stored_issue = (
+            validate_blender_cluster_bake_receipt_for_consumption(
+                stored,
+                asset_root,
+                consumption_context=consumption_context,
+            )
+        )
+        if stored_issue:
+            return {}, stored_issue
     explicit_manifest = str(
         (stored or {}).get("physical_capture_manifest") or ""
     ).strip() if isinstance(stored, dict) else ""
@@ -555,7 +567,6 @@ def resolve_blender_cluster_bake_origin(
         return {}, "blender_cluster_bake_contract_hash_invalid"
 
     declared = []
-    declared_by_role = {}
     for manifest_row in payload.get("maps") or []:
         if not isinstance(manifest_row, dict):
             continue
@@ -585,13 +596,6 @@ def resolve_blender_cluster_bake_origin(
             "sha256": sha256,
         }
         declared.append(declared_row)
-        if raw_role in {
-            SUBSURFACE_AMOUNT_ROLE,
-            SUBSURFACE_COLOR_ROLE,
-        }:
-            if raw_role in declared_by_role:
-                return {}, "blender_cluster_bake_capture_manifest_ambiguous"
-            declared_by_role[raw_role] = declared_row
     if not declared:
         return {}, "blender_cluster_bake_map_role_mismatch"
 
@@ -637,7 +641,6 @@ def resolve_blender_cluster_bake_origin(
                     slot_role=expected_role,
                     slot_path=expected_path,
                     selected_rows=selected_entries,
-                    declared_rows=declared_by_role,
                     material_id=material_id,
                     material_name=material_name,
                     contract_hash=contract_hash,
