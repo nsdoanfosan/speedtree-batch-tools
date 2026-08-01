@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import copy
 import json
 import os
 import sys
@@ -604,11 +605,78 @@ class RelationAndAuthorityTests(unittest.TestCase):
 
         self.assertEqual(
             metrics["content_identity_algorithm"],
+            "sha256-of-hybrid-content-keys-v1",
+        )
+        self.assertEqual(
+            metrics["mutation_authority_algorithm"],
             "sha256-of-full-content-keys-v1",
         )
         self.assertFalse(GUI.item_has_current_live_evidence(item))
         with self.assertRaises(RuntimeError):
             GUI.require_current_live_evidence(item)
+
+    def test_exact_baseline_rejects_bulk_image_off_window_tamper_before_write(self):
+        image = self.folder / "leaf_color.tga"
+        image.write_bytes(b"A" * (2 * 1024 * 1024))
+        original = image.stat()
+        item = self.item()
+        item["cluster_items"] = [{"source_refs": [str(image)]}]
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ):
+            GUI.cache_blender_connection_rows({"items": [item]})
+
+        baseline = GUI.seal_exact_mutation_baseline(
+            [item],
+            action="test",
+            plan_payload={"target": "leaf"},
+        )
+        self.assertEqual(
+            item["_gui_exact_mutation_evidence"]["algorithm"],
+            "sha256-of-full-content-keys-v1",
+        )
+        self.assertTrue(GUI.require_exact_mutation_baseline(baseline))
+
+        changed = bytearray(image.read_bytes())
+        changed[100 * 1024] = ord("B")
+        image.write_bytes(changed)
+        os.utime(
+            image,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        # Startup/readiness sampling can legitimately miss this pixel.  The
+        # selected-plan exact seal must still block before the first write.
+        self.assertTrue(GUI.item_has_current_live_evidence(item))
+        with self.assertRaisesRegex(RuntimeError, "production 파일을 쓰지"):
+            GUI.require_exact_mutation_baseline(baseline)
+
+    def test_current_semantic_reaudit_rejects_old_plan_before_exact_seal(self):
+        stale = self.item()
+        current = copy.deepcopy(stale)
+        current["cluster_items"] = [{"texture_contract_state": "blocked"}]
+        app = GUI.App.__new__(GUI.App)
+        app.cfg = {}
+        with mock.patch.object(
+            GUI,
+            "make_report",
+            return_value={"items": [current]},
+        ), mock.patch.object(
+            GUI,
+            "cache_blender_connection_rows",
+        ), mock.patch.object(
+            GUI,
+            "seal_exact_mutation_baseline",
+        ) as seal:
+            with self.assertRaisesRegex(RuntimeError, "current affected-folder"):
+                app._reaudit_and_seal_mutation_items(
+                    [stale],
+                    action="test",
+                    plan_payload={"target": "leaf"},
+                )
+        seal.assert_not_called()
 
     def test_relation_calculation_honors_cancellation(self):
         with mock.patch.object(
@@ -652,6 +720,7 @@ class RelationAndAuthorityTests(unittest.TestCase):
         self.assertFalse(self.cache_path.exists())
 
     def test_relation_first_pass_deduplicates_shared_content_and_directories(self):
+        (self.folder / "unreferenced.png").write_bytes(b"image")
         first = self.item()
         second = self.item()
         second["name"] = "tree_elm_variant"
@@ -672,6 +741,31 @@ class RelationAndAuthorityTests(unittest.TestCase):
             metrics["first_pass_physical_content_reads"],
         )
         self.assertEqual(metrics["first_pass_directory_enumerations"], 1)
+        self.assertGreater(
+            metrics["unique_membership_file_count"],
+            metrics["unique_content_file_count"],
+        )
+        self.assertEqual(
+            metrics["content_identity_scope"],
+            "full-semantic-content-plus-sampled-bulk-images-plus-"
+            "bounded-directory-membership-v1",
+        )
+
+    def test_relation_directory_membership_change_invalidates_cache(self):
+        rows = [{"blend": self.folder / "leaf.blend", "spms": []}]
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=rows
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            self.assertEqual(calculate.call_count, 1)
+
+            (self.folder / "new_input.png").write_bytes(b"new")
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+
+        self.assertEqual(calculate.call_count, 2)
 
     def test_refresh_generation_rejects_stale_callbacks(self):
         app = GUI.App.__new__(GUI.App)
@@ -1077,7 +1171,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             self.assertEqual(warm_relation_metrics["cache_hits"], 55)
             self.assertEqual(
                 warm_relation_metrics["content_identity_algorithm"],
-                "sha256-of-full-content-keys-v1",
+                "sha256-of-hybrid-content-keys-v1",
             )
             self.assertLess(
                 cold_elapsed + cold_relation_elapsed,

@@ -13,6 +13,7 @@ import os
 import tempfile
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from artifact_content_key import (
@@ -110,7 +111,8 @@ def _stable_content_row(path, memo=None, *, exact=False):
 
 
 def content_identity(
-        paths, *, membership=None, memo=None, max_files=None, exact=False):
+        paths, *, membership=None, memo=None, max_files=None, exact=False,
+        workers=1):
     """Capture stable bounded content keys plus caller-owned membership data."""
     unique = {
         path_key(path): Path(path).expanduser().absolute()
@@ -121,10 +123,24 @@ def content_identity(
         raise BoundedDiscoveryError(
             f"Content identity needs {len(unique)} files; bound is {limit}"
         )
-    rows = [
-        _stable_content_row(unique[key], memo=memo, exact=exact)
-        for key in sorted(unique)
-    ]
+    ordered_keys = sorted(unique)
+    worker_count = min(max(1, int(workers)), len(ordered_keys) or 1)
+    if worker_count > 1:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="pcg-content-key",
+        ) as executor:
+            rows = list(executor.map(
+                lambda key: _stable_content_row(
+                    unique[key], memo=memo, exact=exact
+                ),
+                ordered_keys,
+            ))
+    else:
+        rows = [
+            _stable_content_row(unique[key], memo=memo, exact=exact)
+            for key in ordered_keys
+        ]
     stable_rows = [
         {
             "path": row["path"],

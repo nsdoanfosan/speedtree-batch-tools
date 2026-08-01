@@ -3553,7 +3553,13 @@ class GuiLabelTests(unittest.TestCase):
                 self.gui, "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ) as cleanup:
-            app._run_step3([], [selected], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_cleanup"
+            )
+            app._run_step3(
+                [], [selected], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
             app.cfg, targets=[r"D:\Trees\ladyfern"]
@@ -3660,7 +3666,13 @@ class GuiLabelTests(unittest.TestCase):
                 "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ):
-            app._run_step3(jobs, [target], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_normalize"
+            )
+            app._run_step3(
+                jobs, [target], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
             app.cfg,
@@ -4358,6 +4370,12 @@ class GuiLabelTests(unittest.TestCase):
             "patch": {"changed": False, "renames": []},
         }]}
 
+        baseline = self.gui.seal_exact_mutation_baseline(
+            [], action="unit_test_prepare"
+        )
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
         with mock.patch.object(self.gui, "prepare_sk", return_value=result):
             app._run_prepare([row])
 
@@ -4367,7 +4385,7 @@ class GuiLabelTests(unittest.TestCase):
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
         app._prepare_finished.assert_called_once_with(1, 0)
-        app._validate_live_mutation_items.assert_called_once()
+        app._reaudit_and_seal_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
         app = self.gui.App.__new__(self.gui.App)

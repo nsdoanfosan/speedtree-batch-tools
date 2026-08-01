@@ -120,6 +120,9 @@ RELATION_INPUT_SUFFIXES = frozenset({
     ".blend", ".exr", ".fbx", ".jpeg", ".jpg", ".json", ".png",
     ".sbs", ".spm", ".tga", ".tif", ".tiff",
 })
+RELATION_BULK_IMAGE_SUFFIXES = frozenset({
+    ".exr", ".jpeg", ".jpg", ".png", ".tga", ".tif", ".tiff",
+})
 
 
 def cluster_pair_step1_text(child):
@@ -898,8 +901,16 @@ def _relation_item_payload(item):
 
 
 def _relation_item_content_identity(
-        item, *, content_memo=None, directory_memo=None):
-    """Bind relation/live-mutation evidence to current content and membership."""
+        item, *, content_memo=None, directory_memo=None, exact_all=False):
+    """Bind relation/live-mutation evidence to payload content and membership.
+
+    Every file that the report payload actually names is full-SHA bound.  The
+    bounded directory inventory separately binds the complete relevant name
+    set, so additions/removals remain invalidating without full-hashing every
+    unrelated texture merely because it shares the folder.  A file whose
+    bytes can affect the report must be present in the payload and therefore
+    remains exact mutation evidence.
+    """
     payload = _relation_item_payload(item)
     paths = {}
 
@@ -935,6 +946,7 @@ def _relation_item_content_identity(
     membership = {
         "payload:" + canonical_json_sha256(startup_json_safe(payload))
     }
+    membership_file_keys = set()
     seen_directories = set()
     entry_count = 0
     for directory in directories:
@@ -972,34 +984,202 @@ def _relation_item_content_identity(
             ):
                 key = startup_path_key(candidate)
                 membership.add(key)
-                paths[key] = candidate
-    return content_identity(
-        paths.values(),
-        membership=membership,
-        memo=content_memo,
-        max_files=2_048,
-        exact=True,
-    )
+                membership_file_keys.add(key)
+    if exact_all:
+        identity = content_identity(
+            paths.values(),
+            membership=membership,
+            memo=content_memo,
+            max_files=2_048,
+            exact=True,
+            workers=8,
+        )
+        identity["exact_content_file_count"] = len(paths)
+        identity["sampled_content_file_count"] = 0
+        identity["evidence_scope"] = (
+            "full-payload-content-plus-bounded-directory-membership-v1"
+        )
+    else:
+        exact_paths = [
+            path for path in paths.values()
+            if path.suffix.casefold() not in RELATION_BULK_IMAGE_SUFFIXES
+        ]
+        sampled_paths = [
+            path for path in paths.values()
+            if path.suffix.casefold() in RELATION_BULK_IMAGE_SUFFIXES
+        ]
+        exact_identity = content_identity(
+            exact_paths,
+            membership=membership,
+            memo=content_memo,
+            max_files=2_048,
+            exact=True,
+            workers=8,
+        )
+        sampled_identity = content_identity(
+            sampled_paths,
+            memo=content_memo,
+            max_files=2_048,
+            exact=False,
+            workers=8,
+        )
+        identity = {
+            "algorithm": "sha256-of-hybrid-content-keys-v1",
+            "sha256": canonical_json_sha256({
+                "exact": exact_identity["sha256"],
+                "sampled": sampled_identity["sha256"],
+                "membership": sorted(membership),
+            }),
+            "file_count": (
+                exact_identity["file_count"]
+                + sampled_identity["file_count"]
+            ),
+            "files": (
+                exact_identity["files"] + sampled_identity["files"]
+            ),
+            "membership": sorted(membership),
+            "exact_content_file_count": len(exact_paths),
+            "sampled_content_file_count": len(sampled_paths),
+            "evidence_scope": (
+                "full-semantic-content-plus-sampled-bulk-images-plus-"
+                "bounded-directory-membership-v1"
+            ),
+        }
+    identity["payload_content_file_count"] = len(paths)
+    identity["membership_file_count"] = len(membership_file_keys)
+    return identity
 
 
-def item_has_current_live_evidence(item):
+def item_has_current_live_evidence(
+        item, *, content_memo=None, directory_memo=None):
     """True only when a row's current bytes reproduce its live audit token."""
     expected = item.get("_gui_live_evidence")
     if not isinstance(expected, dict) or not expected.get("sha256"):
         return False
     try:
-        current = _relation_item_content_identity(item)
+        current = _relation_item_content_identity(
+            item,
+            content_memo=content_memo,
+            directory_memo=directory_memo,
+        )
     except Exception:
         return False
     return current.get("sha256") == expected.get("sha256")
 
 
-def require_current_live_evidence(item):
-    if not item_has_current_live_evidence(item):
+def require_current_live_evidence(
+        item, *, content_memo=None, exact_content_memo=None,
+        directory_memo=None):
+    if not item_has_current_live_evidence(
+        item,
+        content_memo=content_memo,
+        directory_memo=directory_memo,
+    ):
         raise RuntimeError(
             "선택한 행의 현재 입력이 live 검사 증거와 일치하지 않습니다. "
             "다시 검사한 뒤 실행하세요."
         )
+    # Bulk image bytes do not change relation semantics, but they are mutation
+    # inputs.  Capture their full current identity inside the execution worker
+    # immediately before any write/external job; this exact evidence is never
+    # replaced by the sampled startup/cache identity.
+    item["_gui_exact_mutation_evidence"] = _relation_item_content_identity(
+        item,
+        content_memo=exact_content_memo,
+        directory_memo=directory_memo,
+        exact_all=True,
+    )
+    return True
+
+
+def mutation_semantic_digest(item):
+    """Digest every report field from which mutation plans are derived."""
+    return canonical_json_sha256(
+        startup_json_safe(_relation_item_payload(item))
+    )
+
+
+def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
+    """Seal current exact inputs after a selected-item semantic re-audit."""
+    content_memo = {}
+    exact_content_memo = {}
+    directory_memo = {}
+    rows = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        require_current_live_evidence(
+            item,
+            content_memo=content_memo,
+            exact_content_memo=exact_content_memo,
+            directory_memo=directory_memo,
+        )
+        identity = item["_gui_exact_mutation_evidence"]
+        rows.append({
+            "item_key": (
+                startup_path_key(item.get("folder") or ""),
+                str(item.get("name") or "").casefold(),
+            ),
+            "semantic_sha256": mutation_semantic_digest(item),
+            "exact_sha256": identity["sha256"],
+            "file_count": identity.get("file_count", 0),
+            "membership": list(identity.get("membership") or ()),
+            "item": item,
+        })
+    public_rows = [
+        {key: value for key, value in row.items() if key != "item"}
+        for row in rows
+    ]
+    plan_digest = canonical_json_sha256(startup_json_safe({
+        "action": str(action),
+        "items": public_rows,
+        "plan": plan_payload,
+    }))
+    return {
+        "schema_version": 1,
+        "authority": "selected_current_reaudit_exact_baseline_v1",
+        "action": str(action),
+        "plan_digest": plan_digest,
+        "items": rows,
+        "plan_payload": startup_json_safe(plan_payload),
+        "writes_before_match": 0,
+    }
+
+
+def require_exact_mutation_baseline(baseline):
+    """Re-hash a sealed baseline immediately before the first write."""
+    if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
+        raise RuntimeError("exact mutation baseline is unavailable")
+    expected_public_rows = []
+    content_memo = {}
+    directory_memo = {}
+    for row in baseline.get("items") or ():
+        item = row.get("item")
+        if not isinstance(item, dict):
+            raise RuntimeError("exact mutation baseline item is unavailable")
+        current = _relation_item_content_identity(
+            item,
+            content_memo=content_memo,
+            directory_memo=directory_memo,
+            exact_all=True,
+        )
+        if current.get("sha256") != row.get("exact_sha256"):
+            raise RuntimeError(
+                "선택 작업 입력이 exact 계획 생성 후 변경되었습니다. "
+                "production 파일을 쓰지 않고 중단합니다."
+            )
+        expected_public_rows.append({
+            key: value for key, value in row.items() if key != "item"
+        })
+    current_plan_digest = canonical_json_sha256(startup_json_safe({
+        "action": baseline.get("action"),
+        "items": expected_public_rows,
+        "plan": baseline.get("plan_payload"),
+    }))
+    if current_plan_digest != baseline.get("plan_digest"):
+        raise RuntimeError("exact mutation plan seal is invalid")
     return True
 
 
@@ -1055,11 +1235,17 @@ def cache_blender_connection_rows(
     def update_metrics(status):
         if metrics is None:
             return
-        file_paths = {
-            str(row.get("path") or "").casefold()
+        unique_file_rows = {
+            str(row.get("path") or "").casefold(): row
             for _namespace, identity in identities.values()
             for row in identity.get("files") or ()
             if row.get("path")
+        }
+        membership_paths = {
+            member
+            for _namespace, identity in identities.values()
+            for member in identity.get("membership") or ()
+            if not str(member).startswith("payload:")
         }
         metrics.update({
             "status": str(status),
@@ -1071,7 +1257,20 @@ def cache_blender_connection_rows(
                 identity["file_count"]
                 for _namespace, identity in identities.values()
             ),
-            "unique_content_file_count": len(file_paths),
+            "unique_content_file_count": len(unique_file_rows),
+            "content_bytes": sum(
+                row.get("size", 0)
+                for _namespace, identity in identities.values()
+                for row in identity.get("files") or ()
+            ),
+            "unique_content_bytes": sum(
+                row.get("size", 0) for row in unique_file_rows.values()
+            ),
+            "membership_file_count": sum(
+                identity.get("membership_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "unique_membership_file_count": len(membership_paths),
             "changed_during_scan": changed_during_scan,
             "first_pass_physical_content_reads": len(
                 first_pass_content_memo
@@ -1086,6 +1285,21 @@ def cache_blender_connection_rows(
                 final_pass_directory_memo
             ),
             "content_identity_algorithm": (
+                "sha256-of-hybrid-content-keys-v1"
+            ),
+            "content_identity_scope": (
+                "full-semantic-content-plus-sampled-bulk-images-plus-"
+                "bounded-directory-membership-v1"
+            ),
+            "exact_content_file_count": sum(
+                identity.get("exact_content_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "sampled_content_file_count": sum(
+                identity.get("sampled_content_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "mutation_authority_algorithm": (
                 "sha256-of-full-content-keys-v1"
             ),
         })
@@ -1373,6 +1587,52 @@ def step2_target_payload(job):
                 detail.get("generator_bindings") or []),
         })
     return {"version": 1, "targets": targets}
+
+
+def step2_exact_plan_payload(jobs, push_spm):
+    """Return the current command/producer scope sealed before Step 2 writes."""
+    return {
+        "push_spm": bool(push_spm),
+        "jobs": [
+            {
+                "base": str(job.get("base") or ""),
+                "albedo": str(job.get("albedo") or ""),
+                "alpha": str(job.get("alpha") or ""),
+                "blend_out": str(job.get("blend_out") or ""),
+                "reuse_existing_blend": bool(
+                    job.get("reuse_existing_blend")
+                ),
+                "target_payload": step2_target_payload(job),
+            }
+            for job in jobs or ()
+        ],
+    }
+
+
+def step3_exact_plan_payload(plan):
+    """Return Step 3's producer/consumer scope without mutable UI objects."""
+    return {
+        "jobs": [
+            {
+                key: value
+                for key, value in job.items()
+                if key not in {"item", "items"}
+            }
+            for job in (plan or {}).get("jobs") or ()
+        ],
+        "sync_files": [
+            str(path) for path in (plan or {}).get("sync_files") or ()
+        ],
+        "exact_step3_spms": [
+            str(path) for path in (plan or {}).get("exact_step3_spms") or ()
+        ],
+        "force_unreal_verify": bool(
+            (plan or {}).get("force_unreal_verify")
+        ),
+        "eligible_row_keys": sorted(
+            list((plan or {}).get("eligible_row_keys") or ())
+        ),
+    }
 
 
 def existing_leaf_blend(source):
@@ -2103,7 +2363,15 @@ class App:
     def _run_add_blend_target_spm(
         self, blend, selected_path, evidence_items=None
     ):
-        self._validate_live_mutation_items(evidence_items or ())
+        baseline = self._reaudit_and_seal_mutation_items(
+            evidence_items or (),
+            action="atlas_target_add",
+            plan_payload={
+                "blend": str(blend),
+                "target_spm": str(selected_path),
+            },
+        )
+        require_exact_mutation_baseline(baseline)
         targets = self._current_targets_for_blend(blend)
         keys = {
             os.path.normcase(str(path.absolute())).casefold()
@@ -2218,7 +2486,15 @@ class App:
     def _run_remove_blend_target_spms(
         self, blend, remove_paths, evidence_items=None
     ):
-        self._validate_live_mutation_items(evidence_items or ())
+        baseline = self._reaudit_and_seal_mutation_items(
+            evidence_items or (),
+            action="atlas_target_remove",
+            plan_payload={
+                "blend": str(blend),
+                "target_spms": [str(path) for path in remove_paths],
+            },
+        )
+        require_exact_mutation_baseline(baseline)
         report_path = TOOL_DIR / f".atlas_target_remove_{os.getpid()}_{threading.get_ident()}.json"
         command = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
             "--python", str(TOOL_DIR / "jobs" / "atlas_target_remove_job.py"), "--",
@@ -3760,12 +4036,88 @@ class App:
     @staticmethod
     def _validate_live_mutation_items(items):
         seen = set()
+        content_memo = {}
+        exact_content_memo = {}
+        directory_memo = {}
         for item in items:
             if not isinstance(item, dict) or id(item) in seen:
                 continue
             seen.add(id(item))
-            require_current_live_evidence(item)
+            require_current_live_evidence(
+                item,
+                content_memo=content_memo,
+                exact_content_memo=exact_content_memo,
+                directory_memo=directory_memo,
+            )
         return True
+
+    @staticmethod
+    def _mutation_item_key(item):
+        return startup_path_key((item or {}).get("folder") or "")
+
+    def _reaudit_and_seal_mutation_items(
+            self, items, *, action, plan_payload=None):
+        """Re-audit selected folders and seal exact current plan inputs.
+
+        The startup hybrid evidence is display/readiness authority only.  A
+        mutating worker reaches this gate after obtaining its shared-queue
+        turn.  The current semantic report must reproduce the exact mutation
+        projection used by the queued plan; only then are all selected payload
+        bytes full-hashed and sealed for a final pre-write comparison.
+        """
+        selected = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = self._mutation_item_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(item)
+        if not selected:
+            return seal_exact_mutation_baseline(
+                (), action=action, plan_payload=plan_payload
+            )
+
+        target_mesh_names = sorted({
+            str(status.get("mesh_name") or "")
+            for item in selected
+            for status in item.get("target_spm_statuses") or ()
+            if str(status.get("mesh_name") or "").strip()
+        })
+        current_report = make_report(
+            self.cfg,
+            targets=[item["folder"] for item in selected],
+            target_mesh_names=target_mesh_names or None,
+        )
+        cache_blender_connection_rows(current_report)
+        current_by_key = {
+            self._mutation_item_key(item): item
+            for item in current_report.get("items") or ()
+        }
+        current_items = []
+        for stale_item in selected:
+            key = self._mutation_item_key(stale_item)
+            current_item = current_by_key.get(key)
+            if current_item is None:
+                raise RuntimeError(
+                    "선택 작업의 current affected-folder audit 결과가 없습니다. "
+                    "production 파일을 쓰지 않고 중단합니다."
+                )
+            if mutation_semantic_digest(current_item) != mutation_semantic_digest(
+                stale_item
+            ):
+                raise RuntimeError(
+                    "선택 작업 계획이 current affected-folder audit와 다릅니다. "
+                    "다시 검사한 뒤 실행하세요. production 파일은 쓰지 않았습니다."
+                )
+            current_items.append(current_item)
+        return seal_exact_mutation_baseline(
+            current_items,
+            action=action,
+            plan_payload=plan_payload,
+        )
 
     def _texplan_rows(self, item):
         if not hasattr(self, "texplan_errors"):
@@ -4319,9 +4671,22 @@ class App:
         self.worker.start()
 
     def _run_prepare(self, rows):
-        self._validate_live_mutation_items(
-            row.get("item") for row in rows
+        plan_payload = {
+            "rows": [
+                {
+                    "folder": str(row.get("item", {}).get("folder") or ""),
+                    "mesh": str(row.get("mesh") or ""),
+                    "exclude": list(row.get("exclude") or ()),
+                }
+                for row in rows
+            ]
+        }
+        baseline = self._reaudit_and_seal_mutation_items(
+            (row.get("item") for row in rows),
+            action="step1_prepare",
+            plan_payload=plan_payload,
         )
+        require_exact_mutation_baseline(baseline)
         done = 0
         failed = 0
         for row in rows:
@@ -4835,11 +5200,16 @@ class App:
         self.worker.start()
 
     def _run_step2(self, jobs, push_spm):
-        self._validate_live_mutation_items(
-            item
-            for job in jobs
-            for item in job.get("items") or [job.get("item")]
+        baseline = self._reaudit_and_seal_mutation_items(
+            (
+                item
+                for job in jobs
+                for item in job.get("items") or [job.get("item")]
+            ),
+            action="step2_atlas",
+            plan_payload=step2_exact_plan_payload(jobs, push_spm),
         )
+        require_exact_mutation_baseline(baseline)
         from pcg_texture_common import REPORT_DIR
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         done = failed = 0
@@ -5651,7 +6021,13 @@ class App:
                 for item in job.get("items") or [job.get("item")]
                 if isinstance(item, dict)
             ]
-        return self._validate_live_mutation_items(items)
+        baseline = self._reaudit_and_seal_mutation_items(
+            items,
+            action="step3_texture",
+            plan_payload=step3_exact_plan_payload(plan),
+        )
+        plan["_exact_mutation_baseline"] = baseline
+        return baseline
 
     def _build_step3_execution_plan(self):
         """Perform the expensive Step 3 preflight without touching Tk."""
@@ -5815,6 +6191,10 @@ class App:
             self.log(f"[③ 실행 계획 실패] {error}")
             return
 
+        exact_mutation_baseline = plan.pop(
+            "_exact_mutation_baseline",
+            None,
+        )
         jobs = plan["jobs"]
         skipped = plan["skipped"]
         sync_files = plan["sync_files"]
@@ -5894,6 +6274,10 @@ class App:
             )
             self.root.update_idletasks()
             worker_kwargs = {}
+            if exact_mutation_baseline is not None:
+                worker_kwargs["exact_mutation_baseline"] = (
+                    exact_mutation_baseline
+                )
             if skipped and eligible_row_keys is not None:
                 worker_kwargs.update({
                     "planned_skipped": len(skipped),
@@ -5955,6 +6339,10 @@ class App:
         # but only the exact checked/PCG-target SK paths may be normalized.
         # A folder can contain sibling variants that were not selected.
         worker_kwargs = {}
+        if exact_mutation_baseline is not None:
+            worker_kwargs["exact_mutation_baseline"] = (
+                exact_mutation_baseline
+            )
         if skipped:
             worker_kwargs["planned_skipped"] = len(skipped)
         if skipped and eligible_row_keys is not None:
@@ -6001,7 +6389,9 @@ class App:
             self, jobs, affected_spms, sync_files=None,
             force_unreal_verify=False, require_all_renders_for_sync=False,
             planned_skipped=0, allowed_step3_row_keys=None,
-            step3_run_report_path=None, step3_run_report=None):
+            step3_run_report_path=None, step3_run_report=None,
+            exact_mutation_baseline=None):
+        require_exact_mutation_baseline(exact_mutation_baseline)
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None

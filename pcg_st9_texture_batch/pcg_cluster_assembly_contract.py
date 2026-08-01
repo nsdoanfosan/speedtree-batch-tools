@@ -1380,7 +1380,11 @@ def _normalized_bounds_contract(value, label, required=False):
     return result
 
 
-def _physical_source_3d_artifacts(receipt):
+def _physical_source_3d_artifacts(
+    receipt,
+    spm_semantic_reader=None,
+    validation_cache=None,
+):
     """Validate the exact SPM/FBX inputs shared by every physical variant."""
     artifacts = None
     identity = None
@@ -1389,6 +1393,19 @@ def _physical_source_3d_artifacts(receipt):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no variants"
         )
+    source_contracts = [
+        (row.get("plan_uv_transfer") or {}).get("source_3d_contract")
+        for row in variants
+        if isinstance(row, dict)
+    ]
+    source_cache_key = "source-3d:" + hashlib.sha256(json.dumps(
+        source_contracts,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if validation_cache is not None and source_cache_key in validation_cache:
+        return copy.deepcopy(validation_cache[source_cache_key])
     for index, row in enumerate(variants, 1):
         transfer = row.get("plan_uv_transfer")
         source = (
@@ -1453,9 +1470,16 @@ def _physical_source_3d_artifacts(receipt):
                     current_semantic = (
                         recorded_semantic
                         if raw_hash_matches and recorded_semantic
-                        else spm_file_structural_semantic_fingerprint(
-                            path,
-                            raw_sha256=fingerprint["sha256"],
+                        else (
+                            spm_semantic_reader(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
+                            if callable(spm_semantic_reader)
+                            else spm_file_structural_semantic_fingerprint(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
                         )
                     )
                 except (OSError, ValueError, ET.ParseError) as exc:
@@ -1544,10 +1568,16 @@ def _physical_source_3d_artifacts(receipt):
             raise ClusterAssemblyReceiptError(
                 "Atlas physical variants have conflicting source 3D contracts"
             )
+    if validation_cache is not None:
+        validation_cache[source_cache_key] = copy.deepcopy(artifacts)
     return artifacts
 
 
-def _physical_normalization_receipt(payload, validation_cache=None):
+def _physical_normalization_receipt(
+    payload,
+    validation_cache=None,
+    spm_semantic_reader=None,
+):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
         return None
@@ -1607,7 +1637,11 @@ def _physical_normalization_receipt(payload, validation_cache=None):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no prototypes"
         )
-    source_3d_artifacts = _physical_source_3d_artifacts(receipt)
+    source_3d_artifacts = _physical_source_3d_artifacts(
+        receipt,
+        spm_semantic_reader=spm_semantic_reader,
+        validation_cache=validation_cache,
+    )
     if (
         not isinstance(unit_probe, dict)
         or unit_probe.get("kind") != "speedtree_fbx_spm_unit_probe"
@@ -1749,10 +1783,12 @@ def _normalized_variant_contract(
     payload,
     group,
     physical_receipt_cache=None,
+    spm_semantic_reader=None,
 ):
     physical = _physical_normalization_receipt(
         payload,
         validation_cache=physical_receipt_cache,
+        spm_semantic_reader=spm_semantic_reader,
     )
     receipt_variants = {}
     if physical is not None:
@@ -2326,7 +2362,14 @@ def _normalized_generator_delivery(
         evidence["errors"].append("production_spm_live_audit_unavailable")
         return _finalize_normalized_generator_delivery(evidence)
 
+    # A board audit owns one immutable, full-SHA-bound SPM generation and may
+    # reuse its compact projection.  Consumers without that generation API
+    # retain the uncached live reader used after external writers.
     snapshot_reader = getattr(
+        audit,
+        "report_generator_delivery_snapshot",
+        None,
+    ) or getattr(
         audit,
         "live_generator_delivery_snapshot",
         None,
@@ -2810,6 +2853,11 @@ def _atlas_normalized_variants(
                 payload,
                 group,
                 physical_receipt_cache=physical_receipt_cache,
+                spm_semantic_reader=getattr(
+                    audit,
+                    "report_spm_structural_semantic_fingerprint",
+                    None,
+                ),
             )
             delivery = _normalized_generator_delivery(
                 audit,
@@ -3789,7 +3837,15 @@ def build_cluster_assembly_contract(
     # Target/scope receipts for one Atlas relationship repeat the same large
     # physical-normalization payload with target-local material IDs. Validate
     # that shared payload once per live contract build.
-    physical_receipt_cache = {}
+    physical_receipt_cache_reader = getattr(
+        audit,
+        "report_physical_receipt_cache",
+        None,
+    )
+    physical_receipt_cache = (
+        physical_receipt_cache_reader()
+        if callable(physical_receipt_cache_reader) else {}
+    )
     for pair_row in relevant_clusters:
         cluster = pair_row["source_spm"]
         authoring_spm = pair_row["authoring_spm"]

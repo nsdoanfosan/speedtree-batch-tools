@@ -32,6 +32,7 @@ DISPLAY_SNAPSHOT_OMITTED_KEYS = frozenset({
     "_gui_blender_connection_pending",
     "_gui_blender_connection_rows",
     "_gui_live_evidence",
+    "_gui_exact_mutation_evidence",
     "component_polygon_indices",
     # These live-audit provenance graphs dominate real 55-folder reports but
     # are not read by the cached board renderer.  The complete live report is

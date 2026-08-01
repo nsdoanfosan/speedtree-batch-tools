@@ -367,7 +367,10 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                         {"material_id": 4},
                         delivery_variants(),
                     )
-                self.assertEqual(read_spm.call_count, 1)
+                # The second exact-content analysis already parsed the current
+                # bytes.  Board delivery classification must reuse that same
+                # generation instead of decompressing the SPM a third time.
+                self.assertEqual(read_spm.call_count, 0)
             finally:
                 audit_module._REPORT_SCAN_CACHE.reset(token)
 
