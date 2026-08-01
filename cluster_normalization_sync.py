@@ -20,6 +20,10 @@ from atlas_manifest_resolver import (
     selected_manifest_payload,
 )
 from cluster_card_pipeline.contract import _read_spm_root
+from cluster_bark_source_resolution import (
+    ClusterBarkSourceResolutionError,
+    load_current_isolated_bark_manifest,
+)
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     generator_guid_key,
@@ -67,6 +71,235 @@ def _read_json(path):
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _normalized_path(path):
+    return str(Path(path).expanduser().absolute()).casefold()
+
+
+def _current_report_artifact(row, label):
+    if not isinstance(row, dict) or row.get("exists") is not True:
+        raise ClusterNormalizationSyncError(
+            f"Cluster isolated bark report has no ready {label} artifact."
+        )
+    try:
+        path = Path(row.get("path") or "").expanduser().absolute()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ClusterNormalizationSyncError(
+            f"Cluster isolated bark report has an invalid {label} path."
+        ) from exc
+    if not path.is_file():
+        raise ClusterNormalizationSyncError(
+            f"Cluster isolated bark {label} is missing: {path}"
+        )
+    current_hash = _sha256_file(path)
+    if str(row.get("sha256") or "").casefold() != current_hash.casefold():
+        raise ClusterNormalizationSyncError(
+            f"Cluster isolated bark {label} is stale: {path}"
+        )
+    try:
+        if int(row.get("size")) != path.stat().st_size:
+            raise ClusterNormalizationSyncError(
+                f"Cluster isolated bark {label} size is stale: {path}"
+            )
+    except (TypeError, ValueError) as exc:
+        raise ClusterNormalizationSyncError(
+            f"Cluster isolated bark report has no valid {label} size."
+        ) from exc
+    return path, current_hash
+
+
+def _xml_source_tree_path(source_xml):
+    source_xml = Path(source_xml).expanduser().absolute()
+    try:
+        root = ET.parse(source_xml).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ClusterNormalizationSyncError(
+            f"Cluster source XML is unreadable: {source_xml}: {exc}"
+        ) from exc
+    values = []
+    for node in root.iter():
+        tag = str(node.tag).rsplit("}", 1)[-1].casefold()
+        if tag == "sourcetree":
+            value = str(node.text or "").strip()
+            if not value:
+                for key, attribute in node.attrib.items():
+                    if str(key).rsplit("}", 1)[-1].casefold() not in {
+                        "file",
+                        "path",
+                        "filename",
+                        "value",
+                        "name",
+                        "source",
+                    }:
+                        continue
+                    value = str(attribute or "").strip()
+                    if value:
+                        break
+            if not value:
+                for child in node.iter():
+                    if child is node:
+                        continue
+                    child_tag = str(child.tag).rsplit("}", 1)[-1].casefold()
+                    if child_tag not in {
+                        "file",
+                        "path",
+                        "filename",
+                        "value",
+                        "name",
+                        "source",
+                    }:
+                        continue
+                    value = str(child.text or "").strip()
+                    if value:
+                        break
+            if value:
+                values.append(value)
+        for key, value in node.attrib.items():
+            if str(key).rsplit("}", 1)[-1].casefold() == "sourcetree":
+                value = str(value or "").strip()
+                if value:
+                    values.append(value)
+    resolved = {}
+    for value in values:
+        candidate = Path(value.replace("\\", "/"))
+        if not candidate.is_absolute():
+            candidate = source_xml.parent / candidate
+        candidate = candidate.expanduser().absolute()
+        resolved[_normalized_path(candidate)] = candidate
+    if len(resolved) != 1:
+        detail = "missing" if not resolved else "ambiguous"
+        raise ClusterNormalizationSyncError(
+            "Cluster source XML SourceTree is "
+            f"{detail}; expected one exact provider path: {source_xml}"
+        )
+    return next(iter(resolved.values()))
+
+
+def _isolated_bark_bundle_from_report(report, source_xml, canonical_spm):
+    resolution = report.get("cluster_bark_source_resolution") or {}
+    if not resolution:
+        return None
+    if resolution.get("status") != "ready":
+        raise ClusterNormalizationSyncError(
+            "Cluster isolated bark source report is not ready."
+        )
+    manifest_path, manifest_hash = _current_report_artifact(
+        resolution.get("manifest"), "manifest"
+    )
+    source_spm, source_hash = _current_report_artifact(
+        resolution.get("source_spm"), "production provider SPM"
+    )
+    isolated_spm, isolated_hash = _current_report_artifact(
+        resolution.get("speedtree_spm"), "exact isolated provider SPM"
+    )
+    canonical_spm = Path(canonical_spm).expanduser().absolute()
+    if _normalized_path(source_spm) != _normalized_path(canonical_spm):
+        raise ClusterNormalizationSyncError(
+            "Cluster isolated bark report belongs to a different production "
+            f"provider: {source_spm}"
+        )
+    try:
+        manifest = load_current_isolated_bark_manifest(
+            manifest_path,
+            source_spm=source_spm,
+            speedtree_spm=isolated_spm,
+        )
+    except ClusterBarkSourceResolutionError as exc:
+        raise ClusterNormalizationSyncError(str(exc)) from exc
+    source_tree = _xml_source_tree_path(source_xml)
+    if _normalized_path(source_tree) != _normalized_path(isolated_spm):
+        raise ClusterNormalizationSyncError(
+            "Cluster source XML SourceTree does not name the exact "
+            f"hash-current isolated provider SPM: {source_tree} != "
+            f"{isolated_spm}"
+        )
+    bundle = {
+        "kind": "cluster_isolated_bark_recipe_bundle",
+        "manifest": str(manifest_path),
+        "manifest_sha256": manifest_hash,
+        "source_spm": str(source_spm),
+        "source_spm_sha256": source_hash,
+        "speedtree_spm": str(isolated_spm),
+        "isolated_spm_sha256": isolated_hash,
+        "source_tree": str(source_tree),
+        "source_xml_sha256": _sha256_file(source_xml),
+        "provider_identity": manifest["provider_identity"],
+        "output_filename": manifest["output_filename"],
+    }
+    bundle["bundle_sha256"] = _canonical_sha256(bundle)
+    return bundle
+
+
+def validate_isolated_bark_recipe_bundle(recipe):
+    """Revalidate the sealed XML/cache bundle immediately before map bake."""
+    if not isinstance(recipe, dict):
+        return None
+    bundle = recipe.get("isolated_bark_bundle")
+    if bundle is None:
+        return None
+    if not isinstance(bundle, dict) or bundle.get("kind") != (
+        "cluster_isolated_bark_recipe_bundle"
+    ):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe has an invalid isolated bark bundle."
+        )
+    sealed = dict(bundle)
+    recorded_seal = sealed.pop("bundle_sha256", None)
+    if not recorded_seal or recorded_seal != _canonical_sha256(sealed):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe isolated bark bundle seal is stale."
+        )
+    source_xml = Path(recipe.get("source_xml") or "").expanduser().absolute()
+    if (
+        not source_xml.is_file()
+        or recipe.get("source_xml_sha256") != _sha256_file(source_xml)
+        or bundle.get("source_xml_sha256") != recipe.get("source_xml_sha256")
+    ):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe source XML is not hash-current."
+        )
+    source_tree = _xml_source_tree_path(source_xml)
+    if (
+        _normalized_path(source_tree)
+        != _normalized_path(bundle.get("source_tree") or "")
+        or _normalized_path(source_tree)
+        != _normalized_path(bundle.get("speedtree_spm") or "")
+    ):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe SourceTree differs from its exact "
+            "isolated provider SPM."
+        )
+    manifest_path = Path(bundle.get("manifest") or "").expanduser().absolute()
+    if (
+        not manifest_path.is_file()
+        or _sha256_file(manifest_path) != bundle.get("manifest_sha256")
+    ):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe bark manifest is not hash-current."
+        )
+    try:
+        manifest = load_current_isolated_bark_manifest(
+            manifest_path,
+            source_spm=bundle.get("source_spm"),
+            speedtree_spm=bundle.get("speedtree_spm"),
+        )
+    except ClusterBarkSourceResolutionError as exc:
+        raise ClusterNormalizationSyncError(str(exc)) from exc
+    if (
+        manifest.get("source_spm_sha256")
+        != bundle.get("source_spm_sha256")
+        or manifest.get("isolated_spm_sha256")
+        != bundle.get("isolated_spm_sha256")
+        or manifest.get("provider_identity")
+        != bundle.get("provider_identity")
+        or manifest.get("output_filename")
+        != bundle.get("output_filename")
+    ):
+        raise ClusterNormalizationSyncError(
+            "Cluster normalization recipe and bark manifest identities differ."
+        )
+    return bundle
 
 
 def normalization_receipt_path(blend):
@@ -795,6 +1028,12 @@ def _receipt_is_current(recipe):
     if recorded_contract_hash == recipe["normalization_contract_sha256"]:
         return True
 
+    # Isolated bark recipes are sealed to an exact provider filename, cache
+    # manifest, XML SourceTree, and SPM hash. They have no safe legacy hash
+    # migration path; any contract mismatch requires a fresh normalization.
+    if recipe.get("isolated_bark_bundle") is not None:
+        return False
+
     # Version-1 receipts included the mutable owner-target list in their recipe
     # hash. Adding another ON target therefore forced an unrelated Blender
     # recapture/rebuild even though the canonical Cluster SPM, XML, merged
@@ -907,6 +1146,11 @@ def resolve_normalization_recipe(
             report_path=report_path,
             reason="source_xml_missing",
         )
+    isolated_bark_bundle = _isolated_bark_bundle_from_report(
+        _report,
+        source_xml,
+        canonical,
+    )
     role = _role_contract(blend)
     target_material_bindings = [
         _resolve_target_role_material(target, role["material_name"])
@@ -967,6 +1211,10 @@ def resolve_normalization_recipe(
         "plan_refinement_levels": 1,
         **role,
     }
+    if isolated_bark_bundle is not None:
+        normalization_contract["isolated_bark_bundle"] = (
+            isolated_bark_bundle
+        )
     normalization_contract_hash = _canonical_sha256(normalization_contract)
     recipe = {
         "kind": "speedtree_cluster_sync_normalization_recipe",
@@ -999,4 +1247,5 @@ __all__ = [
     "ClusterSourceBuildRequiredError",
     "normalization_receipt_path",
     "resolve_normalization_recipe",
+    "validate_isolated_bark_recipe_bundle",
 ]

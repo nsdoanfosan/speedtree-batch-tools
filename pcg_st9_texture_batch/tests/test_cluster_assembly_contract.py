@@ -1,4 +1,6 @@
+import contextlib
 import gzip
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -33,7 +35,9 @@ from pcg_cluster_assembly_contract import (
     dependency_role,
     _atlas_normalized_variants,
     _canonical_bark_contract,
+    _canonical_cluster_texture_refs,
     _normalized_generator_delivery,
+    _tga_basename_validation,
     _validate_normalized_source_dependency,
 )
 import pcg_texture_audit as audit_module
@@ -114,6 +118,88 @@ def write_spm(path, materials, mesh_ids=(), active_material_ids=()):
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wb") as handle:
         handle.write(payload)
+
+
+def issue_67_black_locast_fixture(root):
+    """Materialize the sanitized old-only alias reproduction from issue #67."""
+    fixture_path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "issue_67_black_locast_cluster_texture_alias.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    root = Path(root)
+    folder = root / fixture["asset_folder"]
+    provider = folder / fixture["provider_spm"]
+    raw_provider = provider.with_name(provider.name.removeprefix("SK_"))
+    consumer = folder / fixture["consumer_spm"]
+    cluster_dir = provider.parent
+    legacy_root = root / fixture["legacy_root"]
+
+    for path in (raw_provider, provider):
+        write_spm(path, [("1", "M_Bark_black_locast_01", [], [])])
+
+    refs = [
+        str(legacy_root / row["name"])
+        for row in fixture["textures"]
+    ]
+    maps = "".join(
+        '<Map Name="{role}"><TexFilename>{ref}</TexFilename>'
+        '<TexEnabled>true</TexEnabled></Map>'.format(
+            role=row["role"], ref=ref
+        )
+        for row, ref in zip(fixture["textures"], refs)
+    )
+    consumer_payload = (
+        "<SpeedTree><Materials>"
+        f'<Material_v8 ID="{fixture["material_id"]}" '
+        f'Name="{fixture["material_name"]}">{maps}'
+        '<SupplementalCutoutMeshIDs Count="1">'
+        '<CutoutMesh ID="1"/></SupplementalCutoutMeshIDs>'
+        "</Material_v8></Materials>"
+        '<Meshes><Mesh ID="1" Name="black-locast-fixture"/></Meshes>'
+        '<Generators><Generator Type="Branch"><GUID>issue-67</GUID>'
+        '<Hidden>false</Hidden><Properties><Property>'
+        '<Name>Geometry:Material</Name>'
+        f'<Value>{fixture["material_id"]}</Value>'
+        "</Property></Properties></Generator></Generators></SpeedTree>"
+    ).encode("utf-8")
+    consumer.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(consumer, "wb") as handle:
+        handle.write(consumer_payload)
+
+    output_rows = []
+    for row in fixture["textures"]:
+        output = cluster_dir / row["name"]
+        output.write_bytes(
+            f'issue-67-sanitized-{row["role"]}'.encode("ascii")
+        )
+        output_rows.append({
+            "role": row["role"],
+            "path": str(output.resolve()),
+            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        })
+    contract_sha = hashlib.sha256(
+        b"issue-67-sanitized-physical-capture"
+    ).hexdigest()
+    manifest = folder / fixture["capture_manifest"]
+    manifest.write_text(json.dumps({
+        "kind": "speedtree_cluster_blender_auto_capture",
+        "version": 2,
+        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "direct_uv_source": "same_blender_physical_capture_projection",
+        "physical_capture_contract_sha256": contract_sha,
+        "maps": output_rows,
+    }), encoding="utf-8")
+    return {
+        "fixture": fixture,
+        "folder": folder,
+        "provider": provider,
+        "consumer": consumer,
+        "legacy_refs": refs,
+        "outputs": [Path(row["path"]) for row in output_rows],
+        "manifest": manifest,
+    }
 
 
 def material_only_rebase_fixture(root, with_external_rebase=False):
@@ -313,12 +399,12 @@ class FbxRoleContractTests(unittest.TestCase):
             fbx = Path(temp_dir) / "tree.fbx"
             write_ascii_fbx(
                 fbx,
-                material_names=["leaf_weeping_willow_01_Mat"],
-                mesh_names=["leaf_weeping_willow_01"],
+                material_names=["leaf_provider_current_01_Mat"],
+                mesh_names=["leaf_provider_current_01"],
                 pairs=[
                     (
-                        "leaf_weeping_willow_01_Mat",
-                        "leaf_weeping_willow_01",
+                        "leaf_provider_current_01_Mat",
+                        "leaf_provider_current_01",
                     )
                 ],
             )
@@ -326,15 +412,15 @@ class FbxRoleContractTests(unittest.TestCase):
 
             leaf = classify_fbx_role(
                 report,
-                "M_leaf_weeping_wilow_01",
-                ["leaf_weeping_willow_01"],
+                "M_leaf_provider_legacy_01",
+                ["leaf_provider_current_01"],
             )
 
             self.assertEqual(leaf["status"], "complete_pair")
             self.assertEqual(leaf["decision"], "normalize_part")
             self.assertEqual(
                 leaf["role_identity_aliases"],
-                ["leaf_weeping_willow_01"],
+                ["leaf_provider_current_01"],
             )
 
     @unittest.skipUnless(REAL_ELM_SOURCE_FBX.is_file(), "Tree Elm source FBX unavailable")
@@ -696,6 +782,168 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     for row in payload["cluster_assembly"]["handoff"]["errors"]
                 ],
             )
+
+    def test_issue_67_old_only_black_locast_alias_uses_live_origin_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            case = issue_67_black_locast_fixture(temp)
+            before_consumer = case["consumer"].read_bytes()
+            fixture_text = json.dumps(case["fixture"])
+            self.assertNotIn("OneDrive", fixture_text)
+            self.assertNotIn("D:\\\\", fixture_text)
+            self.assertNotIn("sha256", fixture_text.casefold())
+
+            usage = cluster_material_usage(
+                [case["consumer"]], [case["provider"]]
+            )
+            contract = build_cluster_assembly_contract(
+                case["folder"],
+                [case["consumer"]],
+                [case["provider"]],
+                cluster_usage=usage,
+            )
+            dependency = contract["dependencies"][0]
+            validation = dependency["tga_basename_validation"]
+
+            self.assertEqual(validation["status"], "ok", validation)
+            self.assertIsNone(validation["reason"])
+            self.assertEqual(
+                validation["refs"], [str(path) for path in case["outputs"]]
+            )
+            self.assertEqual(
+                validation["ignored_legacy_aliases"], case["legacy_refs"]
+            )
+            self.assertEqual(
+                dependency["texture_contract_source"],
+                "connected_spm_material_origin_receipt",
+            )
+            groups = dependency["texture_alias_resolution"]["groups"]
+            self.assertEqual(len(groups), 8)
+            self.assertTrue(all(
+                row["status"] == "resolved_current_sibling"
+                for row in groups
+            ))
+            self.assertTrue(all(
+                len(row["proof"]["sha256"]) == 64
+                and row["proof"]["origin_manifests"]
+                for row in groups
+            ))
+            self.assertNotIn(
+                "CLUSTER_TGA_BASENAME_INVALID",
+                [row["code"] for row in contract["handoff"]["errors"]],
+            )
+            self.assertEqual(case["consumer"].read_bytes(), before_consumer)
+
+            receipt = persist_cluster_assembly_receipt(
+                contract, receipt_dir=Path(temp) / "receipts"
+            )
+            loaded = load_cluster_assembly_receipt(
+                receipt, requested_spm=case["consumer"]
+            )
+            persisted = loaded["cluster_assembly"]["handoff"][
+                "cluster_dependencies"
+            ][0]
+            self.assertEqual(
+                [row["path"] for row in persisted["texture_dependencies"]],
+                [str(path) for path in case["outputs"]],
+            )
+            case["manifest"].write_text("{}", encoding="utf-8")
+            with self.assertRaises(ClusterAssemblyReceiptStaleError):
+                load_cluster_assembly_receipt(
+                    receipt, requested_spm=case["consumer"]
+                )
+
+    def test_issue_67_alias_without_current_origin_proof_fails_closed(self):
+        for mode in ("missing_receipt", "hash_mismatch", "ambiguous"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                case = issue_67_black_locast_fixture(temp)
+                before_consumer = case["consumer"].read_bytes()
+                if mode == "missing_receipt":
+                    case["manifest"].unlink()
+                elif mode == "hash_mismatch":
+                    case["outputs"][0].write_bytes(b"changed-after-capture")
+
+                usage = cluster_material_usage(
+                    [case["consumer"]], [case["provider"]]
+                )
+                duplicate_patch = mock.patch(
+                    "pcg_cluster_assembly_contract."
+                    "_preferred_basename_candidates",
+                    side_effect=lambda folder, basename: [
+                        Path(folder) / basename,
+                        Path(folder) / "duplicate" / basename,
+                    ],
+                )
+                context = (
+                    duplicate_patch if mode == "ambiguous"
+                    else contextlib.nullcontext()
+                )
+                with context:
+                    contract = build_cluster_assembly_contract(
+                        case["folder"],
+                        [case["consumer"]],
+                        [case["provider"]],
+                        cluster_usage=usage,
+                    )
+
+                dependency = contract["dependencies"][0]
+                validation = dependency["tga_basename_validation"]
+                self.assertEqual(validation["status"], "missing")
+                self.assertEqual(validation["reason"], "path_alias_missing")
+                self.assertIn(
+                    "CLUSTER_TGA_BASENAME_INVALID",
+                    [row["code"] for row in contract["handoff"]["errors"]],
+                )
+                expected_group_status = (
+                    "path_alias_ambiguous"
+                    if mode == "ambiguous"
+                    else "path_alias_unproven"
+                )
+                self.assertTrue(all(
+                    row["status"] == expected_group_status
+                    for row in validation["unresolved_aliases"]
+                ))
+                self.assertEqual(case["consumer"].read_bytes(), before_consumer)
+
+    def test_issue_67_nothofagus_suffix_and_basename_mismatch_stay_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cluster = Path(temp) / "Tree_nothofagus" / "Cluster"
+            cluster.mkdir(parents=True)
+            output_spm = cluster / "SK_branch_nothofagus_01.spm"
+            legacy_output_spm = cluster / "branch_nothofagus_01.spm"
+            (cluster / "branch_nothofagus_01.tga").write_bytes(b"current")
+            old_root = Path(temp) / "sanitized_retired_sync" / "Cluster"
+
+            for values in (
+                [
+                    old_root / "branch_nothofagus_01.tif",
+                    old_root / "branch_nothofagus_01_Opacity.png",
+                ],
+                [old_root / "branch_nothofagus_02.tga"],
+            ):
+                resolution = {}
+                refs, ignored = _canonical_cluster_texture_refs(
+                    values,
+                    cluster,
+                    resolution_out=resolution,
+                )
+                validation = _tga_basename_validation(
+                    output_spm,
+                    {},
+                    legacy_output_spm=legacy_output_spm,
+                    resolved_refs=refs,
+                    ignored_aliases=ignored,
+                    alias_resolution=resolution,
+                )
+                self.assertEqual(validation["status"], "basename_mismatch")
+                self.assertEqual(
+                    validation["reason"],
+                    "basename_or_suffix_mismatch",
+                )
+                self.assertTrue(validation["invalid"])
+                self.assertNotIn(
+                    str(cluster / "branch_nothofagus_01.tga"),
+                    validation["refs"],
+                )
 
     def test_legacy_texture_path_alias_does_not_stale_canonical_receipt(self):
         with tempfile.TemporaryDirectory() as temp:

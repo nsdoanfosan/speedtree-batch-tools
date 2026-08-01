@@ -182,6 +182,28 @@ def _path_key(path):
     return os.path.normcase(os.path.abspath(str(path))).casefold()
 
 
+def _provider_identity(source_spm):
+    """Return the normalized exact identity of one provider artifact.
+
+    Content hashes deliberately remain reusable only within this exact
+    provider identity.  A path/stem rename must select another cache bundle
+    even when the authored SPM bytes and every normalization input are equal.
+    """
+    source = Path(source_spm).resolve()
+    tree_root = source.parent.parent.resolve()
+    try:
+        relative = source.relative_to(tree_root).as_posix().casefold()
+    except ValueError:
+        relative = source.name.casefold()
+    return {
+        "canonical_path": _path_key(source),
+        "tree_root": _path_key(tree_root),
+        "relative_path": relative,
+        "filename": source.name.casefold(),
+        "stem": source.stem.casefold(),
+    }
+
+
 def _sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -642,6 +664,7 @@ def _normalization_identity(contract, source_spm, required_rows):
         required_rows,
     )
     identity = {
+        "provider_identity": _provider_identity(source_spm),
         "source_spm_sha256": _sha256_file(source_spm),
         "source_material_name_preserved": True,
         "production_texture_handoff": texture_handoff,
@@ -998,7 +1021,12 @@ def _copied_manifest_artifacts_current(manifest):
         "copied_source_external_meshes",
         "copied_source_external_textures",
     ):
-        for row in manifest.get(key) or []:
+        rows = manifest.get(key) or []
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
             path = Path(str(row.get("isolated") or ""))
             if (
                 not path.is_file()
@@ -1007,6 +1035,94 @@ def _copied_manifest_artifacts_current(manifest):
             ):
                 return False
     return True
+
+
+def load_current_isolated_bark_manifest(
+    manifest_path,
+    *,
+    source_spm=None,
+    speedtree_spm=None,
+    signature=None,
+):
+    """Load one ready manifest only when its exact bundle is hash-current."""
+    manifest_path = Path(manifest_path).resolve()
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ClusterBarkSourceResolutionError(
+            "Cluster bark normalization manifest is unreadable: "
+            f"{manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ClusterBarkSourceResolutionError(
+            "Cluster bark normalization manifest is not an object: "
+            + str(manifest_path)
+        )
+    try:
+        recorded_source = Path(manifest.get("source_spm") or "").resolve()
+        recorded_isolated = Path(
+            manifest.get("speedtree_spm") or ""
+        ).resolve()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ClusterBarkSourceResolutionError(
+            "Cluster bark normalization manifest has invalid source paths: "
+            + str(manifest_path)
+        ) from exc
+    expected_source = Path(source_spm or recorded_source).resolve()
+    expected_isolated = Path(speedtree_spm or recorded_isolated).resolve()
+    expected_provider = _provider_identity(expected_source)
+    recorded_provider = manifest.get("provider_identity")
+    nested_identity = manifest.get("identity")
+    nested_provider = (
+        nested_identity.get("provider_identity")
+        if isinstance(nested_identity, dict)
+        else None
+    )
+    issues = []
+    if (
+        manifest.get("kind")
+        != "cluster_isolated_canonical_bark_source"
+    ):
+        issues.append("kind")
+    if manifest.get("status") != "ready":
+        issues.append("status")
+    if manifest.get("production_source_mutated") is not False:
+        issues.append("production_source_mutated")
+    if signature is not None and manifest.get("signature") != signature:
+        issues.append("signature")
+    if _path_key(recorded_source) != _path_key(expected_source):
+        issues.append("source_spm_path")
+    if _path_key(recorded_isolated) != _path_key(expected_isolated):
+        issues.append("speedtree_spm_path")
+    if recorded_provider != expected_provider:
+        issues.append("provider_identity")
+    if nested_provider != expected_provider:
+        issues.append("identity.provider_identity")
+    if str(manifest.get("output_filename") or "").casefold() != (
+        expected_provider["filename"]
+    ):
+        issues.append("output_filename")
+    if recorded_isolated.name.casefold() != expected_provider["filename"]:
+        issues.append("speedtree_spm_filename")
+    if not expected_source.is_file():
+        issues.append("source_spm_missing")
+    elif manifest.get("source_spm_sha256") != _sha256_file(expected_source):
+        issues.append("source_spm_sha256")
+    if not expected_isolated.is_file():
+        issues.append("speedtree_spm_missing")
+    elif manifest.get("isolated_spm_sha256") != _sha256_file(
+        expected_isolated
+    ):
+        issues.append("isolated_spm_sha256")
+    if not _copied_manifest_artifacts_current(manifest):
+        issues.append("copied_artifacts")
+    if issues:
+        raise ClusterBarkSourceResolutionError(
+            "Cluster bark normalization manifest is stale or belongs to a "
+            "different exact provider bundle: "
+            + ", ".join(issues)
+        )
+    return manifest
 
 
 def _rebase_paths(value, old_root, new_root):
@@ -1051,21 +1167,17 @@ def prepare_isolated_bark_source(
     tree_name = source.parent.parent.name
     isolated = cache_dir / tree_name / source.parent.name / source.name
     manifest_path = cache_dir / _BARK_CACHE_MANIFEST_NAME
-    if manifest_path.is_file() and isolated.is_file():
+    if manifest_path.is_file():
         try:
-            manifest = json.loads(
-                manifest_path.read_text(encoding="utf-8")
+            manifest = load_current_isolated_bark_manifest(
+                manifest_path,
+                source_spm=source,
+                speedtree_spm=isolated,
+                signature=signature,
             )
-        except (OSError, ValueError):
-            manifest = {}
-        if (
-            manifest.get("signature") == signature
-            and manifest.get("source_spm_sha256")
-            == identity["source_spm_sha256"]
-            and manifest.get("isolated_spm_sha256")
-            == _sha256_file(isolated)
-            and _copied_manifest_artifacts_current(manifest)
-        ):
+        except ClusterBarkSourceResolutionError:
+            manifest = None
+        if manifest is not None:
             return {
                 "status": "cached",
                 "source_spm": str(source),
@@ -1239,10 +1351,12 @@ def prepare_isolated_bark_source(
             external_mesh_rebase, staging, cache_dir
         )
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "cluster_isolated_canonical_bark_source",
             "status": "ready",
             "signature": signature,
+            "provider_identity": identity["provider_identity"],
+            "output_filename": final_source.name,
             "source_spm": str(source),
             "source_spm_sha256": identity["source_spm_sha256"],
             "speedtree_spm": str(final_source),
@@ -1426,6 +1540,7 @@ def resolve_cluster_bark_source_spm(
 
 __all__ = [
     "ClusterBarkSourceResolutionError",
+    "load_current_isolated_bark_manifest",
     "prepare_isolated_bark_source",
     "resolve_cluster_bark_source_spm",
 ]

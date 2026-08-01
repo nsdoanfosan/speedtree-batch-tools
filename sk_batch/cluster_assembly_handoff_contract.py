@@ -621,9 +621,9 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
             identities.append(material_name)
     # The rendered target SPM is authoritative for the material identity used
     # to cut the base mesh.  Keep a provider/receipt spelling only as an alias;
-    # otherwise a legacy typo (for example ``wilow``) leaks into every newly
-    # generated assembly binding even when the actual target material is
-    # correctly named.
+    # otherwise a legacy provider identity leaks into every newly generated
+    # assembly binding even when the actual target material has the current
+    # authoritative name.
     identities.append(receipt_identity)
     unique = {}
     for identity in identities:

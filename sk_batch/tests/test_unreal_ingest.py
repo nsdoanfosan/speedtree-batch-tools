@@ -61,6 +61,27 @@ def item(queue_id, fingerprint):
     }
 
 
+def test_retry_metadata_is_copied_from_manifest_to_batch_report(tmp_path):
+    runner = load_runner()
+    manifest, _checkpoint, report = write_manifest(tmp_path, [])
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["retry"] = {
+        "kind": "failed_blender_export_and_unreal_retry",
+        "partition": "blender_export",
+    }
+    payload["recovery"] = {
+        "kind": "failed_results_retry_unreal_only",
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = runner.run_manifest(manifest)
+
+    persisted = json.loads(report.read_text(encoding="utf-8"))
+    assert result["retry"] == payload["retry"]
+    assert persisted["retry"] == payload["retry"]
+    assert persisted["recovery"] == payload["recovery"]
+
+
 class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
     def test_dependency_orchestrated_tree_cannot_skip_missing_assembly(self):
         runner = load_runner()

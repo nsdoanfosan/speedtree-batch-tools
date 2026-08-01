@@ -38,6 +38,10 @@ from nanite_assembly_materials import (
 
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
+PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
+PASS_THROUGH_PROVENANCE_REASON = (
+    "selected_target_contract_handoff_pass_through"
+)
 ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN = re.compile(
     r"(?P<prefix>\bsidecar_sha256\s*=\s*)"
@@ -328,6 +332,363 @@ def validate_file_fingerprint(record, label):
             f"expected={_canonical_json(record)} actual={_canonical_json(actual)}"
         )
     return actual
+
+
+def _normalized_contract_path(value):
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+
+
+def _short_contract_value(value, max_chars=240):
+    try:
+        text = _canonical_json(value)
+    except (TypeError, ValueError):
+        text = repr(value)
+    if len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
+
+
+def _first_contract_difference(expected, actual, path):
+    """Return one deterministic semantic mismatch with its exact field path."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key in sorted(set(expected) | set(actual)):
+            child_path = f"{path}.{key}"
+            if key not in expected:
+                return (
+                    f"{child_path}: expected=<missing> "
+                    f"actual={_short_contract_value(actual[key])}"
+                )
+            if key not in actual:
+                return (
+                    f"{child_path}: "
+                    f"expected={_short_contract_value(expected[key])} "
+                    "actual=<missing>"
+                )
+            difference = _first_contract_difference(
+                expected[key], actual[key], child_path
+            )
+            if difference:
+                return difference
+        return ""
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return (
+                f"{path}.length: expected={len(expected)} "
+                f"actual={len(actual)}"
+            )
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected, actual)
+        ):
+            difference = _first_contract_difference(
+                expected_item,
+                actual_item,
+                f"{path}[{index}]",
+            )
+            if difference:
+                return difference
+        return ""
+    if type(expected) is not type(actual) or expected != actual:
+        return (
+            f"{path}: expected={_short_contract_value(expected)} "
+            f"actual={_short_contract_value(actual)}"
+        )
+    return ""
+
+
+def _iter_contract_artifact_records(value, path="target_contract"):
+    if isinstance(value, dict):
+        is_fingerprint = bool(
+            value.get("path")
+            and "exists" in value
+            and any(
+                key in value
+                for key in ("size", "mtime_ns", "sha256")
+            )
+        )
+        if is_fingerprint:
+            yield path, value
+        for key, child in value.items():
+            yield from _iter_contract_artifact_records(
+                child, f"{path}.{key}"
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _iter_contract_artifact_records(
+                child, f"{path}[{index}]"
+            )
+
+
+def _validate_contract_artifact_record(path, expected):
+    artifact_path = Path(str(expected.get("path") or ""))
+    expected_exists = expected.get("exists") is True
+    actual_exists = artifact_path.is_file()
+    if actual_exists != expected_exists:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through artifact mismatch at "
+            f"{path}.exists: expected={expected_exists} "
+            f"actual={actual_exists}; artifact={artifact_path}"
+        )
+    if not expected_exists:
+        return
+    try:
+        stat = artifact_path.stat()
+    except OSError as exc:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through artifact could not be read at "
+            f"{path}: {artifact_path}: {exc}"
+        ) from exc
+    if expected.get("size") is not None and int(expected["size"]) != stat.st_size:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through artifact mismatch at "
+            f"{path}.size: expected={expected['size']} "
+            f"actual={stat.st_size}; artifact={artifact_path}"
+        )
+    expected_sha256 = str(expected.get("sha256") or "").casefold()
+    if expected_sha256:
+        actual_sha256 = str(
+            file_fingerprint(artifact_path).get("sha256") or ""
+        ).casefold()
+        if actual_sha256 != expected_sha256:
+            raise ClusterAssemblyBuildError(
+                "Cluster pass-through artifact mismatch at "
+                f"{path}.sha256: expected={expected_sha256} "
+                f"actual={actual_sha256}; artifact={artifact_path}"
+            )
+    elif expected.get("mtime_ns") is not None:
+        if int(expected["mtime_ns"]) != stat.st_mtime_ns:
+            raise ClusterAssemblyBuildError(
+                "Cluster pass-through artifact mismatch at "
+                f"{path}.mtime_ns: expected={expected['mtime_ns']} "
+                f"actual={stat.st_mtime_ns}; artifact={artifact_path}"
+            )
+
+
+def build_receipt_pass_through_manifest(
+    handoff,
+    *,
+    receipt_path,
+    target_contract,
+    target_spm,
+):
+    """Persist the exact receipt projection that made BWR pass through."""
+    if not isinstance(target_contract, dict):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through target contract is missing"
+        )
+    selected_handoff = target_contract.get("handoff") or {}
+    if selected_handoff.get("status") != "pass_through":
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through target contract is actionable at "
+            "target_contract.handoff.status: expected=pass_through "
+            f"actual={selected_handoff.get('status') or '<missing>'}"
+        )
+    difference = _first_contract_difference(
+        selected_handoff,
+        handoff,
+        "target_contract.handoff",
+    )
+    if difference:
+        raise ClusterAssemblyBuildError(
+            "BWR pass-through handoff differs from the selected target "
+            f"contract at {difference}"
+        )
+    receipt = file_fingerprint(receipt_path)
+    if (
+        receipt.get("exists") is not True
+        or receipt.get("size") is None
+        or not receipt.get("sha256")
+    ):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through receipt fingerprint is incomplete"
+        )
+    target_contract_snapshot = deepcopy(target_contract)
+    target_contract_sha256 = _sha256_bytes(
+        _canonical_json(target_contract_snapshot).encode("utf-8")
+    )
+    provenance = {
+        "schema_version": PASS_THROUGH_PROVENANCE_SCHEMA_VERSION,
+        "requested_spm": str(Path(target_spm).resolve()),
+        "receipt": receipt,
+        "target_contract_sha256": target_contract_sha256,
+        "target_contract": target_contract_snapshot,
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": MANIFEST_KIND,
+        "status": "pass_through",
+        "content_decision": "pass_through",
+        "reason": PASS_THROUGH_PROVENANCE_REASON,
+        "rendered_role_count": 0,
+        "full_skeletal_mesh_preserved": True,
+        "handoff": deepcopy(handoff),
+        "handoff_evidence": {
+            "pcg_receipt": deepcopy(receipt),
+            "selected_target_contract_sha256": target_contract_sha256,
+        },
+        "pass_through_provenance": provenance,
+    }
+
+
+def validate_receipt_pass_through_manifest(
+    manifest,
+    *,
+    receipt_path,
+    target_contract,
+    target_spm,
+):
+    """Validate the same target contract and every immutable artifact."""
+    if not isinstance(manifest, dict):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through manifest is missing"
+        )
+    if manifest.get("kind") != MANIFEST_KIND:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at manifest.kind: "
+            f"expected={MANIFEST_KIND} actual={manifest.get('kind')}"
+        )
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "manifest.schema_version: "
+            f"expected={SCHEMA_VERSION} "
+            f"actual={manifest.get('schema_version')}"
+        )
+    if manifest.get("status") != "pass_through":
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at manifest.status"
+        )
+    provenance = manifest.get("pass_through_provenance")
+    if not isinstance(provenance, dict):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance is missing"
+        )
+    if (
+        provenance.get("schema_version")
+        != PASS_THROUGH_PROVENANCE_SCHEMA_VERSION
+    ):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance schema_version changed: "
+            f"expected={PASS_THROUGH_PROVENANCE_SCHEMA_VERSION} "
+            f"actual={provenance.get('schema_version')}"
+        )
+    if manifest.get("content_decision") != "pass_through":
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "manifest.content_decision"
+        )
+    if manifest.get("reason") != PASS_THROUGH_PROVENANCE_REASON:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at manifest.reason"
+        )
+    try:
+        rendered_role_count = int(manifest.get("rendered_role_count", -1))
+    except (TypeError, ValueError):
+        rendered_role_count = -1
+    if rendered_role_count != 0:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "manifest.rendered_role_count: expected=0 "
+            f"actual={manifest.get('rendered_role_count')}"
+        )
+    expected_target = _normalized_contract_path(
+        provenance.get("requested_spm") or ""
+    )
+    actual_target = _normalized_contract_path(target_spm)
+    if expected_target != actual_target:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "pass_through_provenance.requested_spm: "
+            f"expected={expected_target} actual={actual_target}"
+        )
+
+    saved_contract = provenance.get("target_contract")
+    if not isinstance(saved_contract, dict):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance target_contract is missing"
+        )
+    saved_contract_sha256 = _sha256_bytes(
+        _canonical_json(saved_contract).encode("utf-8")
+    )
+    if saved_contract_sha256 != provenance.get("target_contract_sha256"):
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "pass_through_provenance.target_contract_sha256"
+        )
+    handoff_evidence = manifest.get("handoff_evidence") or {}
+    evidence_sha256 = handoff_evidence.get(
+        "selected_target_contract_sha256"
+    )
+    if evidence_sha256 != saved_contract_sha256:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through provenance mismatch at "
+            "manifest.handoff_evidence.selected_target_contract_sha256"
+        )
+    current_handoff = (
+        target_contract.get("handoff")
+        if isinstance(target_contract, dict)
+        else None
+    ) or {}
+    if current_handoff.get("status") != "pass_through":
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through target became actionable at "
+            "target_contract.handoff.status: expected=pass_through "
+            f"actual={current_handoff.get('status') or '<missing>'}"
+        )
+    difference = _first_contract_difference(
+        saved_contract,
+        target_contract,
+        "target_contract",
+    )
+    if difference:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through target contract changed at " + difference
+        )
+    difference = _first_contract_difference(
+        saved_contract.get("handoff") or {},
+        manifest.get("handoff") or {},
+        "manifest.handoff",
+    )
+    if difference:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through saved handoff changed at " + difference
+        )
+
+    # Compare the selected target before the enclosing receipt fingerprint.
+    # A multi-target receipt can change because another target changed; when
+    # this target changed, name its exact semantic field instead of reporting
+    # only the outer JSON digest.
+    recorded_receipt = provenance.get("receipt") or {}
+    difference = _first_contract_difference(
+        recorded_receipt,
+        handoff_evidence.get("pcg_receipt") or {},
+        "manifest.handoff_evidence.pcg_receipt",
+    )
+    if difference:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through saved receipt evidence changed at "
+            + difference
+        )
+    current_receipt = file_fingerprint(receipt_path)
+    for field in ("path", "exists", "size", "sha256"):
+        expected = recorded_receipt.get(field)
+        actual = current_receipt.get(field)
+        if field == "path":
+            expected = _normalized_contract_path(expected or "")
+            actual = _normalized_contract_path(actual or "")
+        elif field == "sha256":
+            expected = str(expected or "").casefold()
+            actual = str(actual or "").casefold()
+        if expected != actual:
+            raise ClusterAssemblyBuildError(
+                "Cluster pass-through receipt mismatch at "
+                f"pass_through_provenance.receipt.{field}: "
+                f"expected={expected} actual={actual}"
+            )
+    for artifact_path, artifact in _iter_contract_artifact_records(
+        saved_contract
+    ):
+        _validate_contract_artifact_record(artifact_path, artifact)
+    return True
 
 
 _PHYSICAL_CAPTURE_KIND = "speedtree_cluster_physical_capture_fit"
@@ -3470,6 +3831,10 @@ def build_blender_assembly_inputs(
     output_dir,
     full_fbx_path,
     wind_json_path,
+    *,
+    pass_through_receipt_path=None,
+    pass_through_target_contract=None,
+    pass_through_target_spm=None,
 ):
     """Generate base/part FBXs and a strict builder manifest inside BWR.
 
@@ -3477,12 +3842,12 @@ def build_blender_assembly_inputs(
     """
     decision = content_build_decision(handoff)
     if decision == "pass_through":
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": MANIFEST_KIND,
-            "status": "pass_through",
-            "full_skeletal_mesh_preserved": True,
-        }
+        return build_receipt_pass_through_manifest(
+            handoff,
+            receipt_path=pass_through_receipt_path,
+            target_contract=pass_through_target_contract,
+            target_spm=pass_through_target_spm,
+        )
     try:
         import bpy
     except ImportError as exc:  # pragma: no cover - only executes in Blender.
