@@ -326,13 +326,42 @@ python -m pcg_st9_texture_batch.stale_node_table_recovery ^
   --expected-mesh-id 132 --expected-mesh-id 133
 ```
 
+`--expected-mesh-id` is the backward-compatible strict mode: every listed ID
+is sealed as both an authoring-binding target and a required live/export target.
+When issue acceptance requires authoring continuity without universal export,
+use the explicit schema-5 scope mode instead:
+
+```bat
+python -m pcg_st9_texture_batch.stale_node_table_recovery ^
+  "<SPM>" ^
+  --authoring-mesh-id 14 --authoring-mesh-id 15 ^
+  --authoring-mesh-id 16 --authoring-mesh-id 17 ^
+  --required-live-mesh-id 14
+
+python -m pcg_st9_texture_batch.stale_node_table_recovery ^
+  "<SPM>" ^
+  --authoring-mesh-id 14 --authoring-mesh-id 15 ^
+  --authoring-mesh-id 16 --authoring-mesh-id 17 ^
+  --no-required-live-delivery
+```
+
+Explicit mode requires a non-empty authoring scope and either a repeated live
+subset or the explicit no-live-delivery flag. Mixing legacy and explicit modes,
+omitting the live decision, selecting a live ID outside the authoring scope, or
+changing the caller scope after sealing fails closed before Modeler launch.
+Receipts from schemas 2 through 4 remain strict-all and are never rewritten.
+
 Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
 SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
-membership, and required target-binding fingerprints. It then waits for the
+membership, required target-binding fingerprints, and immutable schema-5
+authoring/live scope requirements. It then waits for the
 user to save the file and requires repeated identical stat/size/SHA snapshots
 with successful parsing. Regex, independent ElementTree, target delivery, and
-normalization evidence all come from those same immutable bytes.
+normalization evidence all come from those same immutable bytes. All authoring
+bindings, including hidden bindings, remain fingerprinted; live Node/export and
+normalization requirements apply only to the sealed required-live subset. A
+continuity-only receipt records normalization as not applicable, not complete.
 
 The command does not edit SPM XML, automate Save or keystrokes, kill Modeler,
 roll back automatically, or continue merely because `stale=false`. Library
