@@ -62,6 +62,35 @@ class PushUnrealRecoveryTests(unittest.TestCase):
             "export_report_path": "old-export-report.json",
         }
 
+    def test_retry_manifest_rejects_tool_owned_backup_queue_item(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rollback = (
+                root
+                / (
+                    "SK_weed_reed_02.texture_slot_backup_"
+                    "20260801_010203_123456.spm"
+                )
+            )
+            rollback.write_bytes(b"rollback")
+            manifest = root / "failed_push_manifest.json"
+            manifest.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "items": [{
+                        "schema_version": 1,
+                        "queue_id": str(rollback),
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError,
+                "ineligible SPM artifact",
+            ):
+                load_parent_manifest(manifest)
+
     def test_runtime_code_change_reuses_verified_artifacts_in_new_item(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

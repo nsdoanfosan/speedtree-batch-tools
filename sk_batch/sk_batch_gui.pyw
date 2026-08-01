@@ -116,6 +116,7 @@ from spm_leaf_handoff_contract import (
 )
 from speedtree_pipeline_contract import (
     build_preflight_envelope,
+    is_live_spm,
     source_identity,
     validate_preflight_envelope,
 )
@@ -283,7 +284,7 @@ def material_preflight_mesh_reference_block(spm):
 def is_cluster_source_spm(spm):
     path = Path(spm)
     return (
-        path.suffix.casefold() == ".spm"
+        is_live_spm(path, require_file=False)
         and path.parent.name.casefold() == "cluster"
     )
 
@@ -362,8 +363,7 @@ def owner_cluster_spm_paths(spm):
             for cluster_dir in cluster_dirs
             for candidate in cluster_dir.iterdir()
             if (
-                candidate.is_file()
-                and candidate.suffix.casefold() == ".spm"
+                is_live_spm(candidate)
                 and not candidate.name.startswith("~")
             )
         ))
@@ -2144,8 +2144,16 @@ class App:
 
     @classmethod
     def _collect_scan_result(cls, root, snapshot_caches):
-        spms = scan_sk_spms(root)
-        cluster_sources = scan_cluster_spm_sources(root)
+        spms = [
+            spm
+            for spm in scan_sk_spms(root)
+            if is_live_spm(spm, require_file=False)
+        ]
+        cluster_sources = [
+            row
+            for row in scan_cluster_spm_sources(root)
+            if is_live_spm(row.get("authoring_spm"), require_file=False)
+        ]
         # The population scan above can cold-parse hundreds of SPMs. Persist
         # that shared analysis immediately instead of waiting for a later
         # live-status change that may never occur before process exit.
@@ -2347,12 +2355,20 @@ class App:
             self._table_full_values = {}
         else:
             self._table_full_values.clear()
-        cluster_sources = prepared.get("cluster_sources") or []
+        cluster_sources = [
+            row
+            for row in (prepared.get("cluster_sources") or [])
+            if is_live_spm(row.get("authoring_spm"), require_file=False)
+        ]
         cluster_by_source = {
             _normalized_path(row["authoring_spm"]): row
             for row in cluster_sources
         }
-        spms = list(prepared["spms"]) + [
+        spms = [
+            spm
+            for spm in prepared["spms"]
+            if is_live_spm(spm, require_file=False)
+        ] + [
             row["authoring_spm"] for row in cluster_sources
         ]
         snapshots = prepared["snapshots"]
@@ -3202,6 +3218,7 @@ class App:
         inventory = {
             iid: self._snapshot_batch_item(item)
             for iid, item in self.items.items()
+            if is_live_spm(item.get("spm"), require_file=False)
         }
         targets = [
             inventory[iid] for iid in target_iids if iid in inventory
