@@ -65,6 +65,27 @@ _TEX_FILENAME_RE = re.compile(
     r"(</TexFilename>|<\\TexFilename>)",
     re.IGNORECASE | re.DOTALL,
 )
+_GENERATOR_BLOCK_RE = re.compile(
+    r"<Generator\b[^>]*>.*?</Generator>",
+    re.IGNORECASE | re.DOTALL,
+)
+_GENERATOR_OPEN_RE = re.compile(
+    r"<Generator\b(?![^>]*?/\s*>)[^>]*>",
+    re.IGNORECASE,
+)
+_GENERATOR_CLOSE_RE = re.compile(r"</Generator>", re.IGNORECASE)
+_PROPERTY_BLOCK_RE = re.compile(
+    r"<Property\b[^>]*>.*?</Property>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PROPERTY_NAME_RE = re.compile(
+    r"<Name\b[^>]*>(.*?)</Name>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PROPERTY_VALUE_RE = re.compile(
+    r"<Value\b[^>]*>(.*?)</Value>",
+    re.IGNORECASE | re.DOTALL,
+)
 _FORBIDDEN_DERIVED_SEGMENTS = {
     ".sk_batch_isolated_bark",
     ".cache",
@@ -142,6 +163,22 @@ def _absolute_path(value, relative_to=None):
 
 def _path_key(value):
     return os.path.normcase(str(_absolute_path(value))).casefold()
+
+
+def _positive_material_id_key(value):
+    try:
+        material_id = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return ""
+    return str(material_id) if material_id > 0 else ""
+
+
+def _material_id_sort_key(value):
+    text = str(value or "").strip()
+    try:
+        return (0, int(text), text)
+    except (TypeError, ValueError):
+        return (1, 0, text.casefold())
 
 
 def _local_name(tag):
@@ -540,9 +577,150 @@ def inspect_spm_texture_slots(spm_path):
             "material_name": material_name,
             "slots": slots,
         })
+    generator_blocks = list(_GENERATOR_BLOCK_RE.finditer(text))
+    generator_material_properties = []
+    malformed_properties = []
+    for generator_index, generator_match in enumerate(generator_blocks):
+        for property_index, property_match in enumerate(
+            _PROPERTY_BLOCK_RE.finditer(generator_match.group(0))
+        ):
+            property_block = property_match.group(0)
+            name_match = _PROPERTY_NAME_RE.search(property_block)
+            if name_match is None:
+                continue
+            property_name = html.unescape(
+                " ".join(name_match.group(1).split())
+            )
+            if not property_name.casefold().endswith(":material"):
+                continue
+            value_match = _PROPERTY_VALUE_RE.search(property_block)
+            material_id = (
+                html.unescape(" ".join(value_match.group(1).split()))
+                if value_match is not None
+                else ""
+            )
+            row = {
+                "generator_index": generator_index,
+                "property_index": property_index,
+                "property_name": property_name,
+                "material_id": material_id,
+            }
+            generator_material_properties.append(row)
+            if not material_id:
+                malformed_properties.append(row)
+
+    all_material_ids = [
+        str(material["material_id"] or "").strip()
+        for material in materials
+        if str(material["material_id"] or "").strip()
+    ]
+    texture_material_ids = [
+        str(material["material_id"] or "").strip()
+        for material in materials
+        if material["slots"]
+    ]
+    missing_material_id_indices = [
+        int(material["material_index"])
+        for material in materials
+        if material["slots"] and not str(material["material_id"] or "").strip()
+    ]
+    invalid_material_ids = []
+    positive_material_ids = set()
+    normalized_material_ids = []
+    for material_id in all_material_ids:
+        normalized_material_id = _positive_material_id_key(material_id)
+        if not normalized_material_id:
+            continue
+        normalized_material_ids.append(normalized_material_id)
+        positive_material_ids.add(normalized_material_id)
+    for material_id in texture_material_ids:
+        if not _positive_material_id_key(material_id):
+            invalid_material_ids.append(material_id)
+
+    referenced_material_ids = sorted(
+        {
+            row["material_id"]
+            for row in generator_material_properties
+            if row["material_id"]
+        },
+        key=_material_id_sort_key,
+    )
+    consumed_material_ids = set()
+    sentinel_material_ids = set()
+    invalid_referenced_material_ids = set()
+    for material_id in referenced_material_ids:
+        try:
+            parsed_material_id = int(material_id)
+        except (TypeError, ValueError):
+            invalid_referenced_material_ids.add(material_id)
+            continue
+        # The existing SpeedTree leaf handoff contract defines selectors with
+        # material_id <= 0 as disconnected sentinels and only positive IDs as
+        # active material references. Keep that shared serialization rule here.
+        if parsed_material_id <= 0:
+            sentinel_material_ids.add(material_id)
+        else:
+            consumed_material_ids.add(str(parsed_material_id))
+    missing_referenced_material_ids = sorted(
+        consumed_material_ids - positive_material_ids,
+        key=_material_id_sort_key,
+    )
+    duplicate_material_ids = sorted(
+        {
+            material_id for material_id in normalized_material_ids
+            if (
+                normalized_material_ids.count(material_id) > 1
+                and material_id in consumed_material_ids
+            )
+        },
+        key=_material_id_sort_key,
+    )
+    generator_open_count = len(_GENERATOR_OPEN_RE.findall(text))
+    generator_close_count = len(_GENERATOR_CLOSE_RE.findall(text))
+    generator_structure_complete = bool(
+        generator_open_count == generator_close_count == len(generator_blocks)
+    )
+    if malformed_properties or duplicate_material_ids \
+            or missing_material_id_indices or invalid_material_ids \
+            or invalid_referenced_material_ids \
+            or missing_referenced_material_ids \
+            or not generator_structure_complete:
+        scope_status = "ambiguous"
+    elif not generator_blocks or not generator_material_properties:
+        scope_status = "empty"
+    else:
+        scope_status = "ok"
+    generator_material_scope = {
+        "status": scope_status,
+        "generator_count": len(generator_blocks),
+        "generator_open_count": generator_open_count,
+        "generator_close_count": generator_close_count,
+        "generator_structure_complete": generator_structure_complete,
+        "property_count": len(generator_material_properties),
+        "referenced_material_ids": referenced_material_ids,
+        "consumed_material_ids": sorted(
+            consumed_material_ids, key=_material_id_sort_key
+        ),
+        "sentinel_material_ids": sorted(
+            sentinel_material_ids, key=_material_id_sort_key
+        ),
+        "properties": generator_material_properties,
+        "malformed_properties": malformed_properties,
+        "duplicate_material_ids": duplicate_material_ids,
+        "missing_material_id_indices": missing_material_id_indices,
+        "invalid_material_ids": sorted(
+            set(invalid_material_ids), key=_material_id_sort_key
+        ),
+        "invalid_referenced_material_ids": sorted(
+            invalid_referenced_material_ids,
+            key=_material_id_sort_key,
+        ),
+        "missing_referenced_material_ids": missing_referenced_material_ids,
+    }
     return {
         "spm": str(spm),
         "materials": materials,
+        "generator_material_scope": generator_material_scope,
         "texture_slot_count": sum(
             len(material["slots"]) for material in materials
         ),
@@ -895,17 +1073,120 @@ def build_spm_canonical_texture_plan(
     manifest_path=None,
     material_output_overrides=None,
 ):
-    """Bind every material-owned texture ref to one manifest output set."""
+    """Bind Generator-consumed material texture refs to manifest outputs."""
     spm = _absolute_path(production_spm)
-    inspection = inspect_spm_texture_slots(spm)
+    try:
+        inspection = inspect_spm_texture_slots(spm)
+    except (OSError, EOFError, UnicodeError) as exc:
+        issue = _manifest_issue(
+            "generator_material_scope_unreadable",
+            spm=str(spm),
+            material="*",
+            material_id="",
+            role="*",
+            expected_output="current Generator material properties",
+            error=str(exc),
+        )
+        return {
+            "status": "blocked",
+            "spm": str(spm),
+            "manifest": "",
+            "asset_root": "",
+            "texture_root": "",
+            "bindings": [],
+            "generator_material_scope": {
+                "status": "unreadable",
+                "referenced_material_ids": [],
+            },
+            "skipped_unreferenced_materials": [],
+            "issues": [issue],
+            "error": str(exc),
+            "remediation": PCG_ST9_REMEDIATION,
+        }
     overrides = {
         str(key): value
         for key, value in (material_output_overrides or {}).items()
     }
+    scope = inspection["generator_material_scope"]
+    if scope["status"] != "ok":
+        reason = (
+            "generator_material_scope_ambiguous"
+            if scope["status"] == "ambiguous"
+            else "generator_material_scope_empty"
+        )
+        issue = _manifest_issue(
+            reason,
+            spm=str(spm),
+            material="*",
+            material_id="",
+            role="*",
+            expected_output="current Generator material properties",
+            generator_count=scope["generator_count"],
+            generator_open_count=scope["generator_open_count"],
+            generator_close_count=scope["generator_close_count"],
+            generator_structure_complete=scope[
+                "generator_structure_complete"
+            ],
+            property_count=scope["property_count"],
+            malformed_properties=scope["malformed_properties"],
+            duplicate_material_ids=scope["duplicate_material_ids"],
+            missing_material_id_indices=scope[
+                "missing_material_id_indices"
+            ],
+            invalid_material_ids=scope["invalid_material_ids"],
+            invalid_referenced_material_ids=scope[
+                "invalid_referenced_material_ids"
+            ],
+            missing_referenced_material_ids=scope[
+                "missing_referenced_material_ids"
+            ],
+        )
+        return {
+            "status": "blocked",
+            "spm": str(spm),
+            "manifest": "",
+            "asset_root": "",
+            "texture_root": "",
+            "bindings": [],
+            "generator_material_scope": scope,
+            "skipped_unreferenced_materials": [],
+            "issues": [issue],
+            "error": reason,
+            "remediation": PCG_ST9_REMEDIATION,
+        }
+    referenced_ids = set(scope["consumed_material_ids"])
     referenced_materials = [
         material for material in inspection["materials"]
-        if material["slots"]
+        if (
+            material["slots"]
+            and _positive_material_id_key(material["material_id"])
+            in referenced_ids
+        )
     ]
+    skipped_materials = sorted(
+        [
+            {
+                "material_index": material["material_index"],
+                "material_id": material["material_id"],
+                "material_name": material["material_name"],
+                "refs": [
+                    slot["authored_ref"] for slot in material["slots"]
+                ],
+                "reason": "not_referenced_by_generator_material_property",
+            }
+            for material in inspection["materials"]
+            if (
+                material["slots"]
+                and _positive_material_id_key(material["material_id"])
+                not in referenced_ids
+            )
+        ],
+        key=lambda row: (
+            _material_id_sort_key(row["material_id"]),
+            str(row["material_name"] or "").casefold(),
+            int(row["material_index"]),
+        ),
+    )
     needs_manifest = any(
         str(material["material_id"]) not in overrides
         for material in referenced_materials
@@ -921,6 +1202,8 @@ def build_spm_canonical_texture_plan(
                 "asset_root": "",
                 "texture_root": "",
                 "bindings": [],
+                "generator_material_scope": scope,
+                "skipped_unreferenced_materials": skipped_materials,
                 "issues": list(exc.issues),
                 "error": str(exc),
             }
@@ -943,7 +1226,11 @@ def build_spm_canonical_texture_plan(
     bindings = []
     issues = []
     for material in inspection["materials"]:
-        if not material["slots"]:
+        if (
+            not material["slots"]
+            or _positive_material_id_key(material["material_id"])
+            not in referenced_ids
+        ):
             continue
         material_id = material["material_id"]
         output = overrides.get(material_id)
@@ -1141,6 +1428,8 @@ def build_spm_canonical_texture_plan(
         "asset_root": manifest["asset_root"],
         "texture_root": manifest["texture_root"],
         "bindings": bindings,
+        "generator_material_scope": scope,
+        "skipped_unreferenced_materials": skipped_materials,
         "issues": issues,
         "remediation": PCG_ST9_REMEDIATION if issues else "",
     }
@@ -1411,6 +1700,12 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
         "manifest": plan["manifest"],
         "rewritten_reference_count": len(rewritten),
         "references": rewritten,
+        "generator_material_scope": dict(
+            plan.get("generator_material_scope") or {}
+        ),
+        "skipped_unreferenced_materials": list(
+            plan.get("skipped_unreferenced_materials") or []
+        ),
     }
 
 

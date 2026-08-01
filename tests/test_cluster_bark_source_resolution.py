@@ -41,6 +41,7 @@ def _write_spm(
     refs,
     external_mesh="",
     extra_material_refs=(),
+    generator_material_ids=("1",),
 ):
     maps = "".join(
         _map(f"Map{index}", value)
@@ -69,9 +70,15 @@ def _write_spm(
             else ""
         )
         + '</Mesh></Meshes>'
-        '<Generators><Generator Type="Branch"><Properties><Property>'
-        '<Name>Branches:Material</Name><Value>1</Value>'
-        '</Property></Properties></Generator></Generators></SpeedTree>'
+        '<Generators>'
+        + "".join(
+            '<Generator Type="Branch"><Properties><Property>'
+            '<Name>Branches:Material</Name>'
+            f'<Value>{material_id}</Value>'
+            '</Property></Properties></Generator>'
+            for material_id in generator_material_ids
+        )
+        + '</Generators></SpeedTree>'
     ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wb") as handle:
@@ -352,6 +359,77 @@ def test_content_addressed_bark_source_preserves_production_spm():
         assert Path(missing_exact_rebuilt["manifest"]).is_file()
         assert Path(missing_exact_rebuilt["speedtree_spm"]).is_file()
         assert _sha256(source) == source_hash
+
+
+def test_final_bark_handoff_scopes_detached_materials_to_generator_consumers():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "Tree_elm"
+        source = root / "Cluster" / "SK_branch_elm_01.spm"
+        canonical = root / "SK_Tree_elm_01.spm"
+        _write_spm(
+            source,
+            "M_bark_common_end_01",
+            ["old/common_color.tga"],
+            extra_material_refs=["old/detached_leaf.tif"],
+        )
+        canonical_refs = [_canonical_output(
+            root,
+            canonical,
+            "1",
+            "M_Bark_elm_01",
+            "T_Bark_elm_01",
+        )["color"]]
+        _write_spm(canonical, "M_Bark_elm_01", canonical_refs)
+        contract = {
+            "handoff": {
+                "canonical_bark": {
+                    "status": "replacement_required",
+                    "canonical_material": "M_Bark_elm_01",
+                    "canonical_sources": [{
+                        "spm": str(canonical),
+                        "material_id": "1",
+                        "material_name": "M_Bark_elm_01",
+                        "refs": canonical_refs,
+                    }],
+                    "cluster_bark_sources": [{
+                        "cluster_spm": str(source),
+                        "material_id": "1",
+                        "material_name": "M_bark_common_end_01",
+                        "replacement": "required",
+                    }],
+                },
+            },
+        }
+        required_rows = contract["handoff"]["canonical_bark"][
+            "cluster_bark_sources"
+        ]
+
+        _signature, identity = _normalization_identity(
+            contract, source, required_rows
+        )
+
+        handoff = identity["production_texture_handoff"]
+        assert handoff["status"] == "ok"
+        assert {
+            row["material_id"]
+            for row in handoff["skipped_unreferenced_materials"]
+        } == {"2"}
+        assert handoff["skipped_unreferenced_materials"][0]["refs"] == [
+            "old/detached_leaf.tif"
+        ]
+
+        _write_spm(
+            source,
+            "M_bark_common_end_01",
+            ["old/common_color.tga"],
+            extra_material_refs=["old/detached_leaf.tif"],
+            generator_material_ids=("1", "2"),
+        )
+        with pytest.raises(
+            ClusterBarkSourceResolutionError,
+            match="material_canonical_output_unmapped",
+        ):
+            _normalization_identity(contract, source, required_rows)
 
 
 def test_same_bytes_provider_rename_rebuilds_exact_filename_bundle():
@@ -929,6 +1007,7 @@ def test_isolated_bark_source_rebases_external_texture_dependencies():
             "M_bark_common_end_01",
             ["generic/common_color.tga"],
             extra_material_refs=[external_ref],
+            generator_material_ids=("1", "2"),
         )
         source_texture = source.parent / "generic" / "common_color.tga"
         source_texture.parent.mkdir(parents=True, exist_ok=True)
