@@ -319,7 +319,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             self.original_persistent_dirty
         )
 
-    def test_fresh_snapshot_closes_cached_pre_connection_reproduction(self):
+    def test_full_content_identity_closes_cached_pre_connection_reproduction(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
             report_cache = {
@@ -341,15 +341,15 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                     {"1"},
                 )
 
-                # Reproduce the old contradiction: the Atlas writer has put
-                # Material 4 / Mesh 130-133 in the file, but report-local cache
-                # identity still resolves the pre-connection parsed object.
+                # The Atlas writer has put Material 4 / Mesh 130-133 in the
+                # file without relying on a new stat identity. Full content
+                # identity must reject the pre-connection parsed object.
                 write_blackgum_delivery_spm(target, connected=True)
-                stale = audit_module._spm_analysis(target)
-                self.assertIs(stale, pre_connection)
-                self.assertEqual(
+                current = audit_module._spm_analysis(target)
+                self.assertIsNot(current, pre_connection)
+                self.assertNotEqual(
                     [
-                        row for row in stale["leaf_generator_bindings"]
+                        row for row in current["leaf_generator_bindings"]
                         if row.get("material_id") == "4"
                     ],
                     [],
@@ -993,7 +993,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                 "errors": [],
             })
 
-    def test_schema4_warm_cache_survives_while_live_stale_table_is_uncached(self):
+    def test_stat_only_schema4_cache_is_upgraded_before_live_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
             write_blackgum_delivery_spm(
@@ -1027,11 +1027,15 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             ):
                 warm = audit_module._spm_analysis(target)
 
-            self.assertEqual(
-                warm["leaf_generator_bindings"],
-                [cached_binding],
+            self.assertNotEqual(
+                warm["leaf_generator_bindings"], [cached_binding]
             )
-            self.assertFalse(audit_module._PERSISTENT_SPM_ANALYSIS_DIRTY)
+            self.assertTrue(audit_module._PERSISTENT_SPM_ANALYSIS_DIRTY)
+            upgraded = audit_module._PERSISTENT_SPM_ANALYSIS[path_key]
+            self.assertEqual(
+                upgraded["content_identity_algorithm"],
+                audit_module.SPM_CONTENT_IDENTITY_ALGORITHM,
+            )
 
             with mock.patch.object(
                 audit_module,
@@ -1047,7 +1051,12 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                 )
 
             read_spm.assert_called_once_with(target)
-            self.assertIs(audit_module._SPM_ANALYSIS_CACHE[cache_key], warm)
+            cached_current = next(
+                value
+                for key, value in audit_module._SPM_ANALYSIS_CACHE.items()
+                if key[:3] == cache_key
+            )
+            self.assertIs(cached_current, warm)
             self.assertTrue(snapshot["node_table"]["stale"])
             self.assertEqual(
                 snapshot["node_table"]["orphan_generator_guids"],

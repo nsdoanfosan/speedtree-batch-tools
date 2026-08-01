@@ -794,6 +794,18 @@ def inspect_spm_texture_slots(spm_path):
     """Return non-empty material-owned TexFilename slots from one SPM."""
     spm = _absolute_path(spm_path)
     text = _read_spm_text(spm)
+    return inspect_spm_texture_slots_from_text(spm, text)
+
+
+def inspect_spm_texture_slots_from_text(spm_path, text):
+    """Inspect caller-owned decoded SPM text without reading it again.
+
+    The caller must bind ``text`` to a stable current file identity.  This
+    helper removes duplicate gzip decode/I/O only; it does not authorize a
+    cache hit or any mutation.
+    """
+    spm = _absolute_path(spm_path)
+    text = str(text)
     materials = []
     for material_index, material_match in enumerate(
         _MATERIAL_BLOCK_RE.finditer(text)
@@ -2438,6 +2450,7 @@ __all__ = [
     "canonical_output_manifest_candidates",
     "inspect_production_spm_texture_contract",
     "inspect_spm_texture_slots",
+    "inspect_spm_texture_slots_from_text",
     "load_canonical_output_manifest",
     "normalize_material_key",
     "normalize_texture_set_key",

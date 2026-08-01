@@ -750,12 +750,12 @@ class SourceSelectionTests(unittest.TestCase):
                         pcg_texture_audit.extract_material_image_refs(spm)[0]["refs"],
                         ["leaf_color.tga", "leaf_opacity.tga"],
                     )
-                    self.assertEqual(reader.call_count, 1)
+                    self.assertEqual(reader.call_count, 0)
 
                     write_spm(spm, "88", "leaf_changed_name")
                     self.assertEqual(
                         pcg_texture_audit.active_material_ids(spm), {"88"})
-                    self.assertEqual(reader.call_count, 2)
+                    self.assertEqual(reader.call_count, 0)
             finally:
                 pcg_texture_audit._SPM_ANALYSIS_CACHE = old_memory
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
@@ -3123,6 +3123,7 @@ class GuiLabelTests(unittest.TestCase):
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
                 item_callback=mock.ANY,
+                cancel_check=mock.ANY,
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3151,9 +3152,13 @@ class GuiLabelTests(unittest.TestCase):
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                metrics=mock.ANY,
+                publish_check=mock.ANY,
             )
-            save_analysis.assert_called_once_with()
-            load_sync.assert_called_once_with(migrate=False)
+            save_analysis.assert_called_once_with(
+                publish_check=mock.ANY
+            )
+            load_sync.assert_not_called()
             self.assertEqual(len(app.root.callbacks), 1)
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3261,7 +3266,7 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIs(app.report, report)
         app.populate.assert_called_once_with()
         app._update_summary.assert_called_once_with()
-        app._start_sync_state_migration.assert_called_once_with()
+        app._start_sync_state_migration.assert_not_called()
         self.assertIn("live audit는 완료", app.log.call_args.args[0])
 
     def test_initial_refresh_failure_logs_traceback_and_unlocks_parent_ui(self):
@@ -3369,11 +3374,13 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+                cancel_check=mock.ANY,
             )
             write_snapshot.assert_called_once_with(
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                publish_check=mock.ANY,
             )
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)

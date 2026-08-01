@@ -891,7 +891,8 @@ def _relation_item_payload(item):
     }
 
 
-def _relation_item_content_identity(item):
+def _relation_item_content_identity(
+        item, *, content_memo=None, directory_memo=None):
     """Bind relation/live-mutation evidence to current content and membership."""
     payload = _relation_item_payload(item)
     paths = {}
@@ -935,14 +936,22 @@ def _relation_item_content_identity(item):
         if directory_key in seen_directories or not directory.is_dir():
             continue
         seen_directories.add(directory_key)
-        try:
-            entries = sorted(
-                directory.iterdir(), key=lambda path: path.name.casefold()
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                f"Blender relation inputs could not enumerate {directory}: {exc}"
-            ) from exc
+        entries = (
+            directory_memo.get(directory_key)
+            if directory_memo is not None else None
+        )
+        if entries is None:
+            try:
+                entries = tuple(sorted(
+                    directory.iterdir(), key=lambda path: path.name.casefold()
+                ))
+            except OSError as exc:
+                raise RuntimeError(
+                    "Blender relation inputs could not enumerate "
+                    f"{directory}: {exc}"
+                ) from exc
+            if directory_memo is not None:
+                directory_memo[directory_key] = entries
         entry_count += len(entries)
         if entry_count > 4_096:
             raise BoundedDiscoveryError(
@@ -961,7 +970,9 @@ def _relation_item_content_identity(item):
     return content_identity(
         paths.values(),
         membership=membership,
+        memo=content_memo,
         max_files=2_048,
+        exact=True,
     )
 
 
@@ -1029,10 +1040,59 @@ def cache_blender_connection_rows(
     completed = 0
     cache_hits = 0
     cache_updates = []
+    changed_during_scan = 0
+    first_pass_content_memo = {}
+    first_pass_directory_memo = {}
+    final_pass_content_memo = {}
+    final_pass_directory_memo = {}
+
+    def update_metrics(status):
+        if metrics is None:
+            return
+        file_paths = {
+            str(row.get("path") or "").casefold()
+            for _namespace, identity in identities.values()
+            for row in identity.get("files") or ()
+            if row.get("path")
+        }
+        metrics.update({
+            "status": str(status),
+            "item_count": len(items),
+            "completed_item_count": completed,
+            "cache_hits": cache_hits,
+            "cache_misses": len(misses),
+            "content_file_count": sum(
+                identity["file_count"]
+                for _namespace, identity in identities.values()
+            ),
+            "unique_content_file_count": len(file_paths),
+            "changed_during_scan": changed_during_scan,
+            "first_pass_physical_content_reads": len(
+                first_pass_content_memo
+            ),
+            "first_pass_directory_enumerations": len(
+                first_pass_directory_memo
+            ),
+            "final_pass_physical_content_reads": len(
+                final_pass_content_memo
+            ),
+            "final_pass_directory_enumerations": len(
+                final_pass_directory_memo
+            ),
+            "content_identity_algorithm": (
+                "sha256-of-full-content-keys-v1"
+            ),
+        })
+
     for item in items:
         if cancel_check is not None and cancel_check():
+            update_metrics("canceled")
             raise RuntimeError("PCG Blender relation calculation cancelled")
-        identity = _relation_item_content_identity(item)
+        identity = _relation_item_content_identity(
+            item,
+            content_memo=first_pass_content_memo,
+            directory_memo=first_pass_directory_memo,
+        )
         namespace = startup_path_key(item.get("folder") or item.get("name") or "")
         identities[id(item)] = (namespace, identity)
         cached = cache.get(namespace, identity["sha256"])
@@ -1056,23 +1116,40 @@ def cache_blender_connection_rows(
             executor.submit(blender_connection_rows, item): item
             for item in misses
         }
+        calculated_rows = {}
         for future in as_completed(futures):
             if cancel_check is not None and cancel_check():
                 for pending in futures:
                     pending.cancel()
+                update_metrics("canceled")
                 raise RuntimeError("PCG Blender relation calculation cancelled")
             item = futures[future]
-            rows = future.result()
+            try:
+                calculated_rows[id(item)] = future.result()
+            except Exception:
+                update_metrics("error")
+                raise
+        # Re-observe every miss only after all relation calculations finish.
+        # Shared memos avoid re-hashing/re-enumerating common inputs once per
+        # row while preserving a distinct post-compute snapshot.
+        for item in misses:
+            if cancel_check is not None and cancel_check():
+                update_metrics("canceled")
+                raise RuntimeError("PCG Blender relation calculation cancelled")
             namespace, before = identities[id(item)]
-            # Recapture without the first-pass memo.  A file changed while
-            # relation calculation ran must fail closed rather than publish a
-            # mixed-generation row.
-            after = _relation_item_content_identity(item)
+            after = _relation_item_content_identity(
+                item,
+                content_memo=final_pass_content_memo,
+                directory_memo=final_pass_directory_memo,
+            )
             if before["sha256"] != after["sha256"]:
+                changed_during_scan += 1
+                update_metrics("changed_during_scan")
                 raise RuntimeError(
                     "Blender relation inputs changed during calculation: "
                     + str(item.get("folder") or item.get("name") or "")
                 )
+            rows = calculated_rows[id(item)]
             item["_gui_blender_connection_rows"] = rows
             item["_gui_live_evidence"] = after
             cache_updates.append((namespace, after["sha256"], rows))
@@ -1081,16 +1158,7 @@ def cache_blender_connection_rows(
                 progress_callback(completed, len(items), item)
     if cache_updates:
         cache.put_many(cache_updates)
-    if metrics is not None:
-        metrics.update({
-            "item_count": len(items),
-            "cache_hits": cache_hits,
-            "cache_misses": len(misses),
-            "content_file_count": sum(
-                identity["file_count"]
-                for _namespace, identity in identities.values()
-            ),
-        })
+    update_metrics("ok")
     return report
 
 
@@ -1502,6 +1570,9 @@ class App:
         self.sync_state = {"entries": {}}
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        self._initial_relation_finished = False
+        self._initial_relation_ready = False
+        self._pending_initial_sync_result = None
         self.worker = None
         self._busy = False
         self.shared_queue_runtime = SharedQueueRuntime(
@@ -1519,7 +1590,9 @@ class App:
         root.geometry("1320x820")
         self._build_ui()
         self._set_busy(True)
+        snapshot_view_started = time.perf_counter()
         snapshot_painted = self._load_initial_display_snapshot()
+        snapshot_view_seconds = time.perf_counter() - snapshot_view_started
         self._had_initial_snapshot = bool(snapshot_painted)
         snapshot_state = getattr(self, "_initial_snapshot_state", "missing")
         self.startup_latency.mark(
@@ -1529,7 +1602,20 @@ class App:
                 "row_count": len((self.report or {}).get("items") or ()),
                 "painted": bool(snapshot_painted),
             },
-            details={"cache_state": snapshot_state},
+            details={
+                "cache_state": snapshot_state,
+                "view_apply_seconds": round(snapshot_view_seconds, 6),
+            },
+        )
+        self.startup_latency.milestone(
+            "cached_board_view_applied",
+            status="painted" if snapshot_painted else snapshot_state,
+            counts={
+                "row_count": len((self.report or {}).get("items") or ()),
+            },
+            details={
+                "view_apply_seconds": round(snapshot_view_seconds, 6),
+            },
         )
         if not snapshot_painted:
             self.status_var.set("초기 검사 중...")
@@ -2287,6 +2373,9 @@ class App:
         """Run only the first read-only audit off the Tk main thread."""
         generation, cancel_event = self._begin_refresh_generation()
         self._initial_refreshing = True
+        self._initial_relation_finished = False
+        self._initial_relation_ready = False
+        self._pending_initial_sync_result = None
         self._set_busy(True)
         self.status_var.set("초기 검사 중...")
         self.cfg["tree_root"] = self.root_var.get()
@@ -2346,6 +2435,7 @@ class App:
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
                     item_callback=first_live_item,
+                    cancel_check=cancel_event.is_set,
                 )
             except Exception as exc:
                 error = exc
@@ -2396,6 +2486,23 @@ class App:
             )
             return
         mark_blender_connection_rows_pending(report)
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None:
+            audit_timing = report.get("startup_timing") or {}
+            tracker.milestone(
+                "primary_compute_complete",
+                counts={
+                    "folder_count": len(report.get("items") or ()),
+                },
+                details={
+                    "audit_wall_seconds": audit_timing.get("wall_seconds"),
+                    "cache_state": audit_timing.get("cache_state"),
+                    "session_cache_metrics": audit_timing.get(
+                        "session_cache_metrics"
+                    ) or {},
+                },
+            )
+        primary_view_started = time.perf_counter()
         self.report = report
         self._display_only_snapshot = False
         self.texplan_cache.clear()
@@ -2407,6 +2514,17 @@ class App:
         tracker = getattr(self, "startup_latency", None)
         if tracker is not None:
             audit_timing = report.get("startup_timing") or {}
+            tracker.milestone(
+                "primary_view_applied",
+                counts={
+                    "folder_count": len(report.get("items") or ()),
+                },
+                details={
+                    "view_apply_seconds": round(
+                        time.perf_counter() - primary_view_started, 6
+                    ),
+                },
+            )
             tracker.mark(
                 "primary_live_audit",
                 counts={
@@ -2435,14 +2553,73 @@ class App:
         def relation_worker():
             failure = None
             relation_metrics = {}
+            persistence_receipt = {
+                "cache": {"status": "not_attempted"},
+                "projection": {"status": "not_attempted"},
+            }
+            publication_allowed = lambda: self._refresh_generation_is_current(
+                generation, cancel_event
+            )
+
+            # These are non-authoritative memoization/display artifacts. Save
+            # them before relation work so a safe changed-during-scan failure
+            # does not throw away minutes of completed primary computation.
+            persist_started = time.perf_counter()
             try:
-                # Persist only a display snapshot.  It can paint the next
-                # launch but can never authorize a mutation.
-                write_board_display_snapshot(
+                written = save_spm_analysis_cache(
+                    publish_check=publication_allowed,
+                )
+                persistence_receipt["cache"] = {
+                    "status": (
+                        "written" if written else
+                        "canceled" if not publication_allowed() else
+                        "unchanged"
+                    ),
+                    "file_count": len(written or ()),
+                    "wall_seconds": round(
+                        time.perf_counter() - persist_started, 6
+                    ),
+                }
+            except Exception as exc:
+                persistence_receipt["cache"] = {
+                    "status": "warning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "wall_seconds": round(
+                        time.perf_counter() - persist_started, 6
+                    ),
+                }
+
+            projection_metrics = {}
+            projection_started = time.perf_counter()
+            try:
+                snapshot_path = write_board_display_snapshot(
                     report,
                     cfg,
                     pcg_targets=pcg_targets,
+                    metrics=projection_metrics,
+                    publish_check=publication_allowed,
                 )
+                persistence_receipt["projection"] = {
+                    **projection_metrics,
+                    "status": (
+                        "written" if snapshot_path else
+                        projection_metrics.get("reason", "not_written")
+                    ),
+                    "wall_seconds": round(
+                        time.perf_counter() - projection_started, 6
+                    ),
+                }
+            except Exception as exc:
+                persistence_receipt["projection"] = {
+                    **projection_metrics,
+                    "status": "warning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "wall_seconds": round(
+                        time.perf_counter() - projection_started, 6
+                    ),
+                }
+
+            try:
 
                 def relation_progress(completed, total, item):
                     message = (
@@ -2462,11 +2639,12 @@ class App:
                     ),
                     metrics=relation_metrics,
                 )
-                # Opening the board is a read-only live audit. Receipt
-                # snapshots are persisted after an actual batch/completion
-                # refresh, not while the user is waiting for the first table.
-                save_spm_analysis_cache()
-                self.sync_state = load_sync_state(migrate=False)
+                tracker = getattr(self, "startup_latency", None)
+                if tracker is not None:
+                    tracker.milestone(
+                        "relation_compute_complete",
+                        counts=relation_metrics,
+                    )
             except Exception as exc:
                 failure = exc
             if generation is not None and not self._refresh_generation_is_current(
@@ -2476,12 +2654,14 @@ class App:
             self.root.after(
                 0,
                 lambda result=report, relation_error=failure,
-                metrics=dict(relation_metrics):
+                metrics=dict(relation_metrics),
+                persistence=dict(persistence_receipt):
                     self._initial_refresh_done(
                         result,
                         relation_error,
                         stage="relation",
                         relation_metrics=metrics,
+                        persistence_receipt=persistence,
                         generation=generation,
                         cancel_event=cancel_event,
                     ),
@@ -2489,6 +2669,10 @@ class App:
 
         self.worker = threading.Thread(target=relation_worker, daemon=True)
         self.worker.start()
+        # Receipt migration is an independent read/verification tail.  Run it
+        # beside relation calculation; its Tk projection is coalesced with the
+        # relation projection when migration wins the race.
+        self._start_sync_state_migration()
 
     def _initial_refresh_done(
         self,
@@ -2497,6 +2681,7 @@ class App:
         *,
         stage="relation",
         relation_metrics=None,
+        persistence_receipt=None,
         generation=None,
         cancel_event=None,
     ):
@@ -2505,19 +2690,49 @@ class App:
             generation, cancel_event
         ):
             return
+        pending_sync = None
+        if stage == "relation":
+            self._initial_relation_finished = True
+            self._initial_relation_ready = error is None
+            pending_sync = getattr(
+                self, "_pending_initial_sync_result", None
+            )
+            if (
+                error is None
+                and pending_sync is not None
+                and pending_sync[1] is None
+            ):
+                # Include an already-computed sync projection in the relation
+                # Treeview rebuild instead of deleting/inserting every row a
+                # third time.
+                self.sync_state = pending_sync[0]
         self.worker = None
         self._initial_refreshing = False
         tracker = getattr(self, "startup_latency", None)
         if tracker is not None:
             if stage == "relation":
+                tracker.milestone(
+                    "relation_compute_complete",
+                    status="ok" if error is None else "error",
+                    counts=relation_metrics or {},
+                    details=(
+                        None if error is None else {
+                            "error": f"{type(error).__name__}: {error}"
+                        }
+                    ),
+                )
                 tracker.mark(
                     "blender_relations",
                     status="ok" if error is None else "error",
                     counts=relation_metrics or {},
-                    details=(
-                        None if error is None
-                        else {"error": f"{type(error).__name__}: {error}"}
-                    ),
+                    details={
+                        **(
+                            {} if error is None else {
+                                "error": f"{type(error).__name__}: {error}"
+                            }
+                        ),
+                        "persistence": dict(persistence_receipt or {}),
+                    },
                 )
                 if error is not None:
                     tracker.finish_early("relation_error", error=error)
@@ -2542,6 +2757,7 @@ class App:
             self._display_only_snapshot = True
             self._lock_mutation_controls()
         else:
+            relation_view_started = time.perf_counter()
             self.report = report
             self._display_only_snapshot = False
             persistence = (
@@ -2559,10 +2775,41 @@ class App:
             self.populate()
             self._update_summary()
             self._set_busy(False)
-        if error is None:
-            self._start_sync_state_migration()
+            if tracker is not None:
+                tracker.milestone(
+                    "relation_view_applied",
+                    counts={
+                        "folder_count": len(report.get("items") or ()),
+                    },
+                    details={
+                        "view_apply_seconds": round(
+                            time.perf_counter() - relation_view_started, 6
+                        ),
+                    },
+                )
+                tracker.milestone(
+                    "mutation_usable_ready",
+                    counts={
+                        "folder_count": len(report.get("items") or ()),
+                    },
+                    details={"live_relation_evidence": True},
+                )
+        if stage == "relation" and pending_sync is not None:
+            self._pending_initial_sync_result = None
+            self._apply_sync_state_migration(
+                *pending_sync,
+                view_already_applied=(
+                    error is None and pending_sync[1] is None
+                ),
+            )
+        for name, receipt in (persistence_receipt or {}).items():
+            if receipt.get("status") == "warning":
+                self.log(
+                    f"[초기검사 캐시 경고] {name}: "
+                    f"{receipt.get('error', '저장 실패')}"
+                )
         # A refresh requested mid-initial-scan must not be dropped. Start the
-        # receipt migration first; refresh() will queue behind it when needed
+        # already-running receipt migration first; refresh() queues behind it
         # so two filesystem audits never race each other.
         if getattr(self, "_pending_refresh", False):
             self._pending_refresh = False
@@ -2584,11 +2831,16 @@ class App:
 
     def _start_sync_state_migration(self):
         """Verify legacy success reports without delaying the first table paint."""
+        if (
+            getattr(self, "_initial_relation_finished", False)
+            and not getattr(self, "_initial_relation_ready", False)
+        ):
+            return
         if (self.sync_state or {}).get("migration_complete"):
             tracker = getattr(self, "startup_latency", None)
             if tracker is not None:
-                tracker.mark(
-                    "sync_migration",
+                tracker.milestone(
+                    "sync_compute_complete",
                     status="cached",
                     counts={
                         "entry_count": len(
@@ -2596,6 +2848,9 @@ class App:
                         )
                     },
                 )
+            self._sync_state_migration_done(
+                self.sync_state, status="cached"
+            )
             return
         worker = getattr(self, "sync_migration_worker", None)
         if worker is not None and worker.is_alive():
@@ -2609,6 +2864,20 @@ class App:
                 error = None
             except Exception as exc:
                 state, error = None, exc
+            tracker = getattr(self, "startup_latency", None)
+            if tracker is not None:
+                tracker.milestone(
+                    "sync_compute_complete",
+                    status="ok" if error is None else "error",
+                    counts={
+                        "entry_count": len((state or {}).get("entries") or {})
+                    },
+                    details=(
+                        None if error is None else {
+                            "error": f"{type(error).__name__}: {error}"
+                        }
+                    ),
+                )
             self.root.after(
                 0,
                 lambda result=state, failure=error:
@@ -2620,14 +2889,41 @@ class App:
         )
         self.sync_migration_worker.start()
 
-    def _sync_state_migration_done(self, state, error=None):
+    def _sync_state_migration_done(self, state, error=None, status=None):
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        if (
+            getattr(self, "_initial_refreshing", False)
+            and not getattr(self, "_initial_relation_finished", False)
+        ):
+            self._pending_initial_sync_result = (state, error, status)
+            return
+        self._apply_sync_state_migration(state, error, status)
+
+    def _apply_sync_state_migration(
+        self,
+        state,
+        error=None,
+        status=None,
+        *,
+        view_already_applied=False,
+    ):
+        """Apply a verified sync state after relation authority is ready."""
+        if not getattr(self, "_initial_relation_ready", False):
+            if error is not None:
+                self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
+            if getattr(
+                self, "_pending_refresh_after_sync_migration", False
+            ):
+                self._pending_refresh_after_sync_migration = False
+                self.refresh()
+            return
         tracker = getattr(self, "startup_latency", None)
+        phase_status = status or ("ok" if error is None else "error")
         if tracker is not None:
             tracker.mark(
                 "sync_migration",
-                status="ok" if error is None else "error",
+                status=phase_status,
                 counts={
                     "entry_count": len((state or {}).get("entries") or {})
                 },
@@ -2641,8 +2937,44 @@ class App:
             self.status_var.set("기존 Unreal 기록 확인 실패 · ③에서 다시 확인")
             return
         self.sync_state = state
-        self.populate()
-        self._update_summary()
+        sync_view_started = time.perf_counter()
+        if not view_already_applied:
+            self.populate()
+            self._update_summary()
+        sync_view_seconds = (
+            0.0 if view_already_applied
+            else time.perf_counter() - sync_view_started
+        )
+        if tracker is not None:
+            tracker.milestone(
+                "sync_view_applied",
+                status=phase_status,
+                counts={
+                    "entry_count": len((state or {}).get("entries") or {})
+                },
+                details={
+                    "view_apply_seconds": round(
+                        sync_view_seconds, 6
+                    ),
+                    "coalesced_with_relation_view": bool(
+                        view_already_applied
+                    ),
+                },
+            )
+            tracker.milestone(
+                "usable_ready_all",
+                status=phase_status,
+                counts={
+                    "folder_count": len((self.report or {}).get("items") or ()),
+                    "sync_entry_count": len(
+                        (state or {}).get("entries") or {}
+                    ),
+                },
+                details={
+                    "live_relation_evidence": True,
+                    "sync_state_applied": True,
+                },
+            )
         count = len((state or {}).get("entries") or {})
         self.status_var.set(f"기존 Unreal 동기화 기록 확인 완료 · {count}장")
         if getattr(self, "_pending_refresh_after_sync_migration", False):
@@ -2704,11 +3036,23 @@ class App:
                     cfg,
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
+                    cancel_check=cancel_event.is_set,
+                )
+                publication_allowed = (
+                    lambda: self._refresh_generation_is_current(
+                        generation, cancel_event
+                    )
+                )
+                # Preserve current content-bound memoization even when the
+                # following relation verification safely fails closed.
+                save_spm_analysis_cache(
+                    publish_check=publication_allowed,
                 )
                 write_board_display_snapshot(
                     report,
                     cfg,
                     pcg_targets=pcg_targets,
+                    publish_check=publication_allowed,
                 )
 
                 def relation_progress(completed, total, item):
@@ -2726,10 +3070,6 @@ class App:
                     progress_callback=relation_progress,
                     cancel_check=cancel_event.is_set,
                 )
-                # Manual "rescan" is also read-only. Keep receipt writes on
-                # the mutation/completion path so refreshing the board cannot
-                # spend minutes serializing every asset contract.
-                save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
                 error = exc

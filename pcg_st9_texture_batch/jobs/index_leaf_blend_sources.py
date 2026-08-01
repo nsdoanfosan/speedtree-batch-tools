@@ -1,8 +1,10 @@
 """Index an exact requested set of .blend files in one Blender process."""
 import argparse
+import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import addon_utils
@@ -53,8 +55,10 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
 
+    process_started = time.perf_counter()
     report = {"schema_version": SCHEMA_VERSION, "status": "error", "rows": []}
     try:
+        addon_started = time.perf_counter()
         enabled = addon_utils.enable(
             "atlas_leaf_mesh_builder", default_set=False, persistent=False
         )
@@ -63,22 +67,42 @@ def main():
         from atlas_leaf_mesh_builder.source_index import (
             current_blend_source_index,
         )
+        addon_seconds = time.perf_counter() - addon_started
 
         rows = []
+        request_timings = []
         for request in _load_requests(args.request):
             blend = request["blend"]
             expected_sha256 = request["blend_sha256"]
+            open_started = time.perf_counter()
             bpy.ops.wm.open_mainfile(filepath=str(blend), load_ui=False)
-            rows.append(
-                current_blend_source_index(
-                    expected_blend_path=blend,
-                    expected_sha256=expected_sha256,
-                )
+            open_seconds = time.perf_counter() - open_started
+            index_started = time.perf_counter()
+            row = current_blend_source_index(
+                expected_blend_path=blend,
+                expected_sha256=expected_sha256,
             )
+            index_seconds = time.perf_counter() - index_started
+            rows.append(row)
+            request_timings.append({
+                "blend_path_sha256": hashlib.sha256(
+                    os.path.normcase(str(blend)).casefold().encode("utf-8")
+                ).hexdigest(),
+                "blend_bytes": blend.stat().st_size,
+                "open_seconds": round(open_seconds, 6),
+                "index_seconds": round(index_seconds, 6),
+            })
         report = {
             "schema_version": SCHEMA_VERSION,
             "status": "ok",
             "rows": rows,
+            "timing": {
+                "addon_enable_seconds": round(addon_seconds, 6),
+                "requests": request_timings,
+                "total_seconds": round(
+                    time.perf_counter() - process_started, 6
+                ),
+            },
         }
     except Exception as exc:
         report = {

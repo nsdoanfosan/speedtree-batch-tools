@@ -14,7 +14,7 @@ except ImportError:
     from .pcg_texture_common import SHARED_CACHE_DIR
 
 
-STARTUP_LATENCY_SCHEMA_VERSION = 1
+STARTUP_LATENCY_SCHEMA_VERSION = 2
 STARTUP_LATENCY_RECEIPT_PATH = SHARED_CACHE_DIR / "pcg_startup_latency_latest.json"
 STARTUP_PHASE_ORDER = (
     "cached_board_paint",
@@ -30,8 +30,11 @@ STARTUP_PHASE_BUDGET_SECONDS = {
     "sync_migration": 5.0,
 }
 PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS = {
-    "cold_total": 3.0,
-    "warm_total": 1.0,
+    # CI fixture mirrors the current 55-folder / 597-SPM fleet cardinality.
+    # Files are intentionally tiny, so these budgets guard algorithmic/I/O
+    # amplification rather than pretending to predict OneDrive wall time.
+    "cold_total": 10.0,
+    "warm_total": 6.0,
     "cached_board_paint": 0.25,
 }
 
@@ -63,8 +66,37 @@ class StartupLatencyTracker:
             "phase_order": list(STARTUP_PHASE_ORDER),
             "phase_budgets_seconds": dict(STARTUP_PHASE_BUDGET_SECONDS),
             "phases": [],
+            "milestones": {
+                "tab_selected": {
+                    "status": "ok",
+                    "from_tab_selection_seconds": 0.0,
+                },
+            },
             "status": "running",
         }
+
+    def milestone(self, name, *, status="ok", counts=None, details=None):
+        """Record an absolute UI/compute readiness boundary once."""
+        name = str(name)
+        with self._lock:
+            if name in self._receipt["milestones"]:
+                return dict(self._receipt["milestones"][name])
+            now = float(self._clock())
+            row = {
+                "status": str(status),
+                "from_tab_selection_seconds": round(
+                    max(0.0, now - self._selected_perf), 6
+                ),
+                "counts": dict(counts or {}),
+            }
+            if details:
+                row["details"] = dict(details)
+            self._receipt["milestones"][name] = row
+            self._receipt["total_seconds"] = row[
+                "from_tab_selection_seconds"
+            ]
+            atomic_write_json(self._receipt_path, self._receipt)
+            return dict(row)
 
     def mark(self, phase, *, status="ok", counts=None, details=None):
         phase = str(phase)
@@ -121,6 +153,10 @@ class StartupLatencyTracker:
                     self._receipt["phase_budgets_seconds"]
                 ),
                 "phases": [dict(row) for row in self._receipt["phases"]],
+                "milestones": {
+                    name: dict(row)
+                    for name, row in self._receipt["milestones"].items()
+                },
             }
 
 
