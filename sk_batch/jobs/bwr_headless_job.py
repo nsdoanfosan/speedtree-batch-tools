@@ -55,11 +55,17 @@ from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
 from cluster_export_handoff_contract import (
+    capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
+    reconcile_transient_cluster_export_root,
 )
 from pcg_st9_texture_batch.pcg_cluster_bark_normalization import (
     BarkNormalizationError,
     validate_canonical_bark_export_bundle,
+)
+from cluster_bark_source_resolution import (
+    ClusterBarkSourceResolutionError,
+    load_current_isolated_bark_manifest,
 )
 
 
@@ -392,37 +398,19 @@ def main():
                 args.bark_normalization_manifest
             ).resolve()
             try:
-                bark_normalization_manifest = json.loads(
-                    manifest_path.read_text(encoding="utf-8")
+                bark_normalization_manifest = (
+                    load_current_isolated_bark_manifest(
+                        manifest_path,
+                        source_spm=canonical_spm,
+                        speedtree_spm=speedtree_spm,
+                    )
                 )
-            except (OSError, ValueError) as exc:
-                raise RuntimeError(
-                    "Cluster bark normalization manifest is unreadable: "
-                    f"{manifest_path}: {exc}"
-                ) from exc
-            if (
-                bark_normalization_manifest.get("kind")
-                != "cluster_isolated_canonical_bark_source"
-                or bark_normalization_manifest.get("status") != "ready"
-                or bark_normalization_manifest.get(
-                    "production_source_mutated"
-                ) is not False
-                or Path(
-                    bark_normalization_manifest.get("source_spm") or ""
-                ).resolve() != canonical_spm
-                or Path(
-                    bark_normalization_manifest.get("speedtree_spm") or ""
-                ).resolve() != speedtree_spm
-                or bark_normalization_manifest.get("source_spm_sha256")
-                != file_fingerprint(canonical_spm).get("sha256")
-                or bark_normalization_manifest.get(
-                    "isolated_spm_sha256"
-                ) != file_fingerprint(speedtree_spm).get("sha256")
-            ):
+            except ClusterBarkSourceResolutionError as exc:
                 raise RuntimeError(
                     "Cluster bark normalization manifest is stale or "
-                    "does not match the requested source pair"
-                )
+                    "incompatible with the exact requested provider: "
+                    f"{manifest_path}: {exc}"
+                ) from exc
             report["cluster_bark_source_resolution"] = {
                 "status": "ready",
                 "manifest": file_fingerprint(manifest_path),
@@ -764,10 +752,44 @@ def main():
             repair_settings["source_fbx_cleanup_aliases"] = [
                 str(canonical_source_fbx)
             ]
+        cluster_export_snapshot = None
+        if is_cluster_source and not args.cluster_source_build_only:
+            cluster_export_snapshot = capture_cluster_export_snapshot(
+                bpy.data,
+                canonical_spm.stem,
+            )
         result = bwr_core.run_import_and_repair(repair_settings)
         report["speedtree_export"] = speedtree_export
-        export_collection_issues = export_collection_contract_issues(
-            canonical_spm.stem if is_cluster_source else ""
+        transient_export_reconciliation = None
+        if cluster_export_snapshot is not None:
+            transient_export_reconciliation = (
+                reconcile_transient_cluster_export_root(
+                    bpy.data,
+                    bpy.data.collections.get(
+                        repair_settings.get(
+                            "source_collection_name",
+                            "SpeedTree_Source",
+                        )
+                    ),
+                    cluster_source_stem=canonical_spm.stem,
+                    source_fbx_path=fbx_export["path"],
+                    source_identity_path=canonical_spm,
+                    before_snapshot=cluster_export_snapshot,
+                )
+            )
+            report["cluster_transient_export_reconciliation"] = (
+                transient_export_reconciliation
+            )
+        export_collection_issues = list(
+            (transient_export_reconciliation or {}).get("issues") or ()
+        )
+        export_collection_issues.extend(
+            export_collection_contract_issues(
+                canonical_spm.stem if is_cluster_source else ""
+            )
+        )
+        export_collection_issues = list(
+            dict.fromkeys(export_collection_issues)
         )
         report["export_collection_issues"] = export_collection_issues
         cluster_export_pending = bool(
@@ -834,6 +856,10 @@ def main():
             pipeline_data["export_collection_issues"] = (
                 export_collection_issues
             )
+            if transient_export_reconciliation is not None:
+                pipeline_data[
+                    "cluster_transient_export_reconciliation"
+                ] = transient_export_reconciliation
             if cluster_assembly_handoff is not None:
                 pipeline_data["cluster_assembly_handoff"] = (
                     cluster_assembly_handoff
@@ -898,7 +924,8 @@ def main():
         # A blocked payload leaves an existing source .blend untouched.
         report["blend_resaved"] = False
         if (
-            vertex_payload_contract.get("status") == "ok"
+            not blocking_export_collection_issues
+            and vertex_payload_contract.get("status") == "ok"
             and vertex_color_contract.get("status") == "ok"
             and not leaf_reference_blocked
             and (
@@ -1037,6 +1064,9 @@ def main():
                 Path(blend_dir) / "assembly",
                 "",
                 report["dynamic_wind_json"],
+                pass_through_receipt_path=cluster_receipt_path,
+                pass_through_target_contract=cluster_assembly_contract,
+                pass_through_target_spm=speedtree_spm,
             )
             report["cluster_assembly_manifest"] = assembly_manifest
         elif (

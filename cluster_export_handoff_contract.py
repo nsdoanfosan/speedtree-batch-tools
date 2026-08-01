@@ -22,6 +22,211 @@ SOURCE_BUILD_MODE = "raw_source_for_cluster_normalizer"
 FINAL_HANDOFF_STATUSES = frozenset({"ok", "source_review"})
 
 
+def _object_identity(obj):
+    as_pointer = getattr(obj, "as_pointer", None)
+    if callable(as_pointer):
+        return ("blender_pointer", int(as_pointer()))
+    return ("python_id", id(obj))
+
+
+def _normalized_source_path(value):
+    if not value:
+        return ""
+    return os.path.normcase(
+        os.path.normpath(os.path.abspath(os.path.expanduser(str(value))))
+    )
+
+
+def capture_cluster_export_snapshot(blender_data, cluster_source_stem):
+    """Capture persisted Export ownership before BWR mutates the scene.
+
+    Object pointers distinguish objects authored in the loaded blend from
+    objects created by the current FBX import.  The unsuffixed-name snapshot is
+    retained separately so an owned object removed and recreated by BWR cannot
+    make a persisted ambiguous root look transient.
+    """
+
+    export_collection = blender_data.collections.get("Export")
+    objects = list(export_collection.objects) if export_collection else []
+    expected_name = str(cluster_source_stem or "").casefold()
+    return {
+        "object_identities": frozenset(
+            _object_identity(obj) for obj in objects
+        ),
+        "unsuffixed_empty_names": tuple(
+            sorted(
+                obj.name
+                for obj in objects
+                if obj.type == "EMPTY"
+                and obj.name.casefold() == expected_name
+            )
+        ),
+    }
+
+
+def _matches_exact_source_ownership(
+    obj,
+    *,
+    source_fbx_path,
+    source_identity_path,
+):
+    expected_fbx = _normalized_source_path(source_fbx_path)
+    expected_identity = _normalized_source_path(source_identity_path)
+    return bool(expected_fbx and expected_identity) and (
+        _normalized_source_path(obj.get("codex_source_fbx", ""))
+        == expected_fbx
+        and _normalized_source_path(obj.get("codex_source_identity", ""))
+        == expected_identity
+    )
+
+
+def reconcile_transient_cluster_export_root(
+    blender_data,
+    source_collection,
+    *,
+    cluster_source_stem,
+    source_fbx_path,
+    source_identity_path,
+    before_snapshot,
+):
+    """Move one proven current-run BWR Export hierarchy out of Send2UE.
+
+    A standalone Cluster blend may already contain normalized ordinal pivots.
+    BWR additionally builds a Full-SK reference hierarchy for the current FBX;
+    that hierarchy belongs in ``SpeedTree_Source``, not alongside the persisted
+    pivots in ``Export``.  Reconciliation is fail-closed unless the unsuffixed
+    root and every connected Export member are new and carry both the exact
+    current FBX ownership tag and stable source-SPM identity.
+    """
+
+    export_collection = blender_data.collections.get("Export")
+    base_report = {
+        "status": "not_needed",
+        "cluster_source_stem": str(cluster_source_stem or ""),
+        "source_fbx": str(source_fbx_path or ""),
+        "source_identity": str(source_identity_path or ""),
+        "moved_export_objects": [],
+        "issues": [],
+    }
+    if export_collection is None:
+        base_report["reason"] = "missing_export_collection"
+        return base_report
+
+    expected_name = str(cluster_source_stem or "").casefold()
+    objects = list(export_collection.objects)
+    roots = [
+        obj
+        for obj in objects
+        if obj.type == "EMPTY"
+        and obj.children
+        and obj.name.casefold() == expected_name
+    ]
+    persisted_names = tuple(
+        (before_snapshot or {}).get("unsuffixed_empty_names") or ()
+    )
+    if persisted_names:
+        base_report.update(
+            {
+                "status": "blocked",
+                "reason": "persisted_unsuffixed_export_root",
+                "issues": [
+                    f"cluster_unsuffixed_export_unit:{name}"
+                    for name in persisted_names
+                ],
+            }
+        )
+        return base_report
+    if not roots:
+        base_report["reason"] = "no_unsuffixed_export_root"
+        return base_report
+    if len(roots) != 1:
+        base_report.update(
+            {
+                "status": "blocked",
+                "reason": "multiple_unsuffixed_export_roots",
+                "issues": [
+                    f"cluster_unsuffixed_export_unit:{obj.name}"
+                    for obj in roots
+                ],
+            }
+        )
+        return base_report
+
+    root = roots[0]
+    before_identities = frozenset(
+        (before_snapshot or {}).get("object_identities") or ()
+    )
+    if _object_identity(root) in before_identities:
+        base_report.update(
+            {
+                "status": "blocked",
+                "reason": "persisted_unsuffixed_export_root",
+                "issues": [
+                    f"cluster_unsuffixed_export_unit:{root.name}"
+                ],
+            }
+        )
+        return base_report
+
+    object_set = set(objects)
+    connected = set()
+    pending = [root]
+    while pending:
+        obj = pending.pop()
+        if obj in connected or obj not in object_set:
+            continue
+        connected.add(obj)
+        parent = getattr(obj, "parent", None)
+        if parent in object_set:
+            pending.append(parent)
+        pending.extend(
+            child
+            for child in getattr(obj, "children", ())
+            if child in object_set
+        )
+
+    ambiguous = [
+        obj
+        for obj in connected
+        if _object_identity(obj) in before_identities
+        or not _matches_exact_source_ownership(
+            obj,
+            source_fbx_path=source_fbx_path,
+            source_identity_path=source_identity_path,
+        )
+    ]
+    if ambiguous or source_collection is None:
+        base_report.update(
+            {
+                "status": "blocked",
+                "reason": (
+                    "missing_source_collection"
+                    if source_collection is None
+                    else "ambiguous_unsuffixed_export_hierarchy"
+                ),
+                "ambiguous_objects": sorted(obj.name for obj in ambiguous),
+                "issues": [
+                    f"cluster_unsuffixed_export_unit:{root.name}"
+                ],
+            }
+        )
+        return base_report
+
+    moved = sorted(connected, key=lambda obj: obj.name.casefold())
+    for obj in moved:
+        if obj not in source_collection.objects:
+            source_collection.objects.link(obj)
+        export_collection.objects.unlink(obj)
+    base_report.update(
+        {
+            "status": "reconciled",
+            "reason": "new_exact_bwr_source_hierarchy",
+            "moved_export_objects": [obj.name for obj in moved],
+        }
+    )
+    return base_report
+
+
 def cluster_export_contract_issues(blender_data, cluster_source_stem):
     """Return structural Send2UE Export issues for one Cluster source.
 
@@ -202,7 +407,9 @@ __all__ = [
     "PENDING_HANDOFF_STATUS",
     "SOURCE_BUILD_MODE",
     "atomic_write_json",
+    "capture_cluster_export_snapshot",
     "cluster_export_contract_issues",
     "finalize_cluster_pipeline_payload",
+    "reconcile_transient_cluster_export_root",
     "validate_pending_source_contract",
 ]

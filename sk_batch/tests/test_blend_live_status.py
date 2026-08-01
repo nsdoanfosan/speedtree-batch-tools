@@ -179,6 +179,38 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(events, ["population", "persist"])
         self.assertEqual(result["cluster_sources"], [])
 
+    def test_cached_refresh_reapplies_operational_spm_eligibility(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            live = root / "SK_weed_reed_02.spm"
+            rollback = (
+                root
+                / (
+                    "SK_weed_reed_02.texture_slot_backup_"
+                    "20260801_010203_123456.spm"
+                )
+            )
+            write_empty_spm(live)
+            write_empty_spm(rollback)
+            stale_caches = {
+                str(rollback): {
+                    "size": rollback.stat().st_size,
+                    "mtime_ns": rollback.stat().st_mtime_ns,
+                    "fingerprint": "stale-backup-cache",
+                }
+            }
+
+            with mock.patch.object(
+                gui, "scan_sk_spms", return_value=[live, rollback]
+            ), mock.patch.object(
+                gui, "scan_cluster_spm_sources", return_value=[]
+            ), mock.patch.object(gui, "save_leaf_contract_cache"):
+                result = gui.App._collect_scan_result(root, stale_caches)
+
+            self.assertEqual(result["spms"], [live])
+            self.assertEqual(set(result["snapshots"]), {str(live)})
+
     def setUp(self):
         self._isolated_logs = tempfile.TemporaryDirectory()
 

@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import shutil
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -11,6 +12,7 @@ from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     _copy_canonical_textures,
     _copy_source_external_meshes,
+    _normalization_identity,
     _publish_cache_directory,
     _rebase_external_mesh_refs,
     prepare_isolated_bark_source,
@@ -338,6 +340,114 @@ def test_content_addressed_bark_source_preserves_production_spm():
         assert Path(rebuilt["manifest"]).is_file()
         assert Path(rebuilt["speedtree_spm"]).is_file()
         assert _sha256(source) == source_hash
+
+        Path(rebuilt["speedtree_spm"]).unlink()
+        missing_exact_rebuilt = prepare_isolated_bark_source(
+            source,
+            contract,
+            rows,
+            cache_parent=cache,
+        )
+        assert missing_exact_rebuilt["status"] == "prepared"
+        assert Path(missing_exact_rebuilt["manifest"]).is_file()
+        assert Path(missing_exact_rebuilt["speedtree_spm"]).is_file()
+        assert _sha256(source) == source_hash
+
+
+def test_same_bytes_provider_rename_rebuilds_exact_filename_bundle():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "Tree_neutral"
+        source = root / "Cluster" / "SK_branch_provider_legacy_01.spm"
+        renamed = root / "Cluster" / "SK_branch_provider_current_01.spm"
+        canonical = root / "SK_Tree_neutral_01.spm"
+        canonical_outputs = _canonical_output(
+            root,
+            canonical,
+            "1",
+            "M_bark_neutral_01",
+            "T_bark_neutral_01",
+        )
+        canonical_refs = [
+            canonical_outputs["color"],
+            canonical_outputs["normal"],
+        ]
+        _write_spm(
+            source,
+            "M_bark_common_end_01",
+            ["generic/common_color.tga", "generic/common_normal.tga"],
+        )
+        for index, value in enumerate(
+            ["generic/common_color.tga", "generic/common_normal.tga"],
+            1,
+        ):
+            texture = source.parent / value
+            texture.parent.mkdir(parents=True, exist_ok=True)
+            texture.write_bytes(f"generic-{index}".encode("ascii"))
+        _write_spm(canonical, "M_bark_neutral_01", canonical_refs)
+        contract = {
+            "handoff": {
+                "canonical_bark": {
+                    "status": "replacement_required",
+                    "canonical_material": "M_bark_neutral_01",
+                    "canonical_sources": [{
+                        "spm": str(canonical),
+                        "material_id": "1",
+                        "material_name": "M_bark_neutral_01",
+                        "refs": canonical_refs,
+                    }],
+                    "cluster_bark_sources": [{
+                        "cluster_spm": str(source),
+                        "material_id": "1",
+                        "material_name": "M_bark_common_end_01",
+                        "replacement": "required",
+                    }],
+                },
+            },
+        }
+        rows = contract["handoff"]["canonical_bark"][
+            "cluster_bark_sources"
+        ]
+        cache = Path(temporary) / "cache"
+        legacy = prepare_isolated_bark_source(
+            source,
+            contract,
+            rows,
+            cache_parent=cache,
+        )
+        source_hash = _sha256(source)
+        source.rename(renamed)
+        assert _sha256(renamed) == source_hash
+        rows[0]["cluster_spm"] = str(renamed)
+
+        current_signature, _identity = _normalization_identity(
+            contract,
+            renamed,
+            rows,
+        )
+        incompatible = cache / current_signature[:24]
+        shutil.copytree(Path(legacy["manifest"]).parent, incompatible)
+
+        current = prepare_isolated_bark_source(
+            renamed,
+            contract,
+            rows,
+            cache_parent=cache,
+        )
+        current_manifest = json.loads(
+            Path(current["manifest"]).read_text(encoding="utf-8")
+        )
+
+        assert current["status"] == "prepared"
+        assert current["signature"] != legacy["signature"]
+        assert Path(current["speedtree_spm"]).name == renamed.name
+        assert Path(current["speedtree_spm"]).is_file()
+        assert current_manifest["source_spm"] == str(renamed.resolve())
+        assert current_manifest["speedtree_spm"] == current["speedtree_spm"]
+        assert current_manifest["output_filename"] == renamed.name
+        assert current_manifest["provider_identity"]["stem"] == (
+            renamed.stem.casefold()
+        )
+        assert Path(legacy["manifest"]).is_file()
 
 
 def test_live_owner_contract_overrides_missing_or_stale_receipt_cache():
