@@ -15,14 +15,16 @@ from datetime import date, datetime
 from pathlib import Path
 
 try:
-    from pcg_texture_common import REPORT_DIR, TARGETS_PATH
+    from pcg_texture_common import SHARED_CACHE_DIR, TARGETS_PATH
 except ImportError:
-    from .pcg_texture_common import REPORT_DIR, TARGETS_PATH
+    from .pcg_texture_common import SHARED_CACHE_DIR, TARGETS_PATH
 
 
 BOARD_SNAPSHOT_SCHEMA_VERSION = 1
 BOARD_SNAPSHOT_KIND = "pcg_board_display_snapshot"
-BOARD_SNAPSHOT_PATH = REPORT_DIR / "_cache" / "board_snapshot_v1.json"
+BOARD_SNAPSHOT_PATH = SHARED_CACHE_DIR / "board_snapshot_v1.json"
+BOARD_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+BOARD_SNAPSHOT_RETENTION_COUNT = 1
 
 # These arrays are useful in detailed geometry diagnostics but can dominate a
 # board snapshot.  Their accompanying counts and contract summaries remain.
@@ -203,10 +205,14 @@ def write_board_display_snapshot(
         pcg_targets=None,
         path=BOARD_SNAPSHOT_PATH,
         pcg_targets_path=TARGETS_PATH,
+        max_bytes=BOARD_SNAPSHOT_MAX_BYTES,
 ):
-    """Atomically store a compact table snapshot and its input context."""
+    """Atomically retain one compact snapshot within the byte budget.
+
+    An over-budget candidate is discarded before it reaches disk, preserving
+    the previous bounded snapshot when one exists.
+    """
     destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": BOARD_SNAPSHOT_SCHEMA_VERSION,
         "kind": BOARD_SNAPSHOT_KIND,
@@ -219,24 +225,26 @@ def write_board_display_snapshot(
         ),
         "display_report": compact_display_report(report),
     }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > int(max_bytes):
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
+            mode="wb",
             dir=destination.parent,
             prefix=f".{destination.name}.",
             suffix=".tmp",
             delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
-            json.dump(
-                payload,
-                handle,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, destination)
@@ -294,6 +302,7 @@ def read_board_display_snapshot(
         pcg_targets=None,
         path=BOARD_SNAPSHOT_PATH,
         pcg_targets_path=TARGETS_PATH,
+        max_bytes=BOARD_SNAPSHOT_MAX_BYTES,
 ):
     """Read a display cache and describe how it relates to current inputs.
 
@@ -316,6 +325,11 @@ def read_board_display_snapshot(
     }
     if not source_path.is_file():
         return {**base, "cache_state": "missing", "can_display": False}
+    try:
+        if source_path.stat().st_size > int(max_bytes):
+            return {**base, "cache_state": "oversized", "can_display": False}
+    except OSError:
+        return {**base, "cache_state": "unreadable", "can_display": False}
     try:
         payload = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
@@ -350,7 +364,9 @@ def read_board_display_snapshot(
 
 __all__ = [
     "BOARD_SNAPSHOT_KIND",
+    "BOARD_SNAPSHOT_MAX_BYTES",
     "BOARD_SNAPSHOT_PATH",
+    "BOARD_SNAPSHOT_RETENTION_COUNT",
     "BOARD_SNAPSHOT_SCHEMA_VERSION",
     "DISPLAY_SNAPSHOT_OMITTED_KEYS",
     "board_display_context",

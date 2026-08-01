@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "contract": "speedtree_issue_23_blackgum_main_leaf_mesh_evidence_v1",
+  "issue_url": "https://github.com/nsdoanfosan/speedtree-batch-tools/issues/23",
+  "issue_number": 23,
+  "recorded_utc": "2026-07-31T17:24:59Z",
+  "scope_note": "Asset-only repair and latest-main delivery evidence. No production or stale-node recovery code changed.",
+  "result_status": {
+    "asset_repair": "verified",
+    "issue_19_delivery_identity": "closure_ready",
+    "issue_23": "asset_repair_verified_downstream_rerun_pending",
+    "closure": "incomplete",
+    "closure_blockers": [
+      "Cluster normalization and the Unreal push were not rerun after the asset repair.",
+      "The broad authoring-graph continuity projection changed during the Modeler save, so this evidence does not claim full authoring-graph byte or projection continuity."
+    ]
+  },
+  "audit_repository": {
+    "repository": "nsdoanfosan/speedtree-batch-tools",
+    "origin_main_commit": "85e4d0e07142a8bd09d227d86c838947c90db5a7",
+    "issue_19_merge_commit": "a5c328774ad7a142dde4c6c30e58835d3e3a9404",
+    "snapshot_function": "live_generator_delivery_snapshot",
+    "delivery_function": "_normalized_generator_delivery",
+    "snapshot_contract": "speedtree_live_generator_delivery_snapshot_v1"
+  },
+  "asset": {
+    "asset_relative_path": "SK_weed_blackgum_01.spm",
+    "declaration_relative_path": "speedtree_import_manifest.json",
+    "before_raw_sha256": "562c1e20accc927ecbe9261d4ce4053dc52f26f4a7629a526d93ac77c25a763c",
+    "after_raw_sha256": "104363e9b0fd534c6316bd613e53ec0aa40a98bd547b5bbfe7fd6a4fa673a6dc",
+    "before_text_sha256": "0277e9ee8421a9833eefebdb159d9d23e9192706958b3b7cbf3eb9c1b4c24835",
+    "after_text_sha256": "4f17e4877666d76437cf97de7b42d0d0a778a836db968135920575f136f6a8fc",
+    "before_size": 359776,
+    "after_size": 359818
+  },
+  "preimage_receipt": {
+    "status": "sealed_before_modeler_edit",
+    "backup_name": "SK_weed_blackgum_01.562c1e20accc927ecbe9261d4ce4053dc52f26f4a7629a526d93ac77c25a763c.preimage.spm",
+    "backup_raw_sha256": "562c1e20accc927ecbe9261d4ce4053dc52f26f4a7629a526d93ac77c25a763c",
+    "receipt_name": "SK_weed_blackgum_01.562c1e20accc927ecbe9261d4ce4053dc52f26f4a7629a526d93ac77c25a763c.receipt.json",
+    "receipt_sha256": "25c5b877ee263efb6928436abef7aa82e4b2d82fa2352254b1d67728cf3a7bba"
+  },
+  "declaration": {
+    "target_generator_name": "main_leaf_02 4",
+    "material_id": 7,
+    "required_target_mesh_ids": [130, 131, 132, 133],
+    "target_bindings": [
+      {"slot_prefix": "Leaves:Type:0", "mesh_id": 130},
+      {"slot_prefix": "Leaves:Type:1", "mesh_id": 132}
+    ]
+  },
+  "before": {
+    "target_bindings": [
+      {
+        "slot_prefix": "Leaves:Type:0",
+        "material_id": 7,
+        "mesh_id": -10,
+        "graph_visible": true,
+        "generated_node_count": 440,
+        "export_participates": true,
+        "node_table_stale": false
+      },
+      {
+        "slot_prefix": "Leaves:Type:1",
+        "material_id": 7,
+        "mesh_id": -10,
+        "graph_visible": true,
+        "generated_node_count": 440,
+        "export_participates": true,
+        "node_table_stale": false
+      }
+    ],
+    "node_table": {
+      "generator_count": 22,
+      "node_table_generator_count": 18,
+      "orphan_generator_guid_count": 0,
+      "orphan_node_count": 0,
+      "total_node_count": 2506,
+      "stale": false
+    },
+    "delivery_errors": ["visible_generator_mesh_mismatch"]
+  },
+  "after": {
+    "target_bindings": [
+      {
+        "slot_prefix": "Leaves:Type:0",
+        "material_id": 7,
+        "mesh_id": 130,
+        "graph_visible": true,
+        "generated_node_count": 440,
+        "export_participates": true,
+        "node_table_stale": false
+      },
+      {
+        "slot_prefix": "Leaves:Type:1",
+        "material_id": 7,
+        "mesh_id": 132,
+        "graph_visible": true,
+        "generated_node_count": 440,
+        "export_participates": true,
+        "node_table_stale": false
+      }
+    ],
+    "node_table": {
+      "generator_count": 22,
+      "node_table_generator_count": 18,
+      "orphan_generator_guid_count": 0,
+      "orphan_node_count": 0,
+      "total_node_count": 2506,
+      "stale": false
+    },
+    "delivery": {
+      "delivery_mode": "render_connected",
+      "delivery_complete": true,
+      "errors": [],
+      "missing_live_binding_count": 0,
+      "live_export_participating_target_mesh_ids": [130, 131, 132, 133],
+      "current_required_target_mesh_ids": [130, 131, 132, 133]
+    }
+  },
+  "issue_19_identity_regression": {
+    "old_identity_tokens": [
+      "visible_generator_slot_missing",
+      "live_generator_slot_not_declared_exactly_once"
+    ],
+    "tokens_present_in_fresh_latest_main_delivery_errors": []
+  },
+  "change_scope": {
+    "changed_leaf_binding_count": 2,
+    "changed_leaf_binding_fields": [
+      "Leaves:Type:0:Mesh",
+      "Leaves:Type:1:Mesh"
+    ],
+    "material_id_unchanged": true,
+    "generated_node_counts_unchanged": true,
+    "node_table_unchanged": true,
+    "broad_authoring_graph_equal_after_reverting_only_intended_mesh_values": false,
+    "broad_projection_note": "Modeler save also rewrote derived metadata and serialized numeric or spline representations. Common recovery code was intentionally left unchanged, and downstream normalization or push was not attempted under this unresolved broad continuity signal."
+  },
+  "ui_execution": {
+    "exact_asset_window_only": true,
+    "saved": true,
+    "speedtree_window_released": true,
+    "recovery_lock_released": true
+  }
+}

@@ -178,7 +178,19 @@ def main(argv):
     try:
         runpy.run_path(str(target), run_name="__main__")
     except SystemExit as exc:
-        return int(exc.code or 0)
+        code = exc.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            # Match CPython, including bool because it is an int subclass.
+            return int(code)
+        message = str(code)
+        report(
+            label,
+            f"{label} stopped during startup.\n\n{message}",
+            f"{message}\n",
+        )
+        return 1
     except BaseException as exc:  # noqa: BLE001 - last resort reporter
         report(
             label,

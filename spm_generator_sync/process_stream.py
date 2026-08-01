@@ -4,6 +4,15 @@ Reader threads only drain OS pipes. Callbacks run on the owning worker thread,
 never on a Tk thread. On Windows, real ``subprocess.Popen`` launches are
 suspended, assigned to a private kill-on-close Job Object, and only then
 resumed so descendants cannot escape through the spawn/assign race.
+
+This is the shared safe PIPE contract for SpeedTree Modeler.  Modeler can exit
+while a descendant still holds an inherited stdout/stderr handle, so PIPE is
+safe here only because both channels are drained concurrently, the descendant
+tree is owned, and the post-root-exit EOF wait is bounded.  The converged
+``sk_batch.spm_audit.run_speedtree_export`` caller uses this path by default;
+its temporary-file fallback and the repair add-on's
+``speedtree_cli._run_process`` implement the same rule by avoiding PIPE EOF
+altogether.  Plain ``subprocess.run(capture_output=True)`` is not equivalent.
 """
 
 from __future__ import annotations
@@ -302,8 +311,9 @@ def _reader(
     pending = ""
     line_limit = max(1, int(max_line_chars))
 
-    def emit_complete_lines(*, final: bool = False) -> None:
+    def emit_complete_lines(*, final: bool = False) -> bool:
         nonlocal pending
+        emitted = False
         while True:
             match = _LINE_END.search(pending)
             if match is None:
@@ -311,10 +321,13 @@ def _reader(
             if not final and match.group(0) == "\r" and match.end() == len(pending):
                 break
             events.put(("line", channel, pending[: match.start()]))
+            emitted = True
             pending = pending[match.end() :]
         while len(pending) > line_limit:
             events.put(("line_fragment", channel, pending[:line_limit]))
+            emitted = True
             pending = pending[line_limit:]
+        return emitted
 
     try:
         while True:
@@ -322,7 +335,10 @@ def _reader(
             if not chunk:
                 break
             pending += decoder.decode(chunk)
-            emit_complete_lines()
+            if not emit_complete_lines():
+                # A newline-free Modeler status write is still activity for an
+                # inactivity deadline, but is not yet a callback/capture line.
+                events.put(("activity", channel, None))
         pending += decoder.decode(b"", final=True)
         emit_complete_lines(final=True)
         while len(pending) > line_limit:
@@ -437,6 +453,8 @@ def run_streaming_process(
     *,
     cwd: str | os.PathLike[str] | None = None,
     timeout: float | None = None,
+    inactivity_timeout: float | None = None,
+    activity_probe: Callable[[object], object] | None = None,
     output_callback: Callable[[str, str], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     terminate_grace: float = 1.0,
@@ -450,7 +468,13 @@ def run_streaming_process(
     event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE,
     popen_factory=_DEFAULT_POPEN,
 ) -> ProcessResult:
-    """Stream an owned process with bounded tails and deterministic outcomes."""
+    """Stream an owned process with bounded tails and deterministic outcomes.
+
+    ``timeout`` is an absolute wall-clock cap. ``inactivity_timeout`` is a
+    separate soft deadline reset by streamed lines or a changed
+    ``activity_probe(process)`` value.  Keeping both in this owner means a
+    timeout uses the same exact-tree termination contract as cancellation.
+    """
 
     args = [str(value) for value in command]
     if not args:
@@ -534,11 +558,19 @@ def run_streaming_process(
     cleanup_state = "process_tree_clean"
     oversized_line_fragments = 0
     root_exit_observed_at = None
+    owned_tree_seen_after_exit = False
+    last_activity = started
+    activity_unset = object()
+    activity_state = activity_unset
+    timeout_reason = None
+    timeout_value = None
 
     def consume(event) -> None:
         nonlocal reader_error, callback_error, oversized_line_fragments
+        nonlocal last_activity
         kind, channel, payload = event
         if kind in {"line", "line_fragment"}:
+            last_activity = time.monotonic()
             if kind == "line_fragment":
                 oversized_line_fragments += 1
             captured[channel].append(payload)
@@ -547,6 +579,8 @@ def run_streaming_process(
                     output_callback(channel, payload)
                 except BaseException as exc:
                     callback_error = exc
+        elif kind == "activity":
+            last_activity = time.monotonic()
         elif kind == "reader_error" and reader_error is None:
             reader_error = payload
         elif kind == "eof":
@@ -581,12 +615,18 @@ def run_streaming_process(
                 if root_exit_observed_at is None:
                     root_exit_observed_at = time.monotonic()
                 ownership_done = owner is None or owner.is_empty()
+                if not ownership_done:
+                    # Remembered rather than sampled: a descendant that exits
+                    # in the same instant the grace expires must not change
+                    # which cleanup path runs, or the reported cleanup_state
+                    # becomes a race.
+                    owned_tree_seen_after_exit = True
                 if len(eof_channels) == 2 and ownership_done:
                     final_status = "completed"
                     break
                 if (
                     owner is not None
-                    and not ownership_done
+                    and (not ownership_done or owned_tree_seen_after_exit)
                     and time.monotonic() - root_exit_observed_at
                     >= max(0.0, float(exit_pipe_grace))
                 ):
@@ -618,6 +658,17 @@ def run_streaming_process(
                     break
                 continue
 
+            if activity_probe is not None:
+                try:
+                    current_activity_state = activity_probe(process)
+                except BaseException as exc:
+                    callback_error = exc
+                    continue
+                if current_activity_state != activity_state:
+                    if activity_state is not activity_unset:
+                        last_activity = time.monotonic()
+                    activity_state = current_activity_state
+
             if requested():
                 if output_callback is not None:
                     try:
@@ -645,6 +696,23 @@ def run_streaming_process(
                 break
             elapsed = time.monotonic() - started
             if timeout is not None and elapsed >= float(timeout):
+                timeout_reason = "absolute"
+                timeout_value = float(timeout)
+                final_status = _stop_exact_process(
+                    process,
+                    reason="timed_out",
+                    terminate_grace=terminate_grace,
+                    kill_grace=kill_grace,
+                    owner=owner,
+                )
+                break
+            if (
+                inactivity_timeout is not None
+                and time.monotonic() - last_activity
+                >= float(inactivity_timeout)
+            ):
+                timeout_reason = "inactivity"
+                timeout_value = float(inactivity_timeout)
                 final_status = _stop_exact_process(
                     process,
                     reason="timed_out",
@@ -727,12 +795,18 @@ def run_streaming_process(
     if result.status.startswith("timed_out_"):
         exc = subprocess.TimeoutExpired(
             args,
-            timeout,
+            timeout_value,
             output=result.stdout,
             stderr=result.stderr,
         )
         exc.termination_state = result.status
         exc.pid = result.pid
+        exc.timeout_reason = timeout_reason
+        exc.elapsed = result.elapsed
+        exc.last_activity_age = max(
+            0.0,
+            time.monotonic() - last_activity,
+        )
         raise exc
     return result
 

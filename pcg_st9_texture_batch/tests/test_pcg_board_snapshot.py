@@ -10,6 +10,8 @@ sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_board_snapshot import (
     BOARD_SNAPSHOT_KIND,
+    BOARD_SNAPSHOT_MAX_BYTES,
+    BOARD_SNAPSHOT_RETENTION_COUNT,
     BOARD_SNAPSHOT_SCHEMA_VERSION,
     read_board_display_snapshot,
     write_board_display_snapshot,
@@ -182,6 +184,37 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
             list(self.snapshot.parent.glob(f".{self.snapshot.name}.*.tmp")),
             [],
         )
+
+    def test_size_budget_discards_candidate_and_retains_one_last_good_file(self):
+        self.assertEqual(BOARD_SNAPSHOT_RETENTION_COUNT, 1)
+        self._write(report={"items": [{"name": "last-good"}]})
+        previous = self.snapshot.read_bytes()
+        self.assertLessEqual(len(previous), BOARD_SNAPSHOT_MAX_BYTES)
+
+        written = write_board_display_snapshot(
+            {"items": [{"diagnostic": "x" * (len(previous) + 1024)}]},
+            self.cfg,
+            pcg_targets=self.pcg_targets,
+            path=self.snapshot,
+            pcg_targets_path=self.targets_path,
+            max_bytes=len(previous) + 64,
+        )
+
+        self.assertIsNone(written)
+        self.assertEqual(self.snapshot.read_bytes(), previous)
+        self.assertEqual(
+            list(self.snapshot.parent.glob("board_snapshot_v1*.json")),
+            [self.snapshot],
+        )
+        oversized = read_board_display_snapshot(
+            self.cfg,
+            pcg_targets=self.pcg_targets,
+            path=self.snapshot,
+            pcg_targets_path=self.targets_path,
+            max_bytes=len(previous) - 1,
+        )
+        self.assertEqual(oversized["cache_state"], "oversized")
+        self.assertFalse(oversized["can_display"])
 
     def test_all_asset_board_does_not_depend_on_unused_pcg_file(self):
         write_board_display_snapshot(

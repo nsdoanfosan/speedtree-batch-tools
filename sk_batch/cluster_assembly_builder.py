@@ -22,6 +22,7 @@ import itertools
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 from contextlib import contextmanager
@@ -38,6 +39,16 @@ from nanite_assembly_materials import (
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
 ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
+MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN = re.compile(
+    r"(?P<prefix>\bsidecar_sha256\s*=\s*)"
+    r"(?P<quote>['\"])(?P<sha256>[0-9a-fA-F]{64})(?P=quote)"
+)
+MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN = re.compile(
+    r"(?P<prefix>\bexpected_mesh_name\s*=\s*)"
+    r"(?P<quote>['\"])(?P<mesh_name>[^'\"]+)(?P=quote)"
+)
+
+
 class ClusterAssemblyBuildError(RuntimeError):
     """Raised when a content or hierarchy invariant is not proven."""
 
@@ -4336,6 +4347,17 @@ def _generated_material_sidecar(template_data, generated_mesh_name, output_dir):
         raise ClusterAssemblyBuildError(
             "Full SK material sidecar has no SpeedTree handoff descriptor"
         )
+    source_mesh_name = str(payload.get("mesh_name") or "").strip()
+    descriptor_mesh_name = str(descriptor.get("mesh_name") or "").strip()
+    generated_mesh_name = str(generated_mesh_name or "").strip()
+    if not source_mesh_name or descriptor_mesh_name != source_mesh_name:
+        raise ClusterAssemblyBuildError(
+            "Full SK material sidecar has contradictory mesh identity"
+        )
+    if not generated_mesh_name:
+        raise ClusterAssemblyBuildError(
+            "generated Assembly material sidecar requires a mesh identity"
+        )
     payload["mesh_name"] = generated_mesh_name
     descriptor["mesh_name"] = generated_mesh_name
     validation = payload.get("validation_children")
@@ -4352,9 +4374,92 @@ def _generated_material_sidecar(template_data, generated_mesh_name, output_dir):
     temporary.write_text(encoded, encoding="utf-8")
     os.replace(temporary, target_path)
     return {
-        "source_path": str(source_path.resolve()),
+        "source": file_fingerprint(source_path),
         "generated": file_fingerprint(target_path),
+        "source_mesh_name": source_mesh_name,
+        "generated_mesh_name": generated_mesh_name,
     }
+
+
+def _rewrite_generated_material_sidecar_commands(
+    command_groups,
+    source_sidecar,
+    generated_sidecar,
+    source_mesh_name,
+    generated_mesh_name,
+):
+    source_path = str(source_sidecar.get("path") or "")
+    generated_path = str(generated_sidecar.get("path") or "")
+    source_sha256 = str(source_sidecar.get("sha256") or "").casefold()
+    generated_sha256 = str(generated_sidecar.get("sha256") or "").casefold()
+    source_mesh_name = str(source_mesh_name or "").strip()
+    generated_mesh_name = str(generated_mesh_name or "").strip()
+    if (
+        not source_path
+        or not generated_path
+        or not source_sha256
+        or not generated_sha256
+        or not source_mesh_name
+        or not generated_mesh_name
+    ):
+        raise ClusterAssemblyBuildError(
+            "generated Assembly material sidecar binding is incomplete"
+        )
+    source_variants = {source_path, source_path.replace("\\", "/")}
+    generated_text = generated_path.replace("\\", "/")
+
+    def replace_sha(match):
+        current = match.group("sha256").casefold()
+        if current != source_sha256:
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar command SHA does not match its current bytes"
+            )
+        quote = match.group("quote")
+        return match.group("prefix") + quote + generated_sha256 + quote
+
+    def replace_expected_mesh(match):
+        current = match.group("mesh_name")
+        if current != source_mesh_name:
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar command expected mesh name does not match "
+                "its sidecar"
+            )
+        quote = match.group("quote")
+        return match.group("prefix") + quote + generated_mesh_name + quote
+
+    rewritten_groups = []
+    for commands in command_groups or []:
+        rewritten = []
+        for command in commands:
+            command_text = str(command)
+            for source in source_variants:
+                command_text = command_text.replace(source, generated_text)
+            if "expected_mesh_name" in command_text:
+                command_text, replacement_count = (
+                    MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN.subn(
+                        replace_expected_mesh,
+                        command_text,
+                    )
+                )
+                if replacement_count != 1:
+                    raise ClusterAssemblyBuildError(
+                        "material pipeline command must bind one literal expected "
+                        "mesh name"
+                    )
+            if "sidecar_sha256" in command_text:
+                command_text, replacement_count = (
+                    MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN.subn(
+                        replace_sha,
+                        command_text,
+                    )
+                )
+                if replacement_count != 1:
+                    raise ClusterAssemblyBuildError(
+                        "material pipeline command must bind one literal sidecar SHA"
+                    )
+            rewritten.append(command_text)
+        rewritten_groups.append(rewritten)
+    return rewritten_groups
 
 
 def scope_material_pipeline_to_codex_tests(
@@ -4659,6 +4764,10 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
             raise ClusterAssemblyBuildError(
                 "generated Assembly Unreal path does not match asset_name"
             )
+        if asset_name != export_stem:
+            raise ClusterAssemblyBuildError(
+                "generated Assembly asset_name does not match export_stem"
+            )
         row = deepcopy(full_manifest_asset)
         data = row.setdefault("asset_data", {})
         data["file_path"] = str(source.resolve())
@@ -4678,25 +4787,44 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
             asset_name,
             generated_output_dir,
         )
+        source_sidecar = sidecar["source"]
+        generated_sidecar = sidecar["generated"]
+        source_mesh_name = sidecar["source_mesh_name"]
+        generated_mesh_name = sidecar["generated_mesh_name"]
+        source_sha256 = str(source_sidecar.get("sha256") or "").casefold()
+        template_sha256 = str(
+            template_data.get("_material_pipeline_json_sha256") or ""
+        ).casefold()
+        if template_sha256 and template_sha256 != source_sha256:
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar SHA changed before Assembly ingest-plan build"
+            )
+        template_expected_mesh_name = str(
+            template_data.get("_material_pipeline_expected_mesh_name") or ""
+        ).strip()
+        if (
+            template_expected_mesh_name
+            and template_expected_mesh_name != source_mesh_name
+        ):
+            raise ClusterAssemblyBuildError(
+                "Full material sidecar expected mesh name does not match its sidecar"
+            )
         data["_material_pipeline_json_path"] = sidecar["generated"]["path"]
-        data["_material_pipeline_json_fingerprint"] = sidecar["generated"]
+        data["_material_pipeline_json_sha256"] = generated_sidecar["sha256"]
+        data["_material_pipeline_json_fingerprint"] = generated_sidecar
+        data["_material_pipeline_expected_mesh_name"] = generated_mesh_name
         row["asset_id"] = asset_id
         for key in ("pre_import_commands", "post_import_commands"):
             row[key] = _rewrite_command_asset_path(
                 row.get(key), source_asset_path, asset_path
             )
-            for commands in row[key]:
-                for index, command in enumerate(commands):
-                    rewritten = str(command)
-                    for old_path in {
-                        sidecar["source_path"],
-                        sidecar["source_path"].replace("\\", "/"),
-                    }:
-                        rewritten = rewritten.replace(
-                            old_path,
-                            sidecar["generated"]["path"].replace("\\", "/"),
-                        )
-                    commands[index] = rewritten
+            row[key] = _rewrite_generated_material_sidecar_commands(
+                row[key],
+                source_sidecar,
+                generated_sidecar,
+                source_mesh_name,
+                generated_mesh_name,
+            )
         return row
 
     base_contract = manifest.get("base") or {}
@@ -4879,10 +5007,17 @@ def validate_unreal_bounds_contract(
     awaiting art-direction adjustment.  In that production contract the base
     contains only the non-replaced tree geometry, so Full/base size is not a
     unit probe.  The completed native Assembly remains required to reconstruct
-    the Full SK within tolerance.
+    the Full SK within tolerance.  Per-axis ratios remain the strict default;
+    an all-normalized external-prototype contract may use the Full mesh's
+    largest span as the denominator so a small, centered overhang on a thin
+    axis is not mistaken for a unit or attachment error.
     """
     full_size = _bounds_size(full_bounds, "Full SK")
     base_size = _bounds_size(base_bounds, "Assembly base")
+    relative_tolerance = _positive_number(
+        assembly_relative_tolerance,
+        "Nanite Assembly relative tolerance",
+    )
 
     axis_scale_ratios = [
         full_size[index] / base_size[index] for index in range(3)
@@ -4940,7 +5075,7 @@ def validate_unreal_bounds_contract(
         "normalized_prototype_dominance_allowed": bool(
             allow_normalized_prototype_dominance
         ),
-        "assembly_relative_tolerance": float(assembly_relative_tolerance),
+        "assembly_relative_tolerance": relative_tolerance,
     }
     if assembly_bounds is None:
         if base_scale_outside_limit:
@@ -4950,42 +5085,93 @@ def validate_unreal_bounds_contract(
         return result
 
     assembly_size = _bounds_size(assembly_bounds, "Nanite Assembly")
-    relative_errors = [
-        abs(assembly_size[index] - full_size[index]) / full_size[index]
-        for index in range(3)
+    absolute_errors = [
+        abs(assembly_size[index] - full_size[index]) for index in range(3)
     ]
-    if max(relative_errors) > float(assembly_relative_tolerance):
+    relative_errors = [
+        absolute_errors[index] / full_size[index] for index in range(3)
+    ]
+    full_span_reference = max(full_size)
+    full_span_relative_errors = [
+        value / full_span_reference for value in absolute_errors
+    ]
+    axis_relative_size_ok = max(relative_errors) <= relative_tolerance
+    normalized_full_span_size_ok = (
+        bool(allow_normalized_prototype_dominance)
+        and max(full_span_relative_errors) <= relative_tolerance
+    )
+    if not axis_relative_size_ok and not normalized_full_span_size_ok:
         raise ClusterAssemblyBuildError(
             "Nanite Assembly bounds do not reconstruct the Full SK: "
             f"full_size={full_size} assembly_size={assembly_size} "
-            f"relative_errors={relative_errors}"
+            f"relative_errors={relative_errors} "
+            f"full_span_relative_errors={full_span_relative_errors}"
         )
+    size_validation_mode = (
+        "axis_relative"
+        if axis_relative_size_ok
+        else "full_span_relative_normalized_prototype"
+    )
     full_origin = full_bounds.get("origin")
     assembly_origin = assembly_bounds.get("origin")
     origin_relative_errors = None
+    origin_absolute_errors = None
+    origin_full_span_relative_errors = None
+    origin_validation_mode = None
     if (
         isinstance(full_origin, (list, tuple))
         and len(full_origin) == 3
         and isinstance(assembly_origin, (list, tuple))
         and len(assembly_origin) == 3
     ):
-        origin_relative_errors = [
+        origin_absolute_errors = [
             abs(float(assembly_origin[index]) - float(full_origin[index]))
-            / full_size[index]
             for index in range(3)
         ]
-        if max(origin_relative_errors) > float(assembly_relative_tolerance):
+        origin_relative_errors = [
+            origin_absolute_errors[index] / full_size[index]
+            for index in range(3)
+        ]
+        origin_full_span_relative_errors = [
+            value / full_span_reference for value in origin_absolute_errors
+        ]
+        axis_relative_origin_ok = (
+            max(origin_relative_errors) <= relative_tolerance
+        )
+        normalized_full_span_origin_ok = (
+            bool(allow_normalized_prototype_dominance)
+            and max(origin_full_span_relative_errors) <= relative_tolerance
+        )
+        if not axis_relative_origin_ok and not normalized_full_span_origin_ok:
             raise ClusterAssemblyBuildError(
                 "Nanite Assembly bounds center does not match the Full SK: "
                 f"full_origin={list(full_origin)} "
-                f"assembly_origin={list(assembly_origin)}"
+                f"assembly_origin={list(assembly_origin)} "
+                f"relative_errors={origin_relative_errors} "
+                f"full_span_relative_errors={origin_full_span_relative_errors}"
             )
+        origin_validation_mode = (
+            "axis_relative"
+            if axis_relative_origin_ok
+            else "full_span_relative_normalized_prototype"
+        )
     result.update(
         {
             "status": "complete",
             "assembly": assembly_bounds,
+            "assembly_full_span_reference": full_span_reference,
+            "assembly_size_absolute_errors": absolute_errors,
             "assembly_size_relative_errors": relative_errors,
+            "assembly_size_full_span_relative_errors": (
+                full_span_relative_errors
+            ),
+            "assembly_size_validation_mode": size_validation_mode,
+            "assembly_origin_absolute_errors": origin_absolute_errors,
             "assembly_origin_relative_errors": origin_relative_errors,
+            "assembly_origin_full_span_relative_errors": (
+                origin_full_span_relative_errors
+            ),
+            "assembly_origin_validation_mode": origin_validation_mode,
         }
     )
     return result

@@ -240,6 +240,80 @@ class RootExitedWithOpenPipeTests(unittest.TestCase):
 
 
 class ProcessStreamTests(unittest.TestCase):
+    def test_inactivity_timeout_is_distinct_from_absolute_timeout(self):
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            run_streaming_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout=5,
+                inactivity_timeout=0.12,
+                poll_interval=0.01,
+                terminate_grace=0.05,
+                kill_grace=1,
+            )
+
+        self.assertEqual(raised.exception.timeout_reason, "inactivity")
+        self.assertTrue(
+            raised.exception.termination_state.startswith("timed_out_")
+        )
+
+    def test_activity_probe_extends_the_inactivity_deadline(self):
+        started = time.monotonic()
+
+        def activity_probe(_process):
+            return int((time.monotonic() - started) / 0.02)
+
+        result = run_streaming_process(
+            [sys.executable, "-c", "import time; time.sleep(0.24)"],
+            timeout=2,
+            inactivity_timeout=0.06,
+            activity_probe=activity_probe,
+            poll_interval=0.01,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(result.elapsed, 0.06)
+
+    def test_unterminated_pipe_writes_extend_the_inactivity_deadline(self):
+        result = run_streaming_process(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import sys,time; "
+                    "[(sys.stdout.write('x'),sys.stdout.flush(),time.sleep(0.04)) "
+                    "for _ in range(6)]"
+                ),
+            ],
+            timeout=2,
+            inactivity_timeout=0.08,
+            poll_interval=0.01,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "xxxxxx")
+        self.assertGreater(result.elapsed, 0.08)
+
+    def test_absolute_timeout_wins_while_activity_continues(self):
+        activity = {"revision": 0}
+
+        def activity_probe(_process):
+            activity["revision"] += 1
+            return activity["revision"]
+
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            run_streaming_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout=0.16,
+                inactivity_timeout=0.05,
+                activity_probe=activity_probe,
+                poll_interval=0.01,
+                terminate_grace=0.05,
+                kill_grace=1,
+            )
+
+        self.assertEqual(raised.exception.timeout_reason, "absolute")
+
     def test_crlf_split_between_chunks_does_not_create_a_blank_line(self):
         events = queue.Queue()
         _reader(
