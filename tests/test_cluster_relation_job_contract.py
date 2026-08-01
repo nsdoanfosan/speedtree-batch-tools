@@ -102,6 +102,20 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
 
+    def test_exact_isolated_bark_bundle_is_revalidated_before_map_bake(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        normalize_source = source[
+            source.index("def normalize_cluster_blend("):
+            source.index("\ndef configure_cluster_export_properties(")
+        ]
+        validation = normalize_source.index(
+            "validate_isolated_bark_recipe_bundle(recipe)"
+        )
+        bake = normalize_source.index(
+            "bpy.ops.speedtree_cluster.bake_capture_maps()"
+        )
+        self.assertLess(validation, bake)
+
 
 if __name__ == "__main__":
     unittest.main()

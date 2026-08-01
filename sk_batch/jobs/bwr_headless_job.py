@@ -60,6 +60,10 @@ from pcg_st9_texture_batch.pcg_cluster_bark_normalization import (
     BarkNormalizationError,
     validate_canonical_bark_export_bundle,
 )
+from cluster_bark_source_resolution import (
+    ClusterBarkSourceResolutionError,
+    load_current_isolated_bark_manifest,
+)
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -391,37 +395,19 @@ def main():
                 args.bark_normalization_manifest
             ).resolve()
             try:
-                bark_normalization_manifest = json.loads(
-                    manifest_path.read_text(encoding="utf-8")
+                bark_normalization_manifest = (
+                    load_current_isolated_bark_manifest(
+                        manifest_path,
+                        source_spm=canonical_spm,
+                        speedtree_spm=speedtree_spm,
+                    )
                 )
-            except (OSError, ValueError) as exc:
-                raise RuntimeError(
-                    "Cluster bark normalization manifest is unreadable: "
-                    f"{manifest_path}: {exc}"
-                ) from exc
-            if (
-                bark_normalization_manifest.get("kind")
-                != "cluster_isolated_canonical_bark_source"
-                or bark_normalization_manifest.get("status") != "ready"
-                or bark_normalization_manifest.get(
-                    "production_source_mutated"
-                ) is not False
-                or Path(
-                    bark_normalization_manifest.get("source_spm") or ""
-                ).resolve() != canonical_spm
-                or Path(
-                    bark_normalization_manifest.get("speedtree_spm") or ""
-                ).resolve() != speedtree_spm
-                or bark_normalization_manifest.get("source_spm_sha256")
-                != file_fingerprint(canonical_spm).get("sha256")
-                or bark_normalization_manifest.get(
-                    "isolated_spm_sha256"
-                ) != file_fingerprint(speedtree_spm).get("sha256")
-            ):
+            except ClusterBarkSourceResolutionError as exc:
                 raise RuntimeError(
                     "Cluster bark normalization manifest is stale or "
-                    "does not match the requested source pair"
-                )
+                    "incompatible with the exact requested provider: "
+                    f"{manifest_path}: {exc}"
+                ) from exc
             report["cluster_bark_source_resolution"] = {
                 "status": "ready",
                 "manifest": file_fingerprint(manifest_path),
