@@ -1070,6 +1070,9 @@ def main():
                 Path(blend_dir) / "assembly",
                 "",
                 report["dynamic_wind_json"],
+                pass_through_receipt_path=cluster_receipt_path,
+                pass_through_target_contract=cluster_assembly_contract,
+                pass_through_target_spm=speedtree_spm,
             )
             report["cluster_assembly_manifest"] = assembly_manifest
         elif (
