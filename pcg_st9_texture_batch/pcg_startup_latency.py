@@ -124,7 +124,9 @@ class StartupLatencyTracker:
             self._last_perf = now
             if phase == STARTUP_PHASE_ORDER[-1]:
                 self._receipt["status"] = (
-                    "complete" if status == "ok" else str(status)
+                    "complete"
+                    if status in {"ok", "cached"}
+                    else str(status)
                 )
             self._receipt["total_seconds"] = round(total, 6)
             atomic_write_json(self._receipt_path, self._receipt)

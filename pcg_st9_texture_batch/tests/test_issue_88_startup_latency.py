@@ -109,6 +109,24 @@ class StartupLatencyReceiptTests(unittest.TestCase):
                 1.5,
             )
 
+    def test_cached_sync_tail_still_completes_startup_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ticks = iter((1.05, 1.1, 1.2, 1.3, 1.4))
+            receipt = Path(temporary) / "latency.json"
+            tracker = StartupLatencyTracker(
+                selected_perf=1.0,
+                clock=lambda: next(ticks),
+                receipt_path=receipt,
+            )
+            tracker.mark("cached_board_paint", status="painted")
+            tracker.mark("primary_live_audit")
+            tracker.mark("blender_relations")
+            tracker.mark("sync_migration", status="cached")
+
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "complete")
+            self.assertEqual(payload["phases"][-1]["status"], "cached")
+
 
 class ContentIdentityCacheTests(unittest.TestCase):
     def test_corrupt_cached_value_is_never_authority(self):
@@ -773,6 +791,26 @@ class RelationAndAuthorityTests(unittest.TestCase):
         self.assertTrue(
             sync_view.kwargs["details"]["coalesced_with_relation_view"]
         )
+
+    def test_sync_migration_failure_keeps_step3_fail_closed(self):
+        app = GUI.App.__new__(GUI.App)
+        app._initial_relation_ready = True
+        app._pending_refresh_after_sync_migration = False
+        app.startup_latency = mock.Mock()
+        app.status_var = mock.Mock()
+        app.log = mock.Mock()
+        app._update_step3_button = mock.Mock()
+
+        app._apply_sync_state_migration(
+            None, RuntimeError("receipt verification failed")
+        )
+
+        self.assertTrue(app._sync_state_migration_failed)
+        app._update_step3_button.assert_called_once_with()
+        self.assertFalse(any(
+            call.args[0] == "usable_ready_all"
+            for call in app.startup_latency.milestone.call_args_list
+        ))
 
     def test_first_cold_live_row_unlocks_read_only_review(self):
         app = GUI.App.__new__(GUI.App)

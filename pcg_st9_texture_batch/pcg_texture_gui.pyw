@@ -1570,6 +1570,7 @@ class App:
         self.sync_state = {"entries": {}}
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        self._sync_state_migration_failed = False
         self._initial_relation_finished = False
         self._initial_relation_ready = False
         self._pending_initial_sync_result = None
@@ -2855,6 +2856,7 @@ class App:
         worker = getattr(self, "sync_migration_worker", None)
         if worker is not None and worker.is_alive():
             return
+        self._sync_state_migration_failed = False
         self._sync_state_migrating = True
         self.status_var.set("기존 Unreal 동기화 기록 확인 중…")
 
@@ -2933,9 +2935,17 @@ class App:
                 ),
             )
         if error is not None:
+            self._sync_state_migration_failed = True
             self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
             self.status_var.set("기존 Unreal 기록 확인 실패 · ③에서 다시 확인")
+            self._update_step3_button()
+            if getattr(
+                self, "_pending_refresh_after_sync_migration", False
+            ):
+                self._pending_refresh_after_sync_migration = False
+                self.refresh()
             return
+        self._sync_state_migration_failed = False
         self.sync_state = state
         sync_view_started = time.perf_counter()
         if not view_already_applied:
@@ -4544,6 +4554,14 @@ class App:
         if getattr(self, "_sync_state_migrating", False):
             self.btn_step3.configure(
                 text="③ 기존 Unreal 동기화 기록 확인 중…",
+                state="disabled",
+            )
+            if hasattr(self, "btn_step3_force"):
+                self.btn_step3_force.configure(state="disabled")
+            return
+        if getattr(self, "_sync_state_migration_failed", False):
+            self.btn_step3.configure(
+                text="③ 기존 Unreal 기록 확인 실패 · 다시 검사",
                 state="disabled",
             )
             if hasattr(self, "btn_step3_force"):
