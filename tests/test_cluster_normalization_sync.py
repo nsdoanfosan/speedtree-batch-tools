@@ -18,7 +18,9 @@ from cluster_normalization_sync import (
     inspect_normalization_source_identity,
     normalization_receipt_path,
     resolve_normalization_recipe,
+    validate_isolated_bark_recipe_bundle,
 )
+from cluster_bark_source_resolution import _provider_identity
 
 
 def sha256(path):
@@ -237,6 +239,17 @@ def write_capture_manifest(recipe):
     return path
 
 
+def report_fingerprint(path):
+    path = Path(path).resolve()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": path.stat().st_size,
+        "mtime_ns": path.stat().st_mtime_ns,
+        "sha256": sha256(path),
+    }
+
+
 class ClusterNormalizationSyncTests(unittest.TestCase):
     def fixture(self, temporary):
         owner = Path(temporary) / "Tree_elm"
@@ -278,6 +291,141 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
         unit_probe = Path(temporary) / "unit_probe.json"
         write_unit_probe(unit_probe)
         return blend, source, target, unit_probe
+
+    def attach_isolated_bark_bundle(self, blend, source):
+        cache = blend.parent / ".sk_batch_isolated_bark" / "neutral"
+        isolated = cache / "Tree_neutral" / "Cluster" / source.name
+        isolated.parent.mkdir(parents=True)
+        isolated.write_bytes(source.read_bytes())
+        manifest = cache / "bark_normalization_manifest.json"
+        provider_identity = _provider_identity(source)
+        manifest.write_text(
+            json.dumps({
+                "schema_version": 2,
+                "kind": "cluster_isolated_canonical_bark_source",
+                "status": "ready",
+                "signature": "neutral-provider-signature",
+                "provider_identity": provider_identity,
+                "output_filename": source.name,
+                "source_spm": str(source.resolve()),
+                "source_spm_sha256": sha256(source),
+                "speedtree_spm": str(isolated.resolve()),
+                "isolated_spm_sha256": sha256(isolated),
+                "identity": {
+                    "provider_identity": provider_identity,
+                },
+                "copied_source_tree_textures": [],
+                "copied_source_external_meshes": [],
+                "copied_source_external_textures": [],
+                "copied_canonical_textures": [],
+                "production_source_mutated": False,
+            }),
+            encoding="utf-8",
+        )
+        source_xml = blend.parent / "xml" / f"{blend.stem}.xml"
+        source_xml.write_text(
+            f"<SpeedTreeRaw><SourceTree>{isolated}</SourceTree></SpeedTreeRaw>",
+            encoding="utf-8",
+        )
+        report_path = blend.parent / "reports" / (
+            f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+        )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["cluster_bark_source_resolution"] = {
+            "status": "ready",
+            "manifest": report_fingerprint(manifest),
+            "source_spm": report_fingerprint(source),
+            "speedtree_spm": report_fingerprint(isolated),
+            "production_source_mutated": False,
+        }
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return source_xml, isolated, manifest
+
+    def test_isolated_bark_recipe_seals_exact_xml_manifest_and_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            _source_xml, isolated, manifest = (
+                self.attach_isolated_bark_bundle(blend, source)
+            )
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            bundle = recipe["isolated_bark_bundle"]
+            self.assertEqual(bundle["speedtree_spm"], str(isolated.resolve()))
+            self.assertEqual(bundle["manifest"], str(manifest.resolve()))
+            self.assertEqual(bundle["output_filename"], source.name)
+            self.assertIs(
+                validate_isolated_bark_recipe_bundle(recipe),
+                bundle,
+            )
+
+    def test_isolated_bark_source_tree_mismatch_fails_before_recipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            source_xml, _isolated, _manifest = (
+                self.attach_isolated_bark_bundle(blend, source)
+            )
+            different = source.parent / "SK_branch_different_provider_01.spm"
+            different.write_bytes(source.read_bytes())
+            source_xml.write_text(
+                f"<SpeedTreeRaw><SourceTree>{different}</SourceTree></SpeedTreeRaw>",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ClusterNormalizationSyncError,
+                "SourceTree does not name the exact",
+            ):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
+
+    def test_missing_exact_isolated_spm_fails_before_recipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            _source_xml, isolated, _manifest = (
+                self.attach_isolated_bark_bundle(blend, source)
+            )
+            isolated.unlink()
+
+            with self.assertRaisesRegex(
+                ClusterNormalizationSyncError,
+                "exact isolated provider SPM is missing",
+            ):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                )
+
+    def test_isolated_bark_recipe_rejects_spm_changed_after_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            _source_xml, isolated, _manifest = (
+                self.attach_isolated_bark_bundle(blend, source)
+            )
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            isolated.write_bytes(isolated.read_bytes() + b"changed")
+
+            with self.assertRaisesRegex(
+                ClusterNormalizationSyncError,
+                "manifest is stale|isolated_spm_sha256",
+            ):
+                validate_isolated_bark_recipe_bundle(recipe)
 
     def test_resolves_leaf_recipe_from_current_bwr_and_target_material(self):
         with tempfile.TemporaryDirectory() as temporary:

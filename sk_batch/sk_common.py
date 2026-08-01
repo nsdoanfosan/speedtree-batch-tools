@@ -954,10 +954,6 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
     return compact_error_message(report.get("_report_error") or "원인 확인 불가", max_chars)
 
 
-BACKUP_RE = re.compile(
-    r"\.(codex_backup|skbatch_backup|pcgtex_backup|skbatch-rescue)",
-    re.IGNORECASE,
-)
 BACKUP_SUBDIR = "_spm_backups"
 MANUAL_BONES_SUFFIX = ".skbatch_manual_bones.json"
 # Older runs used a per-tool folder name; still skip it so stragglers never
@@ -1020,7 +1016,7 @@ def scan_sk_spms(root):
             if not name.lower().startswith("sk_") or not name.lower().endswith(".spm"):
                 continue
             candidate = folder / name
-            if BACKUP_RE.search(name) or not is_live_spm(candidate):
+            if not is_live_spm(candidate):
                 continue
             out.append(candidate)
     return sorted(out)
@@ -1066,7 +1062,6 @@ def scan_cluster_spm_sources(root):
             if (
                 not lowered.endswith(".spm")
                 or lowered.startswith("~")
-                or BACKUP_RE.search(name)
             ):
                 continue
             source = cluster_folder / name

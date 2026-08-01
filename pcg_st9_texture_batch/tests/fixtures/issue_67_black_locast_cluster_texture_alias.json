@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "asset_folder": "Tree_black_locast",
+  "provider_spm": "Cluster/SK_branch_black_locast_01.spm",
+  "consumer_spm": "bush_black_locast_02.spm",
+  "material_id": "67",
+  "material_name": "M_branch_black_locast_01",
+  "legacy_root": "sanitized_retired_sync/Tree_black_locast/Cluster",
+  "capture_manifest": "Cluster/branch_black_locast_01_auto_capture_manifest.json",
+  "textures": [
+    {"role": "Color", "name": "branch_black_locast_01.tga"},
+    {"role": "Opacity", "name": "branch_black_locast_01_Opacity.tga"},
+    {"role": "Normal", "name": "branch_black_locast_01_Normal.tga"},
+    {"role": "Gloss", "name": "branch_black_locast_01_Gloss.tga"},
+    {"role": "SubsurfaceColor", "name": "branch_black_locast_01_SubsurfaceColor.tga"},
+    {"role": "SubsurfaceAmount", "name": "branch_black_locast_01_SubsurfaceAmount.tga"},
+    {"role": "AO", "name": "branch_black_locast_01_AO.tga"},
+    {"role": "Height", "name": "branch_black_locast_01_Height.tga"}
+  ]
+}

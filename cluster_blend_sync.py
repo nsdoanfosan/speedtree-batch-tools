@@ -53,6 +53,7 @@ from cluster_source_prepare import (
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    is_live_spm,
     prove_legacy_texture_normalize_semantic_migration,
     spm_file_structural_semantic_fingerprint,
 )
@@ -84,6 +85,8 @@ def normalized_path_key(path):
 
 def _is_live_file(path, suffix):
     path = Path(path)
+    if suffix.casefold() == ".spm":
+        return is_live_spm(path)
     name = path.name.casefold()
     return (
         path.is_file()
@@ -1268,6 +1271,7 @@ def discover_cluster_blend_relations(
         registered = [] if registry is None else [
             Path(value).expanduser().absolute()
             for value in registry.get("target_spms") or ()
+            if is_live_spm(value, require_file=False)
         ]
         registered_by_key = {
             normalized_path_key(path): path for path in registered

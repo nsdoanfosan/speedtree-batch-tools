@@ -155,6 +155,64 @@ def write_stmat(spm, material_names):
 
 
 class SpeedTreeMaterialPreflightTests(unittest.TestCase):
+    def evaluate_issue64_fixture(self, mutate_snapshot=None):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue64_inactive_material_preflight.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "sanitized_cluster03"
+            spm = asset / "SK_cluster_species_03.spm"
+            stmat = asset / "fbx" / "SK_cluster_species_03.stmat"
+            stmat.parent.mkdir(parents=True)
+            spm.write_bytes(b"sanitized fixture; no production SPM content")
+            foreign = stmat.parent / "foreign_species_leaf_color.tif"
+            foreign.write_bytes(b"foreign provisional pixels")
+            self._write_raw_stmat(
+                stmat,
+                fixture["material"]["material_name"],
+                {"Color": foreign},
+            )
+            snapshot = json.loads(json.dumps(
+                fixture["live_export_snapshot"]
+            ))
+            snapshot["spm"] = str(spm.resolve())
+            if mutate_snapshot is not None:
+                mutate_snapshot(snapshot)
+            inspection = {
+                "materials": [{
+                    "material_id": fixture["material"]["material_id"],
+                    "material_name": fixture["material"]["material_name"],
+                    "slots": [],
+                }],
+            }
+            with mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value=inspection,
+            ), mock.patch.object(
+                preflight,
+                "live_generator_delivery_snapshot",
+                return_value=snapshot,
+            ):
+                result = preflight.augment_texture_readiness_contract(
+                    preflight.resolve_texture_bindings(stmat),
+                    stmat,
+                    spm,
+                    source_texture_roots=[],
+                    leaf_contract=fixture["leaf_reference_contract"],
+                    all_material_contract=(
+                        fixture["all_export_material_contract"]
+                    ),
+                    export_evidence_spm=spm,
+                )
+            issues = preflight.preflight_contract_issues({
+                "texture_readiness_contract": result,
+            })
+        return fixture, result, issues
+
     def test_export_reports_shared_slot_boundary_and_restores_helper(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -306,6 +364,197 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(
                 result["missing"][0]["source_rejections"][0]["path"],
                 str(copied.resolve()),
+            )
+
+    def test_issue64_fresh_inactive_rows_are_nonblocking_diagnostics(self):
+        fixture, result, issues = self.evaluate_issue64_fixture()
+
+        self.assertEqual(
+            result["status"],
+            fixture["expected"]["readiness_status"],
+        )
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(len(result["warnings"]), 1)
+        diagnostic = result["warnings"][0]
+        self.assertEqual(
+            diagnostic["issue_code"],
+            fixture["expected"]["diagnostic_issue_code"],
+        )
+        self.assertEqual(
+            diagnostic["export_scope"]["reason"],
+            fixture["expected"]["diagnostic_reason"],
+        )
+        self.assertEqual(
+            diagnostic["export_scope"]["expected_visible_material_names"],
+            [],
+        )
+        self.assertEqual(
+            {
+                row["generator_type"]
+                for row in diagnostic["export_scope"]["bindings"]
+            },
+            {"Frond", "Leaf Mesh"},
+        )
+        self.assertEqual(
+            {
+                row["slot_prefix"]
+                for row in diagnostic["export_scope"]["bindings"]
+            },
+            {"Material:Frond:0", "Leaves:Type:0"},
+        )
+        binding = result["bindings"][0]
+        self.assertEqual(binding["status"], "not_managed")
+        self.assertEqual(
+            binding["texture_contract_status"],
+            "inactive_provisional_source_diagnostic",
+        )
+        self.assertEqual(issues[0]["severity"], "warning")
+        self.assertEqual(issues[0]["entity"], "Material")
+        self.assertTrue(issues[0]["details"]["source_rejections"])
+        self.assertNotIn(
+            fixture["expected"]["blocking_issue_absent"],
+            {issue["code"] for issue in issues},
+        )
+
+    def test_issue64_live_exporting_material_remains_blocked(self):
+        def make_live(snapshot):
+            row = snapshot["leaf_generator_bindings"][0]
+            row["visible"] = True
+            row["graph_visible"] = True
+            row["generated_node_count"] = 3
+            row["export_participates"] = True
+
+        _fixture, result, issues = self.evaluate_issue64_fixture(make_live)
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(
+            result["missing"][0]["reason"],
+            "provisional_source_blocked",
+        )
+        self.assertEqual(
+            result["missing"][0]["export_scope"]["reason"],
+            "material_live_binding_visible_or_exporting",
+        )
+        self.assertIn(
+            "TEXTURE_SET_INCOMPLETE",
+            {issue["code"] for issue in issues},
+        )
+
+    def test_issue64_stale_node_table_remains_fail_closed(self):
+        def make_stale(snapshot):
+            snapshot["node_table"]["stale"] = True
+            snapshot["node_table"]["orphan_node_count"] = 9
+            for row in snapshot["leaf_generator_bindings"]:
+                row["export_evidence"] = "node_table_stale"
+                row["node_table_stale"] = True
+
+        _fixture, result, issues = self.evaluate_issue64_fixture(make_stale)
+
+        self.assertEqual(result["status"], "incomplete")
+        scope = result["missing"][0]["export_scope"]
+        self.assertEqual(
+            scope["reason"],
+            "live_export_evidence_stale_node_table",
+        )
+        self.assertTrue(scope["node_table"]["stale"])
+        self.assertIn(
+            "TEXTURE_SET_INCOMPLETE",
+            {issue["code"] for issue in issues},
+        )
+
+    def test_issue64_ambiguous_binding_state_remains_fail_closed(self):
+        def make_ambiguous(snapshot):
+            del snapshot["leaf_generator_bindings"][1]["graph_visible"]
+
+        _fixture, result, issues = self.evaluate_issue64_fixture(
+            make_ambiguous
+        )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(
+            result["missing"][0]["export_scope"]["reason"],
+            "material_live_binding_state_ambiguous",
+        )
+        self.assertIn(
+            "TEXTURE_SET_INCOMPLETE",
+            {issue["code"] for issue in issues},
+        )
+
+    def test_issue64_nonblocking_diagnostic_allows_main_to_finish(self):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue64_inactive_material_preflight.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "sanitized_cluster03"
+            asset.mkdir()
+            spm = asset / "SK_cluster_species_03.spm"
+            report_path = asset / "preflight.json"
+            write_spm(spm)
+            source = asset / "fbx" / "foreign_species_leaf_color.tif"
+            source.parent.mkdir()
+            source.write_bytes(b"foreign provisional pixels")
+            stmat = asset / "fbx" / "SK_cluster_species_03.stmat"
+            self._write_raw_stmat(
+                stmat,
+                fixture["material"]["material_name"],
+                {"Color": source},
+            )
+            snapshot = json.loads(json.dumps(
+                fixture["live_export_snapshot"]
+            ))
+            snapshot["spm"] = str(spm.resolve())
+            inspection = {
+                "materials": [{
+                    "material_id": fixture["material"]["material_id"],
+                    "material_name": fixture["material"]["material_name"],
+                    "slots": [],
+                }],
+            }
+            with mock.patch.object(
+                preflight,
+                "inspect_spm_leaf_contract",
+                return_value=fixture["leaf_reference_contract"],
+            ), mock.patch.object(
+                preflight,
+                "inspect_all_speedtree_material_export",
+                return_value=fixture["all_export_material_contract"],
+            ), mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value=inspection,
+            ), mock.patch.object(
+                preflight,
+                "live_generator_delivery_snapshot",
+                return_value=snapshot,
+            ), mock.patch.object(
+                preflight,
+                "load_pcg_texture_config",
+                return_value={"source_texture_roots": []},
+            ):
+                exited, export_mock = self.run_preflight(
+                    spm,
+                    report_path,
+                )
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(
+                report["texture_readiness_contract"]["status"],
+                "nonblocking_diagnostics",
+            )
+            issues = report["speedtree_pipeline_contract"]["issues"]
+            self.assertIn(
+                "INACTIVE_MATERIAL_PROVISIONAL_SOURCE",
+                {issue["code"] for issue in issues},
+            )
+            self.assertNotIn(
+                "TEXTURE_SET_INCOMPLETE",
+                {issue["code"] for issue in issues},
             )
 
     def test_invalid_cluster_bake_preserves_exact_origin_issue(self):

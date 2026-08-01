@@ -25,6 +25,10 @@ from cluster_atlas_source_index import (
     build_current_atlas_source_index,
 )
 from sk_batch.repair_push_evidence import export_object_postcondition
+from cluster_normalization_sync import (
+    ClusterNormalizationSyncError,
+    validate_isolated_bark_recipe_bundle,
+)
 
 
 def parse_args():
@@ -123,6 +127,10 @@ def load_normalization_recipe(path, blend, requested):
             "Cluster normalization recipe is missing requested target(s): "
             + ", ".join(missing)
         )
+    try:
+        validate_isolated_bark_recipe_bundle(payload)
+    except ClusterNormalizationSyncError as exc:
+        raise RuntimeError(str(exc)) from exc
     return payload
 
 
@@ -158,6 +166,10 @@ def validate_recipe_registry_contract(recipe, effective_paths):
 
 
 def normalize_cluster_blend(recipe):
+    try:
+        validate_isolated_bark_recipe_bundle(recipe)
+    except ClusterNormalizationSyncError as exc:
+        raise RuntimeError(str(exc)) from exc
     if not recipe or not recipe.get("normalization_required"):
         return {
             "status": "current",

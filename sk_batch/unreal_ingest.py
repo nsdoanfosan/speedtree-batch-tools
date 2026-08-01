@@ -2517,6 +2517,10 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         "counts": counts,
         "items": checkpoint.get("items", {}),
     }
+    for metadata_key in ("retry", "recovery"):
+        metadata = manifest.get(metadata_key)
+        if isinstance(metadata, dict):
+            report[metadata_key] = metadata
     _atomic_write_json(checkpoint_path, checkpoint)
     _atomic_write_json(report_path, report)
     return report

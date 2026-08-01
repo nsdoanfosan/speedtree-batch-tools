@@ -4,6 +4,8 @@ import os
 import re
 from pathlib import Path
 
+from speedtree_pipeline_contract import is_live_spm
+
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "pcg_texture_config.json"
 STATE_PATH = TOOL_DIR / "pcg_texture_state.json"
@@ -108,7 +110,11 @@ def save_state(state):
 
 
 def is_backup_path(path):
-    return bool(BACKUP_RE.search(Path(path).name))
+    candidate = Path(path)
+    return bool(BACKUP_RE.search(candidate.name)) or (
+        candidate.suffix.casefold() == ".spm"
+        and not is_live_spm(candidate, require_file=False)
+    )
 
 
 def is_image_path(path):
