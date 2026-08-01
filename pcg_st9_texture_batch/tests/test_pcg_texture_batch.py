@@ -3122,6 +3122,7 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+                item_callback=mock.ANY,
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3170,7 +3171,10 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIs(app.report, report)
         self.assertEqual(app.texplan_cache, {})
         self.assertEqual(app._set_busy.call_args_list, [
-            mock.call(True), mock.call(False),
+            mock.call(True),
+            # Primary live paint is usable for read-only review before the
+            # relation worker and queued refresh complete.
+            mock.call(False), mock.call(False),
             mock.call(True), mock.call(False),
         ])
         self.assertEqual(app.populate.call_count, 3)
@@ -4335,6 +4339,7 @@ class GuiLabelTests(unittest.TestCase):
         app.tree = FakeTree()
         app.log = mock.Mock()
         app._prepare_finished = mock.Mock()
+        app._validate_live_mutation_items = mock.Mock(return_value=True)
         app._ui = lambda fn: fn()
         row = {
             "item": {"folder": r"D:\Trees\tree_test", "name": "tree_test"},
@@ -4355,6 +4360,7 @@ class GuiLabelTests(unittest.TestCase):
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
         app._prepare_finished.assert_called_once_with(1, 0)
+        app._validate_live_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
         app = self.gui.App.__new__(self.gui.App)
