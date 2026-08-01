@@ -31,6 +31,7 @@ BOARD_SNAPSHOT_RETENTION_COUNT = 1
 DISPLAY_SNAPSHOT_OMITTED_KEYS = frozenset({
     "_gui_blender_connection_pending",
     "_gui_blender_connection_rows",
+    "_gui_live_evidence",
     "component_polygon_indices",
     "polygon_indices",
     "triangle_indices",

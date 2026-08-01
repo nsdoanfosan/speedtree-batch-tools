@@ -12,6 +12,7 @@ sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_cluster_assembly_contract import (  # noqa: E402
     ClusterAssemblyInternalContractError,
+    DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
     DELIVERY_MODE_CONNECTION_INCOMPLETE,
     DELIVERY_MODE_RENDER_CONNECTED,
     _delivery_binding_slot_identity,
@@ -672,6 +673,79 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             removed_delivery["live_export_participating_target_mesh_ids"],
             delivery["live_export_participating_target_mesh_ids"],
         )
+
+    def test_all_proven_inactive_bindings_publish_consistent_pass_through(self):
+        inactive_base = {
+            "generator_index": 1,
+            "generator_name": "Unused Base",
+            "generator_type": "Base",
+            "generated_node_count": 0,
+        }
+        live = []
+        for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS):
+            row = snapshot_binding(
+                slot_prefix,
+                mesh_id,
+                graph_visible=True,
+                generated_node_count=0,
+            )
+            row.update({
+                "export_evidence": "node_table",
+                "node_table_stale": False,
+                "causal_path_active": False,
+                "causal_path_reason": (
+                    "generator_causal_path_inactive_unused_base"
+                ),
+                "causal_path": [],
+                "inactive_base": inactive_base,
+            })
+            live.append(row)
+
+        class AllInactiveAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    live,
+                    TARGET_MESH_IDS,
+                    total_node_count=0,
+                )
+
+        delivery = _normalized_generator_delivery(
+            AllInactiveAudit,
+            "SK_bush_blackgum_02.spm",
+            delivery_payload(),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+        )
+        self.assertEqual(delivery["delivery_decision"], "pass_through")
+        self.assertEqual(
+            delivery["delivery_reason"],
+            "generator_connection_all_bindings_planned_inactive",
+        )
+        self.assertTrue(delivery["generator_connection_declared_complete"])
+        self.assertFalse(delivery["generator_connection_complete"])
+        self.assertFalse(delivery["live_generator_delivery_complete"])
+        self.assertEqual(delivery["active_required_binding_count"], 0)
+        self.assertEqual(
+            delivery["planned_inactive_binding_count"],
+            len(declared_bindings()),
+        )
+        self.assertEqual(delivery["current_required_target_mesh_ids"], [])
+        self.assertEqual(
+            delivery["live_export_participating_target_mesh_ids"],
+            [],
+        )
+        self.assertEqual(delivery["errors"], [])
+        self.assertTrue(all(
+            row["status"] == "planned_inactive"
+            for row in delivery["binding_outcomes"]
+        ))
 
     def test_modeler_shortened_guid_is_the_same_declared_generator(self):
         """The RFC and Modeler spellings resolve to one Generator identity."""

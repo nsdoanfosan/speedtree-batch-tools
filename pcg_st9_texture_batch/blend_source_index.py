@@ -23,6 +23,9 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVE_SESSION = contextvars.ContextVar(
     "pcg_blend_source_index_session", default=None
 )
+_ACTIVE_AUDIT_SCOPE = contextvars.ContextVar(
+    "pcg_blend_source_index_audit_scope", default=None
+)
 
 
 class BlendSourceIndexError(RuntimeError):
@@ -134,18 +137,38 @@ class BlendSourceIndexSession:
                     expected_sha256=digest,
                 )
             except BlendSourceIndexError:
-                self._pending[key] = {
+                pending = self._pending.setdefault(key, {
                     "blend": str(blend_path.resolve()),
                     "blend_sha256": digest,
-                }
+                    "audit_scopes": set(),
+                })
+                scope = _ACTIVE_AUDIT_SCOPE.get()
+                if scope:
+                    pending["audit_scopes"].add(path_key(scope))
                 return frozenset()
 
     def pending_requests(self) -> list[dict]:
         with self._lock:
             return [
-                dict(self._pending[key])
+                {
+                    "blend": self._pending[key]["blend"],
+                    "blend_sha256": self._pending[key]["blend_sha256"],
+                }
                 for key in sorted(self._pending)
             ]
+
+    def pending_audit_scopes(self) -> frozenset[str]:
+        """Return exact folder identities affected by unresolved blends.
+
+        An empty set is intentionally ambiguous: a caller that did not bind a
+        scope must conservatively fall back to its complete audit set.
+        """
+        with self._lock:
+            return frozenset(
+                scope
+                for pending in self._pending.values()
+                for scope in pending.get("audit_scopes") or ()
+            )
 
     def install_report(self, report, requests) -> int:
         """Install one all-or-nothing Blender report for an exact request set."""
@@ -231,11 +254,13 @@ class BlendSourceIndexSession:
 
 
 @contextmanager
-def use_blend_source_index(session):
+def use_blend_source_index(session, audit_scope=None):
     token = _ACTIVE_SESSION.set(session)
+    scope_token = _ACTIVE_AUDIT_SCOPE.set(audit_scope)
     try:
         yield session
     finally:
+        _ACTIVE_AUDIT_SCOPE.reset(scope_token)
         _ACTIVE_SESSION.reset(token)
 
 
