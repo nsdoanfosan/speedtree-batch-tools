@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "source_evidence": {
+    "sanitized_from": "cluster03_no_visible_leaf_materials",
+    "production_asset_included": false,
+    "capture_stage": "post_speedtree_export",
+    "node_table_stale": false
+  },
+  "material": {
+    "material_id": "41",
+    "material_name": "Material",
+    "provisional_source_kind": "foreign_asset_cache_copy"
+  },
+  "leaf_reference_contract": {
+    "status": "no_leaf_slots",
+    "expected_visible_material_names": []
+  },
+  "material_export_contract": {
+    "status": "not_applicable",
+    "expected_materials": []
+  },
+  "all_export_material_contract": {
+    "status": "not_applicable",
+    "expected_materials": []
+  },
+  "live_export_snapshot": {
+    "contract": "speedtree_live_generator_delivery_snapshot_v1",
+    "spm_text_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "total_node_count": 27,
+    "node_table": {
+      "total_node_count": 27,
+      "generator_count": 5,
+      "node_table_generator_count": 3,
+      "orphan_generator_guids": [],
+      "orphan_node_count": 0,
+      "stale": false
+    },
+    "leaf_generator_bindings": [
+      {
+        "generator_guid": "sanitized-frond-guid",
+        "generator_name": "Inactive Frond",
+        "generator_type": "Frond",
+        "slot_prefix": "Material:Frond:0",
+        "material_id": "41",
+        "mesh_id": "71",
+        "visible": false,
+        "graph_visible": false,
+        "generated_node_count": 0,
+        "export_participates": false,
+        "export_evidence": "node_table",
+        "node_table_stale": false
+      },
+      {
+        "generator_guid": "sanitized-leaf-mesh-guid",
+        "generator_name": "Inactive Leaf Mesh",
+        "generator_type": "Leaf Mesh",
+        "slot_prefix": "Leaves:Type:0",
+        "material_id": "41",
+        "mesh_id": "72",
+        "visible": false,
+        "graph_visible": false,
+        "generated_node_count": 0,
+        "export_participates": false,
+        "export_evidence": "node_table",
+        "node_table_stale": false
+      }
+    ]
+  },
+  "expected": {
+    "readiness_status": "nonblocking_diagnostics",
+    "diagnostic_issue_code": "INACTIVE_MATERIAL_PROVISIONAL_SOURCE",
+    "diagnostic_reason": "fresh_live_export_nonparticipation",
+    "blocking_issue_absent": "TEXTURE_SET_INCOMPLETE"
+  }
+}
