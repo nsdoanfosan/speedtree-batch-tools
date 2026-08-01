@@ -3260,6 +3260,40 @@ class GuiLabelTests(unittest.TestCase):
         app._start_sync_state_migration.assert_called_once_with()
         self.assertIn("live audit는 완료", app.log.call_args.args[0])
 
+    def test_initial_refresh_failure_logs_traceback_and_unlocks_parent_ui(self):
+        app = self.gui.App.__new__(self.gui.App)
+        app.root = object()
+        app.worker = mock.Mock()
+        app._initial_refreshing = True
+        app._display_only_snapshot = False
+        app.status_var = mock.Mock()
+        app._set_busy = mock.Mock()
+        app._lock_mutation_controls = mock.Mock()
+        failure = RuntimeError("all inactive delivery classification failed")
+
+        with mock.patch.object(
+            self.gui,
+            "record_exception",
+            return_value=True,
+        ) as record_exception, mock.patch.object(
+            self.gui.messagebox,
+            "showerror",
+        ) as showerror:
+            app._initial_refresh_done(None, failure)
+
+        record_exception.assert_called_once_with(
+            "PCG ST9 Texture initial refresh",
+            failure,
+        )
+        showerror.assert_called_once()
+        self.assertIs(showerror.call_args.kwargs["parent"], app.root)
+        self.assertIn("전체 traceback:", showerror.call_args.args[1])
+        self.assertIsNone(app.worker)
+        self.assertFalse(app._initial_refreshing)
+        self.assertTrue(app._display_only_snapshot)
+        app._set_busy.assert_called_once_with(False)
+        app._lock_mutation_controls.assert_called_once_with()
+
     def test_manual_refresh_runs_audit_in_worker(self):
         class FakeRoot:
             def __init__(self):

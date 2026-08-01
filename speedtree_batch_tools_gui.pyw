@@ -17,14 +17,14 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from speedtree_error_log import ERROR_LOG, record_exception
+
 
 REPO_DIR = Path(__file__).resolve().parent
-ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
 ICON_PNG = REPO_DIR / "assets" / "speedtree_batch_tools_icon_512.png"
 ICON_ICO = REPO_DIR / "assets" / "speedtree_batch_tools.ico"
 APP_USER_MODEL_ID = "PARK.SpeedTree.BatchTools"
@@ -34,17 +34,9 @@ COMPLETION_BANNER_MS = 4000
 
 
 def record_error(label, exc) -> bool:
-    """Append one traceback to the shared error log; never raise from here."""
+    """Append one traceback through the bounded shared launch/UI error log."""
 
-    try:
-        with ERROR_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"\n[{datetime.now().isoformat(timespec='seconds')}] {label}\n"
-            )
-            handle.write("".join(traceback.format_exception(exc)))
-        return True
-    except OSError:
-        return False
+    return record_exception(label, exc)
 
 
 def report_fatal_startup_error(exc) -> None:
