@@ -35,6 +35,8 @@ PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS = {
     # amplification rather than pretending to predict OneDrive wall time.
     "cold_total": 10.0,
     "warm_total": 6.0,
+    "cold_usable_ready": 15.0,
+    "warm_usable_ready": 8.0,
     "cached_board_paint": 0.25,
 }
 

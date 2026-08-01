@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 import pcg_texture_audit as audit  # noqa: E402
+import pcg_board_snapshot as board  # noqa: E402
 from blend_source_index import lookup_blend_source_images  # noqa: E402
 from pcg_startup_cache import (  # noqa: E402
     BoundedDiscoveryError,
@@ -921,7 +922,7 @@ class RelationAndAuthorityTests(unittest.TestCase):
 
 
 class ProductionShapedLatencyFixtureTests(unittest.TestCase):
-    def test_55_folder_597_spm_cold_and_warm_have_latency_budgets(self):
+    def test_55_folder_597_spm_primary_paint_and_usable_latency_budgets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
             cache = Path(temporary) / "cache"
@@ -1022,6 +1023,73 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             )
             self.assertEqual(
                 warm_cache.get("spm_memory_hits_unique_files"), 597
+            )
+
+            snapshot_path = cache / "board.json"
+            snapshot_metrics = {}
+            written = board.write_board_display_snapshot(
+                warm,
+                cfg,
+                path=snapshot_path,
+                metrics=snapshot_metrics,
+            )
+            self.assertEqual(written, snapshot_path)
+            paint_started = time.perf_counter()
+            displayed = board.read_board_display_snapshot(
+                cfg, path=snapshot_path
+            )
+            paint_elapsed = time.perf_counter() - paint_started
+            self.assertTrue(displayed["can_display"])
+            self.assertEqual(
+                len(displayed["display_report"]["items"]), 55
+            )
+            self.assertLess(
+                paint_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "cached_board_paint"
+                ],
+            )
+
+            relation_path = cache / "relations.json"
+            with mock.patch.object(
+                GUI, "BLENDER_RELATION_CACHE_PATH", relation_path
+            ), mock.patch.object(
+                GUI, "blender_connection_rows", return_value=[]
+            ):
+                cold_relation_metrics = {}
+                cold_relation_started = time.perf_counter()
+                GUI.cache_blender_connection_rows(
+                    cold, metrics=cold_relation_metrics
+                )
+                cold_relation_elapsed = (
+                    time.perf_counter() - cold_relation_started
+                )
+                warm_relation_metrics = {}
+                warm_relation_started = time.perf_counter()
+                GUI.cache_blender_connection_rows(
+                    warm, metrics=warm_relation_metrics
+                )
+                warm_relation_elapsed = (
+                    time.perf_counter() - warm_relation_started
+                )
+
+            self.assertEqual(cold_relation_metrics["cache_misses"], 55)
+            self.assertEqual(warm_relation_metrics["cache_hits"], 55)
+            self.assertEqual(
+                warm_relation_metrics["content_identity_algorithm"],
+                "sha256-of-full-content-keys-v1",
+            )
+            self.assertLess(
+                cold_elapsed + cold_relation_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "cold_usable_ready"
+                ],
+            )
+            self.assertLess(
+                warm_elapsed + warm_relation_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "warm_usable_ready"
+                ],
             )
 
 
