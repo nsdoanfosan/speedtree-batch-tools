@@ -184,12 +184,16 @@ class ManualFullRerenderTests(unittest.TestCase):
             app._sync_pending_texture_files = mock.Mock(
                 return_value=sync_report
             )
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_force_rerender"
+            )
             app._run_step3(
                 jobs,
                 affected_spms=[],
                 sync_files=[],
                 force_unreal_verify=False,
                 require_all_renders_for_sync=True,
+                exact_mutation_baseline=baseline,
             )
 
         self.assertEqual(render.call_count, 2)
@@ -234,12 +238,16 @@ class ManualFullRerenderTests(unittest.TestCase):
             self.gui, "make_report",
             side_effect=AssertionError("force rerender must not normalize SPMs"),
         ):
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_force_rerender_failure"
+            )
             app._run_step3(
                 jobs,
                 affected_spms=[],
                 sync_files=[],
                 force_unreal_verify=False,
                 require_all_renders_for_sync=True,
+                exact_mutation_baseline=baseline,
             )
 
         app._sync_pending_texture_files.assert_not_called()

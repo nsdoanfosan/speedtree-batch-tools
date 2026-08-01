@@ -300,12 +300,24 @@ def _forbidden_derived_segment(path):
     return ""
 
 
-def _file_sha256(path):
+def _file_sha256(path, memo=None):
+    candidate = Path(path)
+    stat = candidate.stat()
+    cache_key = (
+        os.path.abspath(str(candidate)).casefold(),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    if memo is not None and cache_key in memo:
+        return memo[cache_key]
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with candidate.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    result = digest.hexdigest()
+    if memo is not None:
+        memo[cache_key] = result
+    return result
 
 
 def _blender_bake_map_role(value):
@@ -327,6 +339,7 @@ def validate_blender_cluster_bake_receipt_for_consumption(
     asset_root,
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
+    file_sha256_memo=None,
 ):
     """Validate preview capability/schema plus live manifest-owned bytes."""
     if not receipt_declares_preview_fallback(receipt):
@@ -420,7 +433,9 @@ def validate_blender_cluster_bake_receipt_for_consumption(
         try:
             if path.stat().st_size <= 0:
                 return "blender_cluster_bake_file_fingerprint_mismatch"
-            actual_sha256 = _file_sha256(path).casefold()
+            actual_sha256 = _file_sha256(
+                path, memo=file_sha256_memo
+            ).casefold()
         except OSError:
             return "blender_cluster_bake_file_fingerprint_mismatch"
         if actual_sha256 != sha256:
@@ -479,6 +494,7 @@ def resolve_blender_cluster_bake_origin(
     asset_root,
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
+    file_sha256_memo=None,
 ):
     """Return one normalized, live-proven Blender bake origin receipt.
 
@@ -523,7 +539,7 @@ def resolve_blender_cluster_bake_origin(
     if not slot_files:
         return {}, "blender_cluster_bake_slot_contract_incomplete"
     parents = {
-        _path_key(Path(row["path"]).parent)
+        os.path.normcase(str(Path(row["path"]).parent))
         for row in slot_files
     }
     capture_dir = Path(slot_files[0]["path"]).parent
@@ -550,6 +566,7 @@ def resolve_blender_cluster_bake_origin(
                 stored,
                 asset_root,
                 consumption_context=consumption_context,
+                file_sha256_memo=file_sha256_memo,
             )
         )
         if stored_issue:
@@ -632,6 +649,9 @@ def resolve_blender_cluster_bake_origin(
             "path": _absolute_path(path_text, manifest_path.parent),
             "sha256": sha256,
         }
+        declared_row["path_key"] = os.path.normcase(
+            str(declared_row["path"])
+        )
         declared.append(declared_row)
     if not declared:
         return {}, "blender_cluster_bake_map_role_mismatch"
@@ -643,11 +663,11 @@ def resolve_blender_cluster_bake_origin(
     for row in slot_files:
         expected_role = _blender_bake_map_role(row["map"])
         expected_path = _absolute_path(row["path"])
+        expected_path_key = os.path.normcase(str(expected_path))
         selected_entries = [
             declared_row
             for declared_row in declared
-            if _path_key(declared_row["path"])
-            == _path_key(expected_path)
+            if declared_row["path_key"] == expected_path_key
         ]
         exact_matches = [
             declared_row
@@ -697,7 +717,9 @@ def resolve_blender_cluster_bake_origin(
         ):
             return {}, "blender_cluster_bake_capture_boundary_mismatch"
         try:
-            actual_sha256 = _file_sha256(expected_path).casefold()
+            actual_sha256 = _file_sha256(
+                expected_path, memo=file_sha256_memo
+            ).casefold()
         except OSError:
             return {}, "blender_cluster_bake_file_fingerprint_mismatch"
         if actual_sha256 != match["sha256"]:
@@ -731,7 +753,10 @@ def resolve_blender_cluster_bake_origin(
         except (TypeError, ValueError):
             return {}, "blender_cluster_bake_receipt_contract_invalid"
     issue = validate_blender_cluster_bake_receipt_for_consumption(
-        receipt, asset_root, consumption_context=consumption_context,
+        receipt,
+        asset_root,
+        consumption_context=consumption_context,
+        file_sha256_memo=file_sha256_memo,
     )
     return ({}, issue) if issue else (receipt, "")
 
@@ -794,6 +819,18 @@ def inspect_spm_texture_slots(spm_path):
     """Return non-empty material-owned TexFilename slots from one SPM."""
     spm = _absolute_path(spm_path)
     text = _read_spm_text(spm)
+    return inspect_spm_texture_slots_from_text(spm, text)
+
+
+def inspect_spm_texture_slots_from_text(spm_path, text):
+    """Inspect caller-owned decoded SPM text without reading it again.
+
+    The caller must bind ``text`` to a stable current file identity.  This
+    helper removes duplicate gzip decode/I/O only; it does not authorize a
+    cache hit or any mutation.
+    """
+    spm = _absolute_path(spm_path)
+    text = str(text)
     materials = []
     for material_index, material_match in enumerate(
         _MATERIAL_BLOCK_RE.finditer(text)
@@ -2254,7 +2291,13 @@ def _resolve_indexed_texture_set(
     }
 
 
-def resolve_texture_set(texture_dirs, texture_base, required_roles=None):
+def resolve_texture_set(
+    texture_dirs,
+    texture_base,
+    required_roles=None,
+    *,
+    texture_index=None,
+):
     """Resolve one literal ``T_`` texture base across candidate directories.
 
     A directory containing every configured role always wins over an earlier
@@ -2263,7 +2306,8 @@ def resolve_texture_set(texture_dirs, texture_base, required_roles=None):
     Material names are intentionally rejected; callers must provide the actual
     managed texture base.
     """
-    texture_index = index_texture_sets(texture_dirs)
+    if texture_index is None:
+        texture_index = index_texture_sets(texture_dirs)
     return _resolve_indexed_texture_set(
         texture_index,
         texture_base,
@@ -2438,6 +2482,7 @@ __all__ = [
     "canonical_output_manifest_candidates",
     "inspect_production_spm_texture_contract",
     "inspect_spm_texture_slots",
+    "inspect_spm_texture_slots_from_text",
     "load_canonical_output_manifest",
     "normalize_material_key",
     "normalize_texture_set_key",
