@@ -128,11 +128,28 @@ from push_dependency_schedule import (
     exact_dependency_contract_from_validated_manifest,
     expand_push_targets,
 )
+from failed_retry_eligibility import (
+    BLENDER_EXPORT_RETRY_FAILURE_KINDS,
+    BLENDER_REBUILD,
+    CURRENT_BLENDER_EXCLUDED,
+    PENDING_UNREAL_VALIDATION,
+    RETRY_ELIGIBILITY_SCHEMA_VERSION,
+    UNREAL_ONLY,
+    UNREAL_PARENT_ABSENT,
+    UNREAL_PARENT_CANDIDATE,
+    UNREAL_PARENT_CURRENT,
+    UNREAL_PARENT_DEPENDENCY_REBUILD,
+    UNREAL_PARENT_INCOMPLETE,
+    UNREAL_PARENT_INVALID,
+    UNREAL_RECOVERY_FAILURE_KINDS,
+    classify_failed_retry,
+)
 from push_unreal_recovery import (
     PushUnrealRecoveryError,
     dependency_closure as unreal_recovery_dependency_closure,
     load_parent_manifest as load_unreal_recovery_parent_manifest,
     recover_manifest_item,
+    validate_unreal_only_recovery_evidence,
 )
 from send2ue_manifest_contract import (
     is_actionable_cluster_assembly_manifest,
@@ -187,24 +204,6 @@ PLANNED_EXCLUSION_KINDS = frozenset({
     "preflight_skip",
     "source_review",
     "stale_execution_freeze",
-})
-UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
-    "data_error",
-    "manual_required",
-    "unreal_crash",
-    "not_run",
-})
-BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
-    "data_error",
-    "internal_error",
-    "not_run",
-    "not_run_unreal",
-    "process",
-    "process_timeout",
-    "push_timeout",
-    "rpc_timeout",
-    "unreal_crash",
-    "unreal_unavailable",
 })
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
@@ -1092,8 +1091,32 @@ def cluster_target_delivery_block(contract, target_spm, producer_spm):
             row.get("delivery_reason")
             or "normalized_generator_delivery_incomplete"
         ).strip() or "normalized_generator_delivery_incomplete"
+        live_node_table = row.get("live_node_table")
+        live_node_table = (
+            live_node_table if isinstance(live_node_table, dict) else {}
+        )
+        # Persist counts and the affected Mesh IDs, but not raw Generator
+        # GUIDs.  The operator needs enough evidence to identify and repair
+        # the authored SPM without copying identity-bearing GUID values into
+        # the shared queue/state files.
+        live_node_table_summary = {
+            key: copy.deepcopy(live_node_table.get(key))
+            for key in (
+                "stale",
+                "generator_count",
+                "node_table_generator_count",
+                "orphan_node_count",
+                "total_node_count",
+            )
+            if key in live_node_table
+        }
+        live_node_table_summary["orphan_generator_guid_count"] = len(
+            live_node_table.get("orphan_generator_guids") or ()
+        )
         return {
             "reason_token": reason_token,
+            "target_spm": str(row["spm"]),
+            "target_name": Path(str(row["spm"])).name,
             "delivery_mode": str(
                 normalized.get("delivery_mode")
                 or dependency.get("normalized_delivery_mode")
@@ -1108,8 +1131,43 @@ def cluster_target_delivery_block(contract, target_spm, producer_spm):
                 )
                 if value
             }),
+            "delivery_remedy": str(
+                row.get("delivery_remedy") or ""
+            ).strip(),
+            "stale_node_table_target_mesh_ids": [
+                copy.deepcopy(value)
+                for value in row.get("stale_node_table_target_mesh_ids") or ()
+            ],
+            "live_node_table": live_node_table_summary,
         }
     return None
+
+
+def target_planned_exclusion_summary(target_spm, reason_token, evidence):
+    """Render a target-first exclusion summary suitable for a narrow GUI row."""
+    target = Path(target_spm)
+    evidence = evidence if isinstance(evidence, dict) else {}
+    parts = [target.name]
+    live_node_table = evidence.get("live_node_table")
+    live_node_table = (
+        live_node_table if isinstance(live_node_table, dict) else {}
+    )
+    if live_node_table.get("stale") is True:
+        parts.append("stale Node table")
+        parts.append(
+            "orphan GUIDs "
+            + str(live_node_table.get("orphan_generator_guid_count") or 0)
+        )
+        orphan_nodes = live_node_table.get("orphan_node_count")
+        total_nodes = live_node_table.get("total_node_count")
+        if orphan_nodes is not None or total_nodes is not None:
+            parts.append(f"orphan Nodes {orphan_nodes or 0}/{total_nodes or 0}")
+        mesh_ids = evidence.get("stale_node_table_target_mesh_ids") or ()
+        if mesh_ids:
+            parts.append("Mesh IDs " + ",".join(str(value) for value in mesh_ids))
+        parts.append("action=regenerate/save this SPM in Modeler, then re-audit")
+    parts.append(f"reason={reason_token}")
+    return " | ".join(parts)
 
 
 def cluster_relation_refresh_state(cluster_spm, target_spms):
@@ -1542,6 +1600,20 @@ def cluster_issue_summary(issues, limit=5):
             lines.append(str(issue))
             continue
         fields = [str(issue.get("code") or "CLUSTER_DATA_INVALID")]
+        # Put the authored target before provider-role/error metadata so the
+        # target remains visible even when a narrow board cell truncates the
+        # rest of the diagnostic.
+        blocked_target_rows = [
+            row
+            for row in issue.get("blocked_targets") or ()
+            if isinstance(row, dict) and row.get("spm")
+        ]
+        targets = [
+            Path(str(row.get("spm"))).name
+            for row in blocked_target_rows
+        ]
+        if targets:
+            fields.append("targets=" + ", ".join(targets[:3]))
         role = str(issue.get("role") or "")
         if role:
             fields.append(f"role={role}")
@@ -1559,13 +1631,40 @@ def cluster_issue_summary(issues, limit=5):
         ]
         if errors:
             fields.append("errors=" + ", ".join(errors[:3]))
-        targets = [
-            Path(str(row.get("spm"))).name
-            for row in issue.get("blocked_targets") or ()
-            if isinstance(row, dict) and row.get("spm")
-        ]
-        if targets:
-            fields.append("targets=" + ", ".join(targets[:3]))
+        stale_target_evidence = []
+        for row in blocked_target_rows[:3]:
+            live_node_table = row.get("live_node_table")
+            if not isinstance(live_node_table, dict):
+                continue
+            if live_node_table.get("stale") is not True:
+                continue
+            evidence = {
+                "live_node_table": {
+                    "stale": True,
+                    "orphan_generator_guid_count": len(
+                        live_node_table.get("orphan_generator_guids") or ()
+                    ),
+                    "orphan_node_count": live_node_table.get(
+                        "orphan_node_count"
+                    ),
+                    "total_node_count": live_node_table.get(
+                        "total_node_count"
+                    ),
+                },
+                "stale_node_table_target_mesh_ids": row.get(
+                    "stale_node_table_target_mesh_ids"
+                ) or (),
+            }
+            stale_target_evidence.append(
+                target_planned_exclusion_summary(
+                    row["spm"],
+                    row.get("delivery_reason")
+                    or "live_export_evidence_unavailable_stale_node_table",
+                    evidence,
+                )
+            )
+        if stale_target_evidence:
+            fields.append("target_evidence=" + "; ".join(stale_target_evidence))
         # A block can be partly explained by a stale node table even when
         # an independent fault keeps the overall code generic. Surface that
         # subset and its fix instead of only the file that failed.
@@ -3720,8 +3819,88 @@ class App:
         }
         self._enqueue_batch_job(job)
 
+    def _failed_retry_repair_state(self, iid):
+        """Return one live provenance decision, never a saved table label."""
+        try:
+            state = self._repair_output_state(Path(iid))
+            if not isinstance(state, dict) or "current" not in state:
+                raise ValueError("Repair eligibility state is incomplete")
+            return state
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {
+                "current": False,
+                "push_ready": False,
+                "kind": "inspection_incomplete",
+                "reason": (
+                    "Blender Repair freshness could not be proven: "
+                    + compact_error_message(exc, 160)
+                ),
+            }
+
+    def _failed_retry_parent_source_record(self, queue_id, parent_item):
+        state_entry = self.state.get(queue_id, {})
+        expected = str(parent_item.get("source_fingerprint") or "")
+        source_record = copy.deepcopy(
+            state_entry.get("push_source_fingerprint_cache") or {}
+        )
+        if source_record.get("fingerprint") != expected:
+            source_record = copy.deepcopy(
+                (
+                    state_entry.get("push_recovery_source_proofs") or {}
+                ).get(expected)
+                or {}
+            )
+        if source_record.get("fingerprint") != expected:
+            recovery = parent_item.get("recovery") or {}
+            snapshot = recovery.get("current_source_snapshot")
+            if (
+                snapshot
+                and recovery.get("current_source_fingerprint") == expected
+            ):
+                source_record = {
+                    "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+                    "fingerprint": expected,
+                    "snapshot": copy.deepcopy(snapshot),
+                }
+        if source_record.get("fingerprint") != expected:
+            raise PushUnrealRecoveryError(
+                "parent source proof is unavailable for "
+                + Path(queue_id).name
+            )
+        return source_record
+
+    def _validate_failed_retry_unreal_item_current(
+        self,
+        queue_id,
+        parent_item,
+        parent_source_record,
+    ):
+        """Use the execution validator before classifying as Unreal-only."""
+        blend_value = str(parent_item.get("blend") or "")
+        if not blend_value:
+            raise PushUnrealRecoveryError(
+                "parent manifest item has no Blender source path"
+            )
+        current_fingerprint = self._source_push_fingerprint(
+            Path(blend_value), queue_id
+        )
+        current_record = copy.deepcopy(
+            self.state.get(queue_id, {}).get(
+                "push_source_fingerprint_cache"
+            )
+            or {}
+        )
+        validate_unreal_only_recovery_evidence(
+            parent_item,
+            parent_source_record=parent_source_record,
+            current_source_record=current_record,
+            current_source_fingerprint=current_fingerprint,
+            rebindable_code_paths=self._push_rebindable_unreal_code_paths(),
+        )
+        return current_record
+
     def start_failed_results_retry(self):
-        """Partition selected Push failures into export and Unreal-only jobs."""
+        """Classify and partition failed/stale Blender and Unreal retries."""
         self._close_cell_editor()
         selected_iids = [
             iid for iid, item in self.items.items() if item["checked"]
@@ -3730,157 +3909,227 @@ class App:
             messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
             return
 
+        repair_states = {
+            iid: self._failed_retry_repair_state(iid)
+            for iid in selected_iids
+        }
+        parent_statuses = {
+            iid: UNREAL_PARENT_ABSENT for iid in selected_iids
+        }
+        parent_diagnostics = {iid: "" for iid in selected_iids}
         grouped = {}
-        export_iids = []
-        skipped = []
+
         for iid in selected_iids:
             entry = self.state.get(iid, {})
-            kind = str(entry.get("push_status_kind") or "")
-            blend_kind = str(entry.get("blend_status_kind") or "")
-            blend_status = str(entry.get("blend_status") or "").strip()
-            visible_blender_failure = (
-                blend_kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS
-                and blend_status.startswith(("실패:", "중단:"))
-            )
-            if visible_blender_failure:
-                export_iids.append(iid)
-                continue
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
-
-            # A parent manifest/checkpoint pair is authoritative evidence that
-            # this item reached Unreal ingest.  Never silently fall back to a
-            # Blender rerun when that evidence is incomplete or invalid: the
-            # immutable recovery contract must fail closed.
-            if manifest_value or checkpoint_value:
-                if kind not in UNREAL_RECOVERY_FAILURE_KINDS:
-                    skipped.append(
-                        f"{Path(iid).name}: Unreal ingest 재시도 상태 아님 ({kind or '상태 없음'})"
-                    )
-                    continue
-                if not manifest_value or not checkpoint_value:
-                    skipped.append(
-                        f"{Path(iid).name}: Unreal parent manifest/checkpoint 불완전"
-                    )
-                    continue
-                try:
-                    manifest_path, manifest, items_by_id = (
-                        load_unreal_recovery_parent_manifest(manifest_value)
-                    )
-                    checkpoint = json.loads(
-                        Path(checkpoint_value).read_text(encoding="utf-8")
-                    )
-                    checkpoint_status = str(
-                        ((checkpoint.get("items") or {}).get(iid) or {}).get(
-                            "status"
-                        )
-                        or ""
-                    )
-                    if checkpoint_status not in UNREAL_RECOVERY_FAILURE_KINDS:
-                        raise PushUnrealRecoveryError(
-                            "parent checkpoint does not record a retryable Unreal failure"
-                        )
-                    if iid not in items_by_id:
-                        raise PushUnrealRecoveryError(
-                            "selected item is absent from its parent manifest"
-                        )
-                except (OSError, ValueError, PushUnrealRecoveryError) as exc:
-                    skipped.append(
-                        f"{Path(iid).name}: {compact_error_message(exc, 120)}"
-                    )
-                    continue
-                key = str(manifest_path)
-                group = grouped.setdefault(
-                    key,
-                    {
-                        "parent_manifest": key,
-                        "parent_report": str(
-                            manifest.get("report_path")
-                            or paths.get("batch_report")
-                            or ""
-                        ),
-                        "selected_queue_ids": [],
-                        "source_records": {},
-                        "items_by_id": items_by_id,
-                    },
+            if not manifest_value and not checkpoint_value:
+                continue
+            if not manifest_value or not checkpoint_value:
+                parent_statuses[iid] = UNREAL_PARENT_INCOMPLETE
+                parent_diagnostics[iid] = (
+                    "Unreal parent manifest/checkpoint 불완전 · "
+                    "전체 Blender→Push를 명시적으로 실행하세요"
                 )
-                group["selected_queue_ids"].append(iid)
+                continue
+            if str(entry.get("push_status_kind") or "") not in (
+                UNREAL_RECOVERY_FAILURE_KINDS
+            ):
+                parent_statuses[iid] = UNREAL_PARENT_INVALID
+                parent_diagnostics[iid] = (
+                    "Unreal parent는 있으나 retryable ingest 실패 상태가 아님"
+                )
+                continue
+            try:
+                manifest_path, manifest, items_by_id = (
+                    load_unreal_recovery_parent_manifest(manifest_value)
+                )
+                checkpoint = json.loads(
+                    Path(checkpoint_value).read_text(encoding="utf-8")
+                )
+                checkpoint_status = str(
+                    ((checkpoint.get("items") or {}).get(iid) or {}).get(
+                        "status"
+                    )
+                    or ""
+                )
+                if checkpoint_status not in UNREAL_RECOVERY_FAILURE_KINDS:
+                    raise PushUnrealRecoveryError(
+                        "parent checkpoint does not record a retryable "
+                        "Unreal failure"
+                    )
+                if iid not in items_by_id:
+                    raise PushUnrealRecoveryError(
+                        "selected item is absent from its parent manifest"
+                    )
+            except (OSError, TypeError, ValueError, PushUnrealRecoveryError) as exc:
+                parent_statuses[iid] = UNREAL_PARENT_INVALID
+                parent_diagnostics[iid] = compact_error_message(exc, 160)
                 continue
 
-            if kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS:
-                export_iids.append(iid)
-                continue
-            if kind == "manual_required":
-                reason = "수동 조치가 필요한 Blender/export 실패"
-            elif kind == "dependency_blocked":
-                reason = "의존 항목 실패로 차단됨 · 원인 항목을 함께 선택해야 함"
-            else:
-                reason = f"재시도 가능한 실패 상태 아님 ({kind or '상태 없음'})"
-            skipped.append(f"{Path(iid).name}: {reason}")
+            key = str(manifest_path)
+            group = grouped.setdefault(
+                key,
+                {
+                    "parent_manifest": key,
+                    "parent_report": str(
+                        manifest.get("report_path")
+                        or paths.get("batch_report")
+                        or ""
+                    ),
+                    "selected_queue_ids": [],
+                    "items_by_id": items_by_id,
+                },
+            )
+            group["selected_queue_ids"].append(iid)
+            parent_statuses[iid] = UNREAL_PARENT_CANDIDATE
 
+        def classify(iid):
+            return classify_failed_retry(
+                self.state.get(iid, {}),
+                repair_states[iid],
+                unreal_parent_status=parent_statuses[iid],
+                unreal_parent_diagnostic=parent_diagnostics[iid],
+            )
+
+        decisions = {iid: classify(iid) for iid in selected_iids}
+        rebuild_ids = {
+            iid
+            for iid, decision in decisions.items()
+            if decision.classification == BLENDER_REBUILD
+        }
         recovery_requests = []
-        unreal_iids = []
+
         for group in grouped.values():
+            pending_selected = [
+                iid
+                for iid in group["selected_queue_ids"]
+                if decisions[iid].classification
+                == PENDING_UNREAL_VALIDATION
+            ]
+            if not pending_selected:
+                continue
             try:
                 required_ids = unreal_recovery_dependency_closure(
-                    group["items_by_id"], group["selected_queue_ids"]
+                    group["items_by_id"], pending_selected
                 )
-                for queue_id in required_ids:
-                    parent_item = group["items_by_id"][queue_id]
-                    state_entry = self.state.get(queue_id, {})
-                    source_record = copy.deepcopy(
-                        state_entry.get("push_source_fingerprint_cache") or {}
-                    )
-                    if source_record.get("fingerprint") != parent_item.get(
-                        "source_fingerprint"
-                    ):
-                        source_record = copy.deepcopy(
-                            (
-                                state_entry.get("push_recovery_source_proofs")
-                                or {}
-                            ).get(str(parent_item.get("source_fingerprint") or ""))
-                            or {}
-                        )
-                    if source_record.get("fingerprint") != parent_item.get(
-                        "source_fingerprint"
-                    ):
-                        recovery = parent_item.get("recovery") or {}
-                        snapshot = recovery.get("current_source_snapshot")
-                        if (
-                            snapshot
-                            and recovery.get("current_source_fingerprint")
-                            == parent_item.get("source_fingerprint")
-                        ):
-                            source_record = {
-                                "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
-                                "fingerprint": parent_item["source_fingerprint"],
-                                "snapshot": copy.deepcopy(snapshot),
-                            }
-                    if source_record.get("fingerprint") != parent_item.get(
-                        "source_fingerprint"
-                    ):
-                        raise PushUnrealRecoveryError(
-                            "parent source proof is unavailable for "
-                            + Path(queue_id).name
-                        )
-                    group["source_records"][queue_id] = source_record
             except PushUnrealRecoveryError as exc:
-                skipped.extend(
-                    f"{Path(iid).name}: {compact_error_message(exc, 120)}"
-                    for iid in group["selected_queue_ids"]
-                )
+                for iid in pending_selected:
+                    parent_statuses[iid] = UNREAL_PARENT_INVALID
+                    parent_diagnostics[iid] = compact_error_message(exc, 160)
                 continue
-            unreal_iids.extend(group["selected_queue_ids"])
+
+            overlap = set(required_ids) & rebuild_ids
+            if overlap:
+                names = ", ".join(
+                    sorted(Path(value).name for value in overlap)
+                )
+                for iid in pending_selected:
+                    parent_statuses[iid] = (
+                        UNREAL_PARENT_DEPENDENCY_REBUILD
+                    )
+                    parent_diagnostics[iid] = (
+                        "Unreal recovery dependency가 Blender rebuild 대상: "
+                        + names
+                    )
+                rebuild_ids.update(pending_selected)
+                continue
+
+            source_records = {}
+            try:
+                for queue_id in sorted(required_ids):
+                    parent_item = group["items_by_id"][queue_id]
+                    source_record = self._failed_retry_parent_source_record(
+                        queue_id, parent_item
+                    )
+                    self._validate_failed_retry_unreal_item_current(
+                        queue_id,
+                        parent_item,
+                        source_record,
+                    )
+                    source_records[queue_id] = source_record
+            except (
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                PushUnrealRecoveryError,
+            ) as exc:
+                for iid in pending_selected:
+                    parent_statuses[iid] = UNREAL_PARENT_INVALID
+                    parent_diagnostics[iid] = (
+                        "immutable Unreal evidence가 current가 아님 · "
+                        + compact_error_message(exc, 160)
+                        + " · 전체 Blender→Push를 실행하세요"
+                    )
+                continue
+
+            for iid in pending_selected:
+                parent_statuses[iid] = UNREAL_PARENT_CURRENT
             recovery_requests.append({
-                key: copy.deepcopy(value)
-                for key, value in group.items()
-                if key != "items_by_id"
+                "parent_manifest": group["parent_manifest"],
+                "parent_report": group["parent_report"],
+                "selected_queue_ids": list(pending_selected),
+                "source_records": source_records,
             })
+
+        # Reconcile across parent manifests as a fixed point. A queue id can
+        # appear as a dependency in an older parent batch while its selected
+        # row belongs to a newer batch. Never leave that id in both partitions.
+        while True:
+            conflicting = next(
+                (
+                    request
+                    for request in recovery_requests
+                    if set(request["source_records"]) & rebuild_ids
+                ),
+                None,
+            )
+            if conflicting is None:
+                break
+            overlap = set(conflicting["source_records"]) & rebuild_ids
+            names = ", ".join(
+                sorted(Path(value).name for value in overlap)
+            )
+            for iid in conflicting["selected_queue_ids"]:
+                parent_statuses[iid] = UNREAL_PARENT_DEPENDENCY_REBUILD
+                parent_diagnostics[iid] = (
+                    "Unreal recovery dependency가 Blender rebuild 대상: "
+                    + names
+                )
+            rebuild_ids.update(conflicting["selected_queue_ids"])
+            recovery_requests.remove(conflicting)
+
+        decisions = {iid: classify(iid) for iid in selected_iids}
+        export_iids = [
+            iid
+            for iid in selected_iids
+            if decisions[iid].classification == BLENDER_REBUILD
+        ]
+        unreal_iids = [
+            iid
+            for iid in selected_iids
+            if decisions[iid].classification == UNREAL_ONLY
+        ]
+        skipped = []
+        for iid in selected_iids:
+            decision = decisions[iid]
+            if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
+                continue
+            prefix = (
+                "current Blender success 제외"
+                if decision.classification == CURRENT_BLENDER_EXCLUDED
+                else "재시도 증거 불완전 · fail closed"
+            )
+            skipped.append(
+                f"{Path(iid).name}: {prefix} · "
+                f"{decision.reason_code} · {decision.diagnostic}"
+            )
 
         if skipped:
             self.log(
-                "실패 재시도 제외:\n  - " + "\n  - ".join(skipped)
+                "실패/stale 재시도 제외:\n  - " + "\n  - ".join(skipped)
             )
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
@@ -3899,6 +4148,18 @@ class App:
         inventory, targets = self._snapshot_batch_request(eligible_iids)
         targets_by_id = {str(item["spm"]): item for item in targets}
         action_kind = "failed_blender_export_and_unreal_retry"
+
+        def eligibility_receipt(ids):
+            return {
+                "schema_version": RETRY_ELIGIBILITY_SCHEMA_VERSION,
+                "items": [
+                    {
+                        "queue_id": iid,
+                        **decisions[iid].metadata(),
+                    }
+                    for iid in ids
+                ],
+            }
 
         # Run immutable Unreal recovery first.  A later Blender/export retry
         # may legitimately rewrite other artifacts; it must not do so before
@@ -3929,6 +4190,7 @@ class App:
                     "partition": "unreal_ingest",
                     "execution_path": "immutable_unreal_only",
                     "selected_queue_ids": unreal_ids,
+                    "eligibility": eligibility_receipt(unreal_ids),
                 },
             })
 
@@ -3939,7 +4201,7 @@ class App:
             export_ids = [str(item["spm"]) for item in export_targets]
             self._enqueue_batch_job({
                 "label": (
-                    "실패 재시도 · Blender/Send2UE→Unreal · "
+                    "실패/stale 재시도 · Blender/Send2UE→Unreal · "
                     f"{len(export_targets)}개"
                 ),
                 "mode": "pipeline",
@@ -3957,6 +4219,7 @@ class App:
                     "partition": "blender_export",
                     "execution_path": "blender_send2ue_then_unreal",
                     "selected_queue_ids": export_ids,
+                    "eligibility": eligibility_receipt(export_ids),
                 },
             })
 
@@ -4202,10 +4465,15 @@ class App:
             "reason_token": reason_token,
             "evidence": copy.deepcopy(evidence),
         }
+        status_summary = target_planned_exclusion_summary(
+            target,
+            reason_token,
+            evidence,
+        )
         self._record_phase_status(
             iid,
             "blend_status",
-            f"Sync excluded: {reason_token}",
+            f"Sync excluded: {status_summary}",
             "planned_excluded",
             str(error),
             details=details,
@@ -4214,7 +4482,7 @@ class App:
         self._record_phase_status(
             iid,
             "push_status",
-            f"Push blocked: {reason_token}",
+            f"Push blocked: {status_summary}",
             "planned_excluded",
             str(error),
             details=details,
@@ -4222,7 +4490,7 @@ class App:
         )
         self.log(
             "[target planned exclusion] "
-            f"{target.name}: {reason_token}; Sync is not Push readiness"
+            f"{status_summary}; Sync is not Push readiness"
         )
 
     def _target_failure_result(self, iid, default_token="item_failed"):
@@ -7879,28 +8147,40 @@ class App:
                 target_block
                 and not global_issues
                 and blocking_codes
-                <= {"NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE"}
+                <= {
+                    "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
+                    "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
+                }
             ):
                 reason_token = target_block["reason_token"]
+                evidence = {
+                    "audit_report": str(audit_report),
+                    "target_spm": target_block["target_spm"],
+                    "target_name": target_block["target_name"],
+                    "delivery_mode": target_block["delivery_mode"],
+                    "delivery_errors": target_block["delivery_errors"],
+                    "delivery_remedy": target_block["delivery_remedy"],
+                    "stale_node_table_target_mesh_ids": target_block[
+                        "stale_node_table_target_mesh_ids"
+                    ],
+                    "live_node_table": target_block["live_node_table"],
+                    "issue_codes": sorted(blocking_codes),
+                    "push_readiness": "blocked_by_current_live_delivery",
+                    "sync_outcome_authoritative": False,
+                    "normalization_postcondition": "not_run",
+                }
+                summary = target_planned_exclusion_summary(
+                    target,
+                    reason_token,
+                    evidence,
+                )
                 raise TargetPlannedExclusionError(
                     "Cluster normalization target excluded by current live "
-                    f"delivery: {target.name}: {reason_token}",
+                    f"delivery: {summary}",
                     reason_token=reason_token,
                     target_spm=target,
                     producer_spm=producer,
-                    evidence={
-                        "audit_report": str(audit_report),
-                        "delivery_mode": target_block["delivery_mode"],
-                        "delivery_errors": target_block[
-                            "delivery_errors"
-                        ],
-                        "issue_codes": sorted(blocking_codes),
-                        "push_readiness": (
-                            "blocked_by_current_live_delivery"
-                        ),
-                        "sync_outcome_authoritative": False,
-                        "normalization_postcondition": "not_run",
-                    },
+                    evidence=evidence,
                     log_file=log_file,
                     report_file=audit_report,
                 )

@@ -16,6 +16,7 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
 
 ①~③은 실행 전 확인창을 띄우며, SPM/SBS/기존 출력은 수정 전에 백업한다.
 """
+import copy
 import json
 import os
 import subprocess
@@ -34,6 +35,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
+from speedtree_error_log import ERROR_LOG, record_exception
 from shared_queue_runtime import SharedQueueRuntime
 from atlas_target_registry import (
     TargetRegistryError,
@@ -43,8 +45,8 @@ from atlas_target_registry import (
 from cluster_blend_sync import discover_cluster_blend_relations
 
 from pcg_texture_common import (
-    REPORT_DIR, TARGETS_PATH, is_backup_path, load_config, load_pcg_targets,
-    save_config,
+    REPORT_DIR, SHARED_CACHE_DIR, TARGETS_PATH, is_backup_path, load_config,
+    load_pcg_targets, save_config,
 )
 from pcg_texture_audit import (
     _unsafe_provisional_source,
@@ -59,6 +61,15 @@ from pcg_board_snapshot import (
     read_board_display_snapshot,
     write_board_display_snapshot,
 )
+from pcg_startup_cache import (
+    BoundedDiscoveryError,
+    ContentAddressedJsonCache,
+    canonical_json_sha256,
+    content_identity,
+    json_safe as startup_json_safe,
+    path_key as startup_path_key,
+)
+from pcg_startup_latency import StartupLatencyTracker
 from export_review_queue import GENERIC_MATERIAL_RE
 from export_texture_plan import bucket_refs, build_texture_plan_from_report
 from pcg_canonical_outputs import (
@@ -95,6 +106,14 @@ TARGET_ROW_COLORS = {
     "target_level": "#FFF0D0",
     "target_both": "#E4F4E4",
 }
+BLENDER_RELATION_CACHE_PATH = (
+    SHARED_CACHE_DIR / "pcg_blender_relation_rows_v1.json"
+)
+BLENDER_RELATION_CACHE_KIND = "pcg_blender_relation_rows"
+RELATION_INPUT_SUFFIXES = frozenset({
+    ".blend", ".exr", ".fbx", ".jpeg", ".jpg", ".json", ".png",
+    ".sbs", ".spm", ".tga", ".tif", ".tiff",
+})
 
 
 def cluster_pair_step1_text(child):
@@ -857,28 +876,221 @@ def blender_connection_rows(item):
     )
 
 
-def cache_blender_connection_rows(report, progress_callback=None):
-    """Resolve expensive relation rows off the Tk main thread once."""
+def _relation_item_payload(item):
+    return {
+        key: item.get(key)
+        for key in (
+            "folder",
+            "name",
+            "chosen_spm",
+            "leaf_mesh_sources",
+            "leaf_atlas_inventory",
+            "cluster_items",
+            "target_spm_statuses",
+        )
+    }
+
+
+def _relation_item_content_identity(item):
+    """Bind relation/live-mutation evidence to current content and membership."""
+    payload = _relation_item_payload(item)
+    paths = {}
+
+    def collect(value):
+        if isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for nested in value:
+                collect(nested)
+            return
+        if not isinstance(value, (str, os.PathLike)):
+            return
+        text = os.fspath(value)
+        if not (
+            isinstance(value, os.PathLike)
+            or "\\" in text
+            or "/" in text
+            or Path(text).suffix.casefold() in RELATION_INPUT_SUFFIXES
+        ):
+            return
+        candidate = Path(text).expanduser().absolute()
+        if candidate.is_file():
+            paths[startup_path_key(candidate)] = candidate
+
+    collect(payload)
+    folder = Path(item.get("folder") or "").expanduser().absolute()
+    directories = [folder, folder / "Cluster"]
+    for path in list(paths.values()):
+        directories.append(path.parent)
+        directories.append(path.parent / ".atlas_leaf_speedtree_scopes")
+    membership = {
+        "payload:" + canonical_json_sha256(startup_json_safe(payload))
+    }
+    seen_directories = set()
+    entry_count = 0
+    for directory in directories:
+        directory_key = startup_path_key(directory)
+        if directory_key in seen_directories or not directory.is_dir():
+            continue
+        seen_directories.add(directory_key)
+        try:
+            entries = sorted(
+                directory.iterdir(), key=lambda path: path.name.casefold()
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Blender relation inputs could not enumerate {directory}: {exc}"
+            ) from exc
+        entry_count += len(entries)
+        if entry_count > 4_096:
+            raise BoundedDiscoveryError(
+                "Blender relation membership exceeded 4096 entries for "
+                + str(folder)
+            )
+        for candidate in entries:
+            if (
+                candidate.is_file()
+                and candidate.suffix.casefold() in RELATION_INPUT_SUFFIXES
+                and not is_backup_path(candidate)
+            ):
+                key = startup_path_key(candidate)
+                membership.add(key)
+                paths[key] = candidate
+    return content_identity(
+        paths.values(),
+        membership=membership,
+        max_files=2_048,
+    )
+
+
+def item_has_current_live_evidence(item):
+    """True only when a row's current bytes reproduce its live audit token."""
+    expected = item.get("_gui_live_evidence")
+    if not isinstance(expected, dict) or not expected.get("sha256"):
+        return False
+    try:
+        current = _relation_item_content_identity(item)
+    except Exception:
+        return False
+    return current.get("sha256") == expected.get("sha256")
+
+
+def require_current_live_evidence(item):
+    if not item_has_current_live_evidence(item):
+        raise RuntimeError(
+            "선택한 행의 현재 입력이 live 검사 증거와 일치하지 않습니다. "
+            "다시 검사한 뒤 실행하세요."
+        )
+    return True
+
+
+def _restore_relation_paths(value, key=None):
+    path_fields = {
+        "blend", "spm", "source_spm", "target_spm",
+        "canonical_spm", "mirror_spm",
+    }
+    if isinstance(value, dict):
+        return {
+            nested_key: _restore_relation_paths(nested, nested_key)
+            for nested_key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_restore_relation_paths(nested, key) for nested in value]
+    if key in path_fields and isinstance(value, str) and value:
+        return Path(value)
+    return value
+
+
+def cache_blender_connection_rows(
+    report,
+    progress_callback=None,
+    cancel_check=None,
+    metrics=None,
+):
+    """Resolve or content-validate relation rows off the Tk main thread."""
     items = list((report or {}).get("items") or [])
     if not items:
+        if metrics is not None:
+            metrics.update({"item_count": 0, "cache_hits": 0, "cache_misses": 0})
         return report
     for item in items:
         item.pop("_gui_blender_connection_pending", None)
+        item.pop("_gui_live_evidence", None)
+
+    cache = ContentAddressedJsonCache(
+        BLENDER_RELATION_CACHE_PATH,
+        BLENDER_RELATION_CACHE_KIND,
+        max_entries=512,
+    )
+    identities = {}
+    misses = []
+    completed = 0
+    cache_hits = 0
+    cache_updates = []
+    for item in items:
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("PCG Blender relation calculation cancelled")
+        identity = _relation_item_content_identity(item)
+        namespace = startup_path_key(item.get("folder") or item.get("name") or "")
+        identities[id(item)] = (namespace, identity)
+        cached = cache.get(namespace, identity["sha256"])
+        if isinstance(cached, list):
+            item["_gui_blender_connection_rows"] = _restore_relation_paths(
+                cached
+            )
+            item["_gui_live_evidence"] = identity
+            cache_hits += 1
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, len(items), item)
+        else:
+            misses.append(item)
+
     with ThreadPoolExecutor(
-        max_workers=min(4, len(items)),
+        max_workers=min(4, len(misses) or 1),
         thread_name_prefix="pcg-gui-relations",
     ) as executor:
         futures = {
             executor.submit(blender_connection_rows, item): item
-            for item in items
+            for item in misses
         }
-        completed = 0
         for future in as_completed(futures):
+            if cancel_check is not None and cancel_check():
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError("PCG Blender relation calculation cancelled")
             item = futures[future]
-            item["_gui_blender_connection_rows"] = future.result()
+            rows = future.result()
+            namespace, before = identities[id(item)]
+            # Recapture without the first-pass memo.  A file changed while
+            # relation calculation ran must fail closed rather than publish a
+            # mixed-generation row.
+            after = _relation_item_content_identity(item)
+            if before["sha256"] != after["sha256"]:
+                raise RuntimeError(
+                    "Blender relation inputs changed during calculation: "
+                    + str(item.get("folder") or item.get("name") or "")
+                )
+            item["_gui_blender_connection_rows"] = rows
+            item["_gui_live_evidence"] = after
+            cache_updates.append((namespace, after["sha256"], rows))
             completed += 1
             if progress_callback is not None:
                 progress_callback(completed, len(items), item)
+    if cache_updates:
+        cache.put_many(cache_updates)
+    if metrics is not None:
+        metrics.update({
+            "item_count": len(items),
+            "cache_hits": cache_hits,
+            "cache_misses": len(misses),
+            "content_file_count": sum(
+                identity["file_count"]
+                for _namespace, identity in identities.values()
+            ),
+        })
     return report
 
 
@@ -886,6 +1098,7 @@ def mark_blender_connection_rows_pending(report):
     """Keep relation discovery off the Tk thread until its worker finishes."""
     for item in (report or {}).get("items") or []:
         item.pop("_gui_blender_connection_rows", None)
+        item.pop("_gui_live_evidence", None)
         item["_gui_blender_connection_pending"] = True
     return report
 
@@ -1270,6 +1483,11 @@ class Tooltip:
 class App:
     def __init__(self, root):
         self.root = root
+        self.startup_latency = StartupLatencyTracker(
+            selected_perf=getattr(
+                root, "_speedtree_tab_selected_perf", time.perf_counter()
+            )
+        )
         self.cfg = load_config()
         self.report = None
         self.items = {}  # iid(folder) -> {"item": dict, "checked": bool}
@@ -1293,12 +1511,27 @@ class App:
         self._manual_refreshing = False
         self._target_refresh_active = False
         self._pending_refresh = False
+        self._display_only_snapshot = False
+        self._refresh_generation = 0
+        self._refresh_cancel_event = threading.Event()
         self.focus_label = focus_data_asset_label(self.cfg.get("pcg_focus_data_assets"))
         root.title("PCG ST9 → SK 전환 준비 보드")
         root.geometry("1320x820")
         self._build_ui()
         self._set_busy(True)
-        if not self._load_initial_display_snapshot():
+        snapshot_painted = self._load_initial_display_snapshot()
+        self._had_initial_snapshot = bool(snapshot_painted)
+        snapshot_state = getattr(self, "_initial_snapshot_state", "missing")
+        self.startup_latency.mark(
+            "cached_board_paint",
+            status="painted" if snapshot_painted else snapshot_state,
+            counts={
+                "row_count": len((self.report or {}).get("items") or ()),
+                "painted": bool(snapshot_painted),
+            },
+            details={"cache_state": snapshot_state},
+        )
+        if not snapshot_painted:
             self.status_var.set("초기 검사 중...")
         self.root.after(0, self._start_initial_refresh)
 
@@ -1709,6 +1942,9 @@ class App:
 
     def add_blend_target_spm(self):
         rows = self._selected_blend_connection_rows()
+        evidence_items = [row.get("item") for row in rows if row.get("item")]
+        if rows and not self._require_live_mutation_items(evidence_items):
+            return
         if any(row.get("managed_by") == "spm_generator_sync" for row in rows):
             messagebox.showinfo(
                 "Cluster 관계",
@@ -1759,13 +1995,16 @@ class App:
                 shared,
                 f"Atlas 대상 추가 · {blend.name}",
                 self._run_add_blend_target_spm,
-                (blend, selected_path),
+                (blend, selected_path, evidence_items),
             ),
             daemon=True,
         )
         self.worker.start()
 
-    def _run_add_blend_target_spm(self, blend, selected_path):
+    def _run_add_blend_target_spm(
+        self, blend, selected_path, evidence_items=None
+    ):
+        self._validate_live_mutation_items(evidence_items or ())
         targets = self._current_targets_for_blend(blend)
         keys = {
             os.path.normcase(str(path.absolute())).casefold()
@@ -1804,6 +2043,9 @@ class App:
 
     def remove_blend_target_spms(self):
         rows = [row for row in self._selected_blend_connection_rows() if row.get("spm")]
+        evidence_items = [row.get("item") for row in rows if row.get("item")]
+        if rows and not self._require_live_mutation_items(evidence_items):
+            return
         if any(row.get("managed_by") == "spm_generator_sync" for row in rows):
             messagebox.showinfo(
                 "Cluster 관계",
@@ -1857,7 +2099,7 @@ class App:
                 shared,
                 f"Atlas 대상 해제 · {blend.name}",
                 self._run_remove_blend_target_spms,
-                (blend, remove_paths),
+                (blend, remove_paths, evidence_items),
             ),
             daemon=True,
         )
@@ -1874,7 +2116,10 @@ class App:
         self.remove_blend_target_spms()
         return True
 
-    def _run_remove_blend_target_spms(self, blend, remove_paths):
+    def _run_remove_blend_target_spms(
+        self, blend, remove_paths, evidence_items=None
+    ):
+        self._validate_live_mutation_items(evidence_items or ())
         report_path = TOOL_DIR / f".atlas_target_remove_{os.getpid()}_{threading.get_ident()}.json"
         command = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
             "--python", str(TOOL_DIR / "jobs" / "atlas_target_remove_job.py"), "--",
@@ -1942,6 +2187,26 @@ class App:
         )
 
     # ------------------------------------------------------------------ scan
+    def _begin_refresh_generation(self):
+        previous = getattr(self, "_refresh_cancel_event", None)
+        if previous is not None:
+            previous.set()
+        self._refresh_generation = getattr(self, "_refresh_generation", 0) + 1
+        self._refresh_cancel_event = threading.Event()
+        return self._refresh_generation, self._refresh_cancel_event
+
+    def _refresh_generation_is_current(self, generation, cancel_event):
+        return (
+            generation == getattr(self, "_refresh_generation", None)
+            and cancel_event is getattr(self, "_refresh_cancel_event", None)
+            and not cancel_event.is_set()
+        )
+
+    def cancel_refresh(self):
+        event = getattr(self, "_refresh_cancel_event", None)
+        if event is not None:
+            event.set()
+
     def _initial_pcg_targets(self):
         if not bool(self.use_pcg_targets_var.get()):
             return None
@@ -1949,6 +2214,7 @@ class App:
 
     def _load_initial_display_snapshot(self):
         """Paint the previous board immediately, never as execution evidence."""
+        self._initial_snapshot_state = "missing"
         try:
             pcg_targets = self._initial_pcg_targets()
             snapshot = read_board_display_snapshot(
@@ -1956,8 +2222,12 @@ class App:
                 pcg_targets=pcg_targets,
             )
         except Exception as exc:
+            self._initial_snapshot_state = "error"
             self.log(f"[표시 캐시 경고] 이전 표를 읽지 못함: {exc}")
             return False
+        self._initial_snapshot_state = str(
+            snapshot.get("cache_state") or "unknown"
+        )
         if not snapshot.get("can_display"):
             return False
         report = snapshot.get("display_report")
@@ -1976,8 +2246,46 @@ class App:
         )
         return True
 
+    def _initial_partial_live_item(
+        self,
+        item,
+        *,
+        generation,
+        cancel_event,
+    ):
+        """Paint the first cold live row while the remaining fleet continues."""
+        if not self._refresh_generation_is_current(generation, cancel_event):
+            return
+        if getattr(self, "_had_initial_snapshot", False):
+            return
+        item.setdefault("target_spm_statuses", [])
+        item.setdefault("target_mesh_names", [])
+        item.setdefault("pcg_target_mesh_names", [])
+        item.setdefault("pcg_mesh_names", [])
+        item.setdefault("pcg_data_assets", [])
+        item.setdefault("level_mesh_names", [])
+        item.setdefault("level_placements", [])
+        item.setdefault("pcg_target_meshes", [])
+        mark_blender_connection_rows_pending({"items": [item]})
+        self.report = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "pcg_targets": {"mesh_count": 0},
+            "summary": {"total": 1, "by_status": {item.get("status", "unknown"): 1}},
+            "items": [item],
+            "partial_live_audit": True,
+        }
+        self._display_only_snapshot = True
+        self.populate()
+        self._update_summary()
+        self._set_busy(False)
+        self._lock_mutation_controls()
+        self.status_var.set(
+            "첫 live 행 표시 · 나머지 폴더 검사 중… · 변경 작업 잠김"
+        )
+
     def _start_initial_refresh(self):
         """Run only the first read-only audit off the Tk main thread."""
+        generation, cancel_event = self._begin_refresh_generation()
         self._initial_refreshing = True
         self._set_busy(True)
         self.status_var.set("초기 검사 중...")
@@ -1985,8 +2293,11 @@ class App:
         save_config(self.cfg)
         cfg = dict(self.cfg)
         use_pcg_targets = bool(self.use_pcg_targets_var.get())
+        partial_lock = threading.Lock()
+        partial_sent = False
 
         def worker():
+            nonlocal partial_sent
             report = None
             error = None
             pcg_targets = None
@@ -1994,6 +2305,10 @@ class App:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
 
                 def progress(completed, total, folder):
+                    if not self._refresh_generation_is_current(
+                        generation, cancel_event
+                    ):
+                        return
                     message = (
                         f"초기 검사 중... {completed}/{total} "
                         f"({Path(folder).name})"
@@ -2003,21 +2318,53 @@ class App:
                         lambda value=message: self.status_var.set(value),
                     )
 
+                def first_live_item(item, _folder):
+                    nonlocal partial_sent
+                    if not self._refresh_generation_is_current(
+                        generation, cancel_event
+                    ):
+                        return
+                    if getattr(self, "_had_initial_snapshot", False):
+                        return
+                    with partial_lock:
+                        if partial_sent:
+                            return
+                        partial_sent = True
+                    display_item = copy.deepcopy(item)
+                    self.root.after(
+                        0,
+                        lambda value=display_item:
+                            self._initial_partial_live_item(
+                                value,
+                                generation=generation,
+                                cancel_event=cancel_event,
+                            ),
+                    )
+
                 report = make_report(
                     cfg,
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
+                    item_callback=first_live_item,
                 )
             except Exception as exc:
                 error = exc
+            if not self._refresh_generation_is_current(
+                generation, cancel_event
+            ):
+                return
             self.root.after(
                 0,
-                lambda result=report, targets=pcg_targets, failure=error:
+                lambda result=report, targets=pcg_targets, failure=error,
+                refresh_generation=generation,
+                refresh_cancel=cancel_event:
                     self._initial_primary_refresh_done(
                         result,
                         cfg,
                         targets,
                         failure,
+                        generation=refresh_generation,
+                        cancel_event=refresh_cancel,
                     ),
             )
 
@@ -2030,10 +2377,23 @@ class App:
         cfg,
         pcg_targets,
         error=None,
+        *,
+        generation=None,
+        cancel_event=None,
     ):
         """Paint live primary columns before resolving Blender relations."""
+        if generation is not None and not self._refresh_generation_is_current(
+            generation, cancel_event
+        ):
+            return
         if error is not None:
-            self._initial_refresh_done(report, error)
+            self._initial_refresh_done(
+                report,
+                error,
+                stage="primary",
+                generation=generation,
+                cancel_event=cancel_event,
+            )
             return
         mark_blender_connection_rows_pending(report)
         self.report = report
@@ -2044,12 +2404,37 @@ class App:
         self.texplan_errors.clear()
         self.populate()
         self._update_summary()
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None:
+            audit_timing = report.get("startup_timing") or {}
+            tracker.mark(
+                "primary_live_audit",
+                counts={
+                    "folder_count": len(report.get("items") or ()),
+                    "blend_index_request_count": audit_timing.get(
+                        "blend_index_request_count", 0
+                    ),
+                    "revalidated_folder_count": audit_timing.get(
+                        "revalidated_folder_count", 0
+                    ),
+                },
+                details={
+                    "audit_wall_seconds": audit_timing.get("wall_seconds"),
+                    "cache_state": audit_timing.get("cache_state"),
+                    "phases": audit_timing.get("phases") or [],
+                },
+            )
+        # The primary board is safe for search/review now.  Mutation controls
+        # remain locked until per-row relation/live identities are complete.
+        self._set_busy(False)
+        self._lock_mutation_controls()
         self.status_var.set(
             "기본 live 검사 완료 · Blender 연결 계산 중… · 변경 작업 잠김"
         )
 
         def relation_worker():
             failure = None
+            relation_metrics = {}
             try:
                 # Persist only a display snapshot.  It can paint the next
                 # launch but can never authorize a mutation.
@@ -2072,6 +2457,10 @@ class App:
                 cache_blender_connection_rows(
                     report,
                     progress_callback=relation_progress,
+                    cancel_check=(
+                        cancel_event.is_set if cancel_event is not None else None
+                    ),
+                    metrics=relation_metrics,
                 )
                 # Opening the board is a read-only live audit. Receipt
                 # snapshots are persisted after an actual batch/completion
@@ -2080,21 +2469,72 @@ class App:
                 self.sync_state = load_sync_state(migrate=False)
             except Exception as exc:
                 failure = exc
+            if generation is not None and not self._refresh_generation_is_current(
+                generation, cancel_event
+            ):
+                return
             self.root.after(
                 0,
-                lambda result=report, relation_error=failure:
-                    self._initial_refresh_done(result, relation_error),
+                lambda result=report, relation_error=failure,
+                metrics=dict(relation_metrics):
+                    self._initial_refresh_done(
+                        result,
+                        relation_error,
+                        stage="relation",
+                        relation_metrics=metrics,
+                        generation=generation,
+                        cancel_event=cancel_event,
+                    ),
             )
 
         self.worker = threading.Thread(target=relation_worker, daemon=True)
         self.worker.start()
 
-    def _initial_refresh_done(self, report, error=None):
+    def _initial_refresh_done(
+        self,
+        report,
+        error=None,
+        *,
+        stage="relation",
+        relation_metrics=None,
+        generation=None,
+        cancel_event=None,
+    ):
         """Apply the initial worker result on the Tk main thread."""
+        if generation is not None and not self._refresh_generation_is_current(
+            generation, cancel_event
+        ):
+            return
         self.worker = None
         self._initial_refreshing = False
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None:
+            if stage == "relation":
+                tracker.mark(
+                    "blender_relations",
+                    status="ok" if error is None else "error",
+                    counts=relation_metrics or {},
+                    details=(
+                        None if error is None
+                        else {"error": f"{type(error).__name__}: {error}"}
+                    ),
+                )
+                if error is not None:
+                    tracker.finish_early("relation_error", error=error)
+            elif error is not None:
+                tracker.finish_early("primary_error", error=error)
         if error is not None:
-            messagebox.showerror("검사 실패", str(error))
+            logged = record_exception("PCG ST9 Texture initial refresh", error)
+            log_note = (
+                f"\n\n전체 traceback: {ERROR_LOG}"
+                if logged
+                else ""
+            )
+            messagebox.showerror(
+                "검사 실패",
+                f"{error}{log_note}",
+                parent=self.root,
+            )
             self.status_var.set(
                 "live 검사 실패 · 저장/기본 표는 표시 전용 · 다시 검사 필요"
             )
@@ -2145,13 +2585,23 @@ class App:
     def _start_sync_state_migration(self):
         """Verify legacy success reports without delaying the first table paint."""
         if (self.sync_state or {}).get("migration_complete"):
+            tracker = getattr(self, "startup_latency", None)
+            if tracker is not None:
+                tracker.mark(
+                    "sync_migration",
+                    status="cached",
+                    counts={
+                        "entry_count": len(
+                            (self.sync_state or {}).get("entries") or {}
+                        )
+                    },
+                )
             return
         worker = getattr(self, "sync_migration_worker", None)
         if worker is not None and worker.is_alive():
             return
         self._sync_state_migrating = True
         self.status_var.set("기존 Unreal 동기화 기록 확인 중…")
-        self._set_busy(True)
 
         def migrate():
             try:
@@ -2173,17 +2623,28 @@ class App:
     def _sync_state_migration_done(self, state, error=None):
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None:
+            tracker.mark(
+                "sync_migration",
+                status="ok" if error is None else "error",
+                counts={
+                    "entry_count": len((state or {}).get("entries") or {})
+                },
+                details=(
+                    None if error is None
+                    else {"error": f"{type(error).__name__}: {error}"}
+                ),
+            )
         if error is not None:
             self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
             self.status_var.set("기존 Unreal 기록 확인 실패 · ③에서 다시 확인")
-            self._set_busy(False)
             return
         self.sync_state = state
         self.populate()
         self._update_summary()
         count = len((state or {}).get("entries") or {})
         self.status_var.set(f"기존 Unreal 동기화 기록 확인 완료 · {count}장")
-        self._set_busy(False)
         if getattr(self, "_pending_refresh_after_sync_migration", False):
             self._pending_refresh_after_sync_migration = False
             self.refresh()
@@ -2212,6 +2673,7 @@ class App:
         self.status_var.set("검사 중...")
         self._manual_refreshing = True
         self._set_busy(True)
+        generation, cancel_event = self._begin_refresh_generation()
         cfg = dict(self.cfg)
         use_pcg_targets = bool(self.use_pcg_targets_var.get())
 
@@ -2225,6 +2687,10 @@ class App:
                 )
 
                 def progress(completed, total, folder):
+                    if not self._refresh_generation_is_current(
+                        generation, cancel_event
+                    ):
+                        return
                     message = (
                         f"다시 검사 중... {completed}/{total} "
                         f"({Path(folder).name})"
@@ -2258,6 +2724,7 @@ class App:
                 cache_blender_connection_rows(
                     report,
                     progress_callback=relation_progress,
+                    cancel_check=cancel_event.is_set,
                 )
                 # Manual "rescan" is also read-only. Keep receipt writes on
                 # the mutation/completion path so refreshing the board cannot
@@ -2266,18 +2733,42 @@ class App:
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
                 error = exc
+            if not self._refresh_generation_is_current(
+                generation, cancel_event
+            ):
+                return
             self.root.after(
                 0,
-                lambda result=report, state=sync_state, failure=error:
-                    self._manual_refresh_done(result, state, failure),
+                lambda result=report, state=sync_state, failure=error,
+                refresh_generation=generation,
+                refresh_cancel=cancel_event:
+                    self._manual_refresh_done(
+                        result,
+                        state,
+                        failure,
+                        generation=refresh_generation,
+                        cancel_event=refresh_cancel,
+                    ),
             )
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
         return True
 
-    def _manual_refresh_done(self, report, sync_state, error=None):
+    def _manual_refresh_done(
+        self,
+        report,
+        sync_state,
+        error=None,
+        *,
+        generation=None,
+        cancel_event=None,
+    ):
         """Apply a user-requested audit without blocking the Tk thread."""
+        if generation is not None and not self._refresh_generation_is_current(
+            generation, cancel_event
+        ):
+            return
         self.worker = None
         self._manual_refreshing = False
         if error is not None:
@@ -2618,6 +3109,7 @@ class App:
                 self.row_copy_paths[blend_iid] = [blend_row["blend"]]
                 self.blend_connection_meta[blend_iid] = {
                     "blend": blend_row["blend"], "spm": None,
+                    "item": item,
                     "managed_by": blend_row.get("managed_by"),
                     "cluster_normalized": bool(blend_row.get("cluster_normalized")),
                 }
@@ -2632,6 +3124,7 @@ class App:
                     self.row_copy_paths[empty_iid] = []
                     self.blend_connection_meta[empty_iid] = {
                         "blend": blend_row["blend"], "spm": None,
+                        "item": item,
                         "managed_by": blend_row.get("managed_by"),
                         "cluster_normalized": bool(blend_row.get("cluster_normalized")),
                     }
@@ -2671,6 +3164,7 @@ class App:
                     self.row_copy_paths[spm_iid] = [target["spm"]]
                     self.blend_connection_meta[spm_iid] = {
                         "blend": blend_row["blend"], "spm": target["spm"],
+                        "item": item,
                         "managed_by": target.get("managed_by") or blend_row.get("managed_by"),
                         "cluster_normalized": bool(blend_row.get("cluster_normalized")),
                         "relation_on": target.get("relation_on"),
@@ -2850,6 +3344,66 @@ class App:
             iid = self.tree.parent(iid)
         entry = self.items.get(iid)
         return entry["item"] if entry else None
+
+    def _checked_report_items(self):
+        selected = []
+        seen = set()
+        for iid, entry in self.items.items():
+            if not entry.get("checked"):
+                continue
+            item = entry.get("item")
+            if isinstance(item, dict) and id(item) not in seen:
+                seen.add(id(item))
+                selected.append(item)
+        for entry in getattr(self, "target_items", {}).values():
+            if not entry.get("checked"):
+                continue
+            folder_entry = self.items.get(entry.get("folder_iid"))
+            item = (folder_entry or {}).get("item")
+            if isinstance(item, dict) and id(item) not in seen:
+                seen.add(id(item))
+                selected.append(item)
+        return selected
+
+    def _require_live_mutation_items(self, items=None):
+        selected = list(items if items is not None else self._checked_report_items())
+        if getattr(self, "_display_only_snapshot", False):
+            stale = selected or [self.selected_item()]
+        else:
+            stale = [
+                item for item in selected
+                if isinstance(item, dict)
+                and not (
+                    isinstance(item.get("_gui_live_evidence"), dict)
+                    and item["_gui_live_evidence"].get("sha256")
+                )
+            ]
+        if not stale:
+            return True
+        names = [
+            str((item or {}).get("name") or Path((item or {}).get("folder") or "").name)
+            for item in stale[:5]
+        ]
+        messagebox.showerror(
+            "live 증거 필요",
+            "저장 snapshot 또는 변경된 입력은 작업 권한이 아닙니다. "
+            "현재 content identity와 일치하는 live 증거가 없는 행이 있습니다:\n"
+            + "\n".join(f"• {name}" for name in names)
+            + "\n\n다시 검사한 뒤 실행하세요.",
+            parent=self.root,
+        )
+        self.status_var.set("변경 작업 차단 · current live 증거가 필요합니다")
+        return False
+
+    @staticmethod
+    def _validate_live_mutation_items(items):
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or id(item) in seen:
+                continue
+            seen.add(id(item))
+            require_current_live_evidence(item)
+        return True
 
     def _texplan_rows(self, item):
         if not hasattr(self, "texplan_errors"):
@@ -3299,6 +3853,8 @@ class App:
                 "일반 식생 또는 Cluster의 canonical SK 자식 행을 체크하세요.",
             )
             return
+        if not self._require_live_mutation_items():
+            return
         self.status_var.set("① 준비 상태 확인 중...")
         self.root.update_idletasks()
         rows = self._build_prepare_rows()
@@ -3401,6 +3957,9 @@ class App:
         self.worker.start()
 
     def _run_prepare(self, rows):
+        self._validate_live_mutation_items(
+            row.get("item") for row in rows
+        )
         done = 0
         failed = 0
         for row in rows:
@@ -3830,6 +4389,8 @@ class App:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 ②를 다시 실행하세요.")
             return
+        if not self._require_live_mutation_items():
+            return
         self.status_var.set("② 대상 확인 중...")
         self.root.update_idletasks()
         push_spm = bool(self.spm_push_var.get())
@@ -3904,6 +4465,11 @@ class App:
         self.worker.start()
 
     def _run_step2(self, jobs, push_spm):
+        self._validate_live_mutation_items(
+            item
+            for job in jobs
+            for item in job.get("items") or [job.get("item")]
+        )
         from pcg_texture_common import REPORT_DIR
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         done = failed = 0
@@ -4640,6 +5206,10 @@ class App:
                 "현재 작업이 끝난 뒤 전체 재추출을 다시 누르세요."
             )
             return
+        if not self._require_live_mutation_items(
+            list((self.report or {}).get("items") or ())
+        ):
+            return
         if not messagebox.askyesno(
             "③ 전체 다시 뽑기",
             (
@@ -4688,12 +5258,30 @@ class App:
                 )
             )
             plan = self._build_step3_force_execution_plan()
+            self._validate_step3_plan_live_evidence(plan)
         except Exception as exc:
             error = exc
         self._ui(
             lambda result=plan, failure=error, claimed=lease:
             self._step3_planning_done(result, failure, claimed)
         )
+
+    def _validate_step3_plan_live_evidence(self, plan):
+        selected_rows = list((plan or {}).get("selected_rows") or ())
+        items = [
+            row[0]
+            for row in selected_rows
+            if isinstance(row, (list, tuple)) and row
+            and isinstance(row[0], dict)
+        ]
+        if not items:
+            items = [
+                item
+                for job in (plan or {}).get("jobs") or ()
+                for item in job.get("items") or [job.get("item")]
+                if isinstance(item, dict)
+            ]
+        return self._validate_live_mutation_items(items)
 
     def _build_step3_execution_plan(self):
         """Perform the expensive Step 3 preflight without touching Tk."""
@@ -4785,6 +5373,7 @@ class App:
                     )
                 )
             plan = self._build_step3_execution_plan()
+            self._validate_step3_plan_live_evidence(plan)
         except Exception as exc:
             error = exc
         self._ui(
@@ -4799,6 +5388,8 @@ class App:
             return
         if getattr(self, "_busy", False):
             self.status_var.set("현재 작업이 끝난 뒤 ③ 실행을 다시 누르세요.")
+            return
+        if not self._require_live_mutation_items():
             return
         try:
             shared = self._enqueue_shared_execution(
@@ -5738,6 +6329,10 @@ class App:
         subprocess.Popen(["explorer", item["folder"]])
 
     def shutdown_shared_queue(self):
+        self.cancel_refresh()
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None and tracker.snapshot().get("status") == "running":
+            tracker.finish_early("cancelled")
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
             runtime.shutdown()

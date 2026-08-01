@@ -71,6 +71,10 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
         report = {
             "items": [{
                 "folder": self.root / "Tree" / "tree_elm",
+                "_gui_live_evidence": {
+                    "sha256": "a" * 64,
+                    "files": ["must-not-survive-display-snapshot"],
+                },
                 "roles": [{
                     "polygon_indices": list(range(1000)),
                     "vertex_indices": {3, 2, 1},
@@ -91,6 +95,10 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
         self.assertEqual(payload["kind"], BOARD_SNAPSHOT_KIND)
         self.assertIs(payload["display_only"], True)
         role = payload["display_report"]["items"][0]["roles"][0]
+        self.assertNotIn(
+            "_gui_live_evidence",
+            payload["display_report"]["items"][0],
+        )
         self.assertNotIn("polygon_indices", role)
         self.assertNotIn("vertex_indices", role)
         self.assertNotIn("component_polygon_indices", role)

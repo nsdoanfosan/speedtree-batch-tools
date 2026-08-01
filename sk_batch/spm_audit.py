@@ -2839,6 +2839,9 @@ def _run_speedtree_export_attempt_streaming(
     soft_timeout,
     absolute_timeout,
     poll_interval,
+    terminate_grace,
+    kill_grace,
+    exit_pipe_grace,
     staged_output,
     attempt,
     output_callback,
@@ -2908,6 +2911,9 @@ def _run_speedtree_export_attempt_streaming(
         "output_callback": forward_output,
         "cancel_requested": cancel_requested,
         "poll_interval": poll_interval,
+        "terminate_grace": terminate_grace,
+        "kill_grace": kill_grace,
+        "exit_pipe_grace": exit_pipe_grace,
         "creationflags": creationflags,
     }
     if popen_factory is not None:
@@ -2970,6 +2976,9 @@ def run_speedtree_export(
     *,
     absolute_timeout=SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS,
     poll_interval=0.5,
+    terminate_grace=1.0,
+    kill_grace=2.0,
+    exit_pipe_grace=1.0,
     crash_retries=SPEEDTREE_EXPORT_CRASH_RETRIES,
     stream_output=True,
     output_callback=None,
@@ -3027,6 +3036,11 @@ def run_speedtree_export(
         "failure_kind": "internal_error",
         "soft_timeout_seconds": soft_timeout,
         "absolute_max_seconds": absolute_timeout,
+        "process_timing": {
+            "terminate_grace_seconds": float(terminate_grace),
+            "kill_grace_seconds": float(kill_grace),
+            "exit_pipe_grace_seconds": float(exit_pipe_grace),
+        },
         "max_access_violation_retries": crash_retries,
         "process_io_contract": (
             "owned_streaming_pipes"
@@ -3062,6 +3076,9 @@ def run_speedtree_export(
                         soft_timeout=min(soft_timeout, remaining_absolute),
                         absolute_timeout=remaining_absolute,
                         poll_interval=poll_interval,
+                        terminate_grace=terminate_grace,
+                        kill_grace=kill_grace,
+                        exit_pipe_grace=exit_pipe_grace,
                         staged_output=staged_output,
                         attempt=attempt,
                         output_callback=output_callback,

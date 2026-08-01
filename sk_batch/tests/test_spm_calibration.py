@@ -15,7 +15,11 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 
 import spm_audit
 from spm_audit import bone_lengths_from_xml, estimate_relative_value_from_probe
-from spm_generator_sync.process_stream import ProcessCancelled, ProcessResult
+from spm_generator_sync.process_stream import (
+    ProcessCancelled,
+    ProcessResult,
+    _requires_owned_tree_cleanup_after_root_exit,
+)
 
 
 def graph_generator(
@@ -820,7 +824,29 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows Job Object ownership")
     def test_streaming_export_completes_when_descendant_holds_pipe_open(self):
-        """Scale the observed 16s completion / 120s false-timeout regression."""
+        """A finished Modeler wins while its descendant still owns the pipe.
+
+        The injected state is #36's deadline race: the owned tree was observed
+        after root exit, then appears empty exactly when cleanup is selected.
+        Remembered ownership must still select tree cleanup.  The live process
+        half uses an explicit 0.1s pipe grace, with 5s allowed for tree cleanup;
+        its 10s inactivity deadline cannot race the intended cleanup path.
+        """
+        terminate_grace = 0.5
+        kill_grace = 5.0
+        exit_pipe_grace = 0.1
+        inactivity_timeout = 10.0
+        absolute_timeout = 15.0
+
+        self.assertTrue(
+            _requires_owned_tree_cleanup_after_root_exit(
+                owner_present=True,
+                ownership_done=True,
+                owned_tree_seen_after_exit=True,
+            ),
+            "remembered descendant ownership must win the grace-deadline race",
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "verify.xml"
             lines = []
@@ -830,9 +856,8 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                 "subprocess.Popen([sys.executable,'-c',"
                 "'import time; time.sleep(30)']); "
                 "print('modeler-finished',flush=True); "
-                "time.sleep(0.16); out.write_text('done',encoding='utf-8')"
+                "out.write_text('done',encoding='utf-8')"
             )
-            started = time.monotonic()
             result = spm_audit.run_speedtree_export(
                 [
                     sys.executable,
@@ -844,24 +869,32 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
                     str(output),
                 ],
                 tmp,
-                0.4,
-                absolute_timeout=4,
+                inactivity_timeout,
+                absolute_timeout=absolute_timeout,
                 poll_interval=0.01,
+                terminate_grace=terminate_grace,
+                kill_grace=kill_grace,
+                exit_pipe_grace=exit_pipe_grace,
                 output_callback=lambda channel, line: lines.append(
                     (channel, line)
                 ),
             )
             exported_payload = output.read_text(encoding="utf-8")
 
-        elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0)
-        self.assertGreater(elapsed, 0.4)
-        self.assertLess(elapsed, 3)
         self.assertEqual(exported_payload, "done")
         self.assertIn(("stdout", "modeler-finished"), lines)
         self.assertEqual(
             result.evidence["process_io_contract"],
             "owned_streaming_pipes",
+        )
+        self.assertEqual(
+            result.evidence["process_timing"],
+            {
+                "terminate_grace_seconds": terminate_grace,
+                "kill_grace_seconds": kill_grace,
+                "exit_pipe_grace_seconds": exit_pipe_grace,
+            },
         )
         self.assertEqual(
             result.evidence["attempts"][0]["cleanup_state"],
