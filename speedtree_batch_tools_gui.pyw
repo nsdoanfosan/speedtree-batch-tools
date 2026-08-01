@@ -15,16 +15,17 @@ import inspect
 import os
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from speedtree_error_log import ERROR_LOG, record_exception
+
 
 REPO_DIR = Path(__file__).resolve().parent
-ERROR_LOG = REPO_DIR / "speedtree_batch_tools_error.log"
 ICON_PNG = REPO_DIR / "assets" / "speedtree_batch_tools_icon_512.png"
 ICON_ICO = REPO_DIR / "assets" / "speedtree_batch_tools.ico"
 APP_USER_MODEL_ID = "PARK.SpeedTree.BatchTools"
@@ -34,17 +35,9 @@ COMPLETION_BANNER_MS = 4000
 
 
 def record_error(label, exc) -> bool:
-    """Append one traceback to the shared error log; never raise from here."""
+    """Append one traceback through the bounded shared launch/UI error log."""
 
-    try:
-        with ERROR_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"\n[{datetime.now().isoformat(timespec='seconds')}] {label}\n"
-            )
-            handle.write("".join(traceback.format_exception(exc)))
-        return True
-    except OSError:
-        return False
+    return record_exception(label, exc)
 
 
 def report_fatal_startup_error(exc) -> None:
@@ -676,6 +669,8 @@ class IntegratedApp:
         selected = self.notebook.select()
         if selected:
             index = self.notebook.index(selected)
+            if self.load_states[index] in {"pending", "scheduled"}:
+                self._record_tab_selection_perf(index, overwrite=True)
             self._schedule_load(index)
             state = self.load_states[index]
             if state == "loaded":
@@ -685,9 +680,29 @@ class IntegratedApp:
             else:
                 self.status_var.set(f"{TOOLS[index].label} 불러오는 중...")
 
+    def _record_tab_selection_perf(self, index, *, overwrite=False):
+        tab = self.tabs[index]
+        recorded = getattr(tab, "_speedtree_tab_selected_perf", None)
+        fallback = getattr(self, "_tab_selection_perf", {})
+        if not overwrite and (recorded is not None or index in fallback):
+            return recorded if recorded is not None else fallback[index]
+        selected_perf = time.perf_counter()
+        try:
+            tab._speedtree_tab_selected_perf = selected_perf
+        except (AttributeError, TypeError):
+            # Lightweight integration-test and alternate host tab objects may
+            # not expose an instance dictionary. Real Tk frames retain the
+            # value directly so the embedded PCG app can start timing at the
+            # user's selection event.
+            fallback = dict(fallback)
+            fallback[index] = selected_perf
+            self._tab_selection_perf = fallback
+        return selected_perf
+
     def _schedule_load(self, index):
         if self.load_states[index] != "pending":
             return
+        self._record_tab_selection_perf(index)
         self.load_states[index] = "scheduled"
         self.root.after_idle(lambda target=index: self._load_tool(target))
 

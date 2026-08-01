@@ -970,6 +970,10 @@ def _origin_alias_proof(value, candidate, origin_receipts):
             not isinstance(receipt, dict)
             or receipt.get("kind")
             != "blender_cluster_bake_texture_origin_receipt"
+            or int(receipt.get("version") or 0) != 1
+            or receipt.get("preview_role_fallbacks")
+            or "preview_role_fallbacks_schema_version" in receipt
+            or "receipt_capabilities" in receipt
             or receipt.get("source_origin") != "blender_cluster_bake"
         ):
             continue
@@ -2623,7 +2627,25 @@ def _normalized_generator_delivery(
         normalized_mesh_ids,
         live_mesh_ids,
     )
-    if bindings and not evidence["errors"]:
+    all_bindings_planned_inactive = bool(
+        bindings
+        and not evidence["errors"]
+        and not required_bindings
+        and evidence["active_required_binding_count"] == 0
+        and evidence["planned_inactive_binding_count"] == len(bindings)
+        and len(evidence["binding_outcomes"]) == len(bindings)
+        and all(
+            row.get("status") == "planned_inactive"
+            for row in evidence["binding_outcomes"]
+        )
+    )
+    if all_bindings_planned_inactive:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "generator_connection_all_bindings_planned_inactive"
+        )
+    elif bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"
         evidence["delivery_reason"] = (

@@ -31,6 +31,7 @@ from spm_leaf_handoff_contract import (  # noqa: E402
     leaf_contract_user_message,
 )
 from speedtree_texture_contract import (  # noqa: E402
+    BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
     REQUIRED_TEXTURE_ROLES,
     TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
     TEXTURE_ORIGIN_NEEDS_PCG_GENERATION,
@@ -38,6 +39,8 @@ from speedtree_texture_contract import (  # noqa: E402
     read_stmat_material_sources,
     resolve_blender_cluster_bake_origin,
     resolve_texture_bindings,
+    seal_blender_cluster_bake_receipt,
+    validate_blender_cluster_bake_receipt_for_consumption,
 )
 from speedtree_export_options_contract import (  # noqa: E402
     require_texture_skip_writing,
@@ -472,6 +475,36 @@ def _cluster_bake_receipt_with_explicit_index_space(
         else SOURCE_SPM_MAP_INDEX_SPACE
     )
     receipt["slot_files"] = normalized
+    normalized_fallbacks = []
+    source_fallbacks = receipt.get("preview_role_fallbacks") or []
+    for fallback in source_fallbacks:
+        if not isinstance(fallback, dict):
+            continue
+        row = dict(fallback)
+        spm_index = int(row.get("map_index", -1))
+        matches = [
+            slot
+            for slot in normalized
+            if (
+                int(slot.get("spm_map_index", -1)) == spm_index
+                and str(slot.get("map") or "")
+                == str(row.get("map") or "")
+            )
+        ]
+        if len(matches) == 1:
+            matched = matches[0]
+            row["map_index"] = int(matched["map_index"])
+        normalized_fallbacks.append(row)
+    if normalized_fallbacks:
+        receipt["preview_role_fallbacks"] = normalized_fallbacks
+    else:
+        receipt.pop("preview_role_fallbacks", None)
+    if (
+        receipt.get("kind")
+        == "blender_cluster_bake_texture_origin_receipt"
+        and normalized_fallbacks
+    ):
+        receipt = seal_blender_cluster_bake_receipt(receipt)
     return receipt
 
 
@@ -580,16 +613,12 @@ def augment_texture_readiness_contract(
                             ],
                         },
                         asset_root,
+                        consumption_context=(
+                            BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
+                        ),
                     )
                 )
                 if bake_receipt:
-                    bake_receipt = (
-                        _cluster_bake_receipt_with_explicit_index_space(
-                            bake_receipt,
-                            spm_slots,
-                            sources,
-                        )
-                    )
                     bake_receipt.update({
                         "material_id": str(
                             spm_material.get("material_id") or ""
@@ -598,6 +627,24 @@ def augment_texture_readiness_contract(
                             spm_material.get("material_name") or ""
                         ),
                     })
+                    bake_receipt = (
+                        _cluster_bake_receipt_with_explicit_index_space(
+                            bake_receipt,
+                            spm_slots,
+                            sources,
+                        )
+                    )
+                    bake_issue = (
+                        validate_blender_cluster_bake_receipt_for_consumption(
+                            bake_receipt,
+                            asset_root,
+                            consumption_context=(
+                                BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
+                            ),
+                        )
+                    )
+                    if bake_issue:
+                        bake_receipt = {}
         if bake_receipt:
             binding.update({
                 "texture_contract_status": "blender_cluster_bake",

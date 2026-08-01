@@ -367,6 +367,27 @@ def _poll_after_signal_error(process, exc, *, token: str):
     ) from exc
 
 
+def _requires_owned_tree_cleanup_after_root_exit(
+    *,
+    owner_present: bool,
+    ownership_done: bool,
+    owned_tree_seen_after_exit: bool,
+) -> bool:
+    """Choose the post-root-exit tree path from remembered ownership.
+
+    A descendant can disappear at the same instant ``exit_pipe_grace``
+    expires while an inherited pipe is still open.  Sampling only
+    ``ownership_done`` at that deadline makes the cleanup outcome depend on
+    scheduling.  Once the tree was observed non-empty after root exit, keep
+    the owned-tree cleanup path authoritative for this launch.
+    """
+
+    return bool(
+        owner_present
+        and (not ownership_done or owned_tree_seen_after_exit)
+    )
+
+
 def _stop_exact_process(
     process: subprocess.Popen,
     *,
@@ -625,8 +646,13 @@ def run_streaming_process(
                     final_status = "completed"
                     break
                 if (
-                    owner is not None
-                    and (not ownership_done or owned_tree_seen_after_exit)
+                    _requires_owned_tree_cleanup_after_root_exit(
+                        owner_present=owner is not None,
+                        ownership_done=ownership_done,
+                        owned_tree_seen_after_exit=(
+                            owned_tree_seen_after_exit
+                        ),
+                    )
                     and time.monotonic() - root_exit_observed_at
                     >= max(0.0, float(exit_pipe_grace))
                 ):
