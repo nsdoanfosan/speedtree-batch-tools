@@ -31,10 +31,13 @@ _PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(
     BATCH_TOOLS_DIR
 )
 from speedtree_texture_contract import (
+    BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+    BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW,
     inspect_spm_texture_slots,
     parse_managed_texture_path,
     resolve_blender_cluster_bake_origin,
     resolve_texture_set,
+    validate_blender_cluster_bake_receipt_for_consumption,
 )
 from speedtree_pipeline_contract import (
     branch_generator_has_render_geometry,
@@ -4315,6 +4318,7 @@ def cluster_render_origin_receipt(
         material,
         output,
         asset_root,
+        consumption_context=BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
     )
     if issue or not receipt:
         return {}
@@ -4352,6 +4356,12 @@ def cluster_render_origin_receipt(
         }
         for row in path_aliases
     ]
+    if validate_blender_cluster_bake_receipt_for_consumption(
+        normalized,
+        asset_root,
+        consumption_context=BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+    ):
+        return {}
     return normalized
 
 
@@ -5078,6 +5088,8 @@ def _atlas_blender_bake_receipt_is_valid(
         not isinstance(receipt, dict)
         or receipt.get("kind") != _BLENDER_CLUSTER_BAKE_RECEIPT_KIND
         or receipt.get("version") != 1
+        or receipt.get("preview_role_fallbacks")
+        or receipt.get("usage") == BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW
         or receipt.get("source_origin") != "blender_cluster_bake"
         or str(receipt.get("material") or "") != material
         or not [

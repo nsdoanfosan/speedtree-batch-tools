@@ -18,6 +18,20 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from speedtree_preview_texture_contract import (
+    PREVIEW_FALLBACK_SCHEMA_FIELD,
+    PREVIEW_ONLY_USAGE,
+    PREVIEW_ROLE_FALLBACKS_FIELD,
+    RECEIPT_CAPABILITIES_FIELD,
+    RECEIPT_CLAIM_FIELD,
+    SUBSURFACE_AMOUNT_ROLE,
+    SUBSURFACE_COLOR_ROLE,
+    build_preview_role_fallback,
+    finalize_preview_receipt,
+    receipt_declares_preview_fallback,
+    validate_preview_receipt,
+)
+
 
 REQUIRED_TEXTURE_ROLES = (
     "color",
@@ -36,6 +50,9 @@ TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE = "blender_cluster_bake"
 TEXTURE_ORIGIN_NEEDS_PCG_GENERATION = (
     "source_fallback_needs_pcg_generation"
 )
+BLENDER_BAKE_CONSUMPTION_STRICT = "strict"
+BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW = "speedtree_preview"
+BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW = PREVIEW_ONLY_USAGE
 PCG_ST9_REMEDIATION = (
     "PCG ST9 Texture에서 누락된 canonical T_* output을 생성한 뒤 "
     "다시 실행하십시오."
@@ -259,19 +276,193 @@ def _blender_bake_map_role(value):
     return _BLENDER_BAKE_ROLE_FOR_MAP.get(compact, "")
 
 
+def seal_blender_cluster_bake_receipt(receipt):
+    """Seal only receipts that exercise the v1 preview capability."""
+    if not receipt_declares_preview_fallback(receipt):
+        return dict(receipt or {})
+    return finalize_preview_receipt(receipt)
+
+
+def validate_blender_cluster_bake_receipt_for_consumption(
+    receipt,
+    asset_root,
+    *,
+    consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
+):
+    """Validate preview capability/schema plus live manifest-owned bytes."""
+    if not receipt_declares_preview_fallback(receipt):
+        if (
+            not isinstance(receipt, dict)
+            or int(receipt.get("version") or 0) != 1
+            or PREVIEW_FALLBACK_SCHEMA_FIELD in receipt
+            or RECEIPT_CAPABILITIES_FIELD in receipt
+            or RECEIPT_CLAIM_FIELD in receipt
+        ):
+            return "blender_cluster_bake_receipt_schema_unsupported"
+        return ""
+    if consumption_context != BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW:
+        return "blender_cluster_bake_preview_fallback_forbidden"
+    try:
+        validate_preview_receipt(
+            receipt,
+            requested_usage=BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW,
+        )
+    except (TypeError, ValueError):
+        return "blender_cluster_bake_receipt_contract_invalid"
+
+    manifest_path = _absolute_path(
+        receipt.get("physical_capture_manifest")
+    )
+    asset_root = _absolute_path(asset_root)
+    capture_dir = manifest_path.parent
+    if (
+        not manifest_path.is_file()
+        or capture_dir.name.casefold() != "cluster"
+        or not _is_within(manifest_path, asset_root)
+        or _forbidden_derived_segment(manifest_path)
+    ):
+        return "blender_cluster_bake_capture_boundary_mismatch"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "blender_cluster_bake_capture_manifest_invalid"
+    if not isinstance(payload, dict):
+        return "blender_cluster_bake_capture_manifest_invalid"
+    contract_hash = str(
+        payload.get("physical_capture_contract_sha256")
+        or (payload.get("physical_capture_contract") or {}).get(
+            "contract_sha256"
+        )
+        or ""
+    ).strip().casefold()
+    if (
+        payload.get("kind") != "speedtree_cluster_blender_auto_capture"
+        or int(payload.get("version") or 0) < 2
+        or payload.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE"
+        or payload.get("direct_uv_source")
+        != "same_blender_physical_capture_projection"
+        or contract_hash
+        != str(
+            receipt.get("physical_capture_contract_sha256") or ""
+        ).casefold()
+        or not re.fullmatch(r"[0-9a-f]{64}", contract_hash)
+    ):
+        return "blender_cluster_bake_capture_manifest_invalid"
+
+    declared = []
+    for source in payload.get("maps") or []:
+        if not isinstance(source, dict):
+            continue
+        raw_role = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            str(source.get("role") or "").casefold(),
+        )
+        role = _blender_bake_map_role(source.get("role"))
+        path_text = str(source.get("path") or "").strip()
+        sha256 = str(source.get("sha256") or "").strip().casefold()
+        row_contract_hash = str(
+            source.get("physical_capture_contract_sha256") or ""
+        ).strip().casefold()
+        if (
+            not role
+            or not path_text
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            or (row_contract_hash and row_contract_hash != contract_hash)
+        ):
+            continue
+        path = _absolute_path(path_text, manifest_path.parent)
+        if (
+            path.parent != capture_dir
+            or not _is_within(path, asset_root)
+            or _forbidden_derived_segment(path)
+        ):
+            return "blender_cluster_bake_capture_boundary_mismatch"
+        try:
+            if path.stat().st_size <= 0:
+                return "blender_cluster_bake_file_fingerprint_mismatch"
+            actual_sha256 = _file_sha256(path).casefold()
+        except OSError:
+            return "blender_cluster_bake_file_fingerprint_mismatch"
+        if actual_sha256 != sha256:
+            return "blender_cluster_bake_file_fingerprint_mismatch"
+        declared.append({
+            "role": role,
+            "raw_role": raw_role,
+            "path": path,
+            "sha256": sha256,
+        })
+
+    slot_files = list(receipt.get("slot_files") or [])
+    for fallback in receipt.get(PREVIEW_ROLE_FALLBACKS_FIELD) or []:
+        selected_path = _absolute_path(fallback["path"])
+        selected = [
+            row
+            for row in declared
+            if (
+                _path_key(row["path"]) == _path_key(selected_path)
+                and row["raw_role"] == SUBSURFACE_COLOR_ROLE
+                and row["sha256"] == fallback["sha256"]
+            )
+        ]
+        amount_rows = [
+            row
+            for row in declared
+            if row["raw_role"] == SUBSURFACE_AMOUNT_ROLE
+        ]
+        matching_slots = [
+            row
+            for row in slot_files
+            if (
+                int(row.get("map_index", -1))
+                == int(fallback["map_index"])
+                and str(row.get("map") or "") == fallback["map"]
+                and str(row.get("capture_role") or "")
+                == SUBSURFACE_AMOUNT_ROLE
+                and _path_key(row.get("path") or "")
+                == _path_key(selected_path)
+                and str(row.get("sha256") or "").casefold()
+                == fallback["sha256"]
+            )
+        ]
+        if (
+            fallback["material_id"]
+            != str(receipt.get("material_id") or "")
+            or fallback["material_name"]
+            != str(receipt.get("material_name") or "")
+            or fallback["contract_hash"] != contract_hash
+            or len(selected) != 1
+            or len(amount_rows) != 1
+            or _path_key(amount_rows[0]["path"])
+            == _path_key(selected_path)
+            or len(matching_slots) != 1
+        ):
+            return "blender_cluster_bake_preview_fallback_evidence_mismatch"
+    return ""
+
+
 def resolve_blender_cluster_bake_origin(
     spm,
     material,
     output,
     asset_root,
+    *,
+    consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
 ):
     """Return one normalized, live-proven Blender bake origin receipt.
 
     A stored receipt is only a shortcut to the physical manifest.  When it is
     absent, the current material's exact map slots are re-evaluated live.
     Downstream code consumes the normalized result instead of repeating
-    filename or folder heuristics.
+    filename or folder heuristics.  The explicit SpeedTree-preview context
+    permits only the receipt-proven SubsurfaceAmount compatibility rule; the
+    default and every other role remain strict.
     """
+    if consumption_context not in {
+        BLENDER_BAKE_CONSUMPTION_STRICT,
+        BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+    }:
+        return {}, "blender_cluster_bake_receipt_usage_unsupported"
     slots = list(material.get("slots") or [])
     provided = list(output.get("slot_files") or [])
     slot_files = []
@@ -313,142 +504,196 @@ def resolve_blender_cluster_bake_origin(
     ):
         return {}, "blender_cluster_bake_capture_boundary_mismatch"
 
-    candidates = []
     stored = output.get("origin_receipt")
-    if isinstance(stored, dict):
-        explicit = _absolute_path(
-            stored.get("physical_capture_manifest")
-        )
-        if explicit.is_file():
-            candidates.append(explicit)
-    color_rows = [
-        row for row in slot_files
-        if _blender_bake_map_role(row["map"]) == "color"
-    ]
-    if color_rows:
+    explicit_manifest = str(
+        (stored or {}).get("physical_capture_manifest") or ""
+    ).strip() if isinstance(stored, dict) else ""
+    if explicit_manifest:
+        manifest_path = _absolute_path(explicit_manifest)
+    else:
+        color_rows = [
+            row for row in slot_files
+            if _blender_bake_map_role(row["map"]) == "color"
+        ]
+        if len(color_rows) != 1:
+            return {}, "blender_cluster_bake_capture_manifest_missing"
         color = Path(color_rows[0]["path"])
-        exact = capture_dir / (
+        manifest_path = capture_dir / (
             f"{color.stem}_auto_capture_manifest.json"
         )
-        if exact.is_file() and exact not in candidates:
-            candidates.append(exact)
-    candidates.extend(
-        path
-        for path in sorted(
-            capture_dir.glob("*_auto_capture_manifest.json")
-        )
-        if path not in candidates
-    )
-    if not candidates:
+    if not manifest_path.is_file():
         return {}, "blender_cluster_bake_capture_manifest_missing"
+    manifest_path = manifest_path.resolve()
+    if (
+        manifest_path.parent != capture_dir
+        or not _is_within(manifest_path, asset_root)
+        or _forbidden_derived_segment(manifest_path)
+    ):
+        return {}, "blender_cluster_bake_capture_boundary_mismatch"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}, "blender_cluster_bake_capture_manifest_invalid"
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind")
+        != "speedtree_cluster_blender_auto_capture"
+        or int(payload.get("version") or 0) < 2
+        or payload.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE"
+        or payload.get("direct_uv_source")
+        != "same_blender_physical_capture_projection"
+    ):
+        return {}, "blender_cluster_bake_capture_manifest_invalid"
+    contract_hash = str(
+        payload.get("physical_capture_contract_sha256")
+        or (payload.get("physical_capture_contract") or {}).get(
+            "contract_sha256"
+        )
+        or ""
+    ).strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+        return {}, "blender_cluster_bake_contract_hash_invalid"
 
-    mismatch = "blender_cluster_bake_map_role_mismatch"
-    for manifest_path in candidates:
-        if (
-            manifest_path.parent != capture_dir
-            or not _is_within(manifest_path, asset_root)
-            or _forbidden_derived_segment(manifest_path)
-        ):
+    declared = []
+    declared_by_role = {}
+    for manifest_row in payload.get("maps") or []:
+        if not isinstance(manifest_row, dict):
             continue
-        try:
-            payload = json.loads(
-                manifest_path.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError, json.JSONDecodeError):
-            mismatch = "blender_cluster_bake_capture_manifest_invalid"
-            continue
-        if (
-            not isinstance(payload, dict)
-            or payload.get("kind")
-            != "speedtree_cluster_blender_auto_capture"
-            or int(payload.get("version") or 0) < 2
-            or payload.get("workflow_mode")
-            != "PHYSICAL_DIRECT_CAPTURE"
-            or payload.get("direct_uv_source")
-            != "same_blender_physical_capture_projection"
-        ):
-            mismatch = "blender_cluster_bake_capture_manifest_invalid"
-            continue
-        contract_hash = str(
-            payload.get("physical_capture_contract_sha256")
-            or (payload.get("physical_capture_contract") or {}).get(
-                "contract_sha256"
-            )
-            or ""
+        raw_role = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            str(manifest_row.get("role") or "").casefold(),
+        )
+        role = _blender_bake_map_role(manifest_row.get("role"))
+        path_text = str(manifest_row.get("path") or "").strip()
+        sha256 = str(
+            manifest_row.get("sha256") or ""
         ).strip().casefold()
-        if not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
-            mismatch = "blender_cluster_bake_contract_hash_invalid"
+        row_contract_hash = str(
+            manifest_row.get("physical_capture_contract_sha256") or ""
+        ).strip().casefold()
+        if not role or not path_text or not re.fullmatch(
+            r"[0-9a-f]{64}", sha256
+        ):
             continue
+        if row_contract_hash and row_contract_hash != contract_hash:
+            return {}, "blender_cluster_bake_contract_hash_mismatch"
+        declared_row = {
+            "role": role,
+            "raw_role": raw_role,
+            "path": _absolute_path(path_text, manifest_path.parent),
+            "sha256": sha256,
+        }
+        declared.append(declared_row)
+        if raw_role in {
+            SUBSURFACE_AMOUNT_ROLE,
+            SUBSURFACE_COLOR_ROLE,
+        }:
+            if raw_role in declared_by_role:
+                return {}, "blender_cluster_bake_capture_manifest_ambiguous"
+            declared_by_role[raw_role] = declared_row
+    if not declared:
+        return {}, "blender_cluster_bake_map_role_mismatch"
 
-        declared = {}
-        for row in payload.get("maps") or []:
-            if not isinstance(row, dict):
-                continue
-            role = _blender_bake_map_role(row.get("role"))
-            path_text = str(row.get("path") or "").strip()
-            sha256 = str(row.get("sha256") or "").strip().casefold()
-            if not role or not path_text or not re.fullmatch(
-                r"[0-9a-f]{64}", sha256
-            ):
-                continue
-            path = _absolute_path(path_text, manifest_path.parent)
+    material_id = str(material.get("material_id") or "")
+    material_name = str(material.get("material_name") or "")
+    normalized_slots = []
+    preview_role_fallbacks = []
+    for row in slot_files:
+        expected_role = _blender_bake_map_role(row["map"])
+        expected_path = _absolute_path(row["path"])
+        selected_entries = [
+            declared_row
+            for declared_row in declared
+            if _path_key(declared_row["path"])
+            == _path_key(expected_path)
+        ]
+        exact_matches = [
+            declared_row
+            for declared_row in selected_entries
+            if declared_row["role"] == expected_role
+        ]
+        if len(exact_matches) > 1:
+            return {}, "blender_cluster_bake_capture_manifest_ambiguous"
+        match = exact_matches[0] if exact_matches else None
+        fallback = None
+        if (
+            match is None
+            and consumption_context
+            == BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
+            and expected_role == "subsurfaceamount"
+        ):
+            if len(selected_entries) > 1:
+                return {}, "blender_cluster_bake_capture_manifest_ambiguous"
             if (
-                path.is_file()
-                and path.parent == manifest_path.parent
-                and not _forbidden_derived_segment(path)
+                len(selected_entries) == 1
+                and selected_entries[0]["raw_role"]
+                == SUBSURFACE_COLOR_ROLE
+                and material_id
+                and material_name
             ):
-                declared.setdefault(role, []).append((path, sha256))
-
-        normalized_slots = []
-        for row in slot_files:
-            expected_role = _blender_bake_map_role(row["map"])
-            expected_path = _absolute_path(row["path"])
-            match = next(
-                (
-                    (path, sha256)
-                    for path, sha256 in declared.get(
-                        expected_role, []
-                    )
-                    if _path_key(path) == _path_key(expected_path)
-                ),
-                None,
-            )
-            if match is None:
-                mismatch = "blender_cluster_bake_map_role_mismatch"
-                break
-            if _file_sha256(expected_path).casefold() != match[1]:
-                mismatch = (
-                    "blender_cluster_bake_file_fingerprint_mismatch"
+                match = selected_entries[0]
+                fallback = build_preview_role_fallback(
+                    slot_role=expected_role,
+                    slot_path=expected_path,
+                    selected_rows=selected_entries,
+                    declared_rows=declared_by_role,
+                    material_id=material_id,
+                    material_name=material_name,
+                    contract_hash=contract_hash,
+                    map_index=row["map_index"],
+                    map_name=row["map"],
+                    workflow_mode=payload.get("workflow_mode"),
+                    direct_uv_source=payload.get("direct_uv_source"),
                 )
-                break
-            normalized_slots.append({
-                **row,
-                "capture_role": expected_role,
-                "sha256": match[1],
-            })
-        else:
-            return {
-                "kind": "blender_cluster_bake_texture_origin_receipt",
-                "version": 1,
-                "origin_state": "blender_cluster_bake",
-                "source_origin": "blender_cluster_bake",
-                "source_spm": str(_absolute_path(spm)),
-                "material_id": str(
-                    material.get("material_id") or ""
-                ),
-                "material_name": str(
-                    material.get("material_name") or ""
-                ),
-                "physical_capture_manifest": str(
-                    manifest_path.resolve()
-                ),
-                "physical_capture_contract_sha256": contract_hash,
-                "source_refs": [
-                    row["path"] for row in normalized_slots
-                ],
-                "slot_files": normalized_slots,
-            }, ""
-    return {}, mismatch
+                if fallback is None:
+                    match = None
+        if match is None:
+            return {}, "blender_cluster_bake_map_role_mismatch"
+        if (
+            expected_path.parent != capture_dir
+            or not _is_within(expected_path, asset_root)
+            or _forbidden_derived_segment(expected_path)
+        ):
+            return {}, "blender_cluster_bake_capture_boundary_mismatch"
+        try:
+            actual_sha256 = _file_sha256(expected_path).casefold()
+        except OSError:
+            return {}, "blender_cluster_bake_file_fingerprint_mismatch"
+        if actual_sha256 != match["sha256"]:
+            return {}, "blender_cluster_bake_file_fingerprint_mismatch"
+        normalized_slots.append({
+            **row,
+            "capture_role": expected_role,
+            "sha256": match["sha256"],
+        })
+        if fallback:
+            preview_role_fallbacks.append(fallback)
+
+    receipt = {
+        "kind": "blender_cluster_bake_texture_origin_receipt",
+        "version": 1,
+        "origin_state": "blender_cluster_bake",
+        "source_origin": "blender_cluster_bake",
+        "slot_index_space": "source_spm_map_order_v1",
+        "source_spm": str(_absolute_path(spm)),
+        "material_id": material_id,
+        "material_name": material_name,
+        "physical_capture_manifest": str(manifest_path),
+        "physical_capture_contract_sha256": contract_hash,
+        "source_refs": [row["path"] for row in normalized_slots],
+        "slot_files": normalized_slots,
+    }
+    if preview_role_fallbacks:
+        receipt[PREVIEW_ROLE_FALLBACKS_FIELD] = preview_role_fallbacks
+        try:
+            receipt = seal_blender_cluster_bake_receipt(receipt)
+        except (TypeError, ValueError):
+            return {}, "blender_cluster_bake_receipt_contract_invalid"
+    issue = validate_blender_cluster_bake_receipt_for_consumption(
+        receipt, asset_root, consumption_context=consumption_context,
+    )
+    return ({}, issue) if issue else (receipt, "")
 
 
 def validate_blender_cluster_bake_override(

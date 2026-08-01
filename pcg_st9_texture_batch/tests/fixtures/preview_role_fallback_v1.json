@@ -1,0 +1,41 @@
+{
+  "kind": "blender_cluster_bake_texture_origin_receipt",
+  "version": 2,
+  "source_origin": "blender_cluster_bake",
+  "material_id": "7",
+  "material_name": "M_leaf_fixture_Mat",
+  "slot_index_space": "stmat_xml_map_order_v1",
+  "physical_capture_manifest": "C:\\SpeedTreeContractFixtures\\cluster\\leaf_auto_capture_manifest.json",
+  "physical_capture_contract_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "slot_files": [
+    {
+      "map_index": 6,
+      "stmat_map_index": 6,
+      "map": "SubsurfaceAmount",
+      "capture_role": "subsurfaceamount",
+      "path": "C:\\SpeedTreeContractFixtures\\cluster\\leaf_Subsurface.tga",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "preview_role_fallbacks": [
+    {
+      "slot_role": "subsurfaceamount",
+      "manifest_role": "subsurfacecolor",
+      "usage": "speedtree_preview_only",
+      "material_id": "7",
+      "material_name": "M_leaf_fixture_Mat",
+      "contract_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "map_index": 6,
+      "map": "SubsurfaceAmount",
+      "path": "C:\\SpeedTreeContractFixtures\\cluster\\leaf_Subsurface.tga",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "preview_role_fallbacks_schema_version": 1,
+  "receipt_capabilities": [
+    "speedtree_preview_role_fallback_v1"
+  ],
+  "receipt_claim": "speedtree_preview_only",
+  "receipt_core_sha256": "475084cc428b608b45f6124195d7fe85adf655acc2511109932678e9fd9b7fed",
+  "receipt_cache_key": "speedtree_preview_only:475084cc428b608b45f6124195d7fe85adf655acc2511109932678e9fd9b7fed"
+}
