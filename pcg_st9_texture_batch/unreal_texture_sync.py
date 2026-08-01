@@ -20,6 +20,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -661,8 +667,10 @@ def _editor_is_running():
     if os.name != "nt":
         return False
     try:
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/FO", "CSV", "/NH"],
+            source="pcg_st9_texture_batch.unreal_texture_sync.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             text=True,
             timeout=10,
@@ -769,8 +777,10 @@ def _run_commandlet(script_path, cfg):
         "-unattended", "-nosplash", "-nullrhi", "-DDC-ForceMemoryCache",
         "-stdout", "-FullStdOutLogOutput", "-log",
     ]
-    result = subprocess.run(
+    result = owned_run(
         command,
+        source="pcg_st9_texture_batch.unreal_texture_sync.commandlet",
+        run_factory=subprocess.run,
         capture_output=True,
         text=True,
         encoding="utf-8",

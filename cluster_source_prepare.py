@@ -15,6 +15,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from cluster_normalization_sync import (
     ClusterSourceBuildRequiredError,
     resolve_normalization_recipe,
@@ -88,8 +90,10 @@ def _write_log(path, command, result=None, error=None):
 
 def _run_stage(command, log_file, *, timeout, stage):
     try:
-        result = subprocess.run(
+        result = owned_run(
             [str(value) for value in command],
+            source=f"cluster_source_prepare.{stage}",
+            run_factory=subprocess.run,
             capture_output=True,
             text=True,
             encoding="utf-8",
