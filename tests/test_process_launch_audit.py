@@ -32,7 +32,11 @@ def _production_sources():
     for suffix in ("*.py", "*.pyw"):
         for path in REPO_DIR.rglob(suffix):
             relative = path.relative_to(REPO_DIR)
-            if path == LIFECYCLE or "tests" in relative.parts:
+            if (
+                path == LIFECYCLE
+                or "tests" in relative.parts
+                or relative.parts[0] == "work"
+            ):
                 continue
             yield path
 
