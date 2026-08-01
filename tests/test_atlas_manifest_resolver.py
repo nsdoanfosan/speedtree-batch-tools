@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,93 @@ class AtlasManifestResolverTests(unittest.TestCase):
             raise AssertionError(kind)
         path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         return path
+
+    def precedence_fixture(self, temporary, fixture_name):
+        fixture_path = Path(__file__).parent / "fixtures" / fixture_name
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        root = Path(temporary) / fixture["asset_folder"]
+        root.mkdir()
+        target = root / fixture["target_spm"]
+        target.write_bytes(b"sanitized-spm")
+
+        def materialize(value):
+            if isinstance(value, dict):
+                return {key: materialize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [materialize(item) for item in value]
+            if isinstance(value, str):
+                return value.replace("{root}", str(root)).replace(
+                    "{target}", str(target)
+                )
+            return value
+
+        current = materialize(fixture["current_per_target"])
+        stale = materialize(fixture["stale_target_scope"])
+        authority_path = self.write_candidate(
+            root,
+            target,
+            "exact_per_target",
+            current,
+        )
+        mirror_path = self.write_candidate(
+            root,
+            target,
+            "exact_target_scope",
+            current,
+            name=f"{current['export_scope_id']}__{target.stem}.json",
+        )
+        stale_path = self.write_candidate(
+            root,
+            target,
+            "exact_target_scope",
+            stale,
+            name=f"{stale['export_scope_id']}__{target.stem}.json",
+        )
+
+        # Deliberately make the stale scope newest.  File time is evidence,
+        # never authority.
+        os.utime(authority_path, (1, 1))
+        os.utime(mirror_path, (2, 2))
+        os.utime(stale_path, (3, 3))
+        return {
+            "fixture": fixture,
+            "target": target,
+            "current": current,
+            "stale": stale,
+            "authority_path": authority_path,
+            "mirror_path": mirror_path,
+            "stale_path": stale_path,
+        }
+
+    def assert_stale_scope_is_shadowed(self, case):
+        resolution = resolve_atlas_manifests(case["target"])
+        self.assertEqual(
+            [row["path"] for row in resolution["selected"]],
+            [
+                str(case["authority_path"].resolve()),
+                str(case["mirror_path"].resolve()),
+            ],
+        )
+        connection = resolution["selected"][0]["payload"][
+            "generator_connection"
+        ]
+        self.assertFalse(connection["requested"])
+        self.assertEqual(connection["bindings"], [])
+        shadow = next(
+            row
+            for row in resolution["shadowed"]
+            if row["path"] == str(case["stale_path"].resolve())
+        )
+        self.assertEqual(
+            shadow["reason"],
+            "superseded_by_higher_precedence_authority",
+        )
+        self.assertEqual(
+            shadow["superseded_by"],
+            str(case["authority_path"].resolve()),
+        )
+        self.assertEqual(resolution["conflicting"], [])
+        return resolution
 
     def test_candidate_kind_and_precedence_matrix(self):
         kinds = (
@@ -159,6 +247,51 @@ class AtlasManifestResolverTests(unittest.TestCase):
                 [str(first.resolve()), str(second.resolve())],
             )
             self.assertEqual(resolution["conflicting"], [])
+
+    def test_exact_target_authority_shadows_silky_shaped_stale_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self.precedence_fixture(
+                temporary,
+                "issue58_silky_generator_precedence.json",
+            )
+            self.assert_stale_scope_is_shadowed(case)
+
+            stale_slots = {
+                row["slot_prefix"]
+                for row in case["stale"]["generator_connection"]["bindings"]
+            }
+            live_slots = {
+                row["slot_prefix"]
+                for row in case["fixture"]["live_generator_topology"]
+            }
+            self.assertIn("Leaves:Type:3", stale_slots)
+            self.assertNotIn("Leaves:Type:3", live_slots)
+            self.assertIn("Material:Frond:0", live_slots)
+
+    def test_exact_target_authority_shadows_black_locust_scope_first(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self.precedence_fixture(
+                temporary,
+                "issue58_black_locust_generator_precedence.json",
+            )
+            self.assert_stale_scope_is_shadowed(case)
+
+            live = case["fixture"]["live_generator_snapshot"]
+            self.assertFalse(live["node_table"]["stale"])
+            self.assertEqual(live["node_table"]["orphan_node_count"], 0)
+            visible_meshes = {
+                row["mesh_id"]
+                for row in live["bindings"]
+                if row["export_participates"]
+            }
+            hidden_declared_meshes = {
+                row["mesh_id"]
+                for row in live["bindings"]
+                if row["generator_name"] == "Leaf 12"
+                and not row["export_participates"]
+            }
+            self.assertEqual(visible_meshes, {93})
+            self.assertEqual(hidden_declared_meshes, {93, 94, 95, 96})
 
     def test_every_operational_precedence_disagreement_fails_closed(self):
         variants = {}

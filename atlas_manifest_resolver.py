@@ -7,11 +7,13 @@ Atlas writes three operational copies of a target relationship:
 * ``speedtree_import_manifest.json`` (rolling global target record).
 
 They are considered in that order.  Coherent lower-precedence mirrors remain
-selected so a writer can update every current operational record.  Disjoint
-scope records may coexist, but any two operational records that overlap and
-disagree on source identity, material ownership, material-group content, or a
-Generator binding fail closed.  Precedence never turns a disagreement into a
-last-writer win.
+selected so a writer can update every current operational record.  A disjoint
+lower-precedence record from another source/scope is superseded by the current
+higher-precedence authority instead of being merged into the desired-state
+set.  Disjoint records at the same precedence may coexist, but any two
+operational records that overlap and disagree on source identity, material
+ownership, material-group content, or a Generator binding fail closed.
+Precedence never turns an overlapping disagreement into a last-writer win.
 
 Historical ``speedtree_import_manifest_M_*.json`` files and non-target-
 suffixed scope identity files are evidence only.  They are never returned as
@@ -519,6 +521,27 @@ def resolve_atlas_manifests(
                     "conflicts_with_kind": winner["kind"],
                     "conflicts_with_precedence": winner["precedence"],
                 })
+            continue
+
+        higher_precedence = [
+            row
+            for row in selected
+            if row["precedence"] < candidate["precedence"]
+        ]
+        coherent_higher_source = next((
+            row
+            for row in higher_precedence
+            if row["source_identity"] == candidate["source_identity"]
+        ), None)
+        if higher_precedence and not overlaps and coherent_higher_source is None:
+            authority = higher_precedence[0]
+            resolution["shadowed"].append({
+                **_public_record(candidate, include_payload=False),
+                "reason": "superseded_by_higher_precedence_authority",
+                "superseded_by": authority["path"],
+                "superseded_by_kind": authority["kind"],
+                "superseded_by_precedence": authority["precedence"],
+            })
             continue
 
         candidate["reason"] = (
