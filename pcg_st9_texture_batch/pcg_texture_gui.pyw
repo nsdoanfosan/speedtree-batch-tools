@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
+from speedtree_error_log import ERROR_LOG, record_exception
 from shared_queue_runtime import SharedQueueRuntime
 from atlas_target_registry import (
     TargetRegistryError,
@@ -2094,7 +2095,17 @@ class App:
         self.worker = None
         self._initial_refreshing = False
         if error is not None:
-            messagebox.showerror("검사 실패", str(error))
+            logged = record_exception("PCG ST9 Texture initial refresh", error)
+            log_note = (
+                f"\n\n전체 traceback: {ERROR_LOG}"
+                if logged
+                else ""
+            )
+            messagebox.showerror(
+                "검사 실패",
+                f"{error}{log_note}",
+                parent=self.root,
+            )
             self.status_var.set(
                 "live 검사 실패 · 저장/기본 표는 표시 전용 · 다시 검사 필요"
             )
