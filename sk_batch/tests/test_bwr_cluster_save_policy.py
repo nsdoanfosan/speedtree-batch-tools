@@ -102,6 +102,15 @@ class ClusterSavePolicyTests(unittest.TestCase):
             source,
         )
 
+    def test_blocking_export_contract_prevents_blend_save(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'if (\n'
+            '            not blocking_export_collection_issues\n'
+            '            and vertex_payload_contract.get("status") == "ok"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
