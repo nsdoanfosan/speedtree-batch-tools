@@ -1,0 +1,45 @@
+{
+  "issue_number": 42,
+  "modeler_version": "10.1.0",
+  "pairs": [
+    {
+      "after_fixture": "lauraceae_11.after.sanitized.xml.gz",
+      "before_fixture": "lauraceae_11.before.sanitized.xml.gz",
+      "expected_core_fingerprint": "ea0deef63dfd0b4437d93f1ba89004a8b4be7c578bc707e435d3e9435009c1bd",
+      "pair_id": "lauraceae_11",
+      "private_after_raw_sha256": "9489f6e02f3de7dc9bf5f860a7de71484026347c1c66f66f53ce9993b1dac47e",
+      "private_before_raw_sha256": "2f996ddb1b180247dd002c942a309bb62a5352712dc5eb3816a1fc5f6c40b3cc",
+      "sanitized_after_xml_sha256": "02b7bdc7449eb5ffef333de96500c5434f61a014b878a37bdea71203567be3e4",
+      "sanitized_before_xml_sha256": "597dc81c067a3061c41b99dc3f37442ae453d52f62464f3c9af1e58db110f5f3"
+    },
+    {
+      "after_fixture": "lauraceae_12.after.sanitized.xml.gz",
+      "before_fixture": "lauraceae_12.before.sanitized.xml.gz",
+      "expected_core_fingerprint": "2fe3dacce5249e408218d4b7102718cfb96bb32fe47cd83dd3b932d89846d523",
+      "pair_id": "lauraceae_12",
+      "private_after_raw_sha256": "1872f0abebb076e2be2b7b7f418979625177a25c7cc4100f16e5a910dd0c6ce6",
+      "private_before_raw_sha256": "141d375f74e3be6289ab28b81b1e40897e58d520e565e7daf53b4cd195f4ae7b",
+      "sanitized_after_xml_sha256": "9a25b31d0024b5a2c6323536ef57799a4a3eb43cb04035f7f08358b6e01a4b64",
+      "sanitized_before_xml_sha256": "8dd0b2a7ede382ccd1238234dfa5220c142fb40ed86a55346f5bfb518ea09907"
+    },
+    {
+      "after_fixture": "densiflora_02.after.sanitized.xml.gz",
+      "before_fixture": "densiflora_02.before.sanitized.xml.gz",
+      "expected_core_fingerprint": "9c32790bdeaabf43119c27ed85cb466f6b6683f9cb71c958d152cbcd33c114bf",
+      "pair_id": "densiflora_02",
+      "private_after_raw_sha256": "38f32e399a1aefdb85aaf23f282b13e49291d832b2c598345db46b79d6bbd387",
+      "private_before_raw_sha256": "2c94fd6de85749980af51ba89868996253897f9c7eeb555f64dead0030660c72",
+      "sanitized_after_xml_sha256": "db42f9587b996b2f39f17e8efb1a7ce4f3258cc88567e09838e78c8251bb119f",
+      "sanitized_before_xml_sha256": "74c762868b183ca84d53549299c9a264d65c61d91671a9d9e993244dff60c032"
+    }
+  ],
+  "sanitization_contract": "raw_text_identity_and_path_substitution_v1",
+  "sanitization_invariants": {
+    "duplicate_count_preserved": true,
+    "element_order_preserved": true,
+    "namespace_spelling_preserved": true,
+    "numeric_lexemes_preserved_outside_replaced_identity_path_tokens": true,
+    "text_and_tail_placement_preserved": true,
+    "xml_reserialized": false
+  }
+}

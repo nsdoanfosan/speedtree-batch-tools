@@ -54,7 +54,9 @@ from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
 from cluster_export_handoff_contract import (
+    capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
+    reconcile_transient_cluster_export_root,
 )
 from pcg_st9_texture_batch.pcg_cluster_bark_normalization import (
     BarkNormalizationError,
@@ -756,10 +758,44 @@ def main():
             repair_settings["source_fbx_cleanup_aliases"] = [
                 str(canonical_source_fbx)
             ]
+        cluster_export_snapshot = None
+        if is_cluster_source and not args.cluster_source_build_only:
+            cluster_export_snapshot = capture_cluster_export_snapshot(
+                bpy.data,
+                canonical_spm.stem,
+            )
         result = bwr_core.run_import_and_repair(repair_settings)
         report["speedtree_export"] = speedtree_export
-        export_collection_issues = export_collection_contract_issues(
-            canonical_spm.stem if is_cluster_source else ""
+        transient_export_reconciliation = None
+        if cluster_export_snapshot is not None:
+            transient_export_reconciliation = (
+                reconcile_transient_cluster_export_root(
+                    bpy.data,
+                    bpy.data.collections.get(
+                        repair_settings.get(
+                            "source_collection_name",
+                            "SpeedTree_Source",
+                        )
+                    ),
+                    cluster_source_stem=canonical_spm.stem,
+                    source_fbx_path=fbx_export["path"],
+                    source_identity_path=canonical_spm,
+                    before_snapshot=cluster_export_snapshot,
+                )
+            )
+            report["cluster_transient_export_reconciliation"] = (
+                transient_export_reconciliation
+            )
+        export_collection_issues = list(
+            (transient_export_reconciliation or {}).get("issues") or ()
+        )
+        export_collection_issues.extend(
+            export_collection_contract_issues(
+                canonical_spm.stem if is_cluster_source else ""
+            )
+        )
+        export_collection_issues = list(
+            dict.fromkeys(export_collection_issues)
         )
         report["export_collection_issues"] = export_collection_issues
         cluster_export_pending = bool(
@@ -826,6 +862,10 @@ def main():
             pipeline_data["export_collection_issues"] = (
                 export_collection_issues
             )
+            if transient_export_reconciliation is not None:
+                pipeline_data[
+                    "cluster_transient_export_reconciliation"
+                ] = transient_export_reconciliation
             if cluster_assembly_handoff is not None:
                 pipeline_data["cluster_assembly_handoff"] = (
                     cluster_assembly_handoff
@@ -890,7 +930,8 @@ def main():
         # A blocked payload leaves an existing source .blend untouched.
         report["blend_resaved"] = False
         if (
-            vertex_payload_contract.get("status") == "ok"
+            not blocking_export_collection_issues
+            and vertex_payload_contract.get("status") == "ok"
             and vertex_color_contract.get("status") == "ok"
             and not leaf_reference_blocked
             and (
