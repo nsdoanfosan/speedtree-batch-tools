@@ -151,6 +151,190 @@ class PushQueueFlowTests(unittest.TestCase):
             fixture["expected_result"]["blocked_reason_token"]
         ])
 
+    @staticmethod
+    def densiflora_stale_contract(target, provider, *, bind_target=True):
+        blocked_row = {
+            "spm": str(target),
+            "delivery_reason": (
+                "live_export_evidence_unavailable_stale_node_table"
+            ),
+            "delivery_remedy": (
+                "Open the target SPM in SpeedTree Modeler, regenerate/save "
+                "the Node table, then re-audit."
+            ),
+            "errors": [
+                "generator_export_evidence_stale_node_table",
+                "normalized_and_live_target_mesh_sets_differ",
+            ],
+            "stale_node_table_target_mesh_ids": [16, 17, 18, 19],
+            "live_node_table": {
+                "stale": True,
+                "generator_count": 48,
+                "node_table_generator_count": 43,
+                "orphan_generator_guids": ["orphan-a", "orphan-b"],
+                "orphan_node_count": 216495,
+                "total_node_count": 223675,
+            },
+        }
+        issue = {
+            "code": "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
+            "role": "cluster",
+            "spm": str(provider),
+            "errors": list(blocked_row["errors"]),
+            "remedy": blocked_row["delivery_remedy"],
+            "blocked_targets": [blocked_row],
+        }
+        return {
+            "tree_source_identities": [{"target_spm": str(target)}],
+            "dependencies": [{
+                "spm": str(provider),
+                "normalized_delivery_mode": "connection_incomplete",
+                "normalized_delivery_blocked": True,
+                "normalized_variants_required": True,
+                "normalized_variants": {
+                    "status": "ready",
+                    "delivery_mode": "connection_incomplete",
+                    "delivery_errors": list(blocked_row["errors"]),
+                    "delivery_blocked_targets": (
+                        [blocked_row] if bind_target else []
+                    ),
+                    "variants": [{"name": "Cluster"}],
+                },
+            }],
+            "handoff": {
+                "status": "blocked",
+                "errors": [issue],
+            },
+        }
+
+    def test_issue16_stale_node_target_is_excluded_with_operator_evidence(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = (
+            Path("densiflora") / "SK_tree_densiflora_03.spm"
+        ).resolve()
+        provider = (
+            Path("densiflora")
+            / "cluster"
+            / "SK_cluster_densiflora_01.spm"
+        ).resolve()
+        contract = self.densiflora_stale_contract(target, provider)
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": Path("densiflora_stale_live_audit.json"),
+            "log_file": Path("densiflora_stale_live_audit.log"),
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ):
+            with self.assertRaises(
+                gui.TargetPlannedExclusionError
+            ) as caught:
+                app._cluster_normalization_stage_observation(
+                    target,
+                    "densiflora",
+                    provider,
+                    require_normalized=False,
+                )
+
+        error = caught.exception
+        evidence = error.evidence
+        self.assertEqual(
+            error.reason_token,
+            "live_export_evidence_unavailable_stale_node_table",
+        )
+        self.assertEqual(evidence["target_name"], target.name)
+        self.assertEqual(
+            evidence["issue_codes"],
+            ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+        )
+        self.assertEqual(
+            evidence["stale_node_table_target_mesh_ids"],
+            [16, 17, 18, 19],
+        )
+        self.assertEqual(
+            evidence["live_node_table"],
+            {
+                "stale": True,
+                "generator_count": 48,
+                "node_table_generator_count": 43,
+                "orphan_node_count": 216495,
+                "total_node_count": 223675,
+                "orphan_generator_guid_count": 2,
+            },
+        )
+        self.assertNotIn("orphan-a", json.dumps(evidence))
+
+        with mock.patch.object(gui, "save_state"):
+            app._record_pipeline_planned_exclusion(target, error)
+        entry = app.state[str(target)]
+        for column in ("blend_status", "push_status"):
+            status = entry[column]
+            self.assertIn(target.name, status)
+            self.assertIn("stale Node table", status)
+            self.assertIn("orphan GUIDs 2", status)
+            self.assertIn("orphan Nodes 216495/223675", status)
+            self.assertIn("Mesh IDs 16,17,18,19", status)
+            self.assertIn("action=regenerate/save", status)
+        self.assertEqual(
+            entry["push_status_error"]["evidence"]["delivery_remedy"],
+            (
+                "Open the target SPM in SpeedTree Modeler, regenerate/save "
+                "the Node table, then re-audit."
+            ),
+        )
+        self.assertNotIn(str(provider), app.state)
+
+    def test_issue16_unbound_stale_node_issue_remains_shared_and_diagnostic(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = (
+            Path("densiflora") / "SK_tree_densiflora_03.spm"
+        ).resolve()
+        provider = (
+            Path("densiflora")
+            / "cluster"
+            / "SK_cluster_densiflora_01.spm"
+        ).resolve()
+        contract = self.densiflora_stale_contract(
+            target,
+            provider,
+            bind_target=False,
+        )
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": Path("unbound_stale_live_audit.json"),
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ):
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._cluster_normalization_stage_observation(
+                    target,
+                    "densiflora",
+                    provider,
+                    require_normalized=False,
+                )
+
+        message = str(caught.exception)
+        self.assertIn(target.name, message)
+        self.assertLess(
+            message.index(f"targets={target.name}"),
+            message.index("role=cluster"),
+        )
+        self.assertIn("orphan GUIDs 2", message)
+        self.assertIn("orphan Nodes 216495/223675", message)
+        self.assertIn("Mesh IDs 16,17,18,19", message)
+        self.assertIn("action=regenerate/save", message)
+
     def test_issue16_planned_exclusion_does_not_fan_out_shared_provider(self):
         gui = load_gui_module()
         app = self.make_app(gui)
