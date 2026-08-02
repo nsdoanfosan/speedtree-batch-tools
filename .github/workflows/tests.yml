@@ -75,9 +75,9 @@ jobs:
       - name: short temp path
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path C:	 | Out-Null
-          "TEMP=C:	"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "TMP=C:	"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path C:\t | Out-Null
+          "TEMP=C:\t"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=C:\t"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Fails in about a second on a syntax break or a contract drift, and
       # prints the production source revision the audit children verify
