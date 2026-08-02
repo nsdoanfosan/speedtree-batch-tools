@@ -3201,7 +3201,17 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
     and combining them is what previously produced false zeroes and unsafe
     re-connect jobs.
     """
-    registry = _existing_atlas_registry(cfg.get("atlas_root"), folder)
+    registry = None
+
+    def atlas_registry():
+        nonlocal registry
+        if registry is None:
+            registry = _existing_atlas_registry(
+                cfg.get("atlas_root"),
+                folder,
+            )
+        return registry
+
     grouped = {}
     for spm in target_spms or []:
         rows = extract_material_image_refs(spm)
@@ -3219,12 +3229,17 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             atlas_like = bool(
                 material.get("managed_leaf_output")
                 or re.match(r"^M_.*?_atlas_\d+", material_name, re.IGNORECASE)
-                or registry.get(canonical_material_name(material_name).lower())
             )
+            if not atlas_like:
+                atlas_like = bool(
+                    atlas_registry().get(
+                        canonical_material_name(material_name).lower()
+                    )
+                )
             if not atlas_like:
                 continue
             atlas_base, blends = _current_leaf_atlas_base(
-                material_name, registry)
+                material_name, atlas_registry())
             key = atlas_base.lower()
             entry = grouped.setdefault(key, {
                 "atlas_base": atlas_base,

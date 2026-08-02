@@ -92,6 +92,33 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_empty_leaf_inventory_skips_atlas_registry_scan(self):
+        spm = Path("manifest-free-tree") / "SK_tree_test.spm"
+        with mock.patch.object(
+            pcg_texture_audit,
+            "extract_material_image_refs",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "mesh_asset_ids",
+            return_value=set(),
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "leaf_generator_bindings",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "_existing_atlas_registry",
+        ) as registry:
+            actual = pcg_texture_audit.current_leaf_atlas_inventory(
+                spm.parent,
+                {"atlas_root": "atlas"},
+                [spm],
+            )
+
+        self.assertEqual(actual, [])
+        registry.assert_not_called()
+
     def test_empty_cluster_items_skip_atlas_declaration_scan(self):
         items = [{
             "folder": "manifest-free-tree",
