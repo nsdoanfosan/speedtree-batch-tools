@@ -35,16 +35,18 @@ jobs:
       # the compile gate ignores that directory, so vendoring it here cannot
       # change the production source revision the audit children verify.
       #
-      # It is pinned to a branch, not main: speedtree_handoff_contract.py and
-      # speedtree_handoff_vectors.json exist only on
-      # bake-selection-and-painter-handoff. Until that lands on substance-tools
-      # main, this repository's tests depend on an unmerged branch of another
-      # repository -- which is why they passed only on a machine that happened
-      # to have it checked out.
+      # This used to pin bake-selection-and-painter-handoff, because
+      # speedtree_handoff_contract.py and speedtree_handoff_vectors.json existed
+      # only on that branch. That branch has since merged (substance-tools PR
+      # #1) and all three files are byte-identical on main -- verified by blob
+      # SHA: pipeline_contract.json 42a0c819, speedtree_handoff_contract.py
+      # ca13f8cb, speedtree_handoff_vectors.json 4628f74a. Tracking main removes
+      # the standing risk that deleting a merged branch turns every PR in this
+      # repository red without a single code change.
       - uses: actions/checkout@v4
         with:
           repository: nsdoanfosan/substance-tools
-          ref: bake-selection-and-painter-handoff
+          ref: main
           path: work/substance-tools
 
       - name: point at the shared contract
@@ -72,12 +74,18 @@ jobs:
       # comparisons fail -- a test-harness weakness, not a product defect: the
       # product canonicalizes correctly. Pinning TEMP to a short path keeps CI
       # measuring the product until the expectations are canonicalized too.
+      #
+      # The path below is the three characters C, :, \, t. It previously held a
+      # literal TAB character, so New-Item failed with `The specified drive root
+      # "C:\<tab>\" either does not exist` on every run and TEMP/TMP were set to
+      # a path that does not exist; Python silently fell back to the default and
+      # this step did nothing at all.
       - name: short temp path
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path C:	 | Out-Null
-          "TEMP=C:	"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "TMP=C:	"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path 'C:\t' | Out-Null
+          "TEMP=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=C:\t"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Fails in about a second on a syntax break or a contract drift, and
       # prints the production source revision the audit children verify
@@ -93,6 +101,7 @@ jobs:
         shell: pwsh
         run: |
           $failed = @()
+          $empty = @()
           $total = 0
           $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
           Get-ChildItem -Recurse -Directory -Filter tests |
@@ -112,11 +121,61 @@ jobs:
               Write-Host "::endgroup::"
               if ($LASTEXITCODE -ne 0) { $failed += $rel }
               $m = [regex]::Match($out, 'Ran (\d+) test')
-              if ($m.Success) { $total += [int]$m.Groups[1].Value }
+              if ($m.Success) {
+                $count = [int]$m.Groups[1].Value
+                $total += $count
+                if ($count -eq 0) { $empty += $rel }
+              } else {
+                $empty += $rel
+              }
             }
           Write-Host "총 $total tests"
           if ($failed.Count -gt 0) {
             Write-Host "::error::failed suites: $($failed -join ', ')"
+            exit 1
+          }
+          # `unittest discover` exits 0 on "Ran 0 tests", so a suite that stops
+          # being collected -- a renamed directory, a file no longer matching
+          # test*.py, an import that quietly drops a module -- reads exactly
+          # like a passing suite. These two tripwires make that loud. The floor
+          # is deliberately far below the current count: it catches collapse,
+          # it is not a target to keep bumping.
+          if ($empty.Count -gt 0) {
+            Write-Host "::error::suites collected zero tests: $($empty -join ', ')"
+            exit 1
+          }
+          if ($total -lt 1500) {
+            Write-Host "::error::collected only $total tests; expected at least 1500"
+            exit 1
+          }
+
+      # `unittest discover` only collects TestCase methods, so a test written as
+      # a module-level `def test_*` function is silently never run. There were
+      # 73 of them across 9 files when this step was added -- including the
+      # whole issue #65 regression file -- and pytest was already being
+      # installed above purely so those files would import. Run them for real,
+      # discovering the files by content so the list cannot rot.
+      - name: module-level tests
+        shell: pwsh
+        run: |
+          $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
+          $files = Get-ChildItem -Recurse -File -Filter 'test_*.py' |
+            Where-Object {
+              $_.FullName -notmatch '__pycache__' -and
+              -not $_.FullName.StartsWith($workRoot, 'OrdinalIgnoreCase') -and
+              (Select-String -Path $_.FullName -Pattern '^def test' -Quiet)
+            } |
+            Sort-Object FullName |
+            ForEach-Object { Resolve-Path -Relative $_.FullName }
+          if (-not $files) {
+            Write-Host "::error::no module-level test functions found; this step expects at least one file"
+            exit 1
+          }
+          Write-Host "module-level test files: $($files.Count)"
+          $files | ForEach-Object { Write-Host "  $_" }
+          python -m pytest @files -q
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::module-level tests failed"
             exit 1
           }
 

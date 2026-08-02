@@ -110,7 +110,7 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
         cls.after_fingerprint = project(cls.after)
 
     def test_literal_no_edit_pair_has_one_current_core_fingerprint(self):
-        self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 5)
+        self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 6)
         self.assertEqual(
             self.before_fingerprint,
             "8d5dc57396cfbd31e918f8f89a2c601fe60c46ffb65fc81ad50ea5656b7419bb",

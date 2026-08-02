@@ -1,9 +1,11 @@
-"""Fail-closed interactive recovery for a stale saved SpeedTree Node table.
+"""Fail-closed recovery for a stale saved SpeedTree Node table.
 
 The Modeler is opened only after an exact byte preimage and an immutable,
-SHA-bound receipt have been created and verified.  The module never edits the
-SPM, automates Save, kills Modeler, rolls back automatically, or treats
-``stale=false`` alone as permission to continue.
+SHA-bound receipt have been created and verified.  A caller may provide the
+bounded exact-PID semantic UIA session; it is invoked only after the stale,
+nonzero-orphan, complete-scope, and unchanged-SHA gates pass.  The module never
+edits the SPM, kills Modeler, simulates input, rolls back automatically, or
+treats ``stale=false`` alone as permission to continue.
 """
 
 from __future__ import annotations
@@ -39,6 +41,10 @@ from speedtree_pipeline_contract import (
     canonical_path_key,
     generator_guid_key,
 )
+from pcg_st9_texture_batch.speedtree_modeler_uia import (
+    SEMANTIC_UIA_CONTRACT,
+    SemanticModelerUIAError,
+)
 
 try:
     from .pcg_cluster_assembly_contract import _normalized_generator_delivery
@@ -59,14 +65,14 @@ RECOVERY_CONTRACT = "speedtree_stale_node_table_interactive_recovery_v2"
 PREIMAGE_RECEIPT_KIND = "speedtree_stale_node_table_preimage_receipt"
 BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
-AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 5
+AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 6
 TARGET_BINDING_PROJECTION_VERSION = 2
 TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
 TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
 TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
-_CURRENT_RECEIPT_DIALECT_KEY = (7, 1, 5, 1, 2, 1)
-_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6, 7})
+_CURRENT_RECEIPT_DIALECT_KEY = (8, 1, 6, 1, 2, 1)
+_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6, 7, 8})
 _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
     # A real Lauraceae receipt uses this tuple, but the historical core-v1
     # implementation is unavailable.  Its sanitized evidence fixture records
@@ -879,6 +885,12 @@ _AUTHORING_GRAPH_V4_RANDOM_SEED_PROPERTY_PATH = (
     "Properties",
     "Property",
 )
+_AUTHORING_GRAPH_V6_ASSET_PATH_TEXT_PATHS = frozenset({
+    (
+        "SpeedTree", "Assets", "Material_v8", "Map", "TexFilename",
+    ),
+    ("SpeedTree", "Assets", "Roughness", "Filename"),
+})
 
 
 def _v4_tag_name(tag):
@@ -1384,6 +1396,24 @@ def _v5_draw_flags_token(value):
     return f"draw-flags-without-view-bit-0x8:{value_without_view_bit}"
 
 
+def _v6_asset_path_token(value, spm_directory):
+    """Resolve one exact Modeler asset-path field without hiding retargets."""
+    raw_text = str(value or "")
+    text = raw_text.strip()
+    if (
+        spm_directory is None
+        or not text
+        or raw_text != text
+        or "\x00" in text
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text)
+    ):
+        return raw_text
+    candidate = Path(text.replace("/", os.sep))
+    if not candidate.is_absolute():
+        candidate = Path(spm_directory) / candidate
+    return "modeler-asset-path:" + canonical_path_key(candidate)
+
+
 def _v4_generated_atlas_mesh_user_data(element):
     if (
         not _v4_plain_tag(element, "UserData")
@@ -1563,6 +1593,7 @@ def _v4_projected_subtree(
     truthy_value=False,
     physics_bones_context=False,
     projection_version=AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+    spm_directory=None,
 ):
     element_tag = _v4_tag_name(element.tag)
     path = tuple(path) + (element_tag,)
@@ -1579,6 +1610,11 @@ def _v4_projected_subtree(
         and path_key == ("SpeedTree", "DrawFlags8", "DrawFlags")
     ):
         text = _v5_draw_flags_token(text)
+    elif (
+        projection_version >= 6
+        and path_key in _AUTHORING_GRAPH_V6_ASSET_PATH_TEXT_PATHS
+    ):
+        text = _v6_asset_path_token(text, spm_directory)
     elif path_key in {
         (
             "SpeedTree", "Generators", "Generator", "Extra",
@@ -1661,6 +1697,7 @@ def _v4_projected_subtree(
                 truthy_value=child_truthy,
                 physics_bones_context=child_physics_bones,
                 projection_version=projection_version,
+                spm_directory=spm_directory,
             )
             for child in _v4_ordered_children(
                 element,
@@ -1675,12 +1712,22 @@ def _v4_projected_subtree(
     return projected
 
 
-def _authoring_graph_core_projection_for_version(text, projection_version):
+def _authoring_graph_core_projection_for_version(
+    text,
+    projection_version,
+    *,
+    spm_path=None,
+):
     """Project the authored XML tree under one immutable core dialect."""
     root = _v4_parse(text)
     projected = _v4_projected_subtree(
         root,
         projection_version=projection_version,
+        spm_directory=(
+            Path(spm_path).expanduser().resolve(strict=False).parent
+            if projection_version >= 6 and spm_path is not None
+            else None
+        ),
     )
     root_children = [
         child for child in root
@@ -1736,11 +1783,12 @@ def _legacy_authoring_graph_core_v4_projection(text):
     return _authoring_graph_core_projection_for_version(text, 4)
 
 
-def _authoring_graph_core_projection(text):
+def _authoring_graph_core_projection(text, *, spm_path=None):
     """Project the full authored XML tree under current fail-closed rules."""
     return _authoring_graph_core_projection_for_version(
         text,
         AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+        spm_path=spm_path,
     )
 
 
@@ -2103,6 +2151,18 @@ def _authoring_graph_core_v5_candidates(snapshot, _expected_mesh_ids=()):
     }]
 
 
+def _authoring_graph_core_v6_candidates(snapshot, _expected_mesh_ids=()):
+    projection = _authoring_graph_core_projection_for_version(
+        snapshot["text"],
+        6,
+        spm_path=snapshot.get("spm"),
+    )
+    return [{
+        key: value for key, value in projection.items()
+        if not key.startswith("_")
+    }]
+
+
 def _target_binding_v1_candidates(snapshot, expected_mesh_ids):
     return _schema2_target_binding_v1_candidates(snapshot, expected_mesh_ids)
 
@@ -2280,7 +2340,7 @@ def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
         target_projection = _target_binding_projection(delivery, expected_mesh_ids)
         normalization = _normalization_evidence(delivery, target_projection)
         authoring_fingerprint = _authoring_graph_projection_v1(text)
-        authoring_core = _authoring_graph_core_projection(text)
+        authoring_core = _authoring_graph_core_projection(text, spm_path=spm)
     except (ET.ParseError, OSError, RuntimeError, TypeError, UnicodeError, ValueError) as exc:
         raise StaleNodeTableRecoveryError(
             "source_snapshot_parse_failed",
@@ -2300,6 +2360,7 @@ def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
         and regex_counts == elementtree["_eligible_counts"]
     )
     return {
+        "spm": str(spm),
         "source_identity": _source_identity(spm),
         "raw_bytes": raw_bytes,
         "text": text,
@@ -2325,6 +2386,17 @@ def _capture_immutable_snapshot(spm_path, expected_mesh_ids):
         "target_projection": target_projection,
         "normalization": normalization,
     }
+
+
+def _snapshot_with_path_resolution_source(snapshot, source_spm):
+    """Bind backup bytes to their operating SPM base for core-v6 paths."""
+    bound = dict(snapshot)
+    bound["spm"] = str(Path(source_spm).expanduser().resolve(strict=False))
+    bound["authoring_graph_core"] = _authoring_graph_core_projection(
+        bound["text"],
+        spm_path=bound["spm"],
+    )
+    return bound
 
 
 def validate_repaired_snapshot(
@@ -2685,6 +2757,9 @@ def _preimage_receipt(
             "size": snapshot["size"],
             "backup_file": backup_name,
             "backup_raw_sha256": snapshot["raw_sha256"],
+            "source_spm": str(
+                Path(snapshot["spm"]).expanduser().resolve(strict=False)
+            ),
         },
         "authoring_graph_projection": {
             "contract": "speedtree_spm_authoring_graph_projection",
@@ -2743,7 +2818,10 @@ def _preimage_receipt(
             ),
         },
         "safety_boundary": {
-            "modeler_save_automation": False,
+            "modeler_save_automation": True,
+            "modeler_save_automation_mode": (
+                "exact_owned_pid_document_menu_uia_invoke"
+            ),
             "modeler_process_kill": False,
             "ui_keystroke_simulation": False,
             "direct_spm_xml_mutation": False,
@@ -2788,7 +2866,7 @@ def _receipt_target_scopes(receipt):
             "authoring_mesh_ids": requested,
             "required_live_mesh_ids": list(requested),
         }
-    if schema_version not in {5, 6, 7}:
+    if schema_version not in {5, 6, 7, 8}:
         return None
     return _target_requirements_v1_scopes(requirements, requested)
 
@@ -2888,6 +2966,17 @@ _CORE_V5_POLICY = _ProjectionPolicy(
         "global_setting_count",
     ),
 )
+_CORE_V6_POLICY = _ProjectionPolicy(
+    "authoring_graph_core_projection",
+    _authoring_graph_core_v6_candidates,
+    (
+        "fingerprint",
+        "generator_count",
+        "link_count",
+        "asset_identity_count",
+        "global_setting_count",
+    ),
+)
 _MEMBERSHIP_V1_POLICY = _ProjectionPolicy(
     "generator_membership",
     _generator_membership_projection_v1,
@@ -2975,6 +3064,15 @@ _RECEIPT_DIALECTS = MappingProxyType({
         _TARGET_V2_POLICY,
         "explicit_sealed_scopes_v1",
     ),
+    (8, 1, 6, 1, 2, 1): _ReceiptDialect(
+        "schema8_graph1_core6_target2_requirements1",
+        (8, 1, 6, 1, 2, 1),
+        _GRAPH_V1_POLICY,
+        _CORE_V6_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V2_POLICY,
+        "explicit_sealed_scopes_v1",
+    ),
 })
 
 
@@ -3033,7 +3131,7 @@ def _resolve_receipt_dialect_spec(receipt, snapshot=None):
             "authoring_graph_core_projection",
             "speedtree_spm_authoring_graph_core_projection",
         ),)
-    if schema_version in {5, 6, 7}:
+    if schema_version in {5, 6, 7, 8}:
         required_blocks += ((
             "target_requirements",
             "speedtree_stale_node_target_requirements",
@@ -3138,6 +3236,16 @@ def _validate_receipt_binding(
             and sealed_target_scopes["required_live_mesh_ids"]
             == caller_required_live
         )
+    source_spm_valid = bool(
+        dialect.versions[0] < 8
+        or (
+            isinstance(exact, dict)
+            and isinstance(exact.get("source_spm"), str)
+            and canonical_path_key(exact["source_spm"])
+            == canonical_path_key(snapshot.get("spm"))
+            and Path(exact["source_spm"]).name == identity["asset_name"]
+        )
+    )
     valid = bool(
         receipt.get("kind") == PREIMAGE_RECEIPT_KIND
         and receipt.get("recovery_contract") == RECOVERY_CONTRACT
@@ -3158,6 +3266,7 @@ def _validate_receipt_binding(
         and exact.get("spm_text_sha256") == snapshot["text_sha256"]
         and exact.get("size") == snapshot["size"]
         and exact.get("backup_file") == Path(backup_path).name
+        and source_spm_valid
         and historical_target_binding_valid
     )
     if not valid:
@@ -3265,6 +3374,18 @@ def _verify_preimage_artifacts(artifacts, snapshot=None, *, capture_fn=None):
             evidence,
         )
     dialect = _resolve_receipt_dialect_spec(receipt, backup_snapshot)
+    if dialect.versions[0] >= 8:
+        source_spm = exact.get("source_spm")
+        if not isinstance(source_spm, str) or not source_spm:
+            raise StaleNodeTableRecoveryError(
+                "preimage_receipt_verification_failed",
+                "the core-v6 receipt has no sealed path-resolution source",
+                evidence,
+            )
+        backup_snapshot = _snapshot_with_path_resolution_source(
+            backup_snapshot,
+            source_spm,
+        )
     if receipt_on_disk != receipt:
         raise StaleNodeTableRecoveryError(
             "preimage_receipt_verification_failed",
@@ -3289,6 +3410,11 @@ def _verify_preimage_artifacts(artifacts, snapshot=None, *, capture_fn=None):
         and exact.get("size") == backup_snapshot["size"]
         and exact.get("backup_file")
         == Path(artifacts["backup_path"]).name
+        and (
+            dialect.versions[0] < 8
+            or canonical_path_key(exact.get("source_spm"))
+            == canonical_path_key(backup_snapshot.get("spm"))
+        )
     )
     policies = [dialect.graph, dialect.membership, dialect.targets]
     if dialect.core is not None:
@@ -3434,6 +3560,7 @@ def verify_sealed_resave(
             _source_identity(spm),
         ) from exc
     preimage = _capture_immutable_snapshot(backup, authoring)
+    preimage = _snapshot_with_path_resolution_source(preimage, spm)
     artifacts = {
         "backup_path": backup,
         "receipt_path": receipt_file,
@@ -3793,6 +3920,11 @@ def _record_blocked_event(recovery_root, identity, error):
         "after_raw_sha256": evidence.get("after_raw_sha256"),
         "verified_after_sha256": evidence.get("verified_after_sha256"),
         "last_reason_tokens": sorted(evidence.get("last_reason_tokens") or []),
+        "semantic_uia": (
+            copy.deepcopy(evidence.get("semantic_uia"))
+            if isinstance(evidence.get("semantic_uia"), dict)
+            else None
+        ),
     }
     path = recovery_root / ("blocked." + uuid.uuid4().hex + ".json")
     try:
@@ -3801,6 +3933,143 @@ def _record_blocked_event(recovery_root, identity, error):
         error.evidence["blocked_event_sha256"] = _sha256_bytes(path.read_bytes())
     except (OSError, FileExistsError):
         error.evidence["blocked_event_write_failed"] = True
+
+
+def _write_semantic_completion_receipt(
+    recovery_root,
+    identity,
+    baseline,
+    after,
+    artifacts,
+    verdict,
+    target_scopes,
+    save_evidence,
+    close_evidence,
+):
+    """Persist bounded hashes, gates, UIA identity, and session outcome."""
+    before_table = baseline["delivery"].get("node_table") or {}
+    after_table = after["delivery"].get("node_table") or {}
+    payload = {
+        "kind": "speedtree_semantic_modeler_recovery_completion",
+        "schema_version": 1,
+        "recovery_contract": RECOVERY_CONTRACT,
+        **identity,
+        "preimage": {
+            "raw_sha256": baseline["raw_sha256"],
+            "spm_text_sha256": baseline["text_sha256"],
+            "backup_file": artifacts["backup_path"].name,
+            "receipt_file": artifacts["receipt_path"].name,
+            "receipt_sha256": artifacts["receipt_sha256"],
+            "node_table_stale": before_table.get("stale"),
+            "orphan_generator_guid_count": len(
+                before_table.get("orphan_generator_guids") or ()
+            ),
+            "orphan_node_count": int(
+                before_table.get("orphan_node_count") or 0
+            ),
+        },
+        "sealed_scope": {
+            "mode": target_scopes["mode"],
+            "authoring_mesh_ids": list(target_scopes["authoring_mesh_ids"]),
+            "required_live_mesh_ids": list(
+                target_scopes["required_live_mesh_ids"]
+            ),
+        },
+        "postimage": {
+            "raw_sha256": after["raw_sha256"],
+            "spm_text_sha256": after["text_sha256"],
+            "node_table_stale": after_table.get("stale"),
+            "orphan_generator_guid_count": len(
+                after_table.get("orphan_generator_guids") or ()
+            ),
+            "orphan_node_count": int(
+                after_table.get("orphan_node_count") or 0
+            ),
+            "authoring_graph_continuity": verdict[
+                "authoring_graph_continuity"
+            ],
+            "generator_membership_continuity": verdict[
+                "generator_membership_continuity"
+            ],
+            "required_target_binding_continuity": verdict[
+                "required_target_binding_continuity"
+            ],
+        },
+        "semantic_uia": {
+            "save": copy.deepcopy(save_evidence),
+            "close": copy.deepcopy(close_evidence),
+        },
+    }
+    path = Path(recovery_root) / (
+        "completion."
+        + identity["source_identity_sha256"][:16]
+        + "."
+        + after["raw_sha256"][:16]
+        + "."
+        + uuid.uuid4().hex
+        + ".json"
+    )
+    try:
+        _atomic_write_new(path, payload)
+        receipt_sha256 = _sha256_bytes(path.read_bytes())
+    except (OSError, FileExistsError) as exc:
+        raise StaleNodeTableRecoveryError(
+            "semantic_completion_receipt_write_failed",
+            "the verified semantic recovery receipt could not be persisted",
+            _public_hash_evidence(after),
+        ) from exc
+    return {
+        "file": path.name,
+        "sha256": receipt_sha256,
+    }
+
+
+def _validated_semantic_uia_evidence(
+    evidence,
+    spm,
+    operation,
+    *,
+    expected_process_id=None,
+):
+    """Accept only the exact sanitized receipt emitted by the owned adapter."""
+    action = "Save" if operation == "save" else "Close"
+    process_id = evidence.get("owned_process_id") if isinstance(evidence, dict) else None
+    valid = bool(
+        isinstance(evidence, dict)
+        and evidence.get("contract") == SEMANTIC_UIA_CONTRACT
+        and type(process_id) is int
+        and process_id > 0
+        and (
+            expected_process_id is None
+            or process_id == expected_process_id
+        )
+        and evidence.get("document_accessible_name") == Path(spm).name
+        and evidence.get("operation") == operation
+        and evidence.get("menu_path") == ["File", action]
+        and evidence.get("semantic_pattern") == "InvokePattern"
+        and evidence.get("bridge_exit_code") == 0
+        and (
+            operation != "save"
+            or (
+                type(evidence.get("session_reused")) is bool
+                and evidence.get("owned_process_alive_after_invoke") is True
+            )
+        )
+        and (
+            operation != "close"
+            or (
+                evidence.get("exact_document_closed") is True
+                and evidence.get("owned_process_alive_after_close") is True
+            )
+        )
+    )
+    if not valid:
+        raise StaleNodeTableRecoveryError(
+            "semantic_uia_receipt_invalid",
+            "the semantic UIA result is not bound to the exact PID, document, and menu",
+            _source_identity(spm),
+        )
+    return copy.deepcopy(evidence)
 
 
 def recover_stale_node_table(
@@ -3825,6 +4094,7 @@ def recover_stale_node_table(
     expected_preimage_raw_sha256=None,
     continuation_commit_lock=None,
     on_continuation_claimed=None,
+    modeler_session=None,
 ):
     """Seal, open, watch, audit, and resume a bound job at most once."""
     spm = Path(spm_path).expanduser().resolve(strict=False)
@@ -3879,6 +4149,15 @@ def recover_stale_node_table(
         raise StaleNodeTableRecoveryError(
             "continuation_commit_lock_invalid",
             "the continuation commit lock must be a context manager",
+            identity,
+        )
+    if modeler_session is not None and not (
+        callable(getattr(modeler_session, "save_document", None))
+        and callable(getattr(modeler_session, "close_document", None))
+    ):
+        raise StaleNodeTableRecoveryError(
+            "semantic_modeler_session_invalid",
+            "the semantic Modeler session does not expose exact Save and Close",
             identity,
         )
     authoring = target_scopes["authoring_mesh_ids"]
@@ -3939,6 +4218,20 @@ def recover_stale_node_table(
                 "retry_invoked": False,
                 "closure_gate": "operational_snapshot_valid_only",
             }
+        orphan_guids = list(
+            node_table.get("orphan_generator_guids") or ()
+        )
+        orphan_node_count = int(node_table.get("orphan_node_count") or 0)
+        if not orphan_guids or orphan_node_count <= 0:
+            raise StaleNodeTableRecoveryError(
+                "stale_orphan_evidence_missing",
+                "semantic Save is allowed only for a stale table with actual orphan ownership and Nodes",
+                _public_hash_evidence(
+                    baseline,
+                    orphan_generator_guid_count=len(orphan_guids),
+                    orphan_node_count=orphan_node_count,
+                ),
+            )
         if not baseline["regex_elementtree_parity"]:
             raise StaleNodeTableRecoveryError(
                 "preimage_regex_elementtree_mismatch",
@@ -3977,7 +4270,32 @@ def recover_stale_node_table(
         # This is the final effectful prelaunch check.  Modeler starts
         # immediately after the exact immutable backup is recaptured.
         _verify_preimage_artifacts(artifacts, prelaunch)
-        process = launch_fn(executable, spm)
+        process = None
+        semantic_save_evidence = None
+        semantic_close_evidence = None
+        semantic_completion = None
+        if modeler_session is None:
+            process = launch_fn(executable, spm)
+        else:
+            try:
+                semantic_save_evidence = modeler_session.save_document(
+                    executable,
+                    spm,
+                )
+            except SemanticModelerUIAError as exc:
+                raise StaleNodeTableRecoveryError(
+                    exc.reason_token,
+                    "the exact semantic Modeler Save failed closed",
+                    _public_hash_evidence(
+                        prelaunch,
+                        semantic_uia=exc.evidence,
+                    ),
+                ) from exc
+            semantic_save_evidence = _validated_semantic_uia_evidence(
+                semantic_save_evidence,
+                spm,
+                "save",
+            )
         after, verdict = wait_for_valid_resave(
             spm,
             baseline,
@@ -3993,6 +4311,38 @@ def recover_stale_node_table(
             monotonic_fn=monotonic_fn,
             guards=guards,
         )
+        if modeler_session is not None:
+            try:
+                semantic_close_evidence = modeler_session.close_document(spm)
+            except SemanticModelerUIAError as exc:
+                raise StaleNodeTableRecoveryError(
+                    exc.reason_token,
+                    "the exact verified recovery document could not be closed",
+                    _public_hash_evidence(
+                        after,
+                        verified_after_sha256=after["raw_sha256"],
+                        semantic_uia=exc.evidence,
+                    ),
+                ) from exc
+            semantic_close_evidence = _validated_semantic_uia_evidence(
+                semantic_close_evidence,
+                spm,
+                "close",
+                expected_process_id=semantic_save_evidence[
+                    "owned_process_id"
+                ],
+            )
+            semantic_completion = _write_semantic_completion_receipt(
+                root,
+                identity,
+                baseline,
+                after,
+                artifacts,
+                verdict,
+                target_scopes,
+                semantic_save_evidence,
+                semantic_close_evidence,
+            )
         retry_result = None
         claim_name = None
         if retry is not None:
@@ -4030,7 +4380,18 @@ def recover_stale_node_table(
             "preimage_receipt": artifacts["receipt_path"].name,
             "preimage_receipt_sha256": artifacts["receipt_sha256"],
             "modeler_launched": True,
-            "modeler_process_observed_only": process is not None,
+            "modeler_process_observed_only": (
+                modeler_session is None and process is not None
+            ),
+            "semantic_uia": (
+                {
+                    "save": semantic_save_evidence,
+                    "close": semantic_close_evidence,
+                }
+                if modeler_session is not None
+                else None
+            ),
+            "semantic_completion_receipt": semantic_completion,
             "reaudit": verdict,
             "retry_invoked": retry is not None,
             "continuation_claim": claim_name,

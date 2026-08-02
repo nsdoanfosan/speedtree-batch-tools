@@ -651,6 +651,142 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 ])
             )
 
+    def test_selected_manifest_proves_exact_duplicate_name_cluster_material(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_birch_sample"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = asset / "SK_tree_birch_sample_03.spm"
+            spm.write_bytes(b"sanitized-spm")
+            color = cluster / "leaf_main.tga"
+            opacity = cluster / "leaf_main_Opacity.tga"
+            color.write_bytes(b"color")
+            opacity.write_bytes(b"opacity")
+            stmat = asset / "fbx" / f"{spm.stem}.stmat"
+            stmat.parent.mkdir()
+            self._write_raw_stmat(
+                stmat,
+                "M_leaf_main_Mat",
+                {"Color": color, "Opacity": opacity},
+            )
+            scope_dir = asset / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            manifest = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(spm),
+                "blend_file": str(cluster / "SK_leaf_main.blend"),
+                "source_collection": "Atlas_Cluster_Cards",
+                "export_scope_id": "scope-leaf-main",
+                "material_groups": [{
+                    "material": "M_leaf_main",
+                    "material_id": 17,
+                    "mesh_ids": [35],
+                    "blender_cluster_bake_texture": {
+                        "files": {
+                            "albedo": str(color),
+                            "alpha": str(opacity),
+                        },
+                        "origin_receipt": {"proof": "selected-exact-target"},
+                    },
+                }],
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            (scope_dir / f"scope-leaf-main__{spm.stem}.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            slots = [
+                {
+                    "map_index": index,
+                    "map": map_name,
+                    "role": map_name.casefold(),
+                    "authored_ref": str(source),
+                    "resolved_ref": str(source.resolve()),
+                }
+                for index, (map_name, source) in enumerate(
+                    (("Color", color), ("Opacity", opacity))
+                )
+            ]
+            inspection = {
+                "materials": [
+                    {
+                        "material_id": "4",
+                        "material_name": "leaf_main",
+                        "slots": slots,
+                    },
+                    {
+                        "material_id": "17",
+                        "material_name": "M_leaf_main",
+                        "slots": slots,
+                    },
+                ],
+            }
+            live_rows = [{
+                "material_id": "17",
+                "material_name": "M_leaf_main",
+                "cutout_mesh_ids": ["35"],
+                "refs": [str(color), str(opacity)],
+                "managed_leaf_output": True,
+            }]
+
+            def prove_origin(
+                _spm,
+                material,
+                output,
+                _asset_root,
+                *,
+                consumption_context,
+            ):
+                self.assertEqual(material["material_id"], "17")
+                self.assertEqual(
+                    output["origin_receipt"]["proof"],
+                    "selected-exact-target",
+                )
+                self.assertEqual(
+                    consumption_context,
+                    preflight.BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+                )
+                return ({"slot_files": output["slot_files"]}, "")
+
+            with mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value=inspection,
+            ), mock.patch.object(
+                preflight,
+                "extract_material_image_refs",
+                return_value=live_rows,
+            ), mock.patch.object(
+                preflight,
+                "resolve_blender_cluster_bake_origin",
+                side_effect=prove_origin,
+            ), mock.patch.object(
+                preflight,
+                "validate_blender_cluster_bake_receipt_for_consumption",
+                return_value="",
+            ):
+                result = preflight.augment_texture_readiness_contract(
+                    preflight.resolve_texture_bindings(stmat),
+                    stmat,
+                    spm,
+                    source_texture_roots=[],
+                )
+
+            binding = result["bindings"][0]
+            self.assertEqual(
+                binding["texture_contract_status"],
+                "blender_cluster_bake",
+            )
+            self.assertEqual(
+                binding["atlas_manifest_ownership"]["material_id"],
+                "17",
+            )
+            self.assertNotIn("source_rejections", binding)
+
     def test_cluster_bake_receipt_records_proven_stmat_index_space(self):
         root = Path("C:/asset")
         color = root / "cluster" / "color.tga"
