@@ -2248,13 +2248,14 @@ class App:
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
         self.btn_retry_failed = ttk.Button(
             actions,
-            text="↻ 실패 Blender/Unreal 재시도",
+            text="↻ 전체 실패 이력 재시도",
             command=self.start_failed_results_retry,
         )
         self.btn_retry_failed.pack(side="left", padx=(2, 6))
         Tooltip(
             self.btn_retry_failed,
-            "체크된 최근 실패를 원인별로 나눠 재시도합니다.\n"
+            "체크 상태와 무관하게 현재 목록 전체의 실패/stale 이력을 "
+            "원인별로 나눠 재시도합니다.\n"
             "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
             "③ Unreal Push까지 실행\n"
             "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
@@ -4169,26 +4170,27 @@ class App:
         return current_record
 
     def start_failed_results_retry(self):
-        """Classify and partition failed/stale Blender and Unreal retries."""
+        """Classify failed/stale retries across the complete inventory."""
         self._close_cell_editor()
-        selected_iids = [
-            iid for iid, item in self.items.items() if item["checked"]
-        ]
-        if not selected_iids:
-            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+        candidate_iids = list(self.items)
+        if not candidate_iids:
+            messagebox.showinfo(
+                "전체 실패 이력 재시도",
+                "현재 목록 전체에 재시도할 대상이 없습니다.",
+            )
             return
 
         repair_states = {
             iid: self._failed_retry_repair_state(iid)
-            for iid in selected_iids
+            for iid in candidate_iids
         }
         parent_statuses = {
-            iid: UNREAL_PARENT_ABSENT for iid in selected_iids
+            iid: UNREAL_PARENT_ABSENT for iid in candidate_iids
         }
-        parent_diagnostics = {iid: "" for iid in selected_iids}
+        parent_diagnostics = {iid: "" for iid in candidate_iids}
         grouped = {}
 
-        for iid in selected_iids:
+        for iid in candidate_iids:
             entry = self.state.get(iid, {})
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
@@ -4262,7 +4264,7 @@ class App:
                 unreal_parent_diagnostic=parent_diagnostics[iid],
             )
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        decisions = {iid: classify(iid) for iid in candidate_iids}
         rebuild_ids = {
             iid
             for iid, decision in decisions.items()
@@ -4370,19 +4372,19 @@ class App:
             rebuild_ids.update(conflicting["selected_queue_ids"])
             recovery_requests.remove(conflicting)
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        decisions = {iid: classify(iid) for iid in candidate_iids}
         export_iids = [
             iid
-            for iid in selected_iids
+            for iid in candidate_iids
             if decisions[iid].classification == BLENDER_REBUILD
         ]
         unreal_iids = [
             iid
-            for iid in selected_iids
+            for iid in candidate_iids
             if decisions[iid].classification == UNREAL_ONLY
         ]
         skipped = []
-        for iid in selected_iids:
+        for iid in candidate_iids:
             decision = decisions[iid]
             if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
                 continue
@@ -4398,16 +4400,18 @@ class App:
 
         if skipped:
             self.log(
-                "실패/stale 재시도 제외:\n  - " + "\n  - ".join(skipped)
+                "전체 대상 실패/stale 재시도 제외:\n  - "
+                + "\n  - ".join(skipped)
             )
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
-            iid for iid in selected_iids if iid in eligible_set
+            iid for iid in candidate_iids if iid in eligible_set
         ]
         if not eligible_iids:
             messagebox.showinfo(
-                "실패 Blender/Unreal 재시도",
-                "재시도 가능한 선택 항목이 없습니다.\n\n"
+                "전체 실패 이력 재시도",
+                "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
+                "없습니다.\n\n"
                 + "\n".join(skipped[:8]),
             )
             return
