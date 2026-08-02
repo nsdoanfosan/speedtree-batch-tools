@@ -34,6 +34,7 @@ from stale_node_table_recovery import (  # noqa: E402
     _ensure_preimage_artifacts,
     _legacy_authoring_graph_core_v2_projection,
     _legacy_authoring_graph_core_v3_projection,
+    _legacy_authoring_graph_core_v4_projection,
     _legacy_target_binding_fingerprint,
     _release_session_lock,
     _resolve_receipt_dialect,
@@ -58,6 +59,27 @@ def _node(guid):
         "<Hidden>false</Hidden>"
         "<Extra><m_bDeleted>false</m_bDeleted><m_bCulled>false</m_bCulled></Extra>"
         "</Node>"
+    )
+
+
+def default_disabled_planar_2():
+    return (
+        "<SplineProperty><Name>Forces:Planar 2</Name>"
+        "<Value>0.25</Value><Variance>0</Variance><Enabled>false</Enabled>"
+        "<CohesionScale>1</CohesionScale><CohesionOffset>0</CohesionOffset>"
+        "<Distribution>0</Distribution><ForceBehaviorID>-1</ForceBehaviorID>"
+        "<Relative>true</Relative><CompoundParentSpline Count=\"1\">"
+        "<Spline DrawMode=\"false\">"
+        "<ControlPoint><X>0</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "<ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "</Spline></CompoundParentSpline><ProfileSpline DrawMode=\"false\">"
+        "<ControlPoint><X>0</X><Y>0</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "<ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "</ProfileSpline></SplineProperty>"
     )
 
 
@@ -534,6 +556,103 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 _authoring_graph_core_projection(changed)["fingerprint"],
             )
 
+    def test_core_v5_accepts_only_exact_disabled_default_planar_2(self):
+        before = spm_text(stale=True)
+        planar = default_disabled_planar_2()
+        after = spm_text(stale=False).replace(
+            "<Properties></Properties></Generator>",
+            f"<Properties>{planar}</Properties></Generator>",
+            1,
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["version"],
+            5,
+        )
+        self.assertEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["version"],
+            4,
+        )
+        self.assertNotEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["fingerprint"],
+            _legacy_authoring_graph_core_v4_projection(after)["fingerprint"],
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(after)["fingerprint"],
+        )
+
+        mutations = {
+            "other name": planar.replace("Forces:Planar 2", "Forces:Planar 3", 1),
+            "value": planar.replace("<Value>0.25</Value>", "<Value>0.5</Value>", 1),
+            "variance": planar.replace("<Variance>0</Variance>", "<Variance>1</Variance>", 1),
+            "active": planar.replace("<Enabled>false</Enabled>", "<Enabled>true</Enabled>", 1),
+            "cohesion": planar.replace("<CohesionScale>1</CohesionScale>", "<CohesionScale>0.5</CohesionScale>", 1),
+            "behavior": planar.replace("<ForceBehaviorID>-1</ForceBehaviorID>", "<ForceBehaviorID>0</ForceBehaviorID>", 1),
+            "relative": planar.replace("<Relative>true</Relative>", "<Relative>false</Relative>", 1),
+            "compound count": planar.replace('Count="1"', 'Count="2"', 1),
+            "compound spline": planar.replace("<Y>1</Y>", "<Y>0.9</Y>", 1),
+            "profile": planar.replace(
+                '<ProfileSpline DrawMode="false"><ControlPoint><X>0</X>',
+                '<ProfileSpline DrawMode="false"><ControlPoint><X>0.1</X>',
+                1,
+            ),
+            "attribute": planar.replace("<SplineProperty>", '<SplineProperty Future="1">', 1),
+            "extra child": planar.replace("</SplineProperty>", "<Future>1</Future></SplineProperty>", 1),
+            "duplicate": planar + planar,
+        }
+        baseline = _authoring_graph_core_projection(before)["fingerprint"]
+        for name, changed_planar in mutations.items():
+            with self.subTest(name=name):
+                changed = spm_text(stale=False).replace(
+                    "<Properties></Properties></Generator>",
+                    f"<Properties>{changed_planar}</Properties></Generator>",
+                    1,
+                )
+                self.assertNotEqual(
+                    baseline,
+                    _authoring_graph_core_projection(changed)["fingerprint"],
+                )
+
+        wrong_ancestry = spm_text(stale=False).replace(
+            "</SpeedTree>",
+            f"<UnknownRoot>{planar}</UnknownRoot></SpeedTree>",
+            1,
+        )
+        self.assertNotEqual(
+            baseline,
+            _authoring_graph_core_projection(wrong_ancestry)["fingerprint"],
+        )
+
+    def test_core_v5_neutralizes_only_draw_flags_view_bit_0x8(self):
+        def with_draw_flags(text, value):
+            return text.replace(
+                "<SpeedTree>",
+                "<SpeedTree><DrawFlags8>"
+                f"<DrawFlags>{value}</DrawFlags>"
+                "</DrawFlags8>",
+                1,
+            )
+
+        before = with_draw_flags(spm_text(stale=True), "3732")
+        after = with_draw_flags(spm_text(stale=False), "3740")
+        self.assertNotEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["fingerprint"],
+            _legacy_authoring_graph_core_v4_projection(after)["fingerprint"],
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(after)["fingerprint"],
+        )
+
+        baseline = _authoring_graph_core_projection(before)["fingerprint"]
+        for value in ("3741", "3733", " 3740", "not-an-integer"):
+            with self.subTest(value=value):
+                changed = with_draw_flags(spm_text(stale=False), value)
+                self.assertNotEqual(
+                    baseline,
+                    _authoring_graph_core_projection(changed)["fingerprint"],
+                )
+
     def test_authoring_core_preserves_root_and_material_authored_values(self):
         before = authored_scope_text(
             stale=True,
@@ -782,7 +901,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             [130],
         )
         self.assertTrue(result["reaudit"]["normalization"]["applicable"])
-        self.assertEqual(receipt["schema_version"], 6)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(
             receipt["target_requirements"]["required_live_mesh_ids"],
             [130],
@@ -1023,7 +1142,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             )
         self.assertEqual(result["status"], "repaired_reaudit_valid")
 
-    def test_schema5_core_v3_receipt_reaudits_byte_for_byte_under_v4(self):
+    def test_schema5_core_v3_receipt_reaudits_byte_for_byte_under_v5(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -1070,7 +1189,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            4,
+            5,
         )
 
     def test_exact_backup_and_immutable_receipt_exist_before_modeler_launch(self):
@@ -1087,12 +1206,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 self.assertEqual(backups[0].read_bytes(), preimage)
                 receipt_text = receipts[0].read_text(encoding="utf-8")
                 receipt = json.loads(receipt_text)
-                self.assertEqual(receipt["schema_version"], 6)
+                self.assertEqual(receipt["schema_version"], 7)
                 self.assertEqual(
                     receipt["authoring_graph_projection"]["version"], 1
                 )
                 self.assertEqual(
-                    receipt["authoring_graph_core_projection"]["version"], 4
+                    receipt["authoring_graph_core_projection"]["version"], 5
                 )
                 self.assertEqual(receipt["generator_membership"]["version"], 1)
                 self.assertEqual(receipt["required_target_bindings"]["version"], 2)
@@ -1529,7 +1648,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             self.assertEqual(reused["receipt_path"].read_bytes(), sealed_bytes)
             self.assertEqual(reused["receipt_sha256"], sealed_sha)
 
-    def test_schema3_core_v2_is_rebuilt_before_current_v4_projection(self):
+    def test_schema3_core_v2_is_rebuilt_before_current_v5_projection(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -1563,7 +1682,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertFalse(result["modeler_launched"])
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            4,
+            5,
         )
 
     def test_receipt_schema_versions_require_exact_integer_types(self):
