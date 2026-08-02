@@ -145,6 +145,123 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertEqual(automation["status"], "automatic_repair_completed")
         self.assertEqual(app._phase_result_summary["completed_count"], 1)
 
+    def test_repaired_cluster_resumes_blocked_consumer_in_same_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": None,
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+            return True
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            captured_targets,
+            [str(self.first), str(self.second)],
+        )
+        self.assertEqual(app._phase_result_summary["completed_count"], 2)
+        self.assertTrue(any(
+            "필수 Cluster 복구 후 Blender 재개" in str(call.args[0])
+            for call in app.log.call_args_list
+        ))
+
+    def test_failed_cluster_repair_finally_blocks_consumer_without_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._run_full_pipeline = mock.Mock()
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-failed")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "failed", "error": "sanitized failure"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        app._run_full_pipeline.assert_not_called()
+        outcomes = {
+            row["target"]: row for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(outcomes[str(self.first)]["outcome"], "failed")
+        self.assertEqual(outcomes[str(self.second)]["outcome"], "blocked")
+        self.assertEqual(
+            outcomes[str(self.second)]["reason_token"],
+            "required_cluster_repair_failed",
+        )
+
+    def test_cancelled_cluster_repair_cancels_consumer_resumably(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._run_full_pipeline = mock.Mock()
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-cancelled")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "cancelled"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        app._run_full_pipeline.assert_not_called()
+        outcomes = {
+            row["target"]: row for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(outcomes[str(self.first)]["outcome"], "cancelled")
+        self.assertEqual(outcomes[str(self.second)]["outcome"], "cancelled")
+        self.assertEqual(
+            outcomes[str(self.second)]["reason_token"],
+            "required_cluster_repair_cancelled",
+        )
+        self.assertEqual(
+            app.state[str(self.second)]["push_status_kind"],
+            "cancelled",
+        )
+
     def test_live_atlas_conflict_enters_structured_repair_evidence(self):
         gui = load_gui_module()
         app = self.app(gui)
@@ -488,6 +605,76 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertIsNone(duplicate)
         app._enqueue_batch_job.assert_called_once_with(job)
         tracker.complete_planning_commit.assert_called_once_with()
+
+    def test_planner_keeps_dependency_blocked_consumer_with_cluster_repair(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        cluster_iid = str(self.first)
+        consumer_iid = str(self.second)
+        app.state = {
+            cluster_iid: {
+                "push_status_kind": "data_error",
+                "push_status_error": {
+                    "kind": "data_error",
+                    "reason_code": "managed_texture_set_incomplete",
+                    "message": "sanitized cluster failure",
+                },
+            },
+            consumer_iid: {
+                "blend_status_kind": "dependency_blocked",
+                "blend_status_error": {
+                    "kind": "dependency_blocked",
+                    "message": "sanitized dependency block",
+                    "blocked_by": [cluster_iid],
+                },
+            },
+        }
+
+        def evidence(iid, _repair_state=None):
+            if iid == cluster_iid:
+                return {
+                    "reason_code": "managed_texture_set_incomplete",
+                    "canonical_spm": iid,
+                }
+            return {
+                "selected_failure": {
+                    "reason_token": "shared_dependency_failed",
+                    "evidence": {"blocked_by": [cluster_iid]},
+                },
+            }
+
+        app._failed_retry_durable_evidence = mock.Mock(side_effect=evidence)
+        repair_plan = mock.Mock()
+        repair_plan.supported = True
+        repair_plan.metadata.return_value = self.plan(self.first, "planned")
+        inventory = {
+            cluster_iid: {"spm": self.first},
+            consumer_iid: {"spm": self.second},
+        }
+
+        with mock.patch.object(
+            gui,
+            "build_exact_target_repair_plan",
+            return_value=repair_plan,
+        ):
+            built = app._build_failed_retry_plan(
+                [cluster_iid, consumer_iid],
+                {"push_transport": "rpc"},
+                inventory_snapshot=inventory,
+            )
+
+        self.assertEqual(len(built["jobs"]), 1)
+        job = built["jobs"][0]
+        self.assertEqual(job["mode"], "failed_retry_repair")
+        self.assertEqual(
+            [str(item["spm"]) for item in job["targets"]],
+            [cluster_iid, consumer_iid],
+        )
+        self.assertEqual(
+            job["resume_after_repairs"],
+            {consumer_iid: [cluster_iid]},
+        )
+        self.assertEqual(len(job["repair_plans"]), 1)
 
     def test_planning_cancel_wins_before_commit_without_enqueue(self):
         gui = load_gui_module()

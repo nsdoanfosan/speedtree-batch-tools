@@ -182,6 +182,7 @@ _PLAN_JOB_FIELDS = frozenset({
     "push_transport",
     "recovery_requests",
     "repair_plans",
+    "resume_after_repairs",
     "retry_metadata",
 })
 

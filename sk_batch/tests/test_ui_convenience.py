@@ -701,6 +701,40 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertEqual(
             caught.exception.report["evidence"]["status"], "repairable"
         )
+        self.assertIn("자동 복구 대상", str(caught.exception))
+        self.assertIn("원인:", str(caught.exception))
+        self.assertIn("조치:", str(caught.exception))
+        self.assertNotIn("preflight failed", str(caught.exception))
+
+    def test_canonical_atlas_real_ownership_conflict_is_korean_final_block(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report={
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {
+                    "status": "unrepairable",
+                    "reason": "different source identity",
+                },
+            },
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ):
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_canonical_atlas_manifests(spm)
+
+        message = str(caught.exception)
+        self.assertIn("최종 차단", message)
+        self.assertIn("서로 다른 원본", message)
+        self.assertIn("임의로 덮어쓰지 않습니다", message)
+        self.assertNotIn("ownership conflict", message)
 
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()
