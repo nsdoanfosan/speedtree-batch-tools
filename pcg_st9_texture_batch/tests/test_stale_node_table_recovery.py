@@ -30,12 +30,14 @@ from stale_node_table_recovery import (  # noqa: E402
     StaleNodeTableRecoveryTimeout,
     _acquire_session_lock,
     _authoring_graph_core_projection,
+    _authoring_graph_core_projection_for_version,
     _capture_immutable_snapshot,
     _ensure_preimage_artifacts,
     _legacy_authoring_graph_core_v2_projection,
     _legacy_authoring_graph_core_v3_projection,
     _legacy_authoring_graph_core_v4_projection,
     _legacy_target_binding_fingerprint,
+    _preimage_receipt,
     _release_session_lock,
     _resolve_receipt_dialect,
     _resolve_target_scopes,
@@ -43,6 +45,10 @@ from stale_node_table_recovery import (  # noqa: E402
     build_parser,
     recover_stale_node_table,
     verify_sealed_resave,
+)
+from pcg_st9_texture_batch.speedtree_modeler_uia import (  # noqa: E402
+    SEMANTIC_UIA_CONTRACT,
+    SemanticModelerUIAError,
 )
 
 
@@ -329,6 +335,7 @@ class RecoveryTestCase(unittest.TestCase):
         expected_preimage_raw_sha256=None,
         continuation_commit_lock=None,
         on_continuation_claimed=None,
+        modeler_session=None,
     ):
         clock = FakeClock()
         after_text = after_text or spm_text(stale=False, volatile="two")
@@ -360,6 +367,7 @@ class RecoveryTestCase(unittest.TestCase):
             expected_preimage_raw_sha256=expected_preimage_raw_sha256,
             continuation_commit_lock=continuation_commit_lock,
             on_continuation_claimed=on_continuation_claimed,
+            modeler_session=modeler_session,
         )
 
 
@@ -556,7 +564,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 _authoring_graph_core_projection(changed)["fingerprint"],
             )
 
-    def test_core_v5_accepts_only_exact_disabled_default_planar_2(self):
+    def test_core_v6_accepts_only_exact_disabled_default_planar_2(self):
         before = spm_text(stale=True)
         planar = default_disabled_planar_2()
         after = spm_text(stale=False).replace(
@@ -566,7 +574,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         )
         self.assertEqual(
             _authoring_graph_core_projection(before)["version"],
-            5,
+            6,
         )
         self.assertEqual(
             _legacy_authoring_graph_core_v4_projection(before)["version"],
@@ -623,7 +631,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
             _authoring_graph_core_projection(wrong_ancestry)["fingerprint"],
         )
 
-    def test_core_v5_neutralizes_only_draw_flags_view_bit_0x8(self):
+    def test_core_v6_neutralizes_only_draw_flags_view_bit_0x8(self):
         def with_draw_flags(text, value):
             return text.replace(
                 "<SpeedTree>",
@@ -773,13 +781,21 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
 
     def test_contract_publishes_every_forbidden_and_required_boundary(self):
         contract = _stale_node_table_recovery_contract()
-        self.assertEqual(contract["schema_version"], 2)
-        self.assertFalse(contract["modeler_auto_save"])
+        self.assertEqual(contract["schema_version"], 3)
+        self.assertTrue(contract["modeler_auto_save"])
+        self.assertEqual(
+            contract["modeler_auto_save_mode"],
+            "exact_owned_pid_document_menu_uia_invoke",
+        )
         self.assertFalse(contract["modeler_process_kill"])
         self.assertFalse(contract["direct_spm_xml_edit"])
         self.assertFalse(contract["ui_input_simulation"])
         self.assertFalse(contract["automatic_rollback"])
         self.assertFalse(contract["stale_false_alone_allows_retry"])
+        self.assertTrue(contract["requires_node_table_stale"])
+        self.assertTrue(contract["requires_nonzero_orphan_owners"])
+        self.assertTrue(contract["requires_nonzero_orphan_nodes"])
+        self.assertTrue(contract["requires_complete_sealed_scope"])
         self.assertTrue(contract["requires_exact_preimage_backup"])
         self.assertTrue(contract["requires_immutable_preimage_receipt"])
         self.assertTrue(contract["source_sha_rechecked_before_continuation"])
@@ -901,7 +917,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             [130],
         )
         self.assertTrue(result["reaudit"]["normalization"]["applicable"])
-        self.assertEqual(receipt["schema_version"], 7)
+        self.assertEqual(receipt["schema_version"], 8)
         self.assertEqual(
             receipt["target_requirements"]["required_live_mesh_ids"],
             [130],
@@ -1189,7 +1205,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            5,
+            6,
         )
 
     def test_exact_backup_and_immutable_receipt_exist_before_modeler_launch(self):
@@ -1206,12 +1222,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 self.assertEqual(backups[0].read_bytes(), preimage)
                 receipt_text = receipts[0].read_text(encoding="utf-8")
                 receipt = json.loads(receipt_text)
-                self.assertEqual(receipt["schema_version"], 7)
+                self.assertEqual(receipt["schema_version"], 8)
                 self.assertEqual(
                     receipt["authoring_graph_projection"]["version"], 1
                 )
                 self.assertEqual(
-                    receipt["authoring_graph_core_projection"]["version"], 5
+                    receipt["authoring_graph_core_projection"]["version"], 6
                 )
                 self.assertEqual(receipt["generator_membership"]["version"], 1)
                 self.assertEqual(receipt["required_target_bindings"]["version"], 2)
@@ -1227,7 +1243,10 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                     receipt["target_requirements"]["required_live_mesh_ids"],
                     list(TARGET_MESH_IDS),
                 )
-                self.assertNotIn(str(folder), receipt_text)
+                self.assertEqual(
+                    receipt["exact_preimage"]["source_spm"],
+                    str(spm.resolve(strict=False)),
+                )
                 self.assertNotIn("g-130", receipt_text)
 
             result = self.recover_with_save(
@@ -1682,7 +1701,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertFalse(result["modeler_launched"])
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            5,
+            6,
         )
 
     def test_receipt_schema_versions_require_exact_integer_types(self):
@@ -2238,6 +2257,254 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 "source_changed_before_modeler_launch",
             )
             self.assertEqual(launched, [])
+
+
+class Schema7PathCompatibilityTests(RecoveryTestCase):
+    def make_schema7_artifacts(self, folder, *, absolute_texture):
+        spm = folder / "model.spm"
+        backup = folder / "model.preimage.spm"
+        receipt_path = folder / "model.receipt.json"
+        before = authored_scope_text(
+            stale=True,
+            guid_suffix="schema7",
+            volatile="before",
+            material_filename=str(absolute_texture),
+        )
+        write_spm(spm, before)
+        baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+        target_scopes, error = _resolve_target_scopes(TARGET_MESH_IDS)
+        self.assertIsNone(error)
+        receipt = _preimage_receipt(
+            baseline,
+            target_scopes,
+            backup.name,
+        )
+        receipt["schema_version"] = 7
+        receipt["exact_preimage"].pop("source_spm")
+        legacy_core = _authoring_graph_core_projection_for_version(before, 5)
+        receipt["authoring_graph_core_projection"] = {
+            key: value
+            for key, value in legacy_core.items()
+            if not key.startswith("_")
+        }
+        backup.write_bytes(spm.read_bytes())
+        receipt_path.write_text(
+            json.dumps(receipt, sort_keys=True),
+            encoding="utf-8",
+        )
+        return spm, backup, receipt_path
+
+    def test_schema7_core5_receipt_accepts_only_same_resolved_texture_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            texture = folder / "textures" / "leaf.png"
+            texture.parent.mkdir()
+            texture.write_bytes(b"fixture")
+            spm, backup, receipt = self.make_schema7_artifacts(
+                folder,
+                absolute_texture=texture,
+            )
+            after = authored_scope_text(
+                stale=False,
+                guid_suffix="schema7",
+                volatile="after",
+                material_filename=str(Path("textures") / "leaf.png"),
+            )
+            write_spm(spm, after)
+
+            result = verify_sealed_resave(
+                spm,
+                backup,
+                receipt,
+                TARGET_MESH_IDS,
+            )
+
+            self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
+            self.assertEqual(
+                result["reaudit"]["authoring_graph_core_projection_version"],
+                6,
+            )
+
+    def test_schema7_core5_receipt_rejects_relative_retarget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            texture = folder / "textures" / "leaf.png"
+            texture.parent.mkdir()
+            texture.write_bytes(b"fixture")
+            spm, backup, receipt = self.make_schema7_artifacts(
+                folder,
+                absolute_texture=texture,
+            )
+            after = authored_scope_text(
+                stale=False,
+                guid_suffix="schema7",
+                volatile="after",
+                material_filename=str(Path("other") / "leaf.png"),
+            )
+            write_spm(spm, after)
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                verify_sealed_resave(
+                    spm,
+                    backup,
+                    receipt,
+                    TARGET_MESH_IDS,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "sealed_resave_reaudit_failed",
+            )
+            self.assertIn(
+                "authoring_graph_changed_during_resave",
+                caught.exception.evidence["reason_tokens"],
+            )
+
+
+class SemanticUIARecoveryTests(RecoveryTestCase):
+    @staticmethod
+    def semantic_receipt(path, operation, *, reused=False):
+        return {
+            "contract": SEMANTIC_UIA_CONTRACT,
+            "owned_process_id": 4242,
+            "document_accessible_name": Path(path).name,
+            "operation": operation,
+            "menu_path": [
+                "File",
+                "Save" if operation == "save" else "Close",
+            ],
+            "semantic_pattern": "InvokePattern",
+            "bridge_exit_code": 0,
+            "session_reused": reused,
+            "owned_process_alive_after_invoke": True,
+        }
+
+    def test_stale_orphan_target_invokes_save_once_then_closes_after_reaudit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            calls = []
+            after_text = spm_text(stale=False, volatile="semantic")
+
+            class Session:
+                def save_document(inner_self, observed_executable, observed_spm):
+                    calls.append(("save", Path(observed_executable), Path(observed_spm)))
+                    write_spm(spm, after_text)
+                    return self.semantic_receipt(observed_spm, "save")
+
+                def close_document(inner_self, observed_spm):
+                    calls.append(("close", Path(observed_spm)))
+                    receipt = self.semantic_receipt(observed_spm, "close")
+                    receipt["exact_document_closed"] = True
+                    receipt["owned_process_alive_after_close"] = True
+                    return receipt
+
+            result = self.recover_with_save(
+                spm,
+                executable,
+                root,
+                modeler_session=Session(),
+            )
+
+            self.assertEqual([row[0] for row in calls], ["save", "close"])
+            self.assertTrue(result["reaudit"]["valid"])
+            node_table = result["reaudit"]["target_delivery"]["node_table"]
+            self.assertFalse(node_table["stale"])
+            self.assertEqual(node_table["orphan_node_count"], 0)
+            completion = result["semantic_completion_receipt"]
+            completion_path = root / completion["file"]
+            self.assertTrue(completion_path.is_file())
+            payload = json.loads(completion_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["preimage"]["node_table_stale"], True)
+            self.assertGreater(payload["preimage"]["orphan_generator_guid_count"], 0)
+            self.assertGreater(payload["preimage"]["orphan_node_count"], 0)
+            self.assertEqual(payload["postimage"]["node_table_stale"], False)
+            self.assertEqual(payload["postimage"]["orphan_generator_guid_count"], 0)
+            self.assertEqual(payload["postimage"]["orphan_node_count"], 0)
+            self.assertTrue(payload["postimage"]["authoring_graph_continuity"])
+            self.assertTrue(payload["postimage"]["generator_membership_continuity"])
+            self.assertTrue(payload["postimage"]["required_target_binding_continuity"])
+            self.assertEqual(payload["semantic_uia"]["save"]["owned_process_id"], 4242)
+            self.assertEqual(payload["semantic_uia"]["close"]["menu_path"], ["File", "Close"])
+
+    def test_zero_orphan_stale_evidence_never_invokes_semantic_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            calls = []
+
+            def zero_orphan_capture(path, expected):
+                snapshot = _capture_immutable_snapshot(path, expected)
+                node_table = snapshot["delivery"]["node_table"]
+                node_table["stale"] = True
+                node_table["orphan_generator_guids"] = []
+                node_table["orphan_node_count"] = 0
+                return snapshot
+
+            class Session:
+                def save_document(inner_self, *_args):
+                    calls.append("save")
+
+                def close_document(inner_self, *_args):
+                    calls.append("close")
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    capture_fn=zero_orphan_capture,
+                    modeler_session=Session(),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "stale_orphan_evidence_missing",
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(list(root.glob("*.preimage.spm")), [])
+
+    def test_ambiguous_document_blocks_without_close_or_source_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            before = spm.read_bytes()
+            calls = []
+
+            class Session:
+                def save_document(inner_self, _executable, observed_spm):
+                    calls.append("save")
+                    raise SemanticModelerUIAError(
+                        "uia_document_ambiguous",
+                        "fixture ambiguity",
+                        {
+                            "owned_process_id": 4242,
+                            "document_accessible_name": Path(observed_spm).name,
+                            "operation": "save",
+                        },
+                    )
+
+                def close_document(inner_self, *_args):
+                    calls.append("close")
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    modeler_session=Session(),
+                )
+
+            self.assertEqual(caught.exception.reason_token, "uia_document_ambiguous")
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(spm.read_bytes(), before)
+            blocked = json.loads(
+                (root / caught.exception.evidence["blocked_event"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(blocked["semantic_uia"]["owned_process_id"], 4242)
+            self.assertEqual(blocked["semantic_uia"]["operation"], "save")
 
 
 class QuiescenceAndGraphGateTests(RecoveryTestCase):

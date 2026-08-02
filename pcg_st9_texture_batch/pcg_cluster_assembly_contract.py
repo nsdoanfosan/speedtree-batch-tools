@@ -2052,7 +2052,7 @@ def _inactive_causal_path_evidence(binding):
 
 
 STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
-STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
+STALE_NODE_TABLE_RECOVERY_MODE = "owned_semantic_uia_modeler_save_watch"
 STALE_NODE_TABLE_REMEDY = (
     "대상 SPM의 저장된 <Node> 테이블이 현재 Generator 그래프와 맞지 않습니다"
     " (없는 Generator에 노드가 남아 있음). Generator 연결 자체는 정상이며 export"
@@ -2062,17 +2062,25 @@ STALE_NODE_TABLE_REMEDY = (
 
 
 def _stale_node_table_recovery_contract():
-    """Describe the safe recovery boundary without claiming unattended save."""
+    """Describe the gated exact-PID semantic Modeler recovery boundary."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": STALE_NODE_TABLE_RECOVERY_MODE,
         "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
-        "modeler_auto_save": False,
+        "modeler_auto_save": True,
+        "modeler_auto_save_mode": "exact_owned_pid_document_menu_uia_invoke",
         "modeler_process_kill": False,
         "direct_spm_xml_edit": False,
         "ui_input_simulation": False,
         "automatic_rollback": False,
-        "requires_user_save": True,
+        "requires_user_save": False,
+        "requires_node_table_stale": True,
+        "requires_nonzero_orphan_owners": True,
+        "requires_nonzero_orphan_nodes": True,
+        "requires_complete_sealed_scope": True,
+        "closes_exact_document_after_valid_reaudit": True,
+        "keeps_owned_modeler_session_alive": True,
+        "unrelated_modeler_session_adoption": False,
         "requires_exact_preimage_backup": True,
         "requires_immutable_preimage_receipt": True,
         "authoring_graph_projection_version": 1,
