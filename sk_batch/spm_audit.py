@@ -232,6 +232,16 @@ def _retryable_windows_lock_error(exc):
     )
 
 
+# 1175 is ERROR_UNABLE_TO_REMOVE_REPLACED, which ReplaceFileW returns when it
+# cannot delete the file it is replacing -- an indexer or a virus scanner
+# holding a transient handle on a file that was just written. It is the same
+# class of failure as 5/32/33 and the same answer applies: the call did nothing,
+# so retrying it is safe. Left out deliberately: 1176 and 1177, where the
+# replacement could not be moved and the destination may already have been
+# renamed, which is not a state to retry blindly into.
+_WINDOWS_TRANSIENT_FILE_LOCK_ERRORS = frozenset({5, 32, 33, 1175})
+
+
 def _retryable_file_operation_error(exc):
     return (
         getattr(exc, "errno", None)
@@ -240,7 +250,8 @@ def _retryable_file_operation_error(exc):
             errno.EAGAIN,
             getattr(errno, "EBUSY", errno.EACCES),
         }
-        or getattr(exc, "winerror", None) in {5, 32, 33}
+        or getattr(exc, "winerror", None)
+        in _WINDOWS_TRANSIENT_FILE_LOCK_ERRORS
     )
 
 
@@ -473,16 +484,28 @@ def _replace_file_with_rescue(
         ctypes.c_void_p,
     )
     kernel32.ReplaceFileW.restype = ctypes.c_bool
-    if not kernel32.ReplaceFileW(
-        str(target),
-        str(temporary),
-        str(rescue),
-        0,
-        None,
-        None,
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return rescue
+    # Every other file operation on this path already retries a transient lock
+    # -- unlink, os.replace, the snapshot reads. This one did not, so a scanner
+    # holding the target for a few milliseconds failed the whole atomic write.
+    # A failed ReplaceFileW has done nothing, so the retry re-enters a clean
+    # state; the caller's fingerprint comparison still decides who won.
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        if kernel32.ReplaceFileW(
+            str(target),
+            str(temporary),
+            str(rescue),
+            0,
+            None,
+            None,
+        ):
+            return rescue
+        last_error = ctypes.WinError(ctypes.get_last_error())
+        if not _retryable_file_operation_error(last_error):
+            raise last_error
+        if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+            _sleep_file_backoff(attempt)
+    raise last_error
 
 
 def _restore_conflict_rescue(

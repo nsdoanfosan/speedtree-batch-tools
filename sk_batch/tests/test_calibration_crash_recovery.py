@@ -5,6 +5,7 @@ but Stop and the watchdog timeout both use ``taskkill /T /F`` and run no
 handler at all.  The in-progress marker makes that state detectable, and the
 next run repairs it from the recorded backup before reading the source.
 """
+import ctypes
 import hashlib
 import gzip
 import json
@@ -739,6 +740,116 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(caught.exception.diagnostic["attempts"], 3)
         self.assertEqual(spm_audit.read_spm(self.spm), SOURCE_XML)
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_replace_file_retries_transient_scanner_lock(self):
+        """WinError 1175 is a held handle, not a verdict.
+
+        CI failed three runs on 2026-08-02 -- two of them merge commits on
+        main -- inside this swap, with ERROR_UNABLE_TO_REMOVE_REPLACED. Every
+        neighbouring file operation already backs off on a transient lock.
+        """
+        temporary = self.root / "replacement.bin"
+        temporary.write_bytes(b"pipeline replacement")
+        self.spm.write_bytes(b"live target")
+        attempts = {"count": 0}
+
+        def flaky_replace(target, replacement, backup, flags, a, b):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                ctypes.set_last_error(1175)
+                return False
+            os.replace(replacement, target)
+            Path(backup).write_bytes(b"displaced")
+            return True
+
+        with self._patched_replace_file(flaky_replace), mock.patch.object(
+            spm_audit, "_sleep_file_backoff"
+        ) as slept:
+            rescue = spm_audit._replace_file_with_rescue(
+                temporary,
+                self.spm,
+                require_existing=True,
+            )
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(self.spm.read_bytes(), b"pipeline replacement")
+        self.assertEqual(Path(rescue).read_bytes(), b"displaced")
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_replace_file_does_not_retry_a_non_transient_error(self):
+        temporary = self.root / "replacement.bin"
+        temporary.write_bytes(b"pipeline replacement")
+        self.spm.write_bytes(b"live target")
+        attempts = {"count": 0}
+
+        def always_denied(target, replacement, backup, flags, a, b):
+            attempts["count"] += 1
+            # ERROR_FILE_NOT_FOUND: nothing about it improves by waiting.
+            ctypes.set_last_error(2)
+            return False
+
+        with self._patched_replace_file(always_denied), mock.patch.object(
+            spm_audit, "_sleep_file_backoff"
+        ) as slept:
+            with self.assertRaises(OSError) as caught:
+                spm_audit._replace_file_with_rescue(
+                    temporary,
+                    self.spm,
+                    require_existing=True,
+                )
+
+        self.assertEqual(caught.exception.winerror, 2)
+        self.assertEqual(attempts["count"], 1)
+        slept.assert_not_called()
+        self.assertEqual(self.spm.read_bytes(), b"live target")
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
+    def test_replace_file_gives_up_after_the_shared_attempt_budget(self):
+        temporary = self.root / "replacement.bin"
+        temporary.write_bytes(b"pipeline replacement")
+        self.spm.write_bytes(b"live target")
+        attempts = {"count": 0}
+
+        def always_locked(target, replacement, backup, flags, a, b):
+            attempts["count"] += 1
+            ctypes.set_last_error(1175)
+            return False
+
+        with self._patched_replace_file(always_locked), mock.patch.object(
+            spm_audit, "_sleep_file_backoff"
+        ):
+            with self.assertRaises(OSError) as caught:
+                spm_audit._replace_file_with_rescue(
+                    temporary,
+                    self.spm,
+                    require_existing=True,
+                )
+
+        self.assertEqual(caught.exception.winerror, 1175)
+        self.assertEqual(
+            attempts["count"], spm_audit.SPM_REPLACE_MAX_ATTEMPTS
+        )
+        self.assertEqual(self.spm.read_bytes(), b"live target")
+
+    def _patched_replace_file(self, implementation):
+        """Swap ReplaceFileW for a callable without touching the real DLL."""
+        real_windll = spm_audit.ctypes.WinDLL
+
+        class _Kernel32:
+            pass
+
+        def fake_windll(name, *args, **kwargs):
+            if name == "kernel32":
+                kernel32 = _Kernel32()
+                kernel32.ReplaceFileW = implementation
+                return kernel32
+            return real_windll(name, *args, **kwargs)
+
+        return mock.patch.object(
+            spm_audit.ctypes, "WinDLL", side_effect=fake_windll
+        )
 
     @unittest.skipUnless(os.name == "nt", "ReplaceFileW rescue is Windows-only")
     def test_atomic_swap_restores_external_writer_that_wins_first_race(self):
