@@ -66,6 +66,8 @@ from repair_orchestration import (
     GENERATOR_SYNC_TOOL,
     PCG_TEXTURE_TOOL,
     REPAIR_PLAN_SCHEMA_VERSION,
+    REPAIR_UI_AUTOMATIC,
+    REPAIR_UI_BLOCKED,
     RepairPlan,
     STATUS_CANCELLED,
     STATUS_CLUSTER,
@@ -82,6 +84,7 @@ from repair_orchestration import (
     fresh_repair_receipt_authoritative,
     has_repair_contract_evidence,
     repair_progress_payload,
+    repair_ui_decision,
     stage_running_status,
 )
 from child_progress_contract import (
@@ -1593,45 +1596,35 @@ def cluster_stale_node_table_recovery_scope(
 
 
 def target_planned_exclusion_summary(target_spm, reason_token, evidence):
-    """Render a target-first exclusion summary suitable for a narrow GUI row."""
+    """Render one Korean cause/action summary for a narrow GUI row."""
     target = Path(target_spm)
     evidence = evidence if isinstance(evidence, dict) else {}
-    parts = [target.name]
+    decision = repair_ui_decision({
+        "reason_token": reason_token,
+        "evidence": evidence,
+    })
+    parts = [target.name, f"원인: {decision['reason']}"]
     live_node_table = evidence.get("live_node_table")
     live_node_table = (
         live_node_table if isinstance(live_node_table, dict) else {}
     )
     if live_node_table.get("stale") is True:
-        parts.append("stale Node table")
+        parts.append("Node table 오래됨")
         parts.append(
-            "orphan GUIDs "
+            "고아 Generator GUID "
             + str(live_node_table.get("orphan_generator_guid_count") or 0)
+            + "개"
         )
         orphan_nodes = live_node_table.get("orphan_node_count")
         total_nodes = live_node_table.get("total_node_count")
         if orphan_nodes is not None or total_nodes is not None:
-            parts.append(f"orphan Nodes {orphan_nodes or 0}/{total_nodes or 0}")
+            parts.append(f"고아 Node {orphan_nodes or 0}/{total_nodes or 0}")
         mesh_ids = evidence.get("stale_node_table_target_mesh_ids") or ()
         if mesh_ids:
-            parts.append("Mesh IDs " + ",".join(str(value) for value in mesh_ids))
-        recovery = evidence.get("stale_node_table_recovery")
-        if isinstance(recovery, dict) and recovery.get("available") is True:
             parts.append(
-                "action=Batch Tools may invoke exact semantic File > Save only "
-                "for the sealed stale+orphan target in its owned Modeler PID; "
-                "Save As/coordinates/keys are forbidden; re-audit/resume is automatic"
+                "대상 Mesh ID " + ",".join(str(value) for value in mesh_ids)
             )
-        else:
-            reason = (
-                str((recovery or {}).get("reason_token") or "scope unavailable")
-                if isinstance(recovery, dict)
-                else "scope unavailable"
-            )
-            parts.append(
-                "action=automatic Modeler recovery is disabled until the "
-                f"target-wide scope is sealed ({reason}); re-run a live audit"
-            )
-    parts.append(f"reason={reason_token}")
+    parts.append(f"조치: {decision['action']}")
     return " | ".join(parts)
 
 
@@ -5125,7 +5118,9 @@ class App:
         })
         display = label
         if status == STATUS_FINAL_FAILED and friendly_reason:
-            display = f"실패 · {friendly_reason}"
+            display = f"최종 차단 · 원인: {friendly_reason}"
+            if remaining_action:
+                display += f" · 조치: {remaining_action}"
         elif status == STATUS_COMPLETED:
             display = compact_success_message(attempted_stages)
         self.ui_queue.put(("cell", (iid, "push_status", display)))
@@ -5247,10 +5242,15 @@ class App:
             str(item["spm"]): item for item in job.get("targets") or ()
         }
         plans = list(job.get("repair_plans") or ())
+        plans_by_id = {
+            str(plan.get("exact_spm")): plan for plan in plans
+        }
         total_stage_count = sum(len(plan.get("stages") or ()) for plan in plans)
         global_completed = 0
         outcomes = []
         pipeline_targets = []
+        successful_repair_ids = set()
+        cancelled_repair_ids = set()
 
         for plan in plans:
             iid = str(plan["exact_spm"])
@@ -5398,6 +5398,7 @@ class App:
                     break
 
             if cancelled:
+                cancelled_repair_ids.add(iid)
                 self._set_failed_retry_automatic_status(
                     iid,
                     STATUS_CANCELLED,
@@ -5457,6 +5458,94 @@ class App:
             )
             item["_failed_retry_attempted_stages"] = attempted
             pipeline_targets.append(item)
+            successful_repair_ids.add(iid)
+
+        pipeline_target_ids = {
+            str(item["spm"]) for item in pipeline_targets
+        }
+        resume_after_repairs = copy.deepcopy(
+            job.get("resume_after_repairs") or {}
+        )
+        for resume_iid, required_roots in resume_after_repairs.items():
+            resume_iid = str(resume_iid)
+            required_roots = [str(value) for value in required_roots or ()]
+            item = targets_by_id.get(resume_iid)
+            missing_roots = [
+                root
+                for root in required_roots
+                if root not in successful_repair_ids
+            ]
+            if item is not None and required_roots and not missing_roots:
+                if resume_iid not in pipeline_target_ids:
+                    item["_failed_retry_resumed_by"] = required_roots
+                    pipeline_targets.append(item)
+                    pipeline_target_ids.add(resume_iid)
+                self.log(
+                    "[자동 복구 완료] 필수 Cluster 복구 후 Blender 재개: "
+                    f"{Path(resume_iid).name}"
+                )
+                continue
+            cancelled_roots = [
+                root for root in required_roots
+                if root in cancelled_repair_ids
+            ]
+            if cancelled_roots or self.stop_flag.is_set():
+                names = ", ".join(
+                    Path(value).name
+                    for value in cancelled_roots or required_roots
+                )
+                reason = (
+                    "필수 Cluster 자동 복구가 취소되어 Blender 재개도 "
+                    f"취소했습니다: {names or '대상 없음'}"
+                )
+                self._record_phase_status(
+                    resume_iid,
+                    "push_status",
+                    f"재시도 취소: {reason}",
+                    "cancelled",
+                    reason,
+                    details={
+                        "blocked_by": required_roots,
+                        "repair_disposition": "cancelled",
+                    },
+                    persist=True,
+                )
+                outcomes.append({
+                    "target": resume_iid,
+                    "target_name": Path(resume_iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "required_cluster_repair_cancelled",
+                    "evidence": {"blocked_by": required_roots},
+                })
+                continue
+            names = ", ".join(
+                Path(value).name for value in missing_roots or required_roots
+            )
+            reason = (
+                "필수 Cluster 자동 복구가 완료되지 않아 Blender를 재개하지 "
+                f"못했습니다: {names or '대상 없음'}"
+            )
+            if item is None:
+                reason = "재개할 소비자가 current inventory에서 사라졌습니다."
+            self._record_phase_status(
+                resume_iid,
+                "push_status",
+                f"최종 차단: {reason}",
+                "dependency_blocked",
+                reason,
+                details={
+                    "blocked_by": required_roots,
+                    "repair_disposition": REPAIR_UI_BLOCKED,
+                },
+                persist=True,
+            )
+            outcomes.append({
+                "target": resume_iid,
+                "target_name": Path(resume_iid).name,
+                "outcome": "blocked",
+                "reason_token": "required_cluster_repair_failed",
+                "evidence": {"blocked_by": required_roots},
+            })
 
         if pipeline_targets and not self.stop_flag.is_set():
             self.ui_queue.put((
@@ -5481,11 +5570,19 @@ class App:
             for item in pipeline_targets:
                 iid = str(item["spm"])
                 attempted = item.pop("_failed_retry_attempted_stages", [])
+                resumed_by = item.pop("_failed_retry_resumed_by", [])
                 pipeline_row = pipeline_by_id.get(iid, {})
-                plan = next(
-                    plan for plan in plans if plan["exact_spm"] == iid
-                )
+                plan = plans_by_id.get(iid)
                 pipeline_outcome = str(pipeline_row.get("outcome") or "")
+                if plan is None:
+                    outcomes.append(pipeline_row or {
+                        "target": iid,
+                        "target_name": Path(iid).name,
+                        "outcome": "failed",
+                        "reason_token": "resumed_pipeline_result_missing",
+                        "evidence": {"resumed_by": resumed_by},
+                    })
+                    continue
                 if pipeline_outcome == "completed":
                     final_receipt = self._set_failed_retry_automatic_status(
                         iid,
@@ -5560,16 +5657,16 @@ class App:
             for item in pipeline_targets:
                 iid = str(item["spm"])
                 attempted = item.pop("_failed_retry_attempted_stages", [])
-                plan = next(
-                    plan for plan in plans if plan["exact_spm"] == iid
-                )
-                self._set_failed_retry_automatic_status(
-                    iid,
-                    STATUS_CANCELLED,
-                    plan=plan,
-                    attempted_stages=attempted,
-                    completed_stages=len(attempted),
-                )
+                item.pop("_failed_retry_resumed_by", None)
+                plan = plans_by_id.get(iid)
+                if plan is not None:
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_CANCELLED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                    )
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
@@ -6130,6 +6227,85 @@ class App:
                     f"details reason_codes={','.join(plan.reason_codes)}"
                 )
         bat_handled_ids = set(automatic_plans) | set(unsupported_plans)
+        candidate_by_path = {
+            os.path.normcase(os.path.abspath(str(iid))).casefold(): iid
+            for iid in candidate_iids
+        }
+
+        def blocked_dependencies(iid):
+            entry = planning_context.entry(iid)
+            dependencies = []
+            for status_column, error_column in (
+                ("push_status_kind", "push_status_error"),
+                ("blend_status_kind", "blend_status_error"),
+                ("spm_status_kind", "spm_status_error"),
+            ):
+                error = entry.get(error_column)
+                if not isinstance(error, dict):
+                    continue
+                status_kind = str(entry.get(status_column) or "")
+                error_kind = str(error.get("kind") or "")
+                if status_kind != "dependency_blocked" and not (
+                    not status_kind and error_kind == "dependency_blocked"
+                ):
+                    continue
+                blocked_by = error.get("blocked_by")
+                if not isinstance(blocked_by, (list, tuple, set)):
+                    continue
+                for value in blocked_by:
+                    key = os.path.normcase(
+                        os.path.abspath(str(value))
+                    ).casefold()
+                    dependency = candidate_by_path.get(key)
+                    if dependency and dependency not in dependencies:
+                        dependencies.append(dependency)
+            return dependencies
+
+        def automatic_dependency_roots(iid):
+            memo = {}
+
+            def visit(target, visiting):
+                if target in memo:
+                    return memo[target]
+                if target in visiting:
+                    return None
+                dependencies = blocked_dependencies(target)
+                if not dependencies:
+                    return None
+                roots = set()
+                next_visiting = set(visiting)
+                next_visiting.add(target)
+                for dependency in dependencies:
+                    if dependency in automatic_plans:
+                        roots.add(dependency)
+                        continue
+                    nested = visit(dependency, next_visiting)
+                    if not nested:
+                        return None
+                    roots.update(nested)
+                memo[target] = roots
+                return roots
+
+            roots = visit(iid, set())
+            if not roots:
+                return ()
+            return tuple(
+                candidate
+                for candidate in candidate_iids
+                if candidate in roots
+            )
+
+        resume_after_repairs = {}
+        for iid in candidate_iids:
+            if iid in bat_handled_ids:
+                continue
+            roots = automatic_dependency_roots(iid)
+            if roots:
+                resume_after_repairs[iid] = roots
+        bat_handled_ids.update(resume_after_repairs)
+        planning_context.counters["dependency_resume_targets"] += len(
+            resume_after_repairs
+        )
         parent_statuses = {
             iid: UNREAL_PARENT_ABSENT for iid in candidate_iids
         }
@@ -6463,7 +6639,11 @@ class App:
         eligible_iids = [
             iid for iid in candidate_iids if iid in eligible_set
         ]
-        runnable_set = eligible_set | set(automatic_plans)
+        runnable_set = (
+            eligible_set
+            | set(automatic_plans)
+            | set(resume_after_repairs)
+        )
         runnable_ids = [
             iid for iid in candidate_iids if iid in runnable_set
         ]
@@ -6598,13 +6778,24 @@ class App:
                 f"{len(unreal_targets)} targets"
             )
 
-        repair_targets = [
+        repair_root_targets = [
             targets_by_id[iid]
             for iid in candidate_iids
             if iid in automatic_plans and iid in targets_by_id
         ]
-        if repair_targets:
-            repair_ids = [str(item["spm"]) for item in repair_targets]
+        if repair_root_targets:
+            repair_ids = [str(item["spm"]) for item in repair_root_targets]
+            resume_ids = [
+                iid
+                for iid in candidate_iids
+                if iid in resume_after_repairs and iid in targets_by_id
+            ]
+            repair_job_ids = [
+                iid
+                for iid in candidate_iids
+                if iid in set(repair_ids) | set(resume_ids)
+            ]
+            repair_targets = [targets_by_id[iid] for iid in repair_job_ids]
             metadata = {
                 "schema_version": 1,
                 "kind": action_kind,
@@ -6612,22 +6803,36 @@ class App:
                 "execution_path": (
                     "exact_bat_then_fresh_reaudit_then_blender_unreal"
                 ),
-                "selected_queue_ids": repair_ids,
+                "selected_queue_ids": repair_job_ids,
                 "eligibility": {
                     "schema_version": 1,
                     "items": [
                         {
                             "queue_id": iid,
-                            "repair_plan": automatic_plans[iid].metadata(),
+                            **(
+                                {
+                                    "repair_plan": automatic_plans[
+                                        iid
+                                    ].metadata(),
+                                }
+                                if iid in automatic_plans
+                                else {
+                                    "reason_code": (
+                                        "required_cluster_repaired_resume"
+                                    ),
+                                    "resume_after_repairs": list(
+                                        resume_after_repairs[iid]
+                                    ),
+                                }
+                            ),
                         }
-                        for iid in repair_ids
+                        for iid in repair_job_ids
                     ],
                 },
             }
             if tracker is not None:
                 tracker.assign_partition(
-                    "exact_bat_repair",
-                    repair_ids,
+                    "exact_bat_repair", repair_job_ids,
                     metadata["execution_path"],
                 )
                 metadata.update({
@@ -6636,8 +6841,9 @@ class App:
                 })
             jobs.append({
                 "label": (
-                    "automatic repair · exact BAT → fresh audit → "
-                    f"Blender/Unreal · {len(repair_targets)}"
+                    "자동 복구 · exact BAT → 재검증 → "
+                    f"차단 소비자 재개 → Blender/Unreal · "
+                    f"{len(repair_targets)}"
                 ),
                 "mode": "failed_retry_repair",
                 "phase": "push",
@@ -6652,6 +6858,10 @@ class App:
                     automatic_plans[iid].metadata()
                     for iid in repair_ids
                 ],
+                "resume_after_repairs": {
+                    iid: list(resume_after_repairs[iid])
+                    for iid in resume_ids
+                },
                 "retry_metadata": metadata,
                 "_retry_progress_tracker": tracker,
             })
@@ -6993,7 +7203,7 @@ class App:
 
         A ``dependency_blocked`` column has no cause of its own -- it only
         records which upstream rows it was blocked by. Stopping there just
-        repeats "차단: required Cluster stage failed" one hop away from the
+        repeats a generic required-Cluster block one hop away from the
         actual error, so walk ``blocked_by`` to the real failure instead.
         """
         seen = _seen if _seen is not None else set()
@@ -7102,30 +7312,44 @@ class App:
         publish_repair_contract=False,
     ):
         iid = str(item["spm"])
-        names = ", ".join(
-            sorted(Path(value).name for value in blocked_sources)
+        root_decisions = []
+        for value in sorted(blocked_sources, key=lambda row: Path(row).name):
+            entry = self._failed_retry_state_entry(value)
+            decision = repair_ui_decision(entry)
+            root_decisions.append((Path(value).name, decision))
+        automatic = bool(root_decisions) and all(
+            decision["status"] == REPAIR_UI_AUTOMATIC
+            for _, decision in root_decisions
         )
-        reason = f"required Cluster stage failed: {names}"
-        # Name the root cause on the consumer row too.  Without it a blocked
-        # asset only says which file failed, so an operator cannot tell an asset
-        # data problem from a tool problem without hunting for the other row.
-        root_causes = sorted({
-            text
-            for text in (
-                self._recorded_failure_reason(value)
-                for value in blocked_sources
-            )
-            if text
-        })
-        if root_causes:
-            reason = f"{reason} — 원인: {' | '.join(root_causes)}"
+        status_prefix = "자동 복구 대상" if automatic else "최종 차단"
+        names = ", ".join(name for name, _ in root_decisions)
+        root_causes = " | ".join(
+            f"{name}: {decision['reason']}"
+            for name, decision in root_decisions
+        ) or "상위 Cluster의 구조화된 실패 원인을 확인하지 못했습니다."
+        root_actions = " | ".join(dict.fromkeys(
+            decision["action"] for _, decision in root_decisions
+        )) or "상위 Cluster의 current audit 증거를 다시 생성해야 합니다."
+        reason = (
+            f"필수 Cluster 단계 · {names} · 원인: {root_causes} · "
+            f"조치: {root_actions}"
+        )
         self._record_phase_status(
             iid,
             column,
-            f"차단: {reason}",
+            f"{status_prefix}: {reason}",
             "dependency_blocked",
             reason,
-            details={"blocked_by": list(blocked_sources)},
+            details={
+                "blocked_by": list(blocked_sources),
+                "repair_disposition": (
+                    REPAIR_UI_AUTOMATIC if automatic else REPAIR_UI_BLOCKED
+                ),
+                "root_repair_decisions": {
+                    name: copy.deepcopy(decision)
+                    for name, decision in root_decisions
+                },
+            },
             persist=persist,
         )
         if publish_repair_contract:
@@ -7135,7 +7359,7 @@ class App:
                 reason=reason,
                 kind="dependency_blocked",
             )
-        self.log(f"[의존성 차단] {Path(iid).name}: {reason}")
+        self.log(f"[{status_prefix}] {Path(iid).name}: {reason}")
 
     def _record_pipeline_planned_exclusion(self, target_spm, error):
         """Persist one target-local block without failing a shared producer."""
@@ -7171,32 +7395,40 @@ class App:
             "reason_token": reason_token,
             "evidence": copy.deepcopy(evidence),
         }
+        decision = repair_ui_decision({
+            "reason_token": reason_token,
+            "evidence": evidence,
+        })
+        details["repair_disposition"] = decision["status"]
+        details["reason_ko"] = decision["reason"]
+        details["action_ko"] = decision["action"]
         status_summary = target_planned_exclusion_summary(
             target,
             reason_token,
             evidence,
         )
+        automatic = decision["status"] == REPAIR_UI_AUTOMATIC
+        status_prefix = "자동 복구 대상" if automatic else "최종 차단"
         self._record_phase_status(
             iid,
             "blend_status",
-            f"Sync excluded: {status_summary}",
+            f"{status_prefix}: Generator/Cluster Sync · {status_summary}",
             "planned_excluded",
-            str(error),
+            f"원인: {decision['reason']} · 조치: {decision['action']}",
             details=details,
             persist=False,
         )
         self._record_phase_status(
             iid,
             "push_status",
-            f"Push blocked: {status_summary}",
+            f"{status_prefix}: Push 대기 · {status_summary}",
             "planned_excluded",
-            str(error),
+            f"원인: {decision['reason']} · 조치: {decision['action']}",
             details=details,
             persist=True,
         )
         self.log(
-            "[target planned exclusion] "
-            f"{status_summary}; Sync is not Push readiness"
+            f"[{status_prefix}] {status_summary}"
         )
 
     def _target_failure_result(self, iid, default_token="item_failed"):
@@ -9717,15 +9949,21 @@ class App:
             )
         except CanonicalOutputManifestError as exc:
             failure_report = copy.deepcopy(getattr(exc, "report", {}) or {})
+            decision = repair_ui_decision(failure_report)
+            automatic = decision["status"] == REPAIR_UI_AUTOMATIC
+            status_prefix = "자동 복구 대상" if automatic else "최종 차단"
             raise BatchItemError(
-                "Canonical PCG → Atlas manifest preflight failed: "
-                + str(exc),
+                f"{status_prefix}: Canonical PCG → Atlas 사전 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
                 report={
                     "status": "failed",
                     "stage": "canonical_atlas_manifest_preflight",
                     "spm": str(spm),
                     "error": str(exc),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
                     **failure_report,
                 },
             ) from exc
@@ -11046,10 +11284,25 @@ class App:
         actual_failure = cluster_issue_summary(live_issues)
 
         if actual_failure:
+            decision = repair_ui_decision({"issues": live_issues})
+            status_prefix = (
+                "자동 복구 대상"
+                if decision["status"] == REPAIR_UI_AUTOMATIC
+                else "최종 차단"
+            )
             raise BatchItemError(
-                "Cluster Assembly actual data audit failed: "
-                + actual_failure,
+                f"{status_prefix}: {spm.name} Cluster Assembly 데이터 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
+                report={
+                    "stage": "cluster_assembly_live_audit",
+                    "spm": str(spm),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
+                    "issues": copy.deepcopy(live_issues),
+                    "internal_summary": actual_failure,
+                },
                 log_file=log_file,
                 report_file=audit_report,
             )
@@ -11309,8 +11562,7 @@ class App:
                     evidence,
                 )
                 raise TargetPlannedExclusionError(
-                    "Cluster normalization target excluded by current live "
-                    f"delivery: {summary}",
+                    "현재 Generator 전달이 차단됨: " + summary,
                     reason_token=reason_token,
                     target_spm=target,
                     producer_spm=producer,
@@ -11319,10 +11571,28 @@ class App:
                     report_file=audit_report,
                 )
             summary = cluster_issue_summary(blocking)
-            stage = "output" if require_normalized else "input"
+            stage = "출력" if require_normalized else "입력"
+            decision = repair_ui_decision({"issues": blocking})
+            status_prefix = (
+                "자동 복구 대상"
+                if decision["status"] == REPAIR_UI_AUTOMATIC
+                else "최종 차단"
+            )
             raise BatchItemError(
-                f"Cluster normalization {stage} validation failed: {summary}",
+                f"{status_prefix}: {target.name} Cluster 정규화 {stage} 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
+                report={
+                    "stage": "cluster_normalization_validation",
+                    "validation_side": stage,
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
+                    "issues": copy.deepcopy(blocking),
+                    "internal_summary": summary,
+                },
                 log_file=log_file,
                 report_file=audit_report,
             )

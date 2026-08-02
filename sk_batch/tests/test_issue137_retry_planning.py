@@ -308,6 +308,9 @@ def test_plan_receipt_reuses_unchanged_assets_and_invalidates_changed_asset(
             "cfg": cfg,
             "force_rerun": True,
             "push_transport": "headless",
+            "resume_after_repairs": {
+                second: [first],
+            },
             "retry_metadata": {
                 "partition": "blender_export",
                 "execution_path": "pipeline",
@@ -359,6 +362,9 @@ def test_plan_receipt_reuses_unchanged_assets_and_invalidates_changed_asset(
     assert reused["_planning_cache_reused"] is True
     assert app._build_failed_retry_plan_scoped.call_count == 0
     assert reused["jobs"][0]["targets"][0]["spm"] == Path(first)
+    assert reused["jobs"][0]["resume_after_repairs"] == {
+        second: [first],
+    }
     metadata = reused["jobs"][0]["retry_metadata"]
     assert metadata["progress_run_id"] == new_tracker.run_id
     assert metadata["plan_cache_reused"] is True

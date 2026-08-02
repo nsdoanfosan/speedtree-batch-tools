@@ -3526,8 +3526,8 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(app._run_limited.call_count, 1)
         self.assertEqual(first_raised.exception.kind, "data_error")
         self.assertEqual(second_raised.exception.kind, "data_error")
-        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(first_raised.exception))
-        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(second_raised.exception))
+        self.assertIn("필수 정규화 Cluster variant", str(first_raised.exception))
+        self.assertIn("필수 정규화 Cluster variant", str(second_raised.exception))
 
     def test_cluster_normalization_stage_partitions_producer_owned_work(
         self,
@@ -3907,10 +3907,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
 
             self.assertEqual(raised.exception.kind, "data_error")
-            self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
-                str(raised.exception),
-            )
+            self.assertIn("Cluster가 참조하는 TGA 파일이 없습니다", str(raised.exception))
             self.assertIn("missing.tga", str(raised.exception))
 
     def _run_producer_normalization_stage(
@@ -4037,10 +4034,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn(
-            "CLUSTER_TGA_BASENAME_INVALID",
-            str(raised.exception),
-        )
+        self.assertIn("Cluster가 참조하는 TGA 파일이 없습니다", str(raised.exception))
+        self.assertIn("missing.tga", str(raised.exception))
 
     def test_normalization_stage_rejects_issue_outside_contract(self):
         gui = load_gui_module()
@@ -4052,10 +4047,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn(
-            "NORMALIZED_VARIANTS_REQUIRED",
-            str(raised.exception),
-        )
+        self.assertIn("필수 정규화 Cluster variant", str(raised.exception))
 
     def test_receipt_ambiguity_after_clean_audit_uses_live_contract(self):
         gui = load_gui_module()

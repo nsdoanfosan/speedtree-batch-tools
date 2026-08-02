@@ -8,6 +8,8 @@ from repair_orchestration import (
     CLUSTER_REFRESH,
     GENERATOR_SYNC,
     GENERATOR_SYNC_AND_CLUSTER,
+    REPAIR_UI_AUTOMATIC,
+    REPAIR_UI_BLOCKED,
     STATUS_COMPLETED,
     STATUS_FINAL_FAILED,
     STATUS_PENDING,
@@ -17,6 +19,7 @@ from repair_orchestration import (
     final_failure_filter,
     fresh_repair_receipt_authoritative,
     repair_progress_payload,
+    repair_ui_decision,
 )
 
 
@@ -81,6 +84,99 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertFalse(plan.supported)
         self.assertIn("ownership", plan.friendly_reason)
         self.assertIn("덮어쓸 수 없습니다", plan.remaining_action)
+
+    def test_operator_message_has_one_korean_atlas_disposition(self):
+        repairable = repair_ui_decision({
+            "reason_code": "atlas_manifest_mirror_conflict_repairable",
+        })
+        blocked = repair_ui_decision({
+            "reason_code": "atlas_manifest_ownership_conflict",
+        })
+
+        self.assertEqual(repairable["status"], REPAIR_UI_AUTOMATIC)
+        self.assertIn("낡은 Atlas manifest 미러", repairable["reason"])
+        self.assertIn("exact BAT", repairable["action"])
+        self.assertEqual(blocked["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("서로 다른 원본", blocked["reason"])
+        self.assertIn("임의로 덮어쓰지 않습니다", blocked["action"])
+
+    def test_unsealed_stale_node_table_is_explicit_final_block(self):
+        evidence = {
+            "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+            "stale_node_table_recovery": {
+                "available": False,
+                "reason_token": "target_delivery_scope_not_explicit",
+            },
+        }
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("자동 저장할 exact target 범위", decision["reason"])
+        self.assertIn("복구 범위를 다시 확정", decision["action"])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.initial_status, STATUS_FINAL_FAILED)
+        self.assertEqual(plan.friendly_reason, decision["reason"])
+
+    def test_generator_delivery_is_explicit_automatic_repair(self):
+        decision = repair_ui_decision({
+            "delivery_reason": "generator_connection_contract_incomplete",
+            "issues": [{"code": "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE"}],
+        })
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertIn("Generator", decision["reason"])
+        self.assertIn("Cluster 갱신", decision["action"])
+
+    def test_sealed_stale_node_table_has_one_automatic_disposition(self):
+        evidence = {
+            "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+            "stale_node_table_recovery": {
+                "available": True,
+                "target_spm": str(self.target),
+            },
+        }
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+
+    def test_missing_normalized_variant_routes_to_exact_cluster_refresh(self):
+        evidence = {
+            "issues": [{
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "spm": str(self.target),
+            }],
+        }
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertIn("필수 정규화 Cluster variant", decision["reason"])
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+
+    def test_missing_cluster_tga_is_exact_korean_final_block(self):
+        evidence = {
+            "issues": [{
+                "code": "CLUSTER_TGA_BASENAME_INVALID",
+                "details": {
+                    "status": "missing",
+                    "missing": ["missing.tga"],
+                    "expected_base": "SK_cluster_elm_01",
+                },
+            }],
+        }
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("TGA 파일이 없습니다", decision["reason"])
+        self.assertIn("missing.tga", decision["reason"])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.friendly_reason, decision["reason"])
 
     def test_deadleaves_missing_t_roles_use_exact_pcg_action(self):
         plan = self.plan({

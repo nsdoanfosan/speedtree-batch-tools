@@ -734,12 +734,13 @@ class PushQueueFlowTests(unittest.TestCase):
         for column in ("blend_status", "push_status"):
             status = entry[column]
             self.assertIn(target.name, status)
-            self.assertIn("stale Node table", status)
-            self.assertIn("orphan GUIDs 2", status)
-            self.assertIn("orphan Nodes 216495/223675", status)
-            self.assertIn("Mesh IDs 16,17,18,19", status)
-            self.assertIn("action=automatic Modeler recovery is disabled", status)
-            self.assertIn("re-run a live audit", status)
+            self.assertIn("최종 차단", status)
+            self.assertIn("Node table 오래됨", status)
+            self.assertIn("고아 Generator GUID 2개", status)
+            self.assertIn("고아 Node 216495/223675", status)
+            self.assertIn("대상 Mesh ID 16,17,18,19", status)
+            self.assertIn("복구 범위를 다시 확정", status)
+            self.assertNotIn("Sync excluded", status)
         self.assertEqual(
             entry["push_status_error"]["evidence"]["delivery_remedy"],
             (
@@ -786,15 +787,11 @@ class PushQueueFlowTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn(target.name, message)
-        self.assertLess(
-            message.index(f"targets={target.name}"),
-            message.index("role=cluster"),
-        )
-        self.assertIn("orphan GUIDs 2", message)
-        self.assertIn("orphan Nodes 216495/223675", message)
-        self.assertIn("Mesh IDs 16,17,18,19", message)
-        self.assertIn("action=automatic Modeler recovery is disabled", message)
-        self.assertIn("re-run a live audit", message)
+        self.assertIn("최종 차단", message)
+        self.assertIn("Node table이 오래되었지만", message)
+        self.assertIn("복구 범위를 다시 확정", message)
+        self.assertNotIn("validation failed", message)
+        self.assertNotIn("role=cluster", message)
 
     def test_issue16_planned_exclusion_does_not_fan_out_shared_provider(self):
         gui = load_gui_module()
@@ -915,8 +912,19 @@ class PushQueueFlowTests(unittest.TestCase):
             weed_outcome["reason_token"],
             fixture["expected_result"]["blocked_reason_token"],
         )
-        self.assertIn("Sync excluded", app.state[str(weed)]["blend_status"])
-        self.assertIn("Push blocked", app.state[str(weed)]["push_status"])
+        self.assertIn(
+            "자동 복구 대상",
+            app.state[str(weed)]["blend_status"],
+        )
+        self.assertIn(
+            "Generator/Cluster Sync",
+            app.state[str(weed)]["blend_status"],
+        )
+        self.assertIn("Push 대기", app.state[str(weed)]["push_status"])
+        self.assertNotIn(
+            "Sync excluded",
+            app.state[str(weed)]["blend_status"],
+        )
         self.assertEqual(
             app.state[str(weed)]["push_status_error"]["reason_token"],
             fixture["expected_result"]["blocked_reason_token"],
@@ -2727,8 +2735,10 @@ class PushQueueFlowTests(unittest.TestCase):
             [{
                 "ready": False,
                 "reason": (
-                    "required Cluster stage failed: "
-                    f"{failed_cluster.name} — 원인: cluster SPM failed"
+                    f"필수 Cluster 단계 · {failed_cluster.name} · 원인: "
+                    f"{failed_cluster.name}: 자동 복구 가능한 구조화 원인을 "
+                    "확인하지 못했습니다. · 조치: 현재 검사에서 정확한 "
+                    "원인과 대상 증거를 다시 생성해야 합니다."
                 ),
                 "kind": "dependency_blocked",
             }],
