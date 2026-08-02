@@ -13,11 +13,12 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import tokenize
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,10 @@ IGNORED_DIRECTORY_NAMES = {
     "node_modules",
     "work",
 }
+IGNORED_REPO_RELATIVE_DIRECTORY_PREFIXES = {
+    (".claude", "worktrees"),
+}
+VCS_ROOT_MARKER_NAMES = {".git", ".hg", ".svn"}
 PRODUCTION_SOURCE_MANIFEST_VERSION = 1
 RUNTIME_COMPILE_NAMES = {
     "_batch_compile_enabled",
@@ -93,17 +98,117 @@ def _read_python_source(path: Path) -> str:
         return handle.read()
 
 
-def _production_sources(repo_root: Path):
-    for current_root, directories, filenames in os.walk(repo_root):
-        directories[:] = sorted(
-            name
-            for name in directories
-            if name.casefold() not in IGNORED_DIRECTORY_NAMES
+def _normalized_relative_parts(path):
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _has_prefix(parts, prefixes):
+    return any(
+        len(parts) >= len(prefix) and parts[: len(prefix)] == prefix
+        for prefix in prefixes
+    )
+
+
+def _git_stdout(repo_root, *arguments):
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _git_ignored_paths(repo_root):
+    """Return ignored untracked directories/files relative to a Git root."""
+    try:
+        top_level = _git_stdout(repo_root, "rev-parse", "--show-toplevel")
+        if top_level is None:
+            return frozenset(), frozenset()
+        discovered_root = Path(os.fsdecode(top_level).strip()).resolve()
+    except (OSError, ValueError):
+        return frozenset(), frozenset()
+    if os.path.normcase(str(discovered_root)) != os.path.normcase(
+        str(repo_root)
+    ):
+        return frozenset(), frozenset()
+
+    output = _git_stdout(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    )
+    if output is None:
+        return frozenset(), frozenset()
+
+    directories = set()
+    files = set()
+    for raw_path in output.split(b"\0"):
+        if not raw_path:
+            continue
+        value = os.fsdecode(raw_path).replace("\\", "/")
+        relative = PurePosixPath(value.rstrip("/"))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            continue
+        parts = _normalized_relative_parts(relative)
+        if value.endswith("/"):
+            directories.add(parts)
+        else:
+            files.add(parts)
+    return frozenset(directories), frozenset(files)
+
+
+def _is_nested_vcs_root(path):
+    return any((path / marker).exists() for marker in VCS_ROOT_MARKER_NAMES)
+
+
+def _production_sources(repo_root: Path):
+    repo_root = Path(repo_root).resolve()
+    ignored_directories, ignored_files = _git_ignored_paths(repo_root)
+    structural_prefixes = frozenset(
+        tuple(part.casefold() for part in prefix)
+        for prefix in IGNORED_REPO_RELATIVE_DIRECTORY_PREFIXES
+    )
+    for current_root, directories, filenames in os.walk(repo_root):
         current = Path(current_root)
+        current_parts = _normalized_relative_parts(
+            current.relative_to(repo_root)
+        )
+        retained_directories = []
+        for name in sorted(directories):
+            relative_parts = current_parts + (name.casefold(),)
+            child = current / name
+            if (
+                name.casefold() in IGNORED_DIRECTORY_NAMES
+                or name.casefold() in VCS_ROOT_MARKER_NAMES
+                or _has_prefix(relative_parts, structural_prefixes)
+                or _has_prefix(relative_parts, ignored_directories)
+                or _is_nested_vcs_root(child)
+            ):
+                continue
+            retained_directories.append(name)
+        directories[:] = retained_directories
         for filename in sorted(filenames):
             path = current / filename
-            if path.suffix.casefold() in SOURCE_SUFFIXES:
+            relative_parts = current_parts + (filename.casefold(),)
+            if (
+                path.suffix.casefold() in SOURCE_SUFFIXES
+                and not _has_prefix(relative_parts, structural_prefixes)
+                and not _has_prefix(relative_parts, ignored_directories)
+                and relative_parts not in ignored_files
+            ):
                 yield path
 
 
