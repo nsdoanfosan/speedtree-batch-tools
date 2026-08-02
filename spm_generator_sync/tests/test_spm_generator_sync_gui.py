@@ -814,6 +814,12 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 "blend": blend,
                 "on_target_spms": [target],
                 "target_spms": [target],
+                "refresh_reasons": [
+                    "blender_source_content_changed"
+                ],
+                "refresh_reason_categories": [
+                    "geometry_ownership"
+                ],
             }],
             "skipped": [],
         }
@@ -852,7 +858,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         ) as prepare, mock.patch.object(
             GUI,
             "run_cluster_relation_transaction",
-            return_value={"status": "ok", "mode": "sync"},
+            return_value={
+                "status": "ok",
+                "mode": "sync",
+                "source_content_identity": {
+                    "kind": "speedtree_cluster_atlas_blender_source_index",
+                    "status": "ok",
+                },
+            },
         ) as refresh, mock.patch.object(
             GUI,
             "write_connected_run_report",
@@ -887,10 +900,144 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertEqual(captured["status"], "partial")
         self.assertEqual(len(captured["failures"]), 1)
         self.assertEqual(len(captured["cluster_refresh"]), 1)
+        cluster_report = captured["cluster_refresh"][0]
+        self.assertEqual(
+            cluster_report["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["refresh_reason_categories"],
+            ["geometry_ownership"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["planned_refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["source_content_identity"][
+                "status"
+            ],
+            "ok",
+        )
+        cluster_unit = next(
+            entry
+            for entry in captured["unit_results"]
+            if entry["stage"] == "cluster_refresh"
+        )
+        self.assertEqual(cluster_unit["outcome"], "succeeded")
+        self.assertEqual(
+            cluster_unit["result"]["planned_refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_unit["result"]["refresh_reason_categories"],
+            ["geometry_ownership"],
+        )
         app.refresh.assert_called_once()
         self.assertIn(
             "실패 1",
             app.status_var.set.call_args.args[0],
+        )
+
+    def test_connected_cluster_failure_preserves_planned_refresh_evidence(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        blend = owner / "Cluster" / "SK_branch_elm_01.blend"
+        target = owner / "SK_Tree_elm_01.spm"
+        scope = {
+            "groups": [],
+            "cluster_rows": [{
+                "kind": "cluster_relation",
+                "folder_relation": "on",
+                "blend": blend,
+                "on_target_spms": [target],
+                "target_spms": [target],
+                "refresh_reasons": [
+                    "blender_source_content_changed"
+                ],
+                "refresh_reason_categories": [
+                    "geometry_ownership"
+                ],
+            }],
+            "skipped": [],
+        }
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {"blender_exe": r"C:\Blender\blender.exe"}
+        app.verify_var = mock.Mock()
+        app.verify_var.get.return_value = False
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = str(owner)
+        app.status_var = mock.Mock()
+        app.refresh = mock.Mock()
+        app._show_job_info = mock.Mock()
+        app.connected_board_scope = mock.Mock(return_value=scope)
+        app._connected_scope_from_board = mock.Mock(return_value=scope)
+        captured = {}
+
+        def run_now(_label, work, done, **_kwargs):
+            result = work(lambda *_args: None)
+            captured.update(result)
+            done(result)
+
+        app._start_job = run_now
+        attempt = {
+            "ok": False,
+            "reason": "cluster fixture failed",
+            "classification": {"category": "product"},
+            "attempts": [],
+            "retry_exhausted": False,
+        }
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ), mock.patch.object(
+            app,
+            "_execute_connected_runtime_unit",
+            return_value=attempt,
+        ), mock.patch.object(
+            GUI,
+            "write_connected_run_report",
+            return_value=Path(r"C:\reports\connected.json"),
+        ), mock.patch.object(
+            GUI,
+            "report_file_identity",
+            return_value={
+                "path": r"C:\reports\connected.json",
+                "sha256": "a" * 64,
+                "size": 100,
+            },
+        ):
+            app.apply_connected_board()
+
+        self.assertEqual(captured["status"], "failed")
+        self.assertEqual(captured["summary"]["cluster"]["failed"], 1)
+        failure = captured["failures"][0]
+        self.assertEqual(
+            failure["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            failure["refresh_reason_categories"],
+            ["geometry_ownership"],
+        )
+        cluster_unit = next(
+            entry
+            for entry in captured["unit_results"]
+            if entry["stage"] == "cluster_refresh"
+        )
+        self.assertEqual(cluster_unit["outcome"], "failed")
+        self.assertEqual(
+            cluster_unit["failure"]["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_unit["failure"]["refresh_reason_categories"],
+            ["geometry_ownership"],
         )
 
     def test_initial_checkpoint_failure_blocks_every_connected_mutation(self):
