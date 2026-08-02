@@ -1176,27 +1176,43 @@ def cluster_stale_node_table_recovery_scope(
     target_spm,
     audit_report,
 ):
-    """Seal a complete target-wide legacy scope or explain why it is unsafe.
+    """Seal authoritative authored and required-live scopes or fail closed.
 
-    This adapter intentionally does not invent the newer required-live
-    manifest contract.  It is eligible only for today's strict Atlas policy,
-    where every normalized target Mesh ID is both authored and required live.
-    All provider-role slices for the exact target must be present in the same
-    live audit; a diagnostic stale subset is never promoted to full scope.
+    Only a producer-validated explicit delivery intent may authorize recovery.
+    Live survivors, visibility, node counts, and diagnostic stale subsets are
+    observations, never recovery intent.  Every required provider-role slice
+    for the exact target must be present in the same content-bound live audit.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
 
     def unavailable(reason_token, **details):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "available": False,
             "mode": "owned_semantic_uia_modeler_save_watch",
-            "scope_policy": "complete_target_wide_legacy_strict_v1",
+            "scope_policy": "explicit_sealed_delivery_scopes_v1",
             "reason_token": str(reason_token),
             "target_spm": str(target),
             "audit_report": str(audit_report or ""),
             **copy.deepcopy(details),
         }
+
+    def canonical_mesh_scope(values, label, *, allow_empty=False):
+        if not isinstance(values, (list, tuple)):
+            return None, f"{label}_missing"
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return None, f"{label}_invalid"
+        canonical = sorted(set(values))
+        if list(values) != canonical:
+            return None, f"{label}_not_canonical"
+        if not canonical and not allow_empty:
+            return None, f"{label}_missing"
+        return canonical, None
 
     if not isinstance(contract, dict):
         return unavailable("recovery_contract_missing")
@@ -1235,7 +1251,8 @@ def cluster_stale_node_table_recovery_scope(
         "generator_export_evidence_stale_node_table",
         "normalized_and_live_target_mesh_sets_differ",
     }
-    expected_mesh_ids = set()
+    authoring_mesh_ids = set()
+    required_live_mesh_ids = set()
     provider_slices = []
     required_dependency_count = 0
     stale_slice_count = 0
@@ -1274,34 +1291,164 @@ def cluster_stale_node_table_recovery_scope(
         delivery = target_rows[0]
         if delivery.get("generator_variant_policy") != strict_policy:
             return unavailable(
-                "target_delivery_policy_not_legacy_strict",
+                "target_delivery_variant_policy_not_supported",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_values = delivery.get("normalized_target_mesh_ids")
-        if not isinstance(mesh_values, (list, tuple)) or not mesh_values:
+        if delivery.get("delivery_scope_mode") != "explicit_sealed_v1":
             return unavailable(
-                "normalized_target_mesh_scope_missing",
+                "target_delivery_scope_not_explicit",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-            for value in mesh_values
+        recovery_target_scope = delivery.get("recovery_target_scope")
+        if not (
+            isinstance(recovery_target_scope, dict)
+            and recovery_target_scope.get("contract")
+            == "speedtree_stale_node_recovery_target_scope"
+            and recovery_target_scope.get("schema_version") == 1
+            and recovery_target_scope.get("policy")
+            == "explicit_sealed_scopes_v1"
         ):
             return unavailable(
-                "normalized_target_mesh_scope_invalid",
+                "authoritative_recovery_target_scope_missing",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_ids = sorted(set(mesh_values))
-        if list(mesh_values) != mesh_ids:
+        supplied_scope_sha256 = str(
+            recovery_target_scope.get("scope_sha256") or ""
+        ).strip().casefold()
+        scope_projection = {
+            key: value
+            for key, value in recovery_target_scope.items()
+            if key != "scope_sha256"
+        }
+        expected_scope_sha256 = hashlib.sha256(
+            json.dumps(
+                scope_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if supplied_scope_sha256 != expected_scope_sha256:
             return unavailable(
-                "normalized_target_mesh_scope_not_canonical",
+                "authoritative_recovery_target_scope_hash_mismatch",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if expected_mesh_ids.intersection(mesh_ids):
+        intent_sha256 = str(
+            recovery_target_scope.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold()
+        if len(intent_sha256) != 64 or any(
+            value not in "0123456789abcdef" for value in intent_sha256
+        ):
             return unavailable(
-                "normalized_target_mesh_scope_overlaps_provider_roles",
+                "target_delivery_scope_intent_sha256_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if intent_sha256 != str(
+            delivery.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold():
+            return unavailable(
+                "target_delivery_scope_intent_echo_mismatch",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        authoring_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("authoring_mesh_ids"),
+            "authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        normalized_ids, scope_error = canonical_mesh_scope(
+            delivery.get("normalized_target_mesh_ids"),
+            "normalized_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        declared_ids, scope_error = canonical_mesh_scope(
+            delivery.get("declared_target_mesh_ids"),
+            "declared_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (normalized_ids == declared_ids == authoring_ids):
+            return unavailable(
+                "authoring_scope_not_exact_declared_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        required_live_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("required_live_mesh_ids"),
+            "required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not set(required_live_ids).issubset(authoring_ids):
+            return unavailable(
+                "required_live_scope_not_authoring_subset",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        current_required_ids, scope_error = canonical_mesh_scope(
+            delivery.get("current_required_target_mesh_ids"),
+            "current_required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if current_required_ids != required_live_ids:
+            return unavailable(
+                "required_live_scope_not_exact_delivery_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+
+        count_fields = {
+            name: delivery.get(name)
+            for name in (
+                "declared_binding_count",
+                "active_required_binding_count",
+                "planned_inactive_binding_count",
+                "delivery_scope_required_live_slot_count",
+                "delivery_scope_continuity_only_slot_count",
+            )
+        }
+        if any(
+            type(value) is not int or value < 0
+            for value in count_fields.values()
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (
+            count_fields["declared_binding_count"] > 0
+            and count_fields["planned_inactive_binding_count"] == 0
+            and count_fields["active_required_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            and count_fields["declared_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            + count_fields["delivery_scope_continuity_only_slot_count"]
+            and bool(required_live_ids)
+            == bool(count_fields["delivery_scope_required_live_slot_count"])
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_inconsistent",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if authoring_mesh_ids.intersection(authoring_ids):
+            return unavailable(
+                "authoring_mesh_scope_overlaps_provider_roles",
                 provider_role=str(dependency.get("role") or ""),
             )
 
@@ -1334,7 +1481,7 @@ def cluster_stale_node_table_recovery_scope(
                     or value <= 0
                     for value in stale_ids
                 )
-                or not set(canonical_stale_ids).issubset(mesh_ids)
+                or not set(canonical_stale_ids).issubset(required_live_ids)
                 or delivery.get("delivery_reason") != stale_reason
                 or not errors
                 or not errors.issubset(stale_consequences)
@@ -1349,20 +1496,32 @@ def cluster_stale_node_table_recovery_scope(
                 )
             stale_slice_count += 1
         elif not (
-            decision == "normalize_part"
-            and not errors
-            and delivery.get("live_generator_delivery_complete") is True
+            (
+                decision == "normalize_part"
+                and not errors
+                and delivery.get("live_generator_delivery_complete") is True
+            )
+            or (
+                decision == "pass_through"
+                and not required_live_ids
+                and not errors
+                and delivery.get("delivery_reason")
+                == "relationship_continuity_only"
+            )
         ):
             return unavailable(
                 "target_delivery_has_independent_blocker",
                 provider_role=str(dependency.get("role") or ""),
             )
 
-        expected_mesh_ids.update(mesh_ids)
+        authoring_mesh_ids.update(authoring_ids)
+        required_live_mesh_ids.update(required_live_ids)
         provider_slices.append({
             "role": str(dependency.get("role") or ""),
             "provider_spm": str(dependency.get("spm") or ""),
-            "normalized_target_mesh_ids": mesh_ids,
+            "delivery_scope_intent_sha256": intent_sha256,
+            "authoring_mesh_ids": authoring_ids,
+            "required_live_mesh_ids": required_live_ids,
             "delivery_decision": decision,
             "orphan_generator_guid_count": (
                 orphan_owner_count if decision == "blocked" else 0
@@ -1372,19 +1531,20 @@ def cluster_stale_node_table_recovery_scope(
             ),
         })
 
-    if required_dependency_count == 0 or not expected_mesh_ids:
+    if required_dependency_count == 0 or not authoring_mesh_ids:
         return unavailable("target_recovery_scope_empty")
     if stale_slice_count == 0:
         return unavailable("target_has_no_stale_blocking_delivery")
 
     sealed = {
-        "schema_version": 1,
+        "schema_version": 2,
         "available": True,
         "mode": "owned_semantic_uia_modeler_save_watch",
-        "scope_policy": "complete_target_wide_legacy_strict_v1",
+        "scope_policy": "explicit_sealed_delivery_scopes_v1",
         "target_spm": str(target),
         "target_preimage_raw_sha256": target_sha256,
-        "expected_mesh_ids": sorted(expected_mesh_ids),
+        "authoring_mesh_ids": sorted(authoring_mesh_ids),
+        "required_live_mesh_ids": sorted(required_live_mesh_ids),
         "provider_slices": sorted(
             provider_slices,
             key=lambda row: (row["role"], row["provider_spm"]),
@@ -9514,8 +9674,12 @@ class App:
         ))
         self.log(
             "Stale Node-table recovery scope sealed from live audit: "
-            f"{target} | Mesh IDs "
-            + ",".join(str(value) for value in scope["expected_mesh_ids"])
+            f"{target} | Authoring Mesh IDs "
+            + ",".join(str(value) for value in scope["authoring_mesh_ids"])
+            + " | required-live Mesh IDs "
+            + ",".join(
+                str(value) for value in scope["required_live_mesh_ids"]
+            )
             + f" | scope={scope['scope_sha256']}"
         )
         executable = self.cfg.get("speedtree_exe") or ""
@@ -9531,14 +9695,18 @@ class App:
             {
                 "target_spm": str(target),
                 "scope_sha256": scope["scope_sha256"],
-                "expected_mesh_ids": list(scope["expected_mesh_ids"]),
+                "authoring_mesh_ids": list(scope["authoring_mesh_ids"]),
+                "required_live_mesh_ids": list(
+                    scope["required_live_mesh_ids"]
+                ),
             },
         ))
         try:
             result = recover_stale_node_table(
                 target,
                 executable,
-                scope["expected_mesh_ids"],
+                authoring_mesh_ids=scope["authoring_mesh_ids"],
+                required_live_mesh_ids=scope["required_live_mesh_ids"],
                 timeout=7200,
                 poll_interval=2.0,
                 stable_reads=3,

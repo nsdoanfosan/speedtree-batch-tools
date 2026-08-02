@@ -478,6 +478,8 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         )
         self.assertEqual(delivery["live_snapshot_total_node_count"], 1)
         self.assertEqual(len(delivery["live_snapshot_sha256"]), 64)
+        self.assertEqual(delivery["delivery_scope_mode"], "legacy_strict")
+        self.assertIsNone(delivery["recovery_target_scope"])
 
     def test_guid_case_slot_case_and_manifest_index_share_one_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1045,6 +1047,16 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
 
         self.assertEqual(delivery["errors"], [])
         self.assertEqual(delivery["delivery_scope_mode"], "explicit_sealed_v1")
+        recovery_scope = delivery["recovery_target_scope"]
+        self.assertEqual(
+            recovery_scope["authoring_mesh_ids"],
+            list(TARGET_MESH_IDS),
+        )
+        self.assertEqual(
+            recovery_scope["required_live_mesh_ids"],
+            [TARGET_MESH_IDS[0]],
+        )
+        self.assertRegex(recovery_scope["scope_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(delivery["active_required_binding_count"], 1)
         self.assertEqual(delivery["planned_inactive_binding_count"], 0)
         self.assertEqual(
@@ -1089,6 +1101,10 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         )
 
         self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["recovery_target_scope"]["required_live_mesh_ids"],
+            [],
+        )
         self.assertEqual(
             delivery["delivery_mode"], DELIVERY_MODE_ASSET_REGISTRATION_ONLY
         )

@@ -14,7 +14,16 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_cluster_assembly_contract import (  # noqa: E402
+    _delivery_binding_slot_identity,
     _normalized_generator_delivery,
+)
+from generator_delivery_scope import (  # noqa: E402
+    CONTINUITY_ONLY_POLICY,
+    INTENT_KIND,
+    RESOLVED_KIND,
+    RUNTIME_INACTIVE_POLICY,
+    SCOPE_KIND,
+    canonical_sha256,
 )
 from stale_node_table_recovery import (  # noqa: E402
     StaleNodeTableRecoveryError,
@@ -124,28 +133,92 @@ def write_fixture_spm(path, fixture):
     path.write_bytes(gzip.compress(payload.encode("utf-8"), mtime=0))
 
 
-def declared_delivery_payload(fixture):
+def declared_delivery_payload(fixture, target, snapshot_sha256):
+    bindings = [
+        {
+            "state": "already_connected",
+            "generator_index": index,
+            "generator_name": binding["generator_name"],
+            "generator_guid": binding["generator_guid"],
+            "generator_type": binding["generator_type"],
+            "slot_prefix": binding["slot_prefix"],
+            "target_material_id": binding["material_id"],
+            "target_mesh_id": binding["mesh_id"],
+        }
+        for index, binding in enumerate(fixture["generator_bindings"])
+    ]
+    authored = [
+        {
+            "slot_identity": list(_delivery_binding_slot_identity(binding)),
+            "target_material_id": binding["target_material_id"],
+            "target_mesh_id": binding["target_mesh_id"],
+        }
+        for binding in bindings
+    ]
+    required_mesh_ids = set(
+        fixture["recovery_scope_contract"]["required_live_mesh_ids"]
+    )
+    required = [
+        row["slot_identity"]
+        for row in authored
+        if row["target_mesh_id"] in required_mesh_ids
+    ]
+    continuity = [
+        {
+            "slot_identity": row["slot_identity"],
+            "reason": "sanitized Densiflora authored continuity",
+            "policy": CONTINUITY_ONLY_POLICY,
+            "provenance": {
+                "fixture": "issue40_densiflora_live_recurrence",
+                "authority_revision": 1,
+            },
+        }
+        for row in authored
+        if row["target_mesh_id"] not in required_mesh_ids
+    ]
+    provider_blend = str(Path("sanitized-provider.blend").resolve())
+    intent = {
+        "kind": INTENT_KIND,
+        "schema_version": 1,
+        "authority": {
+            "kind": "sanitized_test_recipe",
+            "id": "issue-40-densiflora",
+            "provenance": {"fixture": "four-authored-one-live"},
+        },
+        "target": {
+            "spm": str(Path(target).resolve()),
+            "provider_blend": provider_blend,
+            "provider_scope_id": "densiflora-cluster-01",
+            "material_id": fixture["material"]["material_id"],
+        },
+        "authored_slots": authored,
+        "required_live_slot_identities": required,
+        "continuity_only_slots": continuity,
+        "runtime_inactive_policy": RUNTIME_INACTIVE_POLICY,
+    }
+    intent["intent_sha256"] = canonical_sha256(intent)
+    resolved = {
+        "kind": RESOLVED_KIND,
+        "schema_version": 1,
+        "intent_sha256": intent["intent_sha256"],
+        "bindings_sha256": canonical_sha256(authored),
+        "target_spm_postwrite_sha256": snapshot_sha256,
+    }
+    resolved["resolved_sha256"] = canonical_sha256(resolved)
     return {
+        "blend_file": provider_blend,
         "generator_connection": {
             "requested": True,
             "complete": True,
             "generator_variant_policy": "ensure_all_material_cutouts",
-            "bindings": [
-                {
-                    "state": "already_connected",
-                    "generator_index": index,
-                    "generator_name": binding["generator_name"],
-                    "generator_guid": binding["generator_guid"],
-                    "generator_type": binding["generator_type"],
-                    "slot_prefix": binding["slot_prefix"],
-                    "target_material_id": binding["material_id"],
-                    "target_mesh_id": binding["mesh_id"],
-                }
-                for index, binding in enumerate(
-                    fixture["generator_bindings"]
-                )
-            ],
-        }
+            "bindings": bindings,
+            "delivery_scope": {
+                "kind": SCOPE_KIND,
+                "schema_version": 1,
+                "intent": intent,
+                "resolved": resolved,
+            },
+        },
     }
 
 
@@ -186,7 +259,7 @@ class DensifloraLiveRecurrenceTests(unittest.TestCase):
             scope_contract["post_manifest_selection_scope_split_remains"]
         )
 
-    def test_legacy_strict_audit_reproduces_the_live_recurrence(self):
+    def test_explicit_delivery_scope_eliminates_the_live_recurrence(self):
         fixture = load_fixture()
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / fixture["target_spm"]
@@ -204,7 +277,11 @@ class DensifloraLiveRecurrenceTests(unittest.TestCase):
             delivery = _normalized_generator_delivery(
                 FrozenAudit,
                 target,
-                declared_delivery_payload(fixture),
+                declared_delivery_payload(
+                    fixture,
+                    target,
+                    snapshot["spm_text_sha256"],
+                ),
                 {"material_id": fixture["material"]["material_id"]},
                 [
                     {"target_mesh_id": mesh_id}
@@ -212,14 +289,32 @@ class DensifloraLiveRecurrenceTests(unittest.TestCase):
                 ],
             )
 
-        expected = fixture["legacy_strict_audit"]
+        expected = fixture["recovery_scope_contract"]
+        self.assertEqual(delivery["delivery_scope_mode"], "explicit_sealed_v1")
+        self.assertEqual(
+            delivery["normalized_target_mesh_ids"],
+            expected["authoring_mesh_ids"],
+        )
+        self.assertEqual(
+            delivery["current_required_target_mesh_ids"],
+            expected["required_live_mesh_ids"],
+        )
+        recovery_scope = delivery["recovery_target_scope"]
+        self.assertEqual(
+            recovery_scope["authoring_mesh_ids"],
+            expected["authoring_mesh_ids"],
+        )
+        self.assertEqual(
+            recovery_scope["required_live_mesh_ids"],
+            expected["required_live_mesh_ids"],
+        )
+        self.assertRegex(recovery_scope["scope_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             delivery["live_export_participating_target_mesh_ids"],
-            expected["live_export_participating_mesh_ids"],
+            expected["required_live_mesh_ids"],
         )
-        for error in expected["errors"]:
-            self.assertIn(error, delivery["errors"])
-        self.assertNotIn("visible_generator_slot_missing", delivery["errors"])
+        self.assertEqual(delivery["errors"], [])
+        self.assertTrue(delivery["live_generator_delivery_complete"])
 
     def test_explicit_scope_accepts_the_fresh_authored_subset_shape(self):
         fixture = load_fixture()
