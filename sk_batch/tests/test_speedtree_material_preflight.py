@@ -1070,7 +1070,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 },
             )
 
-    def test_unbound_managed_mesh_is_nonblocking_when_material_keeps_others(
+    def test_unbound_managed_mesh_blocks_when_material_keeps_others(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1096,8 +1096,8 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             exited, export_mock = self.run_preflight(spm, report_path)
 
-            self.assertFalse(exited)
-            export_mock.assert_called_once()
+            self.assertTrue(exited)
+            export_mock.assert_not_called()
             contract = json.loads(
                 report_path.read_text(encoding="utf-8")
             )["mesh_file_reference_contract"]
@@ -1109,6 +1109,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(
                 contract["orphan_missing"][0]["usage"],
                 "managed_orphan",
+            )
+            self.assertTrue(
+                contract["atlas_consumer_integrity"]["blocking"]
             )
 
     def test_final_managed_material_mesh_stays_a_blocking_reference(self):
