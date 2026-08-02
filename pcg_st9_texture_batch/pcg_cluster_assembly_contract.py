@@ -32,9 +32,13 @@ from atlas_target_registry import (
     load_target_registry,
 )
 from artifact_content_key import sampled_file_content_snapshot
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    canonical_slot_identity,
+    validate_resolved_delivery_scope,
+)
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
-    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     spm_file_structural_semantic_fingerprint,
@@ -2002,27 +2006,10 @@ def _positive_asset_id(value):
 
 def _delivery_binding_slot_identity(binding):
     """Use authored Generator identity, never XML array position."""
-    prefix = str(
-        binding.get("slot_prefix")
-        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
-    ).strip().casefold()
-    # One GUID has two observed SpeedTree serialization spellings (24-character
-    # RFC base64 and the 23-character Modeler dialect), so the raw string is not
-    # the identity.  Compare the canonical form; the raw value stays in the
-    # evidence rows for provenance.
-    guid = generator_guid_key(binding.get("generator_guid"))
-    if guid and prefix:
-        return "guid", guid, prefix
-    # A missing GUID is already weaker evidence.  Keep the semantic
-    # type/name/prefix tuple so reordering Generator XML cannot silently turn
-    # one authored slot into another.  Duplicate named identities fail closed
-    # as an ambiguous live slot below.
-    return (
-        "named",
-        str(binding.get("generator_type") or "").strip().casefold(),
-        str(binding.get("generator_name") or "").strip().casefold(),
-        prefix,
-    )
+    # Legacy audit snapshots can omit Generator type/name while retaining the
+    # semantic slot prefix.  Preserve that established matching behavior here;
+    # explicit authored scope validation uses the strict shared default.
+    return canonical_slot_identity(binding, strict=False)
 
 
 def _stale_node_table_evidence(binding):
@@ -2283,7 +2270,7 @@ def _normalized_generator_delivery(
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence = {
-        "schema_version": 2,
+        "schema_version": 3,
         "spm": str(Path(production_spm).resolve(strict=False)),
         "delivery_mode": DELIVERY_MODE_CONNECTION_INCOMPLETE,
         "delivery_decision": "blocked",
@@ -2297,6 +2284,10 @@ def _normalized_generator_delivery(
             "fresh_live_export_delivery"
         ),
         "generator_variant_policy": variant_policy or None,
+        "delivery_scope_mode": "legacy_strict",
+        "delivery_scope_intent_sha256": None,
+        "delivery_scope_required_live_slot_count": len(bindings),
+        "delivery_scope_continuity_only_slot_count": 0,
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
@@ -2459,6 +2450,38 @@ def _normalized_generator_delivery(
         dict(live_node_table) if isinstance(live_node_table, dict) else None
     )
     slot_identity = _delivery_binding_slot_identity
+    explicit_scope = connection.get("delivery_scope") is not None
+    scope_contract = None
+    if explicit_scope:
+        try:
+            provider_blend = str(payload.get("blend_file") or "").strip()
+            if not provider_blend:
+                raise GeneratorDeliveryScopeError(
+                    "explicit delivery scope manifest has no provider blend"
+                )
+            scope_contract = validate_resolved_delivery_scope(
+                connection,
+                target_spm=production_spm,
+                material_id=expected_material_id,
+                provider_blend=provider_blend,
+                target_spm_postwrite_sha256=snapshot_sha256,
+            )
+        except GeneratorDeliveryScopeError as exc:
+            evidence["delivery_scope_mode"] = "explicit_invalid"
+            evidence["errors"].append(
+                "generator_delivery_scope_invalid:" + str(exc)
+            )
+            return _finalize_normalized_generator_delivery(evidence)
+        evidence["delivery_scope_mode"] = "explicit_sealed_v1"
+        evidence["delivery_scope_intent_sha256"] = scope_contract[
+            "intent_sha256"
+        ]
+        evidence["delivery_scope_required_live_slot_count"] = len(
+            scope_contract["required_live_slot_identities"]
+        )
+        evidence["delivery_scope_continuity_only_slot_count"] = len(
+            scope_contract["continuity_only_slot_identities"]
+        )
 
     def export_participates(row):
         return bool(
@@ -2543,7 +2566,8 @@ def _normalized_generator_delivery(
         current_material_id = _positive_asset_id(current.get("material_id"))
         current_mesh_id = _positive_asset_id(current.get("mesh_id"))
         if (
-            _inactive_causal_path_evidence(current)
+            not explicit_scope
+            and _inactive_causal_path_evidence(current)
             and target_material_id == expected_material_id
             and current_material_id == target_material_id
             and target_mesh_id in set(normalized_mesh_ids)
@@ -2552,19 +2576,35 @@ def _normalized_generator_delivery(
         ):
             planned_inactive_slots.add(declared_slot)
 
-    required_bindings = [
-        row for row in bindings
-        if tuple(slot_identity(row)) not in planned_inactive_slots
-    ]
+    if explicit_scope:
+        required_slot_identities = scope_contract[
+            "required_live_slot_identities"
+        ]
+        continuity_only_slot_identities = scope_contract[
+            "continuity_only_slot_identities"
+        ]
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
+    else:
+        required_slot_identities = {
+            tuple(slot_identity(row))
+            for row in bindings
+            if tuple(slot_identity(row)) not in planned_inactive_slots
+        }
+        continuity_only_slot_identities = set()
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
     current_required_mesh_ids = sorted({
         _positive_asset_id(row.get("target_mesh_id"))
         for row in required_bindings
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence["active_required_binding_count"] = len(required_bindings)
-    evidence["planned_inactive_binding_count"] = (
-        len(bindings) - len(required_bindings)
-    )
+    evidence["planned_inactive_binding_count"] = len(planned_inactive_slots)
     evidence["current_required_target_mesh_ids"] = (
         current_required_mesh_ids
     )
@@ -2599,6 +2639,7 @@ def _normalized_generator_delivery(
         )
         target_mesh_id = _positive_asset_id(declared.get("target_mesh_id"))
         declared_slot = tuple(slot_identity(declared))
+        continuity_only = declared_slot in continuity_only_slot_identities
         current_rows = live_by_slot.get(declared_slot) or []
         current = current_rows[0] if len(current_rows) == 1 else None
         if target_material_id != expected_material_id:
@@ -2623,11 +2664,17 @@ def _normalized_generator_delivery(
                 errors.append("visible_generator_material_mismatch")
             if current_mesh_id != target_mesh_id:
                 errors.append("visible_generator_mesh_mismatch")
-            if not export_participates(current):
+            if continuity_only and export_participates(current):
+                errors.append(
+                    "continuity_only_generator_export_participating"
+                )
+            elif not export_participates(current):
                 # Fail closed either way, but never report a correct Generator
                 # connection as disconnected: a zero node count read out of a
                 # stale <Node> table is missing evidence, not proof.
-                if declared_slot in planned_inactive_slots:
+                if continuity_only:
+                    outcome_reason = "relationship_continuity_only"
+                elif declared_slot in planned_inactive_slots:
                     outcome_reason = INACTIVE_CAUSAL_PATH_REASON
                 elif _stale_node_table_evidence(current):
                     errors.append(
@@ -2643,7 +2690,9 @@ def _normalized_generator_delivery(
             "errors": errors,
             "complete": not errors,
             "status": (
-                "planned_inactive"
+                "continuity_only"
+                if continuity_only and not errors
+                else "planned_inactive"
                 if outcome_reason and not errors
                 else "completed" if not errors else "failed"
             ),
@@ -2675,7 +2724,7 @@ def _normalized_generator_delivery(
     _classify_stale_node_table_block(
         evidence,
         declared_live_bindings,
-        normalized_mesh_ids,
+        current_required_mesh_ids,
         live_mesh_ids,
     )
     all_bindings_planned_inactive = bool(
@@ -2696,6 +2745,19 @@ def _normalized_generator_delivery(
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
         )
+    elif (
+        explicit_scope
+        and bindings
+        and not required_bindings
+        and not evidence["errors"]
+        and all(
+            row.get("status") == "continuity_only"
+            for row in evidence["binding_outcomes"]
+        )
+    ):
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = "relationship_continuity_only"
     elif bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"

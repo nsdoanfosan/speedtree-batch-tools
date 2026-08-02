@@ -8,6 +8,7 @@ blend, persist a content-addressed receipt, then let Atlas update the owner
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -18,6 +19,10 @@ from cluster_card_pipeline.contract import _read_spm_root
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     load_current_isolated_bark_manifest,
+)
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    validate_delivery_scope_intent,
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
@@ -1112,6 +1117,7 @@ def resolve_normalization_recipe(
     canonical_spm=None,
     unit_probe_path,
     capture_resolution=1024,
+    delivery_scope_intents=None,
 ):
     """Build a fail-closed Blender recipe from current BWR and SPM evidence."""
     blend = Path(blend).expanduser().absolute()
@@ -1173,6 +1179,53 @@ def resolve_normalization_recipe(
         _resolve_target_role_material(target, role["material_name"])
         for target in targets
     ]
+    if delivery_scope_intents is not None:
+        if not isinstance(delivery_scope_intents, dict):
+            raise ClusterNormalizationSyncError(
+                "Generator delivery scope intents must be keyed by target SPM."
+            )
+        supplied_by_target = {
+            str(Path(path).expanduser().absolute()).casefold(): intent
+            for path, intent in delivery_scope_intents.items()
+        }
+        if len(supplied_by_target) != len(delivery_scope_intents):
+            raise ClusterNormalizationSyncError(
+                "Generator delivery scope intents contain duplicate target paths."
+            )
+        connected_targets = {
+            str(Path(row["target_spm"]).expanduser().absolute()).casefold()
+            for row in target_material_bindings
+            if row.get("connect_generators") is True
+        }
+        if set(supplied_by_target) != connected_targets:
+            raise ClusterNormalizationSyncError(
+                "Explicit Generator delivery scope must cover exactly every "
+                "Generator-connected target in the recipe."
+            )
+        for binding in target_material_bindings:
+            if binding.get("connect_generators") is not True:
+                continue
+            target_key = str(
+                Path(binding["target_spm"]).expanduser().absolute()
+            ).casefold()
+            intent = supplied_by_target[target_key]
+            try:
+                validate_delivery_scope_intent(
+                    intent,
+                    target_spm=binding["target_spm"],
+                    material_id=binding["source_material_id"],
+                    provider_blend=blend,
+                )
+            except GeneratorDeliveryScopeError as exc:
+                raise ClusterNormalizationSyncError(
+                    "Explicit Generator delivery scope is invalid for "
+                    f"{binding['target_spm']}: {exc}"
+                ) from exc
+            # Target-local delivery intent stays outside the physical Blender
+            # normalization hash.  It is passed through verbatim and sealed by
+            # the SPM producer after the write; this caller never derives it
+            # from current live Generator evidence.
+            binding["generator_delivery_scope_intent"] = copy.deepcopy(intent)
     first_binding = target_material_bindings[0]
     role = {
         **role,
