@@ -2055,6 +2055,7 @@ class App:
         self._retry_progress_by_run_id = {}
         self._async_retry_planning_enabled = True
         self._retry_planning_workers = set()
+        self._ui_thread_ident = threading.get_ident()
         self._retry_thread_context = threading.local()
         self.cell_editor = None
         self.stop_flag = threading.Event()
@@ -4706,12 +4707,15 @@ class App:
                 and not getattr(self, "pending_batch_jobs", ())
             ):
                 self.stop_flag.clear()
-            tracker = self._new_retry_progress(candidate_iids, cfg)
             self._set_batch_queue_controls(True)
             self.progress_var.set(
                 f"retry stage={RETRY_STAGE_PLANNING} · "
                 f"대상 {len(candidate_iids)}개"
             )
+            # Flush the planning label before any inventory/parent validation
+            # begins in the worker. This callback is the Tk owner thread.
+            self.root.update_idletasks()
+            tracker = self._new_retry_progress(candidate_iids, cfg)
 
             def plan_in_worker():
                 try:
@@ -5146,12 +5150,22 @@ class App:
         """Main-thread half of planning: message boxes, Tk, and enqueue."""
         if not isinstance(plan, dict):
             return None
+        ui_thread_ident = getattr(
+            self,
+            "_ui_thread_ident",
+            threading.main_thread().ident,
+        )
+        if threading.get_ident() != ui_thread_ident:
+            raise RuntimeError(
+                "retry planning commit must run on the Tk owner thread"
+            )
         current = threading.current_thread()
         workers = getattr(self, "_retry_planning_workers", None)
         if isinstance(workers, set):
-            workers.difference_update(
+            finished_workers = {
                 worker for worker in workers if not worker.is_alive()
-            )
+            }
+            workers.difference_update(finished_workers)
             workers.discard(current)
         tracker = plan.get("tracker")
         error = plan.get("error")

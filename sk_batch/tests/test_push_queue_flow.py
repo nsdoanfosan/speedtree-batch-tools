@@ -3508,6 +3508,140 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("체크 상태와 무관하게 현재 목록 전체", source)
         self.assertNotIn("체크된 최근 실패", source)
 
+    def test_slow_complete_inventory_retry_planning_keeps_tk_responsive(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        candidate_ids = ["checked.spm", "unchecked.spm"]
+        self.configure_failed_retry_start(
+            app,
+            candidate_ids,
+            checked_ids=[candidate_ids[0]],
+        )
+        app._async_retry_planning_enabled = True
+        app._retry_planning_workers = set()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        ui_thread_ident = threading.get_ident()
+        app._ui_thread_ident = ui_thread_ident
+        events = []
+
+        class ThreadCheckedVar:
+            value = ""
+
+            def set(self, value):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker touched a Tk variable")
+                self.value = str(value)
+                events.append(("progress", self.value))
+
+        class ThreadCheckedRoot:
+            def update_idletasks(self):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker touched the Tk root")
+                events.append(("paint",))
+
+            def after(self, _delay, _callback):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker scheduled Tk work directly")
+                events.append(("after",))
+
+        app.progress_var = ThreadCheckedVar()
+        app.root = ThreadCheckedRoot()
+        app._set_batch_queue_controls = mock.Mock(
+            side_effect=lambda _busy: events.append(("controls",))
+        )
+        tracker = mock.Mock()
+        tracker.run_id = "slow-complete-inventory"
+        tracker.path = Path("retry-progress.json")
+        app._new_retry_progress = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (
+                events.append(("tracker",)) or tracker
+            )
+        )
+
+        planning_entered = threading.Event()
+        release_planning = threading.Event()
+        repair_threads = []
+
+        def slow_repair_state(_iid):
+            repair_threads.append(threading.get_ident())
+            planning_entered.set()
+            if not release_planning.wait(5):
+                raise AssertionError("test did not release slow planning")
+            return {
+                "current": False,
+                "push_ready": False,
+                "kind": "stale_content",
+                "reason": "deterministic slow complete-inventory planning",
+            }
+
+        app._failed_retry_repair_state = mock.Mock(
+            side_effect=slow_repair_state
+        )
+        enqueued = []
+
+        def enqueue_on_tk_thread(job):
+            if threading.get_ident() != ui_thread_ident:
+                raise AssertionError("worker committed a queue job")
+            enqueued.append(job)
+            events.append(("enqueue",))
+            return len(enqueued)
+
+        app._enqueue_batch_job = mock.Mock(side_effect=enqueue_on_tk_thread)
+
+        with mock.patch.object(gui, "save_config"):
+            run_id = app.start_failed_results_retry()
+            self.assertTrue(planning_entered.wait(1))
+            self.assertEqual(run_id, tracker.run_id)
+            self.assertEqual(
+                events[:4],
+                [
+                    ("controls",),
+                    ("progress", "retry stage=planning · 대상 2개"),
+                    ("paint",),
+                    ("tracker",),
+                ],
+            )
+            self.assertIn("대상 2개", app.progress_var.value)
+            self.assertFalse(enqueued)
+
+            worker = next(iter(app._retry_planning_workers))
+            release_planning.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            app._drain_ui_queue()
+
+        self.assertEqual(
+            app._failed_retry_repair_state.call_args_list,
+            [mock.call(iid) for iid in candidate_ids],
+        )
+        self.assertTrue(repair_threads)
+        self.assertTrue(
+            all(ident != ui_thread_ident for ident in repair_threads)
+        )
+        self.assertEqual(len(enqueued), 1)
+        self.assertEqual(
+            [str(item["spm"]) for item in enqueued[0]["targets"]],
+            candidate_ids,
+        )
+        self.assertIn(("enqueue",), events)
+
+        off_thread_errors = []
+
+        def attempt_off_thread_commit():
+            try:
+                app._commit_failed_retry_plan({})
+            except Exception as exc:
+                off_thread_errors.append(exc)
+
+        off_thread = threading.Thread(target=attempt_off_thread_commit)
+        off_thread.start()
+        off_thread.join(5)
+        self.assertFalse(off_thread.is_alive())
+        self.assertEqual(len(off_thread_errors), 1)
+        self.assertIsInstance(off_thread_errors[0], RuntimeError)
+        self.assertIn("Tk owner thread", str(off_thread_errors[0]))
+
     @staticmethod
     def write_unreal_retry_parent(gui, root, queue_id, status="data_error"):
         manifest_path = root / "parent.json"
