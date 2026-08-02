@@ -47,7 +47,10 @@ STARTUP_TOTAL_INVOCATION_RULES = {
     },
     "spm_analysis_calls": {
         "cardinality": "spm_count",
-        "per_item_limit": 32,
+        # The 597-SPM fixture currently uses 18,837 calls (31.55/file).
+        # Keep enough headroom for ordinary call-graph refactors while still
+        # rejecting the hundreds-per-file amplification this guard targets.
+        "per_item_limit": 48,
     },
     "legacy_receipt_inspection_calls": {
         "cardinality": "spm_count",

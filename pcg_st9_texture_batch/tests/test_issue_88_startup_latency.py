@@ -1085,7 +1085,10 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             # Negative control for the exact PR #61 integration regression:
             # a manifest-free folder used to send every sibling SPM through
             # resolve_atlas_manifests().  The fixture is deliberately tiny,
-            # but preserves that per-SPM/per-scope cardinality mismatch.
+            # but preserves that per-SPM/per-scope cardinality mismatch.  The
+            # unmodified 597-SPM fixture below has no Atlas carrier and records
+            # zero resolver calls, so this injection is the load-bearing proof
+            # that the manifest rule catches more than the trivial 0 <= 55.
             def legacy_per_spm_manifest_targets(folder):
                 return sorted(Path(folder).glob("*.spm"))
 
