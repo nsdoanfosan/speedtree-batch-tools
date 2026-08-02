@@ -175,6 +175,61 @@ def authored_scope_text(
     ).replace("<Assets>", "<Assets>" + material, 1)
 
 
+def issue102_leaf_material_text(
+    *,
+    stale,
+    material_values,
+    mesh_values=None,
+    material_ids=(1, 5),
+    volatile="one",
+):
+    mesh_values = mesh_values or (-10, -10, -10, -10)
+    properties = []
+    for type_index, (material_value, mesh_value) in enumerate(zip(
+        material_values,
+        mesh_values,
+    )):
+        properties.extend((
+            "<Property>"
+            f"<Name>Leaves:Type:{type_index}:Material</Name>"
+            f"<Value>{material_value}</Value>"
+            "</Property>",
+            "<Property>"
+            f"<Name>Leaves:Type:{type_index}:Mesh</Name>"
+            f"<Value>{mesh_value}</Value>"
+            "</Property>",
+        ))
+    generator = (
+        '<Generator Type="Leaf Mesh">'
+        "<Name>Sanitized dormant leaf</Name>"
+        "<GUID>issue102-dormant-leaf</GUID>"
+        "<Hidden>false</Hidden>"
+        f"<Properties>{''.join(properties)}</Properties>"
+        "</Generator>"
+    )
+    materials = "".join(
+        f'<Material_v8 ID="{material_id}" Name="material-{material_id}">'
+        "<Map Name=\"Color\"><TexFilename></TexFilename>"
+        "<TexEnabled>false</TexEnabled></Map>"
+        "</Material_v8>"
+        for material_id in material_ids
+    )
+    return spm_text(stale=stale, volatile=volatile).replace(
+        "<SpeedTree>",
+        '<SpeedTree BuildInfo="" OS="Windows" Title=" Modeler 10.1.0 " '
+        'Version="8" VersionString="10.1.0 ">',
+        1,
+    ).replace(
+        "<Generators>",
+        "<Generators>" + generator,
+        1,
+    ).replace(
+        "<Assets>",
+        "<Assets>" + materials,
+        1,
+    )
+
+
 def write_spm(path, text):
     path.write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
 
@@ -689,6 +744,118 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         self.assertNotEqual(
             _authoring_graph_core_projection(before)["fingerprint"],
             _authoring_graph_core_projection(changed_material)["fingerprint"],
+        )
+
+    def test_issue102_unproven_dormant_leaf_material_transition_is_strict(self):
+        before = issue102_leaf_material_text(
+            stale=True,
+            material_values=(-1, -1, -1, -1),
+        )
+        after = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 0, 0, 0),
+            volatile="two",
+        )
+        before_projection = _authoring_graph_core_projection(before)
+        after_projection = _authoring_graph_core_projection(after)
+
+        self.assertNotEqual(
+            before_projection["fingerprint"],
+            after_projection["fingerprint"],
+        )
+
+        differences = []
+
+        def walk(left, right, path="$", names=()):
+            if type(left) is not type(right):
+                differences.append((path, left, right, names))
+                return
+            if isinstance(left, dict):
+                next_names = names
+                if left.get("tag") == "Property":
+                    property_names = [
+                        child.get("text")
+                        for child in left.get("children", [])
+                        if child.get("tag") == "Name"
+                    ]
+                    next_names = names + tuple(property_names)
+                for key in sorted(set(left) | set(right)):
+                    if key not in left or key not in right:
+                        differences.append((path + "." + key, left, right, next_names))
+                    else:
+                        walk(left[key], right[key], path + "." + key, next_names)
+                return
+            if isinstance(left, list):
+                if len(left) != len(right):
+                    differences.append((path + ".length", len(left), len(right), names))
+                for index, (before_item, after_item) in enumerate(zip(left, right)):
+                    walk(
+                        before_item,
+                        after_item,
+                        f"{path}[{index}]",
+                        names,
+                    )
+                return
+            if left != right:
+                differences.append((path, left, right, names))
+
+        walk(before_projection["_rows"], after_projection["_rows"])
+        self.assertEqual(len(differences), 4)
+        self.assertEqual(
+            {(before_value, after_value) for _, before_value, after_value, _ in differences},
+            {("-1", "0")},
+        )
+        self.assertEqual(
+            {name for _, _, _, names in differences for name in names},
+            {f"Leaves:Type:{type_index}:Material" for type_index in range(4)},
+        )
+
+    def test_issue102_active_material_zero_remains_observable(self):
+        active_zero = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 5, 5, 5),
+            mesh_values=(130, -10, -10, -10),
+            material_ids=(0, 5),
+        )
+        active_five = issue102_leaf_material_text(
+            stale=False,
+            material_values=(5, 5, 5, 5),
+            mesh_values=(130, -10, -10, -10),
+            material_ids=(0, 5),
+        )
+
+        self.assertNotEqual(
+            _authoring_graph_core_projection(active_zero)["fingerprint"],
+            _authoring_graph_core_projection(active_five)["fingerprint"],
+        )
+
+    def test_issue102_recovery_gate_blocks_unproven_transition(self):
+        before = issue102_leaf_material_text(
+            stale=True,
+            material_values=(-1, -1, -1, -1),
+        )
+        after = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 0, 0, 0),
+            volatile="two",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, recovery_root = self.make_files(folder)
+            write_spm(spm, before)
+
+            with self.assertRaises(StaleNodeTableRecoveryTimeout) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    recovery_root,
+                    after_text=after,
+                    timeout=3,
+                )
+
+        self.assertIn(
+            "authoring_graph_changed_during_resave",
+            caught.exception.evidence["last_reason_tokens"],
         )
 
     def test_elementtree_audit_uses_canonical_generator_identity(self):
