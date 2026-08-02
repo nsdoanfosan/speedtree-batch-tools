@@ -28,7 +28,10 @@ from retry_planning import (  # noqa: E402
     RetryPlanningContext,
     RetryPlanningSnapshotError,
     StableJsonCache,
+    build_plan_cache_artifact,
     cheap_durable_candidate,
+    hydrate_plan_cache_artifact,
+    planning_input_signature,
 )
 from retry_progress import RetryProgressReceipt  # noqa: E402
 
@@ -254,6 +257,193 @@ def test_slow_planning_advances_real_receipt_and_cancels_between_units(tmp_path)
     assert len(calls) < len(targets)
     assert len(failures) == 1
     assert isinstance(failures[0], RetryPlanningCancelled)
+
+
+def test_plan_receipt_reuses_unchanged_assets_and_invalidates_changed_asset(
+    tmp_path,
+):
+    gui = load_gui_module()
+    first = str(tmp_path / "SK_first.spm")
+    second = str(tmp_path / "SK_second.spm")
+    Path(first).write_bytes(b"stable-first")
+    Path(second).write_bytes(b"stable-second")
+    targets = [first, second]
+    state = {
+        first: {"push_status_kind": "data_error"},
+        second: {"push_status_kind": "imported_ok"},
+    }
+    inventory = {
+        first: {"spm": Path(first), "checked": True},
+        second: {"spm": Path(second), "checked": False},
+    }
+    cfg = {"push_transport": "headless"}
+    signature = planning_input_signature(targets, state, cfg, inventory)
+
+    old_tracker = RetryProgressReceipt.create(
+        targets, receipt_dir=tmp_path / "old-receipts"
+    )
+    old_tracker.start_planning({
+        "owner_id": "old-owner",
+        "hostname": "test",
+        "pid": 123,
+        "planning_session_id": "old-session",
+    })
+    old_tracker.assign_partition("blender_export", [first], "pipeline")
+    old_tracker.transition(
+        second,
+        "blocked",
+        diagnostic="current success",
+        terminal_reason="current_success",
+        outcome="blocked",
+    )
+    old_plan = {
+        "jobs": [{
+            "label": "cached pipeline",
+            "mode": "pipeline",
+            "phase": "push",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": [inventory[first]],
+            "inventory": inventory,
+            "cfg": cfg,
+            "force_rerun": True,
+            "push_transport": "headless",
+            "retry_metadata": {
+                "partition": "blender_export",
+                "execution_path": "pipeline",
+                "progress_run_id": old_tracker.run_id,
+            },
+            "_retry_progress_tracker": old_tracker,
+        }],
+        "selected_iids": targets,
+        "skipped": ["second is current"],
+        "deferred_status_updates": [],
+        "deferred_logs": [],
+    }
+    artifact = build_plan_cache_artifact(
+        old_plan, old_tracker.snapshot(evaluate=False)
+    )
+    cache = {
+        "schema_version": 1,
+        "input_signature": signature,
+        "artifact": artifact,
+        "side_effects_committed": True,
+    }
+
+    app = gui.App.__new__(gui.App)
+    app.stop_flag = threading.Event()
+    app.state_lock = threading.RLock()
+    app.state = copy.deepcopy(state)
+    app._retry_thread_context = threading.local()
+    app._build_failed_retry_plan_scoped = mock.Mock(
+        side_effect=AssertionError("classification must not run on cache hit")
+    )
+    new_tracker = RetryProgressReceipt.create(
+        targets, receipt_dir=tmp_path / "new-receipts"
+    )
+    new_tracker.start_planning({
+        "owner_id": "new-owner",
+        "hostname": "test",
+        "pid": 456,
+        "planning_session_id": "new-session",
+    })
+    reused = app._build_failed_retry_plan(
+        targets,
+        cfg,
+        tracker=new_tracker,
+        inventory_snapshot=inventory,
+        planning_session_id="new-session",
+        cached_plan_cache=cache,
+    )
+
+    assert reused["_planning_cache_reused"] is True
+    assert app._build_failed_retry_plan_scoped.call_count == 0
+    assert reused["jobs"][0]["targets"][0]["spm"] == Path(first)
+    metadata = reused["jobs"][0]["retry_metadata"]
+    assert metadata["progress_run_id"] == new_tracker.run_id
+    assert metadata["plan_cache_reused"] is True
+    assert new_tracker.snapshot(evaluate=False)["planning"]["progress"][
+        "cache_status"
+    ] == "hit"
+
+    time.sleep(0.002)
+    Path(first).write_bytes(b"changed-first")
+    changed = planning_input_signature(targets, state, cfg, inventory)
+    assert changed["snapshot_sha256"] == signature["snapshot_sha256"]
+    assert changed["file_identities_sha256"] != (
+        signature["file_identities_sha256"]
+    )
+
+
+def test_plan_cache_hydration_skips_committed_deferred_side_effects(tmp_path):
+    target = str(tmp_path / "SK_cached.spm")
+    Path(target).write_bytes(b"cached")
+    inventory = {target: {"spm": Path(target), "checked": True}}
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts"
+    )
+    tracker.start_planning({
+        "owner_id": "owner",
+        "hostname": "test",
+        "pid": 123,
+        "planning_session_id": "session",
+    })
+    artifact = {
+        "schema_version": 1,
+        "selected_iids": [target],
+        "jobs": [{
+            "target_ids": [target],
+            "fields": {
+                "label": "cached",
+                "mode": "pipeline",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "retry_metadata": {
+                    "partition": "blender_export",
+                    "execution_path": "pipeline",
+                },
+            },
+        }],
+        "terminal_results": [],
+        "skipped": [],
+        "deferred_status_updates": [{"iid": target, "status": "pending"}],
+        "deferred_logs": ["old planning log"],
+    }
+    hydrated = hydrate_plan_cache_artifact(
+        artifact,
+        inventory_snapshot=inventory,
+        cfg_snapshot={"push_transport": "headless"},
+        tracker=tracker,
+        side_effects_committed=True,
+    )
+    assert hydrated["deferred_status_updates"] == []
+    assert hydrated["deferred_logs"] == []
+
+
+def test_plan_signature_tracks_atlas_operational_mirrors(tmp_path):
+    target = tmp_path / "SK_cluster_test.spm"
+    target.write_bytes(b"spm")
+    target_dir = tmp_path / ".atlas_leaf_speedtree_targets"
+    target_dir.mkdir()
+    manifest = target_dir / f"{target.stem}.json"
+    manifest.write_text('{"generation":1}', encoding="utf-8")
+    inventory = {str(target): {"spm": target}}
+
+    before = planning_input_signature(
+        [str(target)], {}, {}, inventory
+    )
+    manifest.write_text('{"generation":22}', encoding="utf-8")
+    after = planning_input_signature(
+        [str(target)], {}, {}, inventory
+    )
+
+    assert before["snapshot_sha256"] == after["snapshot_sha256"]
+    assert before["file_identities_sha256"] != (
+        after["file_identities_sha256"]
+    )
 
 
 def test_planner_scope_never_touches_production_drive_or_launches_dcc():

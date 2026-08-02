@@ -15,6 +15,7 @@ from pathlib import Path
 
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
+    atlas_manifest_mirror_repair_plan,
     resolution_evidence,
     resolve_atlas_manifests,
 )
@@ -44,6 +45,10 @@ FORBIDDEN_OUTPUT_DIR_NAMES = {
 
 class CanonicalOutputManifestError(RuntimeError):
     """The asset-local PCG output contract is incomplete or unsafe."""
+
+    def __init__(self, message, *, report=None):
+        super().__init__(message)
+        self.report = dict(report or {})
 
 
 def canonical_texture_root(asset_root):
@@ -343,7 +348,16 @@ def refresh_atlas_manifests_for_spm(
     try:
         atlas_resolution = resolve_atlas_manifests(target)
     except AtlasManifestResolutionError as exc:
-        raise CanonicalOutputManifestError(str(exc)) from exc
+        repair = atlas_manifest_mirror_repair_plan(target, exc.resolution)
+        raise CanonicalOutputManifestError(
+            str(exc),
+            report={
+                "schema_version": 1,
+                "stage": "atlas_manifest_resolution",
+                "reason_token": str(repair.get("reason_code") or ""),
+                "evidence": repair,
+            },
+        ) from exc
     for selected in atlas_resolution["selected"]:
         path = Path(selected["path"])
         payload = selected["payload"]

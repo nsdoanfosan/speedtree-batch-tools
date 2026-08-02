@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -542,6 +543,200 @@ def resolve_atlas_manifests(
 
     resolution["selected"] = [_public_record(row) for row in selected]
     return resolution
+
+
+_MIRROR_OWNERSHIP_FIELDS = (
+    "blend_file",
+    "source_collection",
+    "export_scope_id",
+    "material_groups",
+    "speedtree_material_groups",
+    "generator_connection",
+    "collection_tombstone",
+)
+
+
+def atlas_manifest_mirror_repair_plan(target_spm, resolution=None):
+    """Classify whether one conflict is a stale mirror, without mutating it.
+
+    Automatic repair is intentionally narrow.  One exact-per-target authority
+    must exist, every conflicting record must be lower precedence, and both
+    its source identity and complete ownership-claim key set must match the
+    authority.  A different source/scope or extra claim is authoring ambiguity,
+    not a stale mirror.
+    """
+
+    target = Path(target_spm).expanduser().resolve(strict=False)
+    if resolution is None:
+        try:
+            resolve_atlas_manifests(target)
+        except AtlasManifestResolutionError as exc:
+            resolution = exc.resolution
+        else:
+            return {
+                "schema_version": 1,
+                "status": "not_needed",
+                "reason_code": "atlas_manifest_current",
+                "target_spm": str(target),
+                "authority": None,
+                "mirrors": [],
+            }
+    resolution = copy.deepcopy(dict(resolution or {}))
+    conflicts = list(resolution.get("conflicting") or ())
+    authorities = []
+    for raw_row in resolution.get("selected") or ():
+        if raw_row.get("kind") != "exact_per_target":
+            continue
+        row = copy.deepcopy(raw_row)
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            payload, read_error = _read_payload(row.get("path"))
+            if read_error or payload is None:
+                continue
+            row["payload"] = payload
+        authorities.append(row)
+
+    def unrepairable(reason):
+        return {
+            "schema_version": 1,
+            "status": "unrepairable",
+            "reason_code": "atlas_manifest_ownership_conflict",
+            "reason": str(reason),
+            "target_spm": str(target),
+            "authority": None,
+            "mirrors": [],
+            "resolution": resolution_evidence(resolution),
+        }
+
+    if len(authorities) != 1:
+        return unrepairable("exactly one exact-per-target authority is required")
+    if not conflicts or any(
+        row.get("reason") != "operational_candidate_disagreement"
+        for row in conflicts
+    ):
+        return unrepairable("conflict is not a coherent operational mirror drift")
+    authority = authorities[0]
+    authority_path = normalized_manifest_path(authority["path"])
+    authority_payload = authority["payload"]
+    authority_identity = _source_identity(
+        authority_payload,
+        authority["path"],
+        target_parent=target.parent,
+    )
+    authority_claims = _candidate_claims(
+        authority_payload,
+        authority_identity,
+        authority["kind"],
+    )
+    mirror_paths = []
+    for row in conflicts:
+        if normalized_manifest_path(row.get("conflicts_with")) != authority_path:
+            return unrepairable("conflict winner is not the exact-per-target authority")
+        if int(row.get("precedence", -1)) <= int(authority.get("precedence", 0)):
+            return unrepairable("conflicting record is not a lower-precedence mirror")
+        path = Path(str(row.get("path") or ""))
+        key = normalized_manifest_path(path)
+        if key in {normalized_manifest_path(value) for value in mirror_paths}:
+            continue
+        payload, read_error = _read_payload(path)
+        if read_error or payload is None:
+            return unrepairable(read_error or "mirror payload is unavailable")
+        identity = _source_identity(payload, path, target_parent=target.parent)
+        if identity != authority_identity:
+            return unrepairable("conflicting mirror has a different source identity")
+        claims = _candidate_claims(payload, identity, str(row.get("kind") or ""))
+        if set(claims) != set(authority_claims):
+            return unrepairable("conflicting mirror has a different ownership claim set")
+        mirror_paths.append(path)
+    if not mirror_paths:
+        return unrepairable("no lower-precedence mirror is repairable")
+    return {
+        "schema_version": 1,
+        "status": "repairable",
+        "reason_code": "atlas_manifest_mirror_conflict_repairable",
+        "target_spm": str(target),
+        "authority": str(Path(authority["path"]).resolve(strict=False)),
+        "mirrors": [str(path.resolve(strict=False)) for path in mirror_paths],
+        "source_identity": authority_identity,
+        "ownership_claims": sorted(authority_claims),
+        "resolution": resolution_evidence(resolution),
+    }
+
+
+def _atomic_manifest_write_bytes(path, encoded):
+    destination = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_manifest_write(path, payload):
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    _atomic_manifest_write_bytes(path, encoded)
+
+
+def repair_atlas_manifest_mirrors(target_spm):
+    """Repair only a freshly proven exact-authority/lower-mirror conflict."""
+
+    target = Path(target_spm).expanduser().resolve(strict=False)
+    plan = atlas_manifest_mirror_repair_plan(target)
+    if plan.get("status") == "not_needed":
+        return plan
+    if plan.get("status") != "repairable":
+        raise AtlasManifestResolutionError(
+            str(plan.get("reason") or "Atlas manifest conflict is not repairable"),
+            plan.get("resolution") or {},
+        )
+    authority_payload, read_error = _read_payload(plan["authority"])
+    if read_error or authority_payload is None:
+        raise AtlasManifestResolutionError(
+            read_error or "Atlas manifest authority is unavailable",
+            plan.get("resolution") or {},
+        )
+    originals = {}
+    committed = []
+    try:
+        for value in plan["mirrors"]:
+            path = Path(value)
+            payload, read_error = _read_payload(path)
+            if read_error or payload is None:
+                raise OSError(read_error or "mirror payload is unavailable")
+            originals[path] = path.read_bytes()
+            repaired = copy.deepcopy(payload)
+            for field in _MIRROR_OWNERSHIP_FIELDS:
+                if field in authority_payload:
+                    repaired[field] = copy.deepcopy(authority_payload[field])
+                else:
+                    repaired.pop(field, None)
+            _atomic_manifest_write(path, repaired)
+            committed.append(path)
+        verified = resolve_atlas_manifests(target)
+    except Exception:
+        for path in reversed(committed):
+            try:
+                _atomic_manifest_write_bytes(path, originals[path])
+            except OSError:
+                pass
+        raise
+    return {
+        **plan,
+        "status": "repaired",
+        "verified_resolution": resolution_evidence(verified),
+    }
 
 
 def selected_manifest_payload(resolution):

@@ -18,7 +18,14 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from exact_target_command import build_exact_target_request, run_exact_target_request
-from repair_orchestration import PCG_TEXTURE_TOOL, STEP3_STANDARD, canonical_exact_spm
+from atlas_manifest_resolver import repair_atlas_manifest_mirrors
+from pcg_canonical_outputs import refresh_atlas_manifests_for_spm
+from repair_orchestration import (
+    ATLAS_MANIFEST_MIRROR_REPAIR,
+    PCG_TEXTURE_TOOL,
+    STEP3_STANDARD,
+    canonical_exact_spm,
+)
 from shared_queue_runtime import WaitCancelled
 
 
@@ -175,12 +182,37 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
 
 
 def execute_step3_standard(request: Mapping, *, progress, cancel_event, lease):
-    if request.get("repair_action") != STEP3_STANDARD:
-        raise ValueError("PCG exact-target adapter only supports step3-standard")
+    action = request.get("repair_action")
+    if action not in {STEP3_STANDARD, ATLAS_MANIFEST_MIRROR_REPAIR}:
+        raise ValueError("PCG exact-target adapter repair action is unsupported")
     if len(request.get("target_spms") or ()) != 1:
-        raise ValueError("PCG exact-target Step 3 requires exactly one SPM")
+        raise ValueError("PCG exact-target repair requires exactly one SPM")
     if cancel_event.is_set():
         raise WaitCancelled("exact-target texture repair cancelled")
+    if action == ATLAS_MANIFEST_MIRROR_REPAIR:
+        canonical = Path(request["target_spms"][0]).expanduser().absolute()
+        progress("Atlas manifest 충돌 검증", completed=0, remaining=1)
+        if getattr(lease, "renew_and_check_current", lambda: True)() is not True:
+            raise RuntimeError("shared queue lease is no longer current")
+        repair = repair_atlas_manifest_mirrors(canonical)
+        refreshed = refresh_atlas_manifests_for_spm(
+            canonical,
+            require_complete=True,
+        )
+        progress(
+            "Atlas manifest 복구 완료",
+            completed=1,
+            remaining=0,
+            target=canonical,
+        )
+        return {
+            "status": "completed",
+            "outcome": "completed",
+            "exact_target": canonical,
+            "repair": repair,
+            "canonical_refresh": refreshed,
+            "shared_queue_success": True,
+        }
     progress("PCG 텍스처 계획", completed=0, remaining=1)
     module, app, plan, canonical = build_step3_standard_plan(
         request["target_spms"][0]
@@ -224,7 +256,11 @@ def _parser():
     parser = argparse.ArgumentParser(
         description="PCG ST9 Texture bounded exact-target repair"
     )
-    parser.add_argument("--repair-action", choices=[STEP3_STANDARD], required=True)
+    parser.add_argument(
+        "--repair-action",
+        choices=[STEP3_STANDARD, ATLAS_MANIFEST_MIRROR_REPAIR],
+        required=True,
+    )
     parser.add_argument("--target-spm", action="append", required=True)
     parser.add_argument("--parent-retry-id", required=True)
     parser.add_argument("--request-id", required=True)

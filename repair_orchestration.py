@@ -23,12 +23,14 @@ PCG_TEXTURE_TOOL = "pcg_st9_texture_batch"
 GENERATOR_SYNC_TOOL = "spm_generator_sync"
 
 STEP3_STANDARD = "step3-standard"
+ATLAS_MANIFEST_MIRROR_REPAIR = "atlas-manifest-mirror-repair"
 GENERATOR_SYNC = "generator-sync"
 CLUSTER_REFRESH = "cluster-refresh"
 GENERATOR_SYNC_AND_CLUSTER = "generator-sync-and-cluster"
 
 STATUS_PENDING = "automatic_repair_pending"
 STATUS_TEXTURE = "pcg_texture_repair_running"
+STATUS_ATLAS = "atlas_manifest_repair_running"
 STATUS_GENERATOR = "generator_sync_running"
 STATUS_CLUSTER = "cluster_refresh_running"
 STATUS_REAUDIT = "fresh_reaudit_running"
@@ -40,6 +42,7 @@ STATUS_CANCELLED = "cancelled"
 STATUS_LABELS = {
     STATUS_PENDING: "자동 복구 대기",
     STATUS_TEXTURE: "PCG 텍스처 복구 중",
+    STATUS_ATLAS: "Atlas manifest 복구 중",
     STATUS_GENERATOR: "Generator Sync 중",
     STATUS_CLUSTER: "Cluster 갱신 중",
     STATUS_REAUDIT: "재검증 중",
@@ -61,6 +64,14 @@ TEXTURE_REASON_CODES = frozenset({
     "source_fallback_needs_pcg_generation",
     "texture_set_incomplete",
     "texture_source_fallback_needs_pcg_generation",
+})
+
+ATLAS_MANIFEST_REPAIR_CODES = frozenset({
+    "atlas_manifest_mirror_conflict_repairable",
+})
+
+UNSUPPORTED_ATLAS_MANIFEST_CODES = frozenset({
+    "atlas_manifest_ownership_conflict",
 })
 
 GENERATOR_REASON_CODES = frozenset({
@@ -101,6 +112,8 @@ UNSUPPORTED_EXPORTER_CRASH_CODES = frozenset({
 
 ALL_REPAIR_CONTRACT_CODES = frozenset().union(
     TEXTURE_REASON_CODES,
+    ATLAS_MANIFEST_REPAIR_CODES,
+    UNSUPPORTED_ATLAS_MANIFEST_CODES,
     GENERATOR_REASON_CODES,
     GENERATOR_AND_CLUSTER_REASON_CODES,
     CLUSTER_STALE_REASON_CODES,
@@ -415,6 +428,12 @@ def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[
             "Modeler에서 이 exact asset이 정상적으로 열리고 재질/Generator가 "
             "유효한지 확인한 뒤 수동 export를 시험하세요.",
         )
+    if codes & UNSUPPORTED_ATLAS_MANIFEST_CODES:
+        return (
+            "Atlas operational manifest ownership이 서로 다릅니다.",
+            "서로 다른 source/export scope 또는 ownership claim을 자동으로 "
+            "덮어쓸 수 없습니다. 충돌 영수증의 두 manifest를 확인하세요.",
+        )
     if "atlas_strict_material_binding_conflict" in codes:
         return (
             "실제 소비 texture가 다른 에셋 폴더의 canonical texture와 연결되어 있습니다.",
@@ -504,13 +523,18 @@ def build_exact_target_repair_plan(
         })
 
     texture = bool(codes & TEXTURE_REASON_CODES)
+    atlas_manifest = bool(codes & ATLAS_MANIFEST_REPAIR_CODES)
     generator = bool(codes & GENERATOR_REASON_CODES)
     generator_cluster = bool(codes & GENERATOR_AND_CLUSTER_REASON_CODES)
     cluster_stale = bool(codes & CLUSTER_STALE_REASON_CODES)
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     recipe = _validated_recipe(evidence) if recipe_codes else None
 
-    if codes & (UNSUPPORTED_EXPORT_MATERIAL_CODES | UNSUPPORTED_EXPORTER_CRASH_CODES):
+    if codes & (
+        UNSUPPORTED_EXPORT_MATERIAL_CODES
+        | UNSUPPORTED_EXPORTER_CRASH_CODES
+        | UNSUPPORTED_ATLAS_MANIFEST_CODES
+    ):
         reason, action = _unsupported_message(codes, evidence)
         return RepairPlan(
             REPAIR_PLAN_SCHEMA_VERSION, str(request_id), str(parent_retry_id),
@@ -525,6 +549,13 @@ def build_exact_target_repair_plan(
             STATUS_FINAL_FAILED, reason, action,
         )
 
+    if atlas_manifest:
+        add(
+            "atlas_manifest_repair",
+            PCG_TEXTURE_TOOL,
+            ATLAS_MANIFEST_MIRROR_REPAIR,
+            [canonical],
+        )
     if texture:
         add(
             "pcg_texture",
@@ -622,6 +653,7 @@ def has_repair_contract_evidence(evidence: Mapping[str, Any]) -> bool:
 
 def stage_running_status(stage: Mapping[str, Any]) -> str:
     return {
+        "atlas_manifest_repair": STATUS_ATLAS,
         "pcg_texture": STATUS_TEXTURE,
         "generator_sync": STATUS_GENERATOR,
         "generator_sync_and_cluster": STATUS_GENERATOR,
@@ -670,6 +702,8 @@ def compact_success_message(attempted_stages: Sequence[Mapping[str, Any]]) -> st
     stage_names = {str(row.get("stage") or "") for row in attempted_stages}
     if "pcg_texture" in stage_names:
         names.append("PCG 텍스처")
+    if "atlas_manifest_repair" in stage_names:
+        names.append("Atlas manifest")
     if stage_names & {"generator_sync", "generator_sync_and_cluster"}:
         names.append("Generator")
     if stage_names & {"cluster_refresh", "generator_sync_and_cluster"}:

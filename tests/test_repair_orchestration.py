@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from repair_orchestration import (
+    ATLAS_MANIFEST_MIRROR_REPAIR,
     CLUSTER_REFRESH,
     GENERATOR_SYNC,
     GENERATOR_SYNC_AND_CLUSTER,
@@ -53,6 +54,33 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertEqual(plan.stages[0]["repair_action"], STEP3_STANDARD)
         self.assertFalse(plan.stages[0]["force_rerender"])
         self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
+
+    def test_repairable_atlas_mirror_conflict_routes_exact_bat(self):
+        plan = self.plan({
+            "current_atlas_manifest_repair": {
+                "status": "repairable",
+                "reason_code": "atlas_manifest_mirror_conflict_repairable",
+                "target_spm": str(self.target),
+            },
+        })
+        self.assertTrue(plan.supported)
+        self.assertEqual(len(plan.stages), 1)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            ATLAS_MANIFEST_MIRROR_REPAIR,
+        )
+        self.assertEqual(
+            plan.stages[0]["target_spms"], [str(self.target)]
+        )
+
+    def test_ambiguous_atlas_ownership_conflict_is_friendly_unsupported(self):
+        plan = self.plan({
+            "reason_code": "atlas_manifest_ownership_conflict",
+            "reason": "different source identity",
+        })
+        self.assertFalse(plan.supported)
+        self.assertIn("ownership", plan.friendly_reason)
+        self.assertIn("덮어쓸 수 없습니다", plan.remaining_action)
 
     def test_deadleaves_missing_t_roles_use_exact_pcg_action(self):
         plan = self.plan({

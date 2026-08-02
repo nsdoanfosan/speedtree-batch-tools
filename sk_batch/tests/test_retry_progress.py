@@ -129,6 +129,99 @@ def test_slow_heartbeating_planner_remains_live_without_fake_progress(tmp_path):
     assert row["last_progress_age_seconds"] == 150
 
 
+def test_structured_planning_progress_is_exact_and_durable(tmp_path):
+    clock = FakeClock()
+    targets = [
+        str(tmp_path / "first.spm"),
+        str(tmp_path / "second.spm"),
+    ]
+    tracker = RetryProgressReceipt.create(
+        targets, receipt_dir=tmp_path / "receipts", clock=clock
+    )
+    tracker.start_planning(_planning_owner())
+
+    assert tracker.planning_progress(
+        "wrong-session",
+        substage="classification",
+        completed_count=1,
+        total_count=2,
+    ) is False
+    clock.advance(4)
+    assert tracker.planning_progress(
+        "planning-session",
+        substage="classification",
+        completed_count=1,
+        total_count=2,
+        current_target_id=targets[1],
+        last_completed_unit=targets[0],
+        classified_count=1,
+        validated_count=2,
+        cache_hits=3,
+        cache_misses=1,
+        cache_status="miss",
+    ) is True
+
+    snapshot = tracker.snapshot(evaluate=False)
+    progress = snapshot["planning"]["progress"]
+    assert progress == {
+        "schema_version": 1,
+        "substage": "classification",
+        "completed_count": 1,
+        "total_count": 2,
+        "classified_count": 1,
+        "validated_count": 2,
+        "cache_hits": 3,
+        "cache_misses": 1,
+        "cache_status": "miss",
+        "current_target_id": targets[1],
+        "last_completed_unit": "first.spm",
+        "updated_at": clock(),
+    }
+    assert snapshot["current_target_id"] == targets[1]
+    assert snapshot["planning"]["heartbeat_age_seconds"] == 0
+    assert _target(snapshot, targets[1])["last_progress_age_seconds"] == 0
+
+    restored = RetryProgressReceipt.open(tracker.path, clock=clock)
+    assert restored.snapshot(evaluate=False)["planning"]["progress"] == progress
+
+
+def test_planning_cache_is_durable_but_snapshot_exposes_summary_only(tmp_path):
+    target = str(tmp_path / "cached.spm")
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts"
+    )
+    tracker.start_planning(_planning_owner())
+    artifact = {
+        "schema_version": 1,
+        "jobs": [{"target_ids": [target], "fields": {}}],
+    }
+    signature = {
+        "schema_version": 1,
+        "snapshot_sha256": "a" * 64,
+        "file_identities_sha256": "b" * 64,
+        "referenced_file_count": 1,
+    }
+
+    assert tracker.store_planning_cache(
+        "wrong-session",
+        input_signature=signature,
+        artifact=artifact,
+    ) is False
+    assert tracker.store_planning_cache(
+        "planning-session",
+        input_signature=signature,
+        artifact=artifact,
+        side_effects_committed=True,
+    ) is True
+
+    summary = tracker.snapshot(evaluate=False)["planning"]["plan_cache"]
+    assert "artifact" not in summary
+    assert summary["job_count"] == 1
+    restored = RetryProgressReceipt.open(tracker.path)
+    assert restored.planning_cache()["artifact"] == artifact
+    assert restored.planning_cache()["side_effects_committed"] is True
+
+
 def test_wall_clock_without_heartbeat_cannot_remain_healthy_running(tmp_path):
     clock = FakeClock()
     target = str(tmp_path / "elapsed-only.spm")

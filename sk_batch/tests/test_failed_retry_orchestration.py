@@ -145,6 +145,53 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertEqual(automation["status"], "automatic_repair_completed")
         self.assertEqual(app._phase_result_summary["completed_count"], 1)
 
+    def test_live_atlas_conflict_enters_structured_repair_evidence(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._failed_retry_repair_state = mock.Mock(return_value={
+            "current": False,
+            "push_ready": False,
+            "kind": "material",
+            "reason": "current Atlas conflict",
+        })
+        app.state[str(self.first)] = {
+            "blend_status_kind": "data_error",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "sanitized prior preflight failure",
+            },
+        }
+        repair = {
+            "status": "repairable",
+            "reason_code": "atlas_manifest_mirror_conflict_repairable",
+            "target_spm": str(self.first),
+            "authority": str(self.root / "authority.json"),
+            "mirrors": [str(self.root / "stale.json")],
+        }
+
+        with mock.patch.object(
+            gui, "atlas_manifest_mirror_repair_plan", return_value=repair
+        ):
+            evidence = app._failed_retry_durable_evidence(
+                str(self.first),
+                repair_state=app._failed_retry_repair_state(str(self.first)),
+            )
+
+        self.assertEqual(evidence["current_atlas_manifest_repair"], repair)
+        self.assertTrue(gui.has_repair_contract_evidence(evidence))
+        plan = gui.build_exact_target_repair_plan(
+            self.first,
+            evidence,
+            inventory_paths=[self.first, self.second],
+            parent_retry_id="parent-atlas",
+            request_id="request-atlas",
+        )
+        self.assertTrue(plan.supported)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            "atlas-manifest-mirror-repair",
+        )
+
     def test_generator_cluster_reaudit_uses_only_evidence_provider(self):
         gui = load_gui_module()
         app = self.app(gui)
