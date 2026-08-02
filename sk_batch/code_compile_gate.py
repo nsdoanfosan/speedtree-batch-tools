@@ -22,6 +22,12 @@ from pathlib import Path, PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from process_lifecycle import ProcessLifecycleError, owned_run  # noqa: E402
+
+
 GUI_PATH = Path(__file__).resolve().with_name("sk_batch_gui.pyw")
 PUSH_JOB_PATH = (
     Path(__file__).resolve().parent / "jobs" / "send2ue_push_job.py"
@@ -111,35 +117,25 @@ def _has_prefix(parts, prefixes):
 
 def _git_stdout(repo_root, *arguments):
     try:
-        result = subprocess.run(
+        result = owned_run(
             ["git", "-C", str(repo_root), *arguments],
+            source="sk_batch.code_compile_gate.git_scope_observation",
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, ProcessLifecycleError):
         return None
     return result.stdout if result.returncode == 0 else None
 
 
 def _git_ignored_paths(repo_root):
     """Return ignored untracked directories/files relative to a Git root."""
-    try:
-        top_level = _git_stdout(repo_root, "rev-parse", "--show-toplevel")
-        if top_level is None:
-            return frozenset(), frozenset()
-        discovered_root = Path(os.fsdecode(top_level).strip()).resolve()
-    except (OSError, ValueError):
-        return frozenset(), frozenset()
-    if os.path.normcase(str(discovered_root)) != os.path.normcase(
-        str(repo_root)
-    ):
-        return frozenset(), frozenset()
-
     output = _git_stdout(
         repo_root,
         "ls-files",
+        "--full-name",
         "--others",
         "--ignored",
         "--exclude-standard",
