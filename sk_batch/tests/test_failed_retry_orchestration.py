@@ -376,12 +376,78 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                     disposition,
                 )
 
+    def test_exact_repair_plan_is_returned_then_committed_on_ui_thread(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        iid = str(self.first)
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "managed_texture_set_incomplete",
+            "canonical_spm": iid,
+        })
+        app._snapshot_batch_request = mock.Mock(return_value=(
+            {iid: {"spm": self.first}},
+            [{"spm": self.first}],
+        ))
+        app._enqueue_batch_job = mock.Mock(return_value=1)
+        app._retry_planning_workers = set()
+        app._ui_thread_ident = threading.get_ident()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        app._set_batch_queue_controls = mock.Mock()
+        tracker = mock.Mock()
+        tracker.run_id = "exact-repair-progress"
+        tracker.path = self.root / "retry-progress.json"
+        repair_plan = mock.Mock()
+        repair_plan.supported = True
+        repair_plan.metadata.return_value = self.plan(self.first, "planned")
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "has_repair_contract_evidence",
+            return_value=True,
+        ), mock.patch.object(
+            gui,
+            "build_exact_target_repair_plan",
+            return_value=repair_plan,
+        ):
+            built = app._build_failed_retry_plan(
+                [iid],
+                {"push_transport": "rpc"},
+                tracker=tracker,
+            )
+
+        app._enqueue_batch_job.assert_not_called()
+        self.assertEqual(len(built["jobs"]), 1)
+        job = built["jobs"][0]
+        self.assertEqual(job["mode"], "failed_retry_repair")
+        self.assertEqual(job["targets"], [{"spm": self.first}])
+        self.assertEqual(
+            job["retry_metadata"]["partition"],
+            "exact_bat_repair",
+        )
+        self.assertIs(job["_retry_progress_tracker"], tracker)
+        tracker.assign_partition.assert_called_once_with(
+            "exact_bat_repair",
+            [iid],
+            "exact_bat_then_fresh_reaudit_then_blender_unreal",
+        )
+
+        with mock.patch.object(gui, "save_config"):
+            committed = app._commit_failed_retry_plan(built)
+
+        self.assertEqual(committed, [1])
+        app._enqueue_batch_job.assert_called_once_with(job)
+
     def test_invalid_exact_identity_is_final_fail_closed_not_legacy_retry(self):
         gui = load_gui_module()
         app = self.app(gui)
         missing = self.root / "missing exact.spm"
         app.items = {str(missing): {}}
         app._close_cell_editor = mock.Mock()
+        app._collect_cfg = mock.Mock(return_value={})
+        app._set_batch_queue_controls = mock.Mock()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
         app._enqueue_batch_job = mock.Mock()
         app._failed_retry_repair_state = mock.Mock(return_value={
             "current": False,
@@ -394,6 +460,8 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         })
 
         with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui, "save_config"
+        ), mock.patch.object(
             gui.messagebox,
             "showinfo",
         ):

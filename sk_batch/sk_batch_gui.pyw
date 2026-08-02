@@ -88,6 +88,23 @@ from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
 )
+from retry_progress import (
+    BLENDER as RETRY_STAGE_BLENDER,
+    BLOCKED as RETRY_STAGE_BLOCKED,
+    CANCELLED as RETRY_STAGE_CANCELLED,
+    CLAIMED as RETRY_STAGE_CLAIMED,
+    COMPLETE as RETRY_STAGE_COMPLETE,
+    FAILED as RETRY_STAGE_FAILED,
+    OWNER_LOST as RETRY_STAGE_OWNER_LOST,
+    PENDING_UNREAL as RETRY_STAGE_PENDING_UNREAL,
+    PLANNING as RETRY_STAGE_PLANNING,
+    POST_CHECK as RETRY_STAGE_POST_CHECK,
+    SEND2UE as RETRY_STAGE_SEND2UE,
+    SHARED_QUEUE_WAIT as RETRY_STAGE_SHARED_QUEUE_WAIT,
+    UNREAL as RETRY_STAGE_UNREAL,
+    RetryProgressReceipt,
+    stage_for_send2ue_marker,
+)
 from artifact_content_key import (
     artifact_record_content_key,
     file_content_key_snapshot,
@@ -1176,27 +1193,43 @@ def cluster_stale_node_table_recovery_scope(
     target_spm,
     audit_report,
 ):
-    """Seal a complete target-wide legacy scope or explain why it is unsafe.
+    """Seal authoritative authored and required-live scopes or fail closed.
 
-    This adapter intentionally does not invent the newer required-live
-    manifest contract.  It is eligible only for today's strict Atlas policy,
-    where every normalized target Mesh ID is both authored and required live.
-    All provider-role slices for the exact target must be present in the same
-    live audit; a diagnostic stale subset is never promoted to full scope.
+    Only a producer-validated explicit delivery intent may authorize recovery.
+    Live survivors, visibility, node counts, and diagnostic stale subsets are
+    observations, never recovery intent.  Every required provider-role slice
+    for the exact target must be present in the same content-bound live audit.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
 
     def unavailable(reason_token, **details):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "available": False,
             "mode": "owned_semantic_uia_modeler_save_watch",
-            "scope_policy": "complete_target_wide_legacy_strict_v1",
+            "scope_policy": "explicit_sealed_delivery_scopes_v1",
             "reason_token": str(reason_token),
             "target_spm": str(target),
             "audit_report": str(audit_report or ""),
             **copy.deepcopy(details),
         }
+
+    def canonical_mesh_scope(values, label, *, allow_empty=False):
+        if not isinstance(values, (list, tuple)):
+            return None, f"{label}_missing"
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return None, f"{label}_invalid"
+        canonical = sorted(set(values))
+        if list(values) != canonical:
+            return None, f"{label}_not_canonical"
+        if not canonical and not allow_empty:
+            return None, f"{label}_missing"
+        return canonical, None
 
     if not isinstance(contract, dict):
         return unavailable("recovery_contract_missing")
@@ -1235,7 +1268,8 @@ def cluster_stale_node_table_recovery_scope(
         "generator_export_evidence_stale_node_table",
         "normalized_and_live_target_mesh_sets_differ",
     }
-    expected_mesh_ids = set()
+    authoring_mesh_ids = set()
+    required_live_mesh_ids = set()
     provider_slices = []
     required_dependency_count = 0
     stale_slice_count = 0
@@ -1274,34 +1308,164 @@ def cluster_stale_node_table_recovery_scope(
         delivery = target_rows[0]
         if delivery.get("generator_variant_policy") != strict_policy:
             return unavailable(
-                "target_delivery_policy_not_legacy_strict",
+                "target_delivery_variant_policy_not_supported",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_values = delivery.get("normalized_target_mesh_ids")
-        if not isinstance(mesh_values, (list, tuple)) or not mesh_values:
+        if delivery.get("delivery_scope_mode") != "explicit_sealed_v1":
             return unavailable(
-                "normalized_target_mesh_scope_missing",
+                "target_delivery_scope_not_explicit",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-            for value in mesh_values
+        recovery_target_scope = delivery.get("recovery_target_scope")
+        if not (
+            isinstance(recovery_target_scope, dict)
+            and recovery_target_scope.get("contract")
+            == "speedtree_stale_node_recovery_target_scope"
+            and recovery_target_scope.get("schema_version") == 1
+            and recovery_target_scope.get("policy")
+            == "explicit_sealed_scopes_v1"
         ):
             return unavailable(
-                "normalized_target_mesh_scope_invalid",
+                "authoritative_recovery_target_scope_missing",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_ids = sorted(set(mesh_values))
-        if list(mesh_values) != mesh_ids:
+        supplied_scope_sha256 = str(
+            recovery_target_scope.get("scope_sha256") or ""
+        ).strip().casefold()
+        scope_projection = {
+            key: value
+            for key, value in recovery_target_scope.items()
+            if key != "scope_sha256"
+        }
+        expected_scope_sha256 = hashlib.sha256(
+            json.dumps(
+                scope_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if supplied_scope_sha256 != expected_scope_sha256:
             return unavailable(
-                "normalized_target_mesh_scope_not_canonical",
+                "authoritative_recovery_target_scope_hash_mismatch",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if expected_mesh_ids.intersection(mesh_ids):
+        intent_sha256 = str(
+            recovery_target_scope.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold()
+        if len(intent_sha256) != 64 or any(
+            value not in "0123456789abcdef" for value in intent_sha256
+        ):
             return unavailable(
-                "normalized_target_mesh_scope_overlaps_provider_roles",
+                "target_delivery_scope_intent_sha256_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if intent_sha256 != str(
+            delivery.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold():
+            return unavailable(
+                "target_delivery_scope_intent_echo_mismatch",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        authoring_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("authoring_mesh_ids"),
+            "authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        normalized_ids, scope_error = canonical_mesh_scope(
+            delivery.get("normalized_target_mesh_ids"),
+            "normalized_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        declared_ids, scope_error = canonical_mesh_scope(
+            delivery.get("declared_target_mesh_ids"),
+            "declared_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (normalized_ids == declared_ids == authoring_ids):
+            return unavailable(
+                "authoring_scope_not_exact_declared_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        required_live_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("required_live_mesh_ids"),
+            "required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not set(required_live_ids).issubset(authoring_ids):
+            return unavailable(
+                "required_live_scope_not_authoring_subset",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        current_required_ids, scope_error = canonical_mesh_scope(
+            delivery.get("current_required_target_mesh_ids"),
+            "current_required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if current_required_ids != required_live_ids:
+            return unavailable(
+                "required_live_scope_not_exact_delivery_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+
+        count_fields = {
+            name: delivery.get(name)
+            for name in (
+                "declared_binding_count",
+                "active_required_binding_count",
+                "planned_inactive_binding_count",
+                "delivery_scope_required_live_slot_count",
+                "delivery_scope_continuity_only_slot_count",
+            )
+        }
+        if any(
+            type(value) is not int or value < 0
+            for value in count_fields.values()
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (
+            count_fields["declared_binding_count"] > 0
+            and count_fields["planned_inactive_binding_count"] == 0
+            and count_fields["active_required_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            and count_fields["declared_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            + count_fields["delivery_scope_continuity_only_slot_count"]
+            and bool(required_live_ids)
+            == bool(count_fields["delivery_scope_required_live_slot_count"])
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_inconsistent",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if authoring_mesh_ids.intersection(authoring_ids):
+            return unavailable(
+                "authoring_mesh_scope_overlaps_provider_roles",
                 provider_role=str(dependency.get("role") or ""),
             )
 
@@ -1334,7 +1498,7 @@ def cluster_stale_node_table_recovery_scope(
                     or value <= 0
                     for value in stale_ids
                 )
-                or not set(canonical_stale_ids).issubset(mesh_ids)
+                or not set(canonical_stale_ids).issubset(required_live_ids)
                 or delivery.get("delivery_reason") != stale_reason
                 or not errors
                 or not errors.issubset(stale_consequences)
@@ -1349,20 +1513,32 @@ def cluster_stale_node_table_recovery_scope(
                 )
             stale_slice_count += 1
         elif not (
-            decision == "normalize_part"
-            and not errors
-            and delivery.get("live_generator_delivery_complete") is True
+            (
+                decision == "normalize_part"
+                and not errors
+                and delivery.get("live_generator_delivery_complete") is True
+            )
+            or (
+                decision == "pass_through"
+                and not required_live_ids
+                and not errors
+                and delivery.get("delivery_reason")
+                == "relationship_continuity_only"
+            )
         ):
             return unavailable(
                 "target_delivery_has_independent_blocker",
                 provider_role=str(dependency.get("role") or ""),
             )
 
-        expected_mesh_ids.update(mesh_ids)
+        authoring_mesh_ids.update(authoring_ids)
+        required_live_mesh_ids.update(required_live_ids)
         provider_slices.append({
             "role": str(dependency.get("role") or ""),
             "provider_spm": str(dependency.get("spm") or ""),
-            "normalized_target_mesh_ids": mesh_ids,
+            "delivery_scope_intent_sha256": intent_sha256,
+            "authoring_mesh_ids": authoring_ids,
+            "required_live_mesh_ids": required_live_ids,
             "delivery_decision": decision,
             "orphan_generator_guid_count": (
                 orphan_owner_count if decision == "blocked" else 0
@@ -1372,19 +1548,20 @@ def cluster_stale_node_table_recovery_scope(
             ),
         })
 
-    if required_dependency_count == 0 or not expected_mesh_ids:
+    if required_dependency_count == 0 or not authoring_mesh_ids:
         return unavailable("target_recovery_scope_empty")
     if stale_slice_count == 0:
         return unavailable("target_has_no_stale_blocking_delivery")
 
     sealed = {
-        "schema_version": 1,
+        "schema_version": 2,
         "available": True,
         "mode": "owned_semantic_uia_modeler_save_watch",
-        "scope_policy": "complete_target_wide_legacy_strict_v1",
+        "scope_policy": "explicit_sealed_delivery_scopes_v1",
         "target_spm": str(target),
         "target_preimage_raw_sha256": target_sha256,
-        "expected_mesh_ids": sorted(expected_mesh_ids),
+        "authoring_mesh_ids": sorted(authoring_mesh_ids),
+        "required_live_mesh_ids": sorted(required_live_mesh_ids),
         "provider_slices": sorted(
             provider_slices,
             key=lambda row: (row["role"], row["provider_spm"]),
@@ -2060,6 +2237,12 @@ class App:
         self.batch_job_sequence = 0
         self.batch_job_failures = []
         self.shared_queue_runtime = SharedQueueRuntime("sk_batch")
+        self._active_retry_progress = None
+        self._retry_progress_by_run_id = {}
+        self._async_retry_planning_enabled = True
+        self._retry_planning_workers = set()
+        self._ui_thread_ident = threading.get_ident()
+        self._retry_thread_context = threading.local()
         self.cell_editor = None
         self.stop_flag = threading.Event()
         self._app_open = True
@@ -2082,7 +2265,9 @@ class App:
         root.title("SK Vegetation Batch — 검사 → 본 세팅 → Blender → Unreal")
         root.geometry("1460x840")
         self._build_ui()
+        self._restore_latest_retry_progress()
         self.root.after(100, self._drain_ui_queue)
+        self.root.after(1000, self._refresh_retry_liveness)
         self.scan()
 
     # ------------------------------------------------------------------ UI
@@ -2340,6 +2525,49 @@ class App:
             text="단계·경과 시간·수동 전환까지 남은 시간은 각 파일 행에 표시됩니다.",
         ).pack(side="left", padx=(14, 0))
 
+        retry_live = ttk.LabelFrame(
+            self.root,
+            text="실패 재시도 진행·liveness (durable receipt)",
+            padding=(8, 4),
+        )
+        retry_live.pack(fill="x", padx=6, pady=(0, 4))
+        self.retry_target_var = tk.StringVar(
+            value="current target: - · 0/0 · partition=-"
+        )
+        self.retry_liveness_var = tk.StringVar(
+            value=(
+                "stage=idle · elapsed 0s · progress age - · "
+                "output age - · heartbeat age -"
+            )
+        )
+        self.retry_outcome_var = tk.StringVar(
+            value=(
+                "retry scope: historical failed/stale selection · "
+                "current state: idle · terminal outcome: pending"
+            )
+        )
+        self.retry_diagnostic_var = tk.StringVar(value="latest: -")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_target_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_liveness_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_outcome_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_diagnostic_var,
+            anchor="w",
+        ).pack(fill="x")
+
         cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status", "folder")
         visible_cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status")
         tablef = ttk.LabelFrame(
@@ -2421,6 +2649,237 @@ class App:
 
     def log(self, msg):
         self.ui_queue.put(("log", msg))
+
+    def _retry_progress_notify(self, snapshot):
+        self.ui_queue.put(("retry_progress", snapshot))
+
+    def _retry_progress_thresholds(self, cfg=None):
+        cfg = cfg or getattr(self, "cfg", {}) or {}
+        return {
+            "stall_warning_seconds": float(
+                cfg.get("retry_stall_warning_seconds", 120)
+            ),
+            "owner_lost_seconds": float(
+                cfg.get("retry_owner_lost_seconds", 45)
+            ),
+        }
+
+    def _new_retry_progress(self, target_ids, cfg=None):
+        tracker = RetryProgressReceipt.create(
+            target_ids,
+            notify=self._retry_progress_notify,
+            **self._retry_progress_thresholds(cfg),
+        )
+        self._active_retry_progress = tracker
+        self._retry_progress_by_run_id[tracker.run_id] = tracker
+        return tracker
+
+    def _restore_latest_retry_progress(self):
+        tracker = RetryProgressReceipt.load_latest(
+            notify=self._retry_progress_notify,
+            **self._retry_progress_thresholds(),
+        )
+        if tracker is None:
+            return None
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is not None:
+            tracker.reconcile_queue(runtime.queue)
+        self._active_retry_progress = tracker
+        self._retry_progress_by_run_id[tracker.run_id] = tracker
+        self._render_retry_progress(tracker.snapshot())
+        return tracker
+
+    @staticmethod
+    def _retry_age_text(value):
+        if value is None:
+            return "-"
+        seconds = max(0, int(float(value)))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _render_retry_progress(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return
+        rows = snapshot.get("targets") or []
+        current_id = snapshot.get("current_target_id")
+        current = next(
+            (row for row in rows if row.get("target_id") == current_id),
+            rows[-1] if rows else None,
+        )
+        if current is None:
+            self.retry_target_var.set("current target: - · 0/0 · partition=-")
+            self.retry_liveness_var.set(
+                "stage=idle · elapsed 0s · progress age - · "
+                "output age - · heartbeat age -"
+            )
+            self.retry_outcome_var.set(
+                "retry scope: historical failed/stale selection · "
+                "current state: idle · terminal outcome: pending"
+            )
+            self.retry_diagnostic_var.set("latest: -")
+            return
+        finished = sum(
+            row.get("terminal_at") is not None for row in rows
+        )
+        succeeded = sum(
+            row.get("stage") == RETRY_STAGE_COMPLETE for row in rows
+        )
+        waiting = sum(
+            row.get("stage") == RETRY_STAGE_PENDING_UNREAL for row in rows
+        )
+        cancelled = sum(
+            row.get("stage") == RETRY_STAGE_CANCELLED for row in rows
+        )
+        blocked = sum(
+            row.get("stage") == RETRY_STAGE_BLOCKED for row in rows
+        )
+        owner_lost = sum(
+            row.get("stage") == RETRY_STAGE_OWNER_LOST for row in rows
+        )
+        failed = sum(
+            row.get("stage") == RETRY_STAGE_FAILED
+            for row in rows
+        )
+        remaining = max(0, len(rows) - finished)
+        terminal = (
+            snapshot.get("run_state") == "terminal"
+            or snapshot.get("terminal_at") is not None
+        )
+        if terminal:
+            outcome_text = (
+                "terminal outcome: "
+                f"{snapshot.get('terminal_outcome') or snapshot.get('stage') or '-'}"
+                + (
+                    f" ({snapshot.get('terminal_reason')})"
+                    if snapshot.get("terminal_reason")
+                    else ""
+                )
+            )
+            state_text = "terminal"
+        else:
+            outcome_text = "terminal outcome: pending"
+            state_text = (
+                "waiting"
+                if snapshot.get("run_state") == "waiting"
+                else "running"
+            )
+        continuation = (
+            " · current run continues after individual failures"
+            if (failed or owner_lost or blocked) and remaining
+            else ""
+        )
+        self.retry_outcome_var.set(
+            "retry scope: historical failed/stale selection · "
+            f"current state: {state_text} · success {succeeded} · "
+            f"waiting {waiting} · cancelled {cancelled} · "
+            f"blocked {blocked} · owner_lost {owner_lost} · "
+            f"failed {failed} · remaining {remaining} · {outcome_text}"
+            + continuation
+        )
+        partition_ordinal = current.get("partition_ordinal") or "?"
+        partition_total = current.get("partition_total") or "?"
+        self.retry_target_var.set(
+            f"current target: {current.get('target_name') or '-'} · "
+            f"{finished}/{len(rows)} finished · partition="
+            f"{current.get('partition') or '-'} "
+            f"{partition_ordinal}/{partition_total}"
+        )
+        # Prefix this as an individual target observation: an item-level
+        # failed stage is not a current batch terminal outcome.
+        self.retry_liveness_var.set(
+            "current target stage="
+            f"{current.get('stage') or '-'} · elapsed "
+            f"{self._retry_age_text(current.get('elapsed_seconds'))} · "
+            "progress age "
+            f"{self._retry_age_text(current.get('last_progress_age_seconds'))} · "
+            "output age "
+            f"{self._retry_age_text(current.get('last_output_age_seconds'))} · "
+            "heartbeat age "
+            f"{self._retry_age_text(current.get('last_heartbeat_age_seconds'))}"
+        )
+        self.retry_diagnostic_var.set(
+            "latest: " + str(current.get("latest_diagnostic") or "-")
+        )
+
+    def _retry_tracker_for_job(self, job=None):
+        job = job or getattr(self, "active_batch_job", None)
+        if not isinstance(job, dict):
+            return None
+        tracker = job.get("_retry_progress_tracker")
+        if tracker is not None:
+            return tracker
+        metadata = job.get("retry_metadata") or {}
+        run_id = str(metadata.get("progress_run_id") or "")
+        tracker = getattr(self, "_retry_progress_by_run_id", {}).get(run_id)
+        if tracker is not None:
+            job["_retry_progress_tracker"] = tracker
+        return tracker
+
+    def _retry_transition(
+        self,
+        target_id,
+        stage,
+        diagnostic,
+        *,
+        progress=False,
+        output=False,
+        heartbeat=False,
+        terminal_reason=None,
+        outcome=None,
+    ):
+        tracker = self._retry_tracker_for_job()
+        if tracker is None:
+            return False
+        return tracker.transition(
+            str(target_id),
+            stage,
+            diagnostic=diagnostic,
+            progress=progress,
+            output=output,
+            heartbeat=heartbeat,
+            terminal_reason=terminal_reason,
+            outcome=outcome,
+        )
+
+    def _refresh_retry_liveness(self):
+        if not getattr(self, "_app_open", True):
+            return
+        tracker = getattr(self, "_active_retry_progress", None)
+        active_job = getattr(self, "active_batch_job", None)
+        job_tracker = self._retry_tracker_for_job(active_job)
+        if job_tracker is not None:
+            tracker = job_tracker
+            self._active_retry_progress = tracker
+            lease = getattr(self, "_active_shared_queue_lease", None)
+            partition = str(
+                ((active_job or {}).get("retry_metadata") or {}).get(
+                    "partition"
+                )
+                or ""
+            )
+            if lease is not None and partition:
+                heartbeat_error = lease.heartbeat_error
+                if heartbeat_error is not None:
+                    tracker.mark_partition_terminal(
+                        partition,
+                        RETRY_STAGE_OWNER_LOST,
+                        "shared queue lease heartbeat lost: "
+                        + compact_error_message(heartbeat_error, 160),
+                    )
+                    self.stop_flag.set()
+                else:
+                    snapshot = tracker.snapshot(evaluate=False)
+                    current_id = snapshot.get("current_target_id")
+                    if current_id:
+                        tracker.observe_process(current_id)
+        if tracker is not None:
+            self._render_retry_progress(tracker.snapshot())
+        self.root.after(1000, self._refresh_retry_liveness)
 
     def _table_display_value(self, iid, column, value):
         if column not in STATUS_COLUMNS:
@@ -2524,6 +2983,10 @@ class App:
                         self._set_batch_queue_controls(False)
                 elif kind == "batch_job_done":
                     self._finish_batch_job(payload)
+                elif kind == "retry_progress":
+                    self._render_retry_progress(payload)
+                elif kind == "retry_plan_ready":
+                    self._commit_failed_retry_plan(payload)
                 elif kind == "modeler_recovery":
                     target = Path(payload["target_spm"])
                     self.progress_var.set(
@@ -3720,6 +4183,17 @@ class App:
                 return None
             job["shared_queue_job_id"] = shared["id"]
             job["shared_queue_sequence"] = shared["sequence"]
+            tracker = job.get("_retry_progress_tracker")
+            partition = str(
+                (job.get("retry_metadata") or {}).get("partition") or ""
+            )
+            if tracker is not None and partition:
+                tracker.register_queue_job(
+                    partition,
+                    shared["id"],
+                    shared["sequence"],
+                    local_job_id=job["id"],
+                )
         self.pending_batch_jobs.append(job)
         if self.active_batch_job is not None:
             pending = len(self.pending_batch_jobs)
@@ -3853,7 +4327,10 @@ class App:
         summary = {
             "selected_count": len(job.get("targets") or ()),
             "completed_count": 0,
+            "pending_count": 0,
+            "cancelled_count": 0,
             "blocked_count": 0,
+            "owner_lost_count": 0,
             "planned_excluded_count": 0,
             "dependency_blocked_count": 0,
             "failed_count": 0,
@@ -3861,6 +4338,10 @@ class App:
             "shared_failures": [],
         }
         lease = None
+        tracker = self._retry_tracker_for_job(job)
+        retry_partition = str(
+            (job.get("retry_metadata") or {}).get("partition") or ""
+        )
         try:
             shared_job_id = job.get("shared_queue_job_id")
             shared_runtime = getattr(
@@ -3879,6 +4360,13 @@ class App:
                         + f" · 대기 {queued}개"
                     )
                     self.ui_queue.put(("progress", text))
+                    if tracker is not None and retry_partition:
+                        tracker.queue_wait(
+                            retry_partition,
+                            position=position,
+                            queued_count=queued,
+                            running_head=wait_state.get("running_head"),
+                        )
 
                 lease = shared_runtime.wait_for_turn(
                     shared_job_id,
@@ -3886,10 +4374,14 @@ class App:
                     cancel_event=self.stop_flag,
                 )
                 self._active_shared_queue_lease = lease
+                if tracker is not None and retry_partition:
+                    tracker.claimed(retry_partition, lease.record)
                 self.ui_queue.put((
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
                 ))
+            elif tracker is not None and retry_partition:
+                tracker.claimed(retry_partition)
             self.__dict__.pop("_phase_result_summary", None)
             self._freeze_batch_production_source_manifest()
             if job["mode"] == "pipeline":
@@ -3915,16 +4407,49 @@ class App:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
                 )
+            authoritative_summary = getattr(
+                self,
+                "_phase_result_summary",
+                None,
+            )
             summary = copy.deepcopy(
-                getattr(self, "_phase_result_summary", None)
-                or self._summarize_phase_targets(job["targets"])
+                authoritative_summary
+                or self._summarize_phase_targets(
+                    job["targets"],
+                    phase=(
+                        job.get("terminal_phase")
+                        if job.get("mode") == "pipeline"
+                        else "push"
+                        if job.get("mode") == "unreal_recovery"
+                        else job.get("phase")
+                    ),
+                )
             )
             failed_count = int(summary["failed_count"])
             blocked_count = int(summary["blocked_count"])
-            if self.stop_flag.is_set():
-                status = "stopped"
-            elif failed_count or blocked_count:
+            owner_lost_count = int(summary.get("owner_lost_count", 0) or 0)
+            pending_count = int(summary.get("pending_count", 0) or 0)
+            cancelled_count = int(summary.get("cancelled_count", 0) or 0)
+            completed_count = int(summary.get("completed_count", 0) or 0)
+            selected_count = int(summary.get("selected_count", 0) or 0)
+            actual_problem_count = (
+                failed_count + blocked_count + owner_lost_count
+            )
+            if (
+                selected_count
+                and completed_count == selected_count
+                and (
+                    not self.stop_flag.is_set()
+                    or authoritative_summary is not None
+                )
+            ):
+                status = "completed"
+            elif actual_problem_count:
                 status = "partial"
+            elif cancelled_count or self.stop_flag.is_set():
+                status = "stopped"
+            elif pending_count:
+                status = "waiting"
             elif completed is False:
                 status = "failed"
             if status == "partial":
@@ -3932,10 +4457,17 @@ class App:
                     str(row.get("reason_token"))
                     for row in summary["target_outcomes"]
                     if row.get("reason_token")
+                    and row.get("outcome") in {
+                        "failed",
+                        "blocked",
+                        "planned_excluded",
+                        "owner_lost",
+                    }
                 })
                 error = (
                     f"completed={summary['completed_count']} "
-                    f"blocked={blocked_count} failed={failed_count}"
+                    f"blocked={blocked_count} failed={failed_count} "
+                    f"owner_lost={owner_lost_count}"
                     + (f" | reasons={','.join(tokens)}" if tokens else "")
                 )
             elif status == "failed":
@@ -3956,9 +4488,9 @@ class App:
         finally:
             if lease is not None and not lease.finished:
                 try:
-                    lease.finish(
-                        success=(status == "completed"),
-                        result={
+                    finish_options = {
+                        "success": status in {"completed", "waiting"},
+                        "result": {
                             "tool": "sk_batch",
                             "local_job_id": job["id"],
                             "outcome": status,
@@ -3968,14 +4500,35 @@ class App:
                             ),
                             **summary,
                         },
-                    )
+                    }
+                    if status == "stopped":
+                        finish_options["terminal_status"] = "cancelled"
+                    lease.finish(**finish_options)
                 except Exception as queue_exc:
                     error = compact_error_message(queue_exc)
                     status = "failed"
+                    if tracker is not None and retry_partition:
+                        reconciled = tracker.reconcile_queue(
+                            getattr(self, "shared_queue_runtime", None).queue
+                        )
+                        if not reconciled and lease.heartbeat_error is not None:
+                            tracker.mark_partition_terminal(
+                                retry_partition,
+                                RETRY_STAGE_OWNER_LOST,
+                                "shared queue lease lost before receipt finalization",
+                            )
                     self.log(
                         f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
                         f"{job['label']}: {error}"
                     )
+            if tracker is not None:
+                self._finalize_retry_progress_for_job(
+                    job,
+                    tracker,
+                    status,
+                    summary,
+                    error,
+                )
             self.__dict__.pop("_active_shared_queue_lease", None)
             self.ui_queue.put((
                 "batch_job_done",
@@ -3989,6 +4542,97 @@ class App:
                     **summary,
                 },
             ))
+
+    def _finalize_retry_progress_for_job(
+        self,
+        job,
+        tracker,
+        status,
+        summary,
+        error,
+    ):
+        """Seal only this partition while preserving prior target terminals."""
+        metadata = job.get("retry_metadata") or {}
+        partition = str(metadata.get("partition") or "")
+        selected_ids = [
+            str(value) for value in metadata.get("selected_queue_ids") or []
+        ]
+        outcomes = {
+            str(row.get("target")): row
+            for row in (summary or {}).get("target_outcomes") or []
+            if isinstance(row, dict) and row.get("target")
+        }
+        for target_id in selected_ids:
+            row = outcomes.get(target_id)
+            outcome = str((row or {}).get("outcome") or "")
+            reason = str(
+                (row or {}).get("reason_token")
+                or error
+                or outcome
+                or status
+            )
+            if outcome == "completed" or (
+                not outcome and status == "completed"
+            ):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_POST_CHECK,
+                    diagnostic="post-check complete",
+                    progress=True,
+                    heartbeat=True,
+                )
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_COMPLETE,
+                    diagnostic="retry target complete",
+                    terminal_reason="completed",
+                    outcome=RETRY_STAGE_COMPLETE,
+                )
+            elif outcome in {
+                "pending_unreal",
+                "exported_pending_unreal",
+            } or (not outcome and status == "waiting"):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_PENDING_UNREAL,
+                    diagnostic=reason or "exported; Unreal pending",
+                    outcome=RETRY_STAGE_PENDING_UNREAL,
+                )
+            elif outcome in {"cancelled", "stopped"} or (
+                not outcome and status == "stopped"
+            ):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_CANCELLED,
+                    diagnostic=reason,
+                    terminal_reason="operator_cancelled",
+                    outcome=RETRY_STAGE_CANCELLED,
+                )
+            elif outcome == "owner_lost":
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_OWNER_LOST,
+                    diagnostic=reason,
+                    terminal_reason="owner_lost",
+                    outcome=RETRY_STAGE_OWNER_LOST,
+                )
+            elif outcome in {"blocked", "planned_excluded"}:
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_BLOCKED,
+                    diagnostic=reason,
+                    terminal_reason=reason,
+                    outcome=RETRY_STAGE_BLOCKED,
+                )
+            else:
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_FAILED,
+                    diagnostic=reason,
+                    terminal_reason=reason,
+                    outcome=RETRY_STAGE_FAILED,
+                )
+        tracker.finalize()
 
     def _finish_batch_job(self, payload):
         self._ensure_batch_queue_state()
@@ -4009,8 +4653,17 @@ class App:
                     "completed_count": int(
                         payload.get("completed_count", 0) or 0
                     ),
+                    "pending_count": int(
+                        payload.get("pending_count", 0) or 0
+                    ),
+                    "cancelled_count": int(
+                        payload.get("cancelled_count", 0) or 0
+                    ),
                     "blocked_count": int(
                         payload.get("blocked_count", 0) or 0
+                    ),
+                    "owner_lost_count": int(
+                        payload.get("owner_lost_count", 0) or 0
                     ),
                     "planned_excluded_count": int(
                         payload.get("planned_excluded_count", 0) or 0
@@ -4033,6 +4686,7 @@ class App:
             "completed": "완료",
             "partial": "실패/준비 제외 기록 후 다음 작업 계속",
             "failed": "실패 기록 후 다음 작업 계속",
+            "waiting": "Unreal 대기 상태 기록",
             "stopped": "중지",
         }.get(status, str(status))
         self.log(
@@ -4052,6 +4706,8 @@ class App:
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
             "_headless_progress_label",
+            "_retry_checkpoint_versions",
+            "_retry_checkpoint_output_lines",
             "_phase_failed_items",
             "_phase_result_summary",
         ):
@@ -4063,13 +4719,27 @@ class App:
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
         if status == "stopped":
-            self.progress_var.set("대기열 중지됨")
+            self.progress_var.set(
+                "대기열 중지됨 · cancelled "
+                f"{int(payload.get('cancelled_count', 0) or 0)}"
+            )
+        elif status == "waiting":
+            self.progress_var.set(
+                "대기열 완료 · Unreal 대기 "
+                f"{int(payload.get('pending_count', 0) or 0)}"
+            )
         elif failure_count:
             tokens = sorted({
                 str(row.get("reason_token"))
                 for failure in self.batch_job_failures
                 for row in failure.get("target_outcomes") or ()
                 if row.get("reason_token")
+                and row.get("outcome") in {
+                    "failed",
+                    "blocked",
+                    "planned_excluded",
+                    "owner_lost",
+                }
             })
             completed_total = sum(
                 row.get("completed_count", 0)
@@ -4083,10 +4753,15 @@ class App:
                 row.get("failed_count", 0)
                 for row in self.batch_job_failures
             )
+            owner_lost_total = sum(
+                row.get("owner_lost_count", 0)
+                for row in self.batch_job_failures
+            )
             self.progress_var.set(
                 "대기열 완료 · "
                 f"completed {completed_total} · "
-                f"blocked {blocked_total} · failed {failed_total}"
+                f"blocked {blocked_total} · owner_lost {owner_lost_total} · "
+                f"failed {failed_total}"
                 + (f" · {', '.join(tokens)}" if tokens else "")
             )
         else:
@@ -4793,7 +5468,8 @@ class App:
         )
 
     def _failed_retry_parent_source_record(self, queue_id, parent_item):
-        state_entry = self.state.get(queue_id, {})
+        with self.state_lock:
+            state_entry = copy.deepcopy(self.state.get(queue_id, {}))
         expected = str(parent_item.get("source_fingerprint") or "")
         source_record = copy.deepcopy(
             state_entry.get("push_source_fingerprint_cache") or {}
@@ -4839,12 +5515,13 @@ class App:
         current_fingerprint = self._source_push_fingerprint(
             Path(blend_value), queue_id
         )
-        current_record = copy.deepcopy(
-            self.state.get(queue_id, {}).get(
-                "push_source_fingerprint_cache"
+        with self.state_lock:
+            current_record = copy.deepcopy(
+                self.state.get(queue_id, {}).get(
+                    "push_source_fingerprint_cache"
+                )
+                or {}
             )
-            or {}
-        )
         validate_unreal_only_recovery_evidence(
             parent_item,
             parent_source_record=parent_source_record,
@@ -4855,7 +5532,7 @@ class App:
         return current_record
 
     def start_failed_results_retry(self):
-        """Classify failed/stale retries across the complete inventory."""
+        """Plan complete-inventory retry work without blocking the Tk thread."""
         self._close_cell_editor()
         candidate_iids = list(self.items)
         if not candidate_iids:
@@ -4864,6 +5541,56 @@ class App:
                 "현재 목록 전체에 재시도할 대상이 없습니다.",
             )
             return
+        cfg = dict(self._collect_cfg())
+        tracker = None
+        if getattr(self, "_async_retry_planning_enabled", False):
+            if (
+                getattr(self, "active_batch_job", None) is None
+                and not getattr(self, "pending_batch_jobs", ())
+            ):
+                self.stop_flag.clear()
+            self._set_batch_queue_controls(True)
+            self.progress_var.set(
+                f"retry stage={RETRY_STAGE_PLANNING} · "
+                f"대상 {len(candidate_iids)}개"
+            )
+            # Flush the planning label before any inventory/parent validation
+            # begins in the worker. This callback is the Tk owner thread.
+            self.root.update_idletasks()
+            tracker = self._new_retry_progress(candidate_iids, cfg)
+
+            def plan_in_worker():
+                try:
+                    plan = self._build_failed_retry_plan(
+                        candidate_iids,
+                        cfg,
+                        tracker=tracker,
+                    )
+                except Exception as exc:
+                    plan = {
+                        "error": compact_error_message(exc),
+                        "tracker": tracker,
+                        "selected_iids": list(candidate_iids),
+                        "cfg": cfg,
+                    }
+                self.ui_queue.put(("retry_plan_ready", plan))
+
+            worker = threading.Thread(
+                target=plan_in_worker,
+                name=f"retry-planner-{tracker.run_id[:8]}",
+                daemon=True,
+            )
+            self._retry_planning_workers.add(worker)
+            worker.start()
+            return tracker.run_id
+
+        plan = self._build_failed_retry_plan(candidate_iids, cfg)
+        return self._commit_failed_retry_plan(plan)
+
+    def _build_failed_retry_plan(self, candidate_iids, cfg, tracker=None):
+        """Return immutable queue jobs without performing any Tk operation."""
+        candidate_iids = list(candidate_iids)
+        cfg = dict(cfg)
 
         repair_states = {
             iid: self._failed_retry_repair_state(iid)
@@ -4961,7 +5688,8 @@ class App:
         grouped = {}
 
         for iid in candidate_iids:
-            entry = self.state.get(iid, {})
+            with self.state_lock:
+                entry = copy.deepcopy(self.state.get(iid, {}))
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
@@ -5027,8 +5755,10 @@ class App:
             parent_statuses[iid] = UNREAL_PARENT_CANDIDATE
 
         def classify(iid):
+            with self.state_lock:
+                state_entry = copy.deepcopy(self.state.get(iid, {}))
             return classify_failed_retry(
-                self.state.get(iid, {}),
+                state_entry,
                 repair_states[iid],
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
@@ -5190,24 +5920,47 @@ class App:
         eligible_iids = [
             iid for iid in candidate_iids if iid in eligible_set
         ]
-        if not eligible_iids and not automatic_plans:
-            messagebox.showinfo(
-                "전체 실패 이력 재시도",
-                "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
-                "없습니다.\n\n"
-                + "\n".join((terminal_details + skipped)[:8]),
-            )
-            return
-
-        cfg = dict(self._collect_cfg())
-        save_config(cfg)
+        runnable_set = eligible_set | set(automatic_plans)
         runnable_ids = [
-            iid for iid in candidate_iids
-            if iid in eligible_set or iid in automatic_plans
+            iid for iid in candidate_iids if iid in runnable_set
         ]
+        if not runnable_ids:
+            if tracker is not None:
+                for iid in candidate_iids:
+                    if iid in unsupported_plans:
+                        repair_plan = unsupported_plans[iid]
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_FAILED,
+                            diagnostic=repair_plan.friendly_reason,
+                            terminal_reason=(
+                                next(iter(repair_plan.reason_codes), None)
+                                or "automatic_repair_unsupported"
+                            ),
+                            outcome=RETRY_STAGE_FAILED,
+                        )
+                    else:
+                        decision = decisions[iid]
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_BLOCKED,
+                            diagnostic=decision.diagnostic,
+                            terminal_reason=decision.reason_code,
+                            outcome=RETRY_STAGE_BLOCKED,
+                        )
+                tracker.finalize("no retryable targets")
+            return {
+                "jobs": [],
+                "skipped": terminal_details + skipped,
+                "selected_iids": candidate_iids,
+                "cfg": cfg,
+                "tracker": tracker,
+            }
+
         inventory, targets = self._snapshot_batch_request(runnable_ids)
         targets_by_id = {str(item["spm"]): item for item in targets}
         action_kind = "failed_blender_export_and_unreal_retry"
+        jobs = []
 
         def eligibility_receipt(ids):
             return {
@@ -5229,7 +5982,23 @@ class App:
         ]
         if unreal_targets:
             unreal_ids = [str(item["spm"]) for item in unreal_targets]
-            self._enqueue_batch_job({
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "unreal_ingest",
+                "execution_path": "immutable_unreal_only",
+                "selected_queue_ids": unreal_ids,
+                "eligibility": eligibility_receipt(unreal_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "unreal_ingest", unreal_ids, "immutable_unreal_only"
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
                 "label": (
                     "실패 재시도 · Unreal-only current-code · "
                     f"{len(unreal_targets)}개"
@@ -5244,15 +6013,17 @@ class App:
                 "force_rerun": False,
                 "push_transport": "headless",
                 "recovery_requests": recovery_requests,
-                "retry_metadata": {
-                    "schema_version": 1,
-                    "kind": action_kind,
-                    "partition": "unreal_ingest",
-                    "execution_path": "immutable_unreal_only",
-                    "selected_queue_ids": unreal_ids,
-                    "eligibility": eligibility_receipt(unreal_ids),
-                },
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
             })
+
+        # The queue label describes the current execution. Historical
+        # failed/stale classification is shown only in the retry receipt UI.
+        if unreal_targets:
+            jobs[-1]["label"] = (
+                "Retry run · Unreal-only current-code · "
+                f"{len(unreal_targets)} targets"
+            )
 
         repair_targets = [
             targets_by_id[iid]
@@ -5261,7 +6032,36 @@ class App:
         ]
         if repair_targets:
             repair_ids = [str(item["spm"]) for item in repair_targets]
-            self._enqueue_batch_job({
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "exact_bat_repair",
+                "execution_path": (
+                    "exact_bat_then_fresh_reaudit_then_blender_unreal"
+                ),
+                "selected_queue_ids": repair_ids,
+                "eligibility": {
+                    "schema_version": 1,
+                    "items": [
+                        {
+                            "queue_id": iid,
+                            "repair_plan": automatic_plans[iid].metadata(),
+                        }
+                        for iid in repair_ids
+                    ],
+                },
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "exact_bat_repair",
+                    repair_ids,
+                    metadata["execution_path"],
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
                 "label": (
                     "automatic repair · exact BAT → fresh audit → "
                     f"Blender/Unreal · {len(repair_targets)}"
@@ -5279,25 +6079,8 @@ class App:
                     automatic_plans[iid].metadata()
                     for iid in repair_ids
                 ],
-                "retry_metadata": {
-                    "schema_version": 1,
-                    "kind": action_kind,
-                    "partition": "exact_bat_repair",
-                    "execution_path": (
-                        "exact_bat_then_fresh_reaudit_then_blender_unreal"
-                    ),
-                    "selected_queue_ids": repair_ids,
-                    "eligibility": {
-                        "schema_version": 1,
-                        "items": [
-                            {
-                                "queue_id": iid,
-                                "repair_plan": automatic_plans[iid].metadata(),
-                            }
-                            for iid in repair_ids
-                        ],
-                    },
-                },
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
             })
 
         export_targets = [
@@ -5305,7 +6088,25 @@ class App:
         ]
         if export_targets:
             export_ids = [str(item["spm"]) for item in export_targets]
-            self._enqueue_batch_job({
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "blender_export",
+                "execution_path": "blender_send2ue_then_unreal",
+                "selected_queue_ids": export_ids,
+                "eligibility": eligibility_receipt(export_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "blender_export",
+                    export_ids,
+                    "blender_send2ue_then_unreal",
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
                 "label": (
                     "실패/stale 재시도 · Blender/Send2UE→Unreal · "
                     f"{len(export_targets)}개"
@@ -5319,15 +6120,144 @@ class App:
                 "cfg": cfg,
                 "force_rerun": True,
                 "push_transport": "headless",
-                "retry_metadata": {
-                    "schema_version": 1,
-                    "kind": action_kind,
-                    "partition": "blender_export",
-                    "execution_path": "blender_send2ue_then_unreal",
-                    "selected_queue_ids": export_ids,
-                    "eligibility": eligibility_receipt(export_ids),
-                },
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
             })
+
+        if export_targets:
+            jobs[-1]["label"] = (
+                "Retry run · Blender/Send2UE→Unreal · "
+                f"{len(export_targets)} targets"
+            )
+
+        missing_ids = [
+            iid for iid in runnable_ids if iid not in targets_by_id
+        ]
+        if tracker is not None:
+            for iid in candidate_iids:
+                if iid in runnable_set and iid not in missing_ids:
+                    continue
+                if iid in unsupported_plans:
+                    repair_plan = unsupported_plans[iid]
+                    tracker.transition(
+                        iid,
+                        RETRY_STAGE_FAILED,
+                        diagnostic=repair_plan.friendly_reason,
+                        terminal_reason=(
+                            next(iter(repair_plan.reason_codes), None)
+                            or "automatic_repair_unsupported"
+                        ),
+                        outcome=RETRY_STAGE_FAILED,
+                    )
+                else:
+                    decision = decisions[iid]
+                    tracker.transition(
+                        iid,
+                        RETRY_STAGE_BLOCKED,
+                        diagnostic=(
+                            "selected target disappeared from the planning snapshot"
+                            if iid in missing_ids
+                            else decision.diagnostic
+                        ),
+                        terminal_reason=(
+                            "planning_target_missing"
+                            if iid in missing_ids
+                            else decision.reason_code
+                        ),
+                        outcome=RETRY_STAGE_BLOCKED,
+                    )
+        return {
+            "jobs": jobs,
+            "skipped": terminal_details + skipped,
+            "selected_iids": candidate_iids,
+            "cfg": cfg,
+            "tracker": tracker,
+        }
+
+    def _commit_failed_retry_plan(self, plan):
+        """Main-thread half of planning: message boxes, Tk, and enqueue."""
+        if not isinstance(plan, dict):
+            return None
+        ui_thread_ident = getattr(
+            self,
+            "_ui_thread_ident",
+            threading.main_thread().ident,
+        )
+        if threading.get_ident() != ui_thread_ident:
+            raise RuntimeError(
+                "retry planning commit must run on the Tk owner thread"
+            )
+        current = threading.current_thread()
+        workers = getattr(self, "_retry_planning_workers", None)
+        if isinstance(workers, set):
+            finished_workers = {
+                worker for worker in workers if not worker.is_alive()
+            }
+            workers.difference_update(finished_workers)
+            workers.discard(current)
+        tracker = plan.get("tracker")
+        error = plan.get("error")
+        if self.stop_flag.is_set() and tracker is not None:
+            tracker.mark_unclassified_terminal(
+                plan.get("selected_iids") or [],
+                RETRY_STAGE_CANCELLED,
+                "operator cancelled during retry planning",
+            )
+            tracker.finalize("operator_cancelled")
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        if error:
+            if tracker is not None:
+                tracker.mark_unclassified_terminal(
+                    plan.get("selected_iids") or [],
+                    RETRY_STAGE_FAILED,
+                    error,
+                )
+                tracker.finalize("retry planning failed")
+            messagebox.showerror(
+                "실패 재시도 planning 실패",
+                str(error),
+                parent=self.root,
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        cfg = dict(plan.get("cfg") or {})
+        save_config(cfg)
+        jobs = list(plan.get("jobs") or [])
+        if not jobs:
+            messagebox.showinfo(
+                "전체 실패 이력 재시도",
+                "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
+                "없습니다.\n\n"
+                + "\n".join((plan.get("skipped") or [])[:8]),
+                parent=getattr(self, "root", None),
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        enqueued = []
+        for job in jobs:
+            local_id = self._enqueue_batch_job(job)
+            if local_id is not None:
+                enqueued.append(local_id)
+            elif tracker is not None:
+                partition = (job.get("retry_metadata") or {}).get(
+                    "partition", "unclassified"
+                )
+                tracker.mark_partition_terminal(
+                    partition,
+                    RETRY_STAGE_FAILED,
+                    "shared queue registration failed; retry not executed",
+                )
+        return enqueued
 
     def start_failed_unreal_retry(self):
         """Backward-compatible entry point for existing UI integrations."""
@@ -5635,7 +6565,130 @@ class App:
                 return kind
         return ""
 
-    def _summarize_phase_targets(self, targets):
+    @staticmethod
+    def _target_outcome_for_kind(kind, message=""):
+        """Map one durable status kind to its authoritative result class."""
+        normalized = str(kind or "").strip().casefold()
+        diagnostic = str(message or "").strip().casefold()
+        if "사용자 중지" in diagnostic or "operator cancel" in diagnostic:
+            return "cancelled"
+        if normalized in {"completed", "imported_ok", "ready"}:
+            return "completed"
+        if normalized in {"exported_pending_unreal", "importing"}:
+            return "pending_unreal"
+        if normalized in {"cancelled", "stopped"}:
+            return "cancelled"
+        if normalized == "owner_lost":
+            return "owner_lost"
+        if normalized in PLANNED_EXCLUSION_KINDS:
+            return "planned_excluded"
+        if normalized in {
+            "dependency_blocked",
+            "manual_required",
+            "not_run",
+            "not_run_unreal",
+            "recovery_blocked",
+        }:
+            return "blocked"
+        if normalized:
+            return "failed"
+        return None
+
+    def _target_authoritative_result(self, iid, phase=None):
+        """Project the latest durable phase state without relabeling it failed."""
+        phase_columns = {
+            "check": ("spm_status",),
+            "spm": ("spm_status",),
+            "blender": ("blend_status", "spm_status"),
+            "push": ("push_status", "blend_status", "spm_status"),
+        }
+        columns = phase_columns.get(
+            str(phase or ""),
+            ("push_status", "blend_status", "spm_status"),
+        )
+        state = getattr(self, "state", {}) or {}
+        lock = getattr(self, "state_lock", None)
+        if lock is None:
+            entry = copy.deepcopy(state.get(str(iid), {}))
+        else:
+            with lock:
+                entry = copy.deepcopy(state.get(str(iid), {}))
+        for column in columns:
+            error = entry.get(f"{column}_error")
+            error = error if isinstance(error, dict) else {}
+            result = entry.get(f"{column}_result")
+            result = result if isinstance(result, dict) else {}
+            kind = str(
+                entry.get(f"{column}_kind")
+                or result.get("kind")
+                or error.get("kind")
+                or ""
+            )
+            message = str(
+                result.get("message")
+                or error.get("message")
+                or entry.get(column)
+                or ""
+            )
+            outcome = self._target_outcome_for_kind(kind, message)
+            if outcome is None:
+                continue
+            reason_token = None
+            if outcome == "pending_unreal":
+                reason_token = "exported_pending_unreal"
+            elif outcome == "cancelled":
+                reason_token = "operator_cancelled"
+            elif outcome != "completed":
+                reason_token = str(
+                    error.get("reason_token")
+                    or result.get("reason_token")
+                    or kind
+                    or outcome
+                )
+            evidence = {
+                "durable_kind": kind,
+                "status_column": column,
+            }
+            if message:
+                evidence["message"] = message
+            for source in (error, result):
+                for key, value in source.items():
+                    if key not in {"time", "kind", "message", "reason_token"}:
+                        evidence[key] = copy.deepcopy(value)
+            return {
+                "target": str(iid),
+                "target_name": Path(str(iid)).name,
+                "outcome": outcome,
+                "reason_token": reason_token,
+                "evidence": evidence,
+            }
+        return None
+
+    @staticmethod
+    def _count_target_outcomes(outcomes):
+        return {
+            "completed_count": sum(
+                row.get("outcome") == "completed" for row in outcomes
+            ),
+            "pending_count": sum(
+                row.get("outcome") == "pending_unreal" for row in outcomes
+            ),
+            "cancelled_count": sum(
+                row.get("outcome") == "cancelled" for row in outcomes
+            ),
+            "blocked_count": sum(
+                row.get("outcome") in {"blocked", "planned_excluded"}
+                for row in outcomes
+            ),
+            "owner_lost_count": sum(
+                row.get("outcome") == "owner_lost" for row in outcomes
+            ),
+            "failed_count": sum(
+                row.get("outcome") == "failed" for row in outcomes
+            ),
+        }
+
+    def _summarize_phase_targets(self, targets, phase=None):
         """Build the persisted queue result for a non-pipeline phase."""
         failed_ids = set(
             getattr(self, "_phase_failed_items", set()) or ()
@@ -5645,6 +6698,14 @@ class App:
             iid = str(item["spm"])
             name = Path(iid).name
             if iid not in failed_ids:
+                authoritative = self._target_authoritative_result(iid, phase)
+                if authoritative and authoritative["outcome"] in {
+                    "pending_unreal",
+                    "cancelled",
+                    "owner_lost",
+                }:
+                    outcomes.append(authoritative)
+                    continue
                 outcomes.append({
                     "target": iid,
                     "target_name": name,
@@ -5652,6 +6713,10 @@ class App:
                     "reason_token": None,
                     "evidence": {},
                 })
+                continue
+            authoritative = self._target_authoritative_result(iid, phase)
+            if authoritative is not None:
+                outcomes.append(authoritative)
                 continue
             reason_token, evidence = self._target_failure_result(iid)
             failure_kind = self._target_failure_kind(iid)
@@ -5666,22 +6731,14 @@ class App:
                 "reason_token": reason_token,
                 "evidence": evidence,
             })
-        completed_count = sum(
-            row["outcome"] == "completed" for row in outcomes
-        )
-        blocked_count = sum(
-            row["outcome"] == "planned_excluded" for row in outcomes
-        )
-        failed_count = sum(
-            row["outcome"] == "failed" for row in outcomes
-        )
+        counts = self._count_target_outcomes(outcomes)
         return {
             "selected_count": len(outcomes),
-            "completed_count": completed_count,
-            "blocked_count": blocked_count,
-            "planned_excluded_count": blocked_count,
+            **counts,
+            "planned_excluded_count": sum(
+                row["outcome"] == "planned_excluded" for row in outcomes
+            ),
             "dependency_blocked_count": 0,
-            "failed_count": failed_count,
             "target_outcomes": outcomes,
             "shared_failures": [],
         }
@@ -5728,6 +6785,18 @@ class App:
                 (*dependency_map.get(key, ()), *value)
             ))
         for iid in selected:
+            authoritative = self._target_authoritative_result(
+                iid,
+                getattr(self, "_active_pipeline_terminal_phase", None),
+            )
+            if authoritative and authoritative["outcome"] in {
+                "completed",
+                "pending_unreal",
+                "cancelled",
+                "owner_lost",
+            }:
+                outcomes.append(authoritative)
+                continue
             if iid in planned_ids:
                 outcomes.append(copy.deepcopy(planned[iid]))
                 continue
@@ -5746,6 +6815,9 @@ class App:
                 })
                 continue
             if iid in failed:
+                if authoritative is not None:
+                    outcomes.append(authoritative)
+                    continue
                 reason_token, evidence = self._target_failure_result(
                     iid,
                     default_token=(
@@ -5794,25 +6866,18 @@ class App:
                 "evidence": evidence,
             })
 
-        completed_count = sum(
-            row["outcome"] == "completed" for row in outcomes
-        )
+        counts = self._count_target_outcomes(outcomes)
         planned_count = sum(
             row["outcome"] == "planned_excluded" for row in outcomes
         )
         dependency_blocked_count = sum(
             row["outcome"] == "blocked" for row in outcomes
         )
-        failed_count = sum(
-            row["outcome"] == "failed" for row in outcomes
-        )
         return {
             "selected_count": len(outcomes),
-            "completed_count": completed_count,
-            "blocked_count": planned_count + dependency_blocked_count,
+            **counts,
             "planned_excluded_count": planned_count,
             "dependency_blocked_count": dependency_blocked_count,
-            "failed_count": failed_count,
             "target_outcomes": outcomes,
             "shared_failures": shared_failures,
         }
@@ -6026,31 +7091,55 @@ class App:
             pipeline_abort,
         )
         self._phase_result_summary = copy.deepcopy(summary)
-        if self.stop_flag.is_set():
+        all_completed = bool(summary["selected_count"]) and (
+            summary["completed_count"] == summary["selected_count"]
+        )
+        actual_issue_count = (
+            summary["failed_count"]
+            + summary["blocked_count"]
+            + summary.get("owner_lost_count", 0)
+        )
+        if all_completed:
+            final_text = "전체 자동 완료"
+        elif self.stop_flag.is_set() or summary.get("cancelled_count", 0):
             final_text = "중지됨"
         elif pipeline_abort:
             final_text = f"전체 자동 중단 — {pipeline_abort}"
-        elif excluded_ids:
+        elif actual_issue_count:
             final_text = (
                 "전체 자동 종료 — "
                 f"completed {summary['completed_count']} · "
                 f"blocked {summary['blocked_count']} · "
+                f"owner_lost {summary.get('owner_lost_count', 0)} · "
                 f"failed {summary['failed_count']}"
+            )
+        elif summary.get("pending_count", 0):
+            final_text = (
+                "전체 자동 Unreal 대기 — "
+                f"pending {summary['pending_count']}"
             )
         else:
             final_text = "전체 자동 완료"
         if selected_scope:
             terminal_label = phase_labels[terminal_phase]
-            if self.stop_flag.is_set():
+            if all_completed:
+                final_text = f"{terminal_label} 연계 실행 완료"
+            elif self.stop_flag.is_set() or summary.get("cancelled_count", 0):
                 final_text = f"{terminal_label} 연계 실행 중지됨"
             elif pipeline_abort:
                 final_text = f"{terminal_label} 연계 실행 중단 · {pipeline_abort}"
-            elif excluded_ids:
+            elif actual_issue_count:
                 final_text = (
                     f"{terminal_label} 연계 실행 종료 · "
                     f"completed {summary['completed_count']} · "
                     f"blocked {summary['blocked_count']} · "
+                    f"owner_lost {summary.get('owner_lost_count', 0)} · "
                     f"failed {summary['failed_count']}"
+                )
+            elif summary.get("pending_count", 0):
+                final_text = (
+                    f"{terminal_label} 연계 실행 Unreal 대기 · "
+                    f"pending {summary['pending_count']}"
                 )
             else:
                 final_text = f"{terminal_label} 연계 실행 완료"
@@ -6063,7 +7152,7 @@ class App:
         self.__dict__.pop("_active_blender_dependency_map", None)
         self.__dict__.pop("_pipeline_upstream_failed_items", None)
         self.log(f"🌙 {final_text}")
-        return not (
+        return all_completed or not (
             self.stop_flag.is_set()
             or pipeline_abort
             or excluded_ids
@@ -6076,6 +7165,10 @@ class App:
         shared_runtime = getattr(self, "shared_queue_runtime", None)
         if shared_runtime is not None:
             for job in pending_jobs:
+                tracker = self._retry_tracker_for_job(job)
+                partition = str(
+                    (job.get("retry_metadata") or {}).get("partition") or ""
+                )
                 shared_job_id = job.get("shared_queue_job_id")
                 if not shared_job_id:
                     continue
@@ -6084,6 +7177,12 @@ class App:
                         shared_job_id,
                         reason="sk_batch_local_queue_cancelled",
                     )
+                    if tracker is not None and partition:
+                        tracker.mark_partition_terminal(
+                            partition,
+                            RETRY_STAGE_CANCELLED,
+                            "operator cancelled before shared queue claim",
+                        )
                 except Exception:
                     # A job that acquired its lease between the snapshot and
                     # this cancellation is owned by the worker and is released
@@ -6093,6 +7192,20 @@ class App:
         with self._recovery_commit_lock:
             resume_commit = copy.deepcopy(self._recovery_resume_commit)
             self.stop_flag.set()
+        active_tracker = self._retry_tracker_for_job(
+            getattr(self, "active_batch_job", None)
+        )
+        if active_tracker is not None:
+            snapshot = active_tracker.snapshot(evaluate=False)
+            current_id = snapshot.get("current_target_id")
+            if current_id:
+                active_tracker.observe_process(
+                    current_id,
+                    diagnostic=(
+                        "operator cancellation requested; stopping exact "
+                        "owned process tree"
+                    ),
+                )
         # Worker polling performs the tree kill. Keeping it in one place avoids
         # racing a direct parent-only kill that would orphan SpeedTree children.
         suffix = f" · 대기 작업 {pending}개 취소" if pending else ""
@@ -6117,30 +7230,78 @@ class App:
     def shutdown_shared_queue(self):
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
-            runtime.shutdown()
+            # Persist the operator-close event before the GUI process can
+            # disappear. A later lease recovery remains owner_lost, but its
+            # receipt proves that it followed this close request.
+            runtime.shutdown(operator_close=True)
+        with self._recovery_commit_lock:
+            self._app_open = False
+            tracker = self._retry_tracker_for_job(
+                getattr(self, "active_batch_job", None)
+            )
+            planning = any(
+                worker.is_alive()
+                for worker in getattr(self, "_retry_planning_workers", ())
+            )
+            if tracker is None and planning:
+                tracker = getattr(self, "_active_retry_progress", None)
+            if tracker is not None:
+                tracker.record_operator_close(
+                    "operator closed the SK Batch window; shutdown requested"
+                )
+            self.stop_batch()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
     ):
         """Write the same structured item outcome to GUI and persistent state."""
+        if kind in {"cancelled", "stopped"}:
+            terminal_stage = RETRY_STAGE_CANCELLED
+        elif kind == "owner_lost":
+            terminal_stage = RETRY_STAGE_OWNER_LOST
+        elif kind in PLANNED_EXCLUSION_KINDS or kind in {
+                "dependency_blocked",
+                "manual_required",
+                "not_run",
+                "not_run_unreal",
+                "recovery_blocked",
+        }:
+            terminal_stage = RETRY_STAGE_BLOCKED
+        else:
+            terminal_stage = RETRY_STAGE_FAILED
+        self._retry_transition(
+            iid,
+            terminal_stage,
+            reason,
+            terminal_reason=str(kind),
+            outcome=terminal_stage,
+        )
         self.ui_queue.put(("cell", (iid, column, status_text)))
         with self.state_lock:
             state_entry = self.state.setdefault(iid, {})
             state_entry[column] = status_text
             state_entry[f"{column}_kind"] = kind
-            error_entry = {
+            durable_entry = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "kind": kind,
                 "message": reason,
             }
             if details:
-                error_entry.update(details)
-            state_entry[f"{column}_error"] = error_entry
+                durable_entry.update(details)
+            if kind in {"cancelled", "stopped"}:
+                durable_entry["outcome"] = "cancelled"
+                state_entry[f"{column}_result"] = durable_entry
+                state_entry.pop(f"{column}_error", None)
+            else:
+                state_entry[f"{column}_error"] = durable_entry
+                state_entry.pop(f"{column}_result", None)
             if persist:
                 save_state(self.state)
 
     @staticmethod
     def _failure_status_text(reason, kind):
+        if kind in {"cancelled", "stopped"}:
+            return f"중지: {reason}"
         if kind == "manual_required":
             return reason
         if kind in PUSH_ABORT_KINDS:
@@ -6358,6 +7519,22 @@ class App:
             self.ui_queue.put(
                 ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
             )
+            retry_context = getattr(self, "_retry_thread_context", None)
+            retry_stage = (
+                RETRY_STAGE_UNREAL
+                if phase == "push"
+                else RETRY_STAGE_BLENDER
+            )
+            if retry_context is not None:
+                retry_context.target_id = iid
+                retry_context.stage = retry_stage
+            self._retry_transition(
+                iid,
+                retry_stage,
+                f"{title} started",
+                progress=True,
+                heartbeat=True,
+            )
             try:
                 if phase == "push":
                     dependencies = self._active_push_dependency_map.get(
@@ -6405,10 +7582,21 @@ class App:
                     self._job_blender(iid, spm, item)
                 else:
                     self._job_push(iid, spm)
+                self._retry_transition(
+                    iid,
+                    RETRY_STAGE_POST_CHECK,
+                    f"{title} post-check",
+                    progress=True,
+                    heartbeat=True,
+                )
             except Exception as exc:
                 full_reason = str(exc)
                 reason = compact_error_message(full_reason)
                 kind = getattr(exc, "kind", "data_error")
+                if self.stop_flag.is_set() or kind in {"cancelled", "stopped"}:
+                    kind = "cancelled"
+                    reason = reason or "사용자 중지"
+                    full_reason = full_reason or reason
                 if phase == "blender":
                     self._publish_repair_stage_contract(
                         spm,
@@ -6421,6 +7609,7 @@ class App:
                     reason = "Push 작업 시간 초과 — Unreal/RPC 상태 확인 필요"
                 status_text = self._failure_status_text(reason, kind)
                 tag = {
+                    "cancelled": "중지",
                     "manual_required": "수동",
                     "unreal_crash": "Unreal 중단",
                     "unreal_unavailable": "Unreal 중단",
@@ -6442,8 +7631,9 @@ class App:
                     details=details,
                     persist=phase != "check",
                 )
-                with self.state_lock:
-                    failed_items.add(iid)
+                if kind != "cancelled":
+                    with self.state_lock:
+                        failed_items.add(iid)
                 if phase == "push" and kind in PUSH_ABORT_KINDS:
                     self._phase_abort_reason = reason
                     phase_abort.set()
@@ -6451,6 +7641,9 @@ class App:
                         "[Push 단계 중단] Unreal/RPC 상태가 안전하지 않아 남은 항목을 실행하지 않습니다."
                     )
             finally:
+                if retry_context is not None:
+                    retry_context.target_id = None
+                    retry_context.stage = None
                 with self.state_lock:
                     self._batch_active -= 1
                     self._batch_done += 1
@@ -6549,6 +7742,19 @@ class App:
                     persist=False,
                 )
                 self.log(f"[미실행] {item['spm'].name}: {deferred_reason}")
+        if self.stop_flag.is_set():
+            for item in targets:
+                iid = str(item["spm"])
+                if iid in attempted:
+                    continue
+                self._record_phase_status(
+                    iid,
+                    column,
+                    "중지: 사용자 중지로 미실행",
+                    "cancelled",
+                    "사용자 중지로 미실행",
+                    persist=False,
+                )
 
         with self.state_lock:
             self._phase_failed_items = set(failed_items)
@@ -6609,6 +7815,16 @@ class App:
         ]
         return offset, remainder, lines
 
+    @staticmethod
+    def _retry_output_is_progress(line):
+        value = str(line or "").lstrip()
+        return value.startswith((
+            "SK_BATCH_",
+            "PROGRESS",
+            "progress",
+            "[progress]",
+        ))
+
     def _run_limited(
         self,
         cmd,
@@ -6632,6 +7848,10 @@ class App:
         with self.procs_lock:
             self.active_procs.add(proc)
         try:
+            retry_tracker = self._retry_tracker_for_job()
+            retry_context = getattr(self, "_retry_thread_context", None)
+            retry_target_id = getattr(retry_context, "target_id", None)
+            retry_stage = getattr(retry_context, "stage", None)
             started = time.monotonic()
             deadline = (
                 None if timeout is None else started + timeout
@@ -6662,13 +7882,54 @@ class App:
             latest_line = ""
             latest_progress_line = ""
             next_progress = 0.0
+            next_retry_heartbeat = 0.0
             while proc.poll() is None:
+                active_lease = getattr(
+                    self, "_active_shared_queue_lease", None
+                )
+                if (
+                    retry_tracker is not None
+                    and active_lease is not None
+                    and active_lease.heartbeat_error is not None
+                ):
+                    partition = str(
+                        (
+                            getattr(self, "_active_retry_metadata", {}) or {}
+                        ).get("partition")
+                        or ""
+                    )
+                    if partition:
+                        retry_tracker.mark_partition_terminal(
+                            partition,
+                            RETRY_STAGE_OWNER_LOST,
+                            "shared queue lease heartbeat lost while owned "
+                            "process was active",
+                        )
+                    tree_stopped = terminate_process_tree(proc)
+                    detail = (
+                        ""
+                        if tree_stopped
+                        else " (exact owned tree termination unconfirmed)"
+                    )
+                    owner_error = RuntimeError(
+                        "shared queue owner_lost" + detail
+                    )
+                    owner_error.kind = "owner_lost"
+                    raise owner_error
                 if self.stop_flag.is_set():
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " (자식 프로세스 종료 확인 실패)"
-                    raise RuntimeError("사용자 중지" + detail)
+                    raise BatchItemError(
+                        "사용자 중지" + detail,
+                        kind="cancelled",
+                    )
                 now = time.monotonic()
-                if progress_callback is not None or progress_rules:
+                new_lines = []
+                if (
+                    progress_callback is not None
+                    or progress_rules
+                    or (retry_tracker is not None and retry_target_id)
+                ):
                     (
                         log_offset,
                         log_remainder,
@@ -6693,6 +7954,26 @@ class App:
                                 else now + marker_timeout
                             )
                             break
+                    if retry_tracker is not None and retry_target_id and new_lines:
+                        marker_stage = retry_stage
+                        marker_progress = False
+                        for line in new_lines:
+                            mapped = stage_for_send2ue_marker(
+                                line, marker_stage
+                            )
+                            marker_progress = marker_progress or (
+                                mapped != marker_stage
+                                or self._retry_output_is_progress(line)
+                            )
+                            marker_stage = mapped
+                        retry_stage = marker_stage
+                        retry_tracker.observe_process(
+                            retry_target_id,
+                            stage=retry_stage,
+                            diagnostic=new_lines[-1],
+                            output=True,
+                            progress=marker_progress,
+                        )
                 if deadline is not None and now > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
@@ -6729,6 +8010,16 @@ class App:
                         ),
                     )
                     next_progress = now + 1.0
+                if (
+                    retry_tracker is not None
+                    and retry_target_id
+                    and now >= next_retry_heartbeat
+                ):
+                    retry_tracker.observe_process(
+                        retry_target_id,
+                        stage=retry_stage,
+                    )
+                    next_retry_heartbeat = now + 1.0
                 interval = float(self.cfg.get("process_poll_interval", 0.2))
                 time.sleep(max(0.05, min(interval, 1.0)))
         finally:
@@ -9514,8 +10805,12 @@ class App:
         ))
         self.log(
             "Stale Node-table recovery scope sealed from live audit: "
-            f"{target} | Mesh IDs "
-            + ",".join(str(value) for value in scope["expected_mesh_ids"])
+            f"{target} | Authoring Mesh IDs "
+            + ",".join(str(value) for value in scope["authoring_mesh_ids"])
+            + " | required-live Mesh IDs "
+            + ",".join(
+                str(value) for value in scope["required_live_mesh_ids"]
+            )
             + f" | scope={scope['scope_sha256']}"
         )
         executable = self.cfg.get("speedtree_exe") or ""
@@ -9531,14 +10826,18 @@ class App:
             {
                 "target_spm": str(target),
                 "scope_sha256": scope["scope_sha256"],
-                "expected_mesh_ids": list(scope["expected_mesh_ids"]),
+                "authoring_mesh_ids": list(scope["authoring_mesh_ids"]),
+                "required_live_mesh_ids": list(
+                    scope["required_live_mesh_ids"]
+                ),
             },
         ))
         try:
             result = recover_stale_node_table(
                 target,
                 executable,
-                scope["expected_mesh_ids"],
+                authoring_mesh_ids=scope["authoring_mesh_ids"],
+                required_live_mesh_ids=scope["required_live_mesh_ids"],
                 timeout=7200,
                 poll_interval=2.0,
                 stable_reads=3,
@@ -10544,6 +11843,16 @@ class App:
         return b"UnrealEditor.exe" in (result.stdout or b"")
 
     def _set_push_state(self, iid, kind, status_text, details=None, message=None):
+        progress_message = message or status_text
+        non_error_kinds = {
+            "completed",
+            "ready",
+            "exported_pending_unreal",
+            "importing",
+            "imported_ok",
+            "cancelled",
+            "stopped",
+        }
         self.ui_queue.put(("cell", (iid, "push_status", status_text)))
         with self.state_lock:
             entry = self.state.setdefault(iid, {})
@@ -10554,7 +11863,7 @@ class App:
                 and entry.get("push_status_kind") == kind
                 and (not details or entry.get("push_paths") == details)
                 and (
-                    kind in {"exported_pending_unreal", "importing", "imported_ok"}
+                    kind in non_error_kinds
                     or (
                         existing_error.get("kind") == kind
                         and existing_error.get("message") == error_message
@@ -10565,8 +11874,20 @@ class App:
                 return
             entry["push_status"] = status_text
             entry["push_status_kind"] = kind
-            if kind in {"exported_pending_unreal", "importing", "imported_ok"}:
+            if kind in non_error_kinds:
                 entry.pop("push_status_error", None)
+                if kind in {"cancelled", "stopped"}:
+                    result = {
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "cancelled",
+                        "outcome": "cancelled",
+                        "message": error_message,
+                    }
+                    if details:
+                        result.update(details)
+                    entry["push_status_result"] = result
+                else:
+                    entry.pop("push_status_result", None)
             else:
                 error = {
                     "time": datetime.now().isoformat(timespec="seconds"),
@@ -10576,9 +11897,72 @@ class App:
                 if details:
                     error.update(details)
                 entry["push_status_error"] = error
+                entry.pop("push_status_result", None)
             if details:
                 entry["push_paths"] = details
             save_state(self.state)
+        # Receipt completion follows the durable target state. If the process
+        # exits in this narrow gap, restart either reconciles the exact queue
+        # result or re-runs the normal #79/#89 provenance checks; it never
+        # treats a receipt alone as asset verification.
+        if kind == "exported_pending_unreal":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
+        elif kind == "importing":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_UNREAL,
+                progress_message,
+                heartbeat=True,
+            )
+        elif kind == "imported_ok":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_COMPLETE,
+                "Unreal post-check complete",
+                terminal_reason="completed",
+                outcome=RETRY_STAGE_COMPLETE,
+            )
+        elif kind in {"cancelled", "stopped"}:
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_CANCELLED,
+                progress_message,
+                terminal_reason="operator_cancelled",
+                outcome=RETRY_STAGE_CANCELLED,
+            )
+        else:
+            terminal_stage = (
+                RETRY_STAGE_BLOCKED
+                if kind in PLANNED_EXCLUSION_KINDS
+                or kind in {
+                    "dependency_blocked",
+                    "manual_required",
+                    "not_run",
+                    "not_run_unreal",
+                    "recovery_blocked",
+                }
+                else RETRY_STAGE_FAILED
+            )
+            self._retry_transition(
+                iid,
+                terminal_stage,
+                progress_message,
+                terminal_reason=str(kind),
+                outcome=terminal_stage,
+            )
 
     def _push_dependency_paths(self):
         send2ue_dir = Path(self.cfg["send2ue_dir"])
@@ -10757,11 +12141,19 @@ class App:
 
     def _source_push_fingerprint(self, blend, iid=None):
         """Hash a large source blend once, then reuse its stable stat cache."""
-        state_entry = self.state.setdefault(iid, {}) if iid else {}
+        if iid:
+            with self.state_lock:
+                cache = copy.deepcopy(
+                    self.state.get(iid, {}).get(
+                        "push_source_fingerprint_cache"
+                    )
+                )
+        else:
+            cache = None
         fingerprint, record, cache_hit = cached_push_source_fingerprint(
             blend,
             self._push_source_dependency_paths(iid),
-            cache=state_entry.get("push_source_fingerprint_cache"),
+            cache=cache,
         )
         if iid:
             with self.state_lock:
@@ -10957,7 +12349,13 @@ class App:
         )
         return item
 
-    def _sync_headless_checkpoint(self, checkpoint_path, item_by_id, log_file=None):
+    def _sync_headless_checkpoint(
+        self,
+        checkpoint_path,
+        item_by_id,
+        log_file=None,
+        observed_line=None,
+    ):
         try:
             checkpoint = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -10975,6 +12373,32 @@ class App:
                 continue
             status = result.get("status", "not_run")
             message = result.get("message") or labels.get(status, status)
+            if status == "importing":
+                versions = self.__dict__.setdefault(
+                    "_retry_checkpoint_versions", {}
+                )
+                version = str(result.get("updated_at") or "")
+                progressed = bool(version and versions.get(queue_id) != version)
+                if version:
+                    versions[queue_id] = version
+                last_lines = self.__dict__.setdefault(
+                    "_retry_checkpoint_output_lines", {}
+                )
+                output_changed = bool(
+                    observed_line
+                    and last_lines.get(queue_id) != str(observed_line)
+                )
+                if output_changed:
+                    last_lines[queue_id] = str(observed_line)
+                tracker = self._retry_tracker_for_job()
+                if tracker is not None:
+                    tracker.observe_process(
+                        queue_id,
+                        stage=RETRY_STAGE_UNREAL,
+                        diagnostic=observed_line or message,
+                        output=output_changed,
+                        progress=progressed,
+                    )
             text = labels.get(status, status)
             if status in {"data_error", "manual_required", "unreal_crash", "not_run"}:
                 text = f"{text}: {compact_error_message(message, 80)}"
@@ -11343,6 +12767,17 @@ class App:
                 return index, None
             spm = item["spm"]
             iid = str(spm)
+            retry_context = getattr(self, "_retry_thread_context", None)
+            if retry_context is not None:
+                retry_context.target_id = iid
+                retry_context.stage = RETRY_STAGE_SEND2UE
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_SEND2UE,
+                "Send2UE export started",
+                progress=True,
+                heartbeat=True,
+            )
             self.ui_queue.put(("cell", (iid, "push_status", "Send2UE export 중...")))
             try:
                 return index, self._export_manifest_item(iid, spm, batch_stamp)
@@ -11365,6 +12800,10 @@ class App:
                 with self.state_lock:
                     failed_items.add(iid)
                 return index, None
+            finally:
+                if retry_context is not None:
+                    retry_context.target_id = None
+                    retry_context.stage = None
 
         completed = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -11441,7 +12880,7 @@ class App:
                 if self.state.get(iid, {}).get("push_status_kind") not in {
                     "exported_pending_unreal", "imported_ok", "data_error", "manual_required"
                 }:
-                    self._set_push_state(iid, "not_run", "미실행: 사용자 중지")
+                    self._set_push_state(iid, "cancelled", "중지: 사용자 중지")
             if emit_done:
                 self.ui_queue.put(("progress", "중지됨"))
                 self.ui_queue.put(("done", None))
@@ -11604,10 +13043,17 @@ class App:
                         checkpoint_path,
                         item_by_id,
                         attempt_log,
+                        observed_line=_line,
                     ),
                     env=env,
                 )
             except Exception as exc:
+                if (
+                    self.stop_flag.is_set()
+                    or getattr(exc, "kind", "") in {"cancelled", "stopped"}
+                ):
+                    self.log(f"[headless 중지] {exc}")
+                    break
                 code = -1
                 self.log(f"[headless watchdog] {exc}")
             checkpoint = self._sync_headless_checkpoint(
@@ -11630,6 +13076,48 @@ class App:
             self.log(
                 f"[headless watchdog] commandlet 종료 code={code}; checkpoint 재개"
             )
+
+        if self.stop_flag.is_set():
+            checkpoint = self._sync_headless_checkpoint(
+                checkpoint_path,
+                item_by_id,
+                last_log,
+            )
+            actual_failure_kinds = {
+                "data_error",
+                "manual_required",
+                "unreal_crash",
+                "owner_lost",
+            }
+            for iid in item_by_id:
+                item_status = str(
+                    ((checkpoint.get("items") or {}).get(iid) or {}).get(
+                        "status"
+                    )
+                    or ""
+                )
+                if item_status == "imported_ok":
+                    continue
+                if item_status in actual_failure_kinds:
+                    failed_items.add(str(iid))
+                    continue
+                self._set_push_state(
+                    iid,
+                    "cancelled",
+                    "중지: 사용자 중지",
+                    details={
+                        "manifest": str(manifest_path),
+                        "checkpoint": str(checkpoint_path),
+                        "log": str(last_log or ""),
+                    },
+                )
+            with self.state_lock:
+                self._phase_failed_items = set(failed_items)
+                save_state(self.state)
+            if emit_done:
+                self.ui_queue.put(("progress", f"{progress_label} 중지됨"))
+                self.ui_queue.put(("done", None))
+            return False
 
         if not complete:
             checkpoint = self._sync_headless_checkpoint(
@@ -11810,6 +13298,20 @@ class App:
         }
         entry.pop("push_status_error", None)
         save_state(self.state)
+        self._retry_transition(
+            iid,
+            RETRY_STAGE_POST_CHECK,
+            "Unreal RPC post-check complete",
+            progress=True,
+            heartbeat=True,
+        )
+        self._retry_transition(
+            iid,
+            RETRY_STAGE_COMPLETE,
+            "Unreal RPC retry complete",
+            terminal_reason="completed",
+            outcome=RETRY_STAGE_COMPLETE,
+        )
         self.log(f"push 완료: {result.get('unreal_folder', '?')}{result.get('unit_name', '')}")
 
 
@@ -11822,9 +13324,6 @@ def main():
     app = App(root)
 
     def close():
-        with app._recovery_commit_lock:
-            app._app_open = False
-            app.stop_batch()
         app.shutdown_shared_queue()
         root.destroy()
 

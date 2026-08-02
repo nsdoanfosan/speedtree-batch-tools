@@ -254,6 +254,23 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertFalse(app.pending_batch_jobs)
         self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
 
+    def test_window_shutdown_records_operator_close_before_stopping(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        app.pending_batch_jobs = gui.deque()
+        app.active_batch_job = {"id": 1, "label": "running retry"}
+        app.shared_queue_runtime = mock.Mock()
+        app._app_open = True
+        app._ensure_batch_queue_state()
+
+        app.shutdown_shared_queue()
+
+        app.shared_queue_runtime.shutdown.assert_called_once_with(
+            operator_close=True
+        )
+        self.assertFalse(app._app_open)
+        self.assertTrue(app.stop_flag.is_set())
+
     def test_queued_worker_reports_item_failures_instead_of_success(self):
         gui = load_gui_module()
         app, checked, _unchecked = self.make_start_app(gui)

@@ -38,8 +38,10 @@ from pcg_startup_cache import (  # noqa: E402
 )
 from pcg_startup_latency import (  # noqa: E402
     PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS,
+    StartupAmplificationError,
     StartupLatencyTracker,
     USABLE_READY_ACCEPTANCE_CAP_SECONDS,
+    require_startup_total_invocation_guard,
 )
 
 
@@ -2225,6 +2227,92 @@ class MutationOperationBoundaryTests(unittest.TestCase):
 
 
 class ProductionShapedLatencyFixtureTests(unittest.TestCase):
+    def test_known_per_spm_manifest_amplification_fails_total_call_guard(self):
+        """The pre-fix resolver shape fails while unique counters still pass."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree"
+            cache = Path(temporary) / "cache"
+            root.mkdir()
+            for folder_index in range(2):
+                folder = root / f"tree_fixture_{folder_index:02d}"
+                folder.mkdir()
+                for spm_index in range(2):
+                    path = folder / (
+                        f"SK_tree_fixture_{folder_index:02d}_{spm_index:02d}.spm"
+                    )
+                    path.write_text(
+                        '<?xml version="1.0"?><SpeedTree><Materials>'
+                        '<Material_v8 ID="1" Name="M_fixture_atlas_01">'
+                        '</Material_v8></Materials><Generators></Generators>'
+                        '<Nodes></Nodes></SpeedTree>',
+                        encoding="utf-8",
+                    )
+            cfg = {
+                "tree_root": str(root),
+                "atlas_root": str(root / "atlas"),
+                "source_texture_roots": [],
+                "required_export_maps": [
+                    "color", "normal", "extra", "height",
+                    "opacity", "subsurface",
+                ],
+            }
+
+            # Negative control for the exact PR #61 integration regression:
+            # a manifest-free folder used to send every sibling SPM through
+            # resolve_atlas_manifests().  The fixture is deliberately tiny,
+            # but preserves that per-SPM/per-scope cardinality mismatch.  The
+            # unmodified 597-SPM fixture below has no Atlas carrier and records
+            # zero resolver calls, so this injection is the load-bearing proof
+            # that the manifest rule catches more than the trivial 0 <= 55.
+            def legacy_per_spm_manifest_targets(folder):
+                return sorted(Path(folder).glob("*.spm"))
+
+            with mock.patch.object(
+                audit, "SPM_ANALYSIS_CACHE_PATH", cache / "spm.json"
+            ), mock.patch.object(
+                audit, "SBS_GRAPH_CACHE_PATH", cache / "sbs.json"
+            ), mock.patch.object(
+                audit, "BLEND_IMAGE_CACHE_PATH", cache / "blend.json"
+            ), mock.patch.object(
+                audit, "PROVIDER_MAP_CACHE_PATH", cache / "provider.json"
+            ), mock.patch.object(
+                audit,
+                "_atlas_manifest_targets",
+                side_effect=legacy_per_spm_manifest_targets,
+            ):
+                audit._SPM_ANALYSIS_CACHE.clear()
+                audit._PERSISTENT_SPM_ANALYSIS = None
+                audit._PERSISTENT_SBS_GRAPHS = None
+                audit._PERSISTENT_BLEND_IMAGES = None
+                report = audit.make_report(cfg)
+
+            metrics = report["startup_timing"]["session_cache_metrics"]
+            guard = report["startup_timing"]["total_invocation_guard"]
+            self.assertEqual(
+                metrics.get("spm_decode_misses_unique_files"), 4
+            )
+            self.assertEqual(
+                metrics.get("legacy_receipt_inspection_calls_unique_files"),
+                4,
+            )
+            self.assertEqual(
+                metrics.get("atlas_manifest_resolution_calls"), 8
+            )
+            self.assertEqual(guard["status"], "failed")
+            self.assertEqual(
+                guard["rules"]["atlas_manifest_resolution_calls"]["limit"],
+                2,
+            )
+            with self.assertRaisesRegex(
+                StartupAmplificationError,
+                r"atlas_manifest_resolution_calls=8 > 2",
+            ):
+                require_startup_total_invocation_guard(
+                    metrics,
+                    audit_scope_count=2,
+                    spm_count=4,
+                )
+
     def test_55_folder_597_spm_primary_paint_and_usable_latency_budgets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
@@ -2367,6 +2455,56 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             )
             cold_cache = cold["startup_timing"]["session_cache_metrics"]
             warm_cache = warm["startup_timing"]["session_cache_metrics"]
+            for report, metrics in (
+                (cold, cold_cache),
+                (warm, warm_cache),
+            ):
+                guard = require_startup_total_invocation_guard(
+                    metrics,
+                    audit_scope_count=55,
+                    spm_count=597,
+                )
+                self.assertEqual(guard["status"], "ok")
+                self.assertEqual(
+                    report["startup_timing"]["total_invocation_guard"],
+                    guard,
+                )
+            self.assertEqual(
+                cold_cache.get("spm_analysis_calls"),
+                sum(
+                    cold_cache.get(name, 0)
+                    for name in (
+                        "spm_decode_misses",
+                        "spm_memory_hits",
+                        "spm_persistent_hits",
+                        "spm_report_hits",
+                    )
+                ),
+            )
+            self.assertEqual(
+                warm_cache.get("spm_analysis_calls"),
+                sum(
+                    warm_cache.get(name, 0)
+                    for name in (
+                        "spm_decode_misses",
+                        "spm_memory_hits",
+                        "spm_persistent_hits",
+                        "spm_report_hits",
+                    )
+                ),
+            )
+            self.assertEqual(
+                cold_cache.get("legacy_receipt_inspection_calls"), 597
+            )
+            self.assertEqual(
+                warm_cache.get("legacy_receipt_inspection_calls"), 597
+            )
+            self.assertEqual(
+                cold_cache.get("atlas_manifest_resolution_calls", 0), 0
+            )
+            self.assertEqual(
+                warm_cache.get("atlas_manifest_resolution_calls", 0), 0
+            )
             self.assertEqual(
                 cold_cache.get("spm_decode_misses_unique_files"), 597
             )
