@@ -119,7 +119,7 @@ def classify_failed_retry(
     unreal_parent_status=UNREAL_PARENT_ABSENT,
     unreal_parent_diagnostic="",
 ):
-    """Classify one selected row from structured, content-derived evidence."""
+    """Classify one inventory candidate from structured current evidence."""
 
     entry = entry if isinstance(entry, dict) else {}
     repair_state = (

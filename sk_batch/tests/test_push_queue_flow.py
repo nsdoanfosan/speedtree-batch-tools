@@ -3294,10 +3294,19 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(item["queue_id"], "tree")
 
-    def configure_failed_retry_start(self, app, selected_ids):
+    def configure_failed_retry_start(
+        self,
+        app,
+        candidate_ids,
+        *,
+        checked_ids=None,
+    ):
+        checked_ids = set(
+            candidate_ids if checked_ids is None else checked_ids
+        )
         app.items = {
-            iid: {"spm": Path(iid), "checked": True}
-            for iid in selected_ids
+            iid: {"spm": Path(iid), "checked": iid in checked_ids}
+            for iid in candidate_ids
         }
         app._close_cell_editor = mock.Mock()
         app._collect_cfg = mock.Mock(return_value={"push_transport": "rpc"})
@@ -3305,7 +3314,10 @@ class PushQueueFlowTests(unittest.TestCase):
             side_effect=lambda target_ids: (
                 dict(app.items),
                 [
-                    {"spm": Path(iid), "checked": True}
+                    {
+                        "spm": Path(iid),
+                        "checked": app.items[iid]["checked"],
+                    }
                     for iid in target_ids
                 ],
             )
@@ -3324,6 +3336,15 @@ class PushQueueFlowTests(unittest.TestCase):
             return_value={}
         )
         return jobs
+
+    def test_failed_results_retry_ui_declares_complete_inventory_scope(self):
+        source = (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('text="↻ 전체 실패 이력 재시도"', source)
+        self.assertIn("체크 상태와 무관하게 현재 목록 전체", source)
+        self.assertNotIn("체크된 최근 실패", source)
 
     @staticmethod
     def write_unreal_retry_parent(gui, root, queue_id, status="data_error"):
@@ -3351,11 +3372,15 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         return manifest_path, checkpoint_path
 
-    def test_failed_results_retry_unreal_only_uses_immutable_job(self):
+    def test_failed_results_retry_unchecked_unreal_uses_immutable_job(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         iid = "unreal_failed.spm"
-        jobs = self.configure_failed_retry_start(app, [iid])
+        jobs = self.configure_failed_retry_start(
+            app,
+            [iid],
+            checked_ids=[],
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3387,6 +3412,48 @@ class PushQueueFlowTests(unittest.TestCase):
         eligibility = jobs[0]["retry_metadata"]["eligibility"]
         self.assertEqual(
             eligibility["items"][0]["classification"], "unreal_only"
+        )
+
+    def test_failed_results_retry_is_independent_of_checkbox_state(self):
+        gui = load_gui_module()
+        first = "first_repair_failed.spm"
+        second = "second_repair_failed.spm"
+        candidates = [first, second]
+
+        def run_with_checked(checked_ids):
+            app = self.make_app(gui)
+            jobs = self.configure_failed_retry_start(
+                app,
+                candidates,
+                checked_ids=checked_ids,
+            )
+            app.state = {iid: {} for iid in candidates}
+            app._failed_retry_repair_state.return_value = {
+                "current": False,
+                "push_ready": False,
+                "kind": "stale_content",
+                "reason": "current source fingerprint differs from Repair report",
+            }
+
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+            self.assertEqual(len(jobs), 1)
+            job = jobs[0]
+            return (
+                [str(item["spm"]) for item in job["targets"]],
+                job["retry_metadata"]["eligibility"],
+            )
+
+        first_checked = run_with_checked([first])
+        second_checked = run_with_checked([second])
+
+        self.assertEqual(first_checked, second_checked)
+        self.assertEqual(first_checked[0], candidates)
+        self.assertEqual(len(first_checked[0]), len(set(first_checked[0])))
+        self.assertEqual(
+            [row["queue_id"] for row in first_checked[1]["items"]],
+            candidates,
         )
 
     def test_failed_results_retry_blender_only_rebuilds_then_pushes(self):
@@ -3495,8 +3562,28 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(jobs, [])
         messages.showinfo.assert_called_once()
         self.assertIn("current Blender success 제외", app.log.call_args.args[0])
+        title, body = messages.showinfo.call_args.args
+        self.assertEqual(title, "전체 실패 이력 재시도")
+        self.assertIn("현재 목록 전체", body)
+        self.assertNotIn("선택", body)
 
-    def test_failed_results_retry_mixed_selection_routes_without_duplicates(self):
+    def test_failed_results_retry_empty_inventory_does_not_request_selection(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        jobs = self.configure_failed_retry_start(app, [], checked_ids=[])
+
+        with mock.patch.object(gui, "messagebox") as messages:
+            app.start_failed_results_retry()
+
+        self.assertEqual(jobs, [])
+        app._collect_cfg.assert_not_called()
+        messages.showinfo.assert_called_once()
+        title, body = messages.showinfo.call_args.args
+        self.assertEqual(title, "전체 실패 이력 재시도")
+        self.assertIn("현재 목록 전체", body)
+        self.assertNotIn("선택", body)
+
+    def test_failed_results_retry_mixed_inventory_routes_without_duplicates(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         unreal_iid = "unreal_failed.spm"
