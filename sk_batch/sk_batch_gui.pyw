@@ -109,7 +109,10 @@ from retry_planning import (
     MAX_REPORT_BYTES as RETRY_PLANNING_MAX_REPORT_BYTES,
     RetryPlanningContext,
     RetryPlanningSnapshotError,
+    build_plan_cache_artifact,
     cheap_durable_candidate,
+    hydrate_plan_cache_artifact,
+    planning_input_signature,
 )
 from artifact_content_key import (
     artifact_record_content_key,
@@ -215,6 +218,7 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
     CanonicalOutputManifestError,
     refresh_atlas_manifests_for_spm,
 )
+from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
 from repair_runtime_contract import (
     REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_RUNTIME_RECEIPT_VERSION,
@@ -2680,6 +2684,19 @@ class App:
         self._retry_progress_by_run_id[tracker.run_id] = tracker
         return tracker
 
+    def _reusable_retry_plan_cache(self):
+        """Return only a completed prior run's durable plan candidate."""
+
+        if self.__dict__.pop("_skip_retry_plan_cache_once", False):
+            return None
+        tracker = getattr(self, "_active_retry_progress", None)
+        if tracker is None:
+            return None
+        snapshot = tracker.snapshot(evaluate=False)
+        if snapshot.get("run_state") != "terminal":
+            return None
+        return tracker.planning_cache()
+
     def _restore_latest_retry_progress(self):
         tracker = RetryProgressReceipt.load_latest(
             notify=None,
@@ -2806,12 +2823,42 @@ class App:
         )
         partition_ordinal = current.get("partition_ordinal") or "?"
         partition_total = current.get("partition_total") or "?"
-        self.retry_target_var.set(
-            f"current target: {current.get('target_name') or '-'} · "
-            f"{finished}/{len(rows)} finished · partition="
-            f"{current.get('partition') or '-'} "
-            f"{partition_ordinal}/{partition_total}"
+        planning = snapshot.get("planning") or {}
+        planning_progress = planning.get("progress") or {}
+        planning_visible = (
+            current.get("stage") == RETRY_STAGE_PLANNING
+            and planning.get("status") in {"active", "ready", "committing"}
         )
+        if planning_visible and planning_progress:
+            completed = int(planning_progress.get("completed_count") or 0)
+            total = int(planning_progress.get("total_count") or len(rows))
+            percent = (completed / total * 100.0) if total else 0.0
+            substage = str(planning_progress.get("substage") or "planning")
+            cache_status = str(
+                planning_progress.get("cache_status") or "unchecked"
+            )
+            self.retry_target_var.set(
+                f"planning: {substage} · {completed}/{total} · "
+                f"current {current.get('target_name') or '-'} · "
+                f"cache={cache_status}"
+            )
+            self.progress_var.set(
+                f"retry planning · {substage} · {completed}/{total} · "
+                f"classified {int(planning_progress.get('classified_count') or 0)} · "
+                f"validated {int(planning_progress.get('validated_count') or 0)} · "
+                f"cache={cache_status}"
+            )
+            self.batch_progress.configure(value=percent)
+            self.batch_progress_var.set(
+                f"{completed}/{total} ({percent:.0f}%)"
+            )
+        else:
+            self.retry_target_var.set(
+                f"current target: {current.get('target_name') or '-'} · "
+                f"{finished}/{len(rows)} finished · partition="
+                f"{current.get('partition') or '-'} "
+                f"{partition_ordinal}/{partition_total}"
+            )
         # Prefix this as an individual target observation: an item-level
         # failed stage is not a current batch terminal outcome.
         self.retry_liveness_var.set(
@@ -5015,6 +5062,17 @@ class App:
                     )
                 },
             }
+        atlas_manifest_repair = {}
+        if disposition == "candidate":
+            try:
+                current_atlas_plan = atlas_manifest_mirror_repair_plan(iid)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                current_atlas_plan = {}
+            if current_atlas_plan.get("status") in {
+                "repairable",
+                "unrepairable",
+            }:
+                atlas_manifest_repair = current_atlas_plan
         return {
             "schema_version": 1,
             "queue_id": str(iid),
@@ -5026,6 +5084,7 @@ class App:
                 "evidence": copy.deepcopy(evidence),
             },
             "resumable_cancelled": resumable,
+            "current_atlas_manifest_repair": atlas_manifest_repair,
             "current_repair_state": copy.deepcopy(
                 repair_state
                 if isinstance(repair_state, dict)
@@ -5110,6 +5169,14 @@ class App:
         stage_name = str(stage.get("stage") or "")
         exact_spm = Path(item["spm"])
         evidence = {}
+        if stage_name == "atlas_manifest_repair":
+            refreshed = self._refresh_canonical_atlas_manifests(exact_spm)
+            current_plan = atlas_manifest_mirror_repair_plan(exact_spm)
+            if current_plan.get("status") != "not_needed":
+                raise RuntimeError(
+                    "Atlas manifest conflict remained after exact repair"
+                )
+            evidence["atlas_manifest_refresh"] = copy.deepcopy(refreshed)
         if stage_name == "pcg_texture":
             artifact = self._execute_material_preflight(
                 exact_spm,
@@ -5629,6 +5696,7 @@ class App:
         inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
             candidate_iids
         )
+        cached_plan = self._reusable_retry_plan_cache()
         tracker = None
         if getattr(self, "_async_retry_planning_enabled", False):
             if (
@@ -5671,6 +5739,8 @@ class App:
                         cfg,
                         tracker=tracker,
                         inventory_snapshot=inventory_snapshot,
+                        planning_session_id=planning_session_id,
+                        cached_plan_cache=cached_plan,
                     )
                 except Exception as exc:
                     plan = {
@@ -5728,6 +5798,8 @@ class App:
         cfg,
         tracker=None,
         inventory_snapshot=None,
+        planning_session_id=None,
+        cached_plan_cache=None,
     ):
         """Capture one bounded generation, then build without Tk or live state."""
         candidate_iids = list(candidate_iids)
@@ -5749,17 +5821,105 @@ class App:
             inventory_snapshot=inventory_snapshot,
             cancel_event=getattr(self, "stop_flag", None),
             tracker=tracker,
+            planning_session_id=planning_session_id,
         )
         local.planning_context = context
         try:
-            plan = self._build_failed_retry_plan_scoped(
-                candidate_iids,
-                cfg,
-                tracker=tracker,
-                inventory_snapshot=inventory_snapshot,
-                planning_context=context,
+            context.publish(
+                "cache_lookup",
+                scanned=0,
+                total=len(candidate_iids),
+                cache_status="checking",
+                progress=False,
+                force=True,
             )
+            cache_hit = bool(
+                isinstance(cached_plan_cache, dict)
+                and cached_plan_cache.get("schema_version") == 1
+                and cached_plan_cache.get("input_signature")
+                == context.input_signature
+                and isinstance(cached_plan_cache.get("artifact"), dict)
+                and tracker is not None
+            )
+            if cache_hit:
+                try:
+                    plan = hydrate_plan_cache_artifact(
+                        cached_plan_cache["artifact"],
+                        inventory_snapshot=inventory_snapshot,
+                        cfg_snapshot=cfg,
+                        tracker=tracker,
+                        side_effects_committed=bool(
+                            cached_plan_cache.get("side_effects_committed")
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    context.counters["plan_cache_invalid"] += 1
+                    cache_hit = False
+                else:
+                    context.counters["plan_cache_hits"] += 1
+                    context.publish(
+                        "cache_reuse",
+                        scanned=len(candidate_iids),
+                        total=len(candidate_iids),
+                        last_completed="saved retry plan",
+                        cache_status="hit",
+                        force=True,
+                    )
+                    artifact = copy.deepcopy(cached_plan_cache["artifact"])
+            if not cache_hit:
+                context.counters["plan_cache_misses"] += 1
+                context.publish(
+                    "cache_lookup",
+                    scanned=0,
+                    total=len(candidate_iids),
+                    cache_status="miss",
+                    progress=False,
+                    force=True,
+                )
+                plan = self._build_failed_retry_plan_scoped(
+                    candidate_iids,
+                    cfg,
+                    tracker=tracker,
+                    inventory_snapshot=inventory_snapshot,
+                    planning_context=context,
+                )
+                artifact = None
+                if tracker is not None:
+                    try:
+                        artifact = build_plan_cache_artifact(
+                            plan,
+                            tracker.snapshot(evaluate=False),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        context.counters["plan_cache_write_rejections"] += 1
+            plan["_planning_input_signature"] = copy.deepcopy(
+                context.input_signature
+            )
+            plan["_planning_inventory_snapshot"] = copy.deepcopy(
+                inventory_snapshot
+            )
+            plan["_planning_cache_artifact"] = artifact
+            plan["_planning_session_id"] = planning_session_id
+            plan["_planning_cache_reused"] = cache_hit
+            if (
+                tracker is not None
+                and planning_session_id is not None
+                and artifact is not None
+            ):
+                tracker.store_planning_cache(
+                    planning_session_id,
+                    input_signature=context.input_signature,
+                    artifact=artifact,
+                    side_effects_committed=(
+                        bool(cached_plan_cache.get("side_effects_committed"))
+                        if cache_hit
+                        else False
+                    ),
+                )
             plan["planning_diagnostics"] = context.diagnostics()
+            plan["planning_diagnostics"]["plan_cache"] = (
+                "hit" if cache_hit else "miss"
+            )
             return plan
         finally:
             if previous is None:
@@ -6626,6 +6786,24 @@ class App:
             # A duplicate ready event, cooperative cancellation, or restored
             # terminal receipt must never enqueue the same immutable plan.
             return None
+        if plan.get("_planning_cache_reused"):
+            with self.state_lock:
+                current_state = copy.deepcopy(dict(self.state or {}))
+            current_signature = planning_input_signature(
+                plan.get("selected_iids") or (),
+                current_state,
+                plan.get("cfg") or {},
+                plan.get("_planning_inventory_snapshot") or {},
+            )
+            if current_signature != plan.get("_planning_input_signature"):
+                if tracker is not None:
+                    tracker.finish_planning(
+                        RETRY_STAGE_CANCELLED,
+                        "cached retry plan input changed before commit; replanning",
+                    )
+                self._skip_retry_plan_cache_once = True
+                self.root.after(0, self.start_failed_results_retry)
+                return None
         if error:
             if tracker is not None:
                 tracker.finish_planning(
@@ -6662,6 +6840,31 @@ class App:
         for message in plan.get("deferred_logs") or ():
             self.log(message)
         cfg = dict(plan.get("cfg") or {})
+        artifact = plan.get("_planning_cache_artifact")
+        planning_session_id = plan.get("_planning_session_id")
+        if (
+            tracker is not None
+            and planning_session_id is not None
+            and isinstance(artifact, dict)
+        ):
+            with self.state_lock:
+                committed_state = copy.deepcopy(dict(self.state or {}))
+            committed_signature = planning_input_signature(
+                plan.get("selected_iids") or (),
+                committed_state,
+                cfg,
+                plan.get("_planning_inventory_snapshot") or {},
+            )
+            original_signature = plan.get("_planning_input_signature") or {}
+            if committed_signature.get("file_identities_sha256") == (
+                original_signature.get("file_identities_sha256")
+            ):
+                tracker.store_planning_cache(
+                    planning_session_id,
+                    input_signature=committed_signature,
+                    artifact=artifact,
+                    side_effects_committed=True,
+                )
         try:
             save_config(cfg)
         except Exception as exc:
@@ -9513,6 +9716,7 @@ class App:
                 require_complete=True,
             )
         except CanonicalOutputManifestError as exc:
+            failure_report = copy.deepcopy(getattr(exc, "report", {}) or {})
             raise BatchItemError(
                 "Canonical PCG → Atlas manifest preflight failed: "
                 + str(exc),
@@ -9522,6 +9726,7 @@ class App:
                     "stage": "canonical_atlas_manifest_preflight",
                     "spm": str(spm),
                     "error": str(exc),
+                    **failure_report,
                 },
             ) from exc
         if result["updated"]:
@@ -13310,6 +13515,17 @@ class App:
                 reason = compact_error_message(exc)
                 kind = getattr(exc, "kind", "data_error")
                 details = {}
+                failure_report = getattr(exc, "report", None)
+                if isinstance(failure_report, dict) and failure_report:
+                    details["failure_report"] = copy.deepcopy(failure_report)
+                    if failure_report.get("reason_token"):
+                        details["reason_token"] = str(
+                            failure_report["reason_token"]
+                        )
+                    if isinstance(failure_report.get("evidence"), dict):
+                        details["evidence"] = copy.deepcopy(
+                            failure_report["evidence"]
+                        )
                 if getattr(exc, "log_file", None):
                     details["log"] = str(exc.log_file)
                 if getattr(exc, "report_file", None):

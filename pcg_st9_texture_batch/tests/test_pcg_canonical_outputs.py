@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +18,8 @@ from pcg_canonical_outputs import (
     record_canonical_output,
     validate_manifest,
 )
+from exact_target_repair import execute_step3_standard
+from repair_orchestration import ATLAS_MANIFEST_MIRROR_REPAIR
 import migrate_current_sk_textures
 from pcg_texture_audit import (
     _atlas_manifest_targets,
@@ -28,6 +31,40 @@ from spm_texture_normalize import cleanup_preserved_cluster_outputs
 
 
 class CanonicalOutputManifestTests(unittest.TestCase):
+    def test_exact_bat_dispatches_atlas_mirror_repair_then_canonical_refresh(self):
+        class Lease:
+            @staticmethod
+            def renew_and_check_current():
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_cluster_test.spm"
+            target.write_bytes(b"sanitized")
+            progress = []
+            with mock.patch(
+                "exact_target_repair.repair_atlas_manifest_mirrors",
+                return_value={"status": "repaired"},
+            ) as repair, mock.patch(
+                "exact_target_repair.refresh_atlas_manifests_for_spm",
+                return_value={"status": "current"},
+            ) as refresh:
+                result = execute_step3_standard(
+                    {
+                        "repair_action": ATLAS_MANIFEST_MIRROR_REPAIR,
+                        "target_spms": [str(target)],
+                    },
+                    progress=lambda stage, **data: progress.append((stage, data)),
+                    cancel_event=threading.Event(),
+                    lease=Lease(),
+                )
+
+            self.assertTrue(result["shared_queue_success"])
+            repair.assert_called_once_with(target.absolute())
+            refresh.assert_called_once_with(
+                target.absolute(), require_complete=True
+            )
+            self.assertEqual(progress[-1][1]["completed"], 1)
+
     def test_manifest_free_folder_has_no_atlas_resolution_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             asset = Path(temporary) / "tree_test"

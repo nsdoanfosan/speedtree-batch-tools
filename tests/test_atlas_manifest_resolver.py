@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import tempfile
@@ -6,7 +7,9 @@ from pathlib import Path
 
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
+    atlas_manifest_mirror_repair_plan,
     diagnose_manifest_generator_candidates,
+    repair_atlas_manifest_mirrors,
     resolution_evidence,
     resolve_atlas_manifests,
     resolve_manifest_material_ownership,
@@ -458,6 +461,56 @@ class AtlasManifestResolverTests(unittest.TestCase):
                     "reason": "unsupported_schema_version",
                 },
             }])
+
+    def test_exact_authority_can_repair_same_source_stale_mirror(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, target, _blend, payload = self.fixture(temporary)
+            authority = self.write_candidate(
+                root, target, "exact_per_target", payload
+            )
+            stale = copy.deepcopy(payload)
+            stale["material_groups"][0]["mesh_ids"] = [99]
+            mirror = self.write_candidate(
+                root, target, "exact_global_target", stale
+            )
+
+            plan = atlas_manifest_mirror_repair_plan(target)
+            self.assertEqual(plan["status"], "repairable", plan)
+            self.assertEqual(
+                plan["reason_code"],
+                "atlas_manifest_mirror_conflict_repairable",
+            )
+            self.assertEqual(plan["authority"], str(authority.resolve()))
+            self.assertEqual(plan["mirrors"], [str(mirror.resolve())])
+
+            result = repair_atlas_manifest_mirrors(target)
+            self.assertEqual(result["status"], "repaired")
+            resolution = resolve_atlas_manifests(target)
+            self.assertEqual(len(resolution["selected"]), 2)
+            self.assertEqual(resolution["conflicting"], [])
+            repaired = json.loads(mirror.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["material_groups"], payload["material_groups"])
+
+    def test_different_source_conflict_is_not_automatically_repairable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, target, _blend, payload = self.fixture(temporary)
+            self.write_candidate(root, target, "exact_per_target", payload)
+            conflict = copy.deepcopy(payload)
+            conflict["source_collection"] = "Different Authoring Source"
+            conflict["material_groups"][0]["mesh_ids"] = [99]
+            mirror = self.write_candidate(
+                root, target, "exact_global_target", conflict
+            )
+            before = mirror.read_bytes()
+
+            plan = atlas_manifest_mirror_repair_plan(target)
+            self.assertEqual(plan["status"], "unrepairable")
+            self.assertEqual(
+                plan["reason_code"], "atlas_manifest_ownership_conflict"
+            )
+            with self.assertRaises(AtlasManifestResolutionError):
+                repair_atlas_manifest_mirrors(target)
+            self.assertEqual(mirror.read_bytes(), before)
 
     def test_copied_blend_and_same_name_foreign_scope_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -4516,6 +4516,56 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("evidence state=stalled", liveness)
         self.assertIn("wall elapsed 14m 25s", liveness)
 
+    def test_retry_planning_panel_renders_real_counts_not_just_wall_time(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app.progress_var = mock.Mock()
+        app.batch_progress = mock.Mock()
+        app.batch_progress_var = mock.Mock()
+        app._render_retry_progress({
+            "run_state": "running",
+            "evidence_state": "heartbeat_live",
+            "current_target_id": "C:/sanitized/asset-17.spm",
+            "planning": {
+                "status": "active",
+                "progress": {
+                    "substage": "classification",
+                    "completed_count": 17,
+                    "total_count": 154,
+                    "classified_count": 17,
+                    "validated_count": 54,
+                    "cache_status": "miss",
+                },
+            },
+            "targets": [{
+                "target_id": "C:/sanitized/asset-17.spm",
+                "target_name": "asset-17.spm",
+                "stage": "planning",
+                "terminal_at": None,
+                "wall_elapsed_seconds": 42,
+                "last_progress_age_seconds": 0,
+                "last_output_age_seconds": None,
+                "last_heartbeat_age_seconds": 0,
+            }],
+        })
+
+        target = app.retry_target_var.set.call_args.args[0]
+        progress = app.progress_var.set.call_args.args[0]
+        self.assertIn("classification · 17/154", target)
+        self.assertIn("cache=miss", target)
+        self.assertIn("classified 17", progress)
+        self.assertIn("validated 54", progress)
+        app.batch_progress.configure.assert_called_once_with(
+            value=17 / 154 * 100.0
+        )
+        self.assertEqual(
+            app.batch_progress_var.set.call_args.args[0], "17/154 (11%)"
+        )
+
     def test_retry_liveness_panel_shows_terminal_outcome_only_after_terminal(self):
         gui = load_gui_module()
         app = self.make_app(gui)

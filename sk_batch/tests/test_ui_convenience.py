@@ -668,6 +668,40 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         refresh.assert_not_called()
         app.log.assert_not_called()
 
+    def test_canonical_atlas_conflict_preserves_repair_evidence(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        report = {
+            "reason_token": "atlas_manifest_mirror_conflict_repairable",
+            "evidence": {
+                "status": "repairable",
+                "authority": "authority.json",
+                "mirrors": ["stale.json"],
+            },
+        }
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report=report,
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ):
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(
+            caught.exception.report["reason_token"],
+            "atlas_manifest_mirror_conflict_repairable",
+        )
+        self.assertEqual(
+            caught.exception.report["evidence"]["status"], "repairable"
+        )
+
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:

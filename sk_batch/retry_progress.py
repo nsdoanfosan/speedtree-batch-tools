@@ -224,6 +224,21 @@ class RetryProgressReceipt:
                 "commit_started_at": None,
                 "committed_at": None,
                 "terminal_reason": None,
+                "progress": {
+                    "schema_version": 1,
+                    "substage": "created",
+                    "completed_count": 0,
+                    "total_count": len(ordered),
+                    "classified_count": 0,
+                    "validated_count": 0,
+                    "cache_hits": 0,
+                    "cache_misses": 0,
+                    "cache_status": "unchecked",
+                    "current_target_id": ordered[0] if ordered else None,
+                    "last_completed_unit": "",
+                    "updated_at": now,
+                },
+                "plan_cache": None,
             },
             "queue_jobs": {},
             "lifecycle_events": [
@@ -542,6 +557,131 @@ class RetryProgressReceipt:
             self._touch_locked(now)
             self._write_locked(write_latest=True)
         return True
+
+    def planning_progress(
+        self,
+        planning_session_id,
+        *,
+        substage,
+        completed_count,
+        total_count,
+        current_target_id=None,
+        last_completed_unit=None,
+        classified_count=0,
+        validated_count=0,
+        cache_hits=0,
+        cache_misses=0,
+        cache_status=None,
+        progress=True,
+    ):
+        """Persist structured planner work for the exact active session.
+
+        Heartbeat and progress are deliberately separate: a live but slow
+        planner may renew its heartbeat without moving these counters.
+        """
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None or planning.get("status") != "active":
+                return False
+            owner = planning.get("owner") or {}
+            if owner.get("planning_session_id") != str(planning_session_id):
+                return False
+            total = max(0, int(total_count))
+            completed = max(0, min(total, int(completed_count)))
+            target_id = (
+                None
+                if current_target_id in (None, "")
+                else str(current_target_id)
+            )
+            planning_progress = planning.setdefault("progress", {})
+            planning_progress.update({
+                "schema_version": 1,
+                "substage": str(substage),
+                "completed_count": completed,
+                "total_count": total,
+                "classified_count": max(0, int(classified_count)),
+                "validated_count": max(0, int(validated_count)),
+                "cache_hits": max(0, int(cache_hits)),
+                "cache_misses": max(0, int(cache_misses)),
+                "current_target_id": target_id,
+                "last_completed_unit": _bounded_diagnostic(
+                    Path(str(last_completed_unit)).name
+                    if last_completed_unit
+                    else ""
+                ),
+                "updated_at": now,
+            })
+            if cache_status is not None:
+                planning_progress["cache_status"] = str(cache_status)
+            planning["heartbeat_at"] = now
+            planning["owner_alive"] = True
+            planning["owner_checked_at"] = now
+            if progress:
+                planning["progress_at"] = now
+            if target_id is not None:
+                row = self._target_locked(target_id)
+                if row is not None and row in self._planning_rows_locked():
+                    self._payload["current_target_id"] = target_id
+                    row["last_heartbeat_at"] = now
+                    if progress:
+                        row["last_progress_at"] = now
+                    row["updated_at"] = now
+                    row["latest_diagnostic"] = _bounded_diagnostic(
+                        f"planning {substage} · {completed}/{total}"
+                        f" · cache hit {max(0, int(cache_hits))}"
+                        f"/miss {max(0, int(cache_misses))}"
+                    )
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        self._notify_snapshot()
+        return True
+
+    def store_planning_cache(
+        self,
+        planning_session_id,
+        *,
+        input_signature,
+        artifact,
+        side_effects_committed=False,
+    ):
+        """Atomically attach a reusable immutable plan to this receipt."""
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None:
+                return False
+            owner = planning.get("owner") or {}
+            if owner.get("planning_session_id") != str(planning_session_id):
+                return False
+            if str(planning.get("status") or "") in {
+                "cancelled",
+                "failed",
+                "owner_lost",
+            }:
+                return False
+            # Round-trip here so a cache can never make the receipt unwritable.
+            cache = json.loads(json.dumps({
+                "schema_version": 1,
+                "input_signature": input_signature,
+                "artifact": artifact,
+                "side_effects_committed": bool(side_effects_committed),
+                "stored_at": now,
+            }, ensure_ascii=False, allow_nan=False))
+            planning["plan_cache"] = cache
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        return True
+
+    def planning_cache(self):
+        """Return the durable cache without exposing mutable receipt state."""
+
+        with self._lock:
+            planning = self._planning_locked()
+            cache = (planning or {}).get("plan_cache")
+            return copy.deepcopy(cache) if isinstance(cache, dict) else None
 
     def planning_ready(self, planning_session_id):
         """Persist that a complete plan awaits the single UI-thread commit."""
@@ -1366,6 +1506,21 @@ class RetryProgressReceipt:
             payload = copy.deepcopy(self._payload)
         planning = payload.get("planning")
         if isinstance(planning, dict):
+            plan_cache = planning.get("plan_cache")
+            if isinstance(plan_cache, dict):
+                artifact = plan_cache.get("artifact") or {}
+                planning["plan_cache"] = {
+                    key: copy.deepcopy(plan_cache.get(key))
+                    for key in (
+                        "schema_version",
+                        "input_signature",
+                        "side_effects_committed",
+                        "stored_at",
+                    )
+                }
+                planning["plan_cache"]["job_count"] = len(
+                    artifact.get("jobs") or ()
+                )
             planning_started = planning.get("started_at")
             planning_end = (
                 planning.get("committed_at")
