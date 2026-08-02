@@ -1710,6 +1710,13 @@ def run_cluster_relation_transaction(
                         f"{restore_error}"
                         + diagnostic_detail
                     ) from preparation_error
+                retry_contract = getattr(
+                    preparation_error,
+                    "connected_retry_contract",
+                    None,
+                )
+                if isinstance(retry_contract, dict):
+                    retry_contract["rollback_succeeded"] = True
             original_args = tuple(preparation_error.args)
             if original_args:
                 preparation_error.args = (
