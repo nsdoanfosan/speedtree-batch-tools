@@ -49,6 +49,11 @@ if str(REPO_DIR) not in sys.path:
 
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolve_atlas_manifests,
+    selected_manifest_payload,
+)
 from cluster_blend_sync import discover_cluster_blend_relations
 from speedtree_export_options_contract import require_texture_skip_writing
 try:
@@ -719,30 +724,18 @@ def _path_identity(path: Path | str) -> str:
 
 
 def _atlas_target_relation_manifest(spm_path: Path) -> dict:
-    """Load the one exact target-local Atlas relationship manifest, if any."""
-    manifest_dir = Path(spm_path).parent / ".atlas_leaf_speedtree_targets"
-    if not manifest_dir.is_dir():
-        return {}
-    target_key = _path_identity(spm_path)
-    matches = []
-    for path in sorted(manifest_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(payload, dict)
-            and payload.get("spm")
-            and _path_identity(payload["spm"]) == target_key
-            and (payload.get("generator_connection") or {}).get("complete")
-        ):
-            matches.append(payload)
-    if len(matches) > 1:
-        raise SyncError(
-            "동일 SPM을 가리키는 Atlas target manifest가 여러 개입니다: "
-            f"{spm_path}"
+    """Load the shared-resolver authority for one exact Atlas target."""
+    try:
+        resolution = resolve_atlas_manifests(
+            spm_path,
+            require_generator_complete=True,
         )
-    return matches[0] if matches else {}
+    except AtlasManifestResolutionError as exc:
+        raise SyncError(
+            "Atlas manifest resolution failed for the exact target SPM: "
+            f"{exc}"
+        ) from exc
+    return selected_manifest_payload(resolution)
 
 
 def _material_cutout_ids(material: ET.Element | None) -> list[str]:

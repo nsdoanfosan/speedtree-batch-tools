@@ -26,6 +26,10 @@ from pathlib import Path
 BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
+from atlas_manifest_resolver import (
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
 from process_lifecycle import (
     complete_owned_process,
     owned_popen,
@@ -2339,55 +2343,79 @@ def _existing_atlas_registry(atlas_root, folder):
                 else "backups"
             entry[key].append(str(path))
 
+    # Target-suffixed operational records must use the same candidate set and
+    # conflict rules as every other Atlas consumer.  Old non-target-suffixed
+    # scope identity files remain diagnostic name-reservation evidence only.
+    manifest_records = []
+    seen_manifests = set()
+    for target in _atlas_manifest_targets(folder):
+        resolution = _atlas_manifest_resolution(target)
+        for selected in resolution["selected"]:
+            manifest_path = Path(selected["path"])
+            key = os.path.normcase(str(manifest_path)).casefold()
+            if key in seen_manifests:
+                continue
+            seen_manifests.add(key)
+            manifest_records.append((
+                manifest_path,
+                selected["payload"],
+                Path(resolution["target_spm"]).parent,
+            ))
+
     scopes = Path(folder) / ".atlas_leaf_speedtree_scopes"
     if scopes.is_dir():
         for manifest_path in scopes.glob("*.json"):
+            if "__" in manifest_path.stem:
+                continue
             try:
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-            blend_file = payload.get("blend_file")
-            textures = payload.get("textures") or {}
-            if not blend_file or not textures.get("albedo") or not textures.get("alpha"):
-                continue
-            blend_path = Path(blend_file)
-            if not blend_path.is_absolute():
-                blend_path = (manifest_path.parent / blend_path).resolve()
-            base = blend_path.stem
-            entry = registry.setdefault(base.lower(), {
-                "base": base, "live_blends": [], "backups": [],
-                "source_pairs": [], "scoped_manifests": [],
-                "material_names": [],
-            })
-            entry.setdefault("scoped_manifests", [])
-            entry.setdefault("material_names", [])
-            if str(manifest_path) not in entry["scoped_manifests"]:
-                entry["scoped_manifests"].append(str(manifest_path))
-            if blend_path.is_file():
-                key = (
-                    "live_blends"
-                    if blend_path.suffix.lower() == ".blend"
-                    else "backups"
-                )
-                if str(blend_path) not in entry[key]:
-                    entry[key].append(str(blend_path))
-            pair = _atlas_source_pair_key(
-                textures.get("albedo"), textures.get("alpha"))
-            if pair not in entry["source_pairs"]:
-                entry["source_pairs"].append(pair)
-            manifest_materials = unique([
-                payload.get("atlas_asset_name"),
-                payload.get("requested_atlas_asset_name"),
-                payload.get("material"),
-            ] + [
-                group.get("material")
-                for group in payload.get("material_groups") or []
-                if isinstance(group, dict)
+            manifest_records.append((manifest_path, payload, manifest_path.parent))
+
+    for manifest_path, payload, relative_base in manifest_records:
+        blend_file = payload.get("blend_file")
+        textures = payload.get("textures") or {}
+        if not blend_file or not textures.get("albedo") or not textures.get("alpha"):
+            continue
+        blend_path = Path(blend_file)
+        if not blend_path.is_absolute():
+            blend_path = (relative_base / blend_path).resolve()
+        base = blend_path.stem
+        entry = registry.setdefault(base.lower(), {
+            "base": base, "live_blends": [], "backups": [],
+            "source_pairs": [], "scoped_manifests": [],
+            "material_names": [],
+        })
+        entry.setdefault("scoped_manifests", [])
+        entry.setdefault("material_names", [])
+        if str(manifest_path) not in entry["scoped_manifests"]:
+            entry["scoped_manifests"].append(str(manifest_path))
+        if blend_path.is_file():
+            key = (
+                "live_blends"
+                if blend_path.suffix.lower() == ".blend"
+                else "backups"
+            )
+            if str(blend_path) not in entry[key]:
+                entry[key].append(str(blend_path))
+        pair = _atlas_source_pair_key(
+            textures.get("albedo"), textures.get("alpha"))
+        if pair not in entry["source_pairs"]:
+            entry["source_pairs"].append(pair)
+        manifest_materials = unique([
+            payload.get("atlas_asset_name"),
+            payload.get("requested_atlas_asset_name"),
+            payload.get("material"),
+        ] + [
+            group.get("material")
+            for group in payload.get("material_groups") or []
+            if isinstance(group, dict)
+        ])
+        entry["material_names"] = unique(
+            entry["material_names"] + [
+                name for name in manifest_materials if name
             ])
-            entry["material_names"] = unique(
-                entry["material_names"] + [
-                    name for name in manifest_materials if name
-                ])
     return registry
 
 
@@ -2592,28 +2620,30 @@ def _binding_slot_identity(binding):
     )
 
 
-def _scoped_connection_payloads(spm, atlas_base=""):
-    """Target-specific Atlas Builder manifests for one exact SPM/atlas."""
-    spm = Path(spm)
-    scopes = spm.parent / ".atlas_leaf_speedtree_scopes"
-    if not scopes.is_dir():
-        return []
+def _atlas_manifest_resolution(spm):
+    """Resolve and report-cache the exact operational Atlas candidate set."""
+    target = Path(spm).expanduser().resolve(strict=False)
     report_cache = _REPORT_SCAN_CACHE.get()
-    cache = report_cache.setdefault("atlas_connection_manifests", {}) \
+    cache = report_cache.setdefault("atlas_manifest_resolutions", {}) \
         if report_cache is not None else None
-    cache_key = (str(scopes).lower(), spm.stem.lower())
-    payloads = cache.get(cache_key) if cache is not None else None
-    if payloads is None:
-        payloads = []
-        for path in sorted(scopes.glob(f"*__{spm.stem}.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            payload["_manifest_path"] = str(path)
-            payloads.append(payload)
+    cache_key = os.path.normcase(str(target)).casefold()
+    resolution = cache.get(cache_key) if cache is not None else None
+    if resolution is None:
+        resolution = resolve_atlas_manifests(target)
         if cache is not None:
-            cache[cache_key] = tuple(payloads)
+            cache[cache_key] = resolution
+    return resolution
+
+
+def _scoped_connection_payloads(spm, atlas_base="", *, resolution=None):
+    """Resolver-selected Atlas Builder manifests for one exact SPM/atlas."""
+    resolution = resolution or _atlas_manifest_resolution(spm)
+    payloads = []
+    for selected in resolution["selected"]:
+        payload = dict(selected["payload"])
+        payload["_manifest_path"] = selected["path"]
+        payload["_manifest_kind"] = selected["kind"]
+        payloads.append(payload)
     if not atlas_base:
         return list(payloads)
 
@@ -2672,10 +2702,15 @@ def _normalize_expected_generator_binding(binding, row_by_id,
 
 def _expected_generator_bindings(spm, atlas_base, requested_ids,
                                  requested_names, row_by_id,
-                                 supplied=None, source_bindings=None):
+                                 supplied=None, source_bindings=None,
+                                 atlas_resolution=None):
     expected = []
     requested_set = set(requested_ids)
-    for payload in _scoped_connection_payloads(spm, atlas_base):
+    for payload in _scoped_connection_payloads(
+        spm,
+        atlas_base,
+        resolution=atlas_resolution,
+    ):
         connection = payload.get("generator_connection") or {}
         connection_names = unique(connection.get("source_material_names") or [])
         default_source_id = requested_ids[0] if len(requested_ids) == 1 else None
@@ -2722,6 +2757,7 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
                                       source_material_ids=None, atlas_base="",
                                       expected_generator_bindings=None):
     """Strictly audit every expected source Generator slot and leaf ordinal."""
+    atlas_resolution = _atlas_manifest_resolution(spm)
     rows = extract_material_image_refs(spm)
     row_by_id = {
         str(row.get("material_id")): row
@@ -2779,7 +2815,8 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
     expected = _expected_generator_bindings(
         spm, atlas_base, requested_ids, requested_names, row_by_id,
         supplied=expected_generator_bindings,
-        source_bindings=source_bindings)
+        source_bindings=source_bindings,
+        atlas_resolution=atlas_resolution)
     statuses = []
     for material_id in requested_ids:
         material = row_by_id.get(material_id)
@@ -2868,6 +2905,9 @@ def inspect_leaf_generator_connection(spm, source_material_names=None,
         "generator_connection_complete": complete,
         "generator_connection_update_needed": not complete,
         "generator_connection_reason": reason,
+        "atlas_manifest_resolution": resolution_evidence(
+            atlas_resolution
+        ),
     }
 
 
@@ -3161,7 +3201,17 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
     and combining them is what previously produced false zeroes and unsafe
     re-connect jobs.
     """
-    registry = _existing_atlas_registry(cfg.get("atlas_root"), folder)
+    registry = None
+
+    def atlas_registry():
+        nonlocal registry
+        if registry is None:
+            registry = _existing_atlas_registry(
+                cfg.get("atlas_root"),
+                folder,
+            )
+        return registry
+
     grouped = {}
     for spm in target_spms or []:
         rows = extract_material_image_refs(spm)
@@ -3179,12 +3229,17 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             atlas_like = bool(
                 material.get("managed_leaf_output")
                 or re.match(r"^M_.*?_atlas_\d+", material_name, re.IGNORECASE)
-                or registry.get(canonical_material_name(material_name).lower())
             )
+            if not atlas_like:
+                atlas_like = bool(
+                    atlas_registry().get(
+                        canonical_material_name(material_name).lower()
+                    )
+                )
             if not atlas_like:
                 continue
             atlas_base, blends = _current_leaf_atlas_base(
-                material_name, registry)
+                material_name, atlas_registry())
             key = atlas_base.lower()
             entry = grouped.setdefault(key, {
                 "atlas_base": atlas_base,
@@ -5907,28 +5962,83 @@ def _atlas_blender_bake_receipt_is_valid(
     return True
 
 
+def _atlas_manifest_targets(asset_root):
+    """Skip fleet resolution only when no operational Atlas carrier exists.
+
+    A manifest-free folder has no Atlas evidence to consume, so resolving every
+    sibling SPM only performs repeated negative directory scans.  Once any
+    operational carrier exists, retain the full fleet candidate set so the
+    resolver still owns target identity, freshness, and fail-closed behavior.
+    Diagnostic-only scope/legacy records remain available to direct resolver
+    calls and do not force work in these selected-payload-only batch consumers.
+    """
+    asset_root = _resolve_for_membership(asset_root)
+    targets = {}
+
+    def add(path):
+        path = Path(path).expanduser()
+        if not path.is_absolute():
+            path = asset_root / path
+        path = path.resolve(strict=False)
+        if path.suffix.casefold() != ".spm":
+            return
+        targets.setdefault(os.path.normcase(str(path)).casefold(), path)
+
+    target_dir = asset_root / ".atlas_leaf_speedtree_targets"
+    scope_dir = asset_root / ".atlas_leaf_speedtree_scopes"
+    global_path = asset_root / "speedtree_import_manifest.json"
+    target_records = (
+        [path for path in sorted(target_dir.glob("*.json")) if path.is_file()]
+        if target_dir.is_dir()
+        else []
+    )
+    scope_records = (
+        [
+            path for path in sorted(scope_dir.glob("*.json"))
+            if path.is_file() and "__" in path.stem
+        ]
+        if scope_dir.is_dir()
+        else []
+    )
+    if not target_records and not scope_records and not global_path.is_file():
+        return []
+
+    for path in sorted(asset_root.glob("*.spm")):
+        if path.is_file():
+            add(path)
+    for path in target_records:
+        add(asset_root / f"{path.stem}.spm")
+    for path in scope_records:
+        add(asset_root / f"{path.stem.rsplit('__', 1)[1]}.spm")
+
+    if global_path.is_file():
+        try:
+            payload = json.loads(global_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("spm"):
+            add(payload["spm"])
+
+    return [targets[key] for key in sorted(targets)]
+
+
 def _atlas_provisional_source_declarations_cached(asset_root_text):
     asset_root = _resolve_for_membership(asset_root_text)
     manifests = []
-    for directory_name in (
-        ".atlas_leaf_speedtree_scopes",
-        ".atlas_leaf_speedtree_targets",
-    ):
-        directory = asset_root / directory_name
-        if directory.is_dir():
-            manifests.extend(sorted(directory.glob("*.json")))
-    root_manifest = asset_root / "speedtree_import_manifest.json"
-    if root_manifest.is_file():
-        manifests.append(root_manifest)
+    seen_manifests = set()
+    for target in _atlas_manifest_targets(asset_root):
+        resolution = _atlas_manifest_resolution(target)
+        for selected in resolution["selected"]:
+            key = os.path.normcase(selected["path"]).casefold()
+            if key in seen_manifests:
+                continue
+            seen_manifests.add(key)
+            manifests.append(selected)
 
     declarations = {}
-    for manifest_path in unique(manifests):
-        try:
-            payload = json.loads(
-                Path(manifest_path).read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
+    for selected in manifests:
+        manifest_path = Path(selected["path"])
+        payload = selected["payload"]
         if (
             not isinstance(payload, dict)
             or payload.get("texture_contract_status")
@@ -6068,6 +6178,7 @@ def _atlas_provisional_source_declarations_cached(asset_root_text):
                 declarations.setdefault(key, []).append({
                     "kind": "atlas_provisional_source_declaration",
                     "manifest": str(Path(manifest_path).resolve()),
+                    "manifest_kind": selected["kind"],
                     "material": material,
                     "role": role,
                     "source_origin": source_origin,
@@ -6583,10 +6694,13 @@ def texture_output_contract_state(
 def refresh_texture_output_contract_states(items, cfg=None):
     source_texture_roots = (cfg or {}).get("source_texture_roots") or []
     for item in items:
+        cluster_items = item.get("cluster_items") or []
+        if not cluster_items:
+            continue
         declarations = atlas_provisional_source_declarations(
             item.get("folder") or ""
         )
-        for entry in item.get("cluster_items") or []:
+        for entry in cluster_items:
             entry["texture_contract_state"] = texture_output_contract_state(
                 entry,
                 item.get("folder") or "",

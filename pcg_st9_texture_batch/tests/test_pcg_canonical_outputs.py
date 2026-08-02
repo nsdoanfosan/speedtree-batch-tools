@@ -19,6 +19,7 @@ from pcg_canonical_outputs import (
 )
 import migrate_current_sk_textures
 from pcg_texture_audit import (
+    _atlas_manifest_targets,
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
     texture_output_contract_state,
@@ -27,6 +28,64 @@ from spm_texture_normalize import cleanup_preserved_cluster_outputs
 
 
 class CanonicalOutputManifestTests(unittest.TestCase):
+    def test_manifest_free_folder_has_no_atlas_resolution_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            asset.mkdir()
+            for index in range(3):
+                (asset / f"SK_tree_test_{index}.spm").write_bytes(b"spm")
+
+            self.assertEqual(_atlas_manifest_targets(asset), [])
+
+    def test_target_receipt_preserves_full_fail_closed_fleet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            asset.mkdir()
+            target = asset / "SK_tree_test_1.spm"
+            for index in range(3):
+                (asset / f"SK_tree_test_{index}.spm").write_bytes(b"spm")
+            receipts = asset / ".atlas_leaf_speedtree_targets"
+            receipts.mkdir()
+            (receipts / "stable-receipt.json").write_text(
+                json.dumps({"spm": str(target)}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _atlas_manifest_targets(asset),
+                sorted(
+                    [
+                        (asset / f"SK_tree_test_{index}.spm").resolve()
+                        for index in range(3)
+                    ] + [(asset / "stable-receipt.spm").resolve()],
+                    key=lambda path: str(path).casefold(),
+                ),
+            )
+
+    def test_unreadable_target_receipt_falls_back_to_spm_fleet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            asset.mkdir()
+            spms = []
+            for index in range(2):
+                spm = asset / f"SK_tree_test_{index}.spm"
+                spm.write_bytes(b"spm")
+                spms.append(spm.resolve())
+            receipts = asset / ".atlas_leaf_speedtree_targets"
+            receipts.mkdir()
+            (receipts / "unreadable.json").write_text(
+                "{not-json",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _atlas_manifest_targets(asset),
+                sorted(
+                    spms + [(asset / "unreadable.spm").resolve()],
+                    key=lambda path: str(path).casefold(),
+                ),
+            )
+
     def _outputs(self, asset, texture_base="T_leaf_test"):
         texture = asset / "texture"
         texture.mkdir(parents=True, exist_ok=True)
@@ -87,6 +146,7 @@ class CanonicalOutputManifestTests(unittest.TestCase):
         manifest = asset / "speedtree_import_manifest.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(json.dumps({
+            "spm": str(target_spm),
             "texture_contract_status":
                 "source_fallback_needs_pcg_generation",
             "source_texture_fallbacks": [fallback],
@@ -227,6 +287,62 @@ class CanonicalOutputManifestTests(unittest.TestCase):
             )
             self.assertEqual(second["status"], "current")
             self.assertEqual(second["updated"], [])
+
+    def test_canonical_promotion_updates_selected_records_not_legacy_shadows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_cluster_test.spm"
+            spm.write_bytes(b"spm")
+            payload = {
+                "spm": str(spm),
+                "material_groups": [{
+                    "material": "M_leaf_test",
+                    "material_id": 17,
+                    "texture_contract_status":
+                        "source_fallback_needs_pcg_generation",
+                }],
+                "texture_contract_status":
+                    "source_fallback_needs_pcg_generation",
+            }
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / f"scope__{spm.stem}.json"
+            scope.write_text(json.dumps(payload), encoding="utf-8")
+            legacy = cluster / "speedtree_import_manifest_M_leaf_test.json"
+            legacy.write_text(json.dumps(payload), encoding="utf-8")
+            legacy_before = legacy.read_bytes()
+
+            canonical = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_leaf_test",
+                    "material_targets": [{
+                        "spm": str(spm),
+                        "material_id": "17",
+                        "material_name": "M_leaf_test",
+                    }],
+                },
+                self._outputs(asset),
+                producer_source="test.sbs#T_leaf_test",
+            )
+
+            self.assertEqual(
+                json.loads(scope.read_text(encoding="utf-8"))[
+                    "texture_contract_status"
+                ],
+                "canonical_pcg_output",
+            )
+            self.assertEqual(legacy.read_bytes(), legacy_before)
+            result = refresh_atlas_manifests_for_spm(spm, canonical)
+            self.assertEqual(result["status"], "current")
+            self.assertEqual(
+                [row["path"] for row in result[
+                    "atlas_manifest_resolution"
+                ]["shadowed"]],
+                [str(legacy.resolve())],
+            )
 
     def test_atlas_scope_is_not_partially_promoted_between_texture_sets(self):
         with tempfile.TemporaryDirectory() as temporary:

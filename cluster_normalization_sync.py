@@ -15,6 +15,11 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolve_atlas_manifests,
+    selected_manifest_payload,
+)
 from cluster_card_pipeline.contract import _read_spm_root
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
@@ -521,36 +526,14 @@ def _material_id_by_exact_name(root, material_name):
 
 def _atlas_target_relation_manifest(target_spm):
     target = Path(target_spm).expanduser().absolute()
-    manifest_dir = target.parent / ".atlas_leaf_speedtree_targets"
-    if not manifest_dir.is_dir():
-        return {}
-    target_key = str(target.resolve()).casefold()
-    matches = []
-    for path in sorted(manifest_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        spm = str((payload or {}).get("spm") or "").strip()
-        if not spm:
-            continue
-        try:
-            spm_key = str(Path(spm).expanduser().resolve()).casefold()
-        except OSError:
-            spm_key = str(Path(spm).expanduser().absolute()).casefold()
-        if (
-            spm_key == target_key
-            and (payload.get("generator_connection") or {}).get(
-                "complete"
-            )
-        ):
-            matches.append(payload)
-    if len(matches) > 1:
-        raise ClusterNormalizationSyncError(
-            "Multiple Atlas target manifests describe the same SPM: "
-            f"{target}"
+    try:
+        resolution = resolve_atlas_manifests(
+            target,
+            require_generator_complete=True,
         )
-    return matches[0] if matches else {}
+    except AtlasManifestResolutionError as exc:
+        raise ClusterNormalizationSyncError(str(exc)) from exc
+    return selected_manifest_payload(resolution)
 
 
 def _source_binding_repairs(target_spm, material_record):
