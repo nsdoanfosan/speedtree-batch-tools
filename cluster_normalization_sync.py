@@ -20,6 +20,10 @@ from atlas_manifest_resolver import (
     resolve_atlas_manifests,
     selected_manifest_payload,
 )
+from cluster_atlas_source_index import (
+    inspect_persisted_source_index,
+    normalized_path_key,
+)
 from cluster_card_pipeline.contract import _read_spm_root
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
@@ -314,6 +318,41 @@ def normalization_receipt_path(blend):
         / "reports"
         / f"{blend.stem}_cluster_normalization_sync_receipt.json"
     )
+
+
+def inspect_normalization_source_identity(blend):
+    """Validate the Blender-authored Atlas source index without opening Blender."""
+    blend = Path(blend).expanduser().absolute()
+    receipt_path = normalization_receipt_path(blend)
+    receipt = _read_json(receipt_path)
+    if not receipt:
+        inspected = inspect_persisted_source_index(blend, None)
+        return {**inspected, "receipt": str(receipt_path)}
+    identity = receipt.get("source_blender_index")
+    if identity is None:
+        # Fail closed on the superseded self-projected receipt field.  It is
+        # diagnostic history only and cannot authorize an already-ON no-op.
+        identity = receipt.get("source_blend_content_identity")
+    inspected = inspect_persisted_source_index(blend, identity)
+    reasons = list(inspected.get("refresh_reasons") or ())
+    if (
+        receipt.get("kind") != "speedtree_cluster_sync_normalization"
+        or receipt.get("status") != "ready"
+    ):
+        reasons.append("blender_source_identity_invalid")
+    receipt_blend = str(receipt.get("blend") or "")
+    if not receipt_blend:
+        reasons.append("blender_source_path_identity_missing")
+    elif normalized_path_key(receipt_blend) != normalized_path_key(blend):
+        reasons.append("blender_source_path_changed")
+    reasons = sorted(set(reasons))
+    return {
+        **inspected,
+        "status": "current" if not reasons else "refresh_required",
+        "current": not reasons,
+        "refresh_reasons": reasons,
+        "receipt": str(receipt_path),
+    }
 
 
 def _role_contract(blend):
@@ -1003,12 +1042,10 @@ def _receipt_is_current(recipe):
         is None
     ):
         return False
-    blend = Path(recipe["blend"])
-    if (
-        not blend.is_file()
-        or receipt.get("output_blend_sha256") != _sha256_file(blend)
-    ):
-        return False
+    # The Normalizer dependency is the canonical Cluster SPM/XML/capture
+    # contract below, not every subsequent edit to the Atlas plan collection
+    # saved in the same blend.  Atlas source freshness is validated separately
+    # by ``inspect_normalization_source_identity`` before an already-ON no-op.
     capture_manifest = (
         Path(recipe["capture_output_dir"]).expanduser().absolute()
         / f"{recipe['capture_prefix']}_auto_capture_manifest.json"
@@ -1298,6 +1335,7 @@ def resolve_normalization_recipe(
 __all__ = [
     "ClusterNormalizationSyncError",
     "ClusterSourceBuildRequiredError",
+    "inspect_normalization_source_identity",
     "normalization_receipt_path",
     "resolve_normalization_recipe",
     "validate_isolated_bark_recipe_bundle",
