@@ -285,18 +285,31 @@ class ContentAddressedJsonCache:
         return payload
 
     def get(self, namespace, identity_sha256):
+        return self.get_many(((namespace, identity_sha256),)).get(
+            str(namespace)
+        )
+
+    def get_many(self, rows):
+        """Read and validate several namespaces from one cache snapshot."""
+        requested = [
+            (str(namespace), str(identity_sha256))
+            for namespace, identity_sha256 in rows
+        ]
         with _CACHE_LOCK:
             payload = self._load()
-            row = payload["entries"].get(str(namespace))
-            if (
-                not isinstance(row, dict)
-                or row.get("identity_sha256") != str(identity_sha256)
-                or "value" not in row
-                or row.get("value_sha256")
-                != canonical_json_sha256(row.get("value"))
-            ):
-                return None
-            return row["value"]
+            result = {}
+            for namespace, identity_sha256 in requested:
+                row = payload["entries"].get(namespace)
+                if (
+                    not isinstance(row, dict)
+                    or row.get("identity_sha256") != identity_sha256
+                    or "value" not in row
+                    or row.get("value_sha256")
+                    != canonical_json_sha256(row.get("value"))
+                ):
+                    continue
+                result[namespace] = row["value"]
+            return result
 
     def put(self, namespace, identity_sha256, value):
         self.put_many([(namespace, identity_sha256, value)])
