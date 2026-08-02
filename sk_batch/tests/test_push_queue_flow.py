@@ -1,4 +1,6 @@
 import ast
+import copy
+import hashlib
 import queue
 import json
 import sys
@@ -217,7 +219,12 @@ class PushQueueFlowTests(unittest.TestCase):
     ):
         target = Path(target).resolve()
         dependencies = []
-        for index, (role, provider, mesh_ids) in enumerate(providers):
+        for index, (
+            role,
+            provider,
+            authoring_mesh_ids,
+            required_live_mesh_ids,
+        ) in enumerate(providers):
             errors = [
                 "generator_export_evidence_stale_node_table",
                 "normalized_and_live_target_mesh_sets_differ",
@@ -226,13 +233,48 @@ class PushQueueFlowTests(unittest.TestCase):
             if index == 1 and second_independent_error:
                 errors.append("declared_generator_binding_missing")
                 reason = "generator_connection_contract_incomplete"
+            intent_sha256 = f"{index + 1:064x}"
+            recovery_target_scope = {
+                "contract": "speedtree_stale_node_recovery_target_scope",
+                "schema_version": 1,
+                "policy": "explicit_sealed_scopes_v1",
+                "delivery_scope_intent_sha256": intent_sha256,
+                "authoring_mesh_ids": list(authoring_mesh_ids),
+                "required_live_mesh_ids": list(required_live_mesh_ids),
+            }
+            recovery_target_scope["scope_sha256"] = hashlib.sha256(
+                json.dumps(
+                    recovery_target_scope,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
             target_deliveries = [] if index == 1 and omit_second else [{
                 "spm": str(target),
                 "delivery_decision": "blocked",
                 "delivery_reason": reason,
                 "generator_variant_policy": "ensure_all_material_cutouts",
-                "normalized_target_mesh_ids": list(mesh_ids),
-                "stale_node_table_target_mesh_ids": list(mesh_ids),
+                "delivery_scope_mode": "explicit_sealed_v1",
+                "delivery_scope_intent_sha256": intent_sha256,
+                "recovery_target_scope": recovery_target_scope,
+                "delivery_scope_required_live_slot_count": len(
+                    required_live_mesh_ids
+                ),
+                "delivery_scope_continuity_only_slot_count": (
+                    len(authoring_mesh_ids) - len(required_live_mesh_ids)
+                ),
+                "normalized_target_mesh_ids": list(authoring_mesh_ids),
+                "declared_target_mesh_ids": list(authoring_mesh_ids),
+                "current_required_target_mesh_ids": list(
+                    required_live_mesh_ids
+                ),
+                "declared_binding_count": len(authoring_mesh_ids),
+                "active_required_binding_count": len(required_live_mesh_ids),
+                "planned_inactive_binding_count": 0,
+                "stale_node_table_target_mesh_ids": list(
+                    required_live_mesh_ids
+                ),
                 "live_node_table": {
                     "stale": True,
                     "orphan_generator_guids": ["sanitized-orphan-001"],
@@ -268,11 +310,13 @@ class PushQueueFlowTests(unittest.TestCase):
                 "branch",
                 Path("black_locast/cluster/SK_branch_black_locast_01.spm"),
                 [88],
+                [88],
             ),
             (
                 "cluster",
                 Path("black_locast/cluster/SK_cluster_black_locast_01.spm"),
                 [89, 90, 91, 92],
+                [89],
             ),
         )
         contract = self.recoverable_multi_role_contract(target, providers)
@@ -284,10 +328,17 @@ class PushQueueFlowTests(unittest.TestCase):
         )
 
         self.assertTrue(scope["available"])
-        self.assertEqual(scope["expected_mesh_ids"], [88, 89, 90, 91, 92])
+        self.assertEqual(scope["schema_version"], 2)
+        self.assertEqual(scope["authoring_mesh_ids"], [88, 89, 90, 91, 92])
+        self.assertEqual(scope["required_live_mesh_ids"], [88, 89])
+        self.assertNotIn("expected_mesh_ids", scope)
         self.assertEqual(
-            [row["normalized_target_mesh_ids"] for row in scope["provider_slices"]],
+            [row["authoring_mesh_ids"] for row in scope["provider_slices"]],
             [[88], [89, 90, 91, 92]],
+        )
+        self.assertEqual(
+            [row["required_live_mesh_ids"] for row in scope["provider_slices"]],
+            [[88], [89]],
         )
         self.assertRegex(scope["scope_sha256"], r"^[0-9a-f]{64}$")
 
@@ -295,8 +346,13 @@ class PushQueueFlowTests(unittest.TestCase):
         gui = load_gui_module()
         target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
         providers = (
-            ("branch", Path("provider_branch.spm"), [88]),
-            ("cluster", Path("provider_cluster.spm"), [89, 90, 91, 92]),
+            ("branch", Path("provider_branch.spm"), [88], [88]),
+            (
+                "cluster",
+                Path("provider_cluster.spm"),
+                [89, 90, 91, 92],
+                [89],
+            ),
         )
         partial = gui.cluster_stale_node_table_recovery_scope(
             self.recoverable_multi_role_contract(
@@ -327,6 +383,79 @@ class PushQueueFlowTests(unittest.TestCase):
             mixed["reason_token"],
             "target_delivery_not_stale_only",
         )
+
+    def test_modeler_recovery_scope_rejects_legacy_and_observed_scope_misuse(self):
+        gui = load_gui_module()
+        target = (Path("densiflora") / "SK_tree_densiflora_02.spm").resolve()
+        providers = ((
+            "cluster",
+            Path("provider_cluster.spm"),
+            [14, 15, 16, 17],
+            [14],
+        ),)
+        authoritative = self.recoverable_multi_role_contract(
+            target,
+            providers,
+        )
+
+        legacy = copy.deepcopy(authoritative)
+        legacy_delivery = legacy["dependencies"][0]["normalized_variants"][
+            "target_deliveries"
+        ][0]
+        legacy_delivery["delivery_scope_mode"] = "legacy_strict"
+        legacy_delivery["current_required_target_mesh_ids"] = [
+            14,
+            15,
+            16,
+            17,
+        ]
+
+        observed_only = copy.deepcopy(authoritative)
+        observed_delivery = observed_only["dependencies"][0][
+            "normalized_variants"
+        ]["target_deliveries"][0]
+        observed_delivery.pop("recovery_target_scope")
+        observed_delivery.pop("current_required_target_mesh_ids")
+        observed_delivery["live_export_participating_target_mesh_ids"] = [14]
+        observed_delivery["live_generator_bindings"] = [{
+            "mesh_id": 14,
+            "visible": True,
+            "generated_node_count": 1419,
+        }]
+
+        mixed = copy.deepcopy(authoritative)
+        mixed_delivery = mixed["dependencies"][0]["normalized_variants"][
+            "target_deliveries"
+        ][0]
+        mixed_scope = mixed_delivery["recovery_target_scope"]
+        mixed_scope["required_live_mesh_ids"] = [999]
+        mixed_scope["scope_sha256"] = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in mixed_scope.items()
+                    if key != "scope_sha256"
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        cases = (
+            (legacy, "target_delivery_scope_not_explicit"),
+            (observed_only, "authoritative_recovery_target_scope_missing"),
+            (mixed, "required_live_scope_not_authoring_subset"),
+        )
+        for contract, reason_token in cases:
+            with self.subTest(reason_token=reason_token):
+                scope = gui.cluster_stale_node_table_recovery_scope(
+                    contract,
+                    target,
+                    Path("live_audit.json"),
+                )
+                self.assertFalse(scope["available"])
+                self.assertEqual(scope["reason_token"], reason_token)
 
     def test_nonblocking_stale_node_table_never_starts_recovery(self):
         gui = load_gui_module()
@@ -420,11 +549,12 @@ class PushQueueFlowTests(unittest.TestCase):
         target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
         provider = Path("black_locast/cluster/SK_branch_black_locast_01.spm").resolve()
         providers = (
-            ("branch", provider, [88]),
+            ("branch", provider, [88], [88]),
             (
                 "cluster",
                 Path("black_locast/cluster/SK_cluster_black_locast_01.spm"),
                 [89, 90, 91, 92],
+                [89],
             ),
         )
         scope = gui.cluster_stale_node_table_recovery_scope(
@@ -496,7 +626,16 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(runnable, [target])
         self.assertEqual(len(contracts), 1)
         self.assertEqual(observe.call_count, 2)
-        self.assertEqual(captured["args"][2], [88, 89, 90, 91, 92])
+        self.assertEqual(captured["args"], (target, "SpeedTree_Modeler.exe"))
+        self.assertEqual(
+            captured["kwargs"]["authoring_mesh_ids"],
+            [88, 89, 90, 91, 92],
+        )
+        self.assertEqual(
+            captured["kwargs"]["required_live_mesh_ids"],
+            [88, 89],
+        )
+        self.assertNotIn("expected_mesh_ids", captured["kwargs"])
         self.assertEqual(
             captured["kwargs"]["expected_preimage_raw_sha256"],
             "a" * 64,
@@ -511,10 +650,20 @@ class PushQueueFlowTests(unittest.TestCase):
         session_factory.assert_called_once_with("SpeedTree_Modeler.exe")
         self.assertIs(captured["kwargs"]["modeler_session"], semantic_session)
         self.assertIs(app._stale_node_table_modeler_session, semantic_session)
-        queued_kinds = []
+        queued_payloads = []
         while not app.ui_queue.empty():
-            queued_kinds.append(app.ui_queue.get_nowait()[0])
-        self.assertIn("modeler_recovery", queued_kinds)
+            queued_payloads.append(app.ui_queue.get_nowait())
+        modeler_payload = next(
+            payload
+            for kind, payload in queued_payloads
+            if kind == "modeler_recovery"
+        )
+        self.assertEqual(
+            modeler_payload["authoring_mesh_ids"],
+            [88, 89, 90, 91, 92],
+        )
+        self.assertEqual(modeler_payload["required_live_mesh_ids"], [88, 89])
+        self.assertNotIn("expected_mesh_ids", modeler_payload)
         app._record_pipeline_planned_exclusion.assert_not_called()
 
     def test_issue16_stale_node_target_is_excluded_with_operator_evidence(self):

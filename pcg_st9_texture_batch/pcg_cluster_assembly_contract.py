@@ -39,6 +39,7 @@ from atlas_manifest_resolver import (
 from artifact_content_key import sampled_file_content_snapshot
 from generator_delivery_scope import (
     GeneratorDeliveryScopeError,
+    canonical_sha256,
     canonical_slot_identity,
     validate_resolved_delivery_scope,
 )
@@ -2288,6 +2289,9 @@ def _normalized_generator_delivery(
         "delivery_scope_intent_sha256": None,
         "delivery_scope_required_live_slot_count": len(bindings),
         "delivery_scope_continuity_only_slot_count": 0,
+        # Populated only from a fully validated explicit delivery intent.
+        # Recovery callers must not reconstruct intent from live observations.
+        "recovery_target_scope": None,
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
@@ -2482,6 +2486,28 @@ def _normalized_generator_delivery(
         evidence["delivery_scope_continuity_only_slot_count"] = len(
             scope_contract["continuity_only_slot_identities"]
         )
+        required_slot_identities = scope_contract[
+            "required_live_slot_identities"
+        ]
+        recovery_target_scope = {
+            "contract": "speedtree_stale_node_recovery_target_scope",
+            "schema_version": 1,
+            "policy": "explicit_sealed_scopes_v1",
+            "delivery_scope_intent_sha256": scope_contract["intent_sha256"],
+            "authoring_mesh_ids": sorted({
+                row["target_mesh_id"]
+                for row in scope_contract["authored_slots"]
+            }),
+            "required_live_mesh_ids": sorted({
+                row["target_mesh_id"]
+                for row in scope_contract["authored_slots"]
+                if tuple(row["slot_identity"]) in required_slot_identities
+            }),
+        }
+        recovery_target_scope["scope_sha256"] = canonical_sha256(
+            recovery_target_scope
+        )
+        evidence["recovery_target_scope"] = recovery_target_scope
 
     def export_participates(row):
         return bool(
