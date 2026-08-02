@@ -22,6 +22,10 @@ MANUAL_HANDOFF_CALLS = {
         "external_handoff_popen",
     ),
     (
+        "pcg_st9_texture_batch/speedtree_modeler_uia.py",
+        "external_handoff_popen",
+    ),
+    (
         "spm_generator_sync/spm_generator_sync_gui.pyw",
         "external_handoff_startfile",
     ),

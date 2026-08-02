@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "source_issue": 58,
+  "description": "Sanitized shrub target with a current preserve-existing receipt and a superseded four-leaf-slot scope declaration.",
+  "asset_folder": "shrub_Silky_sample",
+  "target_spm": "SK_shrub_Silky_sample_01.spm",
+  "current_per_target": {
+    "atlas_manifest_schema_version": 1,
+    "spm": "{target}",
+    "blend_file": "{root}\\atlas\\M_leaf_silky_sample.blend",
+    "source_collection": "M_leaf_silky_sample",
+    "export_scope_id": "scope-current-leaf",
+    "generator_variant_policy": "preserve_existing_slots",
+    "material_groups": [
+      {
+        "material": "M_leaf_silky_sample_green",
+        "material_id": 10,
+        "mesh_ids": [62, 63]
+      },
+      {
+        "material": "M_leaf_silky_sample_stem",
+        "material_id": 11,
+        "mesh_ids": [64]
+      }
+    ],
+    "generator_connection": {
+      "requested": false,
+      "complete": false,
+      "generator_variant_policy": "preserve_existing_slots",
+      "bindings": []
+    }
+  },
+  "stale_target_scope": {
+    "atlas_manifest_schema_version": 1,
+    "spm": "{target}",
+    "blend_file": "{root}\\cluster\\SK_cluster_silky_sample.blend",
+    "source_collection": "Atlas_Branch_Plans",
+    "export_scope_id": "scope-stale-cluster",
+    "generator_variant_policy": "ensure_all_material_cutouts",
+    "material_groups": [
+      {
+        "material": "M_cluster_silky_sample_01",
+        "material_id": 1,
+        "mesh_ids": [106, 107, 108, 109]
+      }
+    ],
+    "generator_connection": {
+      "requested": true,
+      "complete": true,
+      "generator_variant_policy": "ensure_all_material_cutouts",
+      "bindings": [
+        {
+          "generator_guid": "stale-leaf-guid",
+          "generator_name": "Leaf 4",
+          "slot_prefix": "Leaves:Type:0",
+          "target_material_id": 1,
+          "target_mesh_id": 106
+        },
+        {
+          "generator_guid": "stale-leaf-guid",
+          "generator_name": "Leaf 4",
+          "slot_prefix": "Leaves:Type:1",
+          "target_material_id": 1,
+          "target_mesh_id": 107
+        },
+        {
+          "generator_guid": "stale-leaf-guid",
+          "generator_name": "Leaf 4",
+          "slot_prefix": "Leaves:Type:2",
+          "target_material_id": 1,
+          "target_mesh_id": 108
+        },
+        {
+          "generator_guid": "stale-leaf-guid",
+          "generator_name": "Leaf 4",
+          "slot_prefix": "Leaves:Type:3",
+          "target_material_id": 1,
+          "target_mesh_id": 109
+        }
+      ]
+    }
+  },
+  "live_generator_topology": [
+    {
+      "generator_name": "Frond 2",
+      "slot_prefix": "Material:Frond:0",
+      "material_id": 1,
+      "mesh_id": 107,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_name": "Leaf 4",
+      "slot_prefix": "Leaves:Type:0",
+      "material_id": 1,
+      "mesh_id": 106,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_name": "Leaf 4",
+      "slot_prefix": "Leaves:Type:1",
+      "material_id": 1,
+      "mesh_id": 108,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_name": "Leaf 4",
+      "slot_prefix": "Leaves:Type:2",
+      "material_id": 1,
+      "mesh_id": 109,
+      "visible": true,
+      "export_participates": true
+    }
+  ]
+}

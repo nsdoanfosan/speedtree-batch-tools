@@ -1164,7 +1164,7 @@ def cluster_stale_node_table_recovery_scope(
         return {
             "schema_version": 1,
             "available": False,
-            "mode": "interactive_modeler_save_watch",
+            "mode": "owned_semantic_uia_modeler_save_watch",
             "scope_policy": "complete_target_wide_legacy_strict_v1",
             "reason_token": str(reason_token),
             "target_spm": str(target),
@@ -1293,6 +1293,13 @@ def cluster_stale_node_table_recovery_scope(
                     provider_role=str(dependency.get("role") or ""),
                 )
             canonical_stale_ids = sorted(set(stale_ids))
+            live_node_table = delivery.get("live_node_table")
+            orphan_owner_count = len(
+                (live_node_table or {}).get("orphan_generator_guids") or ()
+            ) if isinstance(live_node_table, dict) else 0
+            orphan_node_count = int(
+                (live_node_table or {}).get("orphan_node_count") or 0
+            ) if isinstance(live_node_table, dict) else 0
             if (
                 list(stale_ids) != canonical_stale_ids
                 or any(
@@ -1307,6 +1314,8 @@ def cluster_stale_node_table_recovery_scope(
                 or not errors.issubset(stale_consequences)
                 or not isinstance(delivery.get("live_node_table"), dict)
                 or delivery["live_node_table"].get("stale") is not True
+                or orphan_owner_count <= 0
+                or orphan_node_count <= 0
             ):
                 return unavailable(
                     "target_delivery_not_stale_only",
@@ -1329,6 +1338,12 @@ def cluster_stale_node_table_recovery_scope(
             "provider_spm": str(dependency.get("spm") or ""),
             "normalized_target_mesh_ids": mesh_ids,
             "delivery_decision": decision,
+            "orphan_generator_guid_count": (
+                orphan_owner_count if decision == "blocked" else 0
+            ),
+            "orphan_node_count": (
+                orphan_node_count if decision == "blocked" else 0
+            ),
         })
 
     if required_dependency_count == 0 or not expected_mesh_ids:
@@ -1339,7 +1354,7 @@ def cluster_stale_node_table_recovery_scope(
     sealed = {
         "schema_version": 1,
         "available": True,
-        "mode": "interactive_modeler_save_watch",
+        "mode": "owned_semantic_uia_modeler_save_watch",
         "scope_policy": "complete_target_wide_legacy_strict_v1",
         "target_spm": str(target),
         "target_preimage_raw_sha256": target_sha256,
@@ -1389,9 +1404,9 @@ def target_planned_exclusion_summary(target_spm, reason_token, evidence):
         recovery = evidence.get("stale_node_table_recovery")
         if isinstance(recovery, dict) and recovery.get("available") is True:
             parts.append(
-                "action=Batch Tools will request this exact SPM in Modeler; "
-                "verify the displayed path and choose File > Save; Save As "
-                "or incremental Save is not accepted; re-audit/resume is automatic"
+                "action=Batch Tools may invoke exact semantic File > Save only "
+                "for the sealed stale+orphan target in its owned Modeler PID; "
+                "Save As/coordinates/keys are forbidden; re-audit/resume is automatic"
             )
         else:
             reason = (
@@ -2024,6 +2039,7 @@ class App:
         self._app_open = True
         self._recovery_commit_lock = threading.RLock()
         self._recovery_resume_commit = None
+        self._stale_node_table_modeler_session = None
         self.active_procs = set()          # all running child procs (serial or parallel)
         self.procs_lock = threading.Lock()
         self.state_lock = threading.RLock()  # guards self.state writes across worker threads
@@ -2248,13 +2264,14 @@ class App:
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
         self.btn_retry_failed = ttk.Button(
             actions,
-            text="↻ 실패 Blender/Unreal 재시도",
+            text="↻ 전체 실패 이력 재시도",
             command=self.start_failed_results_retry,
         )
         self.btn_retry_failed.pack(side="left", padx=(2, 6))
         Tooltip(
             self.btn_retry_failed,
-            "체크된 최근 실패를 원인별로 나눠 재시도합니다.\n"
+            "체크 상태와 무관하게 현재 목록 전체의 실패/stale 이력을 "
+            "원인별로 나눠 재시도합니다.\n"
             "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
             "③ Unreal Push까지 실행\n"
             "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
@@ -2482,23 +2499,8 @@ class App:
                 elif kind == "modeler_recovery":
                     target = Path(payload["target_spm"])
                     self.progress_var.set(
-                        "SpeedTree Modeler manual Save waiting — "
+                        "SpeedTree Modeler semantic Save in progress — "
                         + target.name
-                    )
-                    messagebox.showinfo(
-                        "SpeedTree Modeler Save required",
-                        (
-                            "Batch Tools asked SpeedTree Modeler to open:\n\n"
-                            f"{target}\n\n"
-                            "Verify that this exact SPM is displayed. Do not "
-                            "make unrelated edits. Choose File > Save yourself. "
-                            "Do not use Save As or incremental Save.\n\n"
-                            "Batch Tools does not automate keyboard input or "
-                            "close Modeler. It is watching the exact file and "
-                            "will re-audit it before resuming this job once. "
-                            "Stop cancels the watcher but leaves Modeler open."
-                        ),
-                        parent=self.root,
                     )
         except queue.Empty:
             pass
@@ -3591,6 +3593,8 @@ class App:
             self._recovery_commit_lock = threading.RLock()
         if not hasattr(self, "_recovery_resume_commit"):
             self._recovery_resume_commit = None
+        if not hasattr(self, "_stale_node_table_modeler_session"):
+            self._stale_node_table_modeler_session = None
 
     def _snapshot_batch_request(self, target_iids):
         inventory = {
@@ -4169,26 +4173,27 @@ class App:
         return current_record
 
     def start_failed_results_retry(self):
-        """Classify and partition failed/stale Blender and Unreal retries."""
+        """Classify failed/stale retries across the complete inventory."""
         self._close_cell_editor()
-        selected_iids = [
-            iid for iid, item in self.items.items() if item["checked"]
-        ]
-        if not selected_iids:
-            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+        candidate_iids = list(self.items)
+        if not candidate_iids:
+            messagebox.showinfo(
+                "전체 실패 이력 재시도",
+                "현재 목록 전체에 재시도할 대상이 없습니다.",
+            )
             return
 
         repair_states = {
             iid: self._failed_retry_repair_state(iid)
-            for iid in selected_iids
+            for iid in candidate_iids
         }
         parent_statuses = {
-            iid: UNREAL_PARENT_ABSENT for iid in selected_iids
+            iid: UNREAL_PARENT_ABSENT for iid in candidate_iids
         }
-        parent_diagnostics = {iid: "" for iid in selected_iids}
+        parent_diagnostics = {iid: "" for iid in candidate_iids}
         grouped = {}
 
-        for iid in selected_iids:
+        for iid in candidate_iids:
             entry = self.state.get(iid, {})
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
@@ -4262,7 +4267,7 @@ class App:
                 unreal_parent_diagnostic=parent_diagnostics[iid],
             )
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        decisions = {iid: classify(iid) for iid in candidate_iids}
         rebuild_ids = {
             iid
             for iid, decision in decisions.items()
@@ -4370,19 +4375,19 @@ class App:
             rebuild_ids.update(conflicting["selected_queue_ids"])
             recovery_requests.remove(conflicting)
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        decisions = {iid: classify(iid) for iid in candidate_iids}
         export_iids = [
             iid
-            for iid in selected_iids
+            for iid in candidate_iids
             if decisions[iid].classification == BLENDER_REBUILD
         ]
         unreal_iids = [
             iid
-            for iid in selected_iids
+            for iid in candidate_iids
             if decisions[iid].classification == UNREAL_ONLY
         ]
         skipped = []
-        for iid in selected_iids:
+        for iid in candidate_iids:
             decision = decisions[iid]
             if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
                 continue
@@ -4398,16 +4403,18 @@ class App:
 
         if skipped:
             self.log(
-                "실패/stale 재시도 제외:\n  - " + "\n  - ".join(skipped)
+                "전체 대상 실패/stale 재시도 제외:\n  - "
+                + "\n  - ".join(skipped)
             )
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
-            iid for iid in selected_iids if iid in eligible_set
+            iid for iid in candidate_iids if iid in eligible_set
         ]
         if not eligible_iids:
             messagebox.showinfo(
-                "실패 Blender/Unreal 재시도",
-                "재시도 가능한 선택 항목이 없습니다.\n\n"
+                "전체 실패 이력 재시도",
+                "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
+                "없습니다.\n\n"
                 + "\n".join(skipped[:8]),
             )
             return
@@ -8575,7 +8582,7 @@ class App:
         *,
         require_normalized,
     ):
-        """Run one sealed manual-Save recovery inside the active job lease."""
+        """Run one sealed semantic-Save recovery inside the active job lease."""
         scope = (
             exclusion.evidence.get("stale_node_table_recovery")
             if isinstance(exclusion.evidence, dict)
@@ -8600,8 +8607,10 @@ class App:
 
         from pcg_st9_texture_batch.stale_node_table_recovery import (
             StaleNodeTableRecoveryError,
-            launch_modeler_for_manual_save,
             recover_stale_node_table,
+        )
+        from pcg_st9_texture_batch.speedtree_modeler_uia import (
+            SpeedTreeModelerRecoverySession,
         )
 
         target = Path(scope["target_spm"]).resolve(strict=False)
@@ -8642,22 +8651,6 @@ class App:
             "is_queue_current": is_queue_current,
         }
 
-        def launch_with_instruction(executable, spm):
-            self.ui_queue.put((
-                "modeler_recovery",
-                {
-                    "target_spm": str(spm),
-                    "scope_sha256": scope["scope_sha256"],
-                    "expected_mesh_ids": list(scope["expected_mesh_ids"]),
-                },
-            ))
-            self.log(
-                "Modeler launch requested for exact recovery target: "
-                f"{spm} | verify the path, then choose File > Save; "
-                "Save As/incremental Save are not accepted"
-            )
-            return launch_modeler_for_manual_save(executable, spm)
-
         def retry_stage(continuation):
             self.ui_queue.put((
                 "progress",
@@ -8695,10 +8688,26 @@ class App:
             + ",".join(str(value) for value in scope["expected_mesh_ids"])
             + f" | scope={scope['scope_sha256']}"
         )
+        executable = self.cfg.get("speedtree_exe") or ""
+        modeler_session = self._stale_node_table_modeler_session
+        if (
+            modeler_session is None
+            or not modeler_session.is_compatible(executable)
+        ):
+            modeler_session = SpeedTreeModelerRecoverySession(executable)
+            self._stale_node_table_modeler_session = modeler_session
+        self.ui_queue.put((
+            "modeler_recovery",
+            {
+                "target_spm": str(target),
+                "scope_sha256": scope["scope_sha256"],
+                "expected_mesh_ids": list(scope["expected_mesh_ids"]),
+            },
+        ))
         try:
             result = recover_stale_node_table(
                 target,
-                self.cfg.get("speedtree_exe") or "",
+                executable,
                 scope["expected_mesh_ids"],
                 timeout=7200,
                 poll_interval=2.0,
@@ -8710,7 +8719,7 @@ class App:
                 expected_preimage_raw_sha256=scope[
                     "target_preimage_raw_sha256"
                 ],
-                launch_fn=launch_with_instruction,
+                modeler_session=modeler_session,
                 continuation_commit_lock=self._recovery_commit_lock,
                 on_continuation_claimed=mark_resume_committed,
             )
@@ -8742,7 +8751,8 @@ class App:
                 self.log(
                     "Stale Node-table recovery stopped fail-closed: "
                     f"{target.name} | reason={exc.reason_token}. "
-                    "Modeler was not closed. Start a fresh live audit before retry."
+                    "No unrelated Modeler process was touched. Start a fresh "
+                    "live audit before retry."
                 )
             return None
         except OSError as exc:
@@ -8753,7 +8763,7 @@ class App:
             self.log(
                 "Stale Node-table recovery I/O failed closed: "
                 f"{target.name} | {compact_error_message(exc)}. "
-                "Modeler was not closed."
+                "No unrelated Modeler process was touched."
             )
             return None
 
@@ -8778,7 +8788,8 @@ class App:
             return None
         self.log(
             "Stale Node-table recovery verified and original stage resumed "
-            f"once: {target.name} | after={result.get('after_raw_sha256')}"
+            f"once: {target.name} | after={result.get('after_raw_sha256')} | "
+            "semantic exact-document Close verified; owned session retained"
         )
         return live_resolution
 

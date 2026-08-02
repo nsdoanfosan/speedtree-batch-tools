@@ -1028,14 +1028,15 @@ def scan_sk_spms(root):
     return sorted(out)
 
 
-def _connected_cluster_rows(owner_folder, clusters):
-    """Return PCG's exact final-SPM-to-Cluster texture connections."""
-    from pcg_st9_texture_batch.pcg_texture_audit import cluster_connection_rows
+def _connected_cluster_rows_by_owner(owner_clusters, metrics=None):
+    """Return PCG-equivalent connections from one shared bounded inventory."""
+    from pcg_st9_texture_batch.cluster_connection_index import (
+        cluster_connection_rows_by_owner,
+    )
 
-    return cluster_connection_rows(
-        owner_folder,
-        clusters=clusters,
-        connected_only=True,
+    return cluster_connection_rows_by_owner(
+        owner_clusters,
+        metrics=metrics,
     )
 
 
@@ -1043,7 +1044,7 @@ def _path_key(value):
     return os.path.normcase(os.path.abspath(str(value))).casefold()
 
 
-def scan_cluster_spm_sources(root):
+def scan_cluster_spm_sources(root, metrics=None):
     """Connected Cluster outputs, normalized to one canonical SK row.
 
     A legacy unprefixed file remains a discoverable normalization input only
@@ -1104,16 +1105,25 @@ def scan_cluster_spm_sources(root):
             "legacy_sk_spm": pair["canonical_spm"],
         }
         by_owner.setdefault(row["owner_folder"], []).append(row)
-    for owner_folder, owner_rows in by_owner.items():
-        sources = [
+    sources_by_owner = {
+        owner_folder: [
             row["output_spm"]
             if row["output_spm"].is_file()
             else row["legacy_output_spm"]
             for row in owner_rows
         ]
+        for owner_folder, owner_rows in by_owner.items()
+    }
+    connections_by_owner = _connected_cluster_rows_by_owner(
+        sources_by_owner,
+        metrics=metrics,
+    )
+    for owner_folder, owner_rows in by_owner.items():
         connection_by_source = {
             _path_key(row.get("source_spm") or row.get("authoring_spm")): row
-            for row in _connected_cluster_rows(owner_folder, sources)
+            for row in connections_by_owner.get(
+                Path(owner_folder).absolute(), ()
+            )
         }
         for row in owner_rows:
             connection = connection_by_source.get(
