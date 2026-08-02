@@ -49,13 +49,29 @@ class WaitAlreadyActive(RuntimeErrorBase):
 def _brief(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if job is None:
         return None
-    return {
+    brief = {
         "id": job["id"],
         "sequence": job["sequence"],
         "app_id": job["app_id"],
         "label": job.get("label"),
         "status": job["status"],
     }
+    lease = job.get("lease")
+    if isinstance(lease, dict):
+        brief["lease"] = {
+            key: lease.get(key)
+            for key in (
+                "owner_id",
+                "hostname",
+                "pid",
+                "process_marker",
+                "claimed_at",
+                "heartbeat_at",
+                "expires_at",
+            )
+            if lease.get(key) is not None
+        }
+    return brief
 
 
 class SharedQueueLease:

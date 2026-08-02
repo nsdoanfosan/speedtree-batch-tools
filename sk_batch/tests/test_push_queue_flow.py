@@ -3779,6 +3779,182 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertTrue(pending[0]["verify_existing_assets"])
         self.assertFalse(pending[1]["verify_existing_assets"])
 
+    def test_retry_liveness_panel_renders_required_operator_fields(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            "current_target_id": "C:/sanitized/SK_tree.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/already_done.spm",
+                    "target_name": "already_done.spm",
+                    "stage": "complete",
+                    "terminal_at": 9.0,
+                },
+                {
+                    "target_id": "C:/sanitized/SK_tree.spm",
+                    "target_name": "SK_tree.spm",
+                    "partition": "blender_export",
+                    "partition_ordinal": 2,
+                    "partition_total": 3,
+                    "stage": "send2ue",
+                    "terminal_at": None,
+                    "elapsed_seconds": 125,
+                    "last_progress_age_seconds": 8,
+                    "last_output_age_seconds": 32,
+                    "last_heartbeat_age_seconds": 1,
+                    "latest_diagnostic": "bounded sanitized diagnostic",
+                },
+            ],
+        })
+        target_text = app.retry_target_var.set.call_args.args[0]
+        live_text = app.retry_liveness_var.set.call_args.args[0]
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        diagnostic_text = app.retry_diagnostic_var.set.call_args.args[0]
+        self.assertIn("current target: SK_tree.spm", target_text)
+        self.assertIn("1/2 finished", target_text)
+        self.assertIn("partition=blender_export 2/3", target_text)
+        self.assertIn("current target stage=send2ue", live_text)
+        self.assertIn("elapsed 2m 05s", live_text)
+        self.assertIn("progress age 8s", live_text)
+        self.assertIn("output age 32s", live_text)
+        self.assertIn("heartbeat age 1s", live_text)
+        self.assertIn("retry scope: historical failed/stale selection", outcome_text)
+        self.assertIn("current state: running", outcome_text)
+        self.assertIn("success 1", outcome_text)
+        self.assertIn("failed 0", outcome_text)
+        self.assertIn("remaining 1", outcome_text)
+        self.assertIn("terminal outcome: pending", outcome_text)
+        self.assertEqual(
+            diagnostic_text, "latest: bounded sanitized diagnostic"
+        )
+
+    def test_retry_liveness_panel_keeps_individual_failure_nonterminal(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            # The per-target/root stage may say failed while another target
+            # runs; only terminal_at/run_state is a batch outcome.
+            "stage": "failed",
+            "terminal_at": None,
+            "current_target_id": "C:/sanitized/active.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/complete.spm",
+                    "target_name": "complete.spm",
+                    "stage": "complete",
+                    "terminal_at": 1.0,
+                },
+                {
+                    "target_id": "C:/sanitized/failed.spm",
+                    "target_name": "failed.spm",
+                    "stage": "failed",
+                    "terminal_at": 2.0,
+                },
+                {
+                    "target_id": "C:/sanitized/active.spm",
+                    "target_name": "active.spm",
+                    "stage": "blender",
+                    "terminal_at": None,
+                    "elapsed_seconds": 3,
+                    "last_progress_age_seconds": 1,
+                    "last_output_age_seconds": None,
+                    "last_heartbeat_age_seconds": 1,
+                },
+            ],
+        })
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        self.assertIn("current state: running", outcome_text)
+        self.assertIn("success 1", outcome_text)
+        self.assertIn("failed 1", outcome_text)
+        self.assertIn("remaining 1", outcome_text)
+        self.assertIn("terminal outcome: pending", outcome_text)
+        self.assertIn("current run continues after individual failures", outcome_text)
+
+    def test_retry_liveness_panel_shows_terminal_outcome_only_after_terminal(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            "run_state": "terminal",
+            "stage": "failed",
+            "terminal_at": 9.0,
+            "terminal_outcome": "failed",
+            "terminal_reason": "all_retry_targets_failed",
+            "current_target_id": "C:/sanitized/failed.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/failed.spm",
+                    "target_name": "failed.spm",
+                    "stage": "failed",
+                    "terminal_at": 9.0,
+                    "elapsed_seconds": 9,
+                    "last_progress_age_seconds": 1,
+                    "last_output_age_seconds": 1,
+                    "last_heartbeat_age_seconds": 1,
+                },
+            ],
+        })
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        self.assertIn("current state: terminal", outcome_text)
+        self.assertIn("terminal outcome: failed", outcome_text)
+        self.assertIn("all_retry_targets_failed", outcome_text)
+
+    def test_push_receipt_completion_follows_durable_target_state(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        sequence = []
+
+        def save_then_record(_state):
+            sequence.append("state_saved")
+
+        def record_retry(*args, **kwargs):
+            sequence.append(("receipt", args[1]))
+            return True
+
+        app._retry_transition = mock.Mock(side_effect=record_retry)
+        with mock.patch.object(gui, "save_state", side_effect=save_then_record):
+            app._set_push_state(
+                "C:/sanitized/tree.spm",
+                "imported_ok",
+                "Unreal imported",
+            )
+
+        self.assertEqual(
+            sequence,
+            [
+                "state_saved",
+                ("receipt", gui.RETRY_STAGE_POST_CHECK),
+                ("receipt", gui.RETRY_STAGE_COMPLETE),
+            ],
+        )
+
+    def test_push_state_persist_failure_cannot_seal_retry_receipt(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        with mock.patch.object(
+            gui, "save_state", side_effect=OSError("state disk unavailable")
+        ):
+            with self.assertRaises(OSError):
+                app._set_push_state(
+                    "C:/sanitized/tree.spm",
+                    "imported_ok",
+                    "Unreal imported",
+                )
+        app._retry_transition.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
