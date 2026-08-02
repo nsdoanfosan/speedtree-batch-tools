@@ -233,7 +233,11 @@ class PushQueueFlowTests(unittest.TestCase):
                 "generator_variant_policy": "ensure_all_material_cutouts",
                 "normalized_target_mesh_ids": list(mesh_ids),
                 "stale_node_table_target_mesh_ids": list(mesh_ids),
-                "live_node_table": {"stale": True},
+                "live_node_table": {
+                    "stale": True,
+                    "orphan_generator_guids": ["sanitized-orphan-001"],
+                    "orphan_node_count": 1,
+                },
                 "errors": errors,
             }]
             dependencies.append({
@@ -407,9 +411,10 @@ class PushQueueFlowTests(unittest.TestCase):
             "\n".join(str(call.args[0]) for call in app.log.call_args_list),
         )
 
-    def test_relation_plan_launches_manual_recovery_and_resumes_stage_once(self):
+    def test_relation_plan_uses_owned_semantic_session_and_resumes_stage_once(self):
         gui = load_gui_module()
         from pcg_st9_texture_batch import stale_node_table_recovery as recovery
+        from pcg_st9_texture_batch import speedtree_modeler_uia as semantic_uia
 
         app = self.make_app(gui)
         target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
@@ -458,7 +463,6 @@ class PushQueueFlowTests(unittest.TestCase):
         def fake_recover(*args, **kwargs):
             captured["args"] = args
             captured["kwargs"] = kwargs
-            kwargs["launch_fn"](args[1], args[0])
             kwargs["on_continuation_claimed"]({
                 "verified_after_raw_sha256": "b" * 64,
             })
@@ -468,6 +472,8 @@ class PushQueueFlowTests(unittest.TestCase):
                 "retry_result": kwargs["retry"]({"verified": True}),
             }
 
+        semantic_session = mock.Mock()
+        semantic_session.is_compatible.return_value = True
         with mock.patch.object(
             app,
             "_cluster_normalization_stage_observation",
@@ -477,10 +483,10 @@ class PushQueueFlowTests(unittest.TestCase):
             "recover_stale_node_table",
             side_effect=fake_recover,
         ), mock.patch.object(
-            recovery,
-            "launch_modeler_for_manual_save",
-            return_value=object(),
-        ) as launch:
+            semantic_uia,
+            "SpeedTreeModelerRecoverySession",
+            return_value=semantic_session,
+        ) as session_factory:
             runnable, contracts = app._cluster_relation_input_plan(
                 [target],
                 "captured",
@@ -502,10 +508,9 @@ class PushQueueFlowTests(unittest.TestCase):
             app._recovery_resume_commit["verified_after_raw_sha256"],
             "b" * 64,
         )
-        launch.assert_called_once_with(
-            "SpeedTree_Modeler.exe",
-            target,
-        )
+        session_factory.assert_called_once_with("SpeedTree_Modeler.exe")
+        self.assertIs(captured["kwargs"]["modeler_session"], semantic_session)
+        self.assertIs(app._stale_node_table_modeler_session, semantic_session)
         queued_kinds = []
         while not app.ui_queue.empty():
             queued_kinds.append(app.ui_queue.get_nowait()[0])
