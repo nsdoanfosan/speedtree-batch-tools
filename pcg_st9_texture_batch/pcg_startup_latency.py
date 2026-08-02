@@ -39,6 +39,107 @@ PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS = {
     "warm_usable_ready": 8.0,
     "cached_board_paint": 0.25,
 }
+STARTUP_TOTAL_INVOCATION_GUARD_SCHEMA_VERSION = 1
+STARTUP_TOTAL_INVOCATION_RULES = {
+    "atlas_manifest_resolution_calls": {
+        "cardinality": "audit_scope_count",
+        "per_item_limit": 1,
+    },
+    "spm_analysis_calls": {
+        "cardinality": "spm_count",
+        # The 597-SPM fixture currently uses 18,837 calls (31.55/file).
+        # Keep enough headroom for ordinary call-graph refactors while still
+        # rejecting the hundreds-per-file amplification this guard targets.
+        "per_item_limit": 48,
+    },
+    "legacy_receipt_inspection_calls": {
+        "cardinality": "spm_count",
+        "per_item_limit": 1,
+    },
+}
+
+
+class StartupAmplificationError(AssertionError):
+    """A deterministic startup total-call bound was exceeded."""
+
+
+def startup_total_invocation_guard(
+    metrics,
+    *,
+    audit_scope_count,
+    spm_count,
+):
+    """Compare expensive-operation totals with fleet-derived bounds.
+
+    Counts are intentionally total invocations, not unique-path counts.  This
+    makes per-call amplification visible even when every unique-file metric is
+    unchanged.  The limits encode the current primary-audit call graph rather
+    than elapsed time, so runner load cannot change the verdict.
+    """
+    cardinalities = {
+        "audit_scope_count": int(audit_scope_count),
+        "spm_count": int(spm_count),
+    }
+    if any(value < 0 for value in cardinalities.values()):
+        raise ValueError("startup guard cardinalities must be non-negative")
+
+    rules = {}
+    violations = []
+    for metric, rule in STARTUP_TOTAL_INVOCATION_RULES.items():
+        cardinality = rule["cardinality"]
+        actual = int((metrics or {}).get(metric, 0))
+        if actual < 0:
+            raise ValueError(
+                f"startup guard metric must be non-negative: {metric}"
+            )
+        per_item_limit = int(rule["per_item_limit"])
+        limit = cardinalities[cardinality] * per_item_limit
+        within_limit = actual <= limit
+        row = {
+            "actual": actual,
+            "limit": limit,
+            "within_limit": within_limit,
+            "cardinality": cardinality,
+            "cardinality_count": cardinalities[cardinality],
+            "per_item_limit": per_item_limit,
+        }
+        rules[metric] = row
+        if not within_limit:
+            violations.append({"metric": metric, **row})
+
+    return {
+        "schema_version": STARTUP_TOTAL_INVOCATION_GUARD_SCHEMA_VERSION,
+        "kind": "pcg_primary_total_invocation_guard",
+        "status": "ok" if not violations else "failed",
+        "audit_scope_count": cardinalities["audit_scope_count"],
+        "spm_count": cardinalities["spm_count"],
+        "rules": rules,
+        "violations": violations,
+    }
+
+
+def require_startup_total_invocation_guard(
+    metrics,
+    *,
+    audit_scope_count,
+    spm_count,
+):
+    """Raise with a stable receipt when any total-call rule is exceeded."""
+    receipt = startup_total_invocation_guard(
+        metrics,
+        audit_scope_count=audit_scope_count,
+        spm_count=spm_count,
+    )
+    if receipt["violations"]:
+        details = ", ".join(
+            f"{row['metric']}={row['actual']} > {row['limit']}"
+            for row in receipt["violations"]
+        )
+        raise StartupAmplificationError(
+            "PCG startup total-invocation amplification guard failed: "
+            + details
+        )
+    return receipt
 
 
 class StartupLatencyTracker:
@@ -168,9 +269,14 @@ class StartupLatencyTracker:
 
 __all__ = [
     "PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS",
+    "STARTUP_TOTAL_INVOCATION_GUARD_SCHEMA_VERSION",
+    "STARTUP_TOTAL_INVOCATION_RULES",
     "STARTUP_LATENCY_RECEIPT_PATH",
     "STARTUP_LATENCY_SCHEMA_VERSION",
     "STARTUP_PHASE_BUDGET_SECONDS",
     "STARTUP_PHASE_ORDER",
+    "StartupAmplificationError",
     "StartupLatencyTracker",
+    "require_startup_total_invocation_guard",
+    "startup_total_invocation_guard",
 ]

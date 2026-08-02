@@ -111,6 +111,7 @@ if __package__ in (None, ""):
         content_identity,
         path_key as startup_path_key,
     )
+    from pcg_startup_latency import startup_total_invocation_guard
 else:
     from .pcg_texture_common import (
         IMAGE_EXTS,
@@ -130,6 +131,7 @@ else:
         content_identity,
         path_key as startup_path_key,
     )
+    from .pcg_startup_latency import startup_total_invocation_guard
 
 if __package__ in (None, ""):
     from blend_source_index import (
@@ -1286,6 +1288,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     long-lived analysis cache never owns the decoded document.
     """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    _record_session_cache_metric("spm_analysis_calls", path=path)
     cache_key = _spm_analysis_cache_key(path)
     cached = _SPM_ANALYSIS_CACHE.get(cache_key)
     if cached is not None:
@@ -1825,6 +1828,7 @@ def _report_legacy_cluster_state(
     cached = cache.get(cache_key)
     if cached is not None:
         return copy.deepcopy(cached)
+    _record_session_cache_metric("legacy_receipt_inspection_calls", path=spm)
     result = inspect_legacy_cluster_state(
         spm,
         foregrounds_snapshot=foregrounds_snapshot,
@@ -2630,6 +2634,9 @@ def _atlas_manifest_resolution(spm):
     cache_key = os.path.normcase(str(target)).casefold()
     resolution = cache.get(cache_key) if cache is not None else None
     if resolution is None:
+        _record_session_cache_metric(
+            "atlas_manifest_resolution_calls", path=target
+        )
         resolution = resolve_atlas_manifests(target)
         if cache is not None:
             cache[cache_key] = resolution
@@ -7872,6 +7879,11 @@ def make_report(
         and report_cache.get("session_metrics") is not None
         else {}
     )
+    total_invocation_guard = startup_total_invocation_guard(
+        session_cache_metrics,
+        audit_scope_count=len(folders),
+        spm_count=int(provider_metrics.get("inventory_file_count", 0)),
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "config": cfg,
@@ -7887,6 +7899,7 @@ def make_report(
             "provider_metrics": provider_metrics,
             "sbs_metrics": sbs_metrics,
             "session_cache_metrics": session_cache_metrics,
+            "total_invocation_guard": total_invocation_guard,
             "phases": startup_phases,
         },
         "pcg_targets": {
