@@ -182,11 +182,17 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                     before_text + after_text,
                     r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
                 )
+                # Projecting one of these documents costs about 15 s -- they
+                # are 78-93 MB of real authored XML -- so the repeated
+                # project_v4(before_text) is worth hoisting rather than
+                # recomputing. Same three assertions, one fewer projection per
+                # pair.
+                before_core_v4 = project_v4(before_text)
                 self.assertEqual(
-                    project_v4(before_text),
+                    before_core_v4,
                     pair["expected_core_fingerprint"],
                 )
-                self.assertEqual(project_v4(before_text), project_v4(after_text))
+                self.assertEqual(before_core_v4, project_v4(after_text))
                 self.assertEqual(project(before_text), project(after_text))
 
     def test_authored_attack_matrix_changes_the_fingerprint(self):
