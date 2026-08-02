@@ -263,6 +263,29 @@ class ClusterRelationJobContractTests(unittest.TestCase):
         )
         self.assertLess(validation, bake)
 
+    def test_explicit_generator_delivery_scope_requires_producer_echo(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        mapping_source = source[
+            source.index("def apply_recipe_source_material_mappings("):
+            source.index("\ndef sync_targets(")
+        ]
+        sync_source = source[
+            source.index("def sync_targets("):
+            source.index("\ndef remove_targets(")
+        ]
+        self.assertIn(
+            'request["generator_delivery_scope_intent"]',
+            mapping_source,
+        )
+        self.assertIn(
+            "validate_resolved_delivery_scope(",
+            mapping_source,
+        )
+        self.assertIn(
+            "validate_producer_delivery_scope_results(results, bindings_by_key)",
+            sync_source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -304,6 +304,9 @@ class RecoveryTestCase(unittest.TestCase):
         expected_mesh_ids=TARGET_MESH_IDS,
         authoring_mesh_ids=None,
         required_live_mesh_ids=None,
+        expected_preimage_raw_sha256=None,
+        continuation_commit_lock=None,
+        on_continuation_claimed=None,
     ):
         clock = FakeClock()
         after_text = after_text or spm_text(stale=False, volatile="two")
@@ -332,6 +335,9 @@ class RecoveryTestCase(unittest.TestCase):
             launch_fn=launch,
             sleep_fn=clock.sleep,
             monotonic_fn=clock.monotonic,
+            expected_preimage_raw_sha256=expected_preimage_raw_sha256,
+            continuation_commit_lock=continuation_commit_lock,
+            on_continuation_claimed=on_continuation_claimed,
         )
 
 
@@ -2238,6 +2244,149 @@ class QuiescenceAndGraphGateTests(RecoveryTestCase):
 
 
 class ContinuationAndRaceTests(RecoveryTestCase):
+    def test_claim_hook_and_stop_commit_share_one_linearization_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            order = []
+
+            class ObservedLock:
+                def __init__(self):
+                    self.lock = threading.RLock()
+                    self.inside = False
+
+                def __enter__(self):
+                    self.lock.acquire()
+                    self.inside = True
+                    return self
+
+                def __exit__(self, *_args):
+                    self.inside = False
+                    self.lock.release()
+
+            commit_lock = ObservedLock()
+
+            def claimed(_payload):
+                self.assertTrue(commit_lock.inside)
+                order.append("claim")
+
+            def retry(_continuation):
+                self.assertFalse(commit_lock.inside)
+                order.append("retry")
+                return "resumed"
+
+            result = self.recover_with_save(
+                spm,
+                executable,
+                root,
+                retry=retry,
+                job_id="linearized",
+                generation=1,
+                guards=open_guards(),
+                continuation_commit_lock=commit_lock,
+                on_continuation_claimed=claimed,
+            )
+
+            self.assertEqual(order, ["claim", "retry"])
+            self.assertEqual(result["retry_result"], "resumed")
+
+    def test_cancel_during_unchanged_manual_wait_stops_before_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            clock = FakeClock()
+            state = {}
+
+            def cancel_after_first_poll(seconds):
+                clock.sleep(seconds)
+                state["cancelled"] = True
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                recover_stale_node_table(
+                    spm,
+                    executable,
+                    TARGET_MESH_IDS,
+                    timeout=7200,
+                    poll_interval=1,
+                    stable_reads=2,
+                    retry=lambda _value: self.fail(
+                        "cancelled wait must not resume"
+                    ),
+                    job_id="mid-wait-cancel",
+                    job_generation=1,
+                    guards=open_guards(state),
+                    recovery_root=root,
+                    launch_fn=lambda *_args: ExitedProcess(),
+                    sleep_fn=cancel_after_first_poll,
+                    monotonic_fn=clock.monotonic,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "initiating_job_cancelled",
+            )
+            self.assertEqual(clock.now, 1.0)
+            self.assertFalse(list(root.glob("continuation.*.claim.json")))
+
+    def test_queue_lease_loss_during_manual_wait_stops_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            clock = FakeClock()
+            state = {"queue_current": True}
+            guards = open_guards(state)
+            guards["is_queue_current"] = lambda: state["queue_current"]
+
+            def lose_lease_after_first_poll(seconds):
+                clock.sleep(seconds)
+                state["queue_current"] = False
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                recover_stale_node_table(
+                    spm,
+                    executable,
+                    TARGET_MESH_IDS,
+                    timeout=7200,
+                    poll_interval=1,
+                    stable_reads=2,
+                    retry=lambda _value: self.fail(
+                        "lost lease must not resume"
+                    ),
+                    job_id="mid-wait-lease-loss",
+                    job_generation=1,
+                    guards=guards,
+                    recovery_root=root,
+                    launch_fn=lambda *_args: ExitedProcess(),
+                    sleep_fn=lose_lease_after_first_poll,
+                    monotonic_fn=clock.monotonic,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "initiating_queue_lease_lost",
+            )
+            self.assertEqual(clock.now, 1.0)
+
+    def test_blocking_audit_sha_mismatch_prevents_modeler_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            launches = []
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    expected_preimage_raw_sha256="0" * 64,
+                    launch_observer=lambda *_args: launches.append(True),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "audit_preimage_identity_changed",
+            )
+            self.assertFalse(launches)
+
     def test_continuation_guard_source_mutation_blocks_claim_and_callback(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -2248,7 +2397,9 @@ class ContinuationAndRaceTests(RecoveryTestCase):
             def mutate_on_continuation_guard():
                 nonlocal guard_calls
                 guard_calls += 1
-                if guard_calls == 2:
+                # Prelaunch plus manual-wait polling consume four checks
+                # before the final continuation authority check.
+                if guard_calls == 5:
                     write_spm(
                         spm,
                         spm_text(stale=False, graph_property="guard-source-race"),

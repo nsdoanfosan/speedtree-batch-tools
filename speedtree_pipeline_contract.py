@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
@@ -231,8 +232,7 @@ def pipeline_contract_path():
     return None
 
 
-@lru_cache(maxsize=1)
-def shared_contract_api():
+def _load_shared_contract_api():
     """Dynamically load the central stdlib-only SpeedTree policy module."""
     contract_path = pipeline_contract_path()
     if contract_path is None:
@@ -284,6 +284,23 @@ def shared_contract_api():
             "central SpeedTree handoff API is incomplete: " + ", ".join(missing)
         )
     return module
+
+
+_SHARED_CONTRACT_API_LOCK = threading.RLock()
+
+
+@lru_cache(maxsize=1)
+def shared_contract_api():
+    """Return one fully initialized policy module across worker threads.
+
+    ``functools.lru_cache`` may execute a cold miss more than once when
+    callers arrive concurrently.  The loader publishes its module name before
+    executing the file, so an unguarded second caller could observe a matching
+    ``__file__`` and return the half-initialized module.  Serialize that one
+    cold initialization; later calls remain ordinary cached reads.
+    """
+    with _SHARED_CONTRACT_API_LOCK:
+        return _load_shared_contract_api()
 
 
 def clear_contract_caches():

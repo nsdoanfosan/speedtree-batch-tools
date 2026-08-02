@@ -10,6 +10,8 @@ import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from speedtree_export_options_contract import require_texture_skip_writing
 from speedtree_pipeline_contract import generator_guid_key
 from .contract import (
@@ -31,8 +33,10 @@ def _run_export(executable, spm, options, output, timeout):
         output.unlink()
     command = [str(executable), str(spm), "-export_options", str(options), "-export", str(output)]
     try:
-        completed = subprocess.run(
+        completed = owned_run(
             command,
+            source="cluster_card_pipeline.speedtree_verify.export",
+            run_factory=subprocess.run,
             cwd=str(Path(spm).parent),
             capture_output=True,
             text=True,

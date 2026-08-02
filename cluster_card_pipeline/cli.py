@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from .contract import (
     ContractError,
     _fingerprint,
@@ -117,7 +119,13 @@ def run(argv=None):
             "--output-dir",
             str(output_dir),
         ]
-        completed = subprocess.run(command, text=True, capture_output=True)
+        completed = owned_run(
+            command,
+            source="cluster_card_pipeline.cli.blender_job",
+            run_factory=subprocess.run,
+            text=True,
+            capture_output=True,
+        )
         (output_dir / "blender_job_stdout.log").write_text(completed.stdout, encoding="utf-8")
         (output_dir / "blender_job_stderr.log").write_text(completed.stderr, encoding="utf-8")
         if completed.returncode:

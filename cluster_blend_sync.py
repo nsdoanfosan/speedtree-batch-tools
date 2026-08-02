@@ -26,6 +26,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
@@ -1815,6 +1817,13 @@ def run_cluster_relation_transaction(
                         f"{restore_error}"
                         + diagnostic_detail
                     ) from preparation_error
+                retry_contract = getattr(
+                    preparation_error,
+                    "connected_retry_contract",
+                    None,
+                )
+                if isinstance(retry_contract, dict):
+                    retry_contract["rollback_succeeded"] = True
             original_args = tuple(preparation_error.args)
             if original_args:
                 preparation_error.args = (
@@ -1891,8 +1900,10 @@ def run_cluster_relation_transaction(
         )
         heartbeat_thread.start()
         try:
-            result = subprocess.run(
+            result = owned_run(
                 command,
+                source="cluster_blend_sync.apply_cluster_relationship",
+                run_factory=subprocess.run,
                 capture_output=True,
                 text=True,
                 timeout=int(timeout),

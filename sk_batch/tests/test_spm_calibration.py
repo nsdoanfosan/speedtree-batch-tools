@@ -525,36 +525,45 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
         class HangingProcess:
             pid = 9876
 
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                killed["terminated"] = self.pid
+                self.returncode = 1
+
+            def kill(self):
+                killed["killed"] = self.pid
+                self.returncode = 1
+
             def wait(self, timeout=None):
-                if "terminated" not in killed:
+                if self.returncode is None:
                     raise subprocess.TimeoutExpired("SpeedTree", timeout)
-                return 1
+                return self.returncode
 
         def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
             return HangingProcess()
-
-        def fake_run(cmd, **kwargs):
-            killed["terminated"] = list(cmd)
-            return mock.Mock(returncode=0)
 
         gate = mock.MagicMock()
         with mock.patch.object(
             spm_audit, "speedtree_export_gate", return_value=gate
         ), mock.patch.object(
             spm_audit.subprocess, "Popen", side_effect=fake_popen
-        ):
-            with mock.patch.object(spm_audit.subprocess, "run", side_effect=fake_run):
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    spm_audit.run_speedtree_export(
-                        ["SpeedTree.exe", "model.spm"],
-                        ".",
-                        5,
-                        stream_output=False,
-                    )
+        ), mock.patch.object(spm_audit.subprocess, "run") as run_mock:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                spm_audit.run_speedtree_export(
+                    ["SpeedTree.exe", "model.spm"],
+                    ".",
+                    5,
+                    stream_output=False,
+                )
 
-        if os.name == "nt":
-            self.assertIn("/T", killed.get("terminated", []))
-            self.assertIn("9876", killed.get("terminated", []))
+        self.assertEqual(killed.get("terminated"), 9876)
+        self.assertNotIn("killed", killed)
+        run_mock.assert_not_called()
 
     def test_active_child_cpu_extends_the_soft_deadline(self):
         class ProgressiveProcess:

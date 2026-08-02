@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from sk_batch.spm_audit import read_spm, write_spm  # noqa: E402
+from process_lifecycle import owned_run  # noqa: E402
 
 
 TEXT_SUFFIXES = {
@@ -126,8 +127,10 @@ def _replace_blend(path, old, new, blender, report_path):
         "--report",
         str(report_path),
     ]
-    completed = subprocess.run(
+    completed = owned_run(
         command,
+        source="tools.migrate_asset_token.blender",
+        run_factory=subprocess.run,
         check=False,
         text=True,
         stdout=subprocess.PIPE,

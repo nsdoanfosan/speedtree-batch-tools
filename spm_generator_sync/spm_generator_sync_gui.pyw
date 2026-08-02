@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -10,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -22,12 +25,36 @@ sys.path.insert(0, str(REPO_DIR))
 # spm_generator_sync.py, not the repository package's limited public API.
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import external_handoff_startfile
+
 from batch_ui_common import clipboard_text, copy_selected_row_paths
 from cluster_blend_sync import (
     run_cluster_folder_relation_transaction,
     run_cluster_relation_transaction,
 )
 from cluster_source_prepare import prepare_cluster_source_if_required
+from connected_run import (
+    CONNECTED_REPORT_SCHEMA_VERSION,
+    RetryPlanInvalid,
+    apply_final_identities,
+    connected_settings,
+    connected_unit_records,
+    dependency_identity,
+    execute_with_bounded_publish_retry,
+    legacy_or_current_summary,
+    load_exact_report,
+    new_unit_results,
+    report_file_identity,
+    scope_dependency_identities,
+    selected_failed_units,
+    shared_queue_result,
+    status_from_unit_results,
+    summarize_unit_results,
+    update_unit_result,
+    validate_failed_retry_plan,
+    validate_preserved_unit_identities,
+    validate_queue_anchored_report,
+)
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 
 
@@ -126,25 +153,50 @@ def save_config(config: dict) -> None:
     )
 
 
-def write_connected_run_report(payload: dict) -> Path:
+def write_connected_run_report(
+    payload: dict,
+    report_path: Path | str | None = None,
+) -> Path:
     """Persist one run-specific connected sync/Cluster refresh report."""
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%S")
-    path = REPORT_DIR / (
-        f"connected_sync_cluster_refresh_{stamp}_{os.getpid()}_"
-        f"{time.time_ns()}.json"
-    )
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
-            encoding="utf-8",
+    if report_path is None:
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        path = REPORT_DIR / (
+            f"connected_sync_cluster_refresh_{stamp}_{os.getpid()}_"
+            f"{time.time_ns()}.json"
         )
+    else:
+        path = Path(report_path)
+        if path.parent.resolve() != REPORT_DIR.resolve():
+            raise ValueError(
+                "connected report checkpoints must stay in the report directory"
+            )
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+            + "\n"
+        )
+        with temporary.open(
+            "x",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        temporary.unlink(missing_ok=True)
     return path
 
 
@@ -566,6 +618,12 @@ class App:
             command=self.apply_connected_board,
         )
         self.apply_connected_button.pack(side="left", padx=(5, 0))
+        self.retry_connected_button = ttk.Button(
+            actions,
+            text="연결 실패 단위만 재시도",
+            command=self.retry_failed_connected_units,
+        )
+        self.retry_connected_button.pack(side="left", padx=(5, 0))
         self.cancel_job_button = ttk.Button(
             actions,
             text="현재 작업 취소",
@@ -1704,7 +1762,11 @@ class App:
                 return
         else:
             folder = items[0]["folder"]
-        os.startfile(str(folder))
+        external_handoff_startfile(
+            str(folder),
+            source="spm_generator_sync.spm_generator_sync_gui.open_folder",
+            ownership="shell_handoff",
+        )
 
     def set_selected_master(self):
         items = self.selected_items()
@@ -2438,6 +2500,174 @@ class App:
             if result.get(key) is not None
         }
 
+    @staticmethod
+    def _checkpoint_connected_payload(payload, report_path=None):
+        """Atomically preserve the latest unit boundary for crash recovery."""
+
+        if report_path is None:
+            report_path = write_connected_run_report(payload)
+            payload["report_path"] = str(report_path)
+            # The first allocation happens inside the writer.  Persist once
+            # more so the durable document carries its own exact path.
+            write_connected_run_report(payload, report_path)
+            return Path(report_path)
+        payload["report_path"] = str(report_path)
+        return Path(write_connected_run_report(payload, report_path))
+
+    def _execute_connected_runtime_unit(
+        self,
+        unit,
+        runtime_unit,
+        job_config,
+        verify,
+        settings,
+        expected_identity,
+        report,
+        progress_callback,
+        on_attempt_event=None,
+    ):
+        """Execute one isolated unit with exact-owner bounded publish retry."""
+
+        raise_if_cancelled = getattr(
+            report, "raise_if_cancelled", lambda: None
+        )
+        process_output = getattr(report, "output", None)
+        cancel_requested = getattr(report, "cancel_requested", None)
+        cancel_event = getattr(report, "cancel_event", None)
+        ownership_probe = getattr(report, "ownership_is_current", None)
+
+        def ownership_is_current():
+            return True if ownership_probe is None else bool(ownership_probe())
+
+        def retry_wait(delay):
+            if cancel_event is None:
+                time.sleep(float(delay))
+            elif cancel_event.wait(float(delay)):
+                raise engine.SyncCancelled("cancelled_at_safe_boundary")
+
+        if unit["stage"] == "generator_sync":
+            group = runtime_unit
+
+            def action():
+                raise_if_cancelled()
+                return engine.apply_group_transaction(
+                    group["folder"],
+                    group["master"],
+                    group["names"],
+                    verify_speedtree=verify,
+                    speedtree_exe=Path(job_config.get("speedtree_exe") or ""),
+                    xml_ini=Path(job_config.get("xml_ini") or ""),
+                    skip_blocked_scale=True,
+                    progress_callback=progress_callback,
+                    process_output_callback=process_output,
+                    cancel_requested=cancel_requested,
+                )
+        else:
+            row = runtime_unit
+
+            def action():
+                raise_if_cancelled()
+                return self._execute_cluster_refresh_rows(
+                    [row],
+                    job_config,
+                    progress_callback,
+                )
+
+        return execute_with_bounded_publish_retry(
+            action,
+            capture_identity=lambda: dependency_identity(
+                unit,
+                settings,
+                refresh_execution_identity=True,
+            ),
+            ownership_is_current=ownership_is_current,
+            cancel_exception_type=engine.SyncCancelled,
+            sleep=retry_wait,
+            on_attempt_event=on_attempt_event,
+            expected_identity=expected_identity,
+        )
+
+    def _finish_connected_payload(
+        self,
+        payload,
+        units,
+        settings,
+        report_path,
+        *,
+        cancelled=False,
+        forced_status=None,
+    ):
+        """Seal final identities, counts, status, and exact report receipt."""
+
+        final_identities = scope_dependency_identities(units, settings)
+        apply_final_identities(payload["unit_results"], final_identities)
+        payload["summary"] = summarize_unit_results(payload["unit_results"])
+        payload["status"] = forced_status or status_from_unit_results(
+            payload["unit_results"],
+            cancelled=cancelled,
+        )
+        payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        report_path = self._checkpoint_connected_payload(
+            payload,
+            report_path,
+        )
+        payload["report_identity"] = report_file_identity(report_path)
+        return report_path
+
+    def _show_connected_result(self, result, *, retry=False):
+        """Render partial distinctly and keep exact counts/report visible."""
+
+        self.refresh()
+        summary = legacy_or_current_summary(result)
+        generator = summary["generator"]
+        cluster = summary["cluster"]
+        failure_count = int(summary.get("failures") or 0)
+        status = str(result.get("status") or "failed").casefold()
+        status_label = {
+            "ok": "완료",
+            "partial": "부분 완료",
+            "failed": "실패",
+            "cancelled": "취소",
+            "stale": "재계획 필요",
+            "incomplete": "중단됨",
+        }.get(status, status)
+        prefix = "연결 실패 단위 재시도" if retry else "연결 전체 처리"
+        self.status_var.set(
+            f"{prefix} {status_label} · Generator "
+            f"{generator['succeeded']}/{generator['total']} · "
+            f"Cluster {cluster['succeeded']}/{cluster['total']} · "
+            f"실패 {failure_count}"
+        )
+        report_path = result.get("report_path") or (
+            f"저장 실패: {result.get('report_error', '경로 없음')}"
+        )
+        detail = (
+            f"상태: {status_label}\n"
+            f"Generator Sync 성공: {generator['succeeded']}/{generator['total']} 그룹\n"
+            f"Cluster 갱신 성공: {cluster['succeeded']}/{cluster['total']} 관계\n"
+            f"실패: {failure_count}개\n\n"
+            f"보고서: {report_path}"
+        )
+        if result.get("retry_invalidated"):
+            detail += (
+                "\n\n현재 보드/콘텐츠가 원본 보고서와 달라 재시도하지 "
+                "않았습니다. 연결 전체 처리에서 새 계획을 만드세요.\n"
+                + "\n".join(result["retry_invalidated"][:8])
+            )
+        failure_lines = []
+        for failure in (result.get("failures") or ())[:8]:
+            label = failure.get("master") or Path(
+                failure.get("blend", "")
+            ).name
+            category = (failure.get("classification") or {}).get("category")
+            failure_lines.append(
+                f"· {label}: {failure.get('reason', '')}"
+                + (f" [{category}]" if category else "")
+            )
+        if failure_lines:
+            detail += "\n\n실패 요약:\n" + "\n".join(failure_lines)
+        self._show_job_info(f"{prefix} · {status_label}", detail)
+
     def apply_connected_board(self):
         """Sync all confirmed board relations, then refresh all exact ON Clusters."""
 
@@ -2505,17 +2735,10 @@ class App:
             return
 
         job_config = dict(self.config)
-        speedtree_exe = Path(job_config.get("speedtree_exe") or "")
-        xml_ini = Path(job_config.get("xml_ini") or "")
         board_root = self.root_var.get().strip()
 
         def apply(report):
             started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-            raise_if_cancelled = getattr(
-                report, "raise_if_cancelled", lambda: None
-            )
-            process_output = getattr(report, "output", None)
-            cancel_requested = getattr(report, "cancel_requested", None)
             report("실행 시점 연결 관계 다시 검사 중", 1)
             runtime_board = engine.scan_tree_folders(
                 Path(board_root),
@@ -2539,10 +2762,35 @@ class App:
             total_units = (
                 len(runtime_groups) + len(runtime_cluster_rows)
             )
+            runtime_units = connected_unit_records(
+                runtime_groups,
+                runtime_cluster_rows,
+            )
+            runtime_objects = [*runtime_groups, *runtime_cluster_rows]
+            runtime_by_id = {
+                unit["unit_id"]: runtime
+                for unit, runtime in zip(runtime_units, runtime_objects)
+            }
+            settings = connected_settings(
+                job_config,
+                verify,
+                board_root,
+                include_cluster_producer=bool(runtime_cluster_rows),
+            )
+            planned_identities = scope_dependency_identities(
+                runtime_units,
+                settings,
+            )
             payload = {
-                "schema_version": 1,
+                "schema_version": CONNECTED_REPORT_SCHEMA_VERSION,
+                "run_id": uuid.uuid4().hex,
                 "started_at": started_at,
                 "root": board_root,
+                "queue_identity": copy.deepcopy(getattr(
+                    report,
+                    "queue_identity",
+                    {"mode": "local_unanchored"},
+                )),
                 "verify_speedtree": verify,
                 "queued_scope": {
                     "generator_group_count": len(groups),
@@ -2562,7 +2810,16 @@ class App:
                 "generator_sync": [],
                 "cluster_refresh": [],
                 "failures": [],
+                "unit_results": new_unit_results(
+                    runtime_units,
+                    planned_identities,
+                ),
+                "status": "running",
             }
+            payload["summary"] = summarize_unit_results(
+                payload["unit_results"]
+            )
+            report_path = self._checkpoint_connected_payload(payload)
 
             def unit_report(unit_index, label, stage, percent):
                 overall = 2 + int(
@@ -2572,190 +2829,184 @@ class App:
                 )
                 report(f"{label} · {stage}", overall)
 
-            unit_index = 0
             cancelled_exc = None
-            for group in runtime_groups:
-                label = (
-                    f"Generator {unit_index + 1}/{total_units} · "
-                    f"{group['master']}"
-                )
-                try:
-                    raise_if_cancelled()
-                    result = engine.apply_group_transaction(
-                        group["folder"],
-                        group["master"],
-                        group["names"],
-                        verify_speedtree=verify,
-                        speedtree_exe=speedtree_exe,
-                        xml_ini=xml_ini,
-                        skip_blocked_scale=True,
-                        progress_callback=(
-                            lambda stage, percent, i=unit_index, text=label:
-                            unit_report(i, text, stage, percent)
-                        ),
-                        process_output_callback=process_output,
-                        cancel_requested=cancel_requested,
+            for unit_index, unit in enumerate(runtime_units):
+                runtime_unit = runtime_by_id[unit["unit_id"]]
+                if unit["stage"] == "generator_sync":
+                    label = (
+                        f"Generator {unit_index + 1}/{total_units} · "
+                        f"{runtime_unit['master']}"
                     )
-                    for entry in result.get("scale_skipped") or ():
-                        risk = entry.get("scale_risk") or {}
-                        payload["skipped"].append({
-                            "stage": "generator_sync",
-                            "folder": str(group["folder"]),
-                            "master": group["master"],
-                            "target": Path(
-                                entry.get("target") or ""
-                            ).name,
-                            "reason": (
-                                entry.get("reason")
-                                or "크기 폭증 위험"
-                            ),
-                            "scale_risk": risk,
-                        })
-                    payload["generator_sync"].append({
-                        "folder": str(group["folder"]),
-                        "master": group["master"],
-                        "followers": list(group["names"]),
-                        "result": self._connected_result_summary(result),
-                    })
-                except engine.SyncCancelled as exc:
-                    cancelled_exc = exc
-                    payload["cancellation"] = exc.as_dict()
-                    break
-                except Exception as exc:
-                    payload["failures"].append({
-                        "stage": "generator_sync",
-                        "folder": str(group["folder"]),
-                        "master": group["master"],
-                        "targets": list(group["names"]),
-                        "reason": str(exc),
-                    })
-                unit_index += 1
+                else:
+                    label = (
+                        f"Cluster {unit_index + 1}/{total_units} · "
+                        f"{Path(runtime_unit['blend']).name}"
+                    )
+                attempt_events = []
 
-            for row in runtime_cluster_rows:
-                if cancelled_exc is not None:
-                    break
-                blend = Path(row["blend"])
-                label = (
-                    f"Cluster {unit_index + 1}/{total_units} · {blend.name}"
-                )
+                def checkpoint_attempt(event):
+                    nonlocal report_path
+                    attempt_events.append(copy.deepcopy(dict(event)))
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="running",
+                        result={
+                            "attempt_history": attempt_events,
+                            "queue_identity": copy.deepcopy(
+                                payload["queue_identity"]
+                            ),
+                        },
+                    )
+                    payload["status"] = "running"
+                    payload["summary"] = summarize_unit_results(
+                        payload["unit_results"]
+                    )
+                    report_path = self._checkpoint_connected_payload(
+                        payload,
+                        report_path,
+                    )
+
                 try:
-                    raise_if_cancelled()
-                    result = self._execute_cluster_refresh_rows(
-                        [row],
+                    attempt = self._execute_connected_runtime_unit(
+                        unit,
+                        runtime_unit,
                         job_config,
+                        verify,
+                        settings,
+                        planned_identities[unit["unit_id"]],
+                        report,
                         lambda stage, percent, i=unit_index, text=label:
                         unit_report(i, text, stage, percent),
+                        checkpoint_attempt,
                     )
-                    payload["cluster_refresh"].append({
-                        "blend": str(blend),
-                        "targets": [
-                            str(path)
-                            for path in row.get("on_target_spms") or ()
-                        ],
-                        "refresh_reasons": list(
-                            row.get("refresh_reasons") or ()
-                        ),
-                        "refresh_reason_categories": list(
-                            row.get("refresh_reason_categories") or ()
-                        ),
-                        "result": self._connected_result_summary(result),
-                    })
-                    raise_if_cancelled()
                 except engine.SyncCancelled as exc:
                     cancelled_exc = exc
                     payload["cancellation"] = exc.as_dict()
                     break
-                except Exception as exc:
-                    payload["failures"].append({
-                        "stage": "cluster_refresh",
-                        "blend": str(blend),
-                        "targets": [
-                            str(path)
-                            for path in row.get("on_target_spms") or ()
-                        ],
-                        "refresh_reasons": list(
-                            row.get("refresh_reasons") or ()
-                        ),
-                        "refresh_reason_categories": list(
-                            row.get("refresh_reason_categories") or ()
-                        ),
-                        "reason": str(exc),
-                    })
-                unit_index += 1
-
-            success_count = (
-                len(payload["generator_sync"])
-                + len(payload["cluster_refresh"])
-            )
-            payload["status"] = (
-                "cancelled"
-                if cancelled_exc is not None
-                else "ok"
-                if not payload["failures"]
-                else "partial"
-                if success_count
-                else "failed"
-            )
-            payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            report("실행 보고서 저장 중", 98)
-            try:
-                payload["report_path"] = str(
-                    write_connected_run_report(payload)
+                if attempt["ok"]:
+                    result = attempt["result"]
+                    summary = self._connected_result_summary(result)
+                    summary["attempt_count"] = attempt["attempt_count"]
+                    if attempt["attempts"]:
+                        summary["publish_retry_attempts"] = attempt["attempts"]
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="succeeded",
+                        result=summary,
+                    )
+                    if unit["stage"] == "generator_sync":
+                        group = runtime_unit
+                        for entry in result.get("scale_skipped") or ():
+                            risk = entry.get("scale_risk") or {}
+                            payload["skipped"].append({
+                                "stage": "generator_sync",
+                                "folder": str(group["folder"]),
+                                "master": group["master"],
+                                "target": Path(
+                                    entry.get("target") or ""
+                                ).name,
+                                "reason": (
+                                    entry.get("reason") or "크기 폭증 위험"
+                                ),
+                                "scale_risk": risk,
+                            })
+                        payload["generator_sync"].append({
+                            "unit_id": unit["unit_id"],
+                            "folder": str(group["folder"]),
+                            "master": group["master"],
+                            "followers": list(group["names"]),
+                            "result": summary,
+                        })
+                    else:
+                        row = runtime_unit
+                        payload["cluster_refresh"].append({
+                            "unit_id": unit["unit_id"],
+                            "blend": str(row["blend"]),
+                            "targets": [
+                                str(path)
+                                for path in row.get("on_target_spms") or ()
+                            ],
+                            "refresh_reasons": list(
+                                row.get("refresh_reasons") or ()
+                            ),
+                            "refresh_reason_categories": list(
+                                row.get("refresh_reason_categories") or ()
+                            ),
+                            "result": summary,
+                        })
+                else:
+                    failure = {
+                        "unit_id": unit["unit_id"],
+                        "stage": unit["stage"],
+                        "reason": attempt["reason"],
+                        "classification": attempt["classification"],
+                        "retry": {
+                            "attempts": attempt["attempts"],
+                            "exhausted": attempt["retry_exhausted"],
+                        },
+                    }
+                    if unit["stage"] == "generator_sync":
+                        failure.update({
+                            "folder": str(runtime_unit["folder"]),
+                            "master": runtime_unit["master"],
+                            "targets": list(runtime_unit["names"]),
+                        })
+                    else:
+                        failure.update({
+                            "blend": str(runtime_unit["blend"]),
+                            "targets": [
+                                str(path)
+                                for path in runtime_unit.get(
+                                    "on_target_spms"
+                                ) or ()
+                            ],
+                            "refresh_reasons": list(
+                                runtime_unit.get("refresh_reasons") or ()
+                            ),
+                            "refresh_reason_categories": list(
+                                runtime_unit.get(
+                                    "refresh_reason_categories"
+                                ) or ()
+                            ),
+                        })
+                    payload["failures"].append(failure)
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="failed",
+                        failure=failure,
+                    )
+                payload["summary"] = summarize_unit_results(
+                    payload["unit_results"]
                 )
-            except Exception as exc:
-                payload["report_error"] = str(exc)
+                report_path = self._checkpoint_connected_payload(
+                    payload,
+                    report_path,
+                )
+
+            report("실행 보고서 저장 중", 98)
+            report_path = self._finish_connected_payload(
+                payload,
+                runtime_units,
+                settings,
+                report_path,
+                cancelled=cancelled_exc is not None,
+            )
             if cancelled_exc is not None:
                 cancelled_exc.report_payload = payload
-                cancelled_exc.report_path = payload.get("report_path")
+                cancelled_exc.report_path = str(report_path)
                 raise cancelled_exc
             return payload
 
         def done(result):
-            self.refresh()
-            sync_ok = len(result["generator_sync"])
-            cluster_ok = len(result["cluster_refresh"])
-            failure_count = len(result["failures"])
-            runtime_group_count = int(
-                result["scope"]["generator_group_count"]
-            )
-            runtime_cluster_count = int(
-                result["scope"]["cluster_relation_count"]
-            )
-            report_path = result.get("report_path") or (
-                f"저장 실패: {result.get('report_error', '알 수 없음')}"
-            )
-            self.status_var.set(
-                f"연결 전체 처리 완료 · Generator "
-                f"{sync_ok}/{runtime_group_count} · "
-                f"Cluster {cluster_ok}/{runtime_cluster_count} · "
-                f"실패 {failure_count}"
-            )
-            failure_lines = [
-                f"· {failure.get('master') or Path(failure.get('blend', '')).name}: "
-                f"{failure['reason']}"
-                for failure in result["failures"][:8]
-            ]
-            detail = (
-                f"Generator Sync 성공: {sync_ok}/{runtime_group_count} 그룹\n"
-                f"Cluster 갱신 성공: {cluster_ok}/{runtime_cluster_count} 관계\n"
-                f"사전 제외: {len(result['skipped'])}개\n"
-                f"실패: {failure_count}개\n\n"
-                f"보고서: {report_path}"
-            )
-            if failure_lines:
-                detail += "\n\n실패 요약:\n" + "\n".join(failure_lines)
-            self._show_job_info(
-                (
-                    "연결 전체 처리 완료"
-                    if not failure_count
-                    else "연결 전체 처리 완료 · 실패 있음"
-                ),
-                detail,
-            )
+            self._show_connected_result(result)
 
         def cancelled(exc):
             self.refresh()
             payload = getattr(exc, "report_payload", {}) or {}
+            summary = legacy_or_current_summary(payload)
             report_path = getattr(exc, "report_path", None) or payload.get(
                 "report_path"
             )
@@ -2763,9 +3014,9 @@ class App:
                 "연결 전체 처리 취소됨",
                 f"상태: {self._cancel_state_label(exc.termination_state)}\n"
                 f"완료된 Generator 그룹: "
-                f"{len(payload.get('generator_sync') or ())}\n"
+                f"{summary['generator']['succeeded']}\n"
                 f"완료된 Cluster 관계: "
-                f"{len(payload.get('cluster_refresh') or ())}\n\n"
+                f"{summary['cluster']['succeeded']}\n\n"
                 f"보고서: {report_path or '저장되지 않음'}",
             )
 
@@ -2776,6 +3027,519 @@ class App:
             queue_label=(
                 f"연결 전체 처리 · 자식 {follower_count}개 · "
                 f"Cluster {len(cluster_rows)}개"
+            ),
+            on_cancel=cancelled,
+        )
+
+    def _load_connected_retry_anchor(self, anchor):
+        """Reload one report only through its still-retained queue receipt."""
+
+        runtime = getattr(self, "shared_queue_runtime", None)
+        queue_backend = getattr(runtime, "queue", None)
+        if queue_backend is None:
+            raise RetryPlanInvalid([
+                "shared queue history is unavailable for retry provenance"
+            ])
+        snapshot = queue_backend.snapshot()
+        job = next(
+            (
+                candidate
+                for candidate in snapshot.get("jobs") or ()
+                if str(candidate.get("id")) == str(anchor["queue_job_id"])
+            ),
+            None,
+        )
+        if job is None:
+            raise RetryPlanInvalid([
+                "source queue receipt is no longer retained"
+            ])
+        payload, identity = load_exact_report(
+            anchor["report"]["path"],
+            anchor["report"],
+        )
+        current_anchor = validate_queue_anchored_report(
+            job,
+            payload,
+            identity,
+        )
+        if current_anchor != anchor:
+            raise RetryPlanInvalid(["source queue anchor changed"])
+        return payload, current_anchor
+
+    def _latest_connected_retry_report(self):
+        """Return the newest queue-anchored v2 report with failed units."""
+
+        runtime = getattr(self, "shared_queue_runtime", None)
+        queue_backend = getattr(runtime, "queue", None)
+        if queue_backend is None:
+            return None
+        snapshot = queue_backend.snapshot()
+        candidates = sorted(
+            snapshot.get("jobs") or (),
+            key=lambda job: (
+                float(job.get("terminal_at") or 0),
+                int(job.get("sequence") or 0),
+            ),
+            reverse=True,
+        )
+        for job in candidates:
+            result = job.get("result") or {}
+            identity = result.get("report")
+            if not isinstance(identity, dict) or not identity.get("path"):
+                continue
+            try:
+                payload, exact_identity = load_exact_report(
+                    identity["path"],
+                    identity,
+                )
+                anchor = validate_queue_anchored_report(
+                    job,
+                    payload,
+                    exact_identity,
+                )
+                if (
+                    int(payload.get("schema_version") or 0)
+                    >= CONNECTED_REPORT_SCHEMA_VERSION
+                    and str(payload.get("status") or "").casefold()
+                    in {"partial", "failed"}
+                    and selected_failed_units(payload)
+                ):
+                    return payload, anchor
+            except (OSError, RetryPlanInvalid):
+                continue
+        return None
+
+    def retry_failed_connected_units(self):
+        """Revalidate immutable evidence and enqueue only its failed units."""
+
+        latest = self._latest_connected_retry_report()
+        if latest is None:
+            messagebox.showinfo(
+                "연결 실패 재시도",
+                "재시도 가능한 v2 부분 완료 보고서가 없습니다.",
+                parent=self.root,
+            )
+            return
+        source_payload, source_anchor = latest
+        failed_units = selected_failed_units(source_payload)
+        by_stage = {
+            "generator_sync": sum(
+                unit.get("stage") == "generator_sync"
+                for unit in failed_units
+            ),
+            "cluster_refresh": sum(
+                unit.get("stage") == "cluster_refresh"
+                for unit in failed_units
+            ),
+        }
+        if not messagebox.askyesno(
+            "연결 실패 단위만 재시도",
+            "원본 보고서의 전체 단위 집합과 현재 파일 SHA-256을 먼저 "
+            "재검증합니다. 하나라도 바뀌면 아무 단위도 실행하지 않고 새 "
+            "계획을 요구합니다.\n\n"
+            f"Generator 실패: {by_stage['generator_sync']}개\n"
+            f"Cluster 실패: {by_stage['cluster_refresh']}개\n"
+            f"총 재시도 후보: {len(failed_units)}개\n\n"
+            f"원본 보고서: {source_anchor['report']['path']}",
+            parent=self.root,
+        ):
+            return
+
+        job_config = dict(self.config)
+        verify = bool(self.verify_var.get())
+        board_root = self.root_var.get().strip()
+
+        def apply(report):
+            report("재시도 원본 보고서 무결성 확인 중", 1)
+            exact_source, exact_anchor = self._load_connected_retry_anchor(
+                source_anchor,
+            )
+            payload = {
+                "schema_version": CONNECTED_REPORT_SCHEMA_VERSION,
+                "run_id": uuid.uuid4().hex,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "root": board_root,
+                "queue_identity": copy.deepcopy(getattr(
+                    report,
+                    "queue_identity",
+                    {"mode": "local_unanchored"},
+                )),
+                "verify_speedtree": verify,
+                "retry_of": exact_anchor,
+                "queued_scope": {
+                    "failed_unit_count": len(failed_units),
+                    "generator_failed_count": by_stage["generator_sync"],
+                    "cluster_failed_count": by_stage["cluster_refresh"],
+                },
+                "scope": copy.deepcopy(exact_source.get("scope") or {}),
+                "skipped": [],
+                "generator_sync": [],
+                "cluster_refresh": [],
+                "failures": copy.deepcopy(
+                    exact_source.get("failures") or []
+                ),
+                "unit_results": copy.deepcopy(
+                    exact_source.get("unit_results") or []
+                ),
+                "status": "retry_validating",
+            }
+            payload["summary"] = summarize_unit_results(
+                payload["unit_results"]
+            )
+            report_path = self._checkpoint_connected_payload(payload)
+
+            runtime_board = engine.scan_tree_folders(
+                Path(board_root),
+                sk_only=bool(job_config.get("sk_only", True)),
+                verify_physical=False,
+            )
+            runtime_scope = self._connected_scope_from_board(runtime_board)
+            runtime_groups = runtime_scope["groups"]
+            runtime_cluster_rows = runtime_scope["cluster_rows"]
+            runtime_units = connected_unit_records(
+                runtime_groups,
+                runtime_cluster_rows,
+            )
+            runtime_objects = [*runtime_groups, *runtime_cluster_rows]
+            runtime_by_id = {
+                unit["unit_id"]: runtime
+                for unit, runtime in zip(runtime_units, runtime_objects)
+            }
+            settings = connected_settings(
+                job_config,
+                verify,
+                board_root,
+                include_cluster_producer=bool(runtime_cluster_rows),
+            )
+            try:
+                plan = validate_failed_retry_plan(
+                    exact_source,
+                    runtime_units,
+                    settings,
+                )
+            except RetryPlanInvalid as exc:
+                payload["retry_invalidated"] = list(exc.reasons)
+                self._finish_connected_payload(
+                    payload,
+                    runtime_units,
+                    settings,
+                    report_path,
+                    forced_status="stale",
+                )
+                return payload
+
+            expected_order = [unit["unit_id"] for unit in runtime_units]
+            protected_success_identities = {
+                entry["unit_id"]: copy.deepcopy(
+                    entry["dependency_identity"]
+                )
+                for entry in exact_source.get("unit_results") or ()
+                if entry.get("outcome") == "succeeded"
+                and isinstance(entry.get("dependency_identity"), dict)
+            }
+            payload["retry_safety"] = {
+                "ordered_plan_unit_ids": expected_order,
+                "overlap_graph": copy.deepcopy(plan["overlap_graph"]),
+                "ineligible_overlaps": copy.deepcopy(
+                    plan["ineligible_overlaps"]
+                ),
+                "protected_success_count": len(
+                    protected_success_identities
+                ),
+                "post_attempt_validations": [],
+            }
+
+            if not plan["units"]:
+                payload["retry_invalidated"] = [
+                    "all failed units overlap a previously successful unit; "
+                    "failed-only retry is ineligible without a fresh full plan"
+                ]
+                self._finish_connected_payload(
+                    payload,
+                    runtime_units,
+                    settings,
+                    report_path,
+                    forced_status="stale",
+                )
+                return payload
+
+            for unit in plan["units"]:
+                update_unit_result(
+                    payload["unit_results"],
+                    unit["unit_id"],
+                    outcome="pending_retry",
+                )
+            payload["failures"] = [
+                copy.deepcopy(entry["failure"])
+                for entry in payload["unit_results"]
+                if entry.get("outcome") == "failed" and entry.get("failure")
+            ]
+            payload["status"] = "retrying"
+            payload["summary"] = summarize_unit_results(
+                payload["unit_results"]
+            )
+            report_path = self._checkpoint_connected_payload(
+                payload,
+                report_path,
+            )
+
+            cancelled_exc = None
+            forced_status = None
+            total = len(plan["units"])
+            for retry_index, unit in enumerate(plan["units"]):
+                baseline = plan["current_identities"][unit["unit_id"]]
+                current = dependency_identity(unit, settings)
+                if current.get("digest") != baseline.get("digest"):
+                    payload["retry_invalidated"] = [
+                        f"{unit['unit_id']} dependency identity changed "
+                        "after retry validation"
+                    ]
+                    forced_status = "stale"
+                    break
+                runtime_unit = runtime_by_id[unit["unit_id"]]
+                label = (
+                    runtime_unit["master"]
+                    if unit["stage"] == "generator_sync"
+                    else Path(runtime_unit["blend"]).name
+                )
+
+                def unit_progress(stage, percent, i=retry_index, text=label):
+                    overall = 2 + int(
+                        94
+                        * (i + max(0, min(100, int(percent))) / 100)
+                        / max(1, total)
+                    )
+                    report(
+                        f"실패 재시도 {i + 1}/{total} · {text} · {stage}",
+                        overall,
+                    )
+
+                attempt_events = []
+
+                def checkpoint_attempt(event):
+                    nonlocal report_path
+                    attempt_events.append(copy.deepcopy(dict(event)))
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="running",
+                        result={
+                            "attempt_history": attempt_events,
+                            "queue_identity": copy.deepcopy(
+                                payload["queue_identity"]
+                            ),
+                        },
+                    )
+                    payload["status"] = "retrying"
+                    payload["summary"] = summarize_unit_results(
+                        payload["unit_results"]
+                    )
+                    report_path = self._checkpoint_connected_payload(
+                        payload,
+                        report_path,
+                    )
+
+                try:
+                    attempt = self._execute_connected_runtime_unit(
+                        unit,
+                        runtime_unit,
+                        job_config,
+                        verify,
+                        settings,
+                        baseline,
+                        report,
+                        unit_progress,
+                        checkpoint_attempt,
+                    )
+                except engine.SyncCancelled as exc:
+                    cancelled_exc = exc
+                    payload["cancellation"] = exc.as_dict()
+                    break
+
+                if attempt["ok"]:
+                    result = attempt["result"]
+                    result_summary = self._connected_result_summary(result)
+                    result_summary["attempt_count"] = attempt["attempt_count"]
+                    if attempt["attempts"]:
+                        result_summary["publish_retry_attempts"] = attempt[
+                            "attempts"
+                        ]
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="succeeded",
+                        result=result_summary,
+                    )
+                    if unit["stage"] == "generator_sync":
+                        payload["generator_sync"].append({
+                            "unit_id": unit["unit_id"],
+                            "folder": str(runtime_unit["folder"]),
+                            "master": runtime_unit["master"],
+                            "followers": list(runtime_unit["names"]),
+                            "result": result_summary,
+                        })
+                    else:
+                        payload["cluster_refresh"].append({
+                            "unit_id": unit["unit_id"],
+                            "blend": str(runtime_unit["blend"]),
+                            "targets": [
+                                str(path)
+                                for path in runtime_unit.get(
+                                    "on_target_spms"
+                                ) or ()
+                            ],
+                            "result": result_summary,
+                        })
+                else:
+                    failure = {
+                        "unit_id": unit["unit_id"],
+                        "stage": unit["stage"],
+                        "reason": attempt["reason"],
+                        "classification": attempt["classification"],
+                        "retry": {
+                            "attempts": attempt["attempts"],
+                            "exhausted": attempt["retry_exhausted"],
+                        },
+                    }
+                    if unit["stage"] == "generator_sync":
+                        failure.update({
+                            "folder": str(runtime_unit["folder"]),
+                            "master": runtime_unit["master"],
+                            "targets": list(runtime_unit["names"]),
+                        })
+                    else:
+                        failure.update({
+                            "blend": str(runtime_unit["blend"]),
+                            "targets": [
+                                str(path)
+                                for path in runtime_unit.get(
+                                    "on_target_spms"
+                                ) or ()
+                            ],
+                        })
+                    update_unit_result(
+                        payload["unit_results"],
+                        unit["unit_id"],
+                        outcome="failed",
+                        failure=failure,
+                    )
+
+                # A Cluster retry may share generated artifacts with a unit
+                # that already succeeded. Rescan after every attempted
+                # mutation and fail closed before a second failed unit can run
+                # if any protected success or the ordered plan changed.
+                try:
+                    post_board = engine.scan_tree_folders(
+                        Path(board_root),
+                        sk_only=bool(job_config.get("sk_only", True)),
+                        verify_physical=False,
+                    )
+                    post_scope = self._connected_scope_from_board(post_board)
+                    post_units = connected_unit_records(
+                        post_scope["groups"],
+                        post_scope["cluster_rows"],
+                    )
+                    guarded_identities = copy.deepcopy(
+                        protected_success_identities
+                    )
+                    for remaining_unit in plan["units"][retry_index + 1:]:
+                        guarded_identities[remaining_unit["unit_id"]] = (
+                            copy.deepcopy(plan["current_identities"][
+                                remaining_unit["unit_id"]
+                            ])
+                        )
+                    post_identities = validate_preserved_unit_identities(
+                        post_units,
+                        expected_order,
+                        guarded_identities,
+                        settings,
+                        capture_unit_ids=(unit["unit_id"],),
+                    )
+                    if attempt["ok"]:
+                        protected_success_identities[unit["unit_id"]] = (
+                            copy.deepcopy(post_identities[unit["unit_id"]])
+                        )
+                    payload["retry_safety"][
+                        "protected_success_count"
+                    ] = len(protected_success_identities)
+                    payload["retry_safety"][
+                        "post_attempt_validations"
+                    ].append({
+                        "after_unit_id": unit["unit_id"],
+                        "attempt_ok": bool(attempt["ok"]),
+                        "protected_success_count": len(
+                            protected_success_identities
+                        ),
+                        "ordered_plan_sha256": hashlib.sha256(
+                            json.dumps(
+                                expected_order,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    })
+                except RetryPlanInvalid as exc:
+                    payload["retry_invalidated"] = list(exc.reasons)
+                    forced_status = "stale"
+                except Exception as exc:
+                    payload["retry_invalidated"] = [
+                        "post-attempt board validation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ]
+                    forced_status = "stale"
+                payload["failures"] = [
+                    copy.deepcopy(entry["failure"])
+                    for entry in payload["unit_results"]
+                    if entry.get("outcome") == "failed"
+                    and entry.get("failure")
+                ]
+                payload["summary"] = summarize_unit_results(
+                    payload["unit_results"]
+                )
+                report_path = self._checkpoint_connected_payload(
+                    payload,
+                    report_path,
+                )
+                if forced_status is not None:
+                    break
+
+            report("재시도 보고서 저장 중", 98)
+            report_path = self._finish_connected_payload(
+                payload,
+                runtime_units,
+                settings,
+                report_path,
+                cancelled=cancelled_exc is not None,
+                forced_status=forced_status,
+            )
+            if cancelled_exc is not None:
+                cancelled_exc.report_payload = payload
+                cancelled_exc.report_path = str(report_path)
+                raise cancelled_exc
+            return payload
+
+        def done(result):
+            self._show_connected_result(result, retry=True)
+
+        def cancelled(exc):
+            payload = getattr(exc, "report_payload", {}) or {}
+            summary = legacy_or_current_summary(payload)
+            self.refresh()
+            self._show_job_info(
+                "연결 실패 단위 재시도 취소됨",
+                f"상태: {self._cancel_state_label(exc.termination_state)}\n"
+                f"누적 Generator 성공: {summary['generator']['succeeded']}\n"
+                f"누적 Cluster 성공: {summary['cluster']['succeeded']}\n\n"
+                f"보고서: {payload.get('report_path') or '저장되지 않음'}",
+            )
+
+        self._start_job(
+            "연결 실패 단위 재검증 및 재시도 중...",
+            apply,
+            done,
+            queue_label=(
+                f"연결 실패 재시도 · Generator {by_stage['generator_sync']}개 · "
+                f"Cluster {by_stage['cluster_refresh']}개"
             ),
             on_cancel=cancelled,
         )
@@ -3116,27 +3880,34 @@ class App:
                             "cancelled_before_launch"
                         ) from exc
                     report("공용 대기열 진입 · 단독 실행", 1)
+                    renew = getattr(lease, "renew_and_check_current", None)
+                    report.ownership_is_current = (
+                        renew if renew is not None else lambda: True
+                    )
+                    report.queue_identity = {
+                        "mode": "shared",
+                        "job_id": str(shared_job_id),
+                        "sequence": job.get("shared_queue_sequence"),
+                        "owner_id": getattr(
+                            shared_runtime,
+                            "owner_id",
+                            None,
+                        ),
+                    }
+                else:
+                    report.ownership_is_current = lambda: True
+                    report.queue_identity = {"mode": "local_unanchored"}
                 raise_if_cancelled()
                 payload = job["func"](report)
-                queue_success = not (
-                    isinstance(payload, dict)
-                    and (
-                        payload.get("failures")
-                        or str(payload.get("status") or "").casefold()
-                        in {"failed", "error", "partial", "cancelled"}
-                    )
+                queue_receipt = shared_queue_result(
+                    payload if isinstance(payload, dict) else {},
+                    job["id"],
                 )
+                queue_success = queue_receipt["outcome"] == "completed"
                 if lease is not None:
                     lease.finish(
                         success=queue_success,
-                        result={
-                            "tool": "spm_generator_sync",
-                            "local_job_id": job["id"],
-                            "outcome": (
-                                "completed"
-                                if queue_success else "failed"
-                            ),
-                        },
+                        result=queue_receipt,
                     )
                 job["worker_terminal_ok"] = True
                 job["worker_terminal_payload"] = payload
@@ -3147,19 +3918,21 @@ class App:
                     job["cancel_state"] = exc.termination_state
                 if lease is not None and not lease.finished:
                     try:
+                        exception_payload = getattr(
+                            exc, "report_payload", None
+                        )
+                        if cancelled and exception_payload is None:
+                            exception_payload = {"status": "cancelled"}
                         lease.finish(
                             success=False,
-                            result={
-                                "tool": "spm_generator_sync",
-                                "local_job_id": job["id"],
-                                "outcome": (
-                                    "cancelled" if cancelled else "failed"
-                                ),
-                                "termination_state": getattr(
+                            result=shared_queue_result(
+                                exception_payload,
+                                job["id"],
+                                error=str(exc),
+                                termination_state=getattr(
                                     exc, "termination_state", None
                                 ),
-                                "error": str(exc),
-                            },
+                            ),
                         )
                     except Exception as queue_exc:
                         exc = RuntimeError(

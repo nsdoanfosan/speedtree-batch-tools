@@ -3,6 +3,7 @@ setlocal
 rem SK Vegetation Batch GUI launcher (no console window)
 set "GUARD=%~dp0..\launch_guard.pyw"
 set "LAUNCHER=%~dp0sk_batch_gui.pyw"
+set "SPEEDTREE_BATCH_LAUNCH_SOURCE=bat:SK_Batch.bat"
 
 where.exe pythonw >nul 2>&1
 if errorlevel 1 goto python_missing
@@ -11,7 +12,8 @@ if not exist "%LAUNCHER%" goto launcher_missing
 pythonw -c "import tkinter" >nul 2>&1
 if errorlevel 1 goto tkinter_missing
 
-rem launch_guard.pyw reports any startup failure; `start` cannot.
+rem `start` guarantees process creation, not readiness. The guard creates its
+rem Job supervisor before importing this GUI; its receipt records BAT source.
 start "" /D "%~dp0" pythonw "%GUARD%" "%LAUNCHER%"
 exit /b 0
 
