@@ -46,6 +46,7 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
+    inspect_normalization_source_identity,
     resolve_normalization_recipe,
 )
 from cluster_source_prepare import (
@@ -69,6 +70,11 @@ BACKUP_NAME_TOKENS = (
 )
 
 CLUSTER_RELATION_HEARTBEAT_SECONDS = 5.0
+
+CAPTURE_TEXTURE_REFRESH_REASONS = {
+    "physical_capture_manifest_missing",
+    "physical_capture_changed",
+}
 
 
 class ClusterBlendSyncError(RuntimeError):
@@ -1009,6 +1015,8 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         }
 
     reasons = []
+    source_content_identity = inspect_normalization_source_identity(blend)
+    reasons.extend(source_content_identity.get("refresh_reasons") or ())
     canonical = Path(canonical_spm).expanduser().absolute()
     recorded_source_rows = _recorded_source_spm_rows(receipt, canonical)
     current_source_sha256 = _sha256_file(canonical) if canonical.is_file() else None
@@ -1096,6 +1104,30 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         "capture_contract_sha256": capture["contract_sha256"],
         "recorded_capture_contract_sha256": recorded_capture_sha256,
         "source_fbx_artifacts": recorded_fbx_rows,
+        "source_content_identity": source_content_identity,
+    }
+
+
+def _refresh_reason_summary(reasons):
+    unique = sorted(set(reasons or ()))
+    capture_texture = [
+        reason for reason in unique
+        if reason in CAPTURE_TEXTURE_REFRESH_REASONS
+    ]
+    geometry_ownership = [
+        reason for reason in unique
+        if reason not in CAPTURE_TEXTURE_REFRESH_REASONS
+    ]
+    categories = []
+    if geometry_ownership:
+        categories.append("geometry_ownership")
+    if capture_texture:
+        categories.append("capture_texture")
+    return {
+        "refresh_reasons": unique,
+        "refresh_reason_categories": categories,
+        "geometry_ownership_refresh_reasons": geometry_ownership,
+        "capture_texture_refresh_reasons": capture_texture,
     }
 
 
@@ -1182,6 +1214,7 @@ def inspect_cluster_target(
             "refresh_deferred": True,
         }
     refresh_required = satisfied and refresh["refresh_required"]
+    refresh.update(_refresh_reason_summary(refresh["refresh_reasons"]))
     return {
         "status": (
             "refresh_required"
@@ -1313,6 +1346,27 @@ def discover_cluster_blend_relations(
                 for relation in owner_relations
                 for reason in relation.get("refresh_reasons") or ()
             }),
+            "refresh_reason_categories": sorted({
+                category
+                for relation in owner_relations
+                for category in (
+                    relation.get("refresh_reason_categories") or ()
+                )
+            }),
+            "geometry_ownership_refresh_reasons": sorted({
+                reason
+                for relation in owner_relations
+                for reason in (
+                    relation.get("geometry_ownership_refresh_reasons") or ()
+                )
+            }),
+            "capture_texture_refresh_reasons": sorted({
+                reason
+                for relation in owner_relations
+                for reason in (
+                    relation.get("capture_texture_refresh_reasons") or ()
+                )
+            }),
             "targets": sorted(
                 relation_rows,
                 key=lambda row: (
@@ -1324,8 +1378,8 @@ def discover_cluster_blend_relations(
     return sorted(rows, key=lambda row: row["blend"].name.casefold())
 
 
-def _current_on_relation_evidence(blend, targets):
-    """Return current physical proof, or ``None`` when a refresh is required.
+def _current_on_relation_state(blend, targets):
+    """Return current physical proof plus fail-closed refresh diagnostics.
 
     The registry alone is not enough to skip work.  A no-op is safe only when
     every effective target is local, still has an exact synced scope, and that
@@ -1334,14 +1388,20 @@ def _current_on_relation_evidence(blend, targets):
     blend = Path(blend).expanduser().absolute()
     owner = blend.parent.parent
     canonical = blend.with_suffix(".spm")
+    reasons = []
+    target_states = []
     if not canonical.is_file():
-        return None
+        reasons.append("canonical_source_missing")
 
     evidence = []
     for target in targets:
         target = Path(target).expanduser().absolute()
-        if target.parent != owner or not target.is_file():
-            return None
+        if target.parent != owner:
+            reasons.append("target_outside_owner")
+            continue
+        if not target.is_file():
+            reasons.append("target_missing")
+            continue
         state = inspect_cluster_target(
             blend,
             target,
@@ -1349,21 +1409,49 @@ def _current_on_relation_evidence(blend, targets):
             canonical_spm=canonical,
             verify_physical=True,
         )
-        if not (
+        target_states.append({
+            "target_spm": str(target),
+            "status": state.get("status"),
+            "refresh_reasons": list(state.get("refresh_reasons") or ()),
+            "refresh_reason_categories": list(
+                state.get("refresh_reason_categories") or ()
+            ),
+            "source_content_identity": state.get(
+                "source_content_identity"
+            ),
+        })
+        reasons.extend(state.get("refresh_reasons") or ())
+        is_current = (
             state.get("status") == "synced"
             and state.get("connection_satisfied") is True
             and state.get("physical") is True
             and state.get("refresh_required") is False
             and state.get("refresh_deferred") is not True
-        ):
-            return None
+        )
+        if not is_current and not state.get("refresh_reasons"):
+            reasons.append("relation_physical_proof_incomplete")
         evidence.append({
             "target_spm": str(target),
             "manifest": state.get("manifest"),
             "material": state.get("material"),
             "material_id": state.get("material_id"),
+            "source_content_identity": state.get(
+                "source_content_identity"
+            ),
         })
-    return evidence
+    summary = _refresh_reason_summary(reasons)
+    return {
+        "current": not summary["refresh_reasons"],
+        "verification": evidence,
+        "targets": target_states,
+        **summary,
+    }
+
+
+def _current_on_relation_evidence(blend, targets):
+    """Compatibility wrapper returning proof only for a strict current state."""
+    state = _current_on_relation_state(blend, targets)
+    return state["verification"] if state["current"] else None
 
 
 def _emit_cluster_relation_progress(callback, stage, message):
@@ -1473,6 +1561,7 @@ def run_cluster_relation_transaction(
     registered_keys = {
         normalized_path_key(path) for path in registered_before
     }
+    preflight_state = None
     if (
         enabled
         and not force_refresh
@@ -1483,11 +1572,11 @@ def run_cluster_relation_transaction(
             "verify_existing_relation",
             "Verifying the existing Cluster ON relationship...",
         )
-        current_evidence = _current_on_relation_evidence(
+        preflight_state = _current_on_relation_state(
             blend,
             effective_targets,
         )
-        if current_evidence is not None:
+        if preflight_state["current"]:
             report = {
                 "status": "ok",
                 "mode": "sync",
@@ -1499,7 +1588,16 @@ def run_cluster_relation_transaction(
                 "no_change": True,
                 "already_on": True,
                 "skip_reason": "already_on_up_to_date",
-                "verification": current_evidence,
+                "verification": preflight_state["verification"],
+                "refresh_reasons": [],
+                "refresh_reason_categories": [],
+                "source_content_identity": (
+                    preflight_state["targets"][0].get(
+                        "source_content_identity"
+                    )
+                    if preflight_state["targets"]
+                    else None
+                ),
             }
             try:
                 runtime_receipt = _write_shared_repair_runtime_receipt(
@@ -1542,6 +1640,12 @@ def run_cluster_relation_transaction(
                 "Blender bake/export was skipped.",
             )
             return report
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "existing_relation_refresh_required",
+            "Existing Cluster relationship requires refresh: "
+            + ", ".join(preflight_state["refresh_reasons"]),
+        )
 
     blender = Path(blender_exe).expanduser().absolute()
     if not blender.is_file():
@@ -1855,6 +1959,21 @@ def run_cluster_relation_transaction(
                 report["repair_runtime_receipt"] = str(runtime_receipt)
         if source_preparation is not None:
             report["source_preparation"] = source_preparation
+        if preflight_state is not None and not preflight_state["current"]:
+            report["preflight_refresh_required"] = True
+            report["preflight_refresh_reasons"] = preflight_state[
+                "refresh_reasons"
+            ]
+            report["preflight_refresh_reason_categories"] = (
+                preflight_state["refresh_reason_categories"]
+            )
+            report["refresh_reasons"] = list(
+                preflight_state["refresh_reasons"]
+            )
+            report["refresh_reason_categories"] = list(
+                preflight_state["refresh_reason_categories"]
+            )
+            report["preflight_target_states"] = preflight_state["targets"]
         return report
 
 

@@ -814,6 +814,12 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                 "blend": blend,
                 "on_target_spms": [target],
                 "target_spms": [target],
+                "refresh_reasons": [
+                    "blender_source_content_changed"
+                ],
+                "refresh_reason_categories": [
+                    "geometry_ownership"
+                ],
             }],
             "skipped": [],
         }
@@ -852,7 +858,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         ) as prepare, mock.patch.object(
             GUI,
             "run_cluster_relation_transaction",
-            return_value={"status": "ok", "mode": "sync"},
+            return_value={
+                "status": "ok",
+                "mode": "sync",
+                "source_content_identity": {
+                    "kind": "speedtree_cluster_atlas_blender_source_index",
+                    "status": "ok",
+                },
+            },
         ) as refresh, mock.patch.object(
             GUI,
             "write_connected_run_report",
@@ -887,6 +900,29 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertEqual(captured["status"], "partial")
         self.assertEqual(len(captured["failures"]), 1)
         self.assertEqual(len(captured["cluster_refresh"]), 1)
+        cluster_report = captured["cluster_refresh"][0]
+        self.assertEqual(
+            cluster_report["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["refresh_reason_categories"],
+            ["geometry_ownership"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["planned_refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["refresh_reasons"],
+            ["blender_source_content_changed"],
+        )
+        self.assertEqual(
+            cluster_report["result"]["source_content_identity"][
+                "status"
+            ],
+            "ok",
+        )
         app.refresh.assert_called_once()
         self.assertIn(
             "실패 1",
