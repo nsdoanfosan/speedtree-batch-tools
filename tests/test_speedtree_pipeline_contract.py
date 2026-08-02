@@ -4,8 +4,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -37,6 +41,7 @@ from speedtree_pipeline_contract import (
     validate_preflight_envelope,
 )
 from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES, resolve_texture_bindings
+import speedtree_pipeline_contract as pipeline_contract
 
 
 def spm_xml(profile=""):
@@ -130,6 +135,45 @@ class GeneratorGuidSpellingTests(unittest.TestCase):
 
 
 class SpeedTreePipelineContractTests(unittest.TestCase):
+    def test_shared_contract_cold_load_is_serialized(self):
+        sentinel = object()
+        state = {"active": 0, "max_active": 0}
+        state_lock = threading.Lock()
+        start = threading.Barrier(4)
+
+        def load():
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(
+                    state["max_active"], state["active"]
+                )
+            time.sleep(0.03)
+            with state_lock:
+                state["active"] -= 1
+            return sentinel
+
+        pipeline_contract.shared_contract_api.cache_clear()
+        try:
+            with mock.patch.object(
+                pipeline_contract, "_load_shared_contract_api", side_effect=load
+            ):
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = [
+                        executor.submit(
+                            lambda: (
+                                start.wait(),
+                                pipeline_contract.shared_contract_api(),
+                            )[1]
+                        )
+                        for _ in range(4)
+                    ]
+                    results = [future.result() for future in futures]
+        finally:
+            pipeline_contract.shared_contract_api.cache_clear()
+
+        self.assertEqual(results, [sentinel] * 4)
+        self.assertEqual(state["max_active"], 1)
+
     def test_structural_spm_fingerprint_ignores_shading_but_not_geometry(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

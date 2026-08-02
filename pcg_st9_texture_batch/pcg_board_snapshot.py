@@ -20,9 +20,9 @@ except ImportError:
     from .pcg_texture_common import SHARED_CACHE_DIR, TARGETS_PATH
 
 
-BOARD_SNAPSHOT_SCHEMA_VERSION = 1
+BOARD_SNAPSHOT_SCHEMA_VERSION = 2
 BOARD_SNAPSHOT_KIND = "pcg_board_display_snapshot"
-BOARD_SNAPSHOT_PATH = SHARED_CACHE_DIR / "board_snapshot_v1.json"
+BOARD_SNAPSHOT_PATH = SHARED_CACHE_DIR / "board_snapshot_v2.json"
 BOARD_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 BOARD_SNAPSHOT_RETENTION_COUNT = 1
 
@@ -32,34 +32,60 @@ DISPLAY_SNAPSHOT_OMITTED_KEYS = frozenset({
     "_gui_blender_connection_pending",
     "_gui_blender_connection_rows",
     "_gui_live_evidence",
+    "_gui_exact_mutation_evidence",
     "component_polygon_indices",
+    # These live-audit provenance graphs dominate real 55-folder reports but
+    # are not read by the cached board renderer.  The complete live report is
+    # left untouched and is still required before controls can be unlocked.
+    "assembly_handoff",
+    "expected_generator_bindings",
+    "generator_bindings",
+    "leaf_atlas_lineage",
     "polygon_indices",
+    "source_generator_bindings",
+    "source_material_statuses",
     "triangle_indices",
     "vertex_indices",
 })
 
 
-def _json_safe(value, *, omit_diagnostics=False):
+def _json_safe(
+        value, *, omit_diagnostics=False, omission_counts=None):
     if isinstance(value, dict):
-        return {
-            str(key): _json_safe(
+        result = {}
+        for key, nested in value.items():
+            key_text = str(key)
+            if (
+                omit_diagnostics
+                and key_text.casefold() in DISPLAY_SNAPSHOT_OMITTED_KEYS
+            ):
+                if omission_counts is not None:
+                    omission_counts[key_text.casefold()] = (
+                        omission_counts.get(key_text.casefold(), 0) + 1
+                    )
+                continue
+            result[key_text] = _json_safe(
                 nested,
                 omit_diagnostics=omit_diagnostics,
+                omission_counts=omission_counts,
             )
-            for key, nested in value.items()
-            if not (
-                omit_diagnostics
-                and str(key).casefold() in DISPLAY_SNAPSHOT_OMITTED_KEYS
-            )
-        }
+        return result
     if isinstance(value, (list, tuple)):
         return [
-            _json_safe(item, omit_diagnostics=omit_diagnostics)
+            _json_safe(
+                item,
+                omit_diagnostics=omit_diagnostics,
+                omission_counts=omission_counts,
+            )
             for item in value
         ]
     if isinstance(value, (set, frozenset)):
         rows = [
-            _json_safe(item, omit_diagnostics=omit_diagnostics)
+            _json_safe(
+                item,
+                omit_diagnostics=omit_diagnostics,
+                omission_counts=omission_counts,
+            )
             for item in value
         ]
         return sorted(
@@ -80,9 +106,21 @@ def _json_safe(value, *, omit_diagnostics=False):
     return str(value)
 
 
-def compact_display_report(report):
+def compact_display_report(report, *, metrics=None):
     """Return a JSON-safe report with large geometry diagnostics removed."""
-    return _json_safe(report or {}, omit_diagnostics=True)
+    omission_counts = {}
+    result = _json_safe(
+        report or {},
+        omit_diagnostics=True,
+        omission_counts=omission_counts,
+    )
+    if metrics is not None:
+        metrics["projection_schema_version"] = (
+            BOARD_SNAPSHOT_SCHEMA_VERSION
+        )
+        metrics["omission_counts"] = dict(sorted(omission_counts.items()))
+        metrics["omitted_field_count"] = sum(omission_counts.values())
+    return result
 
 
 def _canonical_json(value):
@@ -207,6 +245,8 @@ def write_board_display_snapshot(
         path=BOARD_SNAPSHOT_PATH,
         pcg_targets_path=TARGETS_PATH,
         max_bytes=BOARD_SNAPSHOT_MAX_BYTES,
+        metrics=None,
+        publish_check=None,
 ):
     """Atomically retain one compact snapshot within the byte budget.
 
@@ -214,6 +254,7 @@ def write_board_display_snapshot(
     the previous bounded snapshot when one exists.
     """
     destination = Path(path)
+    projection_metrics = {}
     payload = {
         "schema_version": BOARD_SNAPSHOT_SCHEMA_VERSION,
         "kind": BOARD_SNAPSHOT_KIND,
@@ -224,14 +265,37 @@ def write_board_display_snapshot(
             pcg_targets=pcg_targets,
             pcg_targets_path=pcg_targets_path,
         ),
-        "display_report": compact_display_report(report),
+        "projection": {
+            "schema_version": BOARD_SNAPSHOT_SCHEMA_VERSION,
+            "omitted_keys": sorted(DISPLAY_SNAPSHOT_OMITTED_KEYS),
+        },
+        "display_report": compact_display_report(
+            report,
+            metrics=projection_metrics,
+        ),
     }
+    payload["projection"].update(projection_metrics)
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    if len(encoded) > int(max_bytes):
+    candidate_bytes = len(encoded)
+    if metrics is not None:
+        metrics.update(projection_metrics)
+        metrics.update({
+            "candidate_bytes": candidate_bytes,
+            "max_bytes": int(max_bytes),
+            "item_count": len((report or {}).get("items") or ()),
+            "written": False,
+        })
+    if candidate_bytes > int(max_bytes):
+        if metrics is not None:
+            metrics["reason"] = "over_budget"
+        return None
+    if publish_check is not None and not publish_check():
+        if metrics is not None:
+            metrics["reason"] = "publication_canceled"
         return None
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -248,6 +312,10 @@ def write_board_display_snapshot(
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        if publish_check is not None and not publish_check():
+            if metrics is not None:
+                metrics["reason"] = "publication_canceled"
+            return None
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:
@@ -256,6 +324,9 @@ def write_board_display_snapshot(
                 temporary_path.unlink()
             except OSError:
                 pass
+    if metrics is not None:
+        metrics["written"] = True
+        metrics["reason"] = "written"
     return destination
 
 

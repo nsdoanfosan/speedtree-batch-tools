@@ -37,6 +37,8 @@ from speedtree_texture_contract import (
     BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
     BLENDER_BAKE_USAGE_SPEEDTREE_PREVIEW,
     inspect_spm_texture_slots,
+    inspect_spm_texture_slots_from_text,
+    index_texture_sets,
     parse_managed_texture_path,
     resolve_blender_cluster_bake_origin,
     resolve_texture_set,
@@ -48,6 +50,7 @@ from speedtree_pipeline_contract import (
     is_live_spm,
     production_spm_folders,
     read_spm_text as read_pipeline_spm_text,
+    spm_file_structural_semantic_fingerprint as pipeline_spm_structural_fingerprint,
     shared_contract_api,
 )
 from speedtree_legacy_cluster_contract import (
@@ -219,6 +222,10 @@ _PERSISTENT_SPM_ANALYSIS_DIRTY = False
 _PENDING_DECODED_HANDOFF = contextvars.ContextVar(
     "pcg_pending_decoded_spm_handoff", default=None
 )
+_PENDING_RAW_SPM_HANDOFF = contextvars.ContextVar(
+    "pcg_pending_raw_spm_handoff", default=None
+)
+SPM_CONTENT_IDENTITY_ALGORITHM = "sha256-full-v1"
 # v5 additionally excludes non-render Skin:Type=3 Branch scaffolds from the
 # material visibility set.
 SPM_ANALYSIS_CACHE_PATH = SHARED_CACHE_DIR / "spm_analysis_v5.json"
@@ -291,14 +298,138 @@ def unique(seq):
     return out
 
 
-def _new_report_scan_cache():
+class _SessionCacheMetrics:
+    """Thread-safe generation-local cache counters for startup receipts."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._counts = {}
+        self._paths = {}
+
+    def record(self, name, *, path=None, amount=1):
+        name = str(name)
+        with self._lock:
+            self._counts[name] = self._counts.get(name, 0) + int(amount)
+            if path is not None:
+                self._paths.setdefault(name, set()).add(
+                    startup_path_key(path)
+                )
+
+    def snapshot(self):
+        with self._lock:
+            result = dict(self._counts)
+            for name, paths in self._paths.items():
+                result[f"{name}_unique_files"] = len(paths)
+            return result
+
+    def __len__(self):
+        """Keep private report-cache diagnostics collection-like for tests."""
+        with self._lock:
+            return len(self._counts)
+
+
+def _new_report_scan_cache(
+        *, content_snapshots=None, spm_content_keys=None,
+        session_metrics=None, cluster_origin_receipts=None,
+        physical_receipts=None, file_sha256_memo=None):
     return {
         "file_cache_keys": {},
         "root_spms": {},
         "path_exists": {},
-        "content_snapshots": {},
+        "content_snapshots": (
+            content_snapshots if content_snapshots is not None else {}
+        ),
+        "spm_content_keys": (
+            spm_content_keys if spm_content_keys is not None else {}
+        ),
+        "session_metrics": (
+            session_metrics if session_metrics is not None
+            else _SessionCacheMetrics()
+        ),
         "legacy_cluster_states": {},
+        "cluster_origin_receipts": (
+            cluster_origin_receipts
+            if cluster_origin_receipts is not None else {}
+        ),
+        "physical_receipts": (
+            physical_receipts if physical_receipts is not None else {}
+        ),
+        "file_sha256_memo": (
+            file_sha256_memo if file_sha256_memo is not None else {}
+        ),
+        "canonical_manifests": {},
+        "texture_set_indexes": {},
     }
+
+
+def report_physical_receipt_cache():
+    """Return the bounded receipt-validation memo for this report only."""
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is None:
+        return {}
+    return report_cache["physical_receipts"]
+
+
+def report_spm_structural_semantic_fingerprint(path, *, raw_sha256=None):
+    """Reuse an exact structural projection across process restarts.
+
+    Physical-normalization receipts sometimes intentionally outlive a raw SPM
+    texture-only rewrite and therefore need the expensive XML structural
+    projection.  Bind that projection to the same full raw SHA used by the
+    semantic audit cache and persist only the compact digest.
+    """
+    global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    cache_key = _spm_analysis_cache_key(path)
+    path_key, size, mtime_ns, current_raw_sha256 = cache_key
+    expected_raw_sha256 = str(raw_sha256 or current_raw_sha256).casefold()
+    if expected_raw_sha256 != current_raw_sha256:
+        raise ValueError(
+            "SPM structural projection raw identity changed during audit"
+        )
+    with _PERSISTENT_CACHE_LOCK:
+        entry = _persistent_spm_analysis().get(path_key)
+        cached = (
+            entry.get("structural_semantic_fingerprint")
+            if entry
+            and entry.get("size") == size
+            and entry.get("mtime_ns") == mtime_ns
+            and entry.get("content_identity_sha256") == current_raw_sha256
+            and entry.get("structural_semantic_fingerprint_schema") == 1
+            else None
+        )
+    if cached:
+        _record_session_cache_metric(
+            "spm_structural_semantic_hits", path=path
+        )
+        return cached
+    _record_session_cache_metric(
+        "spm_structural_semantic_misses", path=path
+    )
+    result = pipeline_spm_structural_fingerprint(
+        path,
+        raw_sha256=current_raw_sha256,
+    )
+    with _PERSISTENT_CACHE_LOCK:
+        entry = _persistent_spm_analysis().get(path_key)
+        if (
+            entry
+            and entry.get("size") == size
+            and entry.get("mtime_ns") == mtime_ns
+            and entry.get("content_identity_sha256") == current_raw_sha256
+        ):
+            entry["structural_semantic_fingerprint_schema"] = 1
+            entry["structural_semantic_fingerprint"] = result
+            _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+    return result
+
+
+def _record_session_cache_metric(name, *, path=None, amount=1):
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is None:
+        return
+    metrics = report_cache.get("session_metrics")
+    if metrics is not None:
+        metrics.record(name, path=path, amount=amount)
 
 
 def _report_scan_cached(func):
@@ -335,7 +466,7 @@ def _take_pending_decoded_handoff(path, cache_key):
     handoff = _PENDING_DECODED_HANDOFF.get()
     if handoff is None:
         return None
-    _, size, mtime_ns = cache_key
+    _, size, mtime_ns = cache_key[:3]
     expected_path = str(Path(path).resolve()).casefold()
     handoff_path, handoff_size, handoff_mtime_ns = handoff.spm_key
     if (str(handoff_path).casefold(), handoff_size, handoff_mtime_ns) != (
@@ -343,6 +474,159 @@ def _take_pending_decoded_handoff(path, cache_key):
         return None
     _PENDING_DECODED_HANDOFF.set(None)
     return handoff
+
+
+def _spm_analysis_cache_key(path):
+    """Bind SPM semantics to one stable full-file SHA-256 snapshot."""
+    stat_key = _file_cache_key(path)
+    report_cache = _REPORT_SCAN_CACHE.get()
+    memo = (
+        report_cache.get("spm_content_keys")
+        if report_cache is not None else None
+    )
+    memo_key = startup_path_key(path)
+    cached = memo.get(memo_key) if memo is not None else None
+    pending = _PENDING_RAW_SPM_HANDOFF.get()
+    pending_hit = (
+        pending is not None
+        and pending[:3] == (memo_key, stat_key[1], stat_key[2])
+    )
+    memo_hit = (
+        cached is not None
+        and (cached["size"], cached["mtime_ns"]) == stat_key[1:]
+    )
+    if memo_hit:
+        content_sha256 = cached["sha256"]
+        cached_raw = cached.get("raw")
+        if isinstance(cached_raw, bytes):
+            _PENDING_RAW_SPM_HANDOFF.set((
+                memo_key,
+                cached["size"],
+                cached["mtime_ns"],
+                content_sha256,
+                cached_raw,
+            ))
+    elif pending_hit:
+        content_sha256 = pending[3]
+        memo_hit = True
+    else:
+        raw, after = _read_stable_spm_bytes(path)
+        content_sha256 = hashlib.sha256(raw).hexdigest()
+        row = {
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "sha256": content_sha256,
+        }
+        stat_key = (stat_key[0], after.st_size, after.st_mtime_ns)
+        if report_cache is not None:
+            report_cache["file_cache_keys"][stat_key[0]] = stat_key
+        if memo is not None:
+            memo[memo_key] = row
+        _PENDING_RAW_SPM_HANDOFF.set((
+            memo_key,
+            after.st_size,
+            after.st_mtime_ns,
+            content_sha256,
+            raw,
+        ))
+    _record_session_cache_metric(
+        "spm_content_identity_hits" if memo_hit
+        else "spm_content_identity_misses",
+        path=path,
+    )
+    return (*stat_key, content_sha256)
+
+
+def _read_stable_spm_bytes(path):
+    """Read one exact stat-bracketed SPM snapshot."""
+    candidate = Path(path)
+    raw = None
+    after = None
+    for _attempt in range(2):
+        before = candidate.stat()
+        raw = candidate.read_bytes()
+        after = candidate.stat()
+        if (
+            (before.st_size, before.st_mtime_ns)
+            == (after.st_size, after.st_mtime_ns)
+            and len(raw) == after.st_size
+        ):
+            return raw, after
+    raise RuntimeError(
+        f"SPM changed while calculating full content identity: {path}"
+    )
+
+
+def _prefetch_spm_content_keys(paths, *, cancel_check=None, workers=8):
+    """Full-hash the bounded fleet concurrently and retain compressed bytes.
+
+    The same exact bytes are handed to the later cold semantic decode.  This
+    turns hundreds of serialized OneDrive opens into one bounded phase without
+    weakening the full-SHA cache key or reading an SPM twice.
+    """
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is None:
+        return {"file_count": 0, "bytes_read": 0, "workers": 0}
+    unique_paths = {
+        startup_path_key(path): Path(path).absolute()
+        for path in paths or ()
+        if Path(path).is_file()
+    }
+    ordered = [unique_paths[key] for key in sorted(unique_paths)]
+    if not ordered:
+        return {"file_count": 0, "bytes_read": 0, "workers": 0}
+
+    def read_one(candidate):
+        raw, stat = _read_stable_spm_bytes(candidate)
+        return candidate, raw, stat, hashlib.sha256(raw).hexdigest()
+
+    worker_count = min(max(1, int(workers)), len(ordered))
+    total_bytes = 0
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="pcg-spm-identity",
+    ) as executor:
+        futures = [executor.submit(read_one, path) for path in ordered]
+        for future in as_completed(futures):
+            if cancel_check is not None and cancel_check():
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError("PCG startup audit cancelled")
+            candidate, raw, stat, digest = future.result()
+            memo_key = startup_path_key(candidate)
+            report_cache["spm_content_keys"][memo_key] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": digest,
+                "raw": raw,
+            }
+            report_cache["file_cache_keys"][str(candidate).lower()] = (
+                str(candidate).lower(), stat.st_size, stat.st_mtime_ns
+            )
+            total_bytes += stat.st_size
+            _record_session_cache_metric(
+                "spm_content_identity_prefetch", path=candidate
+            )
+    return {
+        "file_count": len(ordered),
+        "bytes_read": total_bytes,
+        "workers": worker_count,
+        "identity_algorithm": SPM_CONTENT_IDENTITY_ALGORITHM,
+    }
+
+
+def _take_pending_raw_spm_handoff(path, cache_key):
+    handoff = _PENDING_RAW_SPM_HANDOFF.get()
+    if handoff is None:
+        return None
+    path_key, size, mtime_ns, content_sha256 = cache_key
+    expected = (
+        startup_path_key(path), size, mtime_ns, content_sha256
+    )
+    if handoff[:4] != expected:
+        return None
+    _PENDING_RAW_SPM_HANDOFF.set(None)
+    return handoff[4]
 
 
 def _persistent_spm_analysis():
@@ -358,34 +642,63 @@ def _persistent_spm_analysis():
     return _PERSISTENT_SPM_ANALYSIS
 
 
-def save_spm_analysis_cache():
-    """Persist compact parsed SPM metadata; never writes to asset folders."""
+def save_spm_analysis_cache(*, publish_check=None):
+    """Persist compact memoization outside assets when generation is current.
+
+    ``publish_check`` is evaluated before serialization and immediately before
+    atomic replace.  A superseded/canceled refresh therefore cannot publish
+    its cache file; dirty in-memory rows remain eligible for a later current
+    generation because every row is independently content-bound.
+    """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY, _PERSISTENT_SBS_GRAPHS_DIRTY
     global _PERSISTENT_BLEND_IMAGES_DIRTY
     written = []
-    for dirty, cache_path, entries, cache_version in (
-        (_PERSISTENT_SPM_ANALYSIS_DIRTY, SPM_ANALYSIS_CACHE_PATH,
-         _persistent_spm_analysis(), 1),
-        (_PERSISTENT_SBS_GRAPHS_DIRTY, SBS_GRAPH_CACHE_PATH,
-         _persistent_sbs_graphs(), 1),
-        (_PERSISTENT_BLEND_IMAGES_DIRTY, BLEND_IMAGE_CACHE_PATH,
-         _persistent_blend_images(), SOURCE_INDEX_CACHE_VERSION),
-    ):
-        if not dirty:
-            continue
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = cache_path.with_name(
-            f".{cache_path.name}.{os.getpid()}.tmp")
-        payload = {"version": cache_version, "entries": entries}
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        temp_path.replace(cache_path)
-        written.append(cache_path)
-    _PERSISTENT_SPM_ANALYSIS_DIRTY = False
-    _PERSISTENT_SBS_GRAPHS_DIRTY = False
-    _PERSISTENT_BLEND_IMAGES_DIRTY = False
+    with _PERSISTENT_CACHE_LOCK:
+        for cache_name, cache_path, entries, cache_version in (
+            ("spm", SPM_ANALYSIS_CACHE_PATH,
+             _persistent_spm_analysis(), 1),
+            ("sbs", SBS_GRAPH_CACHE_PATH,
+             _persistent_sbs_graphs(), 1),
+            ("blend", BLEND_IMAGE_CACHE_PATH,
+             _persistent_blend_images(), SOURCE_INDEX_CACHE_VERSION),
+        ):
+            dirty = {
+                "spm": _PERSISTENT_SPM_ANALYSIS_DIRTY,
+                "sbs": _PERSISTENT_SBS_GRAPHS_DIRTY,
+                "blend": _PERSISTENT_BLEND_IMAGES_DIRTY,
+            }[cache_name]
+            if not dirty:
+                continue
+            if publish_check is not None and not publish_check():
+                break
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = cache_path.with_name(
+                f".{cache_path.name}.{os.getpid()}.tmp")
+            try:
+                payload = {"version": cache_version, "entries": entries}
+                temp_path.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                if publish_check is not None and not publish_check():
+                    break
+                temp_path.replace(cache_path)
+            finally:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            written.append(cache_path)
+            if cache_name == "spm":
+                _PERSISTENT_SPM_ANALYSIS_DIRTY = False
+            elif cache_name == "sbs":
+                _PERSISTENT_SBS_GRAPHS_DIRTY = False
+            else:
+                _PERSISTENT_BLEND_IMAGES_DIRTY = False
     return written or None
 
 
@@ -903,6 +1216,33 @@ def live_generator_delivery_snapshot(path):
     )
 
 
+def report_generator_delivery_snapshot(path):
+    """Return content-bound Generator evidence for one audit generation.
+
+    ``live_generator_delivery_snapshot`` deliberately remains an uncached
+    authority for callers that run after an external writer.  During a
+    read-only board audit, however, ``_spm_analysis`` has already bound the
+    document to a stable full-file SHA-256 snapshot.  Reusing the compact
+    delivery projection from that exact snapshot avoids reopening and
+    decompressing the same production SPM while retaining fail-closed content
+    invalidation (including same-size/restored-mtime replacement).
+    """
+    analysis = _spm_analysis(path)
+    snapshot = analysis.get("generator_delivery_snapshot")
+    if isinstance(snapshot, dict):
+        _record_session_cache_metric("spm_generator_snapshot_hits", path=path)
+        return copy.deepcopy(snapshot)
+
+    _record_session_cache_metric("spm_generator_snapshot_misses", path=path)
+    snapshot = live_generator_delivery_snapshot(path)
+    analysis["generator_delivery_snapshot"] = snapshot
+    _backfill_generator_delivery_snapshot_cache(
+        _spm_analysis_cache_key(path),
+        snapshot,
+    )
+    return copy.deepcopy(snapshot)
+
+
 def _material_cutout_mesh_ids(block):
     mesh_ids = []
     cutout = CUTOUT_MESH_ID_RE.search(block)
@@ -935,25 +1275,31 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     long-lived analysis cache never owns the decoded document.
     """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
-    cache_key = _file_cache_key(path)
+    cache_key = _spm_analysis_cache_key(path)
     cached = _SPM_ANALYSIS_CACHE.get(cache_key)
     if cached is not None:
+        _record_session_cache_metric("spm_memory_hits", path=path)
+        _PENDING_RAW_SPM_HANDOFF.set(None)
         if include_decoded_handoff:
             return cached, _take_pending_decoded_handoff(path, cache_key)
         return cached
 
-    path_key, size, mtime_ns = cache_key
+    path_key, size, mtime_ns, content_identity_sha256 = cache_key
     persistent = _persistent_spm_analysis()
     disk_entry = persistent.get(path_key)
-    # Schema 4 lacks only the two node-table-staleness keys added to each
-    # binding row (export_evidence/node_table_stale, issue #4). Rejecting it
-    # outright forces a full re-decode of every previously-cached SPM the
-    # moment this file bumps schema -- confirmed to blow a warm ~11s scan past
-    # 124s on a 431-file cache. Reuse it; those two keys are simply absent
-    # until the SPM's stat next changes and it gets a fresh parse.
+    # Legacy schema-4/5 rows without a full content digest are intentionally
+    # cold-missed once.  Reusing a stat-only semantic payload could combine
+    # stale material/generator data with current live evidence after a
+    # same-size, restored-mtime replacement.
     if disk_entry and disk_entry.get("size") == size \
             and disk_entry.get("mtime_ns") == mtime_ns \
+            and disk_entry.get("content_identity_sha256") \
+            == content_identity_sha256 \
+            and disk_entry.get("content_identity_algorithm") \
+            == SPM_CONTENT_IDENTITY_ALGORITHM \
             and disk_entry.get("leaf_binding_schema") in (4, 5):
+        _record_session_cache_metric("spm_persistent_hits", path=path)
+        _PENDING_RAW_SPM_HANDOFF.set(None)
         analysis = {
             "material_rows": disk_entry.get("material_rows", []),
             "material_names": disk_entry.get("material_names", []),
@@ -964,13 +1310,43 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             "mesh_asset_ids": set(disk_entry.get("mesh_asset_ids", [])),
             "generator_foregrounds_snapshot": _disk_generator_foregrounds(
                 disk_entry),
+            "texture_slot_inspection": (
+                disk_entry.get("texture_slot_inspection")
+                if disk_entry.get("texture_slot_schema") == 1
+                else None
+            ),
+            "generator_delivery_snapshot": (
+                copy.deepcopy(disk_entry.get("generator_delivery_snapshot"))
+                if disk_entry.get("generator_delivery_snapshot_schema") == 1
+                else None
+            ),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
         if include_decoded_handoff:
             return analysis, _take_pending_decoded_handoff(path, cache_key)
         return analysis
 
-    text = read_maybe_gzip_text(path)
+    _record_session_cache_metric("spm_decode_misses", path=path)
+    _record_session_cache_metric(
+        "spm_compressed_bytes_read", path=path, amount=size
+    )
+    raw = _take_pending_raw_spm_handoff(path, cache_key)
+    if raw is None:
+        text = read_maybe_gzip_text(path)
+    else:
+        decoded = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+        text = decoded.decode("utf-8", errors="replace")
+    _record_session_cache_metric(
+        "spm_decoded_text_chars", path=path, amount=len(text)
+    )
+    # Production SPMs expand to tens of megabytes of XML each.  The prior
+    # one-slot ContextVar handoff was easily displaced when an audit touched a
+    # second SPM before asking for material slots, causing almost every file to
+    # be reopened and decompressed.  Slot inspection is needed for nearly the
+    # entire fleet, so fuse it into the owned cold decode and persist the
+    # compact result with the other content-bound semantics.
+    texture_slot_inspection = inspect_spm_texture_slots_from_text(path, text)
+    _record_session_cache_metric("spm_slot_fused_parses", path=path)
     rows = []
     for block_match in MATERIAL_BLOCK_RE.finditer(text):
         block = block_match.group(0)
@@ -1003,6 +1379,21 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
         for match in MESH_ASSET_ID_RE.finditer(text)
         if match.group(1).strip() not in {"", "-1"}
     }
+    generator_delivery_snapshot = {
+        "contract": "speedtree_live_generator_delivery_snapshot_v1",
+        "spm": str(Path(path).resolve(strict=False)),
+        "spm_text_sha256": hashlib.sha256(
+            text.encode("utf-8")
+        ).hexdigest(),
+        "total_node_count": total_nodes,
+        "leaf_generator_bindings": [dict(row) for row in leaf_bindings],
+        "mesh_asset_ids": sorted(mesh_assets),
+        "node_table": _node_table_state(
+            export_node_counts,
+            total_nodes,
+            _generator_guid_keys_from_text(text),
+        ),
+    }
 
     analysis = {
         "material_rows": rows,
@@ -1024,6 +1415,8 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
         # a valid receipt makes that worthwhile -- and only ever reads this
         # SPM once either way.
         "generator_foregrounds_snapshot": None,
+        "texture_slot_inspection": texture_slot_inspection,
+        "generator_delivery_snapshot": generator_delivery_snapshot,
     }
     # A modified file receives a new stat key. Drop only stale entries for
     # this exact path so long-running GUI refreshes do not grow indefinitely.
@@ -1036,6 +1429,8 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
         persistent[path_key] = {
             "size": size,
             "mtime_ns": mtime_ns,
+            "content_identity_sha256": content_identity_sha256,
+            "content_identity_algorithm": SPM_CONTENT_IDENTITY_ALGORITHM,
             "material_rows": rows,
             "material_names": analysis["material_names"],
             "referenced_material_ids": sorted(referenced),
@@ -1043,6 +1438,10 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             "leaf_generator_bindings": leaf_bindings,
             "mesh_asset_ids": sorted(mesh_assets),
             "leaf_binding_schema": 5,
+            "texture_slot_schema": 1,
+            "texture_slot_inspection": texture_slot_inspection,
+            "generator_delivery_snapshot_schema": 1,
+            "generator_delivery_snapshot": generator_delivery_snapshot,
         }
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     handoff = make_decoded_spm_handoff(
@@ -1089,6 +1488,25 @@ def _backfill_generator_foregrounds_cache(cache_key, snapshot):
     entry["generator_foregrounds"] = foregrounds
     entry["duplicate_generator_guids"] = sorted(duplicate_guids)
     _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+
+
+def _backfill_generator_delivery_snapshot_cache(cache_key, snapshot):
+    """Enrich an exact legacy semantic-cache row after one narrowed read."""
+    global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    path_key, size, mtime_ns, content_identity_sha256 = cache_key
+    with _PERSISTENT_CACHE_LOCK:
+        entry = _persistent_spm_analysis().get(path_key)
+        if (
+            not entry
+            or entry.get("size") != size
+            or entry.get("mtime_ns") != mtime_ns
+            or entry.get("content_identity_sha256")
+            != content_identity_sha256
+        ):
+            return
+        entry["generator_delivery_snapshot_schema"] = 1
+        entry["generator_delivery_snapshot"] = copy.deepcopy(snapshot)
+        _PERSISTENT_SPM_ANALYSIS_DIRTY = True
 
 
 def canonical_material_name(name):
@@ -3568,11 +3986,37 @@ def register_blend_source_index(index_row, blend_path):
     return names
 
 
-def ensure_blend_source_index(cfg, session):
+def _terminate_owned_process_tree(process):
+    """Terminate only the exact child tree launched by this audit."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=0x08000000,
+        )
+    else:
+        try:
+            os.killpg(process.pid, 15)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+
+
+def ensure_blend_source_index(
+        cfg, session, *, cancel_check=None, metrics=None):
     """Index only this audit's unresolved exact blend identities."""
     global _PERSISTENT_BLEND_IMAGES_DIRTY
     requests = session.pending_requests()
     if not requests:
+        if metrics is not None:
+            metrics.update({
+                "request_count": 0,
+                "cache_hit": True,
+                "status": "cached",
+            })
         return {"indexed": 0, "cached": True}
 
     blender = Path(cfg.get("blender_exe", ""))
@@ -3611,16 +4055,64 @@ def ensure_blend_source_index(cfg, session):
         "--python", str(script), "--",
         "--request", str(request_path), "--out", str(report_path),
     ]
+    child = None
+    child_started = time.perf_counter()
+    timeout_seconds = float(cfg.get("atlas_job_timeout", 1800))
     try:
-        result = subprocess.run(
+        child = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=cfg.get("atlas_job_timeout", 1800),
-            creationflags=0x08000000 if os.name == "nt" else 0,
+            creationflags=(0x08000000 | 0x00000200) if os.name == "nt" else 0,
+            start_new_session=(os.name != "nt"),
         )
-        if result.returncode != 0 or not report_path.is_file():
-            detail = (result.stderr or result.stdout or "").strip()[-1000:]
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if cancel_check is not None and cancel_check():
+                _terminate_owned_process_tree(child)
+                child.communicate()
+                if metrics is not None:
+                    metrics.update({
+                        "request_count": len(requests),
+                        "cache_hit": False,
+                        "status": "canceled",
+                        "child_pid": child.pid,
+                        "child_tree_terminated": True,
+                        "wall_seconds": round(
+                            time.perf_counter() - child_started, 6
+                        ),
+                    })
+                raise BlendSourceIndexError(
+                    "Blender source indexing cancelled"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_owned_process_tree(child)
+                child.communicate()
+                if metrics is not None:
+                    metrics.update({
+                        "request_count": len(requests),
+                        "cache_hit": False,
+                        "status": "timeout",
+                        "child_pid": child.pid,
+                        "child_tree_terminated": True,
+                        "wall_seconds": round(
+                            time.perf_counter() - child_started, 6
+                        ),
+                    })
+                raise BlendSourceIndexError(
+                    "Blender source indexing timed out"
+                )
+            try:
+                stdout, stderr = child.communicate(
+                    timeout=min(0.10, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if child.returncode != 0 or not report_path.is_file():
+            detail = (stderr or stdout or "").strip()[-1000:]
             raise BlendSourceIndexError(
                 "Blender source indexing failed"
                 + (f": {detail}" if detail else "")
@@ -3629,10 +4121,48 @@ def ensure_blend_source_index(cfg, session):
         indexed = session.install_report(payload, requests)
         if indexed:
             _PERSISTENT_BLEND_IMAGES_DIRTY = True
-        return {"indexed": indexed, "pending": len(requests)}
-    except BlendSourceIndexError:
+        result = {"indexed": indexed, "pending": len(requests)}
+        if metrics is not None:
+            timing = payload.get("timing") or {}
+            metrics.update({
+                "request_count": len(requests),
+                "cache_hit": False,
+                "status": "ok",
+                "child_pid": child.pid,
+                "child_exit_code": child.returncode,
+                "wall_seconds": round(
+                    time.perf_counter() - child_started, 6
+                ),
+                "child_timing": timing,
+            })
+        return result
+    except BlendSourceIndexError as exc:
+        if metrics is not None and "status" not in metrics:
+            metrics.update({
+                "request_count": len(requests),
+                "cache_hit": False,
+                "status": "error",
+                "child_pid": getattr(child, "pid", None),
+                "child_exit_code": getattr(child, "returncode", None),
+                "wall_seconds": round(
+                    time.perf_counter() - child_started, 6
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
         raise
     except Exception as exc:
+        if metrics is not None:
+            metrics.update({
+                "request_count": len(requests),
+                "cache_hit": False,
+                "status": "error",
+                "child_pid": getattr(child, "pid", None),
+                "child_exit_code": getattr(child, "returncode", None),
+                "wall_seconds": round(
+                    time.perf_counter() - child_started, 6
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
         raise BlendSourceIndexError(
             f"Blender source indexing failed: {type(exc).__name__}: {exc}"
         ) from exc
@@ -3740,7 +4270,25 @@ def find_export_maps_multi(dirs, atlas_base, required_maps):
     # later complete set. Legacy M_ outputs retain exact-name lookup; material
     # labels such as Green/Yellow are never inferred as managed T_ sets.
     if str(atlas_base or "").strip().casefold().startswith("t_"):
-        resolved = resolve_texture_set(dirs, atlas_base, required_maps)
+        report_cache = _REPORT_SCAN_CACHE.get()
+        index_cache = (
+            report_cache.get("texture_set_indexes")
+            if report_cache is not None else None
+        )
+        index_key = tuple(startup_path_key(path) for path in dirs)
+        texture_index = (
+            index_cache.get(index_key) if index_cache is not None else None
+        )
+        if texture_index is None:
+            texture_index = index_texture_sets(dirs)
+            if index_cache is not None:
+                index_cache[index_key] = texture_index
+        resolved = resolve_texture_set(
+            dirs,
+            atlas_base,
+            required_maps,
+            texture_index=texture_index,
+        )
         export_maps = {
             map_name: resolved["files"].get(str(map_name).casefold())
             for map_name in required_maps
@@ -4234,8 +4782,39 @@ def _inspect_spm_texture_slots_cached(path_text, size, mtime_ns):
 
 
 def _cached_spm_texture_slots(path):
-    path_text, size, mtime_ns = _file_cache_key(path)
-    return _inspect_spm_texture_slots_cached(path_text, size, mtime_ns)
+    global _PERSISTENT_SPM_ANALYSIS_DIRTY
+    cache_key = _spm_analysis_cache_key(path)
+    analysis = _spm_analysis(path)
+    inspection = analysis.get("texture_slot_inspection")
+    if isinstance(inspection, dict):
+        _record_session_cache_metric("spm_slot_hits", path=path)
+        return inspection
+
+    _record_session_cache_metric("spm_slot_misses", path=path)
+    handoff = _take_pending_decoded_handoff(path, cache_key)
+    if handoff is not None:
+        inspection = inspect_spm_texture_slots_from_text(path, handoff.text)
+    else:
+        path_text, size, mtime_ns = cache_key[:3]
+        inspection = _inspect_spm_texture_slots_cached(
+            path_text, size, mtime_ns
+        )
+    analysis["texture_slot_inspection"] = inspection
+
+    path_key, size, mtime_ns, content_identity_sha256 = cache_key
+    with _PERSISTENT_CACHE_LOCK:
+        entry = _persistent_spm_analysis().get(path_key)
+        if (
+            entry
+            and entry.get("size") == size
+            and entry.get("mtime_ns") == mtime_ns
+            and entry.get("content_identity_sha256")
+            == content_identity_sha256
+        ):
+            entry["texture_slot_schema"] = 1
+            entry["texture_slot_inspection"] = inspection
+            _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+    return inspection
 
 
 def _spm_material_identity_and_slot_rows(
@@ -4333,6 +4912,56 @@ def cluster_render_origin_receipt(
     material_name=None,
     path_alias_folder=None,
 ):
+    """Memoize one exact physical origin inside the current report only."""
+    report_cache = _REPORT_SCAN_CACHE.get()
+    cache = (
+        report_cache.get("cluster_origin_receipts")
+        if report_cache is not None else None
+    )
+    cache_key = None
+    if cache is not None:
+        cache_key = (
+            startup_path_key(folder),
+            _spm_analysis_cache_key(spm),
+            tuple(str(ref) for ref in refs or ()),
+            str(material_id or ""),
+            str(material_name or ""),
+            startup_path_key(path_alias_folder)
+            if path_alias_folder is not None else "",
+        )
+        if cache_key in cache:
+            _record_session_cache_metric(
+                "cluster_origin_receipt_hits", path=spm
+            )
+            return copy.deepcopy(cache[cache_key])
+    _record_session_cache_metric("cluster_origin_receipt_misses", path=spm)
+    result = _cluster_render_origin_receipt_uncached(
+        folder,
+        spm,
+        refs,
+        material_id=material_id,
+        material_name=material_name,
+        path_alias_folder=path_alias_folder,
+        file_sha256_memo=(
+            report_cache.get("file_sha256_memo")
+            if report_cache is not None else None
+        ),
+    )
+    if cache is not None:
+        cache[cache_key] = copy.deepcopy(result)
+    return result
+
+
+def _cluster_render_origin_receipt_uncached(
+    folder,
+    spm,
+    refs,
+    *,
+    material_id=None,
+    material_name=None,
+    path_alias_folder=None,
+    file_sha256_memo=None,
+):
     """Return exact SPM-material + Blender physical-capture provenance.
 
     ``path_alias_folder`` is a fail-closed compatibility boundary for old
@@ -4418,6 +5047,7 @@ def cluster_render_origin_receipt(
         output,
         asset_root,
         consumption_context=BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+        file_sha256_memo=file_sha256_memo,
     )
     if issue or not receipt:
         return {}
@@ -4459,6 +5089,7 @@ def cluster_render_origin_receipt(
         normalized,
         asset_root,
         consumption_context=BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+        file_sha256_memo=file_sha256_memo,
     ):
         return {}
     return normalized
@@ -5506,7 +6137,16 @@ def _unsafe_provisional_source(
     return "blocked_unproven_source"
 
 
-def _canonical_manifest_output(asset_root, texture_base):
+def _validated_canonical_manifests(asset_root):
+    report_cache = _REPORT_SCAN_CACHE.get()
+    cache = (
+        report_cache.get("canonical_manifests")
+        if report_cache is not None else None
+    )
+    cache_key = startup_path_key(asset_root)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    manifests = []
     for path in canonical_manifest_candidates(asset_root):
         if not path.is_file():
             continue
@@ -5514,7 +6154,22 @@ def _canonical_manifest_output(asset_root, texture_base):
             payload = json.loads(path.read_text(encoding="utf-8"))
             validate_canonical_manifest(payload, path, require_files=True)
         except Exception as exc:
-            return None, f"{type(exc).__name__}: {exc}"
+            result = ([], f"{type(exc).__name__}: {exc}")
+            if cache is not None:
+                cache[cache_key] = result
+            return result
+        manifests.append((path, payload))
+    result = (manifests, None)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _canonical_manifest_output(asset_root, texture_base):
+    manifests, manifest_error = _validated_canonical_manifests(asset_root)
+    if manifest_error:
+        return None, manifest_error
+    for _path, payload in manifests:
         output = next(
             (
                 row
@@ -5539,18 +6194,10 @@ def _canonical_manifest_consumer_bindings(asset_root):
     sets on a later audit.
     """
     asset_root = Path(asset_root).resolve()
-    for manifest_path in canonical_manifest_candidates(asset_root):
-        if not manifest_path.is_file():
-            continue
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            validate_canonical_manifest(
-                payload,
-                manifest_path,
-                require_files=True,
-            )
-        except Exception:
-            return {}, None
+    manifests, manifest_error = _validated_canonical_manifests(asset_root)
+    if manifest_error:
+        return {}, None
+    for manifest_path, payload in manifests:
 
         by_name = {}
         by_id = {}
@@ -6601,9 +7248,13 @@ def _validated_cached_provider_map(value, inventory):
     return result
 
 
-def canonical_cluster_provider_map(root, metrics=None):
+def canonical_cluster_provider_map(root, metrics=None, inventory_paths=None):
     """Map canonical provider candidates through a content-validated cache."""
     inventory = _provider_inventory(root)
+    if inventory_paths is not None:
+        inventory_paths.extend(
+            Path(path) for path in inventory.get("_source_paths") or ()
+        )
     namespace = startup_path_key(root)
     cache = ContentAddressedJsonCache(
         PROVIDER_MAP_CACHE_PATH,
@@ -6666,14 +7317,27 @@ def canonical_cluster_provider_map(root, metrics=None):
 
 
 
-def _audit_one_with_handoff_scope(audit_one, folder):
+def _audit_one_with_handoff_scope(
+        audit_one, folder, *, content_snapshots=None,
+        spm_content_keys=None, session_metrics=None,
+        cluster_origin_receipts=None, physical_receipts=None,
+        file_sha256_memo=None):
     """Bound decoded handoff and repeated filesystem reads to one folder."""
-    report_token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache())
+    report_token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache(
+        content_snapshots=content_snapshots,
+        spm_content_keys=spm_content_keys,
+        session_metrics=session_metrics,
+        cluster_origin_receipts=cluster_origin_receipts,
+        physical_receipts=physical_receipts,
+        file_sha256_memo=file_sha256_memo,
+    ))
     _PENDING_DECODED_HANDOFF.set(None)
+    _PENDING_RAW_SPM_HANDOFF.set(None)
     try:
         return audit_one(folder)
     finally:
         _PENDING_DECODED_HANDOFF.set(None)
+        _PENDING_RAW_SPM_HANDOFF.set(None)
         _REPORT_SCAN_CACHE.reset(report_token)
 
 
@@ -6682,12 +7346,49 @@ def _audit_report_folders(
     audit_one,
     progress_callback=None,
     item_callback=None,
+    cancel_check=None,
 ):
     items = []
     total_folders = len(folders)
+    report_cache = _REPORT_SCAN_CACHE.get()
+    content_snapshots = (
+        report_cache.get("content_snapshots")
+        if report_cache is not None else None
+    )
+    session_metrics = (
+        report_cache.get("session_metrics")
+        if report_cache is not None else None
+    )
+    spm_content_keys = (
+        report_cache.get("spm_content_keys")
+        if report_cache is not None else None
+    )
+    cluster_origin_receipts = (
+        report_cache.get("cluster_origin_receipts")
+        if report_cache is not None else None
+    )
+    physical_receipts = (
+        report_cache.get("physical_receipts")
+        if report_cache is not None else None
+    )
+    file_sha256_memo = (
+        report_cache.get("file_sha256_memo")
+        if report_cache is not None else None
+    )
     if total_folders <= 1:
         for folder in folders:
-            item = _audit_one_with_handoff_scope(audit_one, folder)
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("PCG folder audit cancelled")
+            item = _audit_one_with_handoff_scope(
+                audit_one,
+                folder,
+                content_snapshots=content_snapshots,
+                spm_content_keys=spm_content_keys,
+                session_metrics=session_metrics,
+                cluster_origin_receipts=cluster_origin_receipts,
+                physical_receipts=physical_receipts,
+                file_sha256_memo=file_sha256_memo,
+            )
             items.append(item)
             if item_callback is not None:
                 item_callback(item, folder)
@@ -6705,12 +7406,24 @@ def _audit_report_folders(
     ) as executor:
         futures = {
             executor.submit(
-                _audit_one_with_handoff_scope, audit_one, folder
+                _audit_one_with_handoff_scope,
+                audit_one,
+                folder,
+                content_snapshots=content_snapshots,
+                spm_content_keys=spm_content_keys,
+                session_metrics=session_metrics,
+                cluster_origin_receipts=cluster_origin_receipts,
+                physical_receipts=physical_receipts,
+                file_sha256_memo=file_sha256_memo,
             ): (index, folder)
             for index, folder in enumerate(folders)
         }
         completed = 0
         for future in as_completed(futures):
+            if cancel_check is not None and cancel_check():
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError("PCG folder audit cancelled")
             index, folder = futures[future]
             indexed_items[index] = future.result()
             if item_callback is not None:
@@ -6724,7 +7437,8 @@ def _audit_report_folders(
 @_report_scan_cached
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
-        target_mesh_names=None, progress_callback=None, item_callback=None):
+        target_mesh_names=None, progress_callback=None, item_callback=None,
+        cancel_check=None):
     startup_started = time.perf_counter()
     phase_started = startup_started
     startup_phases = []
@@ -6742,6 +7456,11 @@ def make_report(
         })
         phase_started = now
 
+    def require_not_cancelled():
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("PCG startup audit cancelled")
+
+    require_not_cancelled()
     pcg_targets = focus_pcg_targets(
         pcg_targets,
         cfg.get("pcg_focus_data_assets"),
@@ -6751,14 +7470,23 @@ def make_report(
     finish_phase("candidate_discovery", folder_count=len(folders))
     blend_source_session = BlendSourceIndexSession(_persistent_blend_images())
     provider_metrics = {}
+    provider_inventory_paths = []
     provider_map = (
         canonical_cluster_provider_map(
-            cfg["tree_root"], metrics=provider_metrics
+            cfg["tree_root"], metrics=provider_metrics,
+            inventory_paths=provider_inventory_paths,
         )
         if cfg.get("tree_root")
         else {}
     )
     finish_phase("provider_discovery", **provider_metrics)
+    require_not_cancelled()
+    spm_prefetch_metrics = _prefetch_spm_content_keys(
+        provider_inventory_paths,
+        cancel_check=cancel_check,
+    )
+    finish_phase("spm_content_identity_prefetch", **spm_prefetch_metrics)
+    require_not_cancelled()
     requested_target_mesh_names = sorted({
         normalize_local_asset_stem(name)
         for name in target_mesh_names or []
@@ -6794,18 +7522,26 @@ def make_report(
         audit_one,
         progress_callback=discovery_progress,
         item_callback=item_callback,
+        cancel_check=cancel_check,
     )
     finish_phase("primary_folder_audit", folder_count=len(folders))
+    require_not_cancelled()
     pending = blend_source_session.pending_requests()
     revalidated_folder_count = 0
+    blend_index_metrics = {}
     if pending:
         affected_scope_keys = blend_source_session.pending_audit_scopes()
-        ensure_blend_source_index(cfg, blend_source_session)
+        ensure_blend_source_index(
+            cfg,
+            blend_source_session,
+            cancel_check=cancel_check,
+            metrics=blend_index_metrics,
+        )
         finish_phase(
             "blend_source_index",
-            request_count=len(pending),
-            cache_hit=False,
+            **blend_index_metrics,
         )
+        require_not_cancelled()
         # The index child proved the requested bytes at its exit boundary.
         # Re-hash on the authoritative final pass so a same-size/mtime-restored
         # replacement cannot inherit that row between discovery and result.
@@ -6819,7 +7555,10 @@ def make_report(
         if not affected_scope_keys or not affected_folders:
             affected_folders = list(folders)
         replacements = _audit_report_folders(
-            affected_folders, audit_one, progress_callback=None
+            affected_folders,
+            audit_one,
+            progress_callback=None,
+            cancel_check=cancel_check,
         )
         replacement_by_folder = {
             startup_path_key(item["folder"]): item for item in replacements
@@ -6843,6 +7582,7 @@ def make_report(
             "blend_source_index",
             request_count=0,
             cache_hit=True,
+            status="cached",
         )
     finish_phase(
         "bounded_folder_revalidation",
@@ -6974,6 +7714,13 @@ def make_report(
         and not pending
         else "cold_or_invalidated"
     )
+    report_cache = _REPORT_SCAN_CACHE.get()
+    session_cache_metrics = (
+        report_cache["session_metrics"].snapshot()
+        if report_cache is not None
+        and report_cache.get("session_metrics") is not None
+        else {}
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "config": cfg,
@@ -6984,9 +7731,11 @@ def make_report(
             "wall_seconds": round(startup_total, 6),
             "folder_count": len(folders),
             "blend_index_request_count": len(pending),
+            "blend_index_metrics": blend_index_metrics,
             "revalidated_folder_count": revalidated_folder_count,
             "provider_metrics": provider_metrics,
             "sbs_metrics": sbs_metrics,
+            "session_cache_metrics": session_cache_metrics,
             "phases": startup_phases,
         },
         "pcg_targets": {
