@@ -24,10 +24,16 @@ permissions:
 # by the next merge within fourteen minutes, so the only merge commit that was
 # ever measured was the last one. main is not a protected branch and no check
 # is required, so a cancelled push run is not a delayed verification, it is the
-# absence of one: the tree every worktree branches from was never built. Let
-# main runs finish; queue them per-ref so they still cannot pile up in parallel.
+# absence of one: the tree every worktree branches from was never built.
+#
+# cancel-in-progress: false alone does not fix that. A group holds at most one
+# running and one queued run: a third arrival cancels the queued one. Measured
+# after that change landed -- runs 30749966767 and 30749994407, the merges of
+# #132 and #131, were both cancelled while queued behind #133. So push runs get
+# a group of their own, keyed by commit, and every merge commit is built. Pull
+# requests keep the per-ref group where superseding is what you want.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
