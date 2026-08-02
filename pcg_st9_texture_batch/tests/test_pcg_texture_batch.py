@@ -92,6 +92,24 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_empty_cluster_items_skip_atlas_declaration_scan(self):
+        items = [{
+            "folder": "manifest-free-tree",
+            "cluster_items": [],
+        }]
+
+        with mock.patch.object(
+            pcg_texture_audit,
+            "atlas_provisional_source_declarations",
+        ) as declarations:
+            actual = pcg_texture_audit.refresh_texture_output_contract_states(
+                items,
+                {"source_texture_roots": []},
+            )
+
+        self.assertIs(actual, items)
+        declarations.assert_not_called()
+
     def test_unchanged_receipt_is_not_reported_as_written(self):
         report = {"items": []}
 

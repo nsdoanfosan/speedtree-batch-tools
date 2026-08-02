@@ -5948,7 +5948,15 @@ def _atlas_blender_bake_receipt_is_valid(
 
 
 def _atlas_manifest_targets(asset_root):
-    """Discover target identities, leaving manifest validity to the resolver."""
+    """Skip fleet resolution only when no operational Atlas carrier exists.
+
+    A manifest-free folder has no Atlas evidence to consume, so resolving every
+    sibling SPM only performs repeated negative directory scans.  Once any
+    operational carrier exists, retain the full fleet candidate set so the
+    resolver still owns target identity, freshness, and fail-closed behavior.
+    Diagnostic-only scope/legacy records remain available to direct resolver
+    calls and do not force work in these selected-payload-only batch consumers.
+    """
     asset_root = _resolve_for_membership(asset_root)
     targets = {}
 
@@ -5961,24 +5969,33 @@ def _atlas_manifest_targets(asset_root):
             return
         targets.setdefault(os.path.normcase(str(path)).casefold(), path)
 
+    target_dir = asset_root / ".atlas_leaf_speedtree_targets"
+    scope_dir = asset_root / ".atlas_leaf_speedtree_scopes"
+    global_path = asset_root / "speedtree_import_manifest.json"
+    target_records = (
+        [path for path in sorted(target_dir.glob("*.json")) if path.is_file()]
+        if target_dir.is_dir()
+        else []
+    )
+    scope_records = (
+        [
+            path for path in sorted(scope_dir.glob("*.json"))
+            if path.is_file() and "__" in path.stem
+        ]
+        if scope_dir.is_dir()
+        else []
+    )
+    if not target_records and not scope_records and not global_path.is_file():
+        return []
+
     for path in sorted(asset_root.glob("*.spm")):
         if path.is_file():
             add(path)
+    for path in target_records:
+        add(asset_root / f"{path.stem}.spm")
+    for path in scope_records:
+        add(asset_root / f"{path.stem.rsplit('__', 1)[1]}.spm")
 
-    target_dir = asset_root / ".atlas_leaf_speedtree_targets"
-    if target_dir.is_dir():
-        for path in sorted(target_dir.glob("*.json")):
-            if path.is_file():
-                add(asset_root / f"{path.stem}.spm")
-
-    scope_dir = asset_root / ".atlas_leaf_speedtree_scopes"
-    if scope_dir.is_dir():
-        for path in sorted(scope_dir.glob("*.json")):
-            if not path.is_file() or "__" not in path.stem:
-                continue
-            add(asset_root / f"{path.stem.rsplit('__', 1)[1]}.spm")
-
-    global_path = asset_root / "speedtree_import_manifest.json"
     if global_path.is_file():
         try:
             payload = json.loads(global_path.read_text(encoding="utf-8"))
@@ -6662,10 +6679,13 @@ def texture_output_contract_state(
 def refresh_texture_output_contract_states(items, cfg=None):
     source_texture_roots = (cfg or {}).get("source_texture_roots") or []
     for item in items:
+        cluster_items = item.get("cluster_items") or []
+        if not cluster_items:
+            continue
         declarations = atlas_provisional_source_declarations(
             item.get("folder") or ""
         )
-        for entry in item.get("cluster_items") or []:
+        for entry in cluster_items:
             entry["texture_contract_state"] = texture_output_contract_state(
                 entry,
                 item.get("folder") or "",
