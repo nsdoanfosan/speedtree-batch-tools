@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "source_issue": 58,
+  "description": "Sanitized multi-provider target whose four active managed materials are each proven by an exact target receipt.",
+  "asset_folder": "tree_birch_sample",
+  "target_spm": "SK_tree_birch_sample_03.spm",
+  "providers": [
+    {
+      "kind": "exact_per_target",
+      "payload": {
+        "atlas_manifest_schema_version": 1,
+        "spm": "{target}",
+        "blend_file": "{root}\\cluster\\SK_leaf_side.blend",
+        "source_collection": "Atlas_Cluster_Cards",
+        "export_scope_id": "scope-side",
+        "material_groups": [{
+          "material": "M_leaf_side",
+          "material_id": 18,
+          "mesh_ids": [36],
+          "blender_cluster_bake_texture": {
+            "files": {
+              "albedo": "{root}\\cluster\\leaf_side.tga",
+              "alpha": "{root}\\cluster\\leaf_side_Opacity.tga"
+            }
+          }
+        }],
+        "generator_connection": {
+          "requested": true,
+          "complete": true,
+          "bindings": [{
+            "generator_guid": "leaf-side-guid",
+            "generator_name": "Leaf Side",
+            "slot_prefix": "Leaves:Type:0",
+            "target_material_id": 18,
+            "target_mesh_id": 36
+          }]
+        }
+      }
+    },
+    {
+      "kind": "exact_target_scope",
+      "name": "scope-branch-a__SK_tree_birch_sample_03.json",
+      "payload": {
+        "atlas_manifest_schema_version": 1,
+        "spm": "{target}",
+        "blend_file": "{root}\\cluster\\SK_branch_a.blend",
+        "source_collection": "Atlas_Branch_Plans",
+        "export_scope_id": "scope-branch-a",
+        "material_groups": [{
+          "material": "M_branch_a",
+          "material_id": 19,
+          "mesh_ids": [33],
+          "blender_cluster_bake_texture": {
+            "files": {
+              "albedo": "{root}\\cluster\\branch_a.tga",
+              "alpha": "{root}\\cluster\\branch_a_Opacity.tga"
+            }
+          }
+        }],
+        "generator_connection": {
+          "requested": true,
+          "complete": true,
+          "bindings": [{
+            "generator_guid": "branch-a-guid",
+            "generator_name": "Frond A",
+            "slot_prefix": "Material:Frond:0",
+            "target_material_id": 19,
+            "target_mesh_id": 33
+          }]
+        }
+      }
+    },
+    {
+      "kind": "exact_target_scope",
+      "name": "scope-branch-b__SK_tree_birch_sample_03.json",
+      "payload": {
+        "atlas_manifest_schema_version": 1,
+        "spm": "{target}",
+        "blend_file": "{root}\\cluster\\SK_branch_b.blend",
+        "source_collection": "Atlas_Branch_Plans",
+        "export_scope_id": "scope-branch-b",
+        "material_groups": [{
+          "material": "M_branch_b",
+          "material_id": 16,
+          "mesh_ids": [34],
+          "blender_cluster_bake_texture": {
+            "files": {
+              "albedo": "{root}\\cluster\\branch_b.tga",
+              "alpha": "{root}\\cluster\\branch_b_Opacity.tga"
+            }
+          }
+        }],
+        "generator_connection": {
+          "requested": true,
+          "complete": true,
+          "bindings": [{
+            "generator_guid": "branch-b-guid",
+            "generator_name": "Frond B",
+            "slot_prefix": "Material:Frond:0",
+            "target_material_id": 16,
+            "target_mesh_id": 34
+          }]
+        }
+      }
+    },
+    {
+      "kind": "exact_target_scope",
+      "name": "scope-leaf-main__SK_tree_birch_sample_03.json",
+      "payload": {
+        "atlas_manifest_schema_version": 1,
+        "spm": "{target}",
+        "blend_file": "{root}\\cluster\\SK_leaf_main.blend",
+        "source_collection": "Atlas_Cluster_Cards",
+        "export_scope_id": "scope-leaf-main",
+        "material_groups": [{
+          "material": "M_leaf_main",
+          "material_id": 17,
+          "mesh_ids": [35],
+          "blender_cluster_bake_texture": {
+            "files": {
+              "albedo": "{root}\\cluster\\leaf_main.tga",
+              "alpha": "{root}\\cluster\\leaf_main_Opacity.tga"
+            }
+          }
+        }],
+        "generator_connection": {
+          "requested": true,
+          "complete": true,
+          "bindings": [{
+            "generator_guid": "leaf-main-guid",
+            "generator_name": "Leaf Main",
+            "slot_prefix": "Leaves:Type:0",
+            "target_material_id": 17,
+            "target_mesh_id": 35
+          }]
+        }
+      }
+    },
+    {
+      "kind": "exact_target_scope",
+      "name": "scope-side__SK_tree_birch_sample_03.json",
+      "mirror_of": 0
+    }
+  ],
+  "live_materials": [
+    {
+      "material_name": "M_branch_b",
+      "material_id": 16,
+      "cutout_mesh_ids": [34],
+      "refs": [
+        "{root}\\cluster\\branch_b.tga",
+        "{root}\\cluster\\branch_b_Opacity.tga"
+      ]
+    },
+    {
+      "material_name": "M_leaf_main",
+      "material_id": 17,
+      "cutout_mesh_ids": [35],
+      "refs": [
+        "{root}\\cluster\\leaf_main.tga",
+        "{root}\\cluster\\leaf_main_Opacity.tga"
+      ]
+    },
+    {
+      "material_name": "M_leaf_side",
+      "material_id": 18,
+      "cutout_mesh_ids": [36],
+      "refs": [
+        "{root}\\cluster\\leaf_side.tga",
+        "{root}\\cluster\\leaf_side_Opacity.tga"
+      ]
+    },
+    {
+      "material_name": "M_branch_a",
+      "material_id": 19,
+      "cutout_mesh_ids": [33],
+      "refs": [
+        "{root}\\cluster\\branch_a.tga",
+        "{root}\\cluster\\branch_a_Opacity.tga"
+      ]
+    }
+  ],
+  "live_generator_topology": [
+    {
+      "generator_guid": "branch-a-guid",
+      "generator_name": "Frond A",
+      "slot_prefix": "Material:Frond:0",
+      "material_id": 19,
+      "mesh_id": 33,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_guid": "branch-b-guid",
+      "generator_name": "Frond B",
+      "slot_prefix": "Material:Frond:0",
+      "material_id": 16,
+      "mesh_id": 34,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_guid": "leaf-main-guid",
+      "generator_name": "Leaf Main",
+      "slot_prefix": "Leaves:Type:0",
+      "material_id": 17,
+      "mesh_id": 35,
+      "visible": true,
+      "export_participates": true
+    },
+    {
+      "generator_guid": "leaf-side-guid",
+      "generator_name": "Leaf Side",
+      "slot_prefix": "Leaves:Type:0",
+      "material_id": 18,
+      "mesh_id": 36,
+      "visible": true,
+      "export_participates": true
+    }
+  ]
+}

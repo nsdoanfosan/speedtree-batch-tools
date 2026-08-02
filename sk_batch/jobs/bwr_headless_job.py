@@ -40,6 +40,7 @@ from spm_leaf_handoff_contract import (
     leaf_contract_user_message,
 )
 from speedtree_pipeline_contract import source_identity, validate_preflight_report
+from bwr_atlas_manifest_bridge import install_bwr_atlas_manifest_resolver
 from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -543,6 +544,13 @@ def main():
         # have two identities, so perform those two existing core stages with
         # explicit stems instead of deriving one by removing ``SK_``.
         from speedtree_bone_weight_repair import core as bwr_core
+
+        report["atlas_manifest_resolution"] = (
+            install_bwr_atlas_manifest_resolver(
+                bwr_core,
+                speedtree_spm,
+            )
+        )
 
         export_settings = settings.as_dict()
         speedtree_export = bwr_core.run_speedtree_cli_export(
