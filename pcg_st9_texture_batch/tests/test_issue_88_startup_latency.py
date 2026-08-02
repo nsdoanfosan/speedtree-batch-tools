@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import copy
 import json
+import math
 import os
 import sys
 import tempfile
@@ -29,9 +30,11 @@ from pcg_startup_cache import (  # noqa: E402
 )
 from pcg_startup_latency import (  # noqa: E402
     PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS,
+    STARTUP_TOTAL_INVOCATION_RULES,
     StartupAmplificationError,
     StartupLatencyTracker,
     require_startup_total_invocation_guard,
+    startup_total_invocation_guard,
 )
 
 
@@ -1053,7 +1056,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
         self.fail(message)
 
     def test_known_per_spm_manifest_amplification_fails_total_call_guard(self):
-        """The pre-fix resolver shape fails while unique counters still pass."""
+        """The unmodified fixture resolves zero; injection gives the rule teeth."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
             cache = Path(temporary) / "cache"
@@ -1138,7 +1141,86 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                     spm_count=4,
                 )
 
+    def test_597x_per_spm_negative_control_fails_with_unique_files_clean(self):
+        """An in-memory 597-calls/SPM shape fails without I/O or unique drift."""
+        spm_count = 597
+        metrics = {
+            "spm_analysis_calls": spm_count * spm_count,
+            "spm_analysis_calls_unique_files": spm_count,
+            "spm_decode_misses_unique_files": spm_count,
+            "legacy_receipt_inspection_calls": spm_count,
+            "legacy_receipt_inspection_calls_unique_files": spm_count,
+        }
+
+        # Unique-path counters still describe exactly one visit per fixture
+        # file.  Only the total-invocation counter can see the 597x fan-out.
+        self.assertEqual(
+            metrics["spm_analysis_calls_unique_files"], spm_count
+        )
+        self.assertEqual(
+            metrics["spm_decode_misses_unique_files"], spm_count
+        )
+        self.assertEqual(
+            metrics["legacy_receipt_inspection_calls_unique_files"],
+            spm_count,
+        )
+        guard = startup_total_invocation_guard(
+            metrics,
+            audit_scope_count=55,
+            spm_count=spm_count,
+        )
+        self.assertEqual(guard["status"], "failed")
+        self.assertEqual(
+            guard["rules"]["spm_analysis_calls"]["actual"], 356409
+        )
+        self.assertEqual(
+            guard["rules"]["spm_analysis_calls"]["limit"], 28656
+        )
+        with self.assertRaisesRegex(
+            StartupAmplificationError,
+            r"spm_analysis_calls=356409 > 28656",
+        ):
+            require_startup_total_invocation_guard(
+                metrics,
+                audit_scope_count=55,
+                spm_count=spm_count,
+            )
+
+    def test_spm_limit_is_derived_from_checked_in_calibration_receipt(self):
+        receipt_path = (
+            TOOL_DIR / "tests" / "fixtures"
+            / "issue134_startup_guard_calibration.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        fixture = receipt["measurements"]["production_shaped_fixture"]
+        production = receipt["measurements"]["production_folder"]
+        policy = receipt["calibration_policy"]
+
+        self.assertEqual(fixture["inventory_file_count"], 597)
+        self.assertEqual(fixture["spm_analysis_calls"], 18837)
+        self.assertEqual(fixture["resolve_atlas_manifests"], 0)
+        self.assertEqual(production["inventory_file_count"], 11)
+        self.assertEqual(production["spm_analysis_calls"], 253)
+        self.assertTrue(production["production_spms_unchanged"])
+        largest_ratio = max(
+            fixture["spm_analysis_calls"]
+            / fixture["inventory_file_count"],
+            production["spm_analysis_calls"]
+            / production["inventory_file_count"],
+        )
+        derived_limit = math.ceil(
+            largest_ratio * (1.0 + policy["headroom_fraction"])
+        )
+        self.assertEqual(derived_limit, policy["per_item_limit"])
+        self.assertEqual(
+            derived_limit,
+            STARTUP_TOTAL_INVOCATION_RULES["spm_analysis_calls"][
+                "per_item_limit"
+            ],
+        )
+
     def test_55_folder_597_spm_primary_paint_and_usable_latency_budgets(self):
+        """Reproduce 18,837 analysis calls and zero manifest resolutions."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
             cache = Path(temporary) / "cache"
@@ -1267,6 +1349,18 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                         "spm_persistent_hits",
                     )
                 ),
+            )
+            self.assertEqual(cold_cache.get("spm_analysis_calls"), 18837)
+            self.assertEqual(warm_cache.get("spm_analysis_calls"), 18837)
+            self.assertEqual(
+                cold["startup_timing"]["total_invocation_guard"]["rules"]
+                ["spm_analysis_calls"]["limit"],
+                28656,
+            )
+            self.assertEqual(
+                warm["startup_timing"]["total_invocation_guard"]["rules"]
+                ["spm_analysis_calls"]["limit"],
+                28656,
             )
             self.assertEqual(
                 cold_cache.get("legacy_receipt_inspection_calls"), 597
