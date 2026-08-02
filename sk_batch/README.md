@@ -210,6 +210,27 @@ DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSO
 ①/②/③ 버튼만 체크된 항목을 대상으로 한다. 개별 실패·수동 처리 항목은 상태와 로그에
 남기고 다른 파일은 계속 진행한다. 중지 버튼은 현재 단계의 자식 프로세스까지 종료한다.
 
+## 전체 실패 이력 자동 복구
+
+`↻ 전체 실패 이력 재시도`는 체크 상태와 무관하게 current inventory 전체의 durable
+실패 evidence를 다시 분류한다. 공식 reason code가 PCG texture 또는 Generator/Cluster
+repair에 해당하면 즉시 최종 실패 목록에서 빼고 `자동 복구 대기 → PCG 텍스처 복구 중
+→ Generator Sync 중 → Cluster 갱신 중 → 재검증 중 → Blender-Unreal 재시도 중`으로
+표시한다. SK는 BAT를 하위 프로세스로 띄우지 않고 각 도구의 같은 exact job builder를
+현재 shared queue lease 아래에서 직접 호출한다.
+
+각 BAT 단계 직후 exact SPM을 fresh audit한다. 모든 repair와 audit를 통과한 항목만 기존
+Blender/Send2UE/Unreal partition으로 복귀한다. 지원 불가 authoring/exporter 오류 또는
+terminal repair/re-audit 실패만 최종 `실패`로 승격하며, 그때 파일명·친화적 원인·시도한
+단계·남은 조치를 표시한다. 원래 raw reason code와 내부 오류는 state/receipt detail에만
+보존한다. 취소된 항목은 최종 실패가 아니며 다음 전체 재시도에서 durable evidence로
+재계획할 수 있다.
+
+queue/phase 결과는 공용 terminal 계약이 정규화한 `completed`, `pending_unreal`,
+`cancelled`, `failed`, `blocked`, `owner_lost` outcome만 소비한다. 따라서 성공·Unreal
+대기·사용자 취소 행은 최종 실패 count/token/detail에 들어가지 않으며, 이 기능이 raw
+phase 상태를 다시 해석하지 않는다.
+
 ## 옵션 설명 (GUI 툴팁과 동일)
 
 - **가지당 목표 본 수** — 작은 식물의 목표. 총 본 수를 대략 `가지 수 × 이 값`으로

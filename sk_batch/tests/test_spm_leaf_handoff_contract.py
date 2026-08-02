@@ -22,7 +22,9 @@ from spm_leaf_handoff_contract import (  # noqa: E402
 )
 
 
-def add_material(assets, material_id, name, mesh_ids, managed=False):
+def add_material(
+    assets, material_id, name, mesh_ids, managed=False, refs=()
+):
     material = ET.SubElement(
         assets, "Material_v8", ID=str(material_id), Name=name
     )
@@ -38,6 +40,8 @@ def add_material(assets, material_id, name, mesh_ids, managed=False):
         })
     for mesh_id in mesh_ids:
         ET.SubElement(assets, "Mesh", ID=str(mesh_id), Name=f"mesh_{mesh_id}")
+    for ref in refs:
+        ET.SubElement(material, "TexFilename").text = str(ref)
 
 
 def add_generator(
@@ -134,6 +138,63 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
                 contract["managed_ownership_provenance"]["status"],
                 "marker_only",
             )
+
+    def test_exact_manifest_proves_managed_material_source_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cluster = root / "cluster"
+            cluster.mkdir()
+            color = cluster / "leaf_main.tga"
+            opacity = cluster / "leaf_main_Opacity.tga"
+            color.write_bytes(b"color")
+            opacity.write_bytes(b"opacity")
+            spm = root / "SK_tree_birch_sample_03.spm"
+            write_spm(
+                spm,
+                [(
+                    17,
+                    "M_leaf_main",
+                    [35],
+                    True,
+                    [str(color), str(opacity)],
+                )],
+                [(17, 35)],
+            )
+            scopes = root / ".atlas_leaf_speedtree_scopes"
+            scopes.mkdir()
+            (scopes / f"scope-leaf-main__{spm.stem}.json").write_text(
+                json.dumps({
+                    "atlas_manifest_schema_version": 1,
+                    "spm": str(spm),
+                    "blend_file": str(cluster / "SK_leaf_main.blend"),
+                    "source_collection": "Atlas_Cluster_Cards",
+                    "export_scope_id": "scope-leaf-main",
+                    "material_groups": [{
+                        "material": "M_leaf_main",
+                        "material_id": 17,
+                        "mesh_ids": [35],
+                        "blender_cluster_bake_texture": {
+                            "files": {
+                                "albedo": str(color),
+                                "alpha": str(opacity),
+                            },
+                        },
+                    }],
+                    "generator_connection": {
+                        "requested": True,
+                        "complete": True,
+                        "bindings": [],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            contract = inspect_spm_leaf_contract(spm)
+
+            ownership = contract["managed_ownership_provenance"]
+            self.assertEqual(ownership["status"], "manifest_proven")
+            self.assertEqual(ownership["materials"][0]["material_id"], "17")
+            self.assertEqual(ownership["materials"][0]["mesh_ids"], ["35"])
 
     def test_source_slots_with_managed_outputs_require_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
