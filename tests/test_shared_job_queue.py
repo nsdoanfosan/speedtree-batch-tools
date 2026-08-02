@@ -575,6 +575,66 @@ class SharedJobQueueTests(unittest.TestCase):
                 self.assertNotIn("token", failed["last_expired_lease"])
                 self.assertEqual(claimed_next["id"], waiting["id"])
 
+    def test_operator_close_then_owner_loss_has_ordered_durable_receipt(self):
+        clock_value = [0.0]
+        process_alive = [True]
+        queue = self.queue(
+            lease_seconds=1,
+            clock=lambda: clock_value[0],
+            process_alive=lambda _host, _pid, _marker: process_alive[0],
+        )
+        job = queue.enqueue("sk-batch", {"retry": "seq81-shape"})
+        claimed = queue.claim("sk-owner", job_id=job["id"])
+
+        recorded = queue.record_operator_close_request(
+            job["id"],
+            claimed["lease"]["token"],
+            owner_id="sk-owner",
+        )
+
+        self.assertEqual(recorded["status"], "running")
+        self.assertNotIn("failure_reason", recorded)
+        close_event = recorded["termination_audit"]["events"][0]
+        self.assertEqual(close_event["kind"], "operator_close_requested")
+        self.assertEqual(close_event["batch_outcome_at_event"], "running")
+        self.assertNotIn("token", close_event["owner"])
+
+        # Repeating the same close signal is idempotent while the owner lives.
+        repeated = queue.record_operator_close_request(
+            job["id"],
+            claimed["lease"]["token"],
+            owner_id="sk-owner",
+        )
+        self.assertEqual(len(repeated["termination_audit"]["events"]), 1)
+
+        process_alive[0] = False
+        clock_value[0] = 2.0
+        failed = queue.get(job["id"])
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failure_reason"], "owner_lost")
+        self.assertIsNone(failed["result"])
+        audit = failed["termination_audit"]
+        self.assertEqual(
+            [event["kind"] for event in audit["events"]],
+            ["operator_close_requested", "owner_lost_recovered"],
+        )
+        self.assertEqual(
+            [event["sequence"] for event in audit["events"]],
+            [1, 2],
+        )
+        recovery = audit["events"][1]
+        self.assertEqual(recovery["trigger"], "operator_close_requested")
+        self.assertEqual(recovery["original_batch_outcome"], "unknown")
+        self.assertEqual(
+            audit["terminal_interpretation"],
+            {
+                "terminal_reason": "owner_lost",
+                "trigger": "operator_close_requested",
+                "original_batch_outcome": "unknown",
+            },
+        )
+
     def test_late_finishing_old_sequence_is_retained_by_terminal_time(self):
         context = multiprocessing.get_context("spawn")
         for iteration in range(3):

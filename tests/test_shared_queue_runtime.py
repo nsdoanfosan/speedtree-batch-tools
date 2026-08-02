@@ -449,6 +449,33 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         )
         next_lease.finish()
 
+    def test_operator_close_shutdown_records_active_lease_before_exit(self):
+        runtime = self.runtime(
+            "sk-batch",
+            lease_seconds=0.5,
+            heartbeat_interval=0.05,
+        )
+        job = runtime.enqueue("retry running", {"targets": 83})
+        lease = runtime.wait_for_turn(job["id"])
+
+        runtime.shutdown(operator_close=True)
+
+        running = runtime.queue.get(job["id"])
+        self.assertEqual(running["status"], "running")
+        events = running["termination_audit"]["events"]
+        self.assertEqual(
+            [event["kind"] for event in events],
+            ["operator_close_requested"],
+        )
+        self.assertEqual(events[0]["batch_outcome_at_event"], "running")
+        self.assertNotIn("token", events[0]["owner"])
+        with self.assertRaises(RuntimeClosed):
+            runtime.enqueue("after close", {})
+
+        # Shutdown does not release the live worker; its normal finally path
+        # still owns that transition if the process remains alive long enough.
+        lease.finish(success=False, result={"outcome": "stopped"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,43 @@ class FullPipelineScopeTests(unittest.TestCase):
         worker.start.assert_called_once_with()
         self.assertIn("2개", app.log.call_args.args[0])
 
+    def test_live_retry_status_is_nonterminal_and_counts_outcomes(self):
+        gui = load_gui_module()
+        snapshot = gui.normalized_live_batch_progress({
+            "state": "running",
+            "completed": 21,
+            "total": 83,
+            "failed": 4,
+            "continues_after_failure": True,
+        })
+
+        rendered = gui.live_batch_status_text(
+            snapshot,
+            job_label="현재 재시도 실행 · Blender/Send2UE→Unreal · 83개",
+        )
+
+        self.assertIn("현재 상태: 진행 중", rendered)
+        self.assertIn("성공 17개", rendered)
+        self.assertIn("실패 4개", rendered)
+        self.assertIn("남음 62개", rendered)
+        self.assertIn("개별 실패 후 계속 진행", rendered)
+        self.assertNotIn("최종 결과", rendered)
+        self.assertNotIn("대기열 완료", rendered)
+
+    def test_live_retry_status_marks_safe_abort_as_still_nonterminal(self):
+        gui = load_gui_module()
+        rendered = gui.live_batch_status_text({
+            "state": "running",
+            "completed": 5,
+            "total": 10,
+            "failed": 1,
+            "continues_after_failure": False,
+        })
+
+        self.assertIn("현재 상태: 진행 중", rendered)
+        self.assertIn("개별 실패 후 안전 중단 처리 중", rendered)
+        self.assertNotIn("최종 결과", rendered)
+
     def test_numbered_buttons_route_to_their_required_phase_chain(self):
         gui = load_gui_module()
         for phase, expected_mode, chained in (
@@ -209,6 +246,7 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertIsNone(app.active_batch_job)
         self.assertFalse(app.pending_batch_jobs)
         self.assertEqual(len(app.batch_job_failures), 1)
+        self.assertIn("최종 결과: 실패", app.progress_var.value)
         app.btn_scan.configure.assert_called_with(state="normal")
         app.root_entry.configure.assert_called_with(state="normal")
         app.btn_stop.configure.assert_called_with(state="disabled")
@@ -253,6 +291,23 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertTrue(app.stop_flag.is_set())
         self.assertFalse(app.pending_batch_jobs)
         self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
+
+    def test_window_shutdown_records_operator_close_before_stopping(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        app.pending_batch_jobs = gui.deque()
+        app.active_batch_job = {"id": 1, "label": "running retry"}
+        app.shared_queue_runtime = mock.Mock()
+        app._app_open = True
+        app._ensure_batch_queue_state()
+
+        app.shutdown_shared_queue()
+
+        app.shared_queue_runtime.shutdown.assert_called_once_with(
+            operator_close=True
+        )
+        self.assertFalse(app._app_open)
+        self.assertTrue(app.stop_flag.is_set())
 
     def test_queued_worker_reports_item_failures_instead_of_success(self):
         gui = load_gui_module()

@@ -233,6 +233,77 @@ MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER = (
 )
 MATERIAL_PREFLIGHT_FAILED_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_FAILED"
 MATERIAL_PREFLIGHT_DONE_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_DONE"
+
+
+def normalized_live_batch_progress(payload, previous=None):
+    """Return one UI-safe snapshot for a non-terminal batch execution."""
+
+    previous = previous if isinstance(previous, dict) else {}
+    if isinstance(payload, dict):
+        total = max(0, int(payload.get("total", previous.get("total", 0)) or 0))
+        completed = max(
+            0,
+            int(payload.get("completed", previous.get("completed", 0)) or 0),
+        )
+        failed = max(
+            0,
+            int(payload.get("failed", previous.get("failed", 0)) or 0),
+        )
+        state = str(payload.get("state") or previous.get("state") or "queued")
+        continues = bool(
+            payload.get(
+                "continues_after_failure",
+                previous.get("continues_after_failure", True),
+            )
+        )
+    else:
+        completed, total = payload
+        total = max(0, int(total or 0))
+        completed = max(0, int(completed or 0))
+        failed = (
+            max(0, int(previous.get("failed", 0) or 0))
+            if int(previous.get("total", -1) or -1) == total
+            else 0
+        )
+        state = str(previous.get("state") or "running")
+        continues = bool(previous.get("continues_after_failure", True))
+    completed = min(completed, total)
+    failed = min(failed, completed)
+    return {
+        "state": state,
+        "total": total,
+        "completed": completed,
+        "succeeded": completed - failed,
+        "failed": failed,
+        "remaining": max(0, total - completed),
+        "continues_after_failure": continues,
+    }
+
+
+def live_batch_status_text(snapshot, *, job_label="", pending=0):
+    """Render liveness without presenting an early terminal outcome."""
+
+    snapshot = normalized_live_batch_progress(snapshot)
+    state = (
+        "대기 중"
+        if snapshot["state"] == "queued"
+        else "진행 중"
+    )
+    policy = (
+        "개별 실패 후 계속 진행"
+        if snapshot["continues_after_failure"]
+        else "개별 실패 후 안전 중단 처리 중"
+    )
+    text = (
+        f"현재 상태: {state} · 성공 {snapshot['succeeded']}개 · "
+        f"실패 {snapshot['failed']}개 · 남음 {snapshot['remaining']}개 · "
+        f"{policy}"
+    )
+    if job_label:
+        text += f" · 현재 작업: {job_label}"
+    if pending:
+        text += f" · 대기 {int(pending)}개"
+    return text
 CLUSTER_LIVE_AUDIT_START_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_START"
 CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER = (
     "SK_BATCH_CLUSTER_LIVE_AUDIT_REVISION_OK"
@@ -2289,7 +2360,7 @@ class App:
         )
         self.batch_progress.pack(side="left", padx=(4, 6))
         self.batch_progress_var = tk.StringVar(value="0/0 (0%)")
-        ttk.Label(meters, textvariable=self.batch_progress_var, width=15).pack(side="left")
+        ttk.Label(meters, textvariable=self.batch_progress_var, width=32).pack(side="left")
         ttk.Label(
             meters,
             text="단계·경과 시간·수동 전환까지 남은 시간은 각 파일 행에 표시됩니다.",
@@ -2429,18 +2500,27 @@ class App:
                     if iid in self.items:
                         self._set_table_cell(iid, column, value)
                 elif kind == "progress":
-                    pending = len(getattr(self, "pending_batch_jobs", ()))
-                    suffix = f" · 대기 {pending}개" if pending else ""
-                    self.progress_var.set(f"{payload}{suffix}")
-                elif kind == "batch_progress":
-                    done, total = payload
-                    percent = (done / total * 100.0) if total else 0.0
-                    self.batch_progress.configure(value=percent)
-                    pending = len(getattr(self, "pending_batch_jobs", ()))
-                    suffix = f" · 대기 {pending}개" if pending else ""
-                    self.batch_progress_var.set(
-                        f"{done}/{total} ({percent:.0f}%){suffix}"
+                    if getattr(self, "active_batch_job", None) is not None:
+                        self._render_live_batch_progress()
+                    else:
+                        pending = len(getattr(self, "pending_batch_jobs", ()))
+                        suffix = f" · 대기 {pending}개" if pending else ""
+                        self.progress_var.set(f"{payload}{suffix}")
+                elif kind == "batch_state":
+                    current = getattr(self, "_live_batch_progress", None)
+                    updated = dict(current or {})
+                    updated["state"] = str(payload)
+                    self._live_batch_progress = normalized_live_batch_progress(
+                        updated,
+                        current,
                     )
+                    self._render_live_batch_progress()
+                elif kind == "batch_progress":
+                    self._live_batch_progress = normalized_live_batch_progress(
+                        payload,
+                        getattr(self, "_live_batch_progress", None),
+                    )
+                    self._render_live_batch_progress()
                 elif kind == "scan_done":
                     generation, result, error = payload
                     if error is not None:
@@ -2481,10 +2561,7 @@ class App:
                     self._finish_batch_job(payload)
                 elif kind == "modeler_recovery":
                     target = Path(payload["target_spm"])
-                    self.progress_var.set(
-                        "SpeedTree Modeler manual Save waiting — "
-                        + target.name
-                    )
+                    self._render_live_batch_progress()
                     messagebox.showinfo(
                         "SpeedTree Modeler Save required",
                         (
@@ -3592,6 +3669,31 @@ class App:
         if not hasattr(self, "_recovery_resume_commit"):
             self._recovery_resume_commit = None
 
+    def _render_live_batch_progress(self):
+        snapshot = normalized_live_batch_progress(
+            getattr(self, "_live_batch_progress", {}),
+        )
+        self._live_batch_progress = snapshot
+        completed = snapshot["completed"]
+        total = snapshot["total"]
+        percent = (completed / total * 100.0) if total else 0.0
+        self.batch_progress.configure(value=percent)
+        self.batch_progress_var.set(
+            f"성공 {snapshot['succeeded']} · 실패 {snapshot['failed']} · "
+            f"남음 {snapshot['remaining']} ({percent:.0f}%)"
+        )
+        job = getattr(self, "active_batch_job", None)
+        label = str(job.get("label") or "") if isinstance(job, dict) else ""
+        progress_var = getattr(self, "progress_var", None)
+        if progress_var is not None:
+            progress_var.set(
+                live_batch_status_text(
+                    snapshot,
+                    job_label=label,
+                    pending=len(getattr(self, "pending_batch_jobs", ())),
+                )
+            )
+
     def _snapshot_batch_request(self, target_iids):
         inventory = {
             iid: self._snapshot_batch_item(item)
@@ -3723,12 +3825,16 @@ class App:
         self.stop_flag.clear()
         with self._recovery_commit_lock:
             self._recovery_resume_commit = None
-        self.batch_progress.configure(value=0)
-        pending = len(self.pending_batch_jobs)
-        suffix = f" · 대기 {pending}개" if pending else ""
-        self.batch_progress_var.set(
-            f"0/{len(job['targets'])} (0%){suffix}"
+        self._live_batch_progress = normalized_live_batch_progress(
+            {
+                "state": "queued",
+                "total": len(job["targets"]),
+                "completed": 0,
+                "failed": 0,
+                "continues_after_failure": True,
+            }
         )
+        self._render_live_batch_progress()
         self._set_batch_queue_controls(True)
         self.log(f"[대기열 #{job['id']}] 시작 · {job['label']}")
         self.worker = threading.Thread(
@@ -3829,6 +3935,12 @@ class App:
             "shared_failures": [],
         }
         lease = None
+
+        def publish_execution_state(state):
+            active = getattr(self, "active_batch_job", None)
+            if isinstance(active, dict) and active.get("id") == job.get("id"):
+                self.ui_queue.put(("batch_state", state))
+
         try:
             shared_job_id = job.get("shared_queue_job_id")
             shared_runtime = getattr(
@@ -3846,6 +3958,7 @@ class App:
                         )
                         + f" · 대기 {queued}개"
                     )
+                    publish_execution_state("queued")
                     self.ui_queue.put(("progress", text))
 
                 lease = shared_runtime.wait_for_turn(
@@ -3854,10 +3967,13 @@ class App:
                     cancel_event=self.stop_flag,
                 )
                 self._active_shared_queue_lease = lease
+                publish_execution_state("running")
                 self.ui_queue.put((
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
                 ))
+            else:
+                publish_execution_state("running")
             self.__dict__.pop("_phase_result_summary", None)
             self._freeze_batch_production_source_manifest()
             if job["mode"] == "pipeline":
@@ -4021,11 +4137,12 @@ class App:
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
+        self.__dict__.pop("_live_batch_progress", None)
         self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
         if status == "stopped":
-            self.progress_var.set("대기열 중지됨")
+            self.progress_var.set("최종 결과: 사용자 중지")
         elif failure_count:
             tokens = sorted({
                 str(row.get("reason_token"))
@@ -4045,14 +4162,31 @@ class App:
                 row.get("failed_count", 0)
                 for row in self.batch_job_failures
             )
+            terminal_failure_count = sum(
+                1
+                for row in self.batch_job_failures
+                if row.get("status") == "failed"
+            )
+            result_label = (
+                "실패"
+                if terminal_failure_count
+                else "일부 실패"
+            )
             self.progress_var.set(
-                "대기열 완료 · "
-                f"completed {completed_total} · "
-                f"blocked {blocked_total} · failed {failed_total}"
+                f"최종 결과: {result_label} · "
+                f"성공 {completed_total}개 · "
+                f"차단 {blocked_total}개 · 실패 {failed_total}개"
+                + (
+                    f" · 작업 자체 실패 {terminal_failure_count}건"
+                    if terminal_failure_count else ""
+                )
                 + (f" · {', '.join(tokens)}" if tokens else "")
             )
         else:
-            self.progress_var.set("대기열 완료")
+            completed = int(payload.get("completed_count", 0) or 0)
+            self.progress_var.set(
+                f"최종 결과: 성공 · 성공 {completed}개 · 실패 0개"
+            )
 
     def start_batch(self, phase):
         self._close_cell_editor()
@@ -4398,7 +4532,8 @@ class App:
 
         if skipped:
             self.log(
-                "실패/stale 재시도 제외:\n  - " + "\n  - ".join(skipped)
+                "재시도 대상 분류(과거 실패/stale) 제외:\n  - "
+                + "\n  - ".join(skipped)
             )
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
@@ -4411,6 +4546,19 @@ class App:
                 + "\n".join(skipped[:8]),
             )
             return
+
+        reason_counts = {}
+        for iid in eligible_iids:
+            reason = decisions[iid].reason_code
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        self.log(
+            "재시도 대상 분류 완료 · 과거 실패/stale 근거 "
+            + ", ".join(
+                f"{reason}={count}"
+                for reason, count in sorted(reason_counts.items())
+            )
+            + " · 현재 batch terminal 결과는 아직 결정되지 않음"
+        )
 
         cfg = dict(self._collect_cfg())
         save_config(cfg)
@@ -4440,7 +4588,7 @@ class App:
             unreal_ids = [str(item["spm"]) for item in unreal_targets]
             self._enqueue_batch_job({
                 "label": (
-                    "실패 재시도 · Unreal-only current-code · "
+                    "현재 재시도 실행 · Unreal-only current-code · "
                     f"{len(unreal_targets)}개"
                 ),
                 "mode": "unreal_recovery",
@@ -4470,7 +4618,7 @@ class App:
             export_ids = [str(item["spm"]) for item in export_targets]
             self._enqueue_batch_job({
                 "label": (
-                    "실패/stale 재시도 · Blender/Send2UE→Unreal · "
+                    "현재 재시도 실행 · Blender/Send2UE→Unreal · "
                     f"{len(export_targets)}개"
                 ),
                 "mode": "pipeline",
@@ -5280,7 +5428,13 @@ class App:
     def shutdown_shared_queue(self):
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
-            runtime.shutdown()
+            # Persist the operator-close event before the GUI process can
+            # disappear.  A later lease recovery remains owner_lost, but its
+            # receipt can now prove that it followed this close request.
+            runtime.shutdown(operator_close=True)
+        with self._recovery_commit_lock:
+            self._app_open = False
+            self.stop_batch()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
@@ -5482,7 +5636,16 @@ class App:
         title = titles[phase]
         column = column_by_phase[phase]
         total = len(targets)
-        self.ui_queue.put(("batch_progress", (0, total)))
+        self.ui_queue.put((
+            "batch_progress",
+            {
+                "state": "running",
+                "completed": 0,
+                "total": total,
+                "failed": 0,
+                "continues_after_failure": True,
+            },
+        ))
         self._batch_done = 0
         self._batch_active = 0
         phase_abort = threading.Event()
@@ -5620,7 +5783,16 @@ class App:
                     done = self._batch_done
                     active = self._batch_active
                     failed = len(failed_items)
-                self.ui_queue.put(("batch_progress", (done, total)))
+                self.ui_queue.put((
+                    "batch_progress",
+                    {
+                        "state": "running",
+                        "completed": done,
+                        "total": total,
+                        "failed": min(done, failed),
+                        "continues_after_failure": not phase_abort.is_set(),
+                    },
+                ))
                 self.ui_queue.put((
                     "progress",
                     f"{title} {done}/{total} · 실행 중 {active}개 "
@@ -10184,16 +10356,32 @@ class App:
             status_counts[status] = status_counts.get(status, 0) + 1
         total = len(item_by_id)
         active = status_counts.get("importing", 0)
-        completed = sum(
-            count
-            for status, count in status_counts.items()
-            if status != "importing"
+        succeeded = status_counts.get("imported_ok", 0)
+        failed = sum(
+            status_counts.get(status, 0)
+            for status in (
+                "data_error",
+                "manual_required",
+                "unreal_crash",
+                "not_run",
+            )
         )
-        progress_snapshot = (completed, total, active)
+        completed = min(total, succeeded + failed)
+        progress_snapshot = (completed, total, active, failed)
         if progress_snapshot != getattr(
             self, "_headless_progress_snapshot", None
         ):
             self._headless_progress_snapshot = progress_snapshot
+            self.ui_queue.put((
+                "batch_progress",
+                {
+                    "state": "running",
+                    "completed": completed,
+                    "total": total,
+                    "failed": min(completed, failed),
+                    "continues_after_failure": True,
+                },
+            ))
             self.ui_queue.put(
                 (
                     "progress",
@@ -10261,10 +10449,19 @@ class App:
         parent_lineage = []
         pending_order = []
         total = len(selected_ids)
-        self.ui_queue.put(("batch_progress", (0, total)))
+        self.ui_queue.put((
+            "batch_progress",
+            {
+                "state": "running",
+                "completed": 0,
+                "total": total,
+                "failed": 0,
+                "continues_after_failure": True,
+            },
+        ))
         self.ui_queue.put((
             "progress",
-            f"실패 재시도 · Unreal-only 산출물 검증 0/{total}",
+            f"현재 재시도 실행 · Unreal-only 산출물 검증 0/{total}",
         ))
         prepared_selected = 0
 
@@ -10359,13 +10556,20 @@ class App:
                     "selected_queue_ids": sorted(request_selected),
                 })
                 prepared_selected += len(request_selected)
-                self.ui_queue.put(
-                    ("batch_progress", (prepared_selected, total))
-                )
+                self.ui_queue.put((
+                    "batch_progress",
+                    {
+                        "state": "running",
+                        "completed": prepared_selected + len(failed_items),
+                        "total": total,
+                        "failed": len(failed_items),
+                        "continues_after_failure": True,
+                    },
+                ))
                 self.ui_queue.put(
                     (
                         "progress",
-                        "실패 재시도 · Unreal-only 산출물 검증 "
+                        "현재 재시도 실행 · Unreal-only 산출물 검증 "
                         f"{prepared_selected}/{total}",
                     )
                 )
@@ -10392,6 +10596,16 @@ class App:
                     + ", ".join(Path(value).name for value in request_selected)
                     + f": {reason}"
                 )
+                self.ui_queue.put((
+                    "batch_progress",
+                    {
+                        "state": "running",
+                        "completed": prepared_selected + len(failed_items),
+                        "total": total,
+                        "failed": len(failed_items),
+                        "continues_after_failure": True,
+                    },
+                ))
 
         pending = [
             recovered_by_id[queue_id]
@@ -10430,7 +10644,7 @@ class App:
             if emit_done:
                 self.ui_queue.put((
                     "progress",
-                    "실패 재시도 · Unreal-only 차단 · Blender→Push 필요",
+                    "현재 재시도 실행 · Unreal-only 차단 · Blender→Push 필요",
                 ))
                 self.ui_queue.put(("done", None))
             return False
@@ -10461,7 +10675,7 @@ class App:
             emit_done=emit_done,
             batch_stamp=batch_stamp,
             manifest_metadata=metadata,
-            progress_label="실패 재시도 · Unreal-only",
+            progress_label="현재 재시도 실행 · Unreal-only",
             file_prefix="failed_retry_unreal",
         )
 
@@ -10473,7 +10687,7 @@ class App:
         )
         export_retry = retry_metadata.get("partition") == "blender_export"
         progress_label = (
-            "실패 재시도 · Blender/Send2UE→Unreal"
+            "현재 재시도 실행 · Blender/Send2UE→Unreal"
             if export_retry
             else "Unreal Push"
         )
@@ -10487,7 +10701,16 @@ class App:
             for dependencies in dependency_map.values()
             for dependency in dependencies
         }
-        self.ui_queue.put(("batch_progress", (0, total)))
+        self.ui_queue.put((
+            "batch_progress",
+            {
+                "state": "running",
+                "completed": 0,
+                "total": total,
+                "failed": 0,
+                "continues_after_failure": True,
+            },
+        ))
         exported_by_index = {}
         failed_items = set(getattr(self, "_phase_failed_items", set()))
         workers = max(
@@ -10536,7 +10759,16 @@ class App:
                 if exported_item is not None:
                     exported_by_index[index] = exported_item
                 completed += 1
-                self.ui_queue.put(("batch_progress", (completed, total)))
+                self.ui_queue.put((
+                    "batch_progress",
+                    {
+                        "state": "running",
+                        "completed": completed,
+                        "total": total,
+                        "failed": min(completed, len(failed_items)),
+                        "continues_after_failure": True,
+                    },
+                ))
                 self.ui_queue.put(
                     (
                         "progress",
@@ -10981,10 +11213,19 @@ def main():
     app = App(root)
 
     def close():
-        with app._recovery_commit_lock:
-            app._app_open = False
-            app.stop_batch()
-        app.shutdown_shared_queue()
+        try:
+            app.shutdown_shared_queue()
+        except Exception as exc:
+            app._app_open = True
+            messagebox.showerror(
+                "종료 감사 기록 실패",
+                (
+                    "실행 중 작업의 operator-close 기록을 저장하지 못해 "
+                    f"창을 닫지 않았습니다.\n\n{exc}"
+                ),
+                parent=root,
+            )
+            return
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)

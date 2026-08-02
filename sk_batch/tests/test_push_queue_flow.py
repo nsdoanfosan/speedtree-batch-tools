@@ -3424,6 +3424,8 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(jobs[0]["terminal_phase"], "push")
         self.assertTrue(jobs[0]["force_rerun"])
         self.assertEqual(jobs[0]["push_transport"], "headless")
+        self.assertTrue(jobs[0]["label"].startswith("현재 재시도 실행"))
+        self.assertNotIn("실패/stale", jobs[0]["label"])
         self.assertEqual(
             jobs[0]["retry_metadata"]["execution_path"],
             "blender_send2ue_then_unreal",
