@@ -6188,7 +6188,26 @@ class App:
     def shutdown_shared_queue(self):
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
-            runtime.shutdown()
+            # Persist the operator-close event before the GUI process can
+            # disappear. A later lease recovery remains owner_lost, but its
+            # receipt proves that it followed this close request.
+            runtime.shutdown(operator_close=True)
+        with self._recovery_commit_lock:
+            self._app_open = False
+            tracker = self._retry_tracker_for_job(
+                getattr(self, "active_batch_job", None)
+            )
+            planning = any(
+                worker.is_alive()
+                for worker in getattr(self, "_retry_planning_workers", ())
+            )
+            if tracker is None and planning:
+                tracker = getattr(self, "_active_retry_progress", None)
+            if tracker is not None:
+                tracker.record_operator_close(
+                    "operator closed the SK Batch window; shutdown requested"
+                )
+            self.stop_batch()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
@@ -12255,22 +12274,6 @@ def main():
     app = App(root)
 
     def close():
-        with app._recovery_commit_lock:
-            app._app_open = False
-            tracker = app._retry_tracker_for_job(
-                getattr(app, "active_batch_job", None)
-            )
-            planning = any(
-                worker.is_alive()
-                for worker in getattr(app, "_retry_planning_workers", ())
-            )
-            if tracker is None and planning:
-                tracker = getattr(app, "_active_retry_progress", None)
-            if tracker is not None:
-                tracker.record_operator_close(
-                    "operator closed the SK Batch window; shutdown requested"
-                )
-            app.stop_batch()
         app.shutdown_shared_queue()
         root.destroy()
 
