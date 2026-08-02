@@ -148,6 +148,7 @@ class SharedQueueLease:
         self,
         success: bool = True,
         result: Any = None,
+        terminal_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Stop heartbeating and complete the job exactly once locally."""
 
@@ -165,6 +166,7 @@ class SharedQueueLease:
                 self.token,
                 result=result,
                 success=bool(success),
+                terminal_status=terminal_status,
                 owner_id=self._runtime.owner_id,
             )
             self._finished_record = copy.deepcopy(completed)

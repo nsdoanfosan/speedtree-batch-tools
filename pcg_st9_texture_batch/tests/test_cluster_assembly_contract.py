@@ -1280,6 +1280,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 "leaf": ("leaf_elm_01", 3, [20]),
                 "leaf_side": ("leaf_elm_side_01", 4, [30, 31, 32]),
             }
+            scope_payloads = {}
             for role, (identity, material_id, mesh_ids) in role_specs.items():
                 rows = []
                 for ordinal, mesh_id in enumerate(mesh_ids, 1):
@@ -1315,23 +1316,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         "meshes": rows,
                     }],
                 }
+                scope_payloads[role] = payload
                 (scope_dir / f"scope_{role}__{target.stem}.json").write_text(
                     json.dumps(payload), encoding="utf-8"
                 )
 
-            # The rolling global file is deliberately stale/malformed.  Once
-            # stable scope receipts exist it must not shadow them.
+            # The rolling global file is a coherent lower-precedence mirror.
+            # A stale disagreement is now a resolver error rather than a
+            # last-writer-wins fallback.
             (folder / "speedtree_import_manifest.json").write_text(
-                json.dumps({
-                    "spm": str(target),
-                    "blend_file": str(blend),
-                    "material_groups": [{
-                        "material": "branch_elm_01",
-                        "material_id": 2,
-                        "mesh_ids": [10, 11],
-                        "meshes": [],
-                    }],
-                }),
+                json.dumps(scope_payloads["branch"]),
                 encoding="utf-8",
             )
 

@@ -30,11 +30,14 @@ from stale_node_table_recovery import (  # noqa: E402
     StaleNodeTableRecoveryTimeout,
     _acquire_session_lock,
     _authoring_graph_core_projection,
+    _authoring_graph_core_projection_for_version,
     _capture_immutable_snapshot,
     _ensure_preimage_artifacts,
     _legacy_authoring_graph_core_v2_projection,
     _legacy_authoring_graph_core_v3_projection,
+    _legacy_authoring_graph_core_v4_projection,
     _legacy_target_binding_fingerprint,
+    _preimage_receipt,
     _release_session_lock,
     _resolve_receipt_dialect,
     _resolve_target_scopes,
@@ -42,6 +45,10 @@ from stale_node_table_recovery import (  # noqa: E402
     build_parser,
     recover_stale_node_table,
     verify_sealed_resave,
+)
+from pcg_st9_texture_batch.speedtree_modeler_uia import (  # noqa: E402
+    SEMANTIC_UIA_CONTRACT,
+    SemanticModelerUIAError,
 )
 
 
@@ -58,6 +65,27 @@ def _node(guid):
         "<Hidden>false</Hidden>"
         "<Extra><m_bDeleted>false</m_bDeleted><m_bCulled>false</m_bCulled></Extra>"
         "</Node>"
+    )
+
+
+def default_disabled_planar_2():
+    return (
+        "<SplineProperty><Name>Forces:Planar 2</Name>"
+        "<Value>0.25</Value><Variance>0</Variance><Enabled>false</Enabled>"
+        "<CohesionScale>1</CohesionScale><CohesionOffset>0</CohesionOffset>"
+        "<Distribution>0</Distribution><ForceBehaviorID>-1</ForceBehaviorID>"
+        "<Relative>true</Relative><CompoundParentSpline Count=\"1\">"
+        "<Spline DrawMode=\"false\">"
+        "<ControlPoint><X>0</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "<ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "</Spline></CompoundParentSpline><ProfileSpline DrawMode=\"false\">"
+        "<ControlPoint><X>0</X><Y>0</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "<ControlPoint><X>1</X><Y>1</Y><TangentX>1</TangentX>"
+        "<TangentY>0</TangentY><Length>0</Length></ControlPoint>"
+        "</ProfileSpline></SplineProperty>"
     )
 
 
@@ -151,6 +179,61 @@ def authored_scope_text(
         "".join(blocks) + "<Generators>",
         1,
     ).replace("<Assets>", "<Assets>" + material, 1)
+
+
+def issue102_leaf_material_text(
+    *,
+    stale,
+    material_values,
+    mesh_values=None,
+    material_ids=(1, 5),
+    volatile="one",
+):
+    mesh_values = mesh_values or (-10, -10, -10, -10)
+    properties = []
+    for type_index, (material_value, mesh_value) in enumerate(zip(
+        material_values,
+        mesh_values,
+    )):
+        properties.extend((
+            "<Property>"
+            f"<Name>Leaves:Type:{type_index}:Material</Name>"
+            f"<Value>{material_value}</Value>"
+            "</Property>",
+            "<Property>"
+            f"<Name>Leaves:Type:{type_index}:Mesh</Name>"
+            f"<Value>{mesh_value}</Value>"
+            "</Property>",
+        ))
+    generator = (
+        '<Generator Type="Leaf Mesh">'
+        "<Name>Sanitized dormant leaf</Name>"
+        "<GUID>issue102-dormant-leaf</GUID>"
+        "<Hidden>false</Hidden>"
+        f"<Properties>{''.join(properties)}</Properties>"
+        "</Generator>"
+    )
+    materials = "".join(
+        f'<Material_v8 ID="{material_id}" Name="material-{material_id}">'
+        "<Map Name=\"Color\"><TexFilename></TexFilename>"
+        "<TexEnabled>false</TexEnabled></Map>"
+        "</Material_v8>"
+        for material_id in material_ids
+    )
+    return spm_text(stale=stale, volatile=volatile).replace(
+        "<SpeedTree>",
+        '<SpeedTree BuildInfo="" OS="Windows" Title=" Modeler 10.1.0 " '
+        'Version="8" VersionString="10.1.0 ">',
+        1,
+    ).replace(
+        "<Generators>",
+        "<Generators>" + generator,
+        1,
+    ).replace(
+        "<Assets>",
+        "<Assets>" + materials,
+        1,
+    )
 
 
 def write_spm(path, text):
@@ -307,6 +390,7 @@ class RecoveryTestCase(unittest.TestCase):
         expected_preimage_raw_sha256=None,
         continuation_commit_lock=None,
         on_continuation_claimed=None,
+        modeler_session=None,
     ):
         clock = FakeClock()
         after_text = after_text or spm_text(stale=False, volatile="two")
@@ -338,6 +422,7 @@ class RecoveryTestCase(unittest.TestCase):
             expected_preimage_raw_sha256=expected_preimage_raw_sha256,
             continuation_commit_lock=continuation_commit_lock,
             on_continuation_claimed=on_continuation_claimed,
+            modeler_session=modeler_session,
         )
 
 
@@ -534,6 +619,103 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 _authoring_graph_core_projection(changed)["fingerprint"],
             )
 
+    def test_core_v6_accepts_only_exact_disabled_default_planar_2(self):
+        before = spm_text(stale=True)
+        planar = default_disabled_planar_2()
+        after = spm_text(stale=False).replace(
+            "<Properties></Properties></Generator>",
+            f"<Properties>{planar}</Properties></Generator>",
+            1,
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["version"],
+            6,
+        )
+        self.assertEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["version"],
+            4,
+        )
+        self.assertNotEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["fingerprint"],
+            _legacy_authoring_graph_core_v4_projection(after)["fingerprint"],
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(after)["fingerprint"],
+        )
+
+        mutations = {
+            "other name": planar.replace("Forces:Planar 2", "Forces:Planar 3", 1),
+            "value": planar.replace("<Value>0.25</Value>", "<Value>0.5</Value>", 1),
+            "variance": planar.replace("<Variance>0</Variance>", "<Variance>1</Variance>", 1),
+            "active": planar.replace("<Enabled>false</Enabled>", "<Enabled>true</Enabled>", 1),
+            "cohesion": planar.replace("<CohesionScale>1</CohesionScale>", "<CohesionScale>0.5</CohesionScale>", 1),
+            "behavior": planar.replace("<ForceBehaviorID>-1</ForceBehaviorID>", "<ForceBehaviorID>0</ForceBehaviorID>", 1),
+            "relative": planar.replace("<Relative>true</Relative>", "<Relative>false</Relative>", 1),
+            "compound count": planar.replace('Count="1"', 'Count="2"', 1),
+            "compound spline": planar.replace("<Y>1</Y>", "<Y>0.9</Y>", 1),
+            "profile": planar.replace(
+                '<ProfileSpline DrawMode="false"><ControlPoint><X>0</X>',
+                '<ProfileSpline DrawMode="false"><ControlPoint><X>0.1</X>',
+                1,
+            ),
+            "attribute": planar.replace("<SplineProperty>", '<SplineProperty Future="1">', 1),
+            "extra child": planar.replace("</SplineProperty>", "<Future>1</Future></SplineProperty>", 1),
+            "duplicate": planar + planar,
+        }
+        baseline = _authoring_graph_core_projection(before)["fingerprint"]
+        for name, changed_planar in mutations.items():
+            with self.subTest(name=name):
+                changed = spm_text(stale=False).replace(
+                    "<Properties></Properties></Generator>",
+                    f"<Properties>{changed_planar}</Properties></Generator>",
+                    1,
+                )
+                self.assertNotEqual(
+                    baseline,
+                    _authoring_graph_core_projection(changed)["fingerprint"],
+                )
+
+        wrong_ancestry = spm_text(stale=False).replace(
+            "</SpeedTree>",
+            f"<UnknownRoot>{planar}</UnknownRoot></SpeedTree>",
+            1,
+        )
+        self.assertNotEqual(
+            baseline,
+            _authoring_graph_core_projection(wrong_ancestry)["fingerprint"],
+        )
+
+    def test_core_v6_neutralizes_only_draw_flags_view_bit_0x8(self):
+        def with_draw_flags(text, value):
+            return text.replace(
+                "<SpeedTree>",
+                "<SpeedTree><DrawFlags8>"
+                f"<DrawFlags>{value}</DrawFlags>"
+                "</DrawFlags8>",
+                1,
+            )
+
+        before = with_draw_flags(spm_text(stale=True), "3732")
+        after = with_draw_flags(spm_text(stale=False), "3740")
+        self.assertNotEqual(
+            _legacy_authoring_graph_core_v4_projection(before)["fingerprint"],
+            _legacy_authoring_graph_core_v4_projection(after)["fingerprint"],
+        )
+        self.assertEqual(
+            _authoring_graph_core_projection(before)["fingerprint"],
+            _authoring_graph_core_projection(after)["fingerprint"],
+        )
+
+        baseline = _authoring_graph_core_projection(before)["fingerprint"]
+        for value in ("3741", "3733", " 3740", "not-an-integer"):
+            with self.subTest(value=value):
+                changed = with_draw_flags(spm_text(stale=False), value)
+                self.assertNotEqual(
+                    baseline,
+                    _authoring_graph_core_projection(changed)["fingerprint"],
+                )
+
     def test_authoring_core_preserves_root_and_material_authored_values(self):
         before = authored_scope_text(
             stale=True,
@@ -570,6 +752,118 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         self.assertNotEqual(
             _authoring_graph_core_projection(before)["fingerprint"],
             _authoring_graph_core_projection(changed_material)["fingerprint"],
+        )
+
+    def test_issue102_unproven_dormant_leaf_material_transition_is_strict(self):
+        before = issue102_leaf_material_text(
+            stale=True,
+            material_values=(-1, -1, -1, -1),
+        )
+        after = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 0, 0, 0),
+            volatile="two",
+        )
+        before_projection = _authoring_graph_core_projection(before)
+        after_projection = _authoring_graph_core_projection(after)
+
+        self.assertNotEqual(
+            before_projection["fingerprint"],
+            after_projection["fingerprint"],
+        )
+
+        differences = []
+
+        def walk(left, right, path="$", names=()):
+            if type(left) is not type(right):
+                differences.append((path, left, right, names))
+                return
+            if isinstance(left, dict):
+                next_names = names
+                if left.get("tag") == "Property":
+                    property_names = [
+                        child.get("text")
+                        for child in left.get("children", [])
+                        if child.get("tag") == "Name"
+                    ]
+                    next_names = names + tuple(property_names)
+                for key in sorted(set(left) | set(right)):
+                    if key not in left or key not in right:
+                        differences.append((path + "." + key, left, right, next_names))
+                    else:
+                        walk(left[key], right[key], path + "." + key, next_names)
+                return
+            if isinstance(left, list):
+                if len(left) != len(right):
+                    differences.append((path + ".length", len(left), len(right), names))
+                for index, (before_item, after_item) in enumerate(zip(left, right)):
+                    walk(
+                        before_item,
+                        after_item,
+                        f"{path}[{index}]",
+                        names,
+                    )
+                return
+            if left != right:
+                differences.append((path, left, right, names))
+
+        walk(before_projection["_rows"], after_projection["_rows"])
+        self.assertEqual(len(differences), 4)
+        self.assertEqual(
+            {(before_value, after_value) for _, before_value, after_value, _ in differences},
+            {("-1", "0")},
+        )
+        self.assertEqual(
+            {name for _, _, _, names in differences for name in names},
+            {f"Leaves:Type:{type_index}:Material" for type_index in range(4)},
+        )
+
+    def test_issue102_active_material_zero_remains_observable(self):
+        active_zero = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 5, 5, 5),
+            mesh_values=(130, -10, -10, -10),
+            material_ids=(0, 5),
+        )
+        active_five = issue102_leaf_material_text(
+            stale=False,
+            material_values=(5, 5, 5, 5),
+            mesh_values=(130, -10, -10, -10),
+            material_ids=(0, 5),
+        )
+
+        self.assertNotEqual(
+            _authoring_graph_core_projection(active_zero)["fingerprint"],
+            _authoring_graph_core_projection(active_five)["fingerprint"],
+        )
+
+    def test_issue102_recovery_gate_blocks_unproven_transition(self):
+        before = issue102_leaf_material_text(
+            stale=True,
+            material_values=(-1, -1, -1, -1),
+        )
+        after = issue102_leaf_material_text(
+            stale=False,
+            material_values=(0, 0, 0, 0),
+            volatile="two",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, recovery_root = self.make_files(folder)
+            write_spm(spm, before)
+
+            with self.assertRaises(StaleNodeTableRecoveryTimeout) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    recovery_root,
+                    after_text=after,
+                    timeout=3,
+                )
+
+        self.assertIn(
+            "authoring_graph_changed_during_resave",
+            caught.exception.evidence["last_reason_tokens"],
         )
 
     def test_elementtree_audit_uses_canonical_generator_identity(self):
@@ -654,13 +948,21 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
 
     def test_contract_publishes_every_forbidden_and_required_boundary(self):
         contract = _stale_node_table_recovery_contract()
-        self.assertEqual(contract["schema_version"], 2)
-        self.assertFalse(contract["modeler_auto_save"])
+        self.assertEqual(contract["schema_version"], 3)
+        self.assertTrue(contract["modeler_auto_save"])
+        self.assertEqual(
+            contract["modeler_auto_save_mode"],
+            "exact_owned_pid_document_menu_uia_invoke",
+        )
         self.assertFalse(contract["modeler_process_kill"])
         self.assertFalse(contract["direct_spm_xml_edit"])
         self.assertFalse(contract["ui_input_simulation"])
         self.assertFalse(contract["automatic_rollback"])
         self.assertFalse(contract["stale_false_alone_allows_retry"])
+        self.assertTrue(contract["requires_node_table_stale"])
+        self.assertTrue(contract["requires_nonzero_orphan_owners"])
+        self.assertTrue(contract["requires_nonzero_orphan_nodes"])
+        self.assertTrue(contract["requires_complete_sealed_scope"])
         self.assertTrue(contract["requires_exact_preimage_backup"])
         self.assertTrue(contract["requires_immutable_preimage_receipt"])
         self.assertTrue(contract["source_sha_rechecked_before_continuation"])
@@ -782,7 +1084,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             [130],
         )
         self.assertTrue(result["reaudit"]["normalization"]["applicable"])
-        self.assertEqual(receipt["schema_version"], 6)
+        self.assertEqual(receipt["schema_version"], 8)
         self.assertEqual(
             receipt["target_requirements"]["required_live_mesh_ids"],
             [130],
@@ -1023,7 +1325,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             )
         self.assertEqual(result["status"], "repaired_reaudit_valid")
 
-    def test_schema5_core_v3_receipt_reaudits_byte_for_byte_under_v4(self):
+    def test_schema5_core_v3_receipt_reaudits_byte_for_byte_under_v5(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -1070,7 +1372,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            4,
+            6,
         )
 
     def test_exact_backup_and_immutable_receipt_exist_before_modeler_launch(self):
@@ -1087,12 +1389,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 self.assertEqual(backups[0].read_bytes(), preimage)
                 receipt_text = receipts[0].read_text(encoding="utf-8")
                 receipt = json.loads(receipt_text)
-                self.assertEqual(receipt["schema_version"], 6)
+                self.assertEqual(receipt["schema_version"], 8)
                 self.assertEqual(
                     receipt["authoring_graph_projection"]["version"], 1
                 )
                 self.assertEqual(
-                    receipt["authoring_graph_core_projection"]["version"], 4
+                    receipt["authoring_graph_core_projection"]["version"], 6
                 )
                 self.assertEqual(receipt["generator_membership"]["version"], 1)
                 self.assertEqual(receipt["required_target_bindings"]["version"], 2)
@@ -1108,7 +1410,10 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                     receipt["target_requirements"]["required_live_mesh_ids"],
                     list(TARGET_MESH_IDS),
                 )
-                self.assertNotIn(str(folder), receipt_text)
+                self.assertEqual(
+                    receipt["exact_preimage"]["source_spm"],
+                    str(spm.resolve(strict=False)),
+                )
                 self.assertNotIn("g-130", receipt_text)
 
             result = self.recover_with_save(
@@ -1529,7 +1834,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             self.assertEqual(reused["receipt_path"].read_bytes(), sealed_bytes)
             self.assertEqual(reused["receipt_sha256"], sealed_sha)
 
-    def test_schema3_core_v2_is_rebuilt_before_current_v4_projection(self):
+    def test_schema3_core_v2_is_rebuilt_before_current_v5_projection(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, root = self.make_files(folder)
@@ -1563,7 +1868,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
         self.assertFalse(result["modeler_launched"])
         self.assertEqual(
             result["reaudit"]["authoring_graph_core_projection_version"],
-            4,
+            6,
         )
 
     def test_receipt_schema_versions_require_exact_integer_types(self):
@@ -2119,6 +2424,254 @@ class PreimageAndReceiptTests(RecoveryTestCase):
                 "source_changed_before_modeler_launch",
             )
             self.assertEqual(launched, [])
+
+
+class Schema7PathCompatibilityTests(RecoveryTestCase):
+    def make_schema7_artifacts(self, folder, *, absolute_texture):
+        spm = folder / "model.spm"
+        backup = folder / "model.preimage.spm"
+        receipt_path = folder / "model.receipt.json"
+        before = authored_scope_text(
+            stale=True,
+            guid_suffix="schema7",
+            volatile="before",
+            material_filename=str(absolute_texture),
+        )
+        write_spm(spm, before)
+        baseline = _capture_immutable_snapshot(spm, TARGET_MESH_IDS)
+        target_scopes, error = _resolve_target_scopes(TARGET_MESH_IDS)
+        self.assertIsNone(error)
+        receipt = _preimage_receipt(
+            baseline,
+            target_scopes,
+            backup.name,
+        )
+        receipt["schema_version"] = 7
+        receipt["exact_preimage"].pop("source_spm")
+        legacy_core = _authoring_graph_core_projection_for_version(before, 5)
+        receipt["authoring_graph_core_projection"] = {
+            key: value
+            for key, value in legacy_core.items()
+            if not key.startswith("_")
+        }
+        backup.write_bytes(spm.read_bytes())
+        receipt_path.write_text(
+            json.dumps(receipt, sort_keys=True),
+            encoding="utf-8",
+        )
+        return spm, backup, receipt_path
+
+    def test_schema7_core5_receipt_accepts_only_same_resolved_texture_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            texture = folder / "textures" / "leaf.png"
+            texture.parent.mkdir()
+            texture.write_bytes(b"fixture")
+            spm, backup, receipt = self.make_schema7_artifacts(
+                folder,
+                absolute_texture=texture,
+            )
+            after = authored_scope_text(
+                stale=False,
+                guid_suffix="schema7",
+                volatile="after",
+                material_filename=str(Path("textures") / "leaf.png"),
+            )
+            write_spm(spm, after)
+
+            result = verify_sealed_resave(
+                spm,
+                backup,
+                receipt,
+                TARGET_MESH_IDS,
+            )
+
+            self.assertEqual(result["status"], "sealed_resave_reaudit_valid")
+            self.assertEqual(
+                result["reaudit"]["authoring_graph_core_projection_version"],
+                6,
+            )
+
+    def test_schema7_core5_receipt_rejects_relative_retarget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            texture = folder / "textures" / "leaf.png"
+            texture.parent.mkdir()
+            texture.write_bytes(b"fixture")
+            spm, backup, receipt = self.make_schema7_artifacts(
+                folder,
+                absolute_texture=texture,
+            )
+            after = authored_scope_text(
+                stale=False,
+                guid_suffix="schema7",
+                volatile="after",
+                material_filename=str(Path("other") / "leaf.png"),
+            )
+            write_spm(spm, after)
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                verify_sealed_resave(
+                    spm,
+                    backup,
+                    receipt,
+                    TARGET_MESH_IDS,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "sealed_resave_reaudit_failed",
+            )
+            self.assertIn(
+                "authoring_graph_changed_during_resave",
+                caught.exception.evidence["reason_tokens"],
+            )
+
+
+class SemanticUIARecoveryTests(RecoveryTestCase):
+    @staticmethod
+    def semantic_receipt(path, operation, *, reused=False):
+        return {
+            "contract": SEMANTIC_UIA_CONTRACT,
+            "owned_process_id": 4242,
+            "document_accessible_name": Path(path).name,
+            "operation": operation,
+            "menu_path": [
+                "File",
+                "Save" if operation == "save" else "Close",
+            ],
+            "semantic_pattern": "InvokePattern",
+            "bridge_exit_code": 0,
+            "session_reused": reused,
+            "owned_process_alive_after_invoke": True,
+        }
+
+    def test_stale_orphan_target_invokes_save_once_then_closes_after_reaudit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            calls = []
+            after_text = spm_text(stale=False, volatile="semantic")
+
+            class Session:
+                def save_document(inner_self, observed_executable, observed_spm):
+                    calls.append(("save", Path(observed_executable), Path(observed_spm)))
+                    write_spm(spm, after_text)
+                    return self.semantic_receipt(observed_spm, "save")
+
+                def close_document(inner_self, observed_spm):
+                    calls.append(("close", Path(observed_spm)))
+                    receipt = self.semantic_receipt(observed_spm, "close")
+                    receipt["exact_document_closed"] = True
+                    receipt["owned_process_alive_after_close"] = True
+                    return receipt
+
+            result = self.recover_with_save(
+                spm,
+                executable,
+                root,
+                modeler_session=Session(),
+            )
+
+            self.assertEqual([row[0] for row in calls], ["save", "close"])
+            self.assertTrue(result["reaudit"]["valid"])
+            node_table = result["reaudit"]["target_delivery"]["node_table"]
+            self.assertFalse(node_table["stale"])
+            self.assertEqual(node_table["orphan_node_count"], 0)
+            completion = result["semantic_completion_receipt"]
+            completion_path = root / completion["file"]
+            self.assertTrue(completion_path.is_file())
+            payload = json.loads(completion_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["preimage"]["node_table_stale"], True)
+            self.assertGreater(payload["preimage"]["orphan_generator_guid_count"], 0)
+            self.assertGreater(payload["preimage"]["orphan_node_count"], 0)
+            self.assertEqual(payload["postimage"]["node_table_stale"], False)
+            self.assertEqual(payload["postimage"]["orphan_generator_guid_count"], 0)
+            self.assertEqual(payload["postimage"]["orphan_node_count"], 0)
+            self.assertTrue(payload["postimage"]["authoring_graph_continuity"])
+            self.assertTrue(payload["postimage"]["generator_membership_continuity"])
+            self.assertTrue(payload["postimage"]["required_target_binding_continuity"])
+            self.assertEqual(payload["semantic_uia"]["save"]["owned_process_id"], 4242)
+            self.assertEqual(payload["semantic_uia"]["close"]["menu_path"], ["File", "Close"])
+
+    def test_zero_orphan_stale_evidence_never_invokes_semantic_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            calls = []
+
+            def zero_orphan_capture(path, expected):
+                snapshot = _capture_immutable_snapshot(path, expected)
+                node_table = snapshot["delivery"]["node_table"]
+                node_table["stale"] = True
+                node_table["orphan_generator_guids"] = []
+                node_table["orphan_node_count"] = 0
+                return snapshot
+
+            class Session:
+                def save_document(inner_self, *_args):
+                    calls.append("save")
+
+                def close_document(inner_self, *_args):
+                    calls.append("close")
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    capture_fn=zero_orphan_capture,
+                    modeler_session=Session(),
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "stale_orphan_evidence_missing",
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(list(root.glob("*.preimage.spm")), [])
+
+    def test_ambiguous_document_blocks_without_close_or_source_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            before = spm.read_bytes()
+            calls = []
+
+            class Session:
+                def save_document(inner_self, _executable, observed_spm):
+                    calls.append("save")
+                    raise SemanticModelerUIAError(
+                        "uia_document_ambiguous",
+                        "fixture ambiguity",
+                        {
+                            "owned_process_id": 4242,
+                            "document_accessible_name": Path(observed_spm).name,
+                            "operation": "save",
+                        },
+                    )
+
+                def close_document(inner_self, *_args):
+                    calls.append("close")
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    modeler_session=Session(),
+                )
+
+            self.assertEqual(caught.exception.reason_token, "uia_document_ambiguous")
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(spm.read_bytes(), before)
+            blocked = json.loads(
+                (root / caught.exception.evidence["blocked_event"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(blocked["semantic_uia"]["owned_process_id"], 4242)
+            self.assertEqual(blocked["semantic_uia"]["operation"], "save")
 
 
 class QuiescenceAndGraphGateTests(RecoveryTestCase):

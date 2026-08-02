@@ -370,6 +370,25 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(second_lease.job_id, second["id"])
         second_lease.finish()
 
+    def test_running_owner_can_finish_as_cancelled_without_failed_status(self):
+        runtime = self.runtime()
+        job = runtime.enqueue("operator stop", {"value": 1})
+        lease = runtime.wait_for_turn(job["id"])
+
+        cancelled = lease.finish(
+            result={
+                "outcome": "stopped",
+                "error": "사용자 중지",
+                "failed_count": 0,
+            },
+            terminal_status="cancelled",
+        )
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["result"]["outcome"], "stopped")
+        self.assertEqual(cancelled["result"]["failed_count"], 0)
+        self.assertEqual(cancelled["cancel_reason"], "사용자 중지")
+
     def test_context_manager_records_failure_and_releases_next_job(self):
         runtime = self.runtime()
         first = runtime.enqueue("context failure", {})

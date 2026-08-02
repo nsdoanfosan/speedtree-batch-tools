@@ -15,6 +15,7 @@ The durable stage keys are:
 - `send2ue`
 - `unreal`
 - `post_check`
+- `pending_unreal`
 - `stalled`
 - `blocked`
 - `failed`
@@ -34,9 +35,30 @@ non-terminal, the panel says `current state: running`, shows `success N`,
 an individual target has failed while another remains live, it explicitly says
 the current run continues. Only after every selected target is terminal does
 the panel display the terminal outcome. Receipts expose this distinction as
-`run_state` (`running` or `terminal`) and, after terminalization only,
+`run_state` (`running`, `waiting`, or `terminal`) and, after terminalization only,
 `terminal_outcome`; the root `stage` remains a current-target observation
 until then.
+
+`pending_unreal` is intentionally nonterminal and non-live: export is durable,
+but Unreal has not yet supplied the authoritative import result. A receipt whose
+remaining rows are in this state has `run_state=waiting`; it is not converted
+to `failed`, `stalled`, or `owner_lost` merely because no process heartbeat is
+expected while waiting.
+
+## Authoritative target result semantics
+
+Final queue receipts and UI totals normalize durable target kinds as follows:
+
+- `completed`, `imported_ok`, and `ready` -> `completed`
+- `exported_pending_unreal` (and an active import checkpoint) -> `pending_unreal`
+- `cancelled` and `stopped` -> `cancelled`
+- actual blocked, failed, and `owner_lost` outcomes retain separate classes
+
+Success, waiting, and operator-cancelled rows never contribute to final failure
+counts, reason-token lists, or failed queue-job lists. A late Stop observation
+cannot override an already-authoritative all-target-completed summary. An active
+owned lease stopped by the operator is sealed as queue `status=cancelled`, not
+`failed`; its structured result retains `outcome=stopped` for compatibility.
 
 ## Liveness meanings
 

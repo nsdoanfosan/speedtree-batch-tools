@@ -540,13 +540,23 @@ class SharedJobQueue:
         *,
         result: Any = None,
         success: bool = True,
+        terminal_status: Optional[str] = None,
         owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Finish a leased job and release the global execution slot."""
+        """Finish a leased job with an explicit non-failure cancel when needed."""
 
         job_id = _require_text(job_id, field="job_id")
         lease_token = _require_text(lease_token, field="lease_token")
         result = _json_copy(result, field="result")
+        if terminal_status is not None:
+            terminal_status = _require_text(
+                terminal_status,
+                field="terminal_status",
+            ).casefold()
+            if terminal_status not in {"completed", "failed", "cancelled"}:
+                raise ValueError(
+                    "terminal_status must be completed, failed, or cancelled"
+                )
         expected_owner = (
             None
             if owner_id is None
@@ -556,9 +566,18 @@ class SharedJobQueue:
         def mutate(state: Dict[str, Any], now: float) -> Dict[str, Any]:
             job = self._find_job(state, job_id)
             lease = self._require_lease(job, lease_token, expected_owner)
-            job["status"] = "completed" if success else "failed"
+            job["status"] = terminal_status or (
+                "completed" if success else "failed"
+            )
             job["finished_at"] = now
             job["terminal_at"] = now
+            if job["status"] == "cancelled":
+                job["cancelled_at"] = now
+                job["cancel_reason"] = str(
+                    (result or {}).get("error")
+                    or (result or {}).get("outcome")
+                    or "operator_cancelled"
+                ) if isinstance(result, dict) else "operator_cancelled"
             job["result"] = result
             job["last_lease"] = {
                 key: value for key, value in lease.items() if key != "token"

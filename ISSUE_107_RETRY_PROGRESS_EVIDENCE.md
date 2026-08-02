@@ -100,6 +100,10 @@ earlier material/preflight state.
 | Silent healthy child | live stage; output age increases; heartbeat remains fresh | normal exit, never false-complete |
 | Hung child | `stalled` after the documented warning threshold | remains alive until operator cancel |
 | Operator cancel | `cancelled` with exact target/partition reason | #100 private owned Job tree terminated |
+| Durable success kinds | `completed` for `completed` / `imported_ok` / `ready`; excluded from failure totals and tokens | no replay |
+| Export waiting | `pending_unreal`, `run_state=waiting`; excluded from failure totals and owner-lost liveness | no false failure |
+| Late Stop after 29/29 completion | queue/result remains `completed`, failed/blocked `0` | no completed row is rewritten cancelled |
+| Active operator Stop | target state stores `*_status_kind=cancelled` plus `*_status_result`; no `*_status_error=internal_error` | owned lease seals as queue `cancelled` |
 | Unrelated helper | absent from retry receipt | remains alive across owned-tree cancel |
 | Non-zero child | `failed`, `process_nonzero_exit:7` | exact return code retained |
 | Queue owner lost | `owner_lost` only for incomplete rows | completed rows preserved |
@@ -110,12 +114,15 @@ earlier material/preflight state.
 
 ## Verification receipt
 
-- Focused retry receipt/UI regressions: `95 passed`.
-- Dedicated sanitized #107 acceptance: `6 passed` (included above).
-- Every repository unittest suite used by Windows CI: `1,658 passed`
-  (`252 + 8 + 33 + 585 + 629 + 151`).
-- Compile gate: `203 Python sources`, `4 contract groups`, revision
-  `881e068697d90232`.
+- Latest terminal semantics regressions: `7 passed` (sequence 82 success/wait
+  filtering, sequence 83 late Stop, durable operator cancel, active-lease
+  cancellation, and restart reconstruction).
+- Full push/queue flow: `93 passed`; retry progress: `10 passed`; shared queue
+  suites: `45 passed`.
+- Full SK Batch unittest discovery: `642 passed`.
+- Full repository-root unittest discovery: `261 passed`.
+- Compile gate: `210 Python sources`, `4 contract groups`, revision
+  `ea6a392bd143d64c`.
 - `compileall` and `git diff --check`: passing.
 - The helper cancellation check asserts the unrelated sanitized Python process
   remains alive while the exact owned hung root/grandchild Job tree is clean.

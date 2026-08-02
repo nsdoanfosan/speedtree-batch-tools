@@ -30,6 +30,7 @@ BLENDER = "blender"
 SEND2UE = "send2ue"
 UNREAL = "unreal"
 POST_CHECK = "post_check"
+PENDING_UNREAL = "pending_unreal"
 BLOCKED = "blocked"
 STALLED = "stalled"
 OWNER_LOST = "owner_lost"
@@ -52,6 +53,7 @@ ALL_STAGES = frozenset(
         SEND2UE,
         UNREAL,
         POST_CHECK,
+        PENDING_UNREAL,
         BLOCKED,
         STALLED,
         OWNER_LOST,
@@ -698,6 +700,10 @@ class RetryProgressReceipt:
                 terminal_reason or diagnostic or stage
             )
             row["outcome"] = str(outcome or stage)
+        elif stage == PENDING_UNREAL:
+            row["terminal_at"] = None
+            row["terminal_reason"] = None
+            row["outcome"] = str(outcome or PENDING_UNREAL)
         self._payload["current_target_id"] = row["target_id"]
         self._payload["stage"] = stage
 
@@ -784,6 +790,19 @@ class RetryProgressReceipt:
 
     def _finalize_if_terminal_locked(self, now, reason=None):
         rows = self._targets_locked()
+        waiting = [row for row in rows if row.get("stage") == PENDING_UNREAL]
+        if waiting and all(
+            row.get("stage") in TERMINAL_STAGES or row.get("stage") == PENDING_UNREAL
+            for row in rows
+        ):
+            self._payload["stage"] = PENDING_UNREAL
+            self._payload["run_state"] = "waiting"
+            self._payload["terminal_outcome"] = None
+            self._payload["terminal_reason"] = _bounded_diagnostic(
+                reason or PENDING_UNREAL
+            )
+            self._payload["terminal_at"] = None
+            return True
         if rows and not all(row["stage"] in TERMINAL_STAGES for row in rows):
             return False
         outcomes = {row.get("outcome") or row.get("stage") for row in rows}
@@ -791,12 +810,12 @@ class RetryProgressReceipt:
             stage = COMPLETE
         elif OWNER_LOST in outcomes:
             stage = OWNER_LOST
-        elif CANCELLED in outcomes:
-            stage = CANCELLED
-        elif BLOCKED in outcomes:
-            stage = BLOCKED
         elif FAILED in outcomes:
             stage = FAILED
+        elif BLOCKED in outcomes:
+            stage = BLOCKED
+        elif CANCELLED in outcomes:
+            stage = CANCELLED
         else:
             stage = COMPLETE if not rows else FAILED
         self._payload["stage"] = stage
@@ -965,6 +984,35 @@ class RetryProgressReceipt:
                                 terminal_reason="completed",
                                 outcome=COMPLETE,
                             )
+                        elif outcome in {
+                            "pending_unreal",
+                            "exported_pending_unreal",
+                        }:
+                            self._transition_target_locked(
+                                row,
+                                PENDING_UNREAL,
+                                self._now(),
+                                diagnostic=reason,
+                                outcome=PENDING_UNREAL,
+                            )
+                        elif outcome in {"cancelled", "stopped"}:
+                            self._transition_target_locked(
+                                row,
+                                CANCELLED,
+                                self._now(),
+                                diagnostic=reason,
+                                terminal_reason=reason,
+                                outcome=CANCELLED,
+                            )
+                        elif outcome == "owner_lost":
+                            self._transition_target_locked(
+                                row,
+                                OWNER_LOST,
+                                self._now(),
+                                diagnostic=reason,
+                                terminal_reason=reason,
+                                outcome=OWNER_LOST,
+                            )
                         elif outcome in {"blocked", "planned_excluded"}:
                             self._transition_target_locked(
                                 row,
@@ -1052,6 +1100,7 @@ __all__ = [
     "COMPLETE",
     "FAILED",
     "OWNER_LOST",
+    "PENDING_UNREAL",
     "PLANNING",
     "POST_CHECK",
     "RetryProgressReceipt",

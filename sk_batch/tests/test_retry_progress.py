@@ -21,6 +21,7 @@ from retry_progress import (
     COMPLETE,
     FAILED,
     OWNER_LOST,
+    PENDING_UNREAL,
     PLANNING,
     POST_CHECK,
     SEND2UE,
@@ -333,6 +334,81 @@ def test_restart_reconciles_queue_commit_before_receipt_completion(tmp_path):
     snapshot = restored.snapshot()
     assert _target(snapshot, target)["stage"] == COMPLETE
     assert snapshot["terminal_outcome"] == COMPLETE
+
+
+def test_restart_keeps_success_wait_and_cancel_distinct(tmp_path):
+    completed = str(tmp_path / "completed.spm")
+    pending = str(tmp_path / "pending.spm")
+    cancelled = str(tmp_path / "cancelled.spm")
+    tracker = RetryProgressReceipt.create(
+        [completed, pending, cancelled],
+        receipt_dir=tmp_path / "receipts",
+    )
+    tracker.assign_partition(
+        "unreal_ingest",
+        [completed, pending, cancelled],
+        "immutable_unreal_only",
+    )
+    tracker.register_queue_job("unreal_ingest", "terminal-semantics", 13)
+    queue_snapshot = {
+        "jobs": [
+            {
+                "id": "terminal-semantics",
+                "status": "completed",
+                "result": {
+                    "outcome": "waiting",
+                    "failed_count": 0,
+                    "target_outcomes": [
+                        {"target": completed, "outcome": "completed"},
+                        {"target": pending, "outcome": "pending_unreal"},
+                        {"target": cancelled, "outcome": "cancelled"},
+                    ],
+                },
+            }
+        ]
+    }
+
+    assert tracker.reconcile_queue(queue_snapshot) is True
+    restored = tracker.snapshot(evaluate=False)
+    assert _target(restored, completed)["stage"] == COMPLETE
+    assert _target(restored, pending)["stage"] == PENDING_UNREAL
+    assert _target(restored, cancelled)["stage"] == CANCELLED
+    assert restored["run_state"] == "waiting"
+    assert restored["terminal_outcome"] is None
+
+
+def test_failed_stopped_queue_shell_does_not_override_completed_targets(tmp_path):
+    targets = [str(tmp_path / f"completed_{index}.spm") for index in range(29)]
+    tracker = RetryProgressReceipt.create(
+        targets,
+        receipt_dir=tmp_path / "receipts",
+    )
+    tracker.assign_partition("blender_export", targets, "full_pipeline")
+    tracker.register_queue_job("blender_export", "sequence-83", 83)
+    queue_snapshot = {
+        "jobs": [
+            {
+                "id": "sequence-83",
+                "status": "failed",
+                "result": {
+                    "outcome": "stopped",
+                    "completed_count": 29,
+                    "failed_count": 0,
+                    "blocked_count": 0,
+                    "target_outcomes": [
+                        {"target": target, "outcome": "completed"}
+                        for target in targets
+                    ],
+                },
+            }
+        ]
+    }
+
+    assert tracker.reconcile_queue(queue_snapshot) is True
+    restored = tracker.snapshot(evaluate=False)
+    assert all(row["stage"] == COMPLETE for row in restored["targets"])
+    assert restored["run_state"] == "terminal"
+    assert restored["terminal_outcome"] == COMPLETE
 
 
 def test_push_state_commits_before_retry_receipt_transitions():

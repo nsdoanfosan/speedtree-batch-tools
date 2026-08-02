@@ -13,6 +13,12 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
+
 
 MANIFEST_NAME = "pcg_st9_canonical_outputs.json"
 MANIFEST_KIND = "pcg_st9_canonical_output_manifest"
@@ -108,16 +114,9 @@ def _path_key(path):
 
 
 def _atlas_manifest_candidates(target_spm):
-    target = Path(target_spm).expanduser().resolve(strict=False)
-    candidates = [target.parent / "speedtree_import_manifest.json"]
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-    if scope_dir.is_dir():
-        candidates.extend(sorted(
-            path
-            for path in scope_dir.glob("*.json")
-            if path.is_file()
-        ))
-    return candidates
+    """Compatibility wrapper around the shared fail-closed resolver."""
+    resolution = resolve_atlas_manifests(target_spm)
+    return [Path(row["path"]) for row in resolution["selected"]]
 
 
 def _canonical_atlas_output_row(
@@ -341,19 +340,13 @@ def refresh_atlas_manifests_for_spm(
     pending = []
     matched = []
     planned = []
-    for path in _atlas_manifest_candidates(target):
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise CanonicalOutputManifestError(
-                f"Atlas manifest is unreadable: {path}: {exc}"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise CanonicalOutputManifestError(
-                f"Atlas manifest root must be an object: {path}"
-            )
+    try:
+        atlas_resolution = resolve_atlas_manifests(target)
+    except AtlasManifestResolutionError as exc:
+        raise CanonicalOutputManifestError(str(exc)) from exc
+    for selected in atlas_resolution["selected"]:
+        path = Path(selected["path"])
+        payload = selected["payload"]
         promoted, issue = _promote_atlas_manifest_payload(
             payload,
             path,
@@ -417,6 +410,7 @@ def refresh_atlas_manifests_for_spm(
         "updated": updated,
         "current": current,
         "pending": pending,
+        "atlas_manifest_resolution": resolution_evidence(atlas_resolution),
     }
 
 
