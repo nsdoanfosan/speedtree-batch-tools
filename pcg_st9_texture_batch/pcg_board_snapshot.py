@@ -41,12 +41,62 @@ DISPLAY_SNAPSHOT_OMITTED_KEYS = frozenset({
     "expected_generator_bindings",
     "generator_bindings",
     "leaf_atlas_lineage",
+    "material_targets",
+    "origin_receipt",
     "polygon_indices",
+    "preserved_cluster_materials",
+    "canonical_manifest_consumer_binding",
+    "source_signature",
     "source_generator_bindings",
     "source_material_statuses",
     "triangle_indices",
     "vertex_indices",
 })
+
+
+def _cluster_assembly_display_projection(contract):
+    """Keep only fields read by ``cluster_hierarchy_rows``.
+
+    Real Assembly contracts contain large normalized geometry, receipt, and
+    delivery graphs.  The cached board is display-only and needs just the
+    hierarchy labels/counts and texture status inputs; mutation always uses a
+    fresh full report.
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    dependencies = []
+    for dependency in contract.get("dependencies") or ():
+        if not isinstance(dependency, dict):
+            continue
+        dependencies.append({
+            key: dependency.get(key)
+            for key in (
+                "spm",
+                "name",
+                "role",
+                "decision",
+                "source_mesh_ids",
+                "texture_dependencies",
+                "tga_basename_validation",
+            )
+        } | {
+            "source_materials": [
+                {"material_name": row.get("material_name")}
+                for row in dependency.get("source_materials") or ()
+                if isinstance(row, dict) and row.get("material_name")
+            ],
+        })
+    return {
+        "hierarchy": contract.get("hierarchy") or {},
+        "canonical_bark": {
+            key: (contract.get("canonical_bark") or {}).get(key)
+            for key in ("status", "canonical_material")
+        },
+        "handoff": {
+            key: (contract.get("handoff") or {}).get(key)
+            for key in ("status", "skeleton_wind_contract")
+        },
+        "dependencies": dependencies,
+    }
 
 
 def _json_safe(
@@ -55,6 +105,17 @@ def _json_safe(
         result = {}
         for key, nested in value.items():
             key_text = str(key)
+            if (
+                omit_diagnostics
+                and key_text.casefold() == "cluster_assembly"
+            ):
+                if omission_counts is not None:
+                    omission_counts["cluster_assembly_payload_projected"] = (
+                        omission_counts.get(
+                            "cluster_assembly_payload_projected", 0
+                        ) + 1
+                    )
+                nested = _cluster_assembly_display_projection(nested)
             if (
                 omit_diagnostics
                 and key_text.casefold() in DISPLAY_SNAPSHOT_OMITTED_KEYS
@@ -275,6 +336,15 @@ def write_board_display_snapshot(
         ),
     }
     payload["projection"].update(projection_metrics)
+    payload["payload_integrity"] = {
+        "algorithm": "sha256-canonical-json-v1",
+        "sha256": _sha256_json({
+            "context": payload["context"],
+            "projection": payload["projection"],
+            "display_report": payload["display_report"],
+        }),
+        "trust": "corruption_detection_only_not_execution_authority",
+    }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -419,12 +489,32 @@ def read_board_display_snapshot(
             "can_display": False,
         }
 
+    integrity = payload.get("payload_integrity") or {}
+    expected_payload_sha256 = _sha256_json({
+        "context": payload.get("context"),
+        "projection": payload.get("projection"),
+        "display_report": payload.get("display_report"),
+    })
+    if (
+        integrity.get("algorithm") != "sha256-canonical-json-v1"
+        or integrity.get("sha256") != expected_payload_sha256
+    ):
+        return {
+            **base,
+            "cache_state": "untrusted_payload",
+            "context_state": "unknown",
+            "can_display": False,
+        }
+
     stored_context = payload.get("context")
     mismatches = _context_mismatches(stored_context, expected_context)
     return {
         **base,
         "cache_state": (
             "matching_inputs" if not mismatches else "stale_inputs"
+        ),
+        "context_state": (
+            "matching_context" if not mismatches else "stale_context"
         ),
         "can_display": True,
         "created_at": payload.get("created_at"),

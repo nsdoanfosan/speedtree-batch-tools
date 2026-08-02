@@ -4,13 +4,16 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import copy
+import hashlib
 import json
 import math
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -22,17 +25,24 @@ sys.path.insert(0, str(TOOL_DIR))
 
 import pcg_texture_audit as audit  # noqa: E402
 import pcg_board_snapshot as board  # noqa: E402
+import cluster_blend_sync as cluster_sync  # noqa: E402
+import pcg_cluster_assembly_contract as assembly  # noqa: E402
+import speedtree_texture_contract as texture_contract  # noqa: E402
+import mutation_plan_authority as mutation_authority  # noqa: E402
+from artifact_content_key import ConcurrentContentDigestMemo  # noqa: E402
 from blend_source_index import lookup_blend_source_images  # noqa: E402
 from pcg_startup_cache import (  # noqa: E402
     BoundedDiscoveryError,
     ContentAddressedJsonCache,
     bounded_recursive_files,
+    canonical_json_sha256,
 )
 from pcg_startup_latency import (  # noqa: E402
     PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS,
     STARTUP_TOTAL_INVOCATION_RULES,
     StartupAmplificationError,
     StartupLatencyTracker,
+    USABLE_READY_ACCEPTANCE_CAP_SECONDS,
     require_startup_total_invocation_guard,
     startup_total_invocation_guard,
 )
@@ -144,6 +154,107 @@ class StartupLatencyReceiptTests(unittest.TestCase):
 
 
 class ContentIdentityCacheTests(unittest.TestCase):
+    def test_mutation_authority_spm_analysis_ignores_memory_and_disk_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "SK_tree.spm"
+            spm.write_text(
+                '<?xml version="1.0"?><SpeedTree><Materials>'
+                '<Material_v8 ID="1" Name="M_current"></Material_v8>'
+                '</Materials><Generators></Generators><Nodes></Nodes>'
+                '</SpeedTree>',
+                encoding="utf-8",
+            )
+            cache_path = Path(temporary) / "spm-cache.json"
+
+            @audit._report_scan_cached
+            def scan(*, mutation_authority=False):
+                return copy.deepcopy(audit._spm_analysis(spm))
+
+            with mock.patch.object(
+                audit, "SPM_ANALYSIS_CACHE_PATH", cache_path
+            ):
+                audit._SPM_ANALYSIS_CACHE.clear()
+                audit._PERSISTENT_SPM_ANALYSIS = {}
+                normal = scan()
+                self.assertIn("M_current", normal["material_names"])
+                for row in audit._SPM_ANALYSIS_CACHE.values():
+                    row["material_names"] = ["M_poison"]
+                for row in audit._PERSISTENT_SPM_ANALYSIS.values():
+                    row["material_names"] = ["M_poison"]
+
+                authoritative = scan(mutation_authority=True)
+
+            self.assertIn("M_current", authoritative["material_names"])
+            self.assertNotIn("M_poison", authoritative["material_names"])
+
+    def test_refresh_digest_memo_single_flights_shared_physical_reads(self):
+        memo = ConcurrentContentDigestMemo()
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def compute():
+            calls.append(threading.get_ident())
+            started.set()
+            self.assertTrue(release.wait(timeout=5.0))
+            return "a" * 64
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(
+                    memo.get_or_compute,
+                    ("c:/shared.fbx", 1024, 7),
+                    compute,
+                )
+                for _index in range(8)
+            ]
+            self.assertTrue(started.wait(timeout=5.0))
+            release.set()
+            results = [future.result(timeout=5.0) for future in futures]
+
+        self.assertEqual(results, ["a" * 64] * 8)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(memo.metrics()["misses"], 1)
+        self.assertGreaterEqual(memo.metrics()["waits"], 1)
+
+    def test_refresh_digest_memo_rejects_pending_seed_conflict(self):
+        memo = ConcurrentContentDigestMemo()
+        started = threading.Event()
+        release = threading.Event()
+        key = ("c:/shared.fbx", 4, 7)
+
+        def compute():
+            started.set()
+            self.assertTrue(release.wait(timeout=5.0))
+            return "a" * 64
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(memo.get_or_compute, key, compute)
+            self.assertTrue(started.wait(timeout=5.0))
+            memo.seed(key, "b" * 64)
+            release.set()
+            with self.assertRaisesRegex(ValueError, "Conflicting exact"):
+                future.result(timeout=5.0)
+
+        self.assertNotIn(key, memo)
+
+    def test_authority_digest_rejects_restored_mtime_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.fbx"
+            path.write_bytes(b"AAAA")
+            original = path.stat()
+            memo = ConcurrentContentDigestMemo()
+            first = texture_contract._file_sha256(path, memo=memo)
+            self.assertEqual(first, hashlib.sha256(b"AAAA").hexdigest())
+
+            path.write_bytes(b"BBBB")
+            os.utime(
+                path,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            with self.assertRaisesRegex(OSError, "identity change"):
+                texture_contract._file_sha256(path, memo=memo)
+
     def test_corrupt_cached_value_is_never_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "cache.json"
@@ -384,6 +495,36 @@ class ProviderAndAuditTests(unittest.TestCase):
             self.assertTrue(warm_metrics["cache_hit"])
             self.assertFalse(invalidated_metrics["cache_hit"])
 
+    def test_mutation_authority_provider_pass_bypasses_valid_poison(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree"
+            cluster = root / "tree_elm" / "Cluster"
+            cluster.mkdir(parents=True)
+            provider = cluster / "SK_cluster_elm_01.spm"
+            provider.write_bytes(b"AAAA")
+            cache_path = Path(temporary) / "provider-cache.json"
+            with mock.patch.object(
+                audit, "PROVIDER_MAP_CACHE_PATH", cache_path
+            ):
+                audit.canonical_cluster_provider_map(root)
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                row = next(iter(payload["entries"].values()))
+                row["value"] = {}
+                row["value_sha256"] = canonical_json_sha256({})
+                cache_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                metrics = {}
+                current = audit.canonical_cluster_provider_map(
+                    root,
+                    metrics=metrics,
+                    read_cache=False,
+                )
+
+            owner_key = str(provider.parent.parent.resolve()).casefold()
+            self.assertEqual(current[owner_key], [provider.resolve()])
+            self.assertFalse(metrics["cache_hit"])
+
     def test_blend_index_miss_reaudits_only_affected_folder(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -587,6 +728,94 @@ class RelationAndAuthorityTests(unittest.TestCase):
             GUI.cache_blender_connection_rows({"items": [invalidated_item]})
             self.assertEqual(calculate.call_count, 2)
 
+    def test_mutation_relation_pass_bypasses_checksum_valid_poisoned_rows(self):
+        poisoned = [{"blend": "C:/spoof.blend", "spms": []}]
+        trusted = [{"blend": "C:/current.blend", "spms": []}]
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=poisoned
+        ):
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+
+        current = self.item()
+        metrics = {}
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=trusted
+        ) as calculate:
+            GUI.cache_blender_connection_rows(
+                {"items": [current]},
+                read_cache=False,
+                verify_physical=True,
+                metrics=metrics,
+            )
+
+        calculate.assert_called_once()
+        self.assertEqual(
+            current["_gui_blender_connection_rows"], trusted
+        )
+        self.assertEqual(metrics["cache_hits"], 0)
+        self.assertEqual(
+            metrics["persisted_cache_policy"], "fresh_projection"
+        )
+
+    def test_session_evidence_never_authorizes_stale_relation_cache_hit(self):
+        original = self.spm.stat()
+        first = self.item()
+        stale_session = {
+            "schema_version": 1,
+            "kind": "pcg_refresh_exact_content_evidence",
+            "exact_content_rows": {
+                GUI.startup_path_key(self.spm): {
+                    "path": str(self.spm),
+                    "fingerprint_algorithm": "sha256-full-v1",
+                    "fingerprint": hashlib.sha256(b"AAAA").hexdigest(),
+                    "size": 4,
+                },
+            },
+        }
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [first]})
+            self.spm.write_bytes(b"BBBB")
+            os.utime(
+                self.spm,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            metrics = {}
+            changed = self.item()
+            GUI.cache_blender_connection_rows(
+                {"items": [changed]},
+                session_evidence=stale_session,
+                metrics=metrics,
+            )
+
+        self.assertEqual(calculate.call_count, 2)
+        self.assertEqual(metrics["cache_hits"], 0)
+        self.assertEqual(metrics["cache_misses"], 1)
+        self.assertEqual(metrics["reused_exact_content_file_count"], 0)
+        self.assertEqual(metrics["session_exact_candidate_count"], 1)
+
+    def test_deferred_relation_evidence_cannot_seal_mutation(self):
+        item = self.item()
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ):
+            GUI.cache_blender_connection_rows(
+                {"items": [item]}, verify_physical=False
+            )
+
+        self.assertTrue(GUI.item_has_current_live_evidence(item))
+        with self.assertRaisesRegex(RuntimeError, "display-only"):
+            GUI.seal_exact_mutation_baseline([item], action="test")
+
     def test_mutation_evidence_detects_large_unsampled_restored_mtime_tamper(self):
         self.spm.write_bytes(b"A" * (2 * 1024 * 1024))
         original = self.spm.stat()
@@ -613,7 +842,7 @@ class RelationAndAuthorityTests(unittest.TestCase):
 
         self.assertEqual(
             metrics["content_identity_algorithm"],
-            "sha256-of-hybrid-content-keys-v1",
+            "sha256-of-full-content-keys-v1",
         )
         self.assertEqual(
             metrics["mutation_authority_algorithm"],
@@ -671,10 +900,10 @@ class RelationAndAuthorityTests(unittest.TestCase):
             GUI,
             "make_report",
             return_value={"items": [current]},
-        ), mock.patch.object(
+        ) as make_report, mock.patch.object(
             GUI,
             "cache_blender_connection_rows",
-        ), mock.patch.object(
+        ) as relations, mock.patch.object(
             GUI,
             "seal_exact_mutation_baseline",
         ) as seal:
@@ -685,6 +914,25 @@ class RelationAndAuthorityTests(unittest.TestCase):
                     plan_payload={"target": "leaf"},
                 )
         seal.assert_not_called()
+        self.assertIs(
+            make_report.call_args.kwargs["mutation_authority"], True
+        )
+        self.assertIs(relations.call_args.kwargs["read_cache"], False)
+        self.assertIs(
+            relations.call_args.kwargs["verify_physical"], True
+        )
+
+    def test_nonempty_mutation_plan_cannot_use_empty_item_authority(self):
+        app = GUI.App.__new__(GUI.App)
+        app.cfg = {}
+        with mock.patch.object(GUI, "make_report") as make_report:
+            with self.assertRaisesRegex(RuntimeError, "scope is empty"):
+                app._reaudit_and_seal_mutation_items(
+                    [],
+                    action="atlas_target_add",
+                    plan_payload={"target_spm": str(self.spm)},
+                )
+        make_report.assert_not_called()
 
     def test_relation_calculation_honors_cancellation(self):
         with mock.patch.object(
@@ -700,7 +948,9 @@ class RelationAndAuthorityTests(unittest.TestCase):
         metrics = {}
         original = self.spm.stat()
 
-        def change_during_relation(_item):
+        def change_during_relation(
+            _item, _validation_cache=None, **_kwargs,
+        ):
             self.spm.write_bytes(b"BBBB")
             os.utime(
                 self.spm,
@@ -755,9 +1005,348 @@ class RelationAndAuthorityTests(unittest.TestCase):
         )
         self.assertEqual(
             metrics["content_identity_scope"],
-            "full-semantic-content-plus-sampled-bulk-images-plus-"
-            "bounded-directory-membership-v1",
+            "exact-relation-semantic-dependencies-plus-bounded-"
+            "membership-v2",
         )
+
+    def test_relation_projection_excludes_mutation_only_fields(self):
+        original = self.item()
+        changed = copy.deepcopy(original)
+        changed["cluster_items"] = [{"source_refs": ["other.tga"]}]
+        changed["target_spm_statuses"] = [{"status": "needs_sk"}]
+
+        first = GUI._relation_item_content_identity(original)
+        second = GUI._relation_item_content_identity(changed)
+
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertNotEqual(
+            GUI.mutation_semantic_digest(original),
+            GUI.mutation_semantic_digest(changed),
+        )
+
+    def test_relation_registry_same_size_restored_mtime_invalidates_cache(self):
+        blend = self.folder / "leaf.blend"
+        blend.write_bytes(b"blend bytes are path-only relation evidence")
+        registry = GUI.registry_path_for_blend(blend)
+        registry.write_text('{"value":"AAAA"}', encoding="utf-8")
+        original = registry.stat()
+        item = self.item()
+        item["leaf_mesh_sources"] = [{
+            "atlas_blends": [str(blend)],
+            "targets": [{"spm": str(self.spm)}],
+        }]
+
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            self.assertEqual(calculate.call_count, 1)
+
+            registry.write_text('{"value":"BBBB"}', encoding="utf-8")
+            os.utime(
+                registry,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_derived_cluster_blend_addition_invalidates_relation_cache(self):
+        cluster = self.folder / "Cluster"
+        cluster.mkdir()
+        source = cluster / "SK_cluster.spm"
+        source.write_bytes(b"cluster")
+        derived = cluster / "SK_cluster.blend"
+
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            self.assertEqual(calculate.call_count, 1)
+            derived.write_bytes(b"blend")
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_registry_external_target_content_invalidates_relation_cache(self):
+        cluster = self.folder / "Cluster"
+        cluster.mkdir()
+        source = cluster / "SK_cluster.spm"
+        source.write_bytes(b"cluster")
+        blend = cluster / "SK_cluster.blend"
+        blend.write_bytes(b"blend")
+        external = self.root / "external.spm"
+        external.write_bytes(b"AAAA")
+        original = external.stat()
+        registry = GUI.registry_path_for_blend(blend)
+        registry.write_text(
+            json.dumps({"target_spms": [str(external)]}),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+            self.assertEqual(calculate.call_count, 1)
+            external.write_bytes(b"BBBB")
+            os.utime(
+                external,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            GUI.cache_blender_connection_rows({"items": [self.item()]})
+
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_exact_baseline_binds_registry_bytes(self):
+        blend = self.folder / "leaf.blend"
+        blend.write_bytes(b"blend")
+        registry = GUI.registry_path_for_blend(blend)
+        registry.write_text('{"value":"AAAA"}', encoding="utf-8")
+        original = registry.stat()
+        item = self.item()
+        item["leaf_mesh_sources"] = [{
+            "atlas_blends": [str(blend)],
+            "targets": [{"spm": str(self.spm)}],
+        }]
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ):
+            GUI.cache_blender_connection_rows({"items": [item]})
+        baseline = GUI.seal_exact_mutation_baseline(
+            [item], action="test"
+        )
+        registry.write_text('{"value":"BBBB"}', encoding="utf-8")
+        os.utime(
+            registry,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        with self.assertRaises(RuntimeError):
+            GUI.require_exact_mutation_baseline(baseline)
+
+    def test_relation_scope_manifest_restored_mtime_invalidates_cache(self):
+        blend = self.folder / "leaf.blend"
+        blend.write_bytes(b"blend")
+        scope_dir = self.folder / ".atlas_leaf_speedtree_scopes"
+        scope_dir.mkdir()
+        scope = scope_dir / "leaf__SK_tree_elm.json"
+        scope.write_text('{"value":"AAAA"}', encoding="utf-8")
+        original = scope.stat()
+        item = self.item()
+        item["leaf_mesh_sources"] = [{
+            "atlas_blends": [str(blend)],
+            "targets": [{"spm": str(self.spm)}],
+        }]
+
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            self.assertEqual(calculate.call_count, 1)
+
+            scope.write_text('{"value":"BBBB"}', encoding="utf-8")
+            os.utime(
+                scope,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_relation_scope_manifest_mtime_order_invalidates_cache(self):
+        blend = self.folder / "leaf.blend"
+        blend.write_bytes(b"blend")
+        scope_dir = self.folder / ".atlas_leaf_speedtree_scopes"
+        scope_dir.mkdir()
+        first_scope = scope_dir / "a__SK_tree_elm.json"
+        second_scope = scope_dir / "b__SK_tree_elm.json"
+        for scope, value in ((first_scope, "first"), (second_scope, "second")):
+            scope.write_text(
+                json.dumps({
+                    "blend_file": str(blend),
+                    "spm": str(self.spm),
+                    "value": value,
+                }),
+                encoding="utf-8",
+            )
+        base = time.time_ns() - 10_000_000_000
+        os.utime(first_scope, ns=(base, base))
+        os.utime(second_scope, ns=(base + 1_000_000, base + 1_000_000))
+        item = self.item()
+        item["leaf_mesh_sources"] = [{
+            "atlas_blends": [str(blend)],
+            "targets": [{"spm": str(self.spm)}],
+        }]
+
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+            self.assertEqual(calculate.call_count, 1)
+
+            os.utime(
+                first_scope,
+                ns=(base + 2_000_000, base + 2_000_000),
+            )
+            os.utime(second_scope, ns=(base, base))
+            GUI.cache_blender_connection_rows({"items": [copy.deepcopy(item)]})
+
+        self.assertEqual(calculate.call_count, 2)
+
+    def test_physical_receipt_memo_rejects_restored_mtime_source_change(self):
+        source_spm = self.folder / "physical_source.spm"
+        source_fbx = self.folder / "physical_source.fbx"
+        source_spm.write_bytes(b"SPM1")
+        source_fbx.write_bytes(b"AAAA")
+        fbx_stat = source_fbx.stat()
+        semantic = "c" * 64
+        source_contract = {
+            "source_spm": str(source_spm),
+            "source_spm_sha256": hashlib.sha256(b"SPM1").hexdigest(),
+            "source_spm_semantic_projection_version": (
+                assembly.SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+            ),
+            "source_spm_semantic_fingerprint": semantic,
+            "source_fbx": str(source_fbx),
+            "source_fbx_sha256": hashlib.sha256(b"AAAA").hexdigest(),
+        }
+        receipt = {
+            "variants": [{
+                "plan": "leaf",
+                "plan_uv_transfer": {
+                    "source_3d_contract": source_contract,
+                },
+            }],
+        }
+        memo = ConcurrentContentDigestMemo()
+        first = assembly._physical_source_3d_artifacts(
+            receipt,
+            validation_cache=memo,
+        )
+        self.assertFalse(first["source_fbx"]["raw_sha256_drift"])
+
+        source_fbx.write_bytes(b"BBBB")
+        os.utime(
+            source_fbx,
+            ns=(fbx_stat.st_atime_ns, fbx_stat.st_mtime_ns),
+        )
+        with self.assertRaises(assembly.ClusterAssemblyReceiptStaleError):
+            assembly._physical_source_3d_artifacts(
+                receipt,
+                validation_cache=memo,
+            )
+
+    def test_deferred_and_physical_relation_caches_never_cross_authority(self):
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            physical_metrics = {}
+            GUI.cache_blender_connection_rows(
+                {"items": [self.item()]}, metrics=physical_metrics
+            )
+            deferred_metrics = {}
+            deferred = self.item()
+            GUI.cache_blender_connection_rows(
+                {"items": [deferred]},
+                metrics=deferred_metrics,
+                verify_physical=False,
+            )
+            GUI.cache_blender_connection_rows(
+                {"items": [self.item()]},
+                verify_physical=False,
+            )
+
+        self.assertEqual(calculate.call_count, 2)
+        self.assertEqual(physical_metrics["physical_validation"], "full")
+        self.assertEqual(deferred_metrics["physical_validation"], "deferred")
+        self.assertEqual(
+            deferred["_gui_live_evidence"]["relation_validation_mode"],
+            "deferred",
+        )
+
+    def test_physical_relation_validation_memo_reuses_exact_artifacts(self):
+        canonical = self.folder / "SK_cluster.spm"
+        source_fbx = self.folder / "cluster.fbx"
+        blend = self.folder / "SK_cluster.blend"
+        canonical.write_bytes(b"spm")
+        source_fbx.write_bytes(b"fbx")
+        blend.write_bytes(b"blend")
+        capture = self.folder / "cluster_auto_capture_manifest.json"
+        capture.write_text(json.dumps({
+            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "direct_uv_source": "same_blender_physical_capture_projection",
+            "physical_capture_contract_sha256": "capture-v1",
+        }), encoding="utf-8")
+        semantic = "c" * 64
+        receipt = {
+            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "source_spm": str(canonical),
+            "source_spm_sha256": "a" * 64,
+            "source_spm_semantic_projection_version": (
+                cluster_sync.SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION
+            ),
+            "source_spm_semantic_fingerprint": semantic,
+            "source_fbx": str(source_fbx),
+            "source_fbx_sha256": "b" * 64,
+            "physical_capture_contract_sha256": "capture-v1",
+        }
+        payload = {
+            "normalized_prototype_receipt": receipt,
+            "physical_capture_contract_sha256": "capture-v1",
+        }
+        validation_cache = {}
+
+        def digest(path):
+            return "b" * 64 if Path(path) == source_fbx else "a" * 64
+
+        with mock.patch.object(
+            cluster_sync, "_sha256_file", side_effect=digest
+        ) as sha256_file, mock.patch.object(
+            cluster_sync,
+            "spm_file_structural_semantic_fingerprint",
+            return_value=semantic,
+        ) as structural, mock.patch.object(
+            cluster_sync,
+            "inspect_normalization_source_identity",
+            return_value={"refresh_reasons": []},
+        ):
+            first = cluster_sync._physical_refresh_state(
+                payload,
+                canonical,
+                blend,
+                validation_cache=validation_cache,
+            )
+            second = cluster_sync._physical_refresh_state(
+                payload,
+                canonical,
+                blend,
+                validation_cache=validation_cache,
+            )
+
+        self.assertFalse(first["refresh_required"])
+        self.assertEqual(first, second)
+        self.assertEqual(sha256_file.call_count, 2)
+        self.assertEqual(structural.call_count, 1)
 
     def test_relation_directory_membership_change_invalidates_cache(self):
         rows = [{"blend": self.folder / "leaf.blend", "spms": []}]
@@ -770,7 +1359,7 @@ class RelationAndAuthorityTests(unittest.TestCase):
             GUI.cache_blender_connection_rows({"items": [self.item()]})
             self.assertEqual(calculate.call_count, 1)
 
-            (self.folder / "new_input.png").write_bytes(b"new")
+            (self.folder / "new_input.spm").write_bytes(b"new")
             GUI.cache_blender_connection_rows({"items": [self.item()]})
 
         self.assertEqual(calculate.call_count, 2)
@@ -975,6 +1564,7 @@ class RelationAndAuthorityTests(unittest.TestCase):
             "startup_timing": {"wall_seconds": 1.0, "phases": []},
         }
         order = []
+        relation_kwargs = {}
 
         class ImmediateThread:
             def __init__(self, target, daemon=True):
@@ -984,8 +1574,9 @@ class RelationAndAuthorityTests(unittest.TestCase):
             def start(self):
                 self.target()
 
-        def fail_relation(*_args, **_kwargs):
+        def fail_relation(*_args, **kwargs):
             order.append("relation")
+            relation_kwargs.update(kwargs)
             raise RuntimeError("changed during relation")
 
         with mock.patch.object(
@@ -1019,42 +1610,626 @@ class RelationAndAuthorityTests(unittest.TestCase):
             )
 
         self.assertEqual(order, ["cache", "projection", "relation"])
+        self.assertIs(relation_kwargs["verify_physical"], False)
         self.assertTrue(app._display_only_snapshot)
         app._lock_mutation_controls.assert_called()
 
 
-# The shared 2-core GitHub runner cannot hold these budgets. Recent warm_total
-# measurements against the 6.0 s budget: 6.14 on main itself (run 30734140274,
-# 2242d128), and 6.23 / 6.57 / 8.31 on the Atlas resolver branch. The same test
-# measures 9.9 s on main and 13.4 s with the resolver locally, and passes both
-# times. The clean and regressed distributions overlap on the runner -- 6.14
-# against 6.23 -- so no absolute second threshold there separates a real
-# regression from runner weather: raising the number hides the regression the
-# budget exists to catch, and keeping it fails main at random.
-#
-# So the budgets stay a hard gate where the measurement means something, and
-# become a recorded diagnostic where it does not. Every deterministic guard in
-# this test -- legacy inspection call count, total/unique-file SPM analysis,
-# manifest resolution, and relation cache miss/hit counts -- keeps failing the
-# build everywhere, on the runner included.  Those deterministic guards catch
-# amplification without measuring the clock at all.
-_WALL_CLOCK_BUDGETS_ARE_ADVISORY = bool(os.environ.get("GITHUB_ACTIONS"))
+class MutationPlanAuthorityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.first = self.root / "first.spm"
+        self.second = self.root / "second.spm"
+        self.first.write_bytes(b"AAAA")
+        self.second.write_bytes(b"CCCC")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def capture(self, units, **kwargs):
+        return mutation_authority.capture_manifest(
+            action="test",
+            logical_plan={"units": [row["unit_id"] for row in units]},
+            units=units,
+            receipt_path=self.root / "receipt.json",
+            **kwargs,
+        )
+
+    def test_plan_only_same_size_restored_mtime_tamper_is_blocked(self):
+        original = self.first.stat()
+        manifest = self.capture([{
+            "unit_id": "one",
+            "payload": {"source": str(self.first)},
+            "paths": [self.first],
+        }])
+        self.first.write_bytes(b"BBBB")
+        os.utime(
+            self.first,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        with self.assertRaises(mutation_authority.MutationAuthorityError) as caught:
+            mutation_authority.require_unit(
+                manifest,
+                "one",
+                current_payload={"source": str(self.first)},
+            )
+        self.assertEqual(caught.exception.receipt["blocked_unit"], "one")
+        self.assertEqual(caught.exception.receipt["writes_before_block"], 0)
+
+    def test_missing_output_occupancy_and_directory_order_are_bound(self):
+        output = self.root / "planned.blend"
+        scopes = self.root / ".atlas_leaf_speedtree_scopes"
+        scopes.mkdir()
+        old = scopes / "leaf__SK_tree.json"
+        old.write_text("{}", encoding="utf-8")
+        manifest = self.capture([{
+            "unit_id": "one",
+            "payload": {"output": str(output)},
+            "paths": [output],
+            "memberships": [scopes],
+        }])
+        output.write_bytes(b"occupied")
+        newer = scopes / "new__SK_tree.json"
+        newer.write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "planned path state changed"):
+            mutation_authority.require_unit(
+                manifest,
+                "one",
+                current_payload={"output": str(output)},
+            )
+
+    def test_live_payload_and_config_are_not_detached_self_checks(self):
+        manifest = self.capture(
+            [{
+                "unit_id": "one",
+                "payload": {"source": str(self.first), "mode": "safe"},
+                "paths": [self.first],
+            }],
+            config_projection={"timeout": 10},
+        )
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "live execution payload changed"):
+            mutation_authority.require_unit(
+                manifest,
+                "one",
+                current_payload={
+                    "source": str(self.first),
+                    "mode": "changed",
+                },
+                current_config={"timeout": 10},
+            )
+
+        manifest = self.capture(
+            [{
+                "unit_id": "one",
+                "payload": {"source": str(self.first)},
+                "paths": [self.first],
+            }],
+            config_projection={"timeout": 10},
+        )
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "config changed"):
+            mutation_authority.require_unit(
+                manifest,
+                "one",
+                current_payload={"source": str(self.first)},
+                current_config={"timeout": 11},
+            )
+
+    def test_second_unit_drift_blocks_with_durable_partial_receipt(self):
+        units = [
+            {
+                "unit_id": "one",
+                "payload": {"source": str(self.first)},
+                "paths": [self.first],
+            },
+            {
+                "unit_id": "two",
+                "payload": {"source": str(self.second)},
+                "paths": [self.second],
+            },
+        ]
+        manifest = self.capture(units)
+        mutation_authority.require_unit(
+            manifest, "one", current_payload=units[0]["payload"]
+        )
+        mutation_authority.complete_unit(
+            manifest, "one", post_paths=[self.first]
+        )
+        original = self.second.stat()
+        self.second.write_bytes(b"DDDD")
+        os.utime(
+            self.second,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        with self.assertRaises(mutation_authority.MutationAuthorityError) as caught:
+            mutation_authority.require_unit(
+                manifest, "two", current_payload=units[1]["payload"]
+            )
+        receipt = json.loads(
+            (self.root / "receipt.json").read_text(encoding="utf-8")
+        )["receipt"]
+        self.assertEqual(receipt["blocked_unit"], "two")
+        self.assertEqual(receipt["writes_before_block"], 1)
+        self.assertEqual(receipt["completed_units"][0]["unit_id"], "one")
+        self.assertEqual(caught.exception.receipt, receipt)
+
+    def test_completed_shared_postcondition_advances_only_shared_inputs(self):
+        scope = self.root / "scope"
+        scope.mkdir()
+        shared = scope / "shared.spm"
+        shared.write_bytes(b"initial")
+        units = [
+            {
+                "unit_id": "one",
+                "payload": {"row": 1},
+                "paths": [shared],
+                "write_paths": [shared],
+                "memberships": [scope],
+                "write_memberships": [scope],
+            },
+            {
+                "unit_id": "two",
+                "payload": {"row": 2},
+                "paths": [shared, self.second],
+                "memberships": [scope],
+            },
+        ]
+        manifest = self.capture(units)
+        mutation_authority.require_unit(
+            manifest, "one", current_payload=units[0]["payload"]
+        )
+        shared.write_bytes(b"authorized-post-state")
+        mutation_authority.complete_unit(
+            manifest, "one", post_paths=[shared]
+        )
+        mutation_authority.require_unit(
+            manifest, "two", current_payload=units[1]["payload"]
+        )
+
+        manifest = self.capture(units)
+        mutation_authority.require_unit(
+            manifest, "one", current_payload=units[0]["payload"]
+        )
+        shared.write_bytes(b"next-authorized-post-state")
+        mutation_authority.complete_unit(
+            manifest, "one", post_paths=[shared]
+        )
+        self.second.write_bytes(b"unrelated-drift")
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "planned path state changed"):
+            mutation_authority.require_unit(
+                manifest, "two", current_payload=units[1]["payload"]
+            )
+
+    def test_completed_unit_does_not_advance_undeclared_shared_write(self):
+        shared = self.root / "read-only-shared.spm"
+        shared.write_bytes(b"initial")
+        units = [
+            {
+                "unit_id": "one",
+                "payload": {"row": 1},
+                "paths": [shared],
+            },
+            {
+                "unit_id": "two",
+                "payload": {"row": 2},
+                "paths": [shared],
+            },
+        ]
+        manifest = self.capture(units)
+        mutation_authority.require_unit(
+            manifest, "one", current_payload=units[0]["payload"]
+        )
+        shared.write_bytes(b"unplanned-change")
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "unplanned path changed during execution"):
+            mutation_authority.complete_unit(manifest, "one")
+
+    def test_tool_tamper_and_empty_units_fail_closed(self):
+        tool = self.root / "tool.py"
+        tool.write_bytes(b"AAAA")
+        original = tool.stat()
+        manifest = self.capture(
+            [{
+                "unit_id": "one",
+                "payload": {"source": str(self.first)},
+                "paths": [self.first],
+            }],
+            tool_paths=[tool],
+        )
+        tool.write_bytes(b"BBBB")
+        os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+        with self.assertRaisesRegex(
+                mutation_authority.MutationAuthorityError,
+                "tool/package input changed"):
+            mutation_authority.require_unit(
+                manifest,
+                "one",
+                current_payload={"source": str(self.first)},
+            )
+        with self.assertRaisesRegex(RuntimeError, "at least one"):
+            self.capture([])
+
+    def test_child_authority_rejects_atlas_scope_tamper(self):
+        scopes = self.root / ".atlas_leaf_speedtree_scopes"
+        scopes.mkdir()
+        (scopes / "old__SK_tree.json").write_text("{}", encoding="utf-8")
+        manifest = self.capture([{
+            "unit_id": "atlas-remove",
+            "payload": {"target_spms": [str(self.first)]},
+            "paths": [self.first],
+            "memberships": [scopes],
+        }])
+        child_path = self.root / "child-authority.json"
+        document_sha256 = mutation_authority.write_child_authority(
+            manifest, "atlas-remove", child_path
+        )
+        (scopes / "new__SK_tree.json").write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+                RuntimeError, "directory membership changed"):
+            mutation_authority.validate_child_authority(
+                child_path, document_sha256
+            )
+
+
+class MutationOperationBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def app():
+        app = GUI.App.__new__(GUI.App)
+        app._ui = lambda callback: callback()
+        app.log = mock.Mock()
+        app.tree = mock.Mock()
+        app.status_var = mock.Mock()
+        app._prepare_finished = mock.Mock()
+        app._batch_finished = mock.Mock()
+        return app
+
+    def test_step1_second_row_drift_blocks_before_second_write(self):
+        folders = [self.root / "tree_a", self.root / "tree_b"]
+        rows = []
+        for folder in folders:
+            folder.mkdir()
+            (folder / "SK_tree.spm").write_bytes(b"AAAA")
+            rows.append({
+                "item": {"folder": str(folder), "name": folder.name},
+                "mesh": "",
+                "exclude": [],
+            })
+        units = GUI.step1_authority_units(rows)
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="step1_prepare",
+            plan_payload={
+                "rows": [GUI.step1_unit_payload(row) for row in rows]
+            },
+            authority_units=units,
+            tool_paths=[GUI.mutation_source_path(GUI.prepare_sk)],
+        )
+        app = self.app()
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
+
+        def first_then_drift(*_args, **_kwargs):
+            (folders[1] / "late.spm").write_bytes(b"drift")
+            return {"targets": [{"status": "up_to_date"}]}
+
+        with mock.patch.object(
+            GUI, "prepare_sk", side_effect=first_then_drift
+        ) as prepare:
+            with self.assertRaises(GUI.MutationAuthorityError) as caught:
+                app._run_prepare(rows)
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(caught.exception.receipt["blocked_unit"], units[1]["unit_id"])
+        self.assertEqual(caught.exception.receipt["writes_before_block"], 1)
+
+    def test_step1_same_folder_rows_chain_exact_completed_postcondition(self):
+        folder = self.root / "tree"
+        folder.mkdir()
+        item = {"folder": str(folder), "name": folder.name}
+        rows = [
+            {"item": item, "mesh": "leaf_a", "exclude": []},
+            {"item": item, "mesh": "leaf_b", "exclude": []},
+        ]
+        units = GUI.step1_authority_units(rows)
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="step1_prepare",
+            plan_payload={
+                "rows": [GUI.step1_unit_payload(row) for row in rows]
+            },
+            authority_units=units,
+            tool_paths=[GUI.mutation_source_path(GUI.prepare_sk)],
+        )
+        app = self.app()
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
+
+        def write_planned_target(_folder, mesh_names, **_kwargs):
+            mesh = mesh_names[0]
+            target = folder / f"SK_{mesh}.spm"
+            target.write_bytes(mesh.encode("utf-8"))
+            return {
+                "targets": [{
+                    "status": "prepared",
+                    "mesh_name": mesh,
+                    "created": str(target),
+                    "patch": {"renames": []},
+                }]
+            }
+
+        with mock.patch.object(
+            GUI, "prepare_sk", side_effect=write_planned_target
+        ) as prepare:
+            result = app._run_prepare(rows)
+
+        self.assertEqual(prepare.call_count, 2)
+        self.assertEqual(result["shared_queue_result"]["completed"], 2)
+
+    def test_step1_same_folder_unrelated_drift_after_completion_blocks_next(self):
+        folder = self.root / "tree"
+        folder.mkdir()
+        item = {"folder": str(folder), "name": folder.name}
+        rows = [
+            {"item": item, "mesh": "leaf_a", "exclude": []},
+            {"item": item, "mesh": "leaf_b", "exclude": []},
+        ]
+        units = GUI.step1_authority_units(rows)
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="step1_prepare",
+            plan_payload={
+                "rows": [GUI.step1_unit_payload(row) for row in rows]
+            },
+            authority_units=units,
+            tool_paths=[GUI.mutation_source_path(GUI.prepare_sk)],
+        )
+        app = self.app()
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
+        original_complete = GUI.complete_exact_mutation_unit
+
+        def complete_then_drift(*args, **kwargs):
+            receipt = original_complete(*args, **kwargs)
+            (folder / "unrelated.tmp").write_bytes(b"drift")
+            return receipt
+
+        with mock.patch.object(
+            GUI,
+            "prepare_sk",
+            return_value={"targets": [{"status": "up_to_date"}]},
+        ) as prepare, mock.patch.object(
+            GUI,
+            "complete_exact_mutation_unit",
+            side_effect=complete_then_drift,
+        ):
+            with self.assertRaises(GUI.MutationAuthorityError):
+                app._run_prepare(rows)
+
+        self.assertEqual(prepare.call_count, 1)
+
+    def test_step3_second_render_drift_blocks_before_second_external_call(self):
+        out_dir = self.root / "texture"
+        out_dir.mkdir()
+        inputs = []
+        jobs = []
+        for index in range(2):
+            source = self.root / f"source_{index}.tga"
+            source.write_bytes(b"AAAA")
+            inputs.append(source)
+            jobs.append({
+                "base": f"M_leaf_{index}",
+                "texture_base": f"T_leaf_{index}",
+                "out_dir": str(out_dir),
+                "inputs": {"basecolor": str(source)},
+                "item": {
+                    "folder": str(self.root / f"tree_{index}"),
+                    "name": f"tree_{index}",
+                },
+            })
+        plan = {"jobs": jobs, "pending_manifest_rows": []}
+        units = GUI.step3_authority_units(plan)
+        cfg = {
+            "sbsrender_timeout": 10,
+            "unreal_texture_sync_enabled": False,
+        }
+        config_keys = (
+            "designer_dir",
+            "cluster_sbsar",
+            "cluster_sbsar_normal_behavior",
+            "sbsrender_timeout",
+            "tree_root",
+            "unreal_texture_sync_enabled",
+            "unreal_project",
+            "unreal_editor_cmd",
+            "unreal_texture_destination",
+            "unreal_texture_sync_timeout",
+        )
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="step3_texture",
+            plan_payload=GUI.step3_exact_plan_payload(plan),
+            authority_units=units,
+            config_projection=GUI.mutation_config_projection(
+                cfg, config_keys
+            ),
+        )
+        app = self.app()
+        app.cfg = cfg
+
+        def first_then_drift(job, _cfg, _timeout):
+            original = inputs[1].stat()
+            inputs[1].write_bytes(b"BBBB")
+            os.utime(
+                inputs[1],
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            return {
+                "texture_base": job["texture_base"],
+                "files": [out_dir / f"{job['texture_base']}_color.tga"],
+            }
+
+        with mock.patch.object(
+            GUI, "run_texture_job", side_effect=first_then_drift
+        ) as render:
+            with self.assertRaises(GUI.MutationAuthorityError) as caught:
+                app._run_step3(
+                    jobs,
+                    [],
+                    sync_files=[],
+                    exact_mutation_baseline=baseline,
+                )
+
+        self.assertEqual(render.call_count, 1)
+        self.assertEqual(caught.exception.receipt["blocked_unit"], units[1]["unit_id"])
+
+    def test_step2_second_job_drift_blocks_before_second_child_call(self):
+        jobs = []
+        albedos = []
+        for index in range(2):
+            folder = self.root / f"tree_{index}"
+            folder.mkdir()
+            albedo = folder / f"leaf_{index}_color.tga"
+            alpha = folder / f"leaf_{index}_opacity.tga"
+            albedo.write_bytes(b"AAAA")
+            alpha.write_bytes(b"alpha")
+            albedos.append(albedo)
+            jobs.append({
+                "base": f"M_leaf_{index}",
+                "albedo": str(albedo),
+                "alpha": str(alpha),
+                "blend_out": str(self.root / f"leaf_{index}.blend"),
+                "reuse_existing_blend": False,
+                "target_spms": [],
+                "target_details": [],
+                "item": {"folder": str(folder), "name": folder.name},
+            })
+        cfg = {"blender_exe": "", "atlas_job_timeout": 10}
+        config_keys = ("blender_exe", "atlas_job_timeout")
+        units = GUI.step2_authority_units(jobs, False)
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="step2_atlas",
+            plan_payload=GUI.step2_exact_plan_payload(jobs, False),
+            authority_units=units,
+            config_projection=GUI.mutation_config_projection(
+                cfg, config_keys
+            ),
+            tool_paths=[GUI.TOOL_DIR / "jobs" / "atlas_blend_job.py"],
+        )
+        app = self.app()
+        app.cfg = cfg
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
+
+        def first_then_drift(command, **_kwargs):
+            report_path = Path(command[command.index("--report") + 1])
+            report_path.write_text(
+                json.dumps({"status": "ok", "meshes": 1}),
+                encoding="utf-8",
+            )
+            original = albedos[1].stat()
+            albedos[1].write_bytes(b"BBBB")
+            os.utime(
+                albedos[1],
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            return mock.Mock(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(
+            GUI, "owned_run", side_effect=first_then_drift
+        ) as child, mock.patch.object(
+            GUI, "register_blend_source_index"
+        ), mock.patch.object(GUI, "save_spm_analysis_cache"):
+            with self.assertRaises(GUI.MutationAuthorityError) as caught:
+                app._run_step2(jobs, False)
+
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(caught.exception.receipt["blocked_unit"], units[1]["unit_id"])
+
+    def test_atlas_add_rechecks_target_adjacent_to_registry_write(self):
+        blend = self.root / "leaf.blend"
+        target = self.root / "SK_tree.spm"
+        blend.write_bytes(b"blend")
+        target.write_bytes(b"AAAA")
+        item = {"folder": str(self.root), "name": "tree"}
+        plan_payload = {
+            "blend": str(blend),
+            "target_spm": str(target),
+            "target_registry": str(GUI.registry_path_for_blend(blend)),
+            "capture_manifest": str(
+                GUI._relation_capture_manifest_path(blend)
+            ),
+        }
+        unit_id = "atlas-target-add"
+        baseline = GUI.seal_exact_mutation_baseline(
+            [],
+            action="atlas_target_add",
+            plan_payload=plan_payload,
+            authority_units=[{
+                "unit_id": unit_id,
+                "payload": plan_payload,
+                "item_keys": [],
+                "paths": [
+                    blend,
+                    target,
+                    GUI.registry_path_for_blend(blend),
+                    GUI._relation_capture_manifest_path(blend),
+                ],
+                "memberships": [
+                    target.parent / ".atlas_leaf_speedtree_scopes"
+                ],
+            }],
+        )
+        app = self.app()
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
+
+        def drift_target(_blend):
+            original = target.stat()
+            target.write_bytes(b"BBBB")
+            os.utime(
+                target,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            return []
+
+        app._current_targets_for_blend = mock.Mock(
+            side_effect=drift_target
+        )
+        with mock.patch.object(GUI, "save_target_registry") as save:
+            with self.assertRaises(GUI.MutationAuthorityError):
+                app._run_add_blend_target_spm(
+                    blend, target, evidence_items=[item]
+                )
+        save.assert_not_called()
 
 
 class ProductionShapedLatencyFixtureTests(unittest.TestCase):
-    def assert_within_budget(self, measured, budget_key, label):
-        """Fail on a blown budget locally; record it on a shared CI runner."""
-        budget = PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[budget_key]
-        if measured < budget:
-            return
-        message = (
-            f"{label} took {measured:.3f}s against a {budget}s budget"
-        )
-        if _WALL_CLOCK_BUDGETS_ARE_ADVISORY:
-            print(f"::warning::{message}")
-            return
-        self.fail(message)
-
     def test_known_per_spm_manifest_amplification_fails_total_call_guard(self):
         """The unmodified fixture resolves zero; injection gives the rule teeth."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -1273,27 +2448,75 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                     "inspect_legacy_cluster_state",
                     wraps=audit.inspect_legacy_cluster_state,
                 ) as legacy_inspection:
+                    cold_evidence = {}
                     cold_started = time.perf_counter()
-                    cold = audit.make_report(cfg)
+                    cold = audit.make_report(
+                        cfg, session_evidence=cold_evidence
+                    )
                     cold_elapsed = time.perf_counter() - cold_started
                     audit.save_spm_analysis_cache()
+                    warm_evidence = {}
                     warm_started = time.perf_counter()
-                    warm = audit.make_report(cfg)
+                    warm = audit.make_report(
+                        cfg, session_evidence=warm_evidence
+                    )
                     warm_elapsed = time.perf_counter() - warm_started
+                    base_legacy_call_count = legacy_inspection.call_count
+
+                    invalidated_spm = (
+                        root / "tree_fixture_00"
+                        / "SK_tree_fixture_00_00.spm"
+                    )
+                    original = invalidated_spm.stat()
+                    original_text = invalidated_spm.read_text(
+                        encoding="utf-8"
+                    )
+                    changed = original_text.replace(
+                        "fixture_00_00", "changed_00_00"
+                    )
+                    invalidated_spm.write_text(changed, encoding="utf-8")
+                    os.utime(
+                        invalidated_spm,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                    invalidated_evidence = {}
+                    invalidated_started = time.perf_counter()
+                    invalidated = audit.make_report(
+                        cfg, session_evidence=invalidated_evidence
+                    )
+                    invalidated_elapsed = (
+                        time.perf_counter() - invalidated_started
+                    )
+
+                    scoped_evidence = {}
+                    scoped = audit.make_report(
+                        cfg,
+                        targets=[root / "tree_fixture_00"],
+                        session_evidence=scoped_evidence,
+                    )
+                    invalidated_spm.write_text(
+                        original_text, encoding="utf-8"
+                    )
+                    os.utime(
+                        invalidated_spm,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
 
             self.assertEqual(spm_count, 597)
             self.assertEqual(cold["summary"]["total"], 55)
             self.assertEqual(warm["summary"]["total"], 55)
             self.assertEqual(
-                legacy_inspection.call_count,
+                base_legacy_call_count,
                 1194,
                 "each refresh must inspect current legacy evidence once per SPM",
             )
-            self.assert_within_budget(
-                cold_elapsed, "cold_total", "cold primary audit"
+            self.assertLess(
+                cold_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS["cold_total"],
             )
-            self.assert_within_budget(
-                warm_elapsed, "warm_total", "warm primary audit"
+            self.assertLess(
+                warm_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS["warm_total"],
             )
             self.assertFalse(
                 cold["startup_timing"]["provider_metrics"]["cache_hit"]
@@ -1336,6 +2559,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                         "spm_decode_misses",
                         "spm_memory_hits",
                         "spm_persistent_hits",
+                        "spm_report_hits",
                     )
                 ),
             )
@@ -1347,6 +2571,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                         "spm_decode_misses",
                         "spm_memory_hits",
                         "spm_persistent_hits",
+                        "spm_report_hits",
                     )
                 ),
             )
@@ -1399,8 +2624,11 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             self.assertEqual(
                 len(displayed["display_report"]["items"]), 55
             )
-            self.assert_within_budget(
-                paint_elapsed, "cached_board_paint", "cached board paint"
+            self.assertLess(
+                paint_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "cached_board_paint"
+                ],
             )
 
             relation_path = cache / "relations.json"
@@ -1412,7 +2640,10 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 cold_relation_metrics = {}
                 cold_relation_started = time.perf_counter()
                 GUI.cache_blender_connection_rows(
-                    cold, metrics=cold_relation_metrics
+                    cold,
+                    metrics=cold_relation_metrics,
+                    session_evidence=cold_evidence,
+                    verify_physical=False,
                 )
                 cold_relation_elapsed = (
                     time.perf_counter() - cold_relation_started
@@ -1420,27 +2651,118 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 warm_relation_metrics = {}
                 warm_relation_started = time.perf_counter()
                 GUI.cache_blender_connection_rows(
-                    warm, metrics=warm_relation_metrics
+                    warm,
+                    metrics=warm_relation_metrics,
+                    session_evidence=warm_evidence,
+                    verify_physical=False,
                 )
                 warm_relation_elapsed = (
                     time.perf_counter() - warm_relation_started
+                )
+                invalidated_relation_metrics = {}
+                invalidated_spm.write_text(changed, encoding="utf-8")
+                os.utime(
+                    invalidated_spm,
+                    ns=(original.st_atime_ns, original.st_mtime_ns),
+                )
+                invalidated_relation_started = time.perf_counter()
+                GUI.cache_blender_connection_rows(
+                    invalidated,
+                    metrics=invalidated_relation_metrics,
+                    session_evidence=invalidated_evidence,
+                    verify_physical=False,
+                )
+                invalidated_relation_elapsed = (
+                    time.perf_counter() - invalidated_relation_started
                 )
 
             self.assertEqual(cold_relation_metrics["cache_misses"], 55)
             self.assertEqual(warm_relation_metrics["cache_hits"], 55)
             self.assertEqual(
+                cold_relation_metrics["session_exact_candidate_count"],
+                597,
+            )
+            self.assertEqual(
+                cold_relation_metrics["reused_exact_content_file_count"],
+                0,
+            )
+            self.assertGreater(
+                warm_relation_metrics["first_pass_physical_content_reads"],
+                0,
+            )
+            self.assertEqual(
+                invalidated["startup_timing"]["session_cache_metrics"].get(
+                    "spm_decode_misses_unique_files"
+                ),
+                1,
+            )
+            self.assertEqual(invalidated_relation_metrics["cache_hits"], 54)
+            self.assertEqual(invalidated_relation_metrics["cache_misses"], 1)
+            self.assertEqual(
+                invalidated_relation_metrics[
+                    "session_exact_candidate_count"
+                ],
+                597,
+            )
+            self.assertEqual(scoped["summary"]["total"], 1)
+            self.assertEqual(
+                scoped["startup_timing"]["provider_metrics"][
+                    "inventory_file_count"
+                ],
+                11,
+            )
+            scoped_prefetch = next(
+                phase
+                for phase in scoped["startup_timing"]["phases"]
+                if phase["phase"] == "spm_content_identity_prefetch"
+            )
+            self.assertEqual(scoped_prefetch["counts"]["file_count"], 11)
+            self.assertEqual(
                 warm_relation_metrics["content_identity_algorithm"],
-                "sha256-of-hybrid-content-keys-v1",
+                "sha256-of-full-content-keys-v1",
             )
-            self.assert_within_budget(
+            self.assertLess(
                 cold_elapsed + cold_relation_elapsed,
-                "cold_usable_ready",
-                "cold usable-ready",
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "cold_usable_ready"
+                ],
             )
-            self.assert_within_budget(
+            self.assertLess(
                 warm_elapsed + warm_relation_elapsed,
-                "warm_usable_ready",
-                "warm usable-ready",
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "warm_usable_ready"
+                ],
+            )
+            self.assertLess(
+                invalidated_elapsed + invalidated_relation_elapsed,
+                PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS[
+                    "warm_usable_ready"
+                ],
+            )
+            # This is an additional product ceiling, not a replacement for
+            # the tighter 15s/8s cardinality-fixture budgets above.
+            self.assertLessEqual(
+                cold_elapsed + cold_relation_elapsed,
+                USABLE_READY_ACCEPTANCE_CAP_SECONDS,
+            )
+            self.assertLessEqual(
+                warm_elapsed + warm_relation_elapsed,
+                USABLE_READY_ACCEPTANCE_CAP_SECONDS,
+            )
+            limitation_receipt = {
+                "workload_equivalence": "cardinality_only",
+                "folder_count": 55,
+                "spm_count": 597,
+                "production_assets_touched": False,
+                "live_apps_controlled": False,
+                "limitations": (
+                    "tiny local XML fixtures; same-process warm cache; "
+                    "no production-size files, OneDrive, or live D:/apps"
+                ),
+            }
+            self.assertEqual(
+                limitation_receipt["workload_equivalence"],
+                "cardinality_only",
             )
 
 

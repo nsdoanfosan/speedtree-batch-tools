@@ -39,6 +39,9 @@ PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS = {
     "warm_usable_ready": 8.0,
     "cached_board_paint": 0.25,
 }
+# Product acceptance adds this end-to-end ceiling without replacing any
+# tighter phase/cardinality fixture budget above.
+USABLE_READY_ACCEPTANCE_CAP_SECONDS = 30.0
 STARTUP_TOTAL_INVOCATION_GUARD_SCHEMA_VERSION = 1
 STARTUP_TOTAL_INVOCATION_RULES = {
     "atlas_manifest_resolution_calls": {
@@ -272,6 +275,7 @@ class StartupLatencyTracker:
 
 __all__ = [
     "PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS",
+    "USABLE_READY_ACCEPTANCE_CAP_SECONDS",
     "STARTUP_TOTAL_INVOCATION_GUARD_SCHEMA_VERSION",
     "STARTUP_TOTAL_INVOCATION_RULES",
     "STARTUP_LATENCY_RECEIPT_PATH",

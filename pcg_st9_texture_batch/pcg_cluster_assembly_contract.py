@@ -36,7 +36,12 @@ from atlas_manifest_resolver import (
     resolution_evidence,
     resolve_atlas_manifests,
 )
-from artifact_content_key import sampled_file_content_snapshot
+from artifact_content_key import (
+    ArtifactContentKeyChangedError,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+    sampled_file_content_snapshot,
+)
 from generator_delivery_scope import (
     GeneratorDeliveryScopeError,
     canonical_sha256,
@@ -129,6 +134,16 @@ def _sha256_cached(path_text, size, mtime_ns):
     return digest.hexdigest()
 
 
+def _report_file_sha256_memo():
+    """Find the active audit's refresh-local exact digest memo, if any."""
+    audit = (
+        sys.modules.get("pcg_texture_audit")
+        or sys.modules.get("pcg_st9_texture_batch.pcg_texture_audit")
+    )
+    reader = getattr(audit, "report_file_sha256_cache", None)
+    return reader() if callable(reader) else None
+
+
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
     if not hash_content:
@@ -162,12 +177,45 @@ def file_fingerprint(path, hash_content=True):
             "sha256": None,
         }
     absolute = os.path.abspath(str(candidate))
+    cache_key = (
+        absolute.casefold(), stat.st_size, stat.st_mtime_ns
+    )
+    memo = _report_file_sha256_memo()
+    def compute():
+        try:
+            snapshot = file_content_key_snapshot(
+                candidate, SHA256_ALGORITHM
+            )
+        except ArtifactContentKeyChangedError as exc:
+            raise OSError(str(exc)) from exc
+        if (
+            snapshot["size"], snapshot["mtime_ns"]
+        ) != (
+            stat.st_size, stat.st_mtime_ns
+        ):
+            raise OSError(
+                "Artifact identity changed before its digest was captured: "
+                + str(candidate)
+            )
+        return snapshot["digest"]
+
+    single_flight = getattr(memo, "get_or_compute_verified", None)
+    try:
+        sha256 = (
+            single_flight(cache_key, compute)
+            if callable(single_flight) else compute()
+        )
+    except ValueError as exc:
+        raise OSError(
+            "Artifact content changed without an identity change: "
+            + str(candidate)
+        ) from exc
     return {
         "path": str(candidate),
         "exists": True,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns),
+        "sha256": sha256,
     }
 
 
@@ -200,12 +248,21 @@ def _fresh_file_fingerprint(path):
             and (before.st_size, before.st_mtime_ns)
             == (after.st_size, after.st_mtime_ns)
         ):
+            sha256 = digest.hexdigest()
+            memo = _report_file_sha256_memo()
+            seed = getattr(memo, "seed", None)
+            if callable(seed):
+                seed((
+                    os.path.abspath(str(candidate)).casefold(),
+                    after.st_size,
+                    after.st_mtime_ns,
+                ), sha256)
             return {
                 "path": str(candidate),
                 "exists": True,
                 "size": after.st_size,
                 "mtime_ns": after.st_mtime_ns,
-                "sha256": digest.hexdigest(),
+                "sha256": sha256,
             }
     raise ClusterAssemblyReceiptStaleError(
         "Artifact changed while its content fingerprint was calculated: "
@@ -1401,6 +1458,24 @@ def _physical_source_3d_artifacts(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
+    single_flight = getattr(
+        validation_cache, "get_or_compute_verified", None
+    )
+    if callable(single_flight):
+        try:
+            return copy.deepcopy(single_flight(
+                source_cache_key,
+                lambda: _physical_source_3d_artifacts(
+                    receipt,
+                    spm_semantic_reader=spm_semantic_reader,
+                    validation_cache=None,
+                ),
+            ))
+        except ValueError as exc:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas physical source content changed without an identity "
+                "change"
+            ) from exc
     if validation_cache is not None and source_cache_key in validation_cache:
         return copy.deepcopy(validation_cache[source_cache_key])
     for index, row in enumerate(variants, 1):
@@ -1610,6 +1685,24 @@ def _physical_normalization_receipt(
             separators=(",", ":"),
         ).encode("utf-8")
         cache_key = hashlib.sha256(cache_payload).hexdigest()
+        single_flight = getattr(
+            validation_cache, "get_or_compute_verified", None
+        )
+        if callable(single_flight):
+            try:
+                return copy.deepcopy(single_flight(
+                    cache_key,
+                    lambda: _physical_normalization_receipt(
+                        payload,
+                        validation_cache=None,
+                        spm_semantic_reader=spm_semantic_reader,
+                    ),
+                ))
+            except ValueError as exc:
+                raise ClusterAssemblyReceiptStaleError(
+                    "Atlas physical receipt inputs changed without an "
+                    "identity change"
+                ) from exc
         cached = validation_cache.get(cache_key)
         if cached is not None:
             return cached

@@ -48,9 +48,14 @@ from shared_queue_runtime import SharedQueueRuntime
 from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
+    registry_path_for_blend,
     save_target_registry,
 )
-from cluster_blend_sync import discover_cluster_blend_relations
+from cluster_blend_sync import (
+    RelationValidationCache,
+    discover_cluster_blend_relations,
+    normalized_blend_for_source,
+)
 
 from pcg_texture_common import (
     REPORT_DIR, SHARED_CACHE_DIR, TARGETS_PATH, is_backup_path, load_config,
@@ -78,6 +83,15 @@ from pcg_startup_cache import (
     path_key as startup_path_key,
 )
 from pcg_startup_latency import StartupLatencyTracker
+from mutation_plan_authority import (
+    MutationAuthorityError,
+    capture_manifest as capture_mutation_authority_manifest,
+    complete_unit as complete_mutation_authority_unit,
+    expected_item_state as expected_mutation_item_state,
+    expected_path_state as mutation_authority_expected_path_state,
+    require_unit as require_mutation_authority_unit,
+    write_child_authority as write_child_mutation_authority,
+)
 from export_review_queue import GENERIC_MATERIAL_RE
 from export_texture_plan import bucket_refs, build_texture_plan_from_report
 from pcg_canonical_outputs import (
@@ -115,9 +129,9 @@ TARGET_ROW_COLORS = {
     "target_both": "#E4F4E4",
 }
 BLENDER_RELATION_CACHE_PATH = (
-    SHARED_CACHE_DIR / "pcg_blender_relation_rows_v1.json"
+    SHARED_CACHE_DIR / "pcg_blender_relation_rows_v2.json"
 )
-BLENDER_RELATION_CACHE_KIND = "pcg_blender_relation_rows"
+BLENDER_RELATION_CACHE_KIND = "pcg_blender_relation_rows_v2"
 RELATION_INPUT_SUFFIXES = frozenset({
     ".blend", ".exr", ".fbx", ".jpeg", ".jpg", ".json", ".png",
     ".sbs", ".spm", ".tga", ".tif", ".tiff",
@@ -736,7 +750,9 @@ def apply_target_registry_to_connection_row(row):
     return row
 
 
-def blender_connection_rows(item):
+def blender_connection_rows(
+    item, validation_cache=None, *, verify_physical=True,
+):
     """Return concrete blend files and their audited final-SPM connections.
 
     ``leaf_mesh_sources`` describes work/provenance while
@@ -819,7 +835,11 @@ def blender_connection_rows(item):
     # every owner SK is a concrete ON/OFF candidate and must stay visible when
     # it is OFF.  Generator Sync is the mutation owner; PCG reads the same JSON.
     try:
-        cluster_blends = discover_cluster_blend_relations(item.get("folder") or "")
+        cluster_blends = discover_cluster_blend_relations(
+            item.get("folder") or "",
+            verify_physical=verify_physical,
+            validation_cache=validation_cache,
+        )
     except Exception as exc:
         cluster_blends = []
         item["cluster_blend_scan_error"] = str(exc)
@@ -888,6 +908,44 @@ def blender_connection_rows(item):
 
 
 def _relation_item_payload(item):
+    def source_payload(source):
+        return {
+            "atlas_blends": list(source.get("atlas_blends") or ()),
+            "targets": [
+                {
+                    key: target.get(key)
+                    for key in (
+                        "spm",
+                        "generator_connection_complete",
+                        "export_participating",
+                    )
+                }
+                for target in source.get("targets") or ()
+            ],
+            "target_spms": list(source.get("target_spms") or ()),
+            "export_participating": source.get("export_participating"),
+            "generator_connection_complete": source.get(
+                "generator_connection_complete"
+            ),
+        }
+
+    return {
+        "folder": item.get("folder"),
+        "name": item.get("name"),
+        "chosen_spm": item.get("chosen_spm"),
+        "leaf_mesh_sources": [
+            source_payload(source)
+            for source in item.get("leaf_mesh_sources") or ()
+        ],
+        "leaf_atlas_inventory": [
+            source_payload(source)
+            for source in item.get("leaf_atlas_inventory") or ()
+        ],
+    }
+
+
+def _mutation_item_payload(item):
+    """Keep every existing mutation-plan field outside the slim relation key."""
     return {
         key: item.get(key)
         for key in (
@@ -898,12 +956,300 @@ def _relation_item_payload(item):
             "leaf_atlas_inventory",
             "cluster_items",
             "target_spm_statuses",
+            "sbs_files",
+            "preserved_cluster_materials",
+            "texture_dir",
+            "normal_convention",
+            "ao_policy",
+            "sdf_policy",
+            "pcg_target_names",
+            "duplicate_target_names",
+            # Atlas add/remove plans are derived from these rows. Reproduce
+            # them from current bytes before granting mutation authority.
+            "_gui_blender_connection_rows",
         )
     }
 
 
+def _relation_capture_manifest_path(blend):
+    blend = Path(blend).expanduser().absolute()
+    stem = blend.stem
+    if stem.casefold().startswith("sk_"):
+        stem = stem[3:]
+    return blend.with_name(f"{stem}_auto_capture_manifest.json")
+
+
+def _relation_semantic_inventory(
+        item, payload, *, directory_memo=None, json_memo=None):
+    """Return the bounded exact dependency closure read by relation rows.
+
+    Blender bytes and bulk texture pixels do not affect relation-row
+    calculation.  Their paths and presence remain membership evidence, while
+    current SPM/FBX and registry/scope/capture JSON bytes are exact.  JSON
+    sidecars can name external SPM/FBX dependencies, so those paths are folded
+    into the same bounded closure instead of depending on the broad audit
+    payload by accident.
+    """
+    exact_suffixes = frozenset({
+        ".fbx", ".json", ".spm", ".stmat", ".xml",
+    })
+    paths = {}
+    expected = {}
+    membership = set()
+    directories = {}
+    scope_target_stems = {}
+    json_queue = []
+    parsed_json = set()
+
+    def normalize_candidate(value, *, base=None):
+        text = os.fspath(value)
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute() and base is not None:
+            candidate = Path(base) / candidate
+        return candidate.absolute()
+
+    def add_directory(value, *, role="owner", target_stem=None):
+        directory = normalize_candidate(value)
+        key = startup_path_key(directory)
+        existing = directories.get(key)
+        if existing is None or existing[1] != "scope":
+            directories[key] = (directory, str(role))
+        if role == "scope" and target_stem:
+            scope_target_stems.setdefault(key, set()).add(
+                str(target_stem).casefold()
+            )
+
+    def add_expected(value, *, exact=False, base=None):
+        if not value:
+            return
+        candidate = normalize_candidate(value, base=base)
+        key = startup_path_key(candidate)
+        try:
+            is_file = candidate.is_file()
+        except OSError:
+            is_file = False
+        expected[key] = candidate
+        membership.add(
+            "expected:" + key + (":file" if is_file else ":missing")
+        )
+        if is_file and exact:
+            paths[key] = candidate
+            if candidate.suffix.casefold() == ".json":
+                json_queue.append(candidate)
+
+    def collect_projection(value, key=None):
+        if isinstance(value, dict):
+            for nested_key, nested in value.items():
+                collect_projection(nested, nested_key)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for nested in value:
+                collect_projection(nested, key)
+            return
+        if not isinstance(value, (str, os.PathLike)):
+            return
+        text = os.fspath(value)
+        suffix = Path(text).suffix.casefold()
+        if not (
+            isinstance(value, os.PathLike)
+            or "\\" in text
+            or "/" in text
+            or suffix in RELATION_INPUT_SUFFIXES
+        ):
+            return
+        if key == "folder":
+            add_directory(text, role="owner")
+            return
+        is_blend = suffix == ".blend" or key == "atlas_blends"
+        add_expected(text, exact=(suffix in exact_suffixes and not is_blend))
+        if is_blend:
+            blend = normalize_candidate(text)
+            add_expected(registry_path_for_blend(blend), exact=True)
+            add_expected(_relation_capture_manifest_path(blend), exact=True)
+
+    collect_projection(payload)
+    folder = normalize_candidate(item.get("folder") or "")
+    add_directory(folder, role="owner")
+    add_directory(folder / "Cluster", role="cluster")
+
+    # Direct owner/Cluster entries drive cluster source/blend discovery.
+    enumerated = set()
+    scanned_entry_count = 0
+    semantic_entry_count = 0
+    while True:
+        pending_directories = [
+            (key, directory, role)
+            for key, (directory, role) in directories.items()
+            if key not in enumerated
+        ]
+        if not pending_directories:
+            break
+        for directory_key, directory, role in pending_directories:
+            enumerated.add(directory_key)
+            if not directory.is_dir():
+                membership.add("directory:" + directory_key + ":missing")
+                continue
+            entries = (
+                directory_memo.get(directory_key)
+                if directory_memo is not None else None
+            )
+            if entries is None:
+                try:
+                    entries = tuple(sorted(
+                        directory.iterdir(),
+                        key=lambda path: path.name.casefold(),
+                    ))
+                except OSError as exc:
+                    raise RuntimeError(
+                        "Blender relation inputs could not enumerate "
+                        f"{directory}: {exc}"
+                    ) from exc
+                if directory_memo is not None:
+                    directory_memo[directory_key] = entries
+            scanned_entry_count += len(entries)
+            if scanned_entry_count > 32_768:
+                raise BoundedDiscoveryError(
+                    "Blender relation discovery exceeded 32768 directory "
+                    "entries for "
+                    + str(folder)
+                )
+            membership.add("directory:" + directory_key + ":present")
+            for candidate in entries:
+                suffix = candidate.suffix.casefold()
+                if is_backup_path(candidate):
+                    continue
+                try:
+                    is_file = candidate.is_file()
+                    is_directory = candidate.is_dir()
+                except OSError:
+                    is_file = is_directory = False
+                if is_directory:
+                    continue
+                if role == "scope":
+                    name = candidate.name.casefold()
+                    relevant = suffix == ".json" and any(
+                        name.endswith(f"__{stem}.json")
+                        for stem in scope_target_stems.get(
+                            directory_key, ()
+                        )
+                    )
+                else:
+                    relevant = suffix == ".spm"
+                if not is_file or not relevant:
+                    continue
+                semantic_entry_count += 1
+                if semantic_entry_count > 4_096:
+                    raise BoundedDiscoveryError(
+                        "Blender relation semantic membership exceeded 4096 "
+                        "entries for " + str(folder)
+                    )
+                candidate_key = startup_path_key(candidate)
+                membership.add("entry:" + candidate_key + ":file")
+                if role == "scope":
+                    try:
+                        selection_mtime_ns = candidate.stat().st_mtime_ns
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "Blender relation scope ordering could not stat "
+                            f"{candidate}: {exc}"
+                        ) from exc
+                    membership.add(
+                        "scope-selection-mtime:"
+                        + candidate_key
+                        + ":"
+                        + str(selection_mtime_ns)
+                    )
+                # Owner/Cluster discovery reads SPM membership. Scope
+                # discovery reads JSON membership. Registry and capture JSON
+                # are added explicitly from each projected blend above, so
+                # unrelated report/image files never amplify this identity.
+                add_expected(candidate, exact=True)
+                if role == "cluster" and suffix == ".spm":
+                    # Cluster relation discovery derives normalized blends
+                    # from every live canonical/legacy SPM pair.  Bind that
+                    # derived path and both sidecars even when the primary
+                    # report did not project the blend into a leaf row.
+                    blend = normalized_blend_for_source(candidate)
+                    add_expected(blend, exact=False)
+                    add_expected(registry_path_for_blend(blend), exact=True)
+                    add_expected(
+                        _relation_capture_manifest_path(blend), exact=True
+                    )
+
+        # Scope selection is a glob over each exact target SPM's sibling dir.
+        for candidate in list(paths.values()):
+            if candidate.suffix.casefold() == ".spm":
+                add_directory(
+                    candidate.parent / ".atlas_leaf_speedtree_scopes",
+                    role="scope",
+                    target_stem=candidate.stem,
+                )
+
+        # Sidecars can declare exact external source artifacts.  Parsing is
+        # discovery only; their bytes are still full-SHA bound below.
+        while json_queue:
+            json_path = json_queue.pop()
+            json_key = startup_path_key(json_path)
+            if json_key in parsed_json:
+                continue
+            parsed_json.add(json_key)
+            try:
+                document = (
+                    json_memo.get(json_key)
+                    if json_memo is not None and json_key in json_memo
+                    else json.loads(json_path.read_text(encoding="utf-8"))
+                )
+                if json_memo is not None and json_key not in json_memo:
+                    json_memo[json_key] = document
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                continue
+
+            def collect_declared(value, declared_key=None):
+                if isinstance(value, dict):
+                    for key, nested in value.items():
+                        collect_declared(nested, str(key).casefold())
+                    return
+                if isinstance(value, list):
+                    for nested in value:
+                        collect_declared(nested, declared_key)
+                    return
+                if not isinstance(value, str):
+                    return
+                if declared_key == "source_fbx":
+                    add_expected(
+                        value,
+                        exact=True,
+                        base=json_path.parent,
+                    )
+                elif declared_key in {
+                    "spm",
+                    "source_spm",
+                    "target_spm",
+                    "target_spms",
+                    "canonical_spm",
+                    "mirror_spm",
+                }:
+                    add_expected(
+                        value,
+                        exact=True,
+                        base=json_path.parent,
+                    )
+
+            collect_declared(document)
+
+    return (
+        paths,
+        membership,
+        len(expected),
+        len(enumerated),
+        scanned_entry_count,
+        semantic_entry_count,
+    )
+
+
 def _relation_item_content_identity(
-        item, *, content_memo=None, directory_memo=None, exact_all=False):
+        item, *, content_memo=None, directory_memo=None, json_memo=None,
+        exact_all=False, prepared_inventory=None, workers=8):
     """Bind relation/live-mutation evidence to payload content and membership.
 
     Every file that the report payload actually names is full-SHA bound.  The
@@ -913,7 +1259,10 @@ def _relation_item_content_identity(
     bytes can affect the report must be present in the payload and therefore
     remains exact mutation evidence.
     """
-    payload = _relation_item_payload(item)
+    payload = (
+        _mutation_item_payload(item)
+        if exact_all else _relation_item_payload(item)
+    )
     paths = {}
 
     def collect(value):
@@ -941,13 +1290,64 @@ def _relation_item_content_identity(
 
     collect(payload)
     folder = Path(item.get("folder") or "").expanduser().absolute()
+    if not exact_all:
+        inventory = prepared_inventory or _relation_semantic_inventory(
+            item,
+            payload,
+            directory_memo=directory_memo,
+            json_memo=json_memo,
+        )
+        (
+            paths,
+            membership,
+            expected_count,
+            enumerated_count,
+            scanned_entry_count,
+            semantic_entry_count,
+        ) = inventory
+        membership.add(
+            "payload:" + canonical_json_sha256(startup_json_safe(payload))
+        )
+        identity = content_identity(
+            paths.values(),
+            membership=membership,
+            memo=content_memo,
+            max_files=2_048,
+            exact=True,
+            workers=workers,
+        )
+        identity.update({
+            "exact_content_file_count": len(paths),
+            "sampled_content_file_count": 0,
+            "evidence_scope": (
+                "exact-relation-semantic-dependencies-plus-bounded-"
+                "membership-v2"
+            ),
+            "payload_content_file_count": len(paths),
+            "membership_file_count": expected_count,
+            "directory_count": enumerated_count,
+            "scanned_directory_entry_count": scanned_entry_count,
+            "semantic_membership_entry_count": semantic_entry_count,
+        })
+        return identity
+
+    semantic_inventory = _relation_semantic_inventory(
+        item,
+        _relation_item_payload(item),
+        directory_memo=directory_memo,
+        json_memo=json_memo,
+    )
+    semantic_paths, semantic_membership = semantic_inventory[:2]
+    paths.update(semantic_paths)
+
     directories = [folder, folder / "Cluster"]
     for path in list(paths.values()):
         directories.append(path.parent)
         directories.append(path.parent / ".atlas_leaf_speedtree_scopes")
-    membership = {
+    membership = set(semantic_membership)
+    membership.add(
         "payload:" + canonical_json_sha256(startup_json_safe(payload))
-    }
+    )
     membership_file_keys = set()
     seen_directories = set()
     entry_count = 0
@@ -999,7 +1399,8 @@ def _relation_item_content_identity(
         identity["exact_content_file_count"] = len(paths)
         identity["sampled_content_file_count"] = 0
         identity["evidence_scope"] = (
-            "full-payload-content-plus-bounded-directory-membership-v1"
+            "full-mutation-payload-plus-exact-relation-dependencies-plus-"
+            "bounded-membership-v2"
         )
     else:
         exact_paths = [
@@ -1072,6 +1473,14 @@ def item_has_current_live_evidence(
 def require_current_live_evidence(
         item, *, content_memo=None, exact_content_memo=None,
         directory_memo=None):
+    expected = item.get("_gui_live_evidence")
+    if (
+        not isinstance(expected, dict)
+        or expected.get("relation_validation_mode") != "physical"
+    ):
+        raise RuntimeError(
+            "deferred/display-only relation evidence cannot authorize mutation"
+        )
     if not item_has_current_live_evidence(
         item,
         content_memo=content_memo,
@@ -1097,11 +1506,21 @@ def require_current_live_evidence(
 def mutation_semantic_digest(item):
     """Digest every report field from which mutation plans are derived."""
     return canonical_json_sha256(
-        startup_json_safe(_relation_item_payload(item))
+        startup_json_safe(_mutation_item_payload(item))
     )
 
 
-def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
+def _exact_mutation_item_key(item):
+    return (
+        startup_path_key((item or {}).get("folder") or "")
+        + "|"
+        + str((item or {}).get("name") or "").casefold()
+    )
+
+
+def seal_exact_mutation_baseline(
+        items, *, action, plan_payload=None, authority_units=None,
+        config_projection=None, tool_paths=None, receipt_path=None):
     """Seal current exact inputs after a selected-item semantic re-audit."""
     content_memo = {}
     exact_content_memo = {}
@@ -1120,10 +1539,7 @@ def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
         )
         identity = item["_gui_exact_mutation_evidence"]
         rows.append({
-            "item_key": (
-                startup_path_key(item.get("folder") or ""),
-                str(item.get("name") or "").casefold(),
-            ),
+            "item_key": _exact_mutation_item_key(item),
             "semantic_sha256": mutation_semantic_digest(item),
             "exact_sha256": identity["sha256"],
             "file_count": identity.get("file_count", 0),
@@ -1134,10 +1550,46 @@ def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
         {key: value for key, value in row.items() if key != "item"}
         for row in rows
     ]
+    if authority_units is None:
+        authority_units = [{
+            "unit_id": "all",
+            "payload": plan_payload,
+            "item_keys": [row["item_key"] for row in rows],
+            "paths": (),
+            "memberships": (),
+        }]
+    item_states_by_key = {
+        row["item_key"]: {
+            "exact_sha256": row["exact_sha256"],
+            "file_count": row.get("file_count", 0),
+            "membership": list(row.get("membership") or ()),
+        }
+        for row in rows
+    }
+    authority_units = [
+        {
+            **unit,
+            "item_states": {
+                key: item_states_by_key[key]
+                for key in unit.get("item_keys") or ()
+                if key in item_states_by_key
+            },
+        }
+        for unit in authority_units
+    ]
+    unit_authority = capture_mutation_authority_manifest(
+        action=action,
+        logical_plan=plan_payload,
+        config_projection=config_projection,
+        tool_paths=(GUI_SOURCE_PATH, *(tool_paths or ())),
+        units=authority_units,
+        receipt_path=receipt_path,
+    )
     plan_digest = canonical_json_sha256(startup_json_safe({
         "action": str(action),
         "items": public_rows,
         "plan": plan_payload,
+        "authority_sha256": unit_authority["authority_sha256"],
     }))
     return {
         "schema_version": 1,
@@ -1146,18 +1598,35 @@ def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
         "plan_digest": plan_digest,
         "items": rows,
         "plan_payload": startup_json_safe(plan_payload),
+        "unit_authority": unit_authority,
         "writes_before_match": 0,
     }
 
 
-def require_exact_mutation_baseline(baseline):
-    """Re-hash a sealed baseline immediately before the first write."""
+def require_exact_mutation_baseline(
+        baseline, *, unit_id=None, current_unit_payload=None,
+        current_config=None):
+    """Re-hash the selected unit immediately before its first write."""
     if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
         raise RuntimeError("exact mutation baseline is unavailable")
+    authority = baseline.get("unit_authority")
+    units = list((authority or {}).get("units") or ())
+    if unit_id is None:
+        if len(units) != 1:
+            raise RuntimeError("exact mutation baseline unit is required")
+        unit_id = units[0].get("unit_id")
+    unit = next((
+        row for row in units if row.get("unit_id") == str(unit_id)
+    ), None)
+    if unit is None:
+        raise RuntimeError("exact mutation baseline unit is unavailable")
+    unit_item_keys = set(unit.get("item_keys") or ())
     expected_public_rows = []
     content_memo = {}
     directory_memo = {}
     for row in baseline.get("items") or ():
+        if row.get("item_key") not in unit_item_keys:
+            continue
         item = row.get("item")
         if not isinstance(item, dict):
             raise RuntimeError("exact mutation baseline item is unavailable")
@@ -1167,7 +1636,15 @@ def require_exact_mutation_baseline(baseline):
             directory_memo=directory_memo,
             exact_all=True,
         )
-        if current.get("sha256") != row.get("exact_sha256"):
+        advanced_item = expected_mutation_item_state(
+            authority, str(unit_id), row.get("item_key")
+        )
+        expected_exact_sha256 = (
+            advanced_item.get("exact_sha256")
+            if isinstance(advanced_item, dict)
+            else row.get("exact_sha256")
+        )
+        if current.get("sha256") != expected_exact_sha256:
             raise RuntimeError(
                 "선택 작업 입력이 exact 계획 생성 후 변경되었습니다. "
                 "production 파일을 쓰지 않고 중단합니다."
@@ -1177,12 +1654,108 @@ def require_exact_mutation_baseline(baseline):
         })
     current_plan_digest = canonical_json_sha256(startup_json_safe({
         "action": baseline.get("action"),
-        "items": expected_public_rows,
+        "items": [
+            {key: value for key, value in row.items() if key != "item"}
+            for row in baseline.get("items") or ()
+        ],
         "plan": baseline.get("plan_payload"),
+        "authority_sha256": (authority or {}).get("authority_sha256"),
     }))
     if current_plan_digest != baseline.get("plan_digest"):
         raise RuntimeError("exact mutation plan seal is invalid")
+    require_mutation_authority_unit(
+        authority,
+        str(unit_id),
+        current_payload=(
+            unit.get("payload")
+            if current_unit_payload is None else current_unit_payload
+        ),
+        current_config=current_config,
+    )
+    baseline["writes_before_match"] = len(
+        authority.get("receipt", {}).get("authorized_units") or ()
+    )
     return True
+
+
+def complete_exact_mutation_unit(baseline, unit_id, *, post_paths=None):
+    authority = baseline["unit_authority"]
+    unit = next((
+        row for row in authority.get("units") or ()
+        if row.get("unit_id") == str(unit_id)
+    ), None)
+    if unit is None:
+        raise RuntimeError("exact mutation baseline unit is unavailable")
+    unit_item_keys = set(unit.get("item_keys") or ())
+    content_memo = {}
+    directory_memo = {}
+    item_post_states = {}
+    for row in baseline.get("items") or ():
+        item_key = row.get("item_key")
+        if item_key not in unit_item_keys:
+            continue
+        current = _relation_item_content_identity(
+            row["item"],
+            content_memo=content_memo,
+            directory_memo=directory_memo,
+            exact_all=True,
+        )
+        item_post_states[str(item_key)] = {
+            "exact_sha256": current.get("sha256"),
+            "file_count": current.get("file_count", 0),
+            "membership": list(current.get("membership") or ()),
+        }
+    receipt = complete_mutation_authority_unit(
+        authority,
+        str(unit_id),
+        post_paths=post_paths,
+        item_post_states=item_post_states,
+    )
+    baseline["writes_before_match"] = len(
+        receipt.get("authorized_units") or ()
+    )
+    return receipt
+
+
+def exact_mutation_unit_id(baseline, preferred):
+    units = list(
+        (baseline or {}).get("unit_authority", {}).get("units") or ()
+    )
+    if any(unit.get("unit_id") == str(preferred) for unit in units):
+        return str(preferred)
+    if len(units) == 1:
+        return str(units[0].get("unit_id"))
+    raise RuntimeError(f"exact mutation unit is unavailable: {preferred}")
+
+
+def capture_runtime_mutation_authority(
+        *, action, unit_id, payload, paths, memberships=(),
+        write_paths=(), write_memberships=(),
+        config_projection=None, tool_paths=()):
+    """Seal a plan that is intentionally derived after an earlier unit."""
+    receipt_path = REPORT_DIR / (
+        "mutation_authority_"
+        + str(action).replace("/", "_").replace("\\", "_")
+        + "_"
+        + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        + ".json"
+    )
+    return capture_mutation_authority_manifest(
+        action=action,
+        logical_plan=payload,
+        config_projection=config_projection,
+        tool_paths=(GUI_SOURCE_PATH, *(tool_paths or ())),
+        units=[{
+            "unit_id": unit_id,
+            "payload": payload,
+            "item_keys": [],
+            "paths": paths,
+            "write_paths": write_paths,
+            "memberships": memberships,
+            "write_memberships": write_memberships,
+        }],
+        receipt_path=receipt_path,
+    )
 
 
 def _restore_relation_paths(value, key=None):
@@ -1207,6 +1780,10 @@ def cache_blender_connection_rows(
     progress_callback=None,
     cancel_check=None,
     metrics=None,
+    session_evidence=None,
+    *,
+    verify_physical=True,
+    read_cache=True,
 ):
     """Resolve or content-validate relation rows off the Tk main thread."""
     items = list((report or {}).get("items") or [])
@@ -1229,10 +1806,69 @@ def cache_blender_connection_rows(
     cache_hits = 0
     cache_updates = []
     changed_during_scan = 0
+    exact_rows = (
+        session_evidence.get("exact_content_rows")
+        if isinstance(session_evidence, dict)
+        and session_evidence.get("schema_version") == 1
+        and session_evidence.get("kind")
+        == "pcg_refresh_exact_content_evidence"
+        else {}
+    )
+    session_exact_candidates = {
+        str(key): dict(row)
+        for key, row in (exact_rows or {}).items()
+        if isinstance(row, dict)
+        and row.get("fingerprint_algorithm") == "sha256-full-v1"
+        and row.get("fingerprint")
+    }
+    # Session evidence is a same-refresh acceleration candidate, never
+    # current-content authority.  Cache hits must hash the current bytes too,
+    # including same-size/restored-mtime tampering after the primary audit.
     first_pass_content_memo = {}
+    reused_exact_content_file_count = 0
     first_pass_directory_memo = {}
+    first_pass_json_memo = {}
     final_pass_content_memo = {}
     final_pass_directory_memo = {}
+    final_pass_json_memo = {}
+
+    def prepare_inventories(
+            target_items, content_memo, directory_memo, json_memo):
+        prepared = {}
+        union_paths = {}
+        for target_item in target_items:
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError(
+                    "PCG Blender relation calculation cancelled"
+                )
+            payload = _relation_item_payload(target_item)
+            inventory = _relation_semantic_inventory(
+                target_item,
+                payload,
+                directory_memo=directory_memo,
+                json_memo=json_memo,
+            )
+            prepared[id(target_item)] = inventory
+            for path in inventory[0].values():
+                union_paths[startup_path_key(path)] = path
+        # Hash the generation-wide dependency union once. Per-item identity
+        # assembly below is then a deterministic in-memory projection instead
+        # of creating 55 executor pools and reopening shared files.
+        content_identity(
+            union_paths.values(),
+            memo=content_memo,
+            max_files=10_000,
+            exact=True,
+            workers=8,
+        )
+        return prepared
+
+    first_pass_prepared = prepare_inventories(
+        items,
+        first_pass_content_memo,
+        first_pass_directory_memo,
+        first_pass_json_memo,
+    )
 
     def update_metrics(status):
         if metrics is None:
@@ -1276,22 +1912,30 @@ def cache_blender_connection_rows(
             "changed_during_scan": changed_during_scan,
             "first_pass_physical_content_reads": len(
                 first_pass_content_memo
+            ) - reused_exact_content_file_count,
+            "reused_exact_content_file_count": (
+                reused_exact_content_file_count
+            ),
+            "session_exact_candidate_count": len(
+                session_exact_candidates
             ),
             "first_pass_directory_enumerations": len(
                 first_pass_directory_memo
             ),
+            "first_pass_json_documents": len(first_pass_json_memo),
             "final_pass_physical_content_reads": len(
                 final_pass_content_memo
             ),
             "final_pass_directory_enumerations": len(
                 final_pass_directory_memo
             ),
+            "final_pass_json_documents": len(final_pass_json_memo),
             "content_identity_algorithm": (
-                "sha256-of-hybrid-content-keys-v1"
+                "sha256-of-full-content-keys-v1"
             ),
             "content_identity_scope": (
-                "full-semantic-content-plus-sampled-bulk-images-plus-"
-                "bounded-directory-membership-v1"
+                "exact-relation-semantic-dependencies-plus-bounded-"
+                "membership-v2"
             ),
             "exact_content_file_count": sum(
                 identity.get("exact_content_file_count", 0)
@@ -1304,6 +1948,12 @@ def cache_blender_connection_rows(
             "mutation_authority_algorithm": (
                 "sha256-of-full-content-keys-v1"
             ),
+            "physical_validation": (
+                "full" if verify_physical else "deferred"
+            ),
+            "persisted_cache_policy": (
+                "read_write" if read_cache else "fresh_projection"
+            ),
         })
 
     for item in items:
@@ -1314,10 +1964,21 @@ def cache_blender_connection_rows(
             item,
             content_memo=first_pass_content_memo,
             directory_memo=first_pass_directory_memo,
+            json_memo=first_pass_json_memo,
+            prepared_inventory=first_pass_prepared[id(item)],
+            workers=1,
         )
-        namespace = startup_path_key(item.get("folder") or item.get("name") or "")
+        validation_mode = "physical" if verify_physical else "deferred"
+        identity["relation_validation_mode"] = validation_mode
+        namespace = (
+            startup_path_key(item.get("folder") or item.get("name") or "")
+            + "|" + validation_mode
+        )
         identities[id(item)] = (namespace, identity)
-        cached = cache.get(namespace, identity["sha256"])
+        cached = (
+            cache.get(namespace, identity["sha256"])
+            if read_cache else None
+        )
         if isinstance(cached, list):
             item["_gui_blender_connection_rows"] = _restore_relation_paths(
                 cached
@@ -1334,8 +1995,39 @@ def cache_blender_connection_rows(
         max_workers=min(4, len(misses) or 1),
         thread_name_prefix="pcg-gui-relations",
     ) as executor:
+        relation_validation_cache = RelationValidationCache()
+        for path_key, row in first_pass_content_memo.items():
+            relation_validation_cache.seed(
+                ("sha256", str(path_key)),
+                row["fingerprint"],
+            )
+        for path_key, row in (
+            (session_evidence or {}).get(
+                "spm_structural_semantic_rows"
+            ) or {}
+        ).items():
+            current_row = first_pass_content_memo.get(str(path_key))
+            if (
+                not isinstance(current_row, dict)
+                or current_row.get("fingerprint")
+                != row.get("raw_sha256")
+            ):
+                continue
+            relation_validation_cache.seed(
+                (
+                    "spm_structural_semantic",
+                    str(path_key),
+                    str(row.get("raw_sha256") or ""),
+                ),
+                row.get("semantic_fingerprint"),
+            )
         futures = {
-            executor.submit(blender_connection_rows, item): item
+            executor.submit(
+                blender_connection_rows,
+                item,
+                relation_validation_cache,
+                verify_physical=verify_physical,
+            ): item
             for item in misses
         }
         calculated_rows = {}
@@ -1351,6 +2043,12 @@ def cache_blender_connection_rows(
             except Exception:
                 update_metrics("error")
                 raise
+        final_pass_prepared = prepare_inventories(
+            misses,
+            final_pass_content_memo,
+            final_pass_directory_memo,
+            final_pass_json_memo,
+        )
         # Re-observe every miss only after all relation calculations finish.
         # Shared memos avoid re-hashing/re-enumerating common inputs once per
         # row while preserving a distinct post-compute snapshot.
@@ -1363,6 +2061,12 @@ def cache_blender_connection_rows(
                 item,
                 content_memo=final_pass_content_memo,
                 directory_memo=final_pass_directory_memo,
+                json_memo=final_pass_json_memo,
+                prepared_inventory=final_pass_prepared[id(item)],
+                workers=1,
+            )
+            after["relation_validation_mode"] = (
+                "physical" if verify_physical else "deferred"
             )
             if before["sha256"] != after["sha256"]:
                 changed_during_scan += 1
@@ -1591,6 +2295,49 @@ def step2_target_payload(job):
     return {"version": 1, "targets": targets}
 
 
+def mutation_config_projection(cfg, keys):
+    """Return only config values that can alter one mutation action."""
+    return {
+        str(key): startup_json_safe((cfg or {}).get(key))
+        for key in keys
+    }
+
+
+def mutation_source_path(value):
+    """Return the loaded Python source that implements a mutation helper."""
+    module = sys.modules.get(getattr(value, "__module__", ""))
+    source = getattr(module, "__file__", None)
+    return Path(source).absolute() if source else None
+
+
+def step1_unit_payload(row):
+    item = row.get("item") or {}
+    return {
+        "folder": str(item.get("folder") or ""),
+        "mesh": str(row.get("mesh") or ""),
+        "exclude": list(row.get("exclude") or ()),
+    }
+
+
+def step1_authority_units(rows):
+    units = []
+    for index, row in enumerate(rows or (), 1):
+        item = row.get("item") or {}
+        folder = Path(item.get("folder") or "").absolute()
+        item_key = _exact_mutation_item_key(item)
+        units.append({
+            "unit_id": f"step1:{index}:{startup_path_key(folder)}",
+            "payload": step1_unit_payload(row),
+            "item_keys": [item_key],
+            "write_item_keys": [item_key],
+            "paths": [folder],
+            "write_paths": [folder],
+            "memberships": [folder, folder / "Cluster"],
+            "write_memberships": [folder, folder / "Cluster"],
+        })
+    return units
+
+
 def step2_exact_plan_payload(jobs, push_spm):
     """Return the current command/producer scope sealed before Step 2 writes."""
     return {
@@ -1609,6 +2356,48 @@ def step2_exact_plan_payload(jobs, push_spm):
             for job in jobs or ()
         ],
     }
+
+
+def step2_unit_payload(job, push_spm):
+    return {
+        "push_spm": bool(push_spm),
+        "job": step2_exact_plan_payload([job], push_spm)["jobs"][0],
+    }
+
+
+def step2_authority_units(jobs, push_spm):
+    units = []
+    for index, job in enumerate(jobs or (), 1):
+        items = list(job.get("items") or [job.get("item")])
+        paths = [
+            job.get("albedo"),
+            job.get("alpha"),
+            job.get("blend_out"),
+            *(job.get("target_spms") or ()),
+        ]
+        write_paths = [
+            job.get("blend_out"),
+            *(job.get("target_spms") or ()),
+        ]
+        memberships = [
+            Path(path).parent / ".atlas_leaf_speedtree_scopes"
+            for path in job.get("target_spms") or ()
+        ]
+        item_keys = [
+            _exact_mutation_item_key(item)
+            for item in items if isinstance(item, dict)
+        ]
+        units.append({
+            "unit_id": f"step2:{index}:{job.get('base') or ''}",
+            "payload": step2_unit_payload(job, push_spm),
+            "item_keys": item_keys,
+            "write_item_keys": item_keys,
+            "paths": [path for path in paths if path],
+            "write_paths": [path for path in write_paths if path],
+            "memberships": memberships,
+            "write_memberships": memberships,
+        })
+    return units
 
 
 def step3_exact_plan_payload(plan):
@@ -1634,7 +2423,112 @@ def step3_exact_plan_payload(plan):
         "eligible_row_keys": sorted(
             list((plan or {}).get("eligible_row_keys") or ())
         ),
+        "pending_manifest_rows": [
+            {
+                "row": {
+                    key: value
+                    for key, value in (row or {}).items()
+                    if key != "item"
+                },
+                "files": [str(path) for path in files or ()],
+            }
+            for row, files in (
+                (plan or {}).get("pending_manifest_rows") or ()
+            )
+        ],
+        "require_all_renders_for_sync": bool(
+            (plan or {}).get("require_all_renders_for_sync")
+        ),
+        "operation_label": str(
+            (plan or {}).get("operation_label") or ""
+        ),
     }
+
+
+def step3_job_payload(job):
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {"item", "items"}
+    }
+
+
+def step3_authority_units(plan):
+    units = []
+    for index, (row, files) in enumerate(
+            (plan or {}).get("pending_manifest_rows") or (), 1):
+        item = None
+        if isinstance(row, dict):
+            item = row.get("item") or row
+        texture_root = (
+            canonical_texture_root(item.get("folder"))
+            if isinstance(item, dict) and item.get("folder")
+            else None
+        )
+        manifest_path = (
+            texture_root / "pcg_st9_canonical_outputs.json"
+            if texture_root is not None else None
+        )
+        item_keys = (
+            [_exact_mutation_item_key(item)]
+            if isinstance(item, dict) else []
+        )
+        units.append({
+            "unit_id": f"step3-manifest:{index}",
+            "payload": {
+                "row": row,
+                "files": [str(path) for path in files or ()],
+            },
+            "item_keys": item_keys,
+            "write_item_keys": item_keys,
+            "paths": [
+                *(files or ()),
+                *([manifest_path] if manifest_path is not None else ()),
+            ],
+            "write_paths": (
+                [manifest_path] if manifest_path is not None else []
+            ),
+            "memberships": (
+                [texture_root / "_pcgtex_generated"]
+                if texture_root is not None else []
+            ),
+        })
+    for index, job in enumerate((plan or {}).get("jobs") or (), 1):
+        dependency_paths = step3_job_dependency_paths(job)
+        planned_outputs = output_paths(
+            job["out_dir"], job["texture_base"]
+        ).values()
+        items = list(job.get("items") or [job.get("item")])
+        item_keys = [
+            _exact_mutation_item_key(item)
+            for item in items if isinstance(item, dict)
+        ]
+        write_paths = [
+            *([job.get("sbs")] if job.get("sbs") else ()),
+            *planned_outputs,
+        ]
+        units.append({
+            "unit_id": f"step3-render:{index}:{job.get('base') or ''}",
+            "payload": step3_job_payload(job),
+            "item_keys": item_keys,
+            "write_item_keys": item_keys,
+            "paths": [*dependency_paths, *write_paths],
+            "write_paths": write_paths,
+            "memberships": [
+                Path(path).parent / ".atlas_leaf_speedtree_scopes"
+                for path in dependency_paths
+                if Path(path).suffix.casefold() == ".spm"
+            ],
+        })
+    if not units:
+        units.append({
+            "unit_id": "step3-preflight-only",
+            "payload": step3_exact_plan_payload(plan),
+            "item_keys": [],
+            "paths": list((plan or {}).get("sync_files") or ()),
+            "memberships": [],
+        })
+    return units
 
 
 def existing_leaf_blend(source):
@@ -2365,15 +3259,51 @@ class App:
     def _run_add_blend_target_spm(
         self, blend, selected_path, evidence_items=None
     ):
+        if not Path(selected_path).is_file():
+            raise RuntimeError(
+                "selected Atlas target SPM is not a current file; "
+                "production registry was not written"
+            )
+        plan_payload = {
+            "blend": str(blend),
+            "target_spm": str(selected_path),
+            "target_registry": str(registry_path_for_blend(blend)),
+            "capture_manifest": str(_relation_capture_manifest_path(blend)),
+        }
+        unit_id = "atlas-target-add"
+        evidence_item_keys = [
+            _exact_mutation_item_key(item)
+            for item in evidence_items or ()
+            if isinstance(item, dict)
+        ]
         baseline = self._reaudit_and_seal_mutation_items(
             evidence_items or (),
             action="atlas_target_add",
-            plan_payload={
-                "blend": str(blend),
-                "target_spm": str(selected_path),
-            },
+            plan_payload=plan_payload,
+            authority_units=[{
+                "unit_id": unit_id,
+                "payload": plan_payload,
+                "item_keys": evidence_item_keys,
+                "write_item_keys": evidence_item_keys,
+                "paths": [
+                    blend,
+                    selected_path,
+                    registry_path_for_blend(blend),
+                    _relation_capture_manifest_path(blend),
+                ],
+                "write_paths": [registry_path_for_blend(blend)],
+                "memberships": [
+                    Path(selected_path).parent
+                    / ".atlas_leaf_speedtree_scopes",
+                ],
+            }],
+            tool_paths=[mutation_source_path(save_target_registry)],
         )
-        require_exact_mutation_baseline(baseline)
+        require_exact_mutation_baseline(
+            baseline,
+            unit_id=unit_id,
+            current_unit_payload=plan_payload,
+        )
         targets = self._current_targets_for_blend(blend)
         keys = {
             os.path.normcase(str(path.absolute())).casefold()
@@ -2384,7 +3314,25 @@ class App:
         ).casefold()
         if selected_key not in keys:
             targets.append(selected_path)
-        payload = save_target_registry(blend, targets)
+        require_exact_mutation_baseline(
+            baseline,
+            unit_id=unit_id,
+            current_unit_payload=plan_payload,
+        )
+        payload = save_target_registry(
+            blend,
+            targets,
+            expected_registry_state=mutation_authority_expected_path_state(
+                baseline["unit_authority"],
+                unit_id,
+                registry_path_for_blend(blend),
+            ),
+        )
+        complete_exact_mutation_unit(
+            baseline,
+            unit_id,
+            post_paths=[registry_path_for_blend(blend)],
+        )
         self._ui(
             lambda source=blend, target=selected_path, result=payload:
             self._add_blend_target_done(source, target, result)
@@ -2488,20 +3436,82 @@ class App:
     def _run_remove_blend_target_spms(
         self, blend, remove_paths, evidence_items=None
     ):
+        plan_payload = {
+            "blend": str(blend),
+            "target_spms": [str(path) for path in remove_paths],
+            "target_registry": str(registry_path_for_blend(blend)),
+            "capture_manifest": str(_relation_capture_manifest_path(blend)),
+        }
+        unit_id = "atlas-target-remove"
+        blender_exe = self.cfg.get("blender_exe", "")
+        startup = blender_user_startup_path(blender_exe)
+        config_projection = mutation_config_projection(
+            self.cfg, ("blender_exe", "atlas_job_timeout")
+        )
+        evidence_item_keys = [
+            _exact_mutation_item_key(item)
+            for item in evidence_items or ()
+            if isinstance(item, dict)
+        ]
+        scope_memberships = [
+            Path(path).parent / ".atlas_leaf_speedtree_scopes"
+            for path in remove_paths
+        ]
         baseline = self._reaudit_and_seal_mutation_items(
             evidence_items or (),
             action="atlas_target_remove",
-            plan_payload={
-                "blend": str(blend),
-                "target_spms": [str(path) for path in remove_paths],
-            },
+            plan_payload=plan_payload,
+            authority_units=[{
+                "unit_id": unit_id,
+                "payload": plan_payload,
+                "item_keys": evidence_item_keys,
+                "write_item_keys": evidence_item_keys,
+                "paths": [
+                    blend,
+                    *remove_paths,
+                    registry_path_for_blend(blend),
+                    _relation_capture_manifest_path(blend),
+                ],
+                "write_paths": [
+                    registry_path_for_blend(blend),
+                    *remove_paths,
+                ],
+                "memberships": scope_memberships,
+                "write_memberships": scope_memberships,
+            }],
+            config_projection=config_projection,
+            tool_paths=[
+                blender_exe,
+                startup,
+                TOOL_DIR / "jobs" / "atlas_target_remove_job.py",
+                mutation_source_path(save_target_registry),
+            ],
         )
-        require_exact_mutation_baseline(baseline)
-        report_path = TOOL_DIR / f".atlas_target_remove_{os.getpid()}_{threading.get_ident()}.json"
+        require_exact_mutation_baseline(
+            baseline,
+            unit_id=unit_id,
+            current_unit_payload=plan_payload,
+            current_config=mutation_config_projection(
+                self.cfg, ("blender_exe", "atlas_job_timeout")
+            ),
+        )
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        receipt_stem = (
+            f"atlas_target_remove_{os.getpid()}_{threading.get_ident()}"
+        )
+        report_path = REPORT_DIR / f"{receipt_stem}.json"
+        child_authority_path = REPORT_DIR / f"{receipt_stem}.authority.json"
+        child_authority_sha256 = write_child_mutation_authority(
+            baseline["unit_authority"],
+            unit_id,
+            child_authority_path,
+        )
         command = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
             "--python", str(TOOL_DIR / "jobs" / "atlas_target_remove_job.py"), "--",
             "--blend", str(blend),
             "--report", str(report_path),
+            "--authority-json", str(child_authority_path),
+            "--authority-sha256", child_authority_sha256,
         ]
         for path in remove_paths:
             command.extend(["--spm", str(path)])
@@ -2522,13 +3532,16 @@ class App:
             if result.returncode != 0 or not data or data.get("status") != "ok":
                 detail = (data or {}).get("error") or (result.stderr or result.stdout)[-1200:]
                 raise RuntimeError(detail or "Atlas 대상 해제 작업이 실패했습니다")
+            complete_exact_mutation_unit(
+                baseline,
+                unit_id,
+                post_paths=[
+                    registry_path_for_blend(blend),
+                    *remove_paths,
+                ],
+            )
         except Exception as exc:
             error = exc
-        finally:
-            try:
-                report_path.unlink()
-            except FileNotFoundError:
-                pass
         self._ui(
             lambda result=data, failure=error, source=blend, paths=remove_paths:
                 self._remove_blend_targets_done(source, paths, result, failure)
@@ -2539,6 +3552,8 @@ class App:
                 "operation": "atlas_target_remove",
                 "blend": str(blend),
                 "target_count": len(remove_paths),
+                "report_path": str(report_path),
+                "authority_path": str(child_authority_path),
                 "error": str(error) if error is not None else None,
             },
         }
@@ -2677,6 +3692,7 @@ class App:
         use_pcg_targets = bool(self.use_pcg_targets_var.get())
         partial_lock = threading.Lock()
         partial_sent = False
+        session_evidence = {}
 
         def worker():
             nonlocal partial_sent
@@ -2729,6 +3745,7 @@ class App:
                     progress_callback=progress,
                     item_callback=first_live_item,
                     cancel_check=cancel_event.is_set,
+                    session_evidence=session_evidence,
                 )
             except Exception as exc:
                 error = exc
@@ -2748,6 +3765,7 @@ class App:
                         failure,
                         generation=refresh_generation,
                         cancel_event=refresh_cancel,
+                        session_evidence=session_evidence,
                     ),
             )
 
@@ -2763,6 +3781,7 @@ class App:
         *,
         generation=None,
         cancel_event=None,
+        session_evidence=None,
     ):
         """Paint live primary columns before resolving Blender relations."""
         if generation is not None and not self._refresh_generation_is_current(
@@ -2931,6 +3950,8 @@ class App:
                         cancel_event.is_set if cancel_event is not None else None
                     ),
                     metrics=relation_metrics,
+                    session_evidence=session_evidence,
+                    verify_physical=False,
                 )
                 tracker = getattr(self, "startup_latency", None)
                 if tracker is not None:
@@ -3315,6 +4336,7 @@ class App:
             report = None
             sync_state = None
             error = None
+            session_evidence = {}
             try:
                 pcg_targets = (
                     load_pcg_targets() if use_pcg_targets else None
@@ -3339,6 +4361,7 @@ class App:
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
                     cancel_check=cancel_event.is_set,
+                    session_evidence=session_evidence,
                 )
                 publication_allowed = (
                     lambda: self._refresh_generation_is_current(
@@ -3371,6 +4394,7 @@ class App:
                     report,
                     progress_callback=relation_progress,
                     cancel_check=cancel_event.is_set,
+                    session_evidence=session_evidence,
                 )
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -3458,10 +4482,18 @@ class App:
             report = None
             sync_state = None
             error = None
+            session_evidence = {}
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
-                report = make_report(cfg, pcg_targets=pcg_targets)
-                cache_blender_connection_rows(report)
+                report = make_report(
+                    cfg,
+                    pcg_targets=pcg_targets,
+                    session_evidence=session_evidence,
+                )
+                cache_blender_connection_rows(
+                    report,
+                    session_evidence=session_evidence,
+                )
                 persist_cluster_assembly_receipts_safely(report)
                 save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
@@ -4060,7 +5092,9 @@ class App:
         return startup_path_key((item or {}).get("folder") or "")
 
     def _reaudit_and_seal_mutation_items(
-            self, items, *, action, plan_payload=None):
+            self, items, *, action, plan_payload=None,
+            authority_units=None, config_projection=None,
+            tool_paths=None):
         """Re-audit selected folders and seal exact current plan inputs.
 
         The startup hybrid evidence is display/readiness authority only.  A
@@ -4080,8 +5114,9 @@ class App:
             seen.add(key)
             selected.append(item)
         if not selected:
-            return seal_exact_mutation_baseline(
-                (), action=action, plan_payload=plan_payload
+            raise RuntimeError(
+                "mutation authority scope is empty; production files were "
+                "not written"
             )
 
         target_mesh_names = sorted({
@@ -4094,8 +5129,13 @@ class App:
             self.cfg,
             targets=[item["folder"] for item in selected],
             target_mesh_names=target_mesh_names or None,
+            mutation_authority=True,
         )
-        cache_blender_connection_rows(current_report)
+        cache_blender_connection_rows(
+            current_report,
+            verify_physical=True,
+            read_cache=False,
+        )
         current_by_key = {
             self._mutation_item_key(item): item
             for item in current_report.get("items") or ()
@@ -4121,6 +5161,19 @@ class App:
             current_items,
             action=action,
             plan_payload=plan_payload,
+            authority_units=authority_units,
+            config_projection=config_projection,
+            tool_paths=tool_paths,
+            receipt_path=(
+                REPORT_DIR
+                / (
+                    "mutation_authority_"
+                    + str(action).replace("/", "_").replace("\\", "_")
+                    + "_"
+                    + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    + ".json"
+                )
+            ),
         )
 
     def _texplan_rows(self, item):
@@ -4676,30 +5729,42 @@ class App:
 
     def _run_prepare(self, rows):
         plan_payload = {
-            "rows": [
-                {
-                    "folder": str(row.get("item", {}).get("folder") or ""),
-                    "mesh": str(row.get("mesh") or ""),
-                    "exclude": list(row.get("exclude") or ()),
-                }
-                for row in rows
-            ]
+            "rows": [step1_unit_payload(row) for row in rows]
         }
+        authority_units = step1_authority_units(rows)
         baseline = self._reaudit_and_seal_mutation_items(
             (row.get("item") for row in rows),
             action="step1_prepare",
             plan_payload=plan_payload,
+            authority_units=authority_units,
+            tool_paths=[mutation_source_path(prepare_sk)],
         )
-        require_exact_mutation_baseline(baseline)
         done = 0
         failed = 0
-        for row in rows:
+        for index, row in enumerate(rows):
             item = row["item"]
             mesh = row["mesh"]
             label = mesh or item["name"]
+            preferred_unit_id = authority_units[index]["unit_id"]
+            unit_id = exact_mutation_unit_id(
+                baseline, preferred_unit_id
+            )
+            require_exact_mutation_baseline(
+                baseline,
+                unit_id=unit_id,
+                current_unit_payload=(
+                    step1_unit_payload(row)
+                    if unit_id == preferred_unit_id else None
+                ),
+            )
             try:
                 result = prepare_sk(item["folder"], [mesh] if mesh else None,
                                     dry_run=False, exclude_materials=row.get("exclude"))
+                complete_exact_mutation_unit(
+                    baseline,
+                    unit_id,
+                    post_paths=[item["folder"]],
+                )
                 targets = result.get("targets") or [result]
                 for target in targets:
                     if target.get("created"):
@@ -5204,6 +6269,10 @@ class App:
         self.worker.start()
 
     def _run_step2(self, jobs, push_spm):
+        plan_payload = step2_exact_plan_payload(jobs, push_spm)
+        authority_units = step2_authority_units(jobs, push_spm)
+        config_keys = ("blender_exe", "atlas_job_timeout")
+        blender_exe = self.cfg.get("blender_exe", "")
         baseline = self._reaudit_and_seal_mutation_items(
             (
                 item
@@ -5211,14 +6280,38 @@ class App:
                 for item in job.get("items") or [job.get("item")]
             ),
             action="step2_atlas",
-            plan_payload=step2_exact_plan_payload(jobs, push_spm),
+            plan_payload=plan_payload,
+            authority_units=authority_units,
+            config_projection=mutation_config_projection(
+                self.cfg, config_keys
+            ),
+            tool_paths=[
+                blender_exe,
+                blender_user_startup_path(blender_exe),
+                TOOL_DIR / "jobs" / "atlas_blend_job.py",
+            ],
         )
-        require_exact_mutation_baseline(baseline)
         from pcg_texture_common import REPORT_DIR
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         done = failed = 0
         total = len(jobs)
         for index, job in enumerate(jobs, 1):
+            preferred_unit_id = authority_units[index - 1]["unit_id"]
+            unit_id = exact_mutation_unit_id(
+                baseline, preferred_unit_id
+            )
+            require_exact_mutation_baseline(
+                baseline,
+                unit_id=unit_id,
+                current_unit_payload=(
+                    step2_unit_payload(job, push_spm)
+                    if unit_id == preferred_unit_id else None
+                ),
+                current_config=(
+                    mutation_config_projection(self.cfg, config_keys)
+                    if unit_id == preferred_unit_id else None
+                ),
+            )
             base = job["base"]
             action = "기존 blend 연결" if job["reuse_existing_blend"] else "생성"
             self._ui(lambda i=index, b=base, a=action: self.status_var.set(
@@ -5248,6 +6341,77 @@ class App:
                     cmd += ["--spm", str(spm)]
                 cmd += ["--target-map-json", str(target_map_path)]
                 cmd.append("--build-spm")
+            child_payload = {
+                "albedo": str(job["albedo"]),
+                "alpha": str(job["alpha"]),
+                "material_name": str(base),
+                "blend_out": str(job["blend_out"]),
+                "spms": [str(path) for path in job.get("target_spms") or ()],
+                "target_map_json": (
+                    str(target_map_path)
+                    if push_spm and job.get("target_spms") else ""
+                ),
+                "build_spm": bool(push_spm and job.get("target_spms")),
+                "reuse_existing_blend": bool(
+                    job.get("reuse_existing_blend")
+                ),
+                "quality": "SPEEDTREE_LOW",
+                "plate_mode": "SINGLE",
+            }
+            child_paths = [
+                job["albedo"],
+                job["alpha"],
+                job["blend_out"],
+                *(job.get("target_spms") or ()),
+            ]
+            if child_payload["target_map_json"]:
+                child_paths.append(target_map_path)
+            child_authority = capture_runtime_mutation_authority(
+                action=f"step2_atlas_child_{index}",
+                unit_id="step2-child",
+                payload=child_payload,
+                paths=child_paths,
+                write_paths=[
+                    job["blend_out"],
+                    *(job.get("target_spms") or ()),
+                ],
+                memberships=[
+                    Path(path).parent / ".atlas_leaf_speedtree_scopes"
+                    for path in job.get("target_spms") or ()
+                ],
+                write_memberships=[
+                    Path(path).parent / ".atlas_leaf_speedtree_scopes"
+                    for path in job.get("target_spms") or ()
+                ],
+                config_projection=mutation_config_projection(
+                    self.cfg, config_keys
+                ),
+                tool_paths=[
+                    blender_exe,
+                    blender_user_startup_path(blender_exe),
+                    TOOL_DIR / "jobs" / "atlas_blend_job.py",
+                ],
+            )
+            require_mutation_authority_unit(
+                child_authority,
+                "step2-child",
+                current_payload=child_payload,
+                current_config=mutation_config_projection(
+                    self.cfg, config_keys
+                ),
+            )
+            child_authority_path = REPORT_DIR / (
+                f"atlas_job_{base}_{stamp}.authority.json"
+            )
+            child_authority_sha256 = write_child_mutation_authority(
+                child_authority,
+                "step2-child",
+                child_authority_path,
+            )
+            cmd += [
+                "--authority-json", str(child_authority_path),
+                "--authority-sha256", child_authority_sha256,
+            ]
             try:
                 result = owned_run(cmd,
                                         source="pcg_st9_texture_batch.pcg_texture_gui.atlas_job",
@@ -5269,6 +6433,22 @@ class App:
                     job["blend_out"],
                 )
                 save_spm_analysis_cache()
+                complete_mutation_authority_unit(
+                    child_authority,
+                    "step2-child",
+                    post_paths=[
+                        job["blend_out"],
+                        *(job.get("target_spms") or ()),
+                    ],
+                )
+                complete_exact_mutation_unit(
+                    baseline,
+                    unit_id,
+                    post_paths=[
+                        job["blend_out"],
+                        *(job.get("target_spms") or ()),
+                    ],
+                )
                 done += 1
                 spm_note = (
                     " + 최종 SK Generator 연결 완료"
@@ -6014,6 +7194,11 @@ class App:
         )
 
     def _validate_step3_plan_live_evidence(self, plan):
+        plan["pending_manifest_rows"] = list(
+            (plan or {}).get("pending_manifest_rows")
+            or getattr(self, "_pending_step3_manifest_rows", [])
+            or []
+        )
         selected_rows = list((plan or {}).get("selected_rows") or ())
         items = [
             row[0]
@@ -6032,6 +7217,31 @@ class App:
             items,
             action="step3_texture",
             plan_payload=step3_exact_plan_payload(plan),
+            authority_units=step3_authority_units(plan),
+            config_projection=mutation_config_projection(
+                self.cfg,
+                (
+                    "designer_dir",
+                    "cluster_sbsar",
+                    "cluster_sbsar_normal_behavior",
+                    "sbsrender_timeout",
+                    "tree_root",
+                    "unreal_texture_sync_enabled",
+                    "unreal_project",
+                    "unreal_editor_cmd",
+                    "unreal_texture_destination",
+                    "unreal_texture_sync_timeout",
+                ),
+            ),
+            tool_paths=[
+                Path(self.cfg.get("designer_dir") or "") / "sbsrender.exe",
+                Path(self.cfg.get("designer_dir") or "") / "sbscooker.exe",
+                self.cfg.get("cluster_sbsar"),
+                self.cfg.get("unreal_editor_cmd"),
+                mutation_source_path(run_texture_job),
+                mutation_source_path(normalize_spms_transactionally),
+                mutation_source_path(sync_texture_files),
+            ],
         )
         plan["_exact_mutation_baseline"] = baseline
         return baseline
@@ -6285,6 +7495,10 @@ class App:
                 worker_kwargs["exact_mutation_baseline"] = (
                     exact_mutation_baseline
                 )
+            if plan.get("pending_manifest_rows"):
+                worker_kwargs["pending_manifest_rows"] = list(
+                    plan["pending_manifest_rows"]
+                )
             if skipped and eligible_row_keys is not None:
                 worker_kwargs.update({
                     "planned_skipped": len(skipped),
@@ -6350,6 +7564,10 @@ class App:
             worker_kwargs["exact_mutation_baseline"] = (
                 exact_mutation_baseline
             )
+        if plan.get("pending_manifest_rows"):
+            worker_kwargs["pending_manifest_rows"] = list(
+                plan["pending_manifest_rows"]
+            )
         if skipped:
             worker_kwargs["planned_skipped"] = len(skipped)
         if skipped and eligible_row_keys is not None:
@@ -6397,8 +7615,7 @@ class App:
             force_unreal_verify=False, require_all_renders_for_sync=False,
             planned_skipped=0, allowed_step3_row_keys=None,
             step3_run_report_path=None, step3_run_report=None,
-            exact_mutation_baseline=None):
-        require_exact_mutation_baseline(exact_mutation_baseline)
+            exact_mutation_baseline=None, pending_manifest_rows=None):
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
@@ -6413,13 +7630,27 @@ class App:
                 run_report,
                 stage="worker_start",
             )
-        pending_manifest_rows = list(
-            getattr(self, "_pending_step3_manifest_rows", []) or []
-        )
+        pending_manifest_rows = list(pending_manifest_rows or ())
         self._pending_step3_manifest_rows = []
         if pending_manifest_rows:
             for manifest_index, (row, files) in enumerate(
                     pending_manifest_rows):
+                preferred_unit_id = f"step3-manifest:{manifest_index + 1}"
+                unit_id = exact_mutation_unit_id(
+                    exact_mutation_baseline, preferred_unit_id
+                )
+                unit_payload = {
+                    "row": row,
+                    "files": [str(path) for path in files or ()],
+                }
+                require_exact_mutation_baseline(
+                    exact_mutation_baseline,
+                    unit_id=unit_id,
+                    current_unit_payload=(
+                        unit_payload
+                        if unit_id == preferred_unit_id else None
+                    ),
+                )
                 try:
                     manifest = record_canonical_output(
                         row,
@@ -6430,6 +7661,11 @@ class App:
                         ),
                     )
                     sync_candidates.extend(files)
+                    complete_exact_mutation_unit(
+                        exact_mutation_baseline,
+                        unit_id,
+                        post_paths=[manifest],
+                    )
                     self._ui(lambda path=manifest: self.log(
                         f"[③ canonical manifest] {path}"
                     ))
@@ -6519,9 +7755,45 @@ class App:
             self._ui(lambda i=index, b=base, t=texture_base: self.status_var.set(
                 f"③ {i}/{total}: {b} → {t} 렌더 중..."))
             self._ui(lambda it=job["item"]: self.tree.set(it["folder"], "step3", "렌더 중..."))
+            preferred_unit_id = f"step3-render:{index}:{base}"
+            unit_id = exact_mutation_unit_id(
+                exact_mutation_baseline, preferred_unit_id
+            )
+            config_keys = (
+                "designer_dir",
+                "cluster_sbsar",
+                "cluster_sbsar_normal_behavior",
+                "sbsrender_timeout",
+                "tree_root",
+                "unreal_texture_sync_enabled",
+                "unreal_project",
+                "unreal_editor_cmd",
+                "unreal_texture_destination",
+                "unreal_texture_sync_timeout",
+            )
+            require_exact_mutation_baseline(
+                exact_mutation_baseline,
+                unit_id=unit_id,
+                current_unit_payload=(
+                    step3_job_payload(job)
+                    if unit_id == preferred_unit_id else None
+                ),
+                current_config=(
+                    mutation_config_projection(self.cfg, config_keys)
+                    if unit_id == preferred_unit_id else None
+                ),
+            )
             try:
                 result = run_texture_job(job, self.cfg, timeout)
                 sync_candidates.extend(result.get("files") or [])
+                complete_exact_mutation_unit(
+                    exact_mutation_baseline,
+                    unit_id,
+                    post_paths=[
+                        job.get("sbs"),
+                        *(result.get("files") or ()),
+                    ],
+                )
                 done += 1
                 if render_row is not None:
                     render_row.update({
@@ -6610,9 +7882,11 @@ class App:
                     str(step3_audit_folder_for_spm(path))
                     for path in affected_spms
                 }, key=os.path.normcase)
-                report = make_report(self.cfg, targets=affected_folders)
-                persist_cluster_assembly_receipts_safely(report)
-                save_spm_analysis_cache()
+                report = make_report(
+                    self.cfg,
+                    targets=affected_folders,
+                    mutation_authority=True,
+                )
                 plan = build_texture_plan_from_report(report, "<step3-normalize>")
                 exact_plan = dict(plan)
                 allowed_rows = (
@@ -6650,6 +7924,64 @@ class App:
                 spm_jobs = jobs_from_texture_plan(
                     exact_plan, allowed_spms=affected_spms
                 )
+                normalization_payload = {
+                    "affected_spms": [
+                        str(path) for path in affected_spms
+                    ],
+                    "allowed_step3_row_keys": sorted(
+                        list(allowed_rows or ())
+                    ),
+                    "spm_jobs": startup_json_safe(spm_jobs),
+                    "exact_plan": startup_json_safe(exact_plan),
+                }
+                normalization_config = mutation_config_projection(
+                    self.cfg, ("tree_root",)
+                )
+                normalization_backup_root = (
+                    Path(self.cfg["tree_root"]) / "_spm_backups"
+                )
+                normalization_scope_memberships = [
+                    Path(path).parent
+                    / ".atlas_leaf_speedtree_scopes"
+                    for path in affected_spms
+                ]
+                normalization_authority = (
+                    capture_runtime_mutation_authority(
+                        action="step3_normalize",
+                        unit_id="step3-normalize",
+                        payload=normalization_payload,
+                        paths=[
+                            *affected_spms,
+                            normalization_backup_root,
+                        ],
+                        write_paths=[
+                            *affected_spms,
+                            normalization_backup_root,
+                        ],
+                        memberships=[
+                            *normalization_scope_memberships,
+                            normalization_backup_root,
+                        ],
+                        write_memberships=[normalization_backup_root],
+                        config_projection=normalization_config,
+                        tool_paths=[
+                            mutation_source_path(
+                                normalize_spms_transactionally
+                            ),
+                            mutation_source_path(make_report),
+                        ],
+                    )
+                )
+                require_mutation_authority_unit(
+                    normalization_authority,
+                    "step3-normalize",
+                    current_payload=normalization_payload,
+                    current_config=mutation_config_projection(
+                        self.cfg, ("tree_root",)
+                    ),
+                )
+                persist_cluster_assembly_receipts_safely(report)
+                save_spm_analysis_cache()
                 normalized = normalize_spms_transactionally(
                     spm_jobs,
                     backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
@@ -6657,6 +7989,11 @@ class App:
                     allow_partial_materials=True,
                 )
                 cleanup = cleanup_preserved_cluster_outputs(exact_plan)
+                complete_mutation_authority_unit(
+                    normalization_authority,
+                    "step3-normalize",
+                    post_paths=affected_spms,
+                )
                 if run_report is not None:
                     normalized_spms = [
                         str(path) for path in normalized.get("spms") or []
@@ -6727,6 +8064,10 @@ class App:
                 if cleanup["cleaned"]:
                     self._ui(lambda r=cleanup: self.log(
                         f"[③ Cluster 원본 보존] {len(r['cleaned'])}개 머티리얼 복원"))
+            except MutationAuthorityError:
+                raise
+            except MutationAuthorityError:
+                raise
             except Exception as exc:
                 failed += 1
                 if run_report is not None:
@@ -6786,6 +8127,32 @@ class App:
                         run_report,
                         stage="unreal_sync_start",
                     )
+                sync_payload = {
+                    "files": list(unique_candidates),
+                    "force_verify": bool(force_unreal_verify),
+                }
+                sync_config_keys = (
+                    "unreal_texture_sync_enabled",
+                    "unreal_project",
+                    "unreal_editor_cmd",
+                    "unreal_texture_destination",
+                    "unreal_texture_commandlet_fallback",
+                    "unreal_texture_sync_timeout",
+                )
+                sync_config = mutation_config_projection(
+                    self.cfg, sync_config_keys
+                )
+                sync_authority = capture_runtime_mutation_authority(
+                    action="step3_unreal_sync",
+                    unit_id="step3-unreal-sync",
+                    payload=sync_payload,
+                    paths=unique_candidates,
+                    config_projection=sync_config,
+                    tool_paths=[
+                        self.cfg.get("unreal_editor_cmd"),
+                        mutation_source_path(sync_texture_files),
+                    ],
+                )
                 status_text = (
                     "③ Unreal 전체 재확인 중..."
                     if force_unreal_verify else
@@ -6820,10 +8187,26 @@ class App:
                 )
                 heartbeat.start()
                 try:
+                    require_mutation_authority_unit(
+                        sync_authority,
+                        "step3-unreal-sync",
+                        current_payload={
+                            "files": list(unique_candidates),
+                            "force_verify": bool(force_unreal_verify),
+                        },
+                        current_config=mutation_config_projection(
+                            self.cfg, sync_config_keys
+                        ),
+                    )
                     sync_report = self._sync_pending_texture_files(
                         unique_candidates,
                         progress=sync_progress,
                         force_verify=force_unreal_verify,
+                    )
+                    complete_mutation_authority_unit(
+                        sync_authority,
+                        "step3-unreal-sync",
+                        post_paths=unique_candidates,
                     )
                 finally:
                     heartbeat_stop.set()
@@ -6889,6 +8272,8 @@ class App:
                         f"[③ Unreal 동기화 리포트] {path}"))
                 for error in errors:
                     self._ui(lambda e=error: self.log(f"[③ Unreal 동기화 실패] {e}"))
+            except MutationAuthorityError:
+                raise
             except UnrealTextureSyncDeferred as exc:
                 failed += 1
                 sync_summary["failed"] += 1

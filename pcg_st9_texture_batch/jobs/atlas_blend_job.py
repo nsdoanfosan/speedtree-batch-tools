@@ -25,6 +25,16 @@ from pathlib import Path
 import addon_utils
 import bpy
 
+TOOL_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+sys.path.insert(0, str(TOOL_DIR))
+
+from mutation_plan_authority import (
+    require_child_payload,
+    validate_child_authority,
+)
+
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
@@ -41,6 +51,8 @@ def parse_args():
     parser.add_argument("--target-map-json", default="")
     parser.add_argument("--reuse-existing-blend", action="store_true")
     parser.add_argument("--work-dir", default="")
+    parser.add_argument("--authority-json", required=True)
+    parser.add_argument("--authority-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -207,6 +219,22 @@ def main():
     spm_backups = []
     blend_backup = None
     try:
+        authority = validate_child_authority(
+            args.authority_json,
+            args.authority_sha256,
+        )
+        require_child_payload(authority, {
+            "albedo": str(args.albedo),
+            "alpha": str(args.alpha),
+            "material_name": str(args.material_name),
+            "blend_out": str(args.blend_out),
+            "spms": [str(path) for path in args.spm],
+            "target_map_json": str(args.target_map_json),
+            "build_spm": bool(args.build_spm),
+            "reuse_existing_blend": bool(args.reuse_existing_blend),
+            "quality": str(args.quality),
+            "plate_mode": str(args.plate_mode),
+        })
         mapped_targets = load_target_map(args.target_map_json)
         validate_target_paths(args.spm, mapped_targets)
         if mapped_targets and (not args.build_spm or not args.spm):
@@ -319,6 +347,10 @@ def main():
             "reused_existing_blend": bool(args.reuse_existing_blend),
             "blend_backup": str(blend_backup) if blend_backup else None,
             "spm_backups": [str(backup) for _target, backup in spm_backups],
+            "authority_sha256": authority.get(
+                "parent_authority_sha256"
+            ),
+            "authority_unit": authority.get("unit_id"),
         }
     except Exception as exc:
         restored = []
@@ -336,6 +368,7 @@ def main():
                 blend_restored = f"복원 실패: {restore_exc}"
         report = {
             "status": "error", "error": str(exc), "traceback": traceback.format_exc(),
+            "authority_document_sha256": args.authority_sha256,
             "spm_backups": [str(backup) for _target, backup in spm_backups],
             "spm_restored": restored,
             "blend_backup": str(blend_backup) if blend_backup else None,
