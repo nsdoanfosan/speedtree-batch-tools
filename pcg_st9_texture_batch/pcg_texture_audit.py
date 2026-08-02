@@ -346,6 +346,8 @@ def _new_report_scan_cache(
     return {
         "file_cache_keys": {},
         "root_spms": {},
+        "spm_mesh_indexes": {},
+        "spm_analysis_results": {},
         "path_exists": {},
         "content_snapshots": (
             content_snapshots if content_snapshots is not None else {}
@@ -1401,8 +1403,37 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     long-lived analysis cache never owns the decoded document.
     """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
-    cache_key = _spm_analysis_cache_key(path)
     report_cache = _REPORT_SCAN_CACHE.get()
+    report_key = startup_path_key(path)
+    report_results = (
+        report_cache.get("spm_analysis_results")
+        if report_cache is not None else None
+    )
+    report_entry = (
+        report_results.get(report_key)
+        if report_results is not None else None
+    )
+    if report_entry is not None:
+        cache_key = report_entry["cache_key"]
+        if not report_entry.get("memory_hit_recorded"):
+            _record_session_cache_metric("spm_memory_hits", path=path)
+            report_entry["memory_hit_recorded"] = True
+        _PENDING_RAW_SPM_HANDOFF.set(None)
+        analysis = report_entry["analysis"]
+        if include_decoded_handoff:
+            return analysis, _take_pending_decoded_handoff(path, cache_key)
+        return analysis
+
+    cache_key = _spm_analysis_cache_key(path)
+
+    def remember(analysis, *, memory_hit_recorded=False):
+        if report_results is not None:
+            report_results[report_key] = {
+                "cache_key": cache_key,
+                "analysis": analysis,
+                "memory_hit_recorded": bool(memory_hit_recorded),
+            }
+
     mutation_authority = bool(
         report_cache is not None
         and report_cache.get("mutation_authority")
@@ -1412,6 +1443,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     )
     if cached is not None:
         _record_session_cache_metric("spm_memory_hits", path=path)
+        remember(cached, memory_hit_recorded=True)
         _PENDING_RAW_SPM_HANDOFF.set(None)
         if include_decoded_handoff:
             return cached, _take_pending_decoded_handoff(path, cache_key)
@@ -1455,6 +1487,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             ),
         }
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
+        remember(analysis)
         if include_decoded_handoff:
             return analysis, _take_pending_decoded_handoff(path, cache_key)
         return analysis
@@ -1581,6 +1614,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     handoff = make_decoded_spm_handoff(
         path, text, size=size, mtime_ns=mtime_ns)
     _PENDING_DECODED_HANDOFF.set(handoff)
+    remember(analysis)
     if include_decoded_handoff:
         return analysis, _take_pending_decoded_handoff(path, cache_key)
     return analysis
@@ -1801,6 +1835,53 @@ def loose_sk_spms(folder):
 
 def source_spms(folder):
     return [p for p in root_spms(folder) if not p.name.lower().startswith("sk")]
+
+
+def _folder_spm_mesh_index(folder):
+    """Index one current report's root SPMs by normalized mesh identity.
+
+    Post-processing asks for source/SK status once per mesh. Re-filtering the
+    same 10-11 entry folder lists for every mesh made that pass quadratic on
+    the 597-SPM fixture. The index is scoped to `_REPORT_SCAN_CACHE`, so a new
+    live report (and every mutation authority report) rebuilds it from the
+    current bounded directory membership.
+    """
+    folder = Path(folder)
+    folder_key = startup_path_key(folder)
+    report_cache = _REPORT_SCAN_CACHE.get()
+    report_indexes = (
+        report_cache.get("spm_mesh_indexes")
+        if report_cache is not None else None
+    )
+    cached = (
+        report_indexes.get(folder_key)
+        if report_indexes is not None else None
+    )
+    if cached is not None:
+        return cached
+    index = {
+        "source": {},
+        "preferred": {},
+        "loose": {},
+    }
+    for path in root_spms(folder):
+        name = path.name.casefold()
+        mesh_key = normalize_local_asset_stem(path.stem)
+        if name.startswith("sk_"):
+            role = "preferred"
+        elif name.startswith("sk"):
+            role = "loose"
+        else:
+            role = "source"
+        index[role].setdefault(mesh_key, []).append(path)
+    for rows_by_mesh in index.values():
+        for mesh_key, paths in rows_by_mesh.items():
+            rows_by_mesh[mesh_key] = tuple(sorted(
+                paths, key=lambda candidate: str(candidate).casefold()
+            ))
+    if report_indexes is not None:
+        report_indexes[folder_key] = index
+    return index
 
 
 def extract_material_names(spm):
@@ -3820,28 +3901,20 @@ def spm_matches_mesh_name(spm_path, mesh_name):
 
 
 def find_source_spm_for_mesh(folder, mesh_name):
-    for spm in source_spms(folder):
-        if spm_matches_mesh_name(spm, mesh_name):
-            return spm
-    return None
+    rows = _folder_spm_mesh_index(folder)["source"].get(
+        str(mesh_name).casefold(), ()
+    )
+    return rows[0] if rows else None
 
 
 def find_sk_spm_for_mesh(folder, mesh_name):
-    preferred = []
-    loose = []
-    for spm in preferred_sk_spms(folder):
-        if spm_matches_mesh_name(spm, mesh_name):
-            preferred.append(spm)
-    for spm in loose_sk_spms(folder):
-        if spm in preferred:
-            continue
-        if spm_matches_mesh_name(spm, mesh_name):
-            loose.append(spm)
+    index = _folder_spm_mesh_index(folder)
+    mesh_key = str(mesh_name).casefold()
+    preferred = index["preferred"].get(mesh_key, ())
+    loose = index["loose"].get(mesh_key, ())
     if preferred:
-        return sorted(unique(preferred), key=lambda p: str(p).lower())[0]
-    if loose:
-        return sorted(unique(loose), key=lambda p: str(p).lower())[0]
-    return None
+        return preferred[0]
+    return loose[0] if loose else None
 
 
 def target_spm_status(folder, mesh_name):
@@ -7103,12 +7176,9 @@ def local_target_mesh_names(folder):
 
     folder = Path(folder)
     folder_token = normalize_local_asset_stem(folder.name)
-    names = {
-        normalize_local_asset_stem(path.stem)
-        for path in preferred_sk_spms(folder)
-    }
-    for path in source_spms(folder):
-        token = normalize_local_asset_stem(path.stem)
+    index = _folder_spm_mesh_index(folder)
+    names = set(index["preferred"])
+    for token in index["source"]:
         if token == folder_token or re.search(r"_\d+$", token):
             names.add(token)
     return sorted(name for name in names if name)
