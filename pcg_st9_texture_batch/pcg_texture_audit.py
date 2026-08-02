@@ -26,6 +26,12 @@ from pathlib import Path
 BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
+from process_lifecycle import (
+    complete_owned_process,
+    owned_popen,
+    owned_run,
+    terminate_owned_process,
+)
 from sk_batch.code_compile_gate import (
     production_source_manifest,
     production_source_revision_state,
@@ -3986,23 +3992,13 @@ def register_blend_source_index(index_row, blend_path):
     return names
 
 
-def _terminate_owned_process_tree(process):
+def _terminate_owned_process_tree(process, *, reason="cancelled"):
     """Terminate only the exact child tree launched by this audit."""
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=0x08000000,
-        )
-    else:
-        try:
-            os.killpg(process.pid, 15)
-        except (OSError, ProcessLookupError):
-            process.terminate()
+    return terminate_owned_process(
+        process,
+        reason=reason,
+        terminate_grace=0.0,
+    )
 
 
 def ensure_blend_source_index(
@@ -4056,11 +4052,13 @@ def ensure_blend_source_index(
         "--request", str(request_path), "--out", str(report_path),
     ]
     child = None
+    child_finalized = False
     child_started = time.perf_counter()
     timeout_seconds = float(cfg.get("atlas_job_timeout", 1800))
     try:
-        child = subprocess.Popen(
+        child = owned_popen(
             cmd,
+            source="pcg_st9_texture_batch.pcg_texture_audit.blend_source_index",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -4070,7 +4068,11 @@ def ensure_blend_source_index(
         deadline = time.monotonic() + timeout_seconds
         while True:
             if cancel_check is not None and cancel_check():
-                _terminate_owned_process_tree(child)
+                _terminate_owned_process_tree(
+                    child,
+                    reason="blend_source_index_cancelled",
+                )
+                child_finalized = True
                 child.communicate()
                 if metrics is not None:
                     metrics.update({
@@ -4088,7 +4090,11 @@ def ensure_blend_source_index(
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate_owned_process_tree(child)
+                _terminate_owned_process_tree(
+                    child,
+                    reason="blend_source_index_timeout",
+                )
+                child_finalized = True
                 child.communicate()
                 if metrics is not None:
                     metrics.update({
@@ -4111,6 +4117,11 @@ def ensure_blend_source_index(
                 break
             except subprocess.TimeoutExpired:
                 continue
+        complete_owned_process(
+            child,
+            reason="blend_source_index_root_exit",
+        )
+        child_finalized = True
         if child.returncode != 0 or not report_path.is_file():
             detail = (stderr or stdout or "").strip()[-1000:]
             raise BlendSourceIndexError(
@@ -4167,6 +4178,17 @@ def ensure_blend_source_index(
             f"Blender source indexing failed: {type(exc).__name__}: {exc}"
         ) from exc
     finally:
+        if child is not None and not child_finalized:
+            if child.poll() is None:
+                _terminate_owned_process_tree(
+                    child,
+                    reason="blend_source_index_error",
+                )
+            else:
+                complete_owned_process(
+                    child,
+                    reason="blend_source_index_error_root_exit",
+                )
         for path in (request_path, report_path):
             try:
                 path.unlink()

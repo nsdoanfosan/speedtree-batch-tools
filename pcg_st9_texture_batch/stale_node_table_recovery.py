@@ -27,6 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import external_handoff_popen
+
 from speedtree_pipeline_contract import (
     SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
     canonical_generator_guid,
@@ -3294,8 +3300,10 @@ def verify_sealed_resave(
 
 def launch_modeler_for_manual_save(speedtree_exe, spm_path):
     """Open a visible Modeler session without shell, Save, or input automation."""
-    return subprocess.Popen(
+    return external_handoff_popen(
         [str(speedtree_exe), str(spm_path)],
+        source="pcg_st9_texture_batch.stale_node_table_recovery.manual_modeler",
+        ownership="manual_modeler_handoff",
         cwd=str(Path(spm_path).parent),
         stdin=subprocess.DEVNULL,
     )

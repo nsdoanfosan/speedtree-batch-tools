@@ -57,6 +57,13 @@ BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 
+from process_lifecycle import (
+    ProcessLifecycleError,
+    complete_owned_process,
+    owned_popen,
+    terminate_owned_process,
+)
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sk_common import (
@@ -2485,21 +2492,20 @@ def backup_spm(path):
 
 
 def _terminate_speedtree_tree(process):
-    """Kill a timed-out Modeler and every descendant it launched."""
-    if os.name == "nt":
+    """Stop the exact receipt-owned Modeler tree without PID discovery."""
+
+    if getattr(process, "speedtree_lifecycle_launch_id", None) is not None:
         try:
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-                check=False,
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            terminate_owned_process(
+                process,
+                reason="speedtree_timeout",
+                terminate_grace=1.0,
+                kill_grace=10.0,
             )
-        except (OSError, subprocess.SubprocessError):
+            return
+        except ProcessLifecycleError:
             pass
-    else:
+    if process.poll() is None:
         try:
             process.terminate()
         except OSError:
@@ -2718,8 +2724,10 @@ def _run_speedtree_export_attempt_tempfiles(
     with tempfile.TemporaryFile(
         mode="w+b"
     ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
-        process = subprocess.Popen(
+        process = owned_popen(
             cmd,
+            source="sk_batch.spm_audit.tempfile_export",
+            popen_factory=subprocess.Popen,
             stdout=out_file,
             stderr=err_file,
             **popen_kwargs,
@@ -2814,6 +2822,14 @@ def _run_speedtree_export_attempt_tempfiles(
             if returncode is not None:
                 stdout = read_handle(out_file)
                 stderr = read_handle(err_file)
+                cleanup_state = "injected_process_complete"
+                if getattr(
+                    process, "speedtree_lifecycle_launch_id", None
+                ) is not None:
+                    cleanup_state = complete_owned_process(
+                        process,
+                        reason="speedtree_root_exit",
+                    )
                 return (
                     returncode,
                     stdout,
@@ -2822,6 +2838,7 @@ def _run_speedtree_export_attempt_tempfiles(
                         "attempt": attempt,
                         "duration_seconds": round(now - started, 3),
                         "returncode": int(returncode),
+                        "cleanup_state": cleanup_state,
                         "returncode_hex": (
                             f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
                         ),
@@ -3203,7 +3220,7 @@ def write_calibration_marker(spm_path, backup, source_sha256):
     Calibration edits the source SPM in place (Absolute/1 probe, then Relative
     rounds) and restores it afterwards.  Every *exception* path restores, but a
     hard kill has none: Stop and the watchdog timeout both use
-    ``taskkill /T /F``, so a killed run can leave the SPM in its probe state.
+    forced tree termination, so a killed run can leave the SPM in its probe state.
     This marker makes that state detectable and repairable on the next scan
     instead of silently shipping probe bones into ② and ③.
     """

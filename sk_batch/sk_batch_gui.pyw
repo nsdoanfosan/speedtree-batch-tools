@@ -46,6 +46,8 @@ REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import owned_run
+
 from code_compile_gate import (
     CompileGateError,
     production_source_manifest,
@@ -5788,6 +5790,7 @@ class App:
             log_file=str(log_file),
             affinity=affinity,
             env=env,
+            cooperative_cancel=self.stop_flag.set,
         )
         with self.procs_lock:
             self.active_procs.add(proc)
@@ -9685,8 +9688,10 @@ class App:
 
     @staticmethod
     def _unreal_running():
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
+            source="sk_batch.sk_batch_gui.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             creationflags=0x08000000,
         )

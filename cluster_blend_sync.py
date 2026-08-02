@@ -26,6 +26,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
@@ -1784,8 +1786,10 @@ def run_cluster_relation_transaction(
         )
         heartbeat_thread.start()
         try:
-            result = subprocess.run(
+            result = owned_run(
                 command,
+                source="cluster_blend_sync.apply_cluster_relationship",
+                run_factory=subprocess.run,
                 capture_output=True,
                 text=True,
                 timeout=int(timeout),

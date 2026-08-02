@@ -483,7 +483,7 @@ class ProviderAndAuditTests(unittest.TestCase):
 
             child = FakeChild()
 
-            def terminate(process):
+            def terminate(process, **_kwargs):
                 self.assertIs(process, child)
                 process.returncode = -9
 
@@ -492,7 +492,7 @@ class ProviderAndAuditTests(unittest.TestCase):
                 "BLEND_IMAGE_CACHE_PATH",
                 root / "cache" / "blend.json",
             ), mock.patch.object(
-                audit.subprocess, "Popen", return_value=child
+                audit, "owned_popen", return_value=child
             ), mock.patch.object(
                 audit,
                 "_terminate_owned_process_tree",
@@ -508,7 +508,10 @@ class ProviderAndAuditTests(unittest.TestCase):
                         metrics=metrics,
                     )
 
-            terminate_tree.assert_called_once_with(child)
+            terminate_tree.assert_called_once_with(
+                child,
+                reason="blend_source_index_cancelled",
+            )
             self.assertEqual(metrics["status"], "canceled")
             self.assertTrue(metrics["child_tree_terminated"])
             self.assertEqual(metrics["request_count"], 1)

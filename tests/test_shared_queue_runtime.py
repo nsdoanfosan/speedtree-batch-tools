@@ -426,10 +426,16 @@ class SharedQueueRuntimeTests(unittest.TestCase):
                 accepted_apps={"app-b"},
             )
         )
-        time.sleep(0.04)
-        heartbeat_after = first_runtime.queue.get(first["id"])["lease"][
-            "heartbeat_at"
-        ]
+        heartbeat_after = heartbeat_before
+        heartbeat_deadline = time.monotonic() + 1.0
+        while (
+            heartbeat_after <= heartbeat_before
+            and time.monotonic() < heartbeat_deadline
+        ):
+            time.sleep(0.01)
+            heartbeat_after = first_runtime.queue.get(first["id"])["lease"][
+                "heartbeat_at"
+            ]
         self.assertGreater(heartbeat_after, heartbeat_before)
 
         # The caller has now stopped/joined its real worker and may release.

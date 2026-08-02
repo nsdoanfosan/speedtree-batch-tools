@@ -40,6 +40,8 @@ GUI_MODULE_LOADED_AT = datetime.now().astimezone().isoformat(
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import external_handoff_popen, owned_run
+
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from speedtree_error_log import ERROR_LOG, record_exception
 from shared_queue_runtime import SharedQueueRuntime
@@ -2506,8 +2508,10 @@ class App:
         data = None
         error = None
         try:
-            result = subprocess.run(
+            result = owned_run(
                 command,
+                source="pcg_st9_texture_batch.pcg_texture_gui.remove_atlas_targets",
+                run_factory=subprocess.run,
                 capture_output=True,
                 text=True,
                 timeout=self.cfg.get("atlas_job_timeout", 1800),
@@ -5245,7 +5249,10 @@ class App:
                 cmd += ["--target-map-json", str(target_map_path)]
                 cmd.append("--build-spm")
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True,
+                result = owned_run(cmd,
+                                        source="pcg_st9_texture_batch.pcg_texture_gui.atlas_job",
+                                        run_factory=subprocess.run,
+                                        capture_output=True, text=True,
                                         encoding="utf-8", errors="replace",
                                         timeout=self.cfg.get("atlas_job_timeout", 1800),
                                         creationflags=0x08000000)
@@ -7040,8 +7047,10 @@ class App:
             result = None
             error = None
             try:
-                result = subprocess.run(
+                result = owned_run(
                     cmd,
+                    source="pcg_st9_texture_batch.pcg_texture_gui.refresh_targets",
+                    run_factory=subprocess.run,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
@@ -7086,7 +7095,11 @@ class App:
         if not item:
             messagebox.showinfo("폴더 열기", "표에서 행을 먼저 클릭하세요.")
             return
-        subprocess.Popen(["explorer", item["folder"]])
+        external_handoff_popen(
+            ["explorer", item["folder"]],
+            source="pcg_st9_texture_batch.pcg_texture_gui.open_folder",
+            ownership="shell_handoff",
+        )
 
     def shutdown_shared_queue(self):
         self.cancel_refresh()

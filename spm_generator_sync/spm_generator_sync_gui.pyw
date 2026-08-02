@@ -22,6 +22,8 @@ sys.path.insert(0, str(REPO_DIR))
 # spm_generator_sync.py, not the repository package's limited public API.
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import external_handoff_startfile
+
 from batch_ui_common import clipboard_text, copy_selected_row_paths
 from cluster_blend_sync import (
     run_cluster_folder_relation_transaction,
@@ -1704,7 +1706,11 @@ class App:
                 return
         else:
             folder = items[0]["folder"]
-        os.startfile(str(folder))
+        external_handoff_startfile(
+            str(folder),
+            source="spm_generator_sync.spm_generator_sync_gui.open_folder",
+            ownership="shell_handoff",
+        )
 
     def set_selected_master(self):
         items = self.selected_items()
