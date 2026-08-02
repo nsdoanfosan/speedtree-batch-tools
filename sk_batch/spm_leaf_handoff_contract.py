@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 import functools
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,10 @@ from atlas_manifest_resolver import (  # noqa: E402
 )
 from speedtree_pipeline_contract import open_spm_binary  # noqa: E402
 from speedtree_texture_contract import normalize_material_key  # noqa: E402
+try:  # Package import from repository root.
+    from .atlas_consumer_integrity import audit_atlas_consumer_integrity
+except ImportError:  # Direct SK Batch script execution.
+    from atlas_consumer_integrity import audit_atlas_consumer_integrity  # noqa: E402
 
 
 def _normalized_generator_type(value):
@@ -218,6 +223,43 @@ def _file_key(path):
     candidate = Path(path)
     stat = candidate.stat()
     return os.path.normcase(os.path.abspath(str(candidate))), stat.st_size, stat.st_mtime_ns
+
+
+def _atlas_manifest_signature(spm_path):
+    """Content signature for receipt changes independent of SPM mtime."""
+    spm_path = Path(spm_path)
+    rows = []
+    for directory_name in (
+        ".atlas_leaf_speedtree_targets",
+        ".atlas_leaf_speedtree_scopes",
+    ):
+        directory = spm_path.parent / directory_name
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            rows.append((
+                f"{directory_name}/{path.name}".casefold(),
+                hashlib.sha256(payload).hexdigest(),
+            ))
+    for path in sorted(
+        [spm_path.parent / "speedtree_import_manifest.json"]
+        + list(spm_path.parent.glob("speedtree_import_manifest_M_*.json"))
+    ):
+        if not path.is_file():
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        rows.append((
+            path.name.casefold(),
+            hashlib.sha256(payload).hexdigest(),
+        ))
+    return tuple(rows)
 
 
 def _load_spm_root(path):
@@ -770,27 +812,46 @@ def _spm_mesh_reference_states(root):
                 if value is not None and value >= 0:
                     mesh_ids.add(value)
         managed = _atlas_managed_material_node(material)
+        material_id = _integer(material.attrib.get("ID"))
         for mesh_id in mesh_ids:
             material_references.setdefault(mesh_id, []).append(
-                (managed, len(mesh_ids))
+                (managed, len(mesh_ids), material_id)
             )
     generator_references = set()
-    for prop in root.iter("Property"):
-        name = str(prop.findtext("Name") or "").strip().casefold()
-        if not name.endswith(":mesh"):
+    default_cutout_materials = set()
+    for generator in root.iter("Generator"):
+        properties = generator.find("Properties")
+        if properties is None:
             continue
-        value = _integer(prop.findtext("Value"))
-        if value is not None and value >= 0:
-            generator_references.add(value)
+        values = {
+            str(prop.findtext("Name") or "").strip().casefold(): _integer(
+                prop.findtext("Value")
+            )
+            for prop in list(properties)
+            if str(prop.findtext("Name") or "").strip()
+        }
+        for name, material_id in values.items():
+            if not name.endswith(":material"):
+                continue
+            mesh_id = values.get(name[:-len(":material")] + ":mesh")
+            if mesh_id is not None and mesh_id >= 0:
+                generator_references.add(mesh_id)
+            elif mesh_id == -10 and material_id is not None and material_id > 0:
+                default_cutout_materials.add(material_id)
     live = set(generator_references)
     managed_orphans = set()
     for mesh_id, material_states in material_references.items():
         removable_from_all_materials = all(
             managed and mesh_count > 1
-            for managed, mesh_count in material_states
+            for managed, mesh_count, _material_id in material_states
+        )
+        default_cutout = any(
+            material_id in default_cutout_materials
+            for _managed, _mesh_count, material_id in material_states
         )
         if (
             mesh_id in generator_references
+            or default_cutout
             or not removable_from_all_materials
         ):
             live.add(mesh_id)
@@ -801,11 +862,17 @@ def _spm_mesh_reference_states(root):
         "managed_orphans": managed_orphans,
         "generator": generator_references,
         "material": set(material_references),
+        "default_cutout_materials": default_cutout_materials,
     }
 
 
 @functools.lru_cache(maxsize=512)
-def _mesh_file_references_cached(path_text, _size, _mtime_ns):
+def _mesh_file_references_cached(
+    path_text,
+    _size,
+    _mtime_ns,
+    _manifest_signature,
+):
     path = Path(path_text)
     try:
         root = _load_spm_root(path)
@@ -823,6 +890,39 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
     missing = []
     orphan_missing = []
     reference_states = _spm_mesh_reference_states(root)
+    atlas_integrity = audit_atlas_consumer_integrity(path, root)
+    integrity_usage = {}
+    for row in atlas_integrity.get("managed_meshes") or []:
+        classification = row["classification"]
+        if classification in {
+            "current_reachable",
+            "current_default_cutout",
+        }:
+            usage = "active"
+        elif classification in {
+            "superseded_with_proven_successor",
+            "ambiguous",
+        }:
+            # Preserve the historical final-mesh safety boundary: an orphan
+            # candidate which is the only Mesh owned by a Material remains a
+            # blocking external reference even while integrity review is
+            # required. Multi-Mesh stale generations remain managed orphans.
+            usage = (
+                "active"
+                if row["mesh_id"] in reference_states["live"]
+                else "managed_orphan"
+            )
+        else:
+            usage = classification
+        integrity_usage[row["mesh_id"]] = usage
+    integrity_usage.update({
+        row["mesh_id"]: (
+            "protected_manual"
+            if row.get("owner_material_ids")
+            else "orphan"
+        )
+        for row in atlas_integrity.get("protected_manual_meshes") or []
+    })
     for mesh in root.iter("Mesh"):
         if mesh.attrib.get("ID") is None:
             continue
@@ -848,13 +948,18 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
                 if os.path.isabs(filename)
                 else path.parent / filename
             )
-            usage = (
-                "active"
-                if mesh_id in reference_states["live"]
-                else "managed_orphan"
-                if mesh_id in reference_states["managed_orphans"]
-                else "orphan"
-            )
+            usage = integrity_usage.get(mesh_id)
+            if usage in {"protected_foreign", "protected_manual"}:
+                if mesh_id in reference_states["generator"]:
+                    usage = "active"
+            elif usage is None:
+                usage = (
+                    "active"
+                    if mesh_id in reference_states["live"]
+                    else "managed_orphan"
+                    if mesh_id in reference_states["managed_orphans"]
+                    else "orphan"
+                )
             row = {
                 "mesh_id": mesh_id,
                 "mesh_name": str(mesh.attrib.get("Name") or ""),
@@ -874,13 +979,15 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
             if not row["exists"]:
                 if row["referenced"]:
                     missing.append(row)
-                else:
+                elif usage in {"managed_orphan", "orphan"}:
                     orphan_missing.append(row)
     status = (
         "missing_mesh_files"
         if missing
         else "orphan_missing_mesh_assets"
         if orphan_missing
+        else "managed_asset_integrity_error"
+        if atlas_integrity.get("blocking")
         else "ok"
     )
     return {
@@ -890,6 +997,7 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
         "references": references,
         "missing": missing,
         "orphan_missing": orphan_missing,
+        "atlas_consumer_integrity": atlas_integrity,
     }
 
 
@@ -911,7 +1019,12 @@ def inspect_spm_mesh_file_references(spm_path):
             "checked_references": 0,
             "missing": [],
         }
-    return copy.deepcopy(_mesh_file_references_cached(path_text, size, mtime_ns))
+    return copy.deepcopy(_mesh_file_references_cached(
+        path_text,
+        size,
+        mtime_ns,
+        _atlas_manifest_signature(path),
+    ))
 
 
 def save_leaf_contract_cache():

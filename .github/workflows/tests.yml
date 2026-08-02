@@ -15,9 +15,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Superseding a run is right on a pull request: the branch moved, so the older
+# measurement is about a tree nobody will merge. It is wrong on main. Merges
+# land here in bursts -- on 2026-08-02, six of seven main runs were cancelled
+# by the next merge within fourteen minutes, so the only merge commit that was
+# ever measured was the last one. main is not a protected branch and no check
+# is required, so a cancelled push run is not a delayed verification, it is the
+# absence of one: the tree every worktree branches from was never built. Let
+# main runs finish; queue them per-ref so they still cannot pile up in parallel.
 concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests:
@@ -29,6 +40,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: pip
+          cache-dependency-path: .github/ci-requirements.txt
 
       # A subset of the suites loads the central SpeedTree policy module from
       # the substance-tools repository. It is checked out under work/ because
@@ -49,23 +62,57 @@ jobs:
           ref: main
           path: work/substance-tools
 
+      # The blob SHAs below are the ones PR #109 verified when it moved this
+      # checkout from a merged branch to main. Tracking a moving ref means a
+      # commit in the other repository can change what this repository's suites
+      # are measured against, silently and with no commit here. Comparing the
+      # blobs turns that comment into a live tripwire: drift is annotated and
+      # recorded in the job summary rather than discovered later as a mystery.
+      # A warning, not a failure -- an intentional contract change upstream
+      # should not block every PR here, it should be visible and then followed.
       - name: point at the shared contract
         shell: pwsh
         run: |
-          $contract = Join-Path $env:GITHUB_WORKSPACE 'work\substance-tools\pipeline_contract.json'
+          $vendored = Join-Path $env:GITHUB_WORKSPACE 'work\substance-tools'
+          $contract = Join-Path $vendored 'pipeline_contract.json'
           if (-not (Test-Path $contract)) {
             Write-Host "::error::pipeline_contract.json missing at $contract"
             exit 1
           }
           "SUBSTANCE_TOOLS_PIPELINE_CONTRACT=$contract" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+          $expected = [ordered]@{
+            'pipeline_contract.json'          = '42a0c819'
+            'speedtree_handoff_contract.py'   = 'ca13f8cb'
+            'speedtree_handoff_vectors.json'  = '4628f74a'
+          }
+          Push-Location $vendored
+          $head = (git rev-parse HEAD).Trim()
+          $lines = @("| vendored file | expected blob | actual blob |", "| --- | --- | --- |")
+          foreach ($file in $expected.Keys) {
+            $blob = (git rev-parse --verify --quiet "HEAD:$file")
+            $actual = if ($blob) { $blob.Trim().Substring(0, 8) } else { '(missing)' }
+            if ($actual -ne $expected[$file]) {
+              Write-Host "::warning::substance-tools $file drifted: expected $($expected[$file]), got $actual"
+            }
+            $lines += "| ``$file`` | ``$($expected[$file])`` | ``$actual`` |"
+          }
+          Pop-Location
+          @(
+            "### vendored substance-tools",
+            "",
+            "main at ``$head``",
+            ""
+          ) + $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
       # Production code imports PIL lazily and there is no requirements file,
       # but test_pcg_texture_batch / test_pcg_step3_freshness import Pillow and
       # test_pipeline_plan_cli / test_push_dependency_schedule import pytest at
       # module level, and cluster_assembly_builder.fit_trs_transform needs numpy,
-      # so unittest cannot even load or run them without these.
+      # so unittest cannot even load or run them without these. The versions
+      # live in .github/ci-requirements.txt so they are pinned and cacheable.
       - name: test-only dependencies
-        run: python -m pip install --disable-pip-version-check --quiet pillow pytest numpy
+        run: python -m pip install --disable-pip-version-check --quiet -r .github/ci-requirements.txt
 
       # Several suites build an expected path from tempfile.TemporaryDirectory()
       # and compare it against a value the production code has resolved(). On a
@@ -97,12 +144,19 @@ jobs:
       # change to this file. Every directory named `tests` is a suite; the
       # discovery root is its parent so the flat imports the suites rely on
       # keep working.
+      #
+      # The 30-minute job budget is shared by every step, so a suite that hangs
+      # currently reports as "the job timed out" with no attribution. A per-step
+      # budget names the step that stopped moving. Both numbers sit far above
+      # the observed cost -- the whole job runs in about nine minutes.
       - name: unit suites
         shell: pwsh
+        timeout-minutes: 20
         run: |
           $failed = @()
           $empty = @()
           $total = 0
+          $summary = @()
           $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
           Get-ChildItem -Recurse -Directory -Filter tests |
             Where-Object {
@@ -119,17 +173,31 @@ jobs:
               $out = & python -m unittest discover -s $rel 2>&1 | Out-String
               Write-Host $out
               Write-Host "::endgroup::"
-              if ($LASTEXITCODE -ne 0) { $failed += $rel }
+              $ok = $LASTEXITCODE -eq 0
+              if (-not $ok) { $failed += $rel }
               $m = [regex]::Match($out, 'Ran (\d+) test')
               if ($m.Success) {
                 $count = [int]$m.Groups[1].Value
                 $total += $count
                 if ($count -eq 0) { $empty += $rel }
               } else {
+                $count = 0
                 $empty += $rel
               }
+              $summary += "| ``$rel`` | $count | $(if ($ok) { 'pass' } else { '**fail**' }) |"
             }
           Write-Host "총 $total tests"
+          # Per-suite counts belong on the run page, not only inside collapsed
+          # log groups: the zero-collection tripwire below is about a suite
+          # quietly vanishing, and that is far easier to notice as a number
+          # that moved than as a step that stayed green.
+          @(
+            "### unit suites",
+            "",
+            "| suite | tests | result |",
+            "| --- | ---: | --- |"
+          ) + $summary + @("", "총 $total tests") |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           if ($failed.Count -gt 0) {
             Write-Host "::error::failed suites: $($failed -join ', ')"
             exit 1
@@ -157,6 +225,7 @@ jobs:
       # discovering the files by content so the list cannot rot.
       - name: module-level tests
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
           $files = Get-ChildItem -Recurse -File -Filter 'test_*.py' |
