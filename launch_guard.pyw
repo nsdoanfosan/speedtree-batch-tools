@@ -19,6 +19,11 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from process_lifecycle import (
+    ProcessLifecycleError,
+    shutdown_process_supervisor,
+    start_process_supervisor,
+)
 from shared_job_queue import InterprocessMutex, QueueError
 
 
@@ -145,7 +150,7 @@ def run_code_compile_gate(target):
     return run_gate()
 
 
-def main(argv):
+def _run_main(argv):
     if len(argv) < 2:
         report(
             "launch_guard",
@@ -199,6 +204,54 @@ def main(argv):
         )
         return 1
     return 0
+
+
+def main(argv):
+    # Missing/invalid targets never launch children, so retain the existing
+    # concise error path without creating an otherwise empty receipt.
+    if len(argv) < 2:
+        return _run_main(argv)
+    target = Path(argv[1])
+    if not target.is_absolute():
+        target = (REPO_DIR / target).resolve()
+    if not target.is_file():
+        return _run_main(argv)
+
+    try:
+        supervisor = start_process_supervisor()
+    except ProcessLifecycleError as exc:
+        report(
+            target.name,
+            f"{target.name} process supervisor failed to start.\n\n{exc}",
+            "".join(traceback.format_exception(exc)),
+        )
+        return 1
+
+    result = 1
+    try:
+        result = _run_main(argv)
+    except BaseException as exc:  # noqa: BLE001 - guard its own last boundary
+        report(
+            target.name,
+            f"{target.name} launch supervisor failed.\n\n{exc}",
+            "".join(traceback.format_exception(exc)),
+        )
+        result = 1
+    finally:
+        try:
+            shutdown_process_supervisor(
+                "gui_normal_exit" if result == 0 else "gui_error_exit"
+            )
+        except ProcessLifecycleError as exc:
+            report(
+                target.name,
+                f"{target.name} process cleanup did not complete.\n\n{exc}",
+                "".join(traceback.format_exception(exc)),
+            )
+            result = 1
+    # Keep the supervisor reference alive through the final receipt write.
+    del supervisor
+    return result
 
 
 if __name__ == "__main__":

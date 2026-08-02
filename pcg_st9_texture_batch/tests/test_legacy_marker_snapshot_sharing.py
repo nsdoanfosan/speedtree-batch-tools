@@ -144,7 +144,10 @@ class ColdPassDedupTests(SharedSnapshotTestCase):
                     wraps=contract._generator_section_bytes) as raw_narrow:
                 bindings = audit.leaf_generator_bindings(spm)
 
-            self.assertEqual(reader.call_count, 1)
+            self.assertEqual(reader.call_count, 0)
+            # The full-SHA identity read owns the same raw bytes that are
+            # decoded for semantic analysis; the path-based decoder must not
+            # reopen the SPM.
             # The legacy audit never falls back to its own read/decompress:
             # _generator_section_bytes (the raw-read narrowing helper) must
             # not run at all when the shared snapshot was available.
@@ -288,7 +291,7 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
         audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
         self.reset_in_process_caches()
 
-    def test_schema_four_disk_entry_is_reused_without_a_full_reparse(self):
+    def test_schema_four_disk_entry_is_reparsed_and_content_bound(self):
         with tempfile.TemporaryDirectory() as temp:
             spm = Path(temp) / "SK_tree_schema4.spm"
             write_spm(spm)
@@ -302,6 +305,14 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
             self.assertEqual(reader.call_count, 0)
             self.assertEqual(analysis["material_names"], ["M_leaf_cluster"])
             self.assertIsNone(analysis["generator_foregrounds_snapshot"])
+            path_key, _, _ = audit._file_cache_key(spm)
+            upgraded = audit._PERSISTENT_SPM_ANALYSIS[path_key]
+            self.assertEqual(
+                upgraded["content_identity_algorithm"],
+                audit.SPM_CONTENT_IDENTITY_ALGORITHM,
+            )
+            self.assertEqual(len(upgraded["content_identity_sha256"]), 64)
+            self.assertTrue(audit._PERSISTENT_SPM_ANALYSIS_DIRTY)
 
     def test_missing_snapshot_is_backfilled_lazily_then_never_reread(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -314,7 +325,7 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
                     contract, "_generator_section_bytes",
                     wraps=contract._generator_section_bytes) as raw_narrow:
                 bindings = audit.leaf_generator_bindings(spm)
-            self.assertEqual(raw_narrow.call_count, 1)
+            self.assertEqual(raw_narrow.call_count, 0)
             self.assertTrue(
                 next(row for row in bindings
                      if row["generator_guid"] == LEGACY_GUID)[
@@ -325,8 +336,13 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
             self.assertEqual(entry["legacy_marker_schema"], 1)
             self.assertIn(LEGACY_GUID, entry["generator_foregrounds"])
             self.assertTrue(audit._PERSISTENT_SPM_ANALYSIS_DIRTY)
-            # The material/leaf fields must be untouched by the backfill.
-            self.assertEqual(entry["leaf_binding_schema"], 4)
+            # The stat-only row is upgraded while the same decoded handoff
+            # supplies legacy-marker provenance.
+            self.assertEqual(entry["leaf_binding_schema"], 5)
+            self.assertEqual(
+                entry["content_identity_algorithm"],
+                audit.SPM_CONTENT_IDENTITY_ALGORITHM,
+            )
 
             # A brand-new process reusing only the disk cache must not read
             # the SPM again for either half of the analysis.
@@ -612,7 +628,7 @@ class InvalidationTests(SharedSnapshotTestCase):
                     audit, "read_maybe_gzip_text",
                     wraps=audit.read_maybe_gzip_text) as reader:
                 bindings = audit.leaf_generator_bindings(spm)
-            self.assertEqual(reader.call_count, 1)
+            self.assertEqual(reader.call_count, 0)
             self.assertTrue(
                 next(row for row in bindings
                      if row["generator_guid"] == "new-guid")[

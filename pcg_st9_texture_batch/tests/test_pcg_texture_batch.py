@@ -92,6 +92,51 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_empty_leaf_inventory_skips_atlas_registry_scan(self):
+        spm = Path("manifest-free-tree") / "SK_tree_test.spm"
+        with mock.patch.object(
+            pcg_texture_audit,
+            "extract_material_image_refs",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "mesh_asset_ids",
+            return_value=set(),
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "leaf_generator_bindings",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "_existing_atlas_registry",
+        ) as registry:
+            actual = pcg_texture_audit.current_leaf_atlas_inventory(
+                spm.parent,
+                {"atlas_root": "atlas"},
+                [spm],
+            )
+
+        self.assertEqual(actual, [])
+        registry.assert_not_called()
+
+    def test_empty_cluster_items_skip_atlas_declaration_scan(self):
+        items = [{
+            "folder": "manifest-free-tree",
+            "cluster_items": [],
+        }]
+
+        with mock.patch.object(
+            pcg_texture_audit,
+            "atlas_provisional_source_declarations",
+        ) as declarations:
+            actual = pcg_texture_audit.refresh_texture_output_contract_states(
+                items,
+                {"source_texture_roots": []},
+            )
+
+        self.assertIs(actual, items)
+        declarations.assert_not_called()
+
     def test_unchanged_receipt_is_not_reported_as_written(self):
         report = {"items": []}
 
@@ -750,12 +795,12 @@ class SourceSelectionTests(unittest.TestCase):
                         pcg_texture_audit.extract_material_image_refs(spm)[0]["refs"],
                         ["leaf_color.tga", "leaf_opacity.tga"],
                     )
-                    self.assertEqual(reader.call_count, 1)
+                    self.assertEqual(reader.call_count, 0)
 
                     write_spm(spm, "88", "leaf_changed_name")
                     self.assertEqual(
                         pcg_texture_audit.active_material_ids(spm), {"88"})
-                    self.assertEqual(reader.call_count, 2)
+                    self.assertEqual(reader.call_count, 0)
             finally:
                 pcg_texture_audit._SPM_ANALYSIS_CACHE = old_memory
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
@@ -3123,6 +3168,7 @@ class GuiLabelTests(unittest.TestCase):
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
                 item_callback=mock.ANY,
+                cancel_check=mock.ANY,
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3151,9 +3197,13 @@ class GuiLabelTests(unittest.TestCase):
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                metrics=mock.ANY,
+                publish_check=mock.ANY,
             )
-            save_analysis.assert_called_once_with()
-            load_sync.assert_called_once_with(migrate=False)
+            save_analysis.assert_called_once_with(
+                publish_check=mock.ANY
+            )
+            load_sync.assert_not_called()
             self.assertEqual(len(app.root.callbacks), 1)
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3261,7 +3311,7 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIs(app.report, report)
         app.populate.assert_called_once_with()
         app._update_summary.assert_called_once_with()
-        app._start_sync_state_migration.assert_called_once_with()
+        app._start_sync_state_migration.assert_not_called()
         self.assertIn("live audit는 완료", app.log.call_args.args[0])
 
     def test_initial_refresh_failure_logs_traceback_and_unlocks_parent_ui(self):
@@ -3369,11 +3419,13 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+                cancel_check=mock.ANY,
             )
             write_snapshot.assert_called_once_with(
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                publish_check=mock.ANY,
             )
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3546,7 +3598,13 @@ class GuiLabelTests(unittest.TestCase):
                 self.gui, "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ) as cleanup:
-            app._run_step3([], [selected], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_cleanup"
+            )
+            app._run_step3(
+                [], [selected], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
             app.cfg, targets=[r"D:\Trees\ladyfern"]
@@ -3653,7 +3711,13 @@ class GuiLabelTests(unittest.TestCase):
                 "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ):
-            app._run_step3(jobs, [target], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_normalize"
+            )
+            app._run_step3(
+                jobs, [target], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
             app.cfg,
@@ -4351,6 +4415,12 @@ class GuiLabelTests(unittest.TestCase):
             "patch": {"changed": False, "renames": []},
         }]}
 
+        baseline = self.gui.seal_exact_mutation_baseline(
+            [], action="unit_test_prepare"
+        )
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
         with mock.patch.object(self.gui, "prepare_sk", return_value=result):
             app._run_prepare([row])
 
@@ -4360,7 +4430,7 @@ class GuiLabelTests(unittest.TestCase):
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
         app._prepare_finished.assert_called_once_with(1, 0)
-        app._validate_live_mutation_items.assert_called_once()
+        app._reaudit_and_seal_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
         app = self.gui.App.__new__(self.gui.App)

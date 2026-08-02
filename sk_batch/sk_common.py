@@ -36,6 +36,12 @@ from cluster_spm_pair_contract import (
     resolve_cluster_spm_pair,
 )
 from shared_job_queue import InterprocessMutex
+from process_lifecycle import (
+    ProcessLifecycleError,
+    complete_owned_process,
+    owned_popen,
+    terminate_owned_process,
+)
 
 
 def _default_addon_dir():
@@ -1251,140 +1257,36 @@ def set_process_affinity(pid, cores):
         kernel32.CloseHandle(handle)
 
 
-def _create_kill_on_close_job(proc):
-    """Create and assign a Windows Job that owns *proc* and its descendants.
-
-    Closing the returned handle terminates every process still in the Job.  A
-    Job is the only reliable cleanup boundary when the direct Blender/Python
-    parent crashes before the GUI has a chance to run ``taskkill /T``.
-
-    Return ``None`` when Jobs are unavailable or assignment is denied.  Some
-    hosts place children in a non-nestable Job already; callers must retain the
-    existing process-tree fallback for that case.
-    """
-    if os.name != "nt":
-        return None
-
-    import ctypes
-    from ctypes import wintypes
-
-    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = (
-            ("PerProcessUserTimeLimit", ctypes.c_longlong),
-            ("PerJobUserTimeLimit", ctypes.c_longlong),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        )
-
-    class IO_COUNTERS(ctypes.Structure):
-        _fields_ = (
-            ("ReadOperationCount", ctypes.c_ulonglong),
-            ("WriteOperationCount", ctypes.c_ulonglong),
-            ("OtherOperationCount", ctypes.c_ulonglong),
-            ("ReadTransferCount", ctypes.c_ulonglong),
-            ("WriteTransferCount", ctypes.c_ulonglong),
-            ("OtherTransferCount", ctypes.c_ulonglong),
-        )
-
-    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = (
-            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ("IoInfo", IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        )
-
-    job_object_extended_limit_information = 9
-    job_object_limit_kill_on_job_close = 0x00002000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
-    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    kernel32.SetInformationJobObject.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    )
-    kernel32.SetInformationJobObject.restype = wintypes.BOOL
-    kernel32.AssignProcessToJobObject.argtypes = (
-        wintypes.HANDLE,
-        wintypes.HANDLE,
-    )
-    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    assigned = False
-    try:
-        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        limits.BasicLimitInformation.LimitFlags = (
-            job_object_limit_kill_on_job_close
-        )
-        if not kernel32.SetInformationJobObject(
-            job,
-            job_object_extended_limit_information,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
-        ):
-            return None
-        process_handle = getattr(proc, "_handle", None)
-        if process_handle is None or not kernel32.AssignProcessToJobObject(
-            job, wintypes.HANDLE(process_handle)
-        ):
-            return None
-        assigned = True
-        return job
-    finally:
-        if not assigned:
-            kernel32.CloseHandle(job)
-
-
 def attach_process_kill_job(proc):
-    """Best-effort Job assignment; never prevents a child from launching."""
-    job = None
-    try:
-        job = _create_kill_on_close_job(proc)
-    except Exception:
-        # Sandboxes and inherited non-nestable Jobs can reject assignment.
-        # ``terminate_process_tree`` remains the safe fallback.
-        job = None
+    """Compatibility shim for callers migrated to the shared supervisor."""
+
+    job = getattr(proc, "speedtree_lifecycle_tree_job", None)
     proc.sk_job_handle = job
     return job is not None
 
 
-def _close_windows_handle(handle):
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    return bool(kernel32.CloseHandle(wintypes.HANDLE(handle)))
-
-
 def close_process_kill_job(proc):
-    """Close a managed Job once, killing any descendants that still survive."""
-    job = getattr(proc, "sk_job_handle", None)
-    proc.sk_job_handle = None
-    if job is None or os.name != "nt":
+    """Finalize a completed shared-supervisor launch and its receipt."""
+
+    if getattr(proc, "speedtree_lifecycle_launch_id", None) is None:
         return False
     try:
-        return _close_windows_handle(job)
-    except Exception:
+        complete_owned_process(proc, reason="sk_worker_complete")
+        proc.sk_job_handle = None
+        return True
+    except ProcessLifecycleError:
         return False
 
 
-def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
+def launch_limited(
+    cmd,
+    cfg,
+    log_file=None,
+    cwd=None,
+    affinity=True,
+    env=None,
+    cooperative_cancel=None,
+):
     """Start a background child at reduced priority + optional CPU affinity.
 
     Priority class and affinity are inherited by grandchildren (Blender ->
@@ -1399,8 +1301,11 @@ def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     flags |= CREATE_NO_WINDOW
     handle = open(log_file, "w", encoding="utf-8", errors="replace") if log_file else None
     try:
-        proc = subprocess.Popen(
+        proc = owned_popen(
             cmd,
+            source="sk_batch.sk_common.launch_limited",
+            popen_factory=subprocess.Popen,
+            cooperative_cancel=cooperative_cancel,
             stdout=handle if handle else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             cwd=cwd,
@@ -1432,36 +1337,30 @@ def terminate_process_tree(proc, wait_seconds=5.0):
     gone). A direct-process kill remains as a last resort, but returns False
     because descendants could not be confirmed terminated.
     """
+    if getattr(proc, "speedtree_lifecycle_launch_id", None) is not None:
+        try:
+            terminate_owned_process(
+                proc,
+                reason="sk_stop",
+                terminate_grace=min(1.0, max(0.0, float(wait_seconds))),
+                kill_grace=max(0.1, float(wait_seconds)),
+            )
+            return proc.poll() is not None
+        except ProcessLifecycleError:
+            return False
+
+    # Fail closed for legacy/injected process objects: signal only the exact
+    # retained handle and never discover or kill descendants by PID/name.
     if proc.poll() is not None:
         return True
-
-    tree_confirmed = False
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(1.0, float(wait_seconds)),
-                creationflags=CREATE_NO_WINDOW,
-            )
-            tree_confirmed = result.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            tree_confirmed = False
-    else:
-        try:
-            proc.terminate()
-            tree_confirmed = True
-        except OSError:
-            tree_confirmed = proc.poll() is not None
-
-    if proc.poll() is None:
-        try:
-            proc.wait(timeout=max(0.1, float(wait_seconds)))
-        except subprocess.TimeoutExpired:
+    try:
+        proc.terminate()
+        proc.wait(timeout=max(0.1, float(wait_seconds)))
+    except (OSError, subprocess.TimeoutExpired):
+        if proc.poll() is None:
             try:
                 proc.kill()
                 proc.wait(timeout=max(0.1, float(wait_seconds)))
             except (OSError, subprocess.SubprocessError):
                 pass
-    return tree_confirmed and proc.poll() is not None
+    return False

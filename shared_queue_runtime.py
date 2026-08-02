@@ -75,6 +75,7 @@ class SharedQueueLease:
         self._heartbeat_interval = float(heartbeat_interval)
         self._stop_event = threading.Event()
         self._finish_lock = threading.Lock()
+        self._heartbeat_lock = threading.RLock()
         self._finished_record: Optional[Dict[str, Any]] = None
         self._heartbeat_error: Optional[BaseException] = None
         self._thread = threading.Thread(
@@ -90,14 +91,42 @@ class SharedQueueLease:
 
     @property
     def heartbeat_error(self) -> Optional[BaseException]:
-        return self._heartbeat_error
+        with self._heartbeat_lock:
+            return self._heartbeat_error
 
     @property
     def release_request(self) -> Optional[Dict[str, Any]]:
         """Return the operator request most recently observed by heartbeat."""
+        with self._heartbeat_lock:
+            request = self.record.get("release_request")
+            return None if not isinstance(request, dict) else copy.deepcopy(request)
 
-        request = self.record.get("release_request")
-        return None if not isinstance(request, dict) else copy.deepcopy(request)
+    def renew_and_check_current(self) -> bool:
+        """Synchronously prove this exact token is still current.
+
+        Interactive recovery calls this in its lifecycle guard, including
+        immediately before publishing a continuation claim.  A successful
+        renewal gives that short commit section a fresh backend lease; a
+        heartbeat failure or operator release request fails closed.
+        """
+        with self._heartbeat_lock:
+            if self._finished_record is not None or self._heartbeat_error:
+                return False
+            try:
+                renewed = self._runtime.queue.heartbeat(
+                    self.job_id,
+                    self.token,
+                    owner_id=self._runtime.owner_id,
+                )
+            except BaseException as exc:
+                self._heartbeat_error = exc
+                self._stop_event.set()
+                return False
+            self.record = copy.deepcopy(renewed)
+            return not isinstance(
+                self.record.get("release_request"),
+                dict,
+            )
 
     def finish(
         self,
@@ -164,19 +193,21 @@ class SharedQueueLease:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.wait(self._heartbeat_interval):
-            try:
-                renewed = self._runtime.queue.heartbeat(
-                    self.job_id,
-                    self.token,
-                    owner_id=self._runtime.owner_id,
-                )
-                self.record = copy.deepcopy(renewed)
-            except BaseException as exc:
-                # The foreground owner observes this via ``heartbeat_error``.
-                # Do not spin if the token is lost or persistence is unhealthy.
-                self._heartbeat_error = exc
-                self._stop_event.set()
-                return
+            with self._heartbeat_lock:
+                try:
+                    renewed = self._runtime.queue.heartbeat(
+                        self.job_id,
+                        self.token,
+                        owner_id=self._runtime.owner_id,
+                    )
+                    self.record = copy.deepcopy(renewed)
+                except BaseException as exc:
+                    # The foreground owner observes this via
+                    # ``heartbeat_error``. Do not spin if the token is lost or
+                    # persistence is unhealthy.
+                    self._heartbeat_error = exc
+                    self._stop_event.set()
+                    return
 
     def __enter__(self) -> "SharedQueueLease":
         return self

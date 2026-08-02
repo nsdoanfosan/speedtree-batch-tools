@@ -25,10 +25,17 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run
 
 from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
@@ -3616,7 +3623,7 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False)",
             ]
         )
-        completed = subprocess.run(
+        completed = owned_run(
             [
                 bpy.app.binary_path,
                 "--factory-startup",
@@ -3629,6 +3636,8 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 collection.name,
                 text.name,
             ],
+            source="sk_batch.cluster_assembly_builder.standalone_blender",
+            run_factory=subprocess.run,
             check=False,
             capture_output=True,
             text=True,

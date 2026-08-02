@@ -20,6 +20,14 @@ from pcg_cluster_assembly_contract import (  # noqa: E402
     _normalized_generator_delivery,
 )
 import pcg_texture_audit as audit_module  # noqa: E402
+from generator_delivery_scope import (  # noqa: E402
+    CONTINUITY_ONLY_POLICY,
+    INTENT_KIND,
+    RESOLVED_KIND,
+    RUNTIME_INACTIVE_POLICY,
+    SCOPE_KIND,
+    canonical_sha256,
+)
 
 
 GENERATOR_GUID = "blackgum-generator-guid"
@@ -253,6 +261,75 @@ def delivery_payload(generator_guid=None):
     }
 
 
+def explicit_delivery_payload(spm, required_indices, generator_guid=None):
+    payload = delivery_payload(generator_guid)
+    provider_blend = str(Path("sanitized-provider.blend").resolve(strict=False))
+    payload["blend_file"] = provider_blend
+    bindings = payload["generator_connection"]["bindings"]
+    authored = [
+        {
+            "slot_identity": list(_delivery_binding_slot_identity(row)),
+            "target_material_id": row["target_material_id"],
+            "target_mesh_id": row["target_mesh_id"],
+        }
+        for row in bindings
+    ]
+    required_indices = set(required_indices)
+    required = [
+        row["slot_identity"]
+        for index, row in enumerate(authored)
+        if index in required_indices
+    ]
+    continuity = [
+        {
+            "slot_identity": row["slot_identity"],
+            "reason": "operator-authored continuity fixture",
+            "policy": CONTINUITY_ONLY_POLICY,
+            "provenance": {
+                "fixture": "issue-96-sanitized",
+                "authority_revision": 1,
+            },
+        }
+        for index, row in enumerate(authored)
+        if index not in required_indices
+    ]
+    intent = {
+        "kind": INTENT_KIND,
+        "schema_version": 1,
+        "authority": {
+            "kind": "sanitized_test_recipe",
+            "id": "issue-96",
+            "provenance": {"fixture": "black-locust-shaped"},
+        },
+        "target": {
+            "spm": str(Path(spm).resolve(strict=False)),
+            "provider_blend": provider_blend,
+            "provider_scope_id": "sanitized-provider-scope",
+            "material_id": 4,
+        },
+        "authored_slots": authored,
+        "required_live_slot_identities": required,
+        "continuity_only_slots": continuity,
+        "runtime_inactive_policy": RUNTIME_INACTIVE_POLICY,
+    }
+    intent["intent_sha256"] = canonical_sha256(intent)
+    resolved = {
+        "kind": RESOLVED_KIND,
+        "schema_version": 1,
+        "intent_sha256": intent["intent_sha256"],
+        "bindings_sha256": canonical_sha256(authored),
+        "target_spm_postwrite_sha256": "a" * 64,
+    }
+    resolved["resolved_sha256"] = canonical_sha256(resolved)
+    payload["generator_connection"]["delivery_scope"] = {
+        "kind": SCOPE_KIND,
+        "schema_version": 1,
+        "intent": intent,
+        "resolved": resolved,
+    }
+    return payload
+
+
 def delivery_variants():
     return [
         {"target_mesh_id": mesh_id}
@@ -319,7 +396,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             self.original_persistent_dirty
         )
 
-    def test_fresh_snapshot_closes_cached_pre_connection_reproduction(self):
+    def test_full_content_identity_closes_cached_pre_connection_reproduction(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
             report_cache = {
@@ -341,15 +418,15 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                     {"1"},
                 )
 
-                # Reproduce the old contradiction: the Atlas writer has put
-                # Material 4 / Mesh 130-133 in the file, but report-local cache
-                # identity still resolves the pre-connection parsed object.
+                # The Atlas writer has put Material 4 / Mesh 130-133 in the
+                # file without relying on a new stat identity. Full content
+                # identity must reject the pre-connection parsed object.
                 write_blackgum_delivery_spm(target, connected=True)
-                stale = audit_module._spm_analysis(target)
-                self.assertIs(stale, pre_connection)
-                self.assertEqual(
+                current = audit_module._spm_analysis(target)
+                self.assertIsNot(current, pre_connection)
+                self.assertNotEqual(
                     [
-                        row for row in stale["leaf_generator_bindings"]
+                        row for row in current["leaf_generator_bindings"]
                         if row.get("material_id") == "4"
                     ],
                     [],
@@ -367,7 +444,10 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                         {"material_id": 4},
                         delivery_variants(),
                     )
-                self.assertEqual(read_spm.call_count, 1)
+                # The second exact-content analysis already parsed the current
+                # bytes.  Board delivery classification must reuse that same
+                # generation instead of decompressing the SPM a third time.
+                self.assertEqual(read_spm.call_count, 0)
             finally:
                 audit_module._REPORT_SCAN_CACHE.reset(token)
 
@@ -921,6 +1001,247 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             if "generator_not_export_participating" in row["errors"]
         ))
 
+    def test_explicit_scope_accepts_hidden_and_zero_continuity_only_slots(self):
+        rows = [
+            snapshot_binding(SLOT_PREFIXES[0], TARGET_MESH_IDS[0]),
+            snapshot_binding(
+                SLOT_PREFIXES[1],
+                TARGET_MESH_IDS[1],
+                graph_visible=False,
+                generated_node_count=842,
+            ),
+            snapshot_binding(
+                SLOT_PREFIXES[2],
+                TARGET_MESH_IDS[2],
+                graph_visible=True,
+                generated_node_count=0,
+            ),
+            snapshot_binding(
+                SLOT_PREFIXES[3],
+                TARGET_MESH_IDS[3],
+                graph_visible=True,
+                generated_node_count=0,
+            ),
+        ]
+
+        class ExplicitScopeAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS,
+                    total_node_count=843,
+                )
+
+        target = "SK_tree_sanitized_01.spm"
+        delivery = _normalized_generator_delivery(
+            ExplicitScopeAudit,
+            target,
+            explicit_delivery_payload(target, {0}),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(delivery["delivery_scope_mode"], "explicit_sealed_v1")
+        self.assertEqual(delivery["active_required_binding_count"], 1)
+        self.assertEqual(delivery["planned_inactive_binding_count"], 0)
+        self.assertEqual(
+            delivery["delivery_scope_continuity_only_slot_count"], 3
+        )
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
+        )
+        self.assertEqual(
+            [row["status"] for row in delivery["binding_outcomes"]],
+            ["completed", "continuity_only", "continuity_only", "continuity_only"],
+        )
+
+    def test_explicit_empty_required_scope_is_distinct_from_runtime_inactive(self):
+        rows = [
+            snapshot_binding(
+                slot_prefix,
+                mesh_id,
+                graph_visible=True,
+                generated_node_count=0,
+            )
+            for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
+        ]
+
+        class ContinuityOnlyAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS,
+                    total_node_count=0,
+                )
+
+        target = "SK_tree_sanitized_05.spm"
+        delivery = _normalized_generator_delivery(
+            ContinuityOnlyAudit,
+            target,
+            explicit_delivery_payload(target, set()),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        )
+        self.assertEqual(delivery["delivery_reason"], "relationship_continuity_only")
+        self.assertEqual(delivery["planned_inactive_binding_count"], 0)
+        self.assertTrue(all(
+            row["status"] == "continuity_only"
+            for row in delivery["binding_outcomes"]
+        ))
+
+    def test_tampered_explicit_scope_fails_closed_without_legacy_downgrade(self):
+        rows = [
+            snapshot_binding(slot_prefix, mesh_id)
+            for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
+        ]
+
+        class TamperedScopeAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, rows, TARGET_MESH_IDS)
+
+        target = "SK_tree_sanitized_01.spm"
+        payload = explicit_delivery_payload(target, {0, 1, 2, 3})
+        payload["generator_connection"]["delivery_scope"]["intent"][
+            "required_live_slot_identities"
+        ].pop()
+        delivery = _normalized_generator_delivery(
+            TamperedScopeAudit,
+            target,
+            payload,
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
+        self.assertTrue(any(
+            error.startswith("generator_delivery_scope_invalid:")
+            for error in delivery["errors"]
+        ))
+        self.assertFalse(delivery["generator_connection_complete"])
+
+    def test_foreign_provider_scope_fails_closed(self):
+        rows = [
+            snapshot_binding(slot_prefix, mesh_id)
+            for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
+        ]
+
+        class ForeignScopeAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, rows, TARGET_MESH_IDS)
+
+        target = "SK_tree_sanitized_01.spm"
+        payload = explicit_delivery_payload(target, {0, 1, 2, 3})
+        payload["blend_file"] = str(
+            Path("foreign-provider.blend").resolve(strict=False)
+        )
+        delivery = _normalized_generator_delivery(
+            ForeignScopeAudit,
+            target,
+            payload,
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
+        self.assertTrue(any(
+            "another provider blend" in error
+            for error in delivery["errors"]
+        ))
+
+    def test_resolved_bindings_must_equal_sealed_authored_slots(self):
+        rows = [
+            snapshot_binding(slot_prefix, mesh_id)
+            for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
+        ]
+
+        class MismatchedScopeAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, rows, TARGET_MESH_IDS)
+
+        target = "SK_tree_sanitized_01.spm"
+        payload = explicit_delivery_payload(target, {0, 1, 2, 3})
+        payload["generator_connection"]["bindings"][0][
+            "target_mesh_id"
+        ] = 999
+        delivery = _normalized_generator_delivery(
+            MismatchedScopeAudit,
+            target,
+            payload,
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
+        self.assertTrue(any(
+            "differ from sealed authored slots" in error
+            for error in delivery["errors"]
+        ))
+
+    def test_explicit_required_slot_cannot_be_shrunk_by_unused_base_evidence(self):
+        inactive_base = {
+            "generator_index": 1,
+            "generator_name": "Unused Base",
+            "generator_type": "Base",
+            "generated_node_count": 0,
+        }
+        rows = []
+        for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS):
+            row = snapshot_binding(
+                slot_prefix,
+                mesh_id,
+                graph_visible=True,
+                generated_node_count=0,
+            )
+            row.update({
+                "export_evidence": "node_table",
+                "node_table_stale": False,
+                "causal_path_active": False,
+                "causal_path_reason": (
+                    "generator_causal_path_inactive_unused_base"
+                ),
+                "inactive_base": inactive_base,
+            })
+            rows.append(row)
+
+        class ExplicitInactiveAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS,
+                    total_node_count=0,
+                )
+
+        target = "SK_tree_sanitized_01.spm"
+        delivery = _normalized_generator_delivery(
+            ExplicitInactiveAudit,
+            target,
+            explicit_delivery_payload(target, {0, 1, 2, 3}),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["planned_inactive_binding_count"], 0)
+        self.assertIn("generator_not_export_participating", delivery["errors"])
+        self.assertIn(
+            "normalized_and_live_target_mesh_sets_differ",
+            delivery["errors"],
+        )
+
     def test_declared_complete_value_drift_is_a_precise_live_defect(self):
         rows = [
             snapshot_binding(
@@ -993,7 +1314,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                 "errors": [],
             })
 
-    def test_schema4_warm_cache_survives_while_live_stale_table_is_uncached(self):
+    def test_stat_only_schema4_cache_is_upgraded_before_live_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
             write_blackgum_delivery_spm(
@@ -1027,11 +1348,15 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             ):
                 warm = audit_module._spm_analysis(target)
 
-            self.assertEqual(
-                warm["leaf_generator_bindings"],
-                [cached_binding],
+            self.assertNotEqual(
+                warm["leaf_generator_bindings"], [cached_binding]
             )
-            self.assertFalse(audit_module._PERSISTENT_SPM_ANALYSIS_DIRTY)
+            self.assertTrue(audit_module._PERSISTENT_SPM_ANALYSIS_DIRTY)
+            upgraded = audit_module._PERSISTENT_SPM_ANALYSIS[path_key]
+            self.assertEqual(
+                upgraded["content_identity_algorithm"],
+                audit_module.SPM_CONTENT_IDENTITY_ALGORITHM,
+            )
 
             with mock.patch.object(
                 audit_module,
@@ -1047,7 +1372,12 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                 )
 
             read_spm.assert_called_once_with(target)
-            self.assertIs(audit_module._SPM_ANALYSIS_CACHE[cache_key], warm)
+            cached_current = next(
+                value
+                for key, value in audit_module._SPM_ANALYSIS_CACHE.items()
+                if key[:3] == cache_key
+            )
+            self.assertIs(cached_current, warm)
             self.assertTrue(snapshot["node_table"]["stale"])
             self.assertEqual(
                 snapshot["node_table"]["orphan_generator_guids"],
