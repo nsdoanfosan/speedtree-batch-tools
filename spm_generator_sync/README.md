@@ -105,6 +105,29 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
    - 다른 작업이 진행 중이면 기존 FIFO 대기열에 들어갑니다. 실제 차례가 시작될 때 계보
      manifest와 Cluster registry를 다시 읽으므로, 앞 작업에서 OFF가 된 관계를 오래된
      화면 스냅샷으로 다시 ON 처리하지 않습니다.
+   - v2 보고서는 mutation 전에 생성되고 각 시도 시작/실패 및 단위 완료 때마다 fsync 뒤
+     원자적으로 checkpoint됩니다. `run_id`, queue 소유권, 순서가 고정된 `unit_id`,
+     성공/실패/실행 중 상태, SHA-256 dependency identity, 실패 분류와 bounded retry 시도를
+     보존합니다. checkpoint가 실패하면 다음 mutation은 시작하지 않습니다.
+   - 일부만 실패하면 UI와 공용 FIFO receipt 모두 `partial`을 `failed`와 구분해 표시합니다.
+     receipt에는 Generator/Cluster 성공·실패 수와 정확한 보고서 path/SHA-256/size가 남습니다.
+   - `연결 실패 단위만 재시도`는 임의의 reports 폴더 파일이 아니라 terminal 공용 FIFO
+     receipt가 정확한 path/SHA-256/size로 봉인한 v2 partial 보고서만 읽고 현재 보드를 다시
+     스캔합니다. 전체 단위 순서, 설정/도구/코드, SPM/blend/registry, Atlas
+     target/scope/global receipt, normalization receipt, isolated-source cache 및 생성물 디렉터리
+     inventory와 Blender가 실제 로드한 `atlas_leaf_mesh_builder`/
+     `speedtree_cluster_normalizer` add-on code manifest가 모두 같을 때만 실패 단위를 선택합니다.
+     inventory는 파일 hash 전후 두 번 열거해 중간 add/remove 경쟁도 불안정으로 처리합니다.
+     매 시도 뒤 기존 성공 단위를 다시
+     검증합니다. 보수적 read/write set과 overlap graph에서 기존 성공 단위와 생성물을 공유하는
+     실패 단위는 mutation 전에 failed-only retry 부적격으로 처리하고, 예상 밖 드리프트가
+     생겨도 다음 단위를 실행하지 않은 채 새 전체 계획을 요구합니다.
+   - JSON atomic publish가 구조화된 pre-commit/rollback 성공 증명을 제공한 permission/lock
+     오류만 현재 공용 queue lease와 동일 dependency identity 아래에서 0.2초/0.5초 backoff로
+     최대 3회 시도합니다. 각 attempt 시작 직전에 전체 identity를 다시 캡처하며 Cluster는 설치된
+     add-on producer probe도 다시 실행하므로 plan 이후나 backoff 중 변경은 mutation 전에
+     중단됩니다. 일반 JSON 읽기 오류, rollback 실패, content drift, persistent denial은 재시도해
+     숨기지 않고 보고서에 남깁니다.
 
 파일명의 `_01`은 화면에서 `MASTER 후보`로만 제안합니다. 이름만으로 관계를 확정하거나 파일을
 수정하지 않습니다. 확정한 관계는 나무 폴더의 `spm_generator_sync.json`에 상대 파일명으로 저장됩니다.

@@ -46,6 +46,8 @@ REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import owned_run
+
 from code_compile_gate import (
     CompileGateError,
     production_source_manifest,
@@ -1143,6 +1145,225 @@ def cluster_target_delivery_block(contract, target_spm, producer_spm):
     return None
 
 
+def cluster_stale_node_table_recovery_scope(
+    contract,
+    target_spm,
+    audit_report,
+):
+    """Seal a complete target-wide legacy scope or explain why it is unsafe.
+
+    This adapter intentionally does not invent the newer required-live
+    manifest contract.  It is eligible only for today's strict Atlas policy,
+    where every normalized target Mesh ID is both authored and required live.
+    All provider-role slices for the exact target must be present in the same
+    live audit; a diagnostic stale subset is never promoted to full scope.
+    """
+    target = Path(target_spm).expanduser().resolve(strict=False)
+
+    def unavailable(reason_token, **details):
+        return {
+            "schema_version": 1,
+            "available": False,
+            "mode": "interactive_modeler_save_watch",
+            "scope_policy": "complete_target_wide_legacy_strict_v1",
+            "reason_token": str(reason_token),
+            "target_spm": str(target),
+            "audit_report": str(audit_report or ""),
+            **copy.deepcopy(details),
+        }
+
+    if not isinstance(contract, dict):
+        return unavailable("recovery_contract_missing")
+
+    identity_matches = []
+    for row in contract.get("tree_source_identities") or ():
+        if not isinstance(row, dict):
+            continue
+        identity = row.get("target_spm")
+        if not isinstance(identity, dict) or not identity.get("path"):
+            continue
+        if normalized_folder_key(identity["path"]) == normalized_folder_key(
+            target
+        ):
+            identity_matches.append(identity)
+    if len(identity_matches) != 1:
+        return unavailable(
+            "target_audit_identity_missing_or_ambiguous",
+            identity_match_count=len(identity_matches),
+        )
+    target_sha256 = str(
+        identity_matches[0].get("sha256") or ""
+    ).strip().casefold()
+    if len(target_sha256) != 64 or any(
+        value not in "0123456789abcdef" for value in target_sha256
+    ):
+        return unavailable("target_audit_sha256_missing_or_invalid")
+
+    dependencies = contract.get("dependencies") or ()
+    if not isinstance(dependencies, (list, tuple)) or not dependencies:
+        return unavailable("target_recovery_dependencies_missing")
+
+    strict_policy = "ensure_all_material_cutouts"
+    stale_reason = "live_export_evidence_unavailable_stale_node_table"
+    stale_consequences = {
+        "generator_export_evidence_stale_node_table",
+        "normalized_and_live_target_mesh_sets_differ",
+    }
+    expected_mesh_ids = set()
+    provider_slices = []
+    required_dependency_count = 0
+    stale_slice_count = 0
+
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            return unavailable("target_recovery_dependency_invalid")
+        if dependency.get("normalized_variants_required") is not True:
+            continue
+        required_dependency_count += 1
+        variants = dependency.get("normalized_variants")
+        if not isinstance(variants, dict):
+            return unavailable(
+                "normalized_delivery_evidence_missing",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if str(variants.get("status") or "") not in {"ready", "current"}:
+            return unavailable(
+                "normalized_delivery_evidence_not_current",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        target_rows = [
+            row
+            for row in variants.get("target_deliveries") or ()
+            if isinstance(row, dict)
+            and row.get("spm")
+            and normalized_folder_key(row["spm"])
+            == normalized_folder_key(target)
+        ]
+        if len(target_rows) != 1:
+            return unavailable(
+                "target_delivery_missing_or_ambiguous",
+                provider_role=str(dependency.get("role") or ""),
+                target_delivery_match_count=len(target_rows),
+            )
+        delivery = target_rows[0]
+        if delivery.get("generator_variant_policy") != strict_policy:
+            return unavailable(
+                "target_delivery_policy_not_legacy_strict",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        mesh_values = delivery.get("normalized_target_mesh_ids")
+        if not isinstance(mesh_values, (list, tuple)) or not mesh_values:
+            return unavailable(
+                "normalized_target_mesh_scope_missing",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in mesh_values
+        ):
+            return unavailable(
+                "normalized_target_mesh_scope_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        mesh_ids = sorted(set(mesh_values))
+        if list(mesh_values) != mesh_ids:
+            return unavailable(
+                "normalized_target_mesh_scope_not_canonical",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if expected_mesh_ids.intersection(mesh_ids):
+            return unavailable(
+                "normalized_target_mesh_scope_overlaps_provider_roles",
+                provider_role=str(dependency.get("role") or ""),
+            )
+
+        errors = {
+            str(value)
+            for value in delivery.get("errors") or ()
+            if str(value)
+        }
+        decision = str(delivery.get("delivery_decision") or "")
+        if decision == "blocked":
+            stale_ids = delivery.get("stale_node_table_target_mesh_ids")
+            if not isinstance(stale_ids, (list, tuple)) or not stale_ids:
+                return unavailable(
+                    "stale_target_mesh_scope_missing",
+                    provider_role=str(dependency.get("role") or ""),
+                )
+            canonical_stale_ids = sorted(set(stale_ids))
+            if (
+                list(stale_ids) != canonical_stale_ids
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                    for value in stale_ids
+                )
+                or not set(canonical_stale_ids).issubset(mesh_ids)
+                or delivery.get("delivery_reason") != stale_reason
+                or not errors
+                or not errors.issubset(stale_consequences)
+                or not isinstance(delivery.get("live_node_table"), dict)
+                or delivery["live_node_table"].get("stale") is not True
+            ):
+                return unavailable(
+                    "target_delivery_not_stale_only",
+                    provider_role=str(dependency.get("role") or ""),
+                )
+            stale_slice_count += 1
+        elif not (
+            decision == "normalize_part"
+            and not errors
+            and delivery.get("live_generator_delivery_complete") is True
+        ):
+            return unavailable(
+                "target_delivery_has_independent_blocker",
+                provider_role=str(dependency.get("role") or ""),
+            )
+
+        expected_mesh_ids.update(mesh_ids)
+        provider_slices.append({
+            "role": str(dependency.get("role") or ""),
+            "provider_spm": str(dependency.get("spm") or ""),
+            "normalized_target_mesh_ids": mesh_ids,
+            "delivery_decision": decision,
+        })
+
+    if required_dependency_count == 0 or not expected_mesh_ids:
+        return unavailable("target_recovery_scope_empty")
+    if stale_slice_count == 0:
+        return unavailable("target_has_no_stale_blocking_delivery")
+
+    sealed = {
+        "schema_version": 1,
+        "available": True,
+        "mode": "interactive_modeler_save_watch",
+        "scope_policy": "complete_target_wide_legacy_strict_v1",
+        "target_spm": str(target),
+        "target_preimage_raw_sha256": target_sha256,
+        "expected_mesh_ids": sorted(expected_mesh_ids),
+        "provider_slices": sorted(
+            provider_slices,
+            key=lambda row: (row["role"], row["provider_spm"]),
+        ),
+        "audit_report": str(audit_report or ""),
+    }
+    sealed["scope_sha256"] = hashlib.sha256(
+        (
+            json.dumps(
+                sealed,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    return sealed
+
+
 def target_planned_exclusion_summary(target_spm, reason_token, evidence):
     """Render a target-first exclusion summary suitable for a narrow GUI row."""
     target = Path(target_spm)
@@ -1165,7 +1386,23 @@ def target_planned_exclusion_summary(target_spm, reason_token, evidence):
         mesh_ids = evidence.get("stale_node_table_target_mesh_ids") or ()
         if mesh_ids:
             parts.append("Mesh IDs " + ",".join(str(value) for value in mesh_ids))
-        parts.append("action=regenerate/save this SPM in Modeler, then re-audit")
+        recovery = evidence.get("stale_node_table_recovery")
+        if isinstance(recovery, dict) and recovery.get("available") is True:
+            parts.append(
+                "action=Batch Tools will request this exact SPM in Modeler; "
+                "verify the displayed path and choose File > Save; Save As "
+                "or incremental Save is not accepted; re-audit/resume is automatic"
+            )
+        else:
+            reason = (
+                str((recovery or {}).get("reason_token") or "scope unavailable")
+                if isinstance(recovery, dict)
+                else "scope unavailable"
+            )
+            parts.append(
+                "action=automatic Modeler recovery is disabled until the "
+                f"target-wide scope is sealed ({reason}); re-run a live audit"
+            )
     parts.append(f"reason={reason_token}")
     return " | ".join(parts)
 
@@ -1784,6 +2021,9 @@ class App:
         self.shared_queue_runtime = SharedQueueRuntime("sk_batch")
         self.cell_editor = None
         self.stop_flag = threading.Event()
+        self._app_open = True
+        self._recovery_commit_lock = threading.RLock()
+        self._recovery_resume_commit = None
         self.active_procs = set()          # all running child procs (serial or parallel)
         self.procs_lock = threading.Lock()
         self.state_lock = threading.RLock()  # guards self.state writes across worker threads
@@ -2239,6 +2479,27 @@ class App:
                         self._set_batch_queue_controls(False)
                 elif kind == "batch_job_done":
                     self._finish_batch_job(payload)
+                elif kind == "modeler_recovery":
+                    target = Path(payload["target_spm"])
+                    self.progress_var.set(
+                        "SpeedTree Modeler manual Save waiting — "
+                        + target.name
+                    )
+                    messagebox.showinfo(
+                        "SpeedTree Modeler Save required",
+                        (
+                            "Batch Tools asked SpeedTree Modeler to open:\n\n"
+                            f"{target}\n\n"
+                            "Verify that this exact SPM is displayed. Do not "
+                            "make unrelated edits. Choose File > Save yourself. "
+                            "Do not use Save As or incremental Save.\n\n"
+                            "Batch Tools does not automate keyboard input or "
+                            "close Modeler. It is watching the exact file and "
+                            "will re-audit it before resuming this job once. "
+                            "Stop cancels the watcher but leaves Modeler open."
+                        ),
+                        parent=self.root,
+                    )
         except queue.Empty:
             pass
         self.root.after(150, self._drain_ui_queue)
@@ -3326,6 +3587,10 @@ class App:
             self.batch_job_sequence = 0
         if not hasattr(self, "batch_job_failures"):
             self.batch_job_failures = []
+        if not hasattr(self, "_recovery_commit_lock"):
+            self._recovery_commit_lock = threading.RLock()
+        if not hasattr(self, "_recovery_resume_commit"):
+            self._recovery_resume_commit = None
 
     def _snapshot_batch_request(self, target_iids):
         inventory = {
@@ -3456,6 +3721,8 @@ class App:
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
         self.stop_flag.clear()
+        with self._recovery_commit_lock:
+            self._recovery_resume_commit = None
         self.batch_progress.configure(value=0)
         pending = len(self.pending_batch_jobs)
         suffix = f" · 대기 {pending}개" if pending else ""
@@ -3586,6 +3853,7 @@ class App:
                     on_wait=report_wait,
                     cancel_event=self.stop_flag,
                 )
+                self._active_shared_queue_lease = lease
                 self.ui_queue.put((
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
@@ -3670,6 +3938,7 @@ class App:
                         f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
                         f"{job['label']}: {error}"
                     )
+            self.__dict__.pop("_active_shared_queue_lease", None)
             self.ui_queue.put((
                 "batch_job_done",
                 {
@@ -4984,14 +5253,29 @@ class App:
                     # only after its child processes have stopped.
                     pass
         self.pending_batch_jobs.clear()
-        self.stop_flag.set()
+        with self._recovery_commit_lock:
+            resume_commit = copy.deepcopy(self._recovery_resume_commit)
+            self.stop_flag.set()
         # Worker polling performs the tree kill. Keeping it in one place avoids
         # racing a direct parent-only kill that would orphan SpeedTree children.
         suffix = f" · 대기 작업 {pending}개 취소" if pending else ""
-        self.log(
-            "중지 요청됨 — 실행 중인 작업과 SpeedTree 자식을 종료합니다."
-            + suffix
-        )
+        if (
+            isinstance(resume_commit, dict)
+            and isinstance(self.active_batch_job, dict)
+            and resume_commit.get("job_id") == self.active_batch_job.get("id")
+        ):
+            self.log(
+                "중지 요청이 Modeler 복구 재개 commit 뒤에 도착했습니다. "
+                "봉인된 callback은 한 번 완료될 수 있으며 이후 작업은 "
+                "중지합니다. 사용자가 연 Modeler는 종료하지 않습니다."
+                + suffix
+            )
+        else:
+            self.log(
+                "중지 요청됨 — 실행 중인 자동화 작업과 관리 대상 SpeedTree "
+                "자식을 종료합니다. 수동 복구 Modeler는 종료하지 않습니다."
+                + suffix
+            )
 
     def shutdown_shared_queue(self):
         runtime = getattr(self, "shared_queue_runtime", None)
@@ -5506,6 +5790,7 @@ class App:
             log_file=str(log_file),
             affinity=affinity,
             env=env,
+            cooperative_cancel=self.stop_flag.set,
         )
         with self.procs_lock:
             self.active_procs.add(proc)
@@ -8169,6 +8454,13 @@ class App:
                     "sync_outcome_authoritative": False,
                     "normalization_postcondition": "not_run",
                 }
+                evidence["stale_node_table_recovery"] = (
+                    cluster_stale_node_table_recovery_scope(
+                        contract,
+                        target,
+                        audit_report,
+                    )
+                )
                 summary = target_planned_exclusion_summary(
                     target,
                     reason_token,
@@ -8225,7 +8517,7 @@ class App:
         for target in relation_targets:
             try:
                 live_resolution = (
-                    self._cluster_normalization_stage_observation(
+                    self._cluster_normalization_stage_with_recovery(
                         target,
                         f"{stamp}_normalization_input",
                         producer_spm,
@@ -8247,6 +8539,248 @@ class App:
             })
             runnable_relation_targets.append(target)
         return runnable_relation_targets, live_target_contracts
+
+    def _cluster_normalization_stage_with_recovery(
+        self,
+        target_spm,
+        stamp,
+        producer_spm,
+        *,
+        require_normalized,
+    ):
+        """Observe one stage and recover a safely sealed stale exclusion."""
+        try:
+            return self._cluster_normalization_stage_observation(
+                target_spm,
+                stamp,
+                producer_spm,
+                require_normalized=require_normalized,
+            )
+        except TargetPlannedExclusionError as exc:
+            recovered = self._attempt_stale_node_table_recovery(
+                exc,
+                stamp,
+                producer_spm,
+                require_normalized=require_normalized,
+            )
+            if recovered is None:
+                raise
+            return recovered
+
+    def _attempt_stale_node_table_recovery(
+        self,
+        exclusion,
+        stamp,
+        producer_spm,
+        *,
+        require_normalized,
+    ):
+        """Run one sealed manual-Save recovery inside the active job lease."""
+        scope = (
+            exclusion.evidence.get("stale_node_table_recovery")
+            if isinstance(exclusion.evidence, dict)
+            else None
+        )
+        if not isinstance(scope, dict) or scope.get("available") is not True:
+            return None
+        self._ensure_batch_queue_state()
+        job = getattr(self, "active_batch_job", None)
+        if not isinstance(job, dict) or not job.get("id"):
+            exclusion.evidence["recovery_attempt"] = {
+                "status": "not_started",
+                "reason_token": "initiating_job_context_missing",
+            }
+            return None
+        if self.stop_flag.is_set():
+            exclusion.evidence["recovery_attempt"] = {
+                "status": "not_started",
+                "reason_token": "initiating_job_cancelled",
+            }
+            return None
+
+        from pcg_st9_texture_batch.stale_node_table_recovery import (
+            StaleNodeTableRecoveryError,
+            launch_modeler_for_manual_save,
+            recover_stale_node_table,
+        )
+
+        target = Path(scope["target_spm"]).resolve(strict=False)
+        captured_job_id = job["id"]
+        captured_generation = (
+            job.get("shared_queue_sequence") or captured_job_id
+        )
+        captured_shared_job_id = job.get("shared_queue_job_id")
+
+        def is_job_current():
+            current = getattr(self, "active_batch_job", None)
+            return (
+                isinstance(current, dict)
+                and current.get("id") == captured_job_id
+                and (
+                    current.get("shared_queue_sequence") or current.get("id")
+                )
+                == captured_generation
+            )
+
+        def is_queue_current():
+            if not captured_shared_job_id:
+                return True
+            lease = getattr(self, "_active_shared_queue_lease", None)
+            return bool(
+                lease is not None
+                and lease.job_id == captured_shared_job_id
+                and not lease.finished
+                and lease.renew_and_check_current()
+            )
+
+        guards = {
+            "is_cancelled": self.stop_flag.is_set,
+            "is_app_open": lambda: bool(
+                getattr(self, "_app_open", True)
+            ),
+            "is_job_current": is_job_current,
+            "is_queue_current": is_queue_current,
+        }
+
+        def launch_with_instruction(executable, spm):
+            self.ui_queue.put((
+                "modeler_recovery",
+                {
+                    "target_spm": str(spm),
+                    "scope_sha256": scope["scope_sha256"],
+                    "expected_mesh_ids": list(scope["expected_mesh_ids"]),
+                },
+            ))
+            self.log(
+                "Modeler launch requested for exact recovery target: "
+                f"{spm} | verify the path, then choose File > Save; "
+                "Save As/incremental Save are not accepted"
+            )
+            return launch_modeler_for_manual_save(executable, spm)
+
+        def retry_stage(continuation):
+            self.ui_queue.put((
+                "progress",
+                "Modeler Save verified; identity-bound live re-audit running — "
+                + target.name,
+            ))
+            return self._cluster_normalization_stage_observation(
+                target,
+                f"{stamp}_modeler_recovery_reaudit",
+                producer_spm,
+                require_normalized=require_normalized,
+            )
+
+        def mark_resume_committed(claim_payload):
+            self._recovery_resume_commit = {
+                "job_id": captured_job_id,
+                "job_generation": captured_generation,
+                "verified_after_raw_sha256": claim_payload[
+                    "verified_after_raw_sha256"
+                ],
+            }
+            self.ui_queue.put((
+                "progress",
+                "Modeler Save verified; original-stage resume committed — "
+                + target.name,
+            ))
+
+        self.ui_queue.put((
+            "progress",
+            "Sealing Modeler recovery preimage — " + target.name,
+        ))
+        self.log(
+            "Stale Node-table recovery scope sealed from live audit: "
+            f"{target} | Mesh IDs "
+            + ",".join(str(value) for value in scope["expected_mesh_ids"])
+            + f" | scope={scope['scope_sha256']}"
+        )
+        try:
+            result = recover_stale_node_table(
+                target,
+                self.cfg.get("speedtree_exe") or "",
+                scope["expected_mesh_ids"],
+                timeout=7200,
+                poll_interval=2.0,
+                stable_reads=3,
+                retry=retry_stage,
+                job_id=str(captured_job_id),
+                job_generation=str(captured_generation),
+                guards=guards,
+                expected_preimage_raw_sha256=scope[
+                    "target_preimage_raw_sha256"
+                ],
+                launch_fn=launch_with_instruction,
+                continuation_commit_lock=self._recovery_commit_lock,
+                on_continuation_claimed=mark_resume_committed,
+            )
+        except StaleNodeTableRecoveryError as exc:
+            continuation_failed = exc.reason_token in {
+                "continuation_callback_failed",
+                "continuation_claim_publish_failed",
+            }
+            exclusion.evidence["recovery_attempt"] = {
+                "status": (
+                    "repaired_but_continuation_failed_replan_required"
+                    if continuation_failed
+                    else "blocked"
+                ),
+                "reason_token": exc.reason_token,
+                "blocked_event": exc.evidence.get("blocked_event"),
+                "blocked_event_sha256": exc.evidence.get(
+                    "blocked_event_sha256"
+                ),
+            }
+            if continuation_failed:
+                self.log(
+                    "The SPM passed the sealed recovery gate, but the original "
+                    "stage continuation failed after its once-only claim: "
+                    f"{target.name} | reason={exc.reason_token}. The claim "
+                    "will not be replayed; start a fresh live-audit job."
+                )
+            else:
+                self.log(
+                    "Stale Node-table recovery stopped fail-closed: "
+                    f"{target.name} | reason={exc.reason_token}. "
+                    "Modeler was not closed. Start a fresh live audit before retry."
+                )
+            return None
+        except OSError as exc:
+            exclusion.evidence["recovery_attempt"] = {
+                "status": "blocked",
+                "reason_token": "modeler_launch_or_recovery_io_failed",
+            }
+            self.log(
+                "Stale Node-table recovery I/O failed closed: "
+                f"{target.name} | {compact_error_message(exc)}. "
+                "Modeler was not closed."
+            )
+            return None
+
+        if result.get("status") == "already_repaired":
+            exclusion.evidence["recovery_attempt"] = {
+                "status": "replan_required",
+                "reason_token": "source_already_repaired_after_blocking_audit",
+                "after_raw_sha256": result.get("after_raw_sha256"),
+            }
+            self.log(
+                "The SPM changed after the blocking audit and is already "
+                f"non-stale: {target.name}. Run a fresh job plan; the old "
+                "checkpoint was not resumed."
+            )
+            return None
+        live_resolution = result.get("retry_result")
+        if not isinstance(live_resolution, dict):
+            exclusion.evidence["recovery_attempt"] = {
+                "status": "blocked",
+                "reason_token": "recovery_continuation_result_missing",
+            }
+            return None
+        self.log(
+            "Stale Node-table recovery verified and original stage resumed "
+            f"once: {target.name} | after={result.get('after_raw_sha256')}"
+        )
+        return live_resolution
 
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
@@ -8531,7 +9065,7 @@ class App:
                             self._refresh_cluster_source_relations(spm, item)
                         )
                         for target in relation_targets:
-                            self._cluster_normalization_stage_observation(
+                            self._cluster_normalization_stage_with_recovery(
                                 target,
                                 f"{stamp}_normalization_output",
                                 producer_spm,
@@ -8897,7 +9431,7 @@ class App:
                         final_pipeline.get("source_review_required")
                     )
                     result["cluster_normalization_verification"] = [
-                        self._cluster_normalization_stage_observation(
+                        self._cluster_normalization_stage_with_recovery(
                             target,
                             f"{stamp}_normalization_output",
                             producer_spm,
@@ -9154,8 +9688,10 @@ class App:
 
     @staticmethod
     def _unreal_running():
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
+            source="sk_batch.sk_batch_gui.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             creationflags=0x08000000,
         )
@@ -10445,7 +10981,9 @@ def main():
     app = App(root)
 
     def close():
-        app.stop_batch()
+        with app._recovery_commit_lock:
+            app._app_open = False
+            app.stop_batch()
         app.shutdown_shared_queue()
         root.destroy()
 

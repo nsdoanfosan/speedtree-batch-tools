@@ -16,6 +16,7 @@ if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
 from speedtree_export_options_contract import require_texture_skip_writing
+from process_lifecycle import owned_run
 
 
 class UnitProbeExportError(RuntimeError):
@@ -59,8 +60,10 @@ def _export(speedtree_exe, spm, options, output, timeout):
         "-export",
         str(output),
     ]
-    completed = subprocess.run(
+    completed = owned_run(
         command,
+        source="cluster_card_pipeline.unit_probe_export_measure.export",
+        run_factory=subprocess.run,
         cwd=str(Path(spm).expanduser().resolve().parent),
         capture_output=True,
         text=True,

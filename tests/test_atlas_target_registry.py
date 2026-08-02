@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(PCG_DIR))
 
 from atlas_target_registry import (  # noqa: E402
+    TargetRegistryPublishError,
     load_target_registry,
     registry_path_for_blend,
     save_target_registry,
@@ -52,6 +54,32 @@ class AtlasTargetRegistryTests(unittest.TestCase):
                 load_target_registry(blend)["target_spms"],
                 [str(first.absolute()), str(second.absolute())],
             )
+
+    def test_publish_lock_is_structured_precommit_and_cleans_unique_temp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "M_leaf_elm_atlas_01.blend"
+            blend.touch()
+            first = root / "SK_Tree_elm_01.spm"
+            second = root / "SK_Tree_elm_02.spm"
+            save_target_registry(blend, [first])
+            before = registry_path_for_blend(blend).read_bytes()
+
+            with mock.patch(
+                "atlas_target_registry.os.replace",
+                side_effect=PermissionError(13, "publish locked"),
+            ):
+                with self.assertRaises(TargetRegistryPublishError) as raised:
+                    save_target_registry(blend, [second])
+
+            contract = raised.exception.connected_retry_contract
+            self.assertEqual(contract["operation_phase"], "registry_publish")
+            self.assertFalse(contract["committed"])
+            self.assertFalse(contract["rollback_succeeded"])
+            self.assertTrue(contract["temporary_output_isolated"])
+            self.assertEqual(contract["error_code"], 13)
+            self.assertEqual(registry_path_for_blend(blend).read_bytes(), before)
+            self.assertEqual(list(root.glob(".*.tmp")), [])
 
     def test_exact_registry_replaces_inferred_one_target_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:

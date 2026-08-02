@@ -17,6 +17,7 @@ SK_ 데이터(나나이트 + 논마스크 지오메트리 + 버추얼 텍스처)
 ①~③은 실행 전 확인창을 띄우며, SPM/SBS/기존 출력은 수정 전에 백업한다.
 """
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -31,8 +32,15 @@ from tkinter import filedialog, messagebox, ttk
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_DIR = TOOL_DIR.parent
+GUI_SOURCE_PATH = Path(__file__).resolve()
+GUI_SOURCE_SHA256 = hashlib.sha256(GUI_SOURCE_PATH.read_bytes()).hexdigest()
+GUI_MODULE_LOADED_AT = datetime.now().astimezone().isoformat(
+    timespec="milliseconds"
+)
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
+
+from process_lifecycle import external_handoff_popen, owned_run
 
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from speedtree_error_log import ERROR_LOG, record_exception
@@ -113,6 +121,9 @@ BLENDER_RELATION_CACHE_KIND = "pcg_blender_relation_rows"
 RELATION_INPUT_SUFFIXES = frozenset({
     ".blend", ".exr", ".fbx", ".jpeg", ".jpg", ".json", ".png",
     ".sbs", ".spm", ".tga", ".tif", ".tiff",
+})
+RELATION_BULK_IMAGE_SUFFIXES = frozenset({
+    ".exr", ".jpeg", ".jpg", ".png", ".tga", ".tif", ".tiff",
 })
 
 
@@ -891,8 +902,17 @@ def _relation_item_payload(item):
     }
 
 
-def _relation_item_content_identity(item):
-    """Bind relation/live-mutation evidence to current content and membership."""
+def _relation_item_content_identity(
+        item, *, content_memo=None, directory_memo=None, exact_all=False):
+    """Bind relation/live-mutation evidence to payload content and membership.
+
+    Every file that the report payload actually names is full-SHA bound.  The
+    bounded directory inventory separately binds the complete relevant name
+    set, so additions/removals remain invalidating without full-hashing every
+    unrelated texture merely because it shares the folder.  A file whose
+    bytes can affect the report must be present in the payload and therefore
+    remains exact mutation evidence.
+    """
     payload = _relation_item_payload(item)
     paths = {}
 
@@ -928,6 +948,7 @@ def _relation_item_content_identity(item):
     membership = {
         "payload:" + canonical_json_sha256(startup_json_safe(payload))
     }
+    membership_file_keys = set()
     seen_directories = set()
     entry_count = 0
     for directory in directories:
@@ -935,14 +956,22 @@ def _relation_item_content_identity(item):
         if directory_key in seen_directories or not directory.is_dir():
             continue
         seen_directories.add(directory_key)
-        try:
-            entries = sorted(
-                directory.iterdir(), key=lambda path: path.name.casefold()
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                f"Blender relation inputs could not enumerate {directory}: {exc}"
-            ) from exc
+        entries = (
+            directory_memo.get(directory_key)
+            if directory_memo is not None else None
+        )
+        if entries is None:
+            try:
+                entries = tuple(sorted(
+                    directory.iterdir(), key=lambda path: path.name.casefold()
+                ))
+            except OSError as exc:
+                raise RuntimeError(
+                    "Blender relation inputs could not enumerate "
+                    f"{directory}: {exc}"
+                ) from exc
+            if directory_memo is not None:
+                directory_memo[directory_key] = entries
         entry_count += len(entries)
         if entry_count > 4_096:
             raise BoundedDiscoveryError(
@@ -957,32 +986,202 @@ def _relation_item_content_identity(item):
             ):
                 key = startup_path_key(candidate)
                 membership.add(key)
-                paths[key] = candidate
-    return content_identity(
-        paths.values(),
-        membership=membership,
-        max_files=2_048,
-    )
+                membership_file_keys.add(key)
+    if exact_all:
+        identity = content_identity(
+            paths.values(),
+            membership=membership,
+            memo=content_memo,
+            max_files=2_048,
+            exact=True,
+            workers=8,
+        )
+        identity["exact_content_file_count"] = len(paths)
+        identity["sampled_content_file_count"] = 0
+        identity["evidence_scope"] = (
+            "full-payload-content-plus-bounded-directory-membership-v1"
+        )
+    else:
+        exact_paths = [
+            path for path in paths.values()
+            if path.suffix.casefold() not in RELATION_BULK_IMAGE_SUFFIXES
+        ]
+        sampled_paths = [
+            path for path in paths.values()
+            if path.suffix.casefold() in RELATION_BULK_IMAGE_SUFFIXES
+        ]
+        exact_identity = content_identity(
+            exact_paths,
+            membership=membership,
+            memo=content_memo,
+            max_files=2_048,
+            exact=True,
+            workers=8,
+        )
+        sampled_identity = content_identity(
+            sampled_paths,
+            memo=content_memo,
+            max_files=2_048,
+            exact=False,
+            workers=8,
+        )
+        identity = {
+            "algorithm": "sha256-of-hybrid-content-keys-v1",
+            "sha256": canonical_json_sha256({
+                "exact": exact_identity["sha256"],
+                "sampled": sampled_identity["sha256"],
+                "membership": sorted(membership),
+            }),
+            "file_count": (
+                exact_identity["file_count"]
+                + sampled_identity["file_count"]
+            ),
+            "files": (
+                exact_identity["files"] + sampled_identity["files"]
+            ),
+            "membership": sorted(membership),
+            "exact_content_file_count": len(exact_paths),
+            "sampled_content_file_count": len(sampled_paths),
+            "evidence_scope": (
+                "full-semantic-content-plus-sampled-bulk-images-plus-"
+                "bounded-directory-membership-v1"
+            ),
+        }
+    identity["payload_content_file_count"] = len(paths)
+    identity["membership_file_count"] = len(membership_file_keys)
+    return identity
 
 
-def item_has_current_live_evidence(item):
+def item_has_current_live_evidence(
+        item, *, content_memo=None, directory_memo=None):
     """True only when a row's current bytes reproduce its live audit token."""
     expected = item.get("_gui_live_evidence")
     if not isinstance(expected, dict) or not expected.get("sha256"):
         return False
     try:
-        current = _relation_item_content_identity(item)
+        current = _relation_item_content_identity(
+            item,
+            content_memo=content_memo,
+            directory_memo=directory_memo,
+        )
     except Exception:
         return False
     return current.get("sha256") == expected.get("sha256")
 
 
-def require_current_live_evidence(item):
-    if not item_has_current_live_evidence(item):
+def require_current_live_evidence(
+        item, *, content_memo=None, exact_content_memo=None,
+        directory_memo=None):
+    if not item_has_current_live_evidence(
+        item,
+        content_memo=content_memo,
+        directory_memo=directory_memo,
+    ):
         raise RuntimeError(
             "선택한 행의 현재 입력이 live 검사 증거와 일치하지 않습니다. "
             "다시 검사한 뒤 실행하세요."
         )
+    # Bulk image bytes do not change relation semantics, but they are mutation
+    # inputs.  Capture their full current identity inside the execution worker
+    # immediately before any write/external job; this exact evidence is never
+    # replaced by the sampled startup/cache identity.
+    item["_gui_exact_mutation_evidence"] = _relation_item_content_identity(
+        item,
+        content_memo=exact_content_memo,
+        directory_memo=directory_memo,
+        exact_all=True,
+    )
+    return True
+
+
+def mutation_semantic_digest(item):
+    """Digest every report field from which mutation plans are derived."""
+    return canonical_json_sha256(
+        startup_json_safe(_relation_item_payload(item))
+    )
+
+
+def seal_exact_mutation_baseline(items, *, action, plan_payload=None):
+    """Seal current exact inputs after a selected-item semantic re-audit."""
+    content_memo = {}
+    exact_content_memo = {}
+    directory_memo = {}
+    rows = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        require_current_live_evidence(
+            item,
+            content_memo=content_memo,
+            exact_content_memo=exact_content_memo,
+            directory_memo=directory_memo,
+        )
+        identity = item["_gui_exact_mutation_evidence"]
+        rows.append({
+            "item_key": (
+                startup_path_key(item.get("folder") or ""),
+                str(item.get("name") or "").casefold(),
+            ),
+            "semantic_sha256": mutation_semantic_digest(item),
+            "exact_sha256": identity["sha256"],
+            "file_count": identity.get("file_count", 0),
+            "membership": list(identity.get("membership") or ()),
+            "item": item,
+        })
+    public_rows = [
+        {key: value for key, value in row.items() if key != "item"}
+        for row in rows
+    ]
+    plan_digest = canonical_json_sha256(startup_json_safe({
+        "action": str(action),
+        "items": public_rows,
+        "plan": plan_payload,
+    }))
+    return {
+        "schema_version": 1,
+        "authority": "selected_current_reaudit_exact_baseline_v1",
+        "action": str(action),
+        "plan_digest": plan_digest,
+        "items": rows,
+        "plan_payload": startup_json_safe(plan_payload),
+        "writes_before_match": 0,
+    }
+
+
+def require_exact_mutation_baseline(baseline):
+    """Re-hash a sealed baseline immediately before the first write."""
+    if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
+        raise RuntimeError("exact mutation baseline is unavailable")
+    expected_public_rows = []
+    content_memo = {}
+    directory_memo = {}
+    for row in baseline.get("items") or ():
+        item = row.get("item")
+        if not isinstance(item, dict):
+            raise RuntimeError("exact mutation baseline item is unavailable")
+        current = _relation_item_content_identity(
+            item,
+            content_memo=content_memo,
+            directory_memo=directory_memo,
+            exact_all=True,
+        )
+        if current.get("sha256") != row.get("exact_sha256"):
+            raise RuntimeError(
+                "선택 작업 입력이 exact 계획 생성 후 변경되었습니다. "
+                "production 파일을 쓰지 않고 중단합니다."
+            )
+        expected_public_rows.append({
+            key: value for key, value in row.items() if key != "item"
+        })
+    current_plan_digest = canonical_json_sha256(startup_json_safe({
+        "action": baseline.get("action"),
+        "items": expected_public_rows,
+        "plan": baseline.get("plan_payload"),
+    }))
+    if current_plan_digest != baseline.get("plan_digest"):
+        raise RuntimeError("exact mutation plan seal is invalid")
     return True
 
 
@@ -1029,10 +1228,93 @@ def cache_blender_connection_rows(
     completed = 0
     cache_hits = 0
     cache_updates = []
+    changed_during_scan = 0
+    first_pass_content_memo = {}
+    first_pass_directory_memo = {}
+    final_pass_content_memo = {}
+    final_pass_directory_memo = {}
+
+    def update_metrics(status):
+        if metrics is None:
+            return
+        unique_file_rows = {
+            str(row.get("path") or "").casefold(): row
+            for _namespace, identity in identities.values()
+            for row in identity.get("files") or ()
+            if row.get("path")
+        }
+        membership_paths = {
+            member
+            for _namespace, identity in identities.values()
+            for member in identity.get("membership") or ()
+            if not str(member).startswith("payload:")
+        }
+        metrics.update({
+            "status": str(status),
+            "item_count": len(items),
+            "completed_item_count": completed,
+            "cache_hits": cache_hits,
+            "cache_misses": len(misses),
+            "content_file_count": sum(
+                identity["file_count"]
+                for _namespace, identity in identities.values()
+            ),
+            "unique_content_file_count": len(unique_file_rows),
+            "content_bytes": sum(
+                row.get("size", 0)
+                for _namespace, identity in identities.values()
+                for row in identity.get("files") or ()
+            ),
+            "unique_content_bytes": sum(
+                row.get("size", 0) for row in unique_file_rows.values()
+            ),
+            "membership_file_count": sum(
+                identity.get("membership_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "unique_membership_file_count": len(membership_paths),
+            "changed_during_scan": changed_during_scan,
+            "first_pass_physical_content_reads": len(
+                first_pass_content_memo
+            ),
+            "first_pass_directory_enumerations": len(
+                first_pass_directory_memo
+            ),
+            "final_pass_physical_content_reads": len(
+                final_pass_content_memo
+            ),
+            "final_pass_directory_enumerations": len(
+                final_pass_directory_memo
+            ),
+            "content_identity_algorithm": (
+                "sha256-of-hybrid-content-keys-v1"
+            ),
+            "content_identity_scope": (
+                "full-semantic-content-plus-sampled-bulk-images-plus-"
+                "bounded-directory-membership-v1"
+            ),
+            "exact_content_file_count": sum(
+                identity.get("exact_content_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "sampled_content_file_count": sum(
+                identity.get("sampled_content_file_count", 0)
+                for _namespace, identity in identities.values()
+            ),
+            "mutation_authority_algorithm": (
+                "sha256-of-full-content-keys-v1"
+            ),
+        })
+
     for item in items:
         if cancel_check is not None and cancel_check():
+            update_metrics("canceled")
             raise RuntimeError("PCG Blender relation calculation cancelled")
-        identity = _relation_item_content_identity(item)
+        identity = _relation_item_content_identity(
+            item,
+            content_memo=first_pass_content_memo,
+            directory_memo=first_pass_directory_memo,
+        )
         namespace = startup_path_key(item.get("folder") or item.get("name") or "")
         identities[id(item)] = (namespace, identity)
         cached = cache.get(namespace, identity["sha256"])
@@ -1056,23 +1338,40 @@ def cache_blender_connection_rows(
             executor.submit(blender_connection_rows, item): item
             for item in misses
         }
+        calculated_rows = {}
         for future in as_completed(futures):
             if cancel_check is not None and cancel_check():
                 for pending in futures:
                     pending.cancel()
+                update_metrics("canceled")
                 raise RuntimeError("PCG Blender relation calculation cancelled")
             item = futures[future]
-            rows = future.result()
+            try:
+                calculated_rows[id(item)] = future.result()
+            except Exception:
+                update_metrics("error")
+                raise
+        # Re-observe every miss only after all relation calculations finish.
+        # Shared memos avoid re-hashing/re-enumerating common inputs once per
+        # row while preserving a distinct post-compute snapshot.
+        for item in misses:
+            if cancel_check is not None and cancel_check():
+                update_metrics("canceled")
+                raise RuntimeError("PCG Blender relation calculation cancelled")
             namespace, before = identities[id(item)]
-            # Recapture without the first-pass memo.  A file changed while
-            # relation calculation ran must fail closed rather than publish a
-            # mixed-generation row.
-            after = _relation_item_content_identity(item)
+            after = _relation_item_content_identity(
+                item,
+                content_memo=final_pass_content_memo,
+                directory_memo=final_pass_directory_memo,
+            )
             if before["sha256"] != after["sha256"]:
+                changed_during_scan += 1
+                update_metrics("changed_during_scan")
                 raise RuntimeError(
                     "Blender relation inputs changed during calculation: "
                     + str(item.get("folder") or item.get("name") or "")
                 )
+            rows = calculated_rows[id(item)]
             item["_gui_blender_connection_rows"] = rows
             item["_gui_live_evidence"] = after
             cache_updates.append((namespace, after["sha256"], rows))
@@ -1081,16 +1380,7 @@ def cache_blender_connection_rows(
                 progress_callback(completed, len(items), item)
     if cache_updates:
         cache.put_many(cache_updates)
-    if metrics is not None:
-        metrics.update({
-            "item_count": len(items),
-            "cache_hits": cache_hits,
-            "cache_misses": len(misses),
-            "content_file_count": sum(
-                identity["file_count"]
-                for _namespace, identity in identities.values()
-            ),
-        })
+    update_metrics("ok")
     return report
 
 
@@ -1301,6 +1591,52 @@ def step2_target_payload(job):
     return {"version": 1, "targets": targets}
 
 
+def step2_exact_plan_payload(jobs, push_spm):
+    """Return the current command/producer scope sealed before Step 2 writes."""
+    return {
+        "push_spm": bool(push_spm),
+        "jobs": [
+            {
+                "base": str(job.get("base") or ""),
+                "albedo": str(job.get("albedo") or ""),
+                "alpha": str(job.get("alpha") or ""),
+                "blend_out": str(job.get("blend_out") or ""),
+                "reuse_existing_blend": bool(
+                    job.get("reuse_existing_blend")
+                ),
+                "target_payload": step2_target_payload(job),
+            }
+            for job in jobs or ()
+        ],
+    }
+
+
+def step3_exact_plan_payload(plan):
+    """Return Step 3's producer/consumer scope without mutable UI objects."""
+    return {
+        "jobs": [
+            {
+                key: value
+                for key, value in job.items()
+                if key not in {"item", "items"}
+            }
+            for job in (plan or {}).get("jobs") or ()
+        ],
+        "sync_files": [
+            str(path) for path in (plan or {}).get("sync_files") or ()
+        ],
+        "exact_step3_spms": [
+            str(path) for path in (plan or {}).get("exact_step3_spms") or ()
+        ],
+        "force_unreal_verify": bool(
+            (plan or {}).get("force_unreal_verify")
+        ),
+        "eligible_row_keys": sorted(
+            list((plan or {}).get("eligible_row_keys") or ())
+        ),
+    }
+
+
 def existing_leaf_blend(source):
     """Return the first audited blend that still exists on disk."""
     for value in source.get("atlas_blends") or []:
@@ -1486,7 +1822,13 @@ class App:
         self.startup_latency = StartupLatencyTracker(
             selected_perf=getattr(
                 root, "_speedtree_tab_selected_perf", time.perf_counter()
-            )
+            ),
+            source_provenance={
+                "path": str(GUI_SOURCE_PATH),
+                "sha256": GUI_SOURCE_SHA256,
+                "module_loaded_at": GUI_MODULE_LOADED_AT,
+                "process_id": os.getpid(),
+            },
         )
         self.cfg = load_config()
         self.report = None
@@ -1502,6 +1844,10 @@ class App:
         self.sync_state = {"entries": {}}
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        self._sync_state_migration_failed = False
+        self._initial_relation_finished = False
+        self._initial_relation_ready = False
+        self._pending_initial_sync_result = None
         self.worker = None
         self._busy = False
         self.shared_queue_runtime = SharedQueueRuntime(
@@ -1519,7 +1865,9 @@ class App:
         root.geometry("1320x820")
         self._build_ui()
         self._set_busy(True)
+        snapshot_view_started = time.perf_counter()
         snapshot_painted = self._load_initial_display_snapshot()
+        snapshot_view_seconds = time.perf_counter() - snapshot_view_started
         self._had_initial_snapshot = bool(snapshot_painted)
         snapshot_state = getattr(self, "_initial_snapshot_state", "missing")
         self.startup_latency.mark(
@@ -1529,7 +1877,20 @@ class App:
                 "row_count": len((self.report or {}).get("items") or ()),
                 "painted": bool(snapshot_painted),
             },
-            details={"cache_state": snapshot_state},
+            details={
+                "cache_state": snapshot_state,
+                "view_apply_seconds": round(snapshot_view_seconds, 6),
+            },
+        )
+        self.startup_latency.milestone(
+            "cached_board_view_applied",
+            status="painted" if snapshot_painted else snapshot_state,
+            counts={
+                "row_count": len((self.report or {}).get("items") or ()),
+            },
+            details={
+                "view_apply_seconds": round(snapshot_view_seconds, 6),
+            },
         )
         if not snapshot_painted:
             self.status_var.set("초기 검사 중...")
@@ -2004,7 +2365,15 @@ class App:
     def _run_add_blend_target_spm(
         self, blend, selected_path, evidence_items=None
     ):
-        self._validate_live_mutation_items(evidence_items or ())
+        baseline = self._reaudit_and_seal_mutation_items(
+            evidence_items or (),
+            action="atlas_target_add",
+            plan_payload={
+                "blend": str(blend),
+                "target_spm": str(selected_path),
+            },
+        )
+        require_exact_mutation_baseline(baseline)
         targets = self._current_targets_for_blend(blend)
         keys = {
             os.path.normcase(str(path.absolute())).casefold()
@@ -2119,7 +2488,15 @@ class App:
     def _run_remove_blend_target_spms(
         self, blend, remove_paths, evidence_items=None
     ):
-        self._validate_live_mutation_items(evidence_items or ())
+        baseline = self._reaudit_and_seal_mutation_items(
+            evidence_items or (),
+            action="atlas_target_remove",
+            plan_payload={
+                "blend": str(blend),
+                "target_spms": [str(path) for path in remove_paths],
+            },
+        )
+        require_exact_mutation_baseline(baseline)
         report_path = TOOL_DIR / f".atlas_target_remove_{os.getpid()}_{threading.get_ident()}.json"
         command = atlas_blender_command(self.cfg.get("blender_exe", "")) + [
             "--python", str(TOOL_DIR / "jobs" / "atlas_target_remove_job.py"), "--",
@@ -2131,8 +2508,10 @@ class App:
         data = None
         error = None
         try:
-            result = subprocess.run(
+            result = owned_run(
                 command,
+                source="pcg_st9_texture_batch.pcg_texture_gui.remove_atlas_targets",
+                run_factory=subprocess.run,
                 capture_output=True,
                 text=True,
                 timeout=self.cfg.get("atlas_job_timeout", 1800),
@@ -2287,6 +2666,9 @@ class App:
         """Run only the first read-only audit off the Tk main thread."""
         generation, cancel_event = self._begin_refresh_generation()
         self._initial_refreshing = True
+        self._initial_relation_finished = False
+        self._initial_relation_ready = False
+        self._pending_initial_sync_result = None
         self._set_busy(True)
         self.status_var.set("초기 검사 중...")
         self.cfg["tree_root"] = self.root_var.get()
@@ -2346,6 +2728,7 @@ class App:
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
                     item_callback=first_live_item,
+                    cancel_check=cancel_event.is_set,
                 )
             except Exception as exc:
                 error = exc
@@ -2396,6 +2779,23 @@ class App:
             )
             return
         mark_blender_connection_rows_pending(report)
+        tracker = getattr(self, "startup_latency", None)
+        if tracker is not None:
+            audit_timing = report.get("startup_timing") or {}
+            tracker.milestone(
+                "primary_compute_complete",
+                counts={
+                    "folder_count": len(report.get("items") or ()),
+                },
+                details={
+                    "audit_wall_seconds": audit_timing.get("wall_seconds"),
+                    "cache_state": audit_timing.get("cache_state"),
+                    "session_cache_metrics": audit_timing.get(
+                        "session_cache_metrics"
+                    ) or {},
+                },
+            )
+        primary_view_started = time.perf_counter()
         self.report = report
         self._display_only_snapshot = False
         self.texplan_cache.clear()
@@ -2407,6 +2807,17 @@ class App:
         tracker = getattr(self, "startup_latency", None)
         if tracker is not None:
             audit_timing = report.get("startup_timing") or {}
+            tracker.milestone(
+                "primary_view_applied",
+                counts={
+                    "folder_count": len(report.get("items") or ()),
+                },
+                details={
+                    "view_apply_seconds": round(
+                        time.perf_counter() - primary_view_started, 6
+                    ),
+                },
+            )
             tracker.mark(
                 "primary_live_audit",
                 counts={
@@ -2435,14 +2846,73 @@ class App:
         def relation_worker():
             failure = None
             relation_metrics = {}
+            persistence_receipt = {
+                "cache": {"status": "not_attempted"},
+                "projection": {"status": "not_attempted"},
+            }
+            publication_allowed = lambda: self._refresh_generation_is_current(
+                generation, cancel_event
+            )
+
+            # These are non-authoritative memoization/display artifacts. Save
+            # them before relation work so a safe changed-during-scan failure
+            # does not throw away minutes of completed primary computation.
+            persist_started = time.perf_counter()
             try:
-                # Persist only a display snapshot.  It can paint the next
-                # launch but can never authorize a mutation.
-                write_board_display_snapshot(
+                written = save_spm_analysis_cache(
+                    publish_check=publication_allowed,
+                )
+                persistence_receipt["cache"] = {
+                    "status": (
+                        "written" if written else
+                        "canceled" if not publication_allowed() else
+                        "unchanged"
+                    ),
+                    "file_count": len(written or ()),
+                    "wall_seconds": round(
+                        time.perf_counter() - persist_started, 6
+                    ),
+                }
+            except Exception as exc:
+                persistence_receipt["cache"] = {
+                    "status": "warning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "wall_seconds": round(
+                        time.perf_counter() - persist_started, 6
+                    ),
+                }
+
+            projection_metrics = {}
+            projection_started = time.perf_counter()
+            try:
+                snapshot_path = write_board_display_snapshot(
                     report,
                     cfg,
                     pcg_targets=pcg_targets,
+                    metrics=projection_metrics,
+                    publish_check=publication_allowed,
                 )
+                persistence_receipt["projection"] = {
+                    **projection_metrics,
+                    "status": (
+                        "written" if snapshot_path else
+                        projection_metrics.get("reason", "not_written")
+                    ),
+                    "wall_seconds": round(
+                        time.perf_counter() - projection_started, 6
+                    ),
+                }
+            except Exception as exc:
+                persistence_receipt["projection"] = {
+                    **projection_metrics,
+                    "status": "warning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "wall_seconds": round(
+                        time.perf_counter() - projection_started, 6
+                    ),
+                }
+
+            try:
 
                 def relation_progress(completed, total, item):
                     message = (
@@ -2462,11 +2932,12 @@ class App:
                     ),
                     metrics=relation_metrics,
                 )
-                # Opening the board is a read-only live audit. Receipt
-                # snapshots are persisted after an actual batch/completion
-                # refresh, not while the user is waiting for the first table.
-                save_spm_analysis_cache()
-                self.sync_state = load_sync_state(migrate=False)
+                tracker = getattr(self, "startup_latency", None)
+                if tracker is not None:
+                    tracker.milestone(
+                        "relation_compute_complete",
+                        counts=relation_metrics,
+                    )
             except Exception as exc:
                 failure = exc
             if generation is not None and not self._refresh_generation_is_current(
@@ -2476,12 +2947,14 @@ class App:
             self.root.after(
                 0,
                 lambda result=report, relation_error=failure,
-                metrics=dict(relation_metrics):
+                metrics=dict(relation_metrics),
+                persistence=dict(persistence_receipt):
                     self._initial_refresh_done(
                         result,
                         relation_error,
                         stage="relation",
                         relation_metrics=metrics,
+                        persistence_receipt=persistence,
                         generation=generation,
                         cancel_event=cancel_event,
                     ),
@@ -2489,6 +2962,10 @@ class App:
 
         self.worker = threading.Thread(target=relation_worker, daemon=True)
         self.worker.start()
+        # Receipt migration is an independent read/verification tail.  Run it
+        # beside relation calculation; its Tk projection is coalesced with the
+        # relation projection when migration wins the race.
+        self._start_sync_state_migration()
 
     def _initial_refresh_done(
         self,
@@ -2497,6 +2974,7 @@ class App:
         *,
         stage="relation",
         relation_metrics=None,
+        persistence_receipt=None,
         generation=None,
         cancel_event=None,
     ):
@@ -2505,19 +2983,49 @@ class App:
             generation, cancel_event
         ):
             return
+        pending_sync = None
+        if stage == "relation":
+            self._initial_relation_finished = True
+            self._initial_relation_ready = error is None
+            pending_sync = getattr(
+                self, "_pending_initial_sync_result", None
+            )
+            if (
+                error is None
+                and pending_sync is not None
+                and pending_sync[1] is None
+            ):
+                # Include an already-computed sync projection in the relation
+                # Treeview rebuild instead of deleting/inserting every row a
+                # third time.
+                self.sync_state = pending_sync[0]
         self.worker = None
         self._initial_refreshing = False
         tracker = getattr(self, "startup_latency", None)
         if tracker is not None:
             if stage == "relation":
+                tracker.milestone(
+                    "relation_compute_complete",
+                    status="ok" if error is None else "error",
+                    counts=relation_metrics or {},
+                    details=(
+                        None if error is None else {
+                            "error": f"{type(error).__name__}: {error}"
+                        }
+                    ),
+                )
                 tracker.mark(
                     "blender_relations",
                     status="ok" if error is None else "error",
                     counts=relation_metrics or {},
-                    details=(
-                        None if error is None
-                        else {"error": f"{type(error).__name__}: {error}"}
-                    ),
+                    details={
+                        **(
+                            {} if error is None else {
+                                "error": f"{type(error).__name__}: {error}"
+                            }
+                        ),
+                        "persistence": dict(persistence_receipt or {}),
+                    },
                 )
                 if error is not None:
                     tracker.finish_early("relation_error", error=error)
@@ -2542,6 +3050,7 @@ class App:
             self._display_only_snapshot = True
             self._lock_mutation_controls()
         else:
+            relation_view_started = time.perf_counter()
             self.report = report
             self._display_only_snapshot = False
             persistence = (
@@ -2559,10 +3068,41 @@ class App:
             self.populate()
             self._update_summary()
             self._set_busy(False)
-        if error is None:
-            self._start_sync_state_migration()
+            if tracker is not None:
+                tracker.milestone(
+                    "relation_view_applied",
+                    counts={
+                        "folder_count": len(report.get("items") or ()),
+                    },
+                    details={
+                        "view_apply_seconds": round(
+                            time.perf_counter() - relation_view_started, 6
+                        ),
+                    },
+                )
+                tracker.milestone(
+                    "mutation_usable_ready",
+                    counts={
+                        "folder_count": len(report.get("items") or ()),
+                    },
+                    details={"live_relation_evidence": True},
+                )
+        if stage == "relation" and pending_sync is not None:
+            self._pending_initial_sync_result = None
+            self._apply_sync_state_migration(
+                *pending_sync,
+                view_already_applied=(
+                    error is None and pending_sync[1] is None
+                ),
+            )
+        for name, receipt in (persistence_receipt or {}).items():
+            if receipt.get("status") == "warning":
+                self.log(
+                    f"[초기검사 캐시 경고] {name}: "
+                    f"{receipt.get('error', '저장 실패')}"
+                )
         # A refresh requested mid-initial-scan must not be dropped. Start the
-        # receipt migration first; refresh() will queue behind it when needed
+        # already-running receipt migration first; refresh() queues behind it
         # so two filesystem audits never race each other.
         if getattr(self, "_pending_refresh", False):
             self._pending_refresh = False
@@ -2584,11 +3124,16 @@ class App:
 
     def _start_sync_state_migration(self):
         """Verify legacy success reports without delaying the first table paint."""
+        if (
+            getattr(self, "_initial_relation_finished", False)
+            and not getattr(self, "_initial_relation_ready", False)
+        ):
+            return
         if (self.sync_state or {}).get("migration_complete"):
             tracker = getattr(self, "startup_latency", None)
             if tracker is not None:
-                tracker.mark(
-                    "sync_migration",
+                tracker.milestone(
+                    "sync_compute_complete",
                     status="cached",
                     counts={
                         "entry_count": len(
@@ -2596,10 +3141,14 @@ class App:
                         )
                     },
                 )
+            self._sync_state_migration_done(
+                self.sync_state, status="cached"
+            )
             return
         worker = getattr(self, "sync_migration_worker", None)
         if worker is not None and worker.is_alive():
             return
+        self._sync_state_migration_failed = False
         self._sync_state_migrating = True
         self.status_var.set("기존 Unreal 동기화 기록 확인 중…")
 
@@ -2609,6 +3158,20 @@ class App:
                 error = None
             except Exception as exc:
                 state, error = None, exc
+            tracker = getattr(self, "startup_latency", None)
+            if tracker is not None:
+                tracker.milestone(
+                    "sync_compute_complete",
+                    status="ok" if error is None else "error",
+                    counts={
+                        "entry_count": len((state or {}).get("entries") or {})
+                    },
+                    details=(
+                        None if error is None else {
+                            "error": f"{type(error).__name__}: {error}"
+                        }
+                    ),
+                )
             self.root.after(
                 0,
                 lambda result=state, failure=error:
@@ -2620,14 +3183,41 @@ class App:
         )
         self.sync_migration_worker.start()
 
-    def _sync_state_migration_done(self, state, error=None):
+    def _sync_state_migration_done(self, state, error=None, status=None):
         self.sync_migration_worker = None
         self._sync_state_migrating = False
+        if (
+            getattr(self, "_initial_refreshing", False)
+            and not getattr(self, "_initial_relation_finished", False)
+        ):
+            self._pending_initial_sync_result = (state, error, status)
+            return
+        self._apply_sync_state_migration(state, error, status)
+
+    def _apply_sync_state_migration(
+        self,
+        state,
+        error=None,
+        status=None,
+        *,
+        view_already_applied=False,
+    ):
+        """Apply a verified sync state after relation authority is ready."""
+        if not getattr(self, "_initial_relation_ready", False):
+            if error is not None:
+                self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
+            if getattr(
+                self, "_pending_refresh_after_sync_migration", False
+            ):
+                self._pending_refresh_after_sync_migration = False
+                self.refresh()
+            return
         tracker = getattr(self, "startup_latency", None)
+        phase_status = status or ("ok" if error is None else "error")
         if tracker is not None:
             tracker.mark(
                 "sync_migration",
-                status="ok" if error is None else "error",
+                status=phase_status,
                 counts={
                     "entry_count": len((state or {}).get("entries") or {})
                 },
@@ -2637,12 +3227,56 @@ class App:
                 ),
             )
         if error is not None:
+            self._sync_state_migration_failed = True
             self.log(f"기존 Unreal 동기화 기록 확인 실패: {error}")
             self.status_var.set("기존 Unreal 기록 확인 실패 · ③에서 다시 확인")
+            self._update_step3_button()
+            if getattr(
+                self, "_pending_refresh_after_sync_migration", False
+            ):
+                self._pending_refresh_after_sync_migration = False
+                self.refresh()
             return
+        self._sync_state_migration_failed = False
         self.sync_state = state
-        self.populate()
-        self._update_summary()
+        sync_view_started = time.perf_counter()
+        if not view_already_applied:
+            self.populate()
+            self._update_summary()
+        sync_view_seconds = (
+            0.0 if view_already_applied
+            else time.perf_counter() - sync_view_started
+        )
+        if tracker is not None:
+            tracker.milestone(
+                "sync_view_applied",
+                status=phase_status,
+                counts={
+                    "entry_count": len((state or {}).get("entries") or {})
+                },
+                details={
+                    "view_apply_seconds": round(
+                        sync_view_seconds, 6
+                    ),
+                    "coalesced_with_relation_view": bool(
+                        view_already_applied
+                    ),
+                },
+            )
+            tracker.milestone(
+                "usable_ready_all",
+                status=phase_status,
+                counts={
+                    "folder_count": len((self.report or {}).get("items") or ()),
+                    "sync_entry_count": len(
+                        (state or {}).get("entries") or {}
+                    ),
+                },
+                details={
+                    "live_relation_evidence": True,
+                    "sync_state_applied": True,
+                },
+            )
         count = len((state or {}).get("entries") or {})
         self.status_var.set(f"기존 Unreal 동기화 기록 확인 완료 · {count}장")
         if getattr(self, "_pending_refresh_after_sync_migration", False):
@@ -2704,11 +3338,23 @@ class App:
                     cfg,
                     pcg_targets=pcg_targets,
                     progress_callback=progress,
+                    cancel_check=cancel_event.is_set,
+                )
+                publication_allowed = (
+                    lambda: self._refresh_generation_is_current(
+                        generation, cancel_event
+                    )
+                )
+                # Preserve current content-bound memoization even when the
+                # following relation verification safely fails closed.
+                save_spm_analysis_cache(
+                    publish_check=publication_allowed,
                 )
                 write_board_display_snapshot(
                     report,
                     cfg,
                     pcg_targets=pcg_targets,
+                    publish_check=publication_allowed,
                 )
 
                 def relation_progress(completed, total, item):
@@ -2726,10 +3372,6 @@ class App:
                     progress_callback=relation_progress,
                     cancel_check=cancel_event.is_set,
                 )
-                # Manual "rescan" is also read-only. Keep receipt writes on
-                # the mutation/completion path so refreshing the board cannot
-                # spend minutes serializing every asset contract.
-                save_spm_analysis_cache()
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
                 error = exc
@@ -3398,12 +4040,88 @@ class App:
     @staticmethod
     def _validate_live_mutation_items(items):
         seen = set()
+        content_memo = {}
+        exact_content_memo = {}
+        directory_memo = {}
         for item in items:
             if not isinstance(item, dict) or id(item) in seen:
                 continue
             seen.add(id(item))
-            require_current_live_evidence(item)
+            require_current_live_evidence(
+                item,
+                content_memo=content_memo,
+                exact_content_memo=exact_content_memo,
+                directory_memo=directory_memo,
+            )
         return True
+
+    @staticmethod
+    def _mutation_item_key(item):
+        return startup_path_key((item or {}).get("folder") or "")
+
+    def _reaudit_and_seal_mutation_items(
+            self, items, *, action, plan_payload=None):
+        """Re-audit selected folders and seal exact current plan inputs.
+
+        The startup hybrid evidence is display/readiness authority only.  A
+        mutating worker reaches this gate after obtaining its shared-queue
+        turn.  The current semantic report must reproduce the exact mutation
+        projection used by the queued plan; only then are all selected payload
+        bytes full-hashed and sealed for a final pre-write comparison.
+        """
+        selected = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = self._mutation_item_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(item)
+        if not selected:
+            return seal_exact_mutation_baseline(
+                (), action=action, plan_payload=plan_payload
+            )
+
+        target_mesh_names = sorted({
+            str(status.get("mesh_name") or "")
+            for item in selected
+            for status in item.get("target_spm_statuses") or ()
+            if str(status.get("mesh_name") or "").strip()
+        })
+        current_report = make_report(
+            self.cfg,
+            targets=[item["folder"] for item in selected],
+            target_mesh_names=target_mesh_names or None,
+        )
+        cache_blender_connection_rows(current_report)
+        current_by_key = {
+            self._mutation_item_key(item): item
+            for item in current_report.get("items") or ()
+        }
+        current_items = []
+        for stale_item in selected:
+            key = self._mutation_item_key(stale_item)
+            current_item = current_by_key.get(key)
+            if current_item is None:
+                raise RuntimeError(
+                    "선택 작업의 current affected-folder audit 결과가 없습니다. "
+                    "production 파일을 쓰지 않고 중단합니다."
+                )
+            if mutation_semantic_digest(current_item) != mutation_semantic_digest(
+                stale_item
+            ):
+                raise RuntimeError(
+                    "선택 작업 계획이 current affected-folder audit와 다릅니다. "
+                    "다시 검사한 뒤 실행하세요. production 파일은 쓰지 않았습니다."
+                )
+            current_items.append(current_item)
+        return seal_exact_mutation_baseline(
+            current_items,
+            action=action,
+            plan_payload=plan_payload,
+        )
 
     def _texplan_rows(self, item):
         if not hasattr(self, "texplan_errors"):
@@ -3957,9 +4675,22 @@ class App:
         self.worker.start()
 
     def _run_prepare(self, rows):
-        self._validate_live_mutation_items(
-            row.get("item") for row in rows
+        plan_payload = {
+            "rows": [
+                {
+                    "folder": str(row.get("item", {}).get("folder") or ""),
+                    "mesh": str(row.get("mesh") or ""),
+                    "exclude": list(row.get("exclude") or ()),
+                }
+                for row in rows
+            ]
+        }
+        baseline = self._reaudit_and_seal_mutation_items(
+            (row.get("item") for row in rows),
+            action="step1_prepare",
+            plan_payload=plan_payload,
         )
+        require_exact_mutation_baseline(baseline)
         done = 0
         failed = 0
         for row in rows:
@@ -4204,6 +4935,14 @@ class App:
         if getattr(self, "_sync_state_migrating", False):
             self.btn_step3.configure(
                 text="③ 기존 Unreal 동기화 기록 확인 중…",
+                state="disabled",
+            )
+            if hasattr(self, "btn_step3_force"):
+                self.btn_step3_force.configure(state="disabled")
+            return
+        if getattr(self, "_sync_state_migration_failed", False):
+            self.btn_step3.configure(
+                text="③ 기존 Unreal 기록 확인 실패 · 다시 검사",
                 state="disabled",
             )
             if hasattr(self, "btn_step3_force"):
@@ -4465,11 +5204,16 @@ class App:
         self.worker.start()
 
     def _run_step2(self, jobs, push_spm):
-        self._validate_live_mutation_items(
-            item
-            for job in jobs
-            for item in job.get("items") or [job.get("item")]
+        baseline = self._reaudit_and_seal_mutation_items(
+            (
+                item
+                for job in jobs
+                for item in job.get("items") or [job.get("item")]
+            ),
+            action="step2_atlas",
+            plan_payload=step2_exact_plan_payload(jobs, push_spm),
         )
+        require_exact_mutation_baseline(baseline)
         from pcg_texture_common import REPORT_DIR
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         done = failed = 0
@@ -4505,7 +5249,10 @@ class App:
                 cmd += ["--target-map-json", str(target_map_path)]
                 cmd.append("--build-spm")
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True,
+                result = owned_run(cmd,
+                                        source="pcg_st9_texture_batch.pcg_texture_gui.atlas_job",
+                                        run_factory=subprocess.run,
+                                        capture_output=True, text=True,
                                         encoding="utf-8", errors="replace",
                                         timeout=self.cfg.get("atlas_job_timeout", 1800),
                                         creationflags=0x08000000)
@@ -5281,7 +6028,13 @@ class App:
                 for item in job.get("items") or [job.get("item")]
                 if isinstance(item, dict)
             ]
-        return self._validate_live_mutation_items(items)
+        baseline = self._reaudit_and_seal_mutation_items(
+            items,
+            action="step3_texture",
+            plan_payload=step3_exact_plan_payload(plan),
+        )
+        plan["_exact_mutation_baseline"] = baseline
+        return baseline
 
     def _build_step3_execution_plan(self):
         """Perform the expensive Step 3 preflight without touching Tk."""
@@ -5445,6 +6198,10 @@ class App:
             self.log(f"[③ 실행 계획 실패] {error}")
             return
 
+        exact_mutation_baseline = plan.pop(
+            "_exact_mutation_baseline",
+            None,
+        )
         jobs = plan["jobs"]
         skipped = plan["skipped"]
         sync_files = plan["sync_files"]
@@ -5524,6 +6281,10 @@ class App:
             )
             self.root.update_idletasks()
             worker_kwargs = {}
+            if exact_mutation_baseline is not None:
+                worker_kwargs["exact_mutation_baseline"] = (
+                    exact_mutation_baseline
+                )
             if skipped and eligible_row_keys is not None:
                 worker_kwargs.update({
                     "planned_skipped": len(skipped),
@@ -5585,6 +6346,10 @@ class App:
         # but only the exact checked/PCG-target SK paths may be normalized.
         # A folder can contain sibling variants that were not selected.
         worker_kwargs = {}
+        if exact_mutation_baseline is not None:
+            worker_kwargs["exact_mutation_baseline"] = (
+                exact_mutation_baseline
+            )
         if skipped:
             worker_kwargs["planned_skipped"] = len(skipped)
         if skipped and eligible_row_keys is not None:
@@ -5631,7 +6396,9 @@ class App:
             self, jobs, affected_spms, sync_files=None,
             force_unreal_verify=False, require_all_renders_for_sync=False,
             planned_skipped=0, allowed_step3_row_keys=None,
-            step3_run_report_path=None, step3_run_report=None):
+            step3_run_report_path=None, step3_run_report=None,
+            exact_mutation_baseline=None):
+        require_exact_mutation_baseline(exact_mutation_baseline)
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
@@ -6280,8 +7047,10 @@ class App:
             result = None
             error = None
             try:
-                result = subprocess.run(
+                result = owned_run(
                     cmd,
+                    source="pcg_st9_texture_batch.pcg_texture_gui.refresh_targets",
+                    run_factory=subprocess.run,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
@@ -6326,7 +7095,11 @@ class App:
         if not item:
             messagebox.showinfo("폴더 열기", "표에서 행을 먼저 클릭하세요.")
             return
-        subprocess.Popen(["explorer", item["folder"]])
+        external_handoff_popen(
+            ["explorer", item["folder"]],
+            source="pcg_st9_texture_batch.pcg_texture_gui.open_folder",
+            ownership="shell_handoff",
+        )
 
     def shutdown_shared_queue(self):
         self.cancel_refresh()

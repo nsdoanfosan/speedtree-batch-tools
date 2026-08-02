@@ -1022,11 +1022,15 @@ class GuiSyncStateTests(unittest.TestCase):
                 self.gui, "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ):
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_cleanup"
+            )
             app._run_step3(
                 [],
                 [selected],
                 sync_files=[],
                 allowed_step3_row_keys=allowed,
+                exact_mutation_baseline=baseline,
             )
 
         exact_plan = build_jobs.call_args.args[0]
@@ -1110,6 +1114,9 @@ class GuiSyncStateTests(unittest.TestCase):
                     affected_spms=[],
                     sync_files=[],
                 )
+                baseline = self.gui.seal_exact_mutation_baseline(
+                    [], action="unit_test_step3_report"
+                )
                 app._run_step3(
                     [job],
                     affected_spms=[],
@@ -1118,6 +1125,7 @@ class GuiSyncStateTests(unittest.TestCase):
                     allowed_step3_row_keys={good_key},
                     step3_run_report_path=report_path,
                     step3_run_report=payload,
+                    exact_mutation_baseline=baseline,
                 )
 
             saved = json.loads(

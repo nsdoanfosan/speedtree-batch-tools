@@ -37,9 +37,13 @@ from atlas_manifest_resolver import (
     resolve_atlas_manifests,
 )
 from artifact_content_key import sampled_file_content_snapshot
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    canonical_slot_identity,
+    validate_resolved_delivery_scope,
+)
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
-    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     spm_file_structural_semantic_fingerprint,
@@ -1372,7 +1376,11 @@ def _normalized_bounds_contract(value, label, required=False):
     return result
 
 
-def _physical_source_3d_artifacts(receipt):
+def _physical_source_3d_artifacts(
+    receipt,
+    spm_semantic_reader=None,
+    validation_cache=None,
+):
     """Validate the exact SPM/FBX inputs shared by every physical variant."""
     artifacts = None
     identity = None
@@ -1381,6 +1389,19 @@ def _physical_source_3d_artifacts(receipt):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no variants"
         )
+    source_contracts = [
+        (row.get("plan_uv_transfer") or {}).get("source_3d_contract")
+        for row in variants
+        if isinstance(row, dict)
+    ]
+    source_cache_key = "source-3d:" + hashlib.sha256(json.dumps(
+        source_contracts,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if validation_cache is not None and source_cache_key in validation_cache:
+        return copy.deepcopy(validation_cache[source_cache_key])
     for index, row in enumerate(variants, 1):
         transfer = row.get("plan_uv_transfer")
         source = (
@@ -1445,9 +1466,16 @@ def _physical_source_3d_artifacts(receipt):
                     current_semantic = (
                         recorded_semantic
                         if raw_hash_matches and recorded_semantic
-                        else spm_file_structural_semantic_fingerprint(
-                            path,
-                            raw_sha256=fingerprint["sha256"],
+                        else (
+                            spm_semantic_reader(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
+                            if callable(spm_semantic_reader)
+                            else spm_file_structural_semantic_fingerprint(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
                         )
                     )
                 except (OSError, ValueError, ET.ParseError) as exc:
@@ -1536,10 +1564,16 @@ def _physical_source_3d_artifacts(receipt):
             raise ClusterAssemblyReceiptError(
                 "Atlas physical variants have conflicting source 3D contracts"
             )
+    if validation_cache is not None:
+        validation_cache[source_cache_key] = copy.deepcopy(artifacts)
     return artifacts
 
 
-def _physical_normalization_receipt(payload, validation_cache=None):
+def _physical_normalization_receipt(
+    payload,
+    validation_cache=None,
+    spm_semantic_reader=None,
+):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
         return None
@@ -1599,7 +1633,11 @@ def _physical_normalization_receipt(payload, validation_cache=None):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no prototypes"
         )
-    source_3d_artifacts = _physical_source_3d_artifacts(receipt)
+    source_3d_artifacts = _physical_source_3d_artifacts(
+        receipt,
+        spm_semantic_reader=spm_semantic_reader,
+        validation_cache=validation_cache,
+    )
     if (
         not isinstance(unit_probe, dict)
         or unit_probe.get("kind") != "speedtree_fbx_spm_unit_probe"
@@ -1741,10 +1779,12 @@ def _normalized_variant_contract(
     payload,
     group,
     physical_receipt_cache=None,
+    spm_semantic_reader=None,
 ):
     physical = _physical_normalization_receipt(
         payload,
         validation_cache=physical_receipt_cache,
+        spm_semantic_reader=spm_semantic_reader,
     )
     receipt_variants = {}
     if physical is not None:
@@ -1958,27 +1998,10 @@ def _positive_asset_id(value):
 
 def _delivery_binding_slot_identity(binding):
     """Use authored Generator identity, never XML array position."""
-    prefix = str(
-        binding.get("slot_prefix")
-        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
-    ).strip().casefold()
-    # One GUID has two observed SpeedTree serialization spellings (24-character
-    # RFC base64 and the 23-character Modeler dialect), so the raw string is not
-    # the identity.  Compare the canonical form; the raw value stays in the
-    # evidence rows for provenance.
-    guid = generator_guid_key(binding.get("generator_guid"))
-    if guid and prefix:
-        return "guid", guid, prefix
-    # A missing GUID is already weaker evidence.  Keep the semantic
-    # type/name/prefix tuple so reordering Generator XML cannot silently turn
-    # one authored slot into another.  Duplicate named identities fail closed
-    # as an ambiguous live slot below.
-    return (
-        "named",
-        str(binding.get("generator_type") or "").strip().casefold(),
-        str(binding.get("generator_name") or "").strip().casefold(),
-        prefix,
-    )
+    # Legacy audit snapshots can omit Generator type/name while retaining the
+    # semantic slot prefix.  Preserve that established matching behavior here;
+    # explicit authored scope validation uses the strict shared default.
+    return canonical_slot_identity(binding, strict=False)
 
 
 def _stale_node_table_evidence(binding):
@@ -2239,7 +2262,7 @@ def _normalized_generator_delivery(
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence = {
-        "schema_version": 2,
+        "schema_version": 3,
         "spm": str(Path(production_spm).resolve(strict=False)),
         "delivery_mode": DELIVERY_MODE_CONNECTION_INCOMPLETE,
         "delivery_decision": "blocked",
@@ -2253,6 +2276,10 @@ def _normalized_generator_delivery(
             "fresh_live_export_delivery"
         ),
         "generator_variant_policy": variant_policy or None,
+        "delivery_scope_mode": "legacy_strict",
+        "delivery_scope_intent_sha256": None,
+        "delivery_scope_required_live_slot_count": len(bindings),
+        "delivery_scope_continuity_only_slot_count": 0,
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
@@ -2318,7 +2345,14 @@ def _normalized_generator_delivery(
         evidence["errors"].append("production_spm_live_audit_unavailable")
         return _finalize_normalized_generator_delivery(evidence)
 
+    # A board audit owns one immutable, full-SHA-bound SPM generation and may
+    # reuse its compact projection.  Consumers without that generation API
+    # retain the uncached live reader used after external writers.
     snapshot_reader = getattr(
+        audit,
+        "report_generator_delivery_snapshot",
+        None,
+    ) or getattr(
         audit,
         "live_generator_delivery_snapshot",
         None,
@@ -2408,6 +2442,38 @@ def _normalized_generator_delivery(
         dict(live_node_table) if isinstance(live_node_table, dict) else None
     )
     slot_identity = _delivery_binding_slot_identity
+    explicit_scope = connection.get("delivery_scope") is not None
+    scope_contract = None
+    if explicit_scope:
+        try:
+            provider_blend = str(payload.get("blend_file") or "").strip()
+            if not provider_blend:
+                raise GeneratorDeliveryScopeError(
+                    "explicit delivery scope manifest has no provider blend"
+                )
+            scope_contract = validate_resolved_delivery_scope(
+                connection,
+                target_spm=production_spm,
+                material_id=expected_material_id,
+                provider_blend=provider_blend,
+                target_spm_postwrite_sha256=snapshot_sha256,
+            )
+        except GeneratorDeliveryScopeError as exc:
+            evidence["delivery_scope_mode"] = "explicit_invalid"
+            evidence["errors"].append(
+                "generator_delivery_scope_invalid:" + str(exc)
+            )
+            return _finalize_normalized_generator_delivery(evidence)
+        evidence["delivery_scope_mode"] = "explicit_sealed_v1"
+        evidence["delivery_scope_intent_sha256"] = scope_contract[
+            "intent_sha256"
+        ]
+        evidence["delivery_scope_required_live_slot_count"] = len(
+            scope_contract["required_live_slot_identities"]
+        )
+        evidence["delivery_scope_continuity_only_slot_count"] = len(
+            scope_contract["continuity_only_slot_identities"]
+        )
 
     def export_participates(row):
         return bool(
@@ -2492,7 +2558,8 @@ def _normalized_generator_delivery(
         current_material_id = _positive_asset_id(current.get("material_id"))
         current_mesh_id = _positive_asset_id(current.get("mesh_id"))
         if (
-            _inactive_causal_path_evidence(current)
+            not explicit_scope
+            and _inactive_causal_path_evidence(current)
             and target_material_id == expected_material_id
             and current_material_id == target_material_id
             and target_mesh_id in set(normalized_mesh_ids)
@@ -2501,19 +2568,35 @@ def _normalized_generator_delivery(
         ):
             planned_inactive_slots.add(declared_slot)
 
-    required_bindings = [
-        row for row in bindings
-        if tuple(slot_identity(row)) not in planned_inactive_slots
-    ]
+    if explicit_scope:
+        required_slot_identities = scope_contract[
+            "required_live_slot_identities"
+        ]
+        continuity_only_slot_identities = scope_contract[
+            "continuity_only_slot_identities"
+        ]
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
+    else:
+        required_slot_identities = {
+            tuple(slot_identity(row))
+            for row in bindings
+            if tuple(slot_identity(row)) not in planned_inactive_slots
+        }
+        continuity_only_slot_identities = set()
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
     current_required_mesh_ids = sorted({
         _positive_asset_id(row.get("target_mesh_id"))
         for row in required_bindings
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence["active_required_binding_count"] = len(required_bindings)
-    evidence["planned_inactive_binding_count"] = (
-        len(bindings) - len(required_bindings)
-    )
+    evidence["planned_inactive_binding_count"] = len(planned_inactive_slots)
     evidence["current_required_target_mesh_ids"] = (
         current_required_mesh_ids
     )
@@ -2548,6 +2631,7 @@ def _normalized_generator_delivery(
         )
         target_mesh_id = _positive_asset_id(declared.get("target_mesh_id"))
         declared_slot = tuple(slot_identity(declared))
+        continuity_only = declared_slot in continuity_only_slot_identities
         current_rows = live_by_slot.get(declared_slot) or []
         current = current_rows[0] if len(current_rows) == 1 else None
         if target_material_id != expected_material_id:
@@ -2572,11 +2656,17 @@ def _normalized_generator_delivery(
                 errors.append("visible_generator_material_mismatch")
             if current_mesh_id != target_mesh_id:
                 errors.append("visible_generator_mesh_mismatch")
-            if not export_participates(current):
+            if continuity_only and export_participates(current):
+                errors.append(
+                    "continuity_only_generator_export_participating"
+                )
+            elif not export_participates(current):
                 # Fail closed either way, but never report a correct Generator
                 # connection as disconnected: a zero node count read out of a
                 # stale <Node> table is missing evidence, not proof.
-                if declared_slot in planned_inactive_slots:
+                if continuity_only:
+                    outcome_reason = "relationship_continuity_only"
+                elif declared_slot in planned_inactive_slots:
                     outcome_reason = INACTIVE_CAUSAL_PATH_REASON
                 elif _stale_node_table_evidence(current):
                     errors.append(
@@ -2592,7 +2682,9 @@ def _normalized_generator_delivery(
             "errors": errors,
             "complete": not errors,
             "status": (
-                "planned_inactive"
+                "continuity_only"
+                if continuity_only and not errors
+                else "planned_inactive"
                 if outcome_reason and not errors
                 else "completed" if not errors else "failed"
             ),
@@ -2624,7 +2716,7 @@ def _normalized_generator_delivery(
     _classify_stale_node_table_block(
         evidence,
         declared_live_bindings,
-        normalized_mesh_ids,
+        current_required_mesh_ids,
         live_mesh_ids,
     )
     all_bindings_planned_inactive = bool(
@@ -2645,6 +2737,19 @@ def _normalized_generator_delivery(
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
         )
+    elif (
+        explicit_scope
+        and bindings
+        and not required_bindings
+        and not evidence["errors"]
+        and all(
+            row.get("status") == "continuity_only"
+            for row in evidence["binding_outcomes"]
+        )
+    ):
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = "relationship_continuity_only"
     elif bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"
@@ -2813,6 +2918,11 @@ def _atlas_normalized_variants(
                 payload,
                 group,
                 physical_receipt_cache=physical_receipt_cache,
+                spm_semantic_reader=getattr(
+                    audit,
+                    "report_spm_structural_semantic_fingerprint",
+                    None,
+                ),
             )
             delivery = _normalized_generator_delivery(
                 audit,
@@ -3795,7 +3905,15 @@ def build_cluster_assembly_contract(
     # Target/scope receipts for one Atlas relationship repeat the same large
     # physical-normalization payload with target-local material IDs. Validate
     # that shared payload once per live contract build.
-    physical_receipt_cache = {}
+    physical_receipt_cache_reader = getattr(
+        audit,
+        "report_physical_receipt_cache",
+        None,
+    )
+    physical_receipt_cache = (
+        physical_receipt_cache_reader()
+        if callable(physical_receipt_cache_reader) else {}
+    )
     for pair_row in relevant_clusters:
         cluster = pair_row["source_spm"]
         authoring_spm = pair_row["authoring_spm"]

@@ -22,6 +22,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from process_lifecycle import external_handoff_popen, external_handoff_startfile
 from speedtree_error_log import ERROR_LOG, record_exception
 
 
@@ -915,9 +916,18 @@ class IntegratedApp:
             return
         try:
             if os.name == "nt":
-                os.startfile(launcher)
+                external_handoff_startfile(
+                    launcher,
+                    source="speedtree_batch_tools_gui.open_standalone",
+                    ownership="standalone_gui_handoff",
+                )
             else:
-                subprocess.Popen([str(launcher)], cwd=str(launcher.parent))
+                external_handoff_popen(
+                    [str(launcher)],
+                    source="speedtree_batch_tools_gui.open_standalone",
+                    ownership="standalone_gui_handoff",
+                    cwd=str(launcher.parent),
+                )
         except OSError as exc:
             messagebox.showerror("개별 실행 실패", str(exc), parent=self.root)
 
