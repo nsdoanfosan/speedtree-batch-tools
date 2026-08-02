@@ -1,0 +1,12 @@
+# Test-only dependencies for .github/workflows/tests.yml. Production code has
+# no requirements file and imports PIL lazily; these exist because a handful of
+# test modules import Pillow, pytest, or numpy at module level.
+#
+# Pinned rather than latest so a release on PyPI cannot turn every PR in this
+# repository red without a single code change here -- the same standing risk
+# PR #109 removed for the vendored substance-tools branch. The versions below
+# are the newest that support the workflow's Python 3.10; bump them
+# deliberately, in a commit whose CI run is the verification.
+pillow==12.3.0
+pytest==9.1.1
+numpy==2.2.6
