@@ -2676,7 +2676,7 @@ class App:
 
     def _restore_latest_retry_progress(self):
         tracker = RetryProgressReceipt.load_latest(
-            notify=self._retry_progress_notify,
+            notify=None,
             **self._retry_progress_thresholds(),
         )
         if tracker is None:
@@ -2684,6 +2684,13 @@ class App:
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
             tracker.reconcile_queue(runtime.queue)
+            planning = tracker.snapshot(evaluate=False).get("planning") or {}
+            tracker.reconcile_planning_owner(
+                runtime.owner_process_alive(planning.get("owner"))
+            )
+        else:
+            tracker.reconcile_planning_owner(None)
+        tracker.set_notify(self._retry_progress_notify)
         self._active_retry_progress = tracker
         self._retry_progress_by_run_id[tracker.run_id] = tracker
         self._render_retry_progress(tracker.snapshot())
@@ -2763,11 +2770,21 @@ class App:
             state_text = "terminal"
         else:
             outcome_text = "terminal outcome: pending"
-            state_text = (
-                "waiting"
-                if snapshot.get("run_state") == "waiting"
-                else "running"
+            evidence_state = str(
+                snapshot.get("evidence_state") or "evidence_unknown"
             )
+            if snapshot.get("run_state") == "waiting":
+                state_text = "waiting"
+            elif evidence_state in {
+                "stalled",
+                "owner_lost",
+                "failed",
+                "owner_unknown",
+                "heartbeat_unknown",
+            }:
+                state_text = evidence_state
+            else:
+                state_text = "running"
         continuation = (
             " · current run continues after individual failures"
             if (failed or owner_lost or blocked) and remaining
@@ -2792,9 +2809,11 @@ class App:
         # Prefix this as an individual target observation: an item-level
         # failed stage is not a current batch terminal outcome.
         self.retry_liveness_var.set(
+            "evidence state="
+            f"{snapshot.get('evidence_state') or 'unknown'} · "
             "current target stage="
-            f"{current.get('stage') or '-'} · elapsed "
-            f"{self._retry_age_text(current.get('elapsed_seconds'))} · "
+            f"{current.get('stage') or '-'} · wall elapsed "
+            f"{self._retry_age_text(current.get('wall_elapsed_seconds', current.get('elapsed_seconds')))} · "
             "progress age "
             f"{self._retry_age_text(current.get('last_progress_age_seconds'))} · "
             "output age "
@@ -2878,6 +2897,35 @@ class App:
                     if current_id:
                         tracker.observe_process(current_id)
         if tracker is not None:
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                tracker.reconcile_queue(runtime.queue)
+                planning = tracker.snapshot(evaluate=False).get(
+                    "planning"
+                ) or {}
+                owner_alive = runtime.owner_process_alive(
+                    planning.get("owner")
+                )
+                worker = next(
+                    (
+                        candidate
+                        for candidate in getattr(
+                            self, "_retry_planning_workers", ()
+                        )
+                        if getattr(
+                            candidate, "retry_progress_run_id", None
+                        ) == tracker.run_id
+                    ),
+                    None,
+                )
+                if (
+                    worker is not None
+                    and planning.get("status") == "active"
+                ):
+                    owner_alive = worker.is_alive()
+                tracker.reconcile_planning_owner(owner_alive)
+            else:
+                tracker.reconcile_planning_owner(None)
             self._render_retry_progress(tracker.snapshot())
         self.root.after(1000, self._refresh_retry_liveness)
 
@@ -5558,8 +5606,26 @@ class App:
             # begins in the worker. This callback is the Tk owner thread.
             self.root.update_idletasks()
             tracker = self._new_retry_progress(candidate_iids, cfg)
+            planning_session_id = uuid.uuid4().hex
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                planning_owner = runtime.owner_identity
+            else:
+                planning_owner = {
+                    "owner_id": f"sk_batch-planning:{os.getpid()}",
+                    "hostname": os.environ.get("COMPUTERNAME") or "local",
+                    "pid": os.getpid(),
+                    "process_marker": None,
+                }
+            planning_owner.update({
+                "planning_session_id": planning_session_id,
+                "thread_name": f"retry-planner-{tracker.run_id[:8]}",
+            })
+            tracker.start_planning(planning_owner)
+            planning_finished = threading.Event()
 
             def plan_in_worker():
+                plan = None
                 try:
                     plan = self._build_failed_retry_plan(
                         candidate_iids,
@@ -5573,15 +5639,40 @@ class App:
                         "selected_iids": list(candidate_iids),
                         "cfg": cfg,
                     }
-                self.ui_queue.put(("retry_plan_ready", plan))
+                if plan is not None:
+                    tracker.planning_ready(planning_session_id)
+                    planning_finished.set()
+                    self.ui_queue.put(("retry_plan_ready", plan))
 
             worker = threading.Thread(
                 target=plan_in_worker,
-                name=f"retry-planner-{tracker.run_id[:8]}",
+                name=planning_owner["thread_name"],
                 daemon=True,
             )
+            worker.retry_progress_run_id = tracker.run_id
             self._retry_planning_workers.add(worker)
             worker.start()
+
+            def heartbeat_planner():
+                while not planning_finished.wait(1.0):
+                    if not worker.is_alive():
+                        tracker.finish_planning(
+                            RETRY_STAGE_FAILED,
+                            "planner thread terminated before plan commit",
+                        )
+                        planning_finished.set()
+                        return
+                    if not tracker.planning_heartbeat(
+                        planning_session_id,
+                        thread_ident=worker.ident,
+                    ):
+                        return
+
+            threading.Thread(
+                target=heartbeat_planner,
+                name=f"retry-planner-heartbeat-{tracker.run_id[:8]}",
+                daemon=True,
+            ).start()
             return tracker.run_id
 
         plan = self._build_failed_retry_plan(candidate_iids, cfg)
@@ -5836,6 +5927,11 @@ class App:
                         + compact_error_message(exc, 160)
                         + " · 전체 Blender→Push를 실행하세요"
                     )
+                # The manifest dependency graph was structurally valid even
+                # though its immutable source proof was not. Preserve that
+                # exact closure for the safe full-pipeline fallback instead
+                # of excluding the current provider and blocking its tree.
+                rebuild_ids.update(required_ids)
                 continue
 
             for iid in pending_selected:
@@ -5878,7 +5974,10 @@ class App:
         export_iids = [
             iid
             for iid in candidate_iids
-            if decisions[iid].classification == BLENDER_REBUILD
+            if (
+                decisions[iid].classification == BLENDER_REBUILD
+                or iid in rebuild_ids
+            )
             and iid not in bat_handled_ids
         ]
         unreal_iids = [
@@ -5892,7 +5991,10 @@ class App:
             if iid in bat_handled_ids:
                 continue
             decision = decisions[iid]
-            if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
+            if (
+                decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}
+                or iid in rebuild_ids
+            ):
                 continue
             prefix = (
                 "current Blender success 제외"
@@ -5968,7 +6070,24 @@ class App:
                 "items": [
                     {
                         "queue_id": iid,
-                        **decisions[iid].metadata(),
+                        **(
+                            {
+                                **decisions[iid].metadata(),
+                                "classification": BLENDER_REBUILD,
+                                "reason_code": (
+                                    "unreal_dependency_full_rebuild_fallback"
+                                ),
+                                "diagnostic": (
+                                    "Exact immutable parent dependency is "
+                                    "included in the full rebuild fallback"
+                                ),
+                                "scheduled_as_dependency": True,
+                            }
+                            if iid in rebuild_ids
+                            and decisions[iid].classification
+                            != BLENDER_REBUILD
+                            else decisions[iid].metadata()
+                        ),
                     }
                     for iid in ids
                 ],
@@ -6198,25 +6317,25 @@ class App:
         tracker = plan.get("tracker")
         error = plan.get("error")
         if self.stop_flag.is_set() and tracker is not None:
-            tracker.mark_unclassified_terminal(
-                plan.get("selected_iids") or [],
+            tracker.finish_planning(
                 RETRY_STAGE_CANCELLED,
                 "operator cancelled during retry planning",
             )
-            tracker.finalize("operator_cancelled")
             if not getattr(self, "active_batch_job", None) and not getattr(
                 self, "pending_batch_jobs", ()
             ):
                 self._set_batch_queue_controls(False)
             return None
+        if tracker is not None and not tracker.claim_planning_commit():
+            # A duplicate ready event, cooperative cancellation, or restored
+            # terminal receipt must never enqueue the same immutable plan.
+            return None
         if error:
             if tracker is not None:
-                tracker.mark_unclassified_terminal(
-                    plan.get("selected_iids") or [],
+                tracker.finish_planning(
                     RETRY_STAGE_FAILED,
                     error,
                 )
-                tracker.finalize("retry planning failed")
             messagebox.showerror(
                 "실패 재시도 planning 실패",
                 str(error),
@@ -6228,9 +6347,29 @@ class App:
                 self._set_batch_queue_controls(False)
             return None
         cfg = dict(plan.get("cfg") or {})
-        save_config(cfg)
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            error = compact_error_message(exc)
+            if tracker is not None:
+                tracker.finish_planning(
+                    RETRY_STAGE_FAILED,
+                    "retry plan config commit failed: " + error,
+                )
+            messagebox.showerror(
+                "실패 재시도 planning commit 실패",
+                error,
+                parent=getattr(self, "root", None),
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
         jobs = list(plan.get("jobs") or [])
         if not jobs:
+            if tracker is not None:
+                tracker.complete_planning_commit()
             messagebox.showinfo(
                 "전체 실패 이력 재시도",
                 "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
@@ -6245,6 +6384,17 @@ class App:
             return None
         enqueued = []
         for job in jobs:
+            if self.stop_flag.is_set():
+                if tracker is not None:
+                    partition = (job.get("retry_metadata") or {}).get(
+                        "partition", "unclassified"
+                    )
+                    tracker.mark_partition_terminal(
+                        partition,
+                        RETRY_STAGE_CANCELLED,
+                        "operator cancelled before plan partition enqueue",
+                    )
+                continue
             local_id = self._enqueue_batch_job(job)
             if local_id is not None:
                 enqueued.append(local_id)
@@ -6257,6 +6407,8 @@ class App:
                     RETRY_STAGE_FAILED,
                     "shared queue registration failed; retry not executed",
                 )
+        if tracker is not None:
+            tracker.complete_planning_commit()
         return enqueued
 
     def start_failed_unreal_retry(self):
@@ -7192,6 +7344,16 @@ class App:
         with self._recovery_commit_lock:
             resume_commit = copy.deepcopy(self._recovery_resume_commit)
             self.stop_flag.set()
+        planning_tracker = getattr(self, "_active_retry_progress", None)
+        if planning_tracker is not None:
+            planning = planning_tracker.snapshot(evaluate=False).get(
+                "planning"
+            ) or {}
+            if planning.get("status") in {"active", "ready", "committing"}:
+                planning_tracker.finish_planning(
+                    RETRY_STAGE_CANCELLED,
+                    "operator cancelled retry planning",
+                )
         active_tracker = self._retry_tracker_for_job(
             getattr(self, "active_batch_job", None)
         )

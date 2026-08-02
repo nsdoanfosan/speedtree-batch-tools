@@ -397,6 +397,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         tracker = mock.Mock()
         tracker.run_id = "exact-repair-progress"
         tracker.path = self.root / "retry-progress.json"
+        tracker.claim_planning_commit.side_effect = [True, False]
         repair_plan = mock.Mock()
         repair_plan.supported = True
         repair_plan.metadata.return_value = self.plan(self.first, "planned")
@@ -434,9 +435,40 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
 
         with mock.patch.object(gui, "save_config"):
             committed = app._commit_failed_retry_plan(built)
+            duplicate = app._commit_failed_retry_plan(built)
 
         self.assertEqual(committed, [1])
+        self.assertIsNone(duplicate)
         app._enqueue_batch_job.assert_called_once_with(job)
+        tracker.complete_planning_commit.assert_called_once_with()
+
+    def test_planning_cancel_wins_before_commit_without_enqueue(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._ui_thread_ident = threading.get_ident()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        app._retry_planning_workers = set()
+        app._set_batch_queue_controls = mock.Mock()
+        app._enqueue_batch_job = mock.Mock()
+        app.stop_flag.set()
+        tracker = mock.Mock()
+        plan = {
+            "tracker": tracker,
+            "selected_iids": [str(self.first)],
+            "cfg": {},
+            "jobs": [{"label": "must not enqueue"}],
+        }
+
+        committed = app._commit_failed_retry_plan(plan)
+
+        self.assertIsNone(committed)
+        app._enqueue_batch_job.assert_not_called()
+        tracker.finish_planning.assert_called_once_with(
+            gui.RETRY_STAGE_CANCELLED,
+            "operator cancelled during retry planning",
+        )
+        tracker.claim_planning_commit.assert_not_called()
 
     def test_invalid_exact_identity_is_final_fail_closed_not_legacy_retry(self):
         gui = load_gui_module()

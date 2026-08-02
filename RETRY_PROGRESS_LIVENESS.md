@@ -1,8 +1,8 @@
 # Failed retry progress and liveness contract
 
-Issue #107 adds an observer layer to the existing failed Blender/Unreal retry
-paths. It does not change #79/#89 classification, dependency closure, immutable
-Unreal recovery evidence, or fail-closed eligibility.
+Issue #107 adds a durable observer layer to the failed Blender/Unreal retry
+paths. Issue #138 extends that contract to pre-enqueue planning ownership and
+safe full-pipeline fallback when immutable Unreal recovery cannot be proven.
 
 ## Operator stages
 
@@ -24,20 +24,22 @@ The durable stage keys are:
 - `complete`
 
 The SK Batch window shows the exact current target, completed/total, partition
-ordinal/total, elapsed time, last progress/output/heartbeat age, and a bounded
-latest diagnostic. Shared-queue wait includes FIFO position and the current
-lease owner identity when another owner is ahead.
+ordinal/total, **wall elapsed** time, an evidence state, separate last
+progress/output/heartbeat ages, and a bounded latest diagnostic. Wall time is
+never execution evidence. Shared-queue wait includes FIFO position and the
+current lease owner identity when another owner is ahead.
 
 The receipt's `selection_context` is `historical_failed_or_stale_retry_targets`.
 It is intentionally not the current run outcome. While any target is
-non-terminal, the panel says `current state: running`, shows `success N`,
-`failed N`, and `remaining N`, and labels the terminal outcome as pending. If
-an individual target has failed while another remains live, it explicitly says
-the current run continues. Only after every selected target is terminal does
-the panel display the terminal outcome. Receipts expose this distinction as
-`run_state` (`running`, `waiting`, or `terminal`) and, after terminalization only,
-`terminal_outcome`; the root `stage` remains a current-target observation
-until then.
+non-terminal, the panel shows `success N`, `failed N`, `remaining N`, and a
+pending terminal outcome. The current state is `running` only with live owner
+or heartbeat evidence; it may instead say `stalled`, `owner_lost`, or an
+unknown-owner state. If an individual target has failed while another remains
+live, it explicitly says the current run continues. Only after every selected
+target is terminal does the panel display the terminal outcome. Receipts expose
+this distinction as `run_state` (`running`, `waiting`, or `terminal`) and, after
+terminalization only, `terminal_outcome`; the root `stage` remains a
+current-target observation until then.
 
 `pending_unreal` is intentionally nonterminal and non-live: export is durable,
 but Unreal has not yet supplied the authoritative import result. A receipt whose
@@ -72,15 +74,35 @@ The three age clocks intentionally mean different things:
 A silent child can therefore remain `blender`, `send2ue`, or `unreal` with a
 fresh heartbeat and an increasing output age. It is never treated as complete.
 
+Planning is owned before any queue job exists. Its receipt records the runtime
+owner ID, hostname, PID, process creation marker, planning session ID, thread
+identity, heartbeat, ready state, commit claim, and commit completion. A
+dedicated non-Tk monitor renews only that exact planner session. A slow planner
+with a live heartbeat stays live even when wall time grows; wall time without a
+heartbeat cannot do so.
+
 The default `retry_stall_warning_seconds` is **120 seconds**. Crossing it with
 a fresh heartbeat changes the visible state to `stalled` and exposes the
 already-enabled Stop action. This warning does not terminate anything. New
 progress returns the target to its prior live stage.
 
-The default `retry_owner_lost_seconds` is **45 seconds**. An expired exact
-owner heartbeat or a shared-queue `owner_lost` lease reconciliation produces
-the distinct durable `owner_lost` result. Already completed targets are kept
-terminal and are not scheduled again by receipt reconstruction.
+The default `retry_owner_lost_seconds` is **45 seconds**. A confirmed-absent
+exact planning owner or a shared-queue `owner_lost` lease reconciliation
+produces the distinct durable `owner_lost` result. An expired planning
+heartbeat whose process is still present is `failed`, not falsely healthy.
+Already completed targets are kept terminal and are not scheduled again by
+receipt reconstruction.
+
+## Full-pipeline fallback eligibility
+
+A structured failed Push history is not discarded merely because its immutable
+Unreal parent proof is missing, incomplete, or no longer current. Immutable
+Unreal-only recovery still requires current proof; when that proof fails, the
+retry planner routes the exact target through a forced Blender -> Send2UE ->
+Unreal pipeline instead. If a structurally valid parent manifest already proved
+an exact dependency closure, those providers are included in the same fallback
+job even when their own Blender outputs are current. This prevents the former
+`current provider excluded` + `dependent tree blocked` zero-job dead end.
 
 Existing child phase timeouts remain authoritative where configured. Their
 cleanup calls the #100 process lifecycle using the recorded process handle and
@@ -95,8 +117,9 @@ Each retry click creates one atomic receipt under:
 
 The receipt records one row per exact selected target, including partition,
 execution path, ordinals, stage timestamps, all three liveness timestamps,
-bounded diagnostic, outcome, and terminal reason. It also records each exact
-shared queue job ID, sequence, status, owner identity, and receipt run ID.
+bounded diagnostic, outcome, and terminal reason. It also records the exact
+planning owner/session state plus each exact shared queue job ID, sequence,
+status, owner identity, and receipt run ID.
 `latest.json` points only to a receipt in that same directory.
 
 It also retains a bounded chronological `lifecycle_events` list. This records
@@ -112,16 +135,20 @@ never schedules work. A completed receipt also never bypasses the existing
 #79/#89 provenance and fingerprint checks when an operator later starts a new
 retry plan.
 
-On startup the UI loads the latest receipt, reconciles its exact job IDs with
-the shared queue, and renders the last trustworthy state. Corrupt, unsupported,
-or path-escaping latest pointers are ignored rather than guessed.
+On startup the UI loads the latest receipt without rendering it, reconciles its
+exact job IDs with the shared queue, probes the exact planning PID + creation
+marker, terminalizes stale legacy planning receipts without owner identity, and
+only then renders the last trustworthy state. Corrupt, unsupported, or
+path-escaping latest pointers are ignored rather than guessed.
 
 ## Tk and cancellation boundary
 
 Retry classification/planning runs on a background Python thread. It performs
 no Tk operation. It posts an immutable plan to `ui_queue`; only
 `_drain_ui_queue` on the main thread shows dialogs, changes widgets, or enqueues
-the plan.
+the plan. The receipt durably claims `committing` before enqueue, so duplicate
+ready events cannot enqueue twice. Cooperative cancellation terminalizes
+uncommitted planning rows as `cancelled` and wins before that claim.
 
 Stop cancels still-waiting exact queue tickets. For an active target it sets the
 cooperative stop flag; the existing worker poll then closes only the exact

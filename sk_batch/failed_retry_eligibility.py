@@ -192,10 +192,13 @@ def classify_failed_retry(
         )
     if parent in {UNREAL_PARENT_INCOMPLETE, UNREAL_PARENT_INVALID}:
         return _result(
-            BLOCKED,
-            "unreal_parent_evidence_" + parent,
+            BLENDER_REBUILD,
+            "unreal_parent_evidence_" + parent + "_full_rebuild",
             unreal_parent_diagnostic
-            or "Unreal parent evidence is incomplete; run the full pipeline",
+            or (
+                "Unreal parent evidence cannot authorize immutable recovery; "
+                "regenerate it through the full Blender pipeline"
+            ),
             repair_kind,
             parent,
         )
@@ -216,11 +219,12 @@ def classify_failed_retry(
 
     if push_kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS:
         return _result(
-            BLOCKED,
-            "push_phase_evidence_missing",
+            BLENDER_REBUILD,
+            "push_phase_evidence_missing_full_rebuild",
             (
                 "Push failure has no export report or complete Unreal "
-                "manifest/checkpoint evidence; run the full pipeline explicitly"
+                "manifest/checkpoint evidence; regenerate it through the "
+                "full Blender pipeline"
             ),
             repair_kind,
             parent,

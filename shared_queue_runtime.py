@@ -301,6 +301,20 @@ class SharedQueueRuntime:
         self._shutdown_event = threading.Event()
         self._closed = False
 
+    @property
+    def owner_identity(self) -> Dict[str, Any]:
+        """Exact process identity used by leases and pre-lease planning."""
+
+        return self.queue.local_owner_identity(owner_id=self.owner_id)
+
+    def owner_process_alive(
+        self,
+        owner: Optional[Dict[str, Any]],
+    ) -> Optional[bool]:
+        """Read-only exact-owner probe for restored durable receipts."""
+
+        return self.queue.owner_process_alive(owner)
+
     def enqueue(self, label: str, payload: Any) -> Dict[str, Any]:
         """Append one callback-owned ticket to the shared global FIFO."""
 
