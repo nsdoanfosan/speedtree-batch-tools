@@ -9,6 +9,21 @@
 PCG_ST9_Texture_Batch.bat
 ```
 
+## 공식 exact-target repair 명령
+
+인자 없이 실행하면 기존 GUI가 그대로 열린다. 인자가 있으면 GUI를 띄우지 않고
+공용 durable FIFO에서 exact canonical SPM 하나의 일반 ③만 실행한다. 누락되거나
+불완전하거나 오래된 active consumer role만 처리하며 `③ 전체 다시 뽑기`처럼 force
+rerender하지 않는다.
+
+```bat
+PCG_ST9_Texture_Batch.bat --repair-action step3-standard --target-spm "D:\...\SK_asset.spm" --parent-retry-id retry-118 --request-id repair-001 --receipt "D:\...\repair-001.json"
+```
+
+`--target-spm`은 current inventory의 동일 실파일이어야 한다. 이름 유사도나 폴더명
+오타로 보정하지 않으며, queue owner ack 뒤에만 계획/변경을 시작한다. receipt에는
+queue 대기·실행·terminal 상태와 exit status에 대응하는 성공/실패 결과가 남는다.
+
 ①/②/③과 Atlas 대상 해제는 SK Batch·SPM Generator Sync와 같은 프로세스 간
 공용 FIFO에 들어간다. 다른 BAT 창에서 실행해도 실제 변경 작업은 겹치지 않는다.
 일반 ③과 `③ 전체 다시 뽑기`의 무거운 대상 계획은 공용 실행 차례가 온 뒤
