@@ -257,14 +257,19 @@ def code_revision(records):
     return stable_fingerprint(identities)
 
 
-def load_parent_manifest(path):
+def load_parent_manifest(path, *, manifest_payload=None):
     manifest_path = Path(path)
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise PushUnrealRecoveryError(
-            f"parent Push manifest could not be read: {manifest_path}: {exc}"
-        ) from exc
+    if manifest_payload is None:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PushUnrealRecoveryError(
+                f"parent Push manifest could not be read: {manifest_path}: {exc}"
+            ) from exc
+    else:
+        manifest = manifest_payload
+    if not isinstance(manifest, dict):
+        raise PushUnrealRecoveryError("parent Push manifest is not an object")
     if manifest.get("schema_version") != PUSH_MANIFEST_SCHEMA_VERSION:
         raise PushUnrealRecoveryError(
             "parent Push manifest schema is incompatible: "

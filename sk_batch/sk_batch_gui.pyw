@@ -105,6 +105,12 @@ from retry_progress import (
     RetryProgressReceipt,
     stage_for_send2ue_marker,
 )
+from retry_planning import (
+    MAX_REPORT_BYTES as RETRY_PLANNING_MAX_REPORT_BYTES,
+    RetryPlanningContext,
+    RetryPlanningSnapshotError,
+    cheap_durable_candidate,
+)
 from artifact_content_key import (
     artifact_record_content_key,
     file_content_key_snapshot,
@@ -4849,6 +4855,19 @@ class App:
         }
         self._enqueue_batch_job(job)
 
+    def _failed_retry_planning_context(self):
+        local = getattr(self, "_retry_thread_context", None)
+        context = getattr(local, "planning_context", None)
+        return context if isinstance(context, RetryPlanningContext) else None
+
+    def _failed_retry_state_entry(self, iid):
+        context = self._failed_retry_planning_context()
+        if context is not None:
+            return context.entry(iid)
+        with self.state_lock:
+            value = self.state.get(str(iid), {})
+            return copy.deepcopy(value if isinstance(value, dict) else {})
+
     def _failed_retry_repair_state(self, iid):
         """Return one live provenance decision, never a saved table label."""
         try:
@@ -4870,8 +4889,8 @@ class App:
     def _failed_retry_durable_evidence(self, iid, repair_state=None):
         """Return the saved structured failure plus current live provenance."""
 
-        with self.state_lock:
-            entry = copy.deepcopy(self.state.get(str(iid), {}) or {})
+        context = self._failed_retry_planning_context()
+        entry = self._failed_retry_state_entry(iid)
         automation = entry.get("failed_retry_automation") or {}
         automation_status = str(
             automation.get("status")
@@ -4948,10 +4967,29 @@ class App:
                     continue
                 seen_reports.add(key)
                 try:
-                    if not absolute.is_file() or absolute.stat().st_size > 64 * 1024 * 1024:
+                    if (
+                        not absolute.is_file()
+                        or absolute.stat().st_size
+                        > RETRY_PLANNING_MAX_REPORT_BYTES
+                    ):
                         continue
-                    payload = json.loads(absolute.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError):
+                    payload = (
+                        context.load_json(
+                            absolute,
+                            namespace="durable_report",
+                            max_bytes=RETRY_PLANNING_MAX_REPORT_BYTES,
+                        )
+                        if context is not None
+                        else json.loads(
+                            absolute.read_text(encoding="utf-8")
+                        )
+                    )
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    RetryPlanningSnapshotError,
+                ):
                     continue
                 report_payloads.append({
                     "path": str(absolute),
@@ -5516,8 +5554,7 @@ class App:
         )
 
     def _failed_retry_parent_source_record(self, queue_id, parent_item):
-        with self.state_lock:
-            state_entry = copy.deepcopy(self.state.get(queue_id, {}))
+        state_entry = self._failed_retry_state_entry(queue_id)
         expected = str(parent_item.get("source_fingerprint") or "")
         source_record = copy.deepcopy(
             state_entry.get("push_source_fingerprint_cache") or {}
@@ -5563,13 +5600,12 @@ class App:
         current_fingerprint = self._source_push_fingerprint(
             Path(blend_value), queue_id
         )
-        with self.state_lock:
-            current_record = copy.deepcopy(
-                self.state.get(queue_id, {}).get(
-                    "push_source_fingerprint_cache"
-                )
-                or {}
+        current_record = copy.deepcopy(
+            self._failed_retry_state_entry(queue_id).get(
+                "push_source_fingerprint_cache"
             )
+            or {}
+        )
         validate_unreal_only_recovery_evidence(
             parent_item,
             parent_source_record=parent_source_record,
@@ -5590,6 +5626,9 @@ class App:
             )
             return
         cfg = dict(self._collect_cfg())
+        inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
+            candidate_iids
+        )
         tracker = None
         if getattr(self, "_async_retry_planning_enabled", False):
             if (
@@ -5631,6 +5670,7 @@ class App:
                         candidate_iids,
                         cfg,
                         tracker=tracker,
+                        inventory_snapshot=inventory_snapshot,
                     )
                 except Exception as exc:
                     plan = {
@@ -5675,18 +5715,160 @@ class App:
             ).start()
             return tracker.run_id
 
-        plan = self._build_failed_retry_plan(candidate_iids, cfg)
+        plan = self._build_failed_retry_plan(
+            candidate_iids,
+            cfg,
+            inventory_snapshot=inventory_snapshot,
+        )
         return self._commit_failed_retry_plan(plan)
 
-    def _build_failed_retry_plan(self, candidate_iids, cfg, tracker=None):
-        """Return immutable queue jobs without performing any Tk operation."""
+    def _build_failed_retry_plan(
+        self,
+        candidate_iids,
+        cfg,
+        tracker=None,
+        inventory_snapshot=None,
+    ):
+        """Capture one bounded generation, then build without Tk or live state."""
         candidate_iids = list(candidate_iids)
         cfg = dict(cfg)
+        if inventory_snapshot is None:
+            inventory_snapshot, _targets = self._snapshot_batch_request(
+                candidate_iids
+            )
+        local = getattr(self, "_retry_thread_context", None)
+        if local is None:
+            local = threading.local()
+            self._retry_thread_context = local
+        previous = getattr(local, "planning_context", None)
+        context = RetryPlanningContext.capture(
+            target_ids=candidate_iids,
+            state=getattr(self, "state", {}),
+            state_lock=getattr(self, "state_lock", threading.RLock()),
+            cfg_snapshot=cfg,
+            inventory_snapshot=inventory_snapshot,
+            cancel_event=getattr(self, "stop_flag", None),
+            tracker=tracker,
+        )
+        local.planning_context = context
+        try:
+            plan = self._build_failed_retry_plan_scoped(
+                candidate_iids,
+                cfg,
+                tracker=tracker,
+                inventory_snapshot=inventory_snapshot,
+                planning_context=context,
+            )
+            plan["planning_diagnostics"] = context.diagnostics()
+            return plan
+        finally:
+            if previous is None:
+                try:
+                    del local.planning_context
+                except AttributeError:
+                    pass
+            else:
+                local.planning_context = previous
 
-        repair_states = {
-            iid: self._failed_retry_repair_state(iid)
-            for iid in candidate_iids
-        }
+    def _build_failed_retry_plan_scoped(
+        self,
+        candidate_iids,
+        cfg,
+        *,
+        tracker=None,
+        inventory_snapshot=None,
+        planning_context,
+    ):
+        """Return immutable queue jobs from one RetryPlanningContext."""
+        candidate_iids = list(candidate_iids)
+        cfg = dict(cfg)
+        deferred_status_updates = []
+        deferred_logs = []
+
+        def defer_status(iid, status, **kwargs):
+            deferred_status_updates.append({
+                "iid": str(iid),
+                "status": str(status),
+                "kwargs": kwargs,
+            })
+
+        repair_states = {}
+        fresh_candidate_iids = []
+        with planning_context.span("cheap_candidate_discovery"):
+            for index, iid in enumerate(candidate_iids, start=1):
+                planning_context.check_cancel()
+                entry = planning_context.entry(iid)
+                saved_signature = self._normalized_live_status_signature(
+                    entry.get("live_status_signature")
+                )
+                live_identity_current = False
+                if saved_signature is not None:
+                    try:
+                        current_signature = self._live_status_signature(
+                            Path(iid),
+                            tuple(entry.get("live_texture_paths") or ()),
+                        )
+                        live_identity_current = (
+                            current_signature == saved_signature
+                        )
+                        planning_context.counters[
+                            "durable_identity_matches"
+                            if live_identity_current
+                            else "durable_identity_misses"
+                        ] += 1
+                    except OSError:
+                        planning_context.counters[
+                            "durable_identity_incomplete"
+                        ] += 1
+                candidate, reason = cheap_durable_candidate(
+                    entry,
+                    live_identity_current=live_identity_current,
+                )
+                planning_context.counters["candidate_rows"] += int(candidate)
+                planning_context.counters["durable_current_excluded"] += int(
+                    not candidate
+                )
+                if candidate:
+                    fresh_candidate_iids.append(iid)
+                else:
+                    repair_states[iid] = {
+                        "current": True,
+                        "push_ready": True,
+                        "kind": "ready",
+                        "reason": reason,
+                    }
+                planning_context.publish(
+                    "cheap_candidate",
+                    current_target=iid,
+                    scanned=index,
+                    last_completed=iid,
+                )
+
+        with planning_context.span("repair_state_validation"):
+            total_fresh = len(fresh_candidate_iids)
+            for index, iid in enumerate(fresh_candidate_iids, start=1):
+                planning_context.check_cancel()
+                planning_context.publish(
+                    "repair_state_validation",
+                    current_target=iid,
+                    scanned=(
+                        len(candidate_iids) - total_fresh + index - 1
+                    ),
+                    last_completed=(
+                        fresh_candidate_iids[index - 2]
+                        if index > 1
+                        else "cheap candidate pass"
+                    ),
+                    progress=False,
+                )
+                repair_states[iid] = self._failed_retry_repair_state(iid)
+                planning_context.counters["repair_state_validations"] += 1
+                planning_context.publish(
+                    "repair_state_validation",
+                    current_target=iid,
+                    scanned=len(candidate_iids) - total_fresh + index,
+                    last_completed=iid,
+                )
         retry_run_id = (
             "failed-retry-"
             + datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -5695,9 +5877,25 @@ class App:
         )
         automatic_plans = {}
         unsupported_plans = {}
-        for iid in candidate_iids:
-            evidence = self._failed_retry_durable_evidence(
-                iid, repair_states[iid]
+        for evidence_index, iid in enumerate(
+            fresh_candidate_iids,
+            start=1,
+        ):
+            planning_context.check_cancel()
+            with planning_context.span("durable_evidence_load"):
+                evidence = self._failed_retry_durable_evidence(
+                    iid, repair_states[iid]
+                )
+            planning_context.counters["durable_evidence_rows"] += 1
+            planning_context.publish(
+                "durable_evidence",
+                current_target=iid,
+                scanned=(
+                    len(candidate_iids)
+                    - len(fresh_candidate_iids)
+                    + evidence_index
+                ),
+                last_completed=iid,
             )
             if not has_repair_contract_evidence(evidence):
                 continue
@@ -5737,7 +5935,7 @@ class App:
                     "목록을 새로 검사해 canonical SPM identity를 갱신한 뒤 다시 실행하세요.",
                 )
                 unsupported_plans[iid] = plan
-                self._set_failed_retry_automatic_status(
+                defer_status(
                     iid,
                     STATUS_FINAL_FAILED,
                     plan=plan,
@@ -5745,28 +5943,28 @@ class App:
                     friendly_reason=plan.friendly_reason,
                     remaining_action=plan.remaining_action,
                 )
-                self.log(
+                deferred_logs.append(
                     f"[automatic repair plan excluded] {Path(iid).name}: "
                     f"{raw_error}"
                 )
                 continue
             if plan.supported:
                 automatic_plans[iid] = plan
-                self._set_failed_retry_automatic_status(
+                defer_status(
                     iid,
                     STATUS_PENDING,
                     plan=plan,
                 )
             else:
                 unsupported_plans[iid] = plan
-                self._set_failed_retry_automatic_status(
+                defer_status(
                     iid,
                     STATUS_FINAL_FAILED,
                     plan=plan,
                     friendly_reason=plan.friendly_reason,
                     remaining_action=plan.remaining_action,
                 )
-                self.log(
+                deferred_logs.append(
                     f"[automatic repair unsupported] {Path(iid).name}: "
                     f"{plan.friendly_reason} | remaining={plan.remaining_action} | "
                     f"details reason_codes={','.join(plan.reason_codes)}"
@@ -5777,10 +5975,22 @@ class App:
         }
         parent_diagnostics = {iid: "" for iid in candidate_iids}
         grouped = {}
+        validated_parent_manifests = {}
 
-        for iid in candidate_iids:
-            with self.state_lock:
-                entry = copy.deepcopy(self.state.get(iid, {}))
+        for parent_index, iid in enumerate(candidate_iids, start=1):
+            planning_context.check_cancel()
+            planning_context.publish(
+                "parent_grouping",
+                current_target=iid,
+                scanned=parent_index - 1,
+                last_completed=(
+                    candidate_iids[parent_index - 2]
+                    if parent_index > 1
+                    else "durable evidence pass"
+                ),
+                progress=False,
+            )
+            entry = planning_context.entry(iid)
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
@@ -5802,12 +6012,42 @@ class App:
                 )
                 continue
             try:
-                manifest_path, manifest, items_by_id = (
-                    load_unreal_recovery_parent_manifest(manifest_value)
-                )
-                checkpoint = json.loads(
-                    Path(checkpoint_value).read_text(encoding="utf-8")
-                )
+                with planning_context.span("parent_grouping_validation"):
+                    manifest_payload = planning_context.load_json(
+                        manifest_value,
+                        namespace="parent_manifest",
+                    )
+                    manifest_identity = (
+                        planning_context.parent_cache.identity(
+                            manifest_value,
+                            namespace="parent_manifest",
+                        )
+                    )
+                    parent_snapshot = validated_parent_manifests.get(
+                        manifest_identity
+                    )
+                    if parent_snapshot is None:
+                        parent_snapshot = (
+                            load_unreal_recovery_parent_manifest(
+                                manifest_value,
+                                manifest_payload=manifest_payload,
+                            )
+                        )
+                        validated_parent_manifests[manifest_identity] = (
+                            parent_snapshot
+                        )
+                        planning_context.counters[
+                            "parent_manifest_validations"
+                        ] += 1
+                    else:
+                        planning_context.counters[
+                            "parent_manifest_validation_cache_hits"
+                        ] += 1
+                    manifest_path, manifest, items_by_id = parent_snapshot
+                    checkpoint = planning_context.load_json(
+                        checkpoint_value,
+                        namespace="parent_checkpoint",
+                    )
                 checkpoint_status = str(
                     ((checkpoint.get("items") or {}).get(iid) or {}).get(
                         "status"
@@ -5823,7 +6063,13 @@ class App:
                     raise PushUnrealRecoveryError(
                         "selected item is absent from its parent manifest"
                     )
-            except (OSError, TypeError, ValueError, PushUnrealRecoveryError) as exc:
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                PushUnrealRecoveryError,
+                RetryPlanningSnapshotError,
+            ) as exc:
                 parent_statuses[iid] = UNREAL_PARENT_INVALID
                 parent_diagnostics[iid] = compact_error_message(exc, 160)
                 continue
@@ -5844,18 +6090,36 @@ class App:
             )
             group["selected_queue_ids"].append(iid)
             parent_statuses[iid] = UNREAL_PARENT_CANDIDATE
+            planning_context.publish(
+                "parent_grouping",
+                current_target=iid,
+                scanned=parent_index,
+                last_completed=iid,
+            )
 
         def classify(iid):
-            with self.state_lock:
-                state_entry = copy.deepcopy(self.state.get(iid, {}))
             return classify_failed_retry(
-                state_entry,
+                planning_context.entry(iid),
                 repair_states[iid],
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
             )
 
-        decisions = {iid: classify(iid) for iid in candidate_iids}
+        decisions = {}
+        with planning_context.span("classification"):
+            for classification_index, iid in enumerate(
+                candidate_iids,
+                start=1,
+            ):
+                planning_context.check_cancel()
+                decisions[iid] = classify(iid)
+                planning_context.counters["classifications"] += 1
+                planning_context.publish(
+                    "classification",
+                    current_target=iid,
+                    scanned=classification_index,
+                    last_completed=iid,
+                )
         rebuild_ids = {
             iid
             for iid, decision in decisions.items()
@@ -5865,6 +6129,7 @@ class App:
         recovery_requests = []
 
         for group in grouped.values():
+            planning_context.check_cancel()
             pending_selected = [
                 iid
                 for iid in group["selected_queue_ids"]
@@ -5875,9 +6140,11 @@ class App:
             if not pending_selected:
                 continue
             try:
-                required_ids = unreal_recovery_dependency_closure(
-                    group["items_by_id"], pending_selected
-                )
+                with planning_context.span("dependency_closure"):
+                    required_ids = unreal_recovery_dependency_closure(
+                        group["items_by_id"], pending_selected
+                    )
+                planning_context.counters["dependency_closures"] += 1
             except PushUnrealRecoveryError as exc:
                 for iid in pending_selected:
                     parent_statuses[iid] = UNREAL_PARENT_INVALID
@@ -5903,15 +6170,24 @@ class App:
             source_records = {}
             try:
                 for queue_id in sorted(required_ids):
+                    planning_context.check_cancel()
                     parent_item = group["items_by_id"][queue_id]
-                    source_record = self._failed_retry_parent_source_record(
-                        queue_id, parent_item
-                    )
-                    self._validate_failed_retry_unreal_item_current(
-                        queue_id,
-                        parent_item,
-                        source_record,
-                    )
+                    with planning_context.span(
+                        "immutable_unreal_validation"
+                    ):
+                        source_record = (
+                            self._failed_retry_parent_source_record(
+                                queue_id, parent_item
+                            )
+                        )
+                        self._validate_failed_retry_unreal_item_current(
+                            queue_id,
+                            parent_item,
+                            source_record,
+                        )
+                    planning_context.counters[
+                        "immutable_unreal_validations"
+                    ] += 1
                     source_records[queue_id] = source_record
             except (
                 OSError,
@@ -5970,7 +6246,12 @@ class App:
             rebuild_ids.update(conflicting["selected_queue_ids"])
             recovery_requests.remove(conflicting)
 
-        decisions = {iid: classify(iid) for iid in candidate_iids}
+        with planning_context.span("classification"):
+            decisions = {
+                iid: classify(iid)
+                for iid in candidate_iids
+            }
+        planning_context.counters["classifications"] += len(candidate_iids)
         export_iids = [
             iid
             for iid in candidate_iids
@@ -6007,7 +6288,7 @@ class App:
             )
 
         if skipped:
-            self.log(
+            deferred_logs.append(
                 "전체 대상 실패/stale 재시도 제외:\n  - "
                 + "\n  - ".join(skipped)
             )
@@ -6057,9 +6338,22 @@ class App:
                 "selected_iids": candidate_iids,
                 "cfg": cfg,
                 "tracker": tracker,
+                "deferred_status_updates": deferred_status_updates,
+                "deferred_logs": deferred_logs,
             }
 
-        inventory, targets = self._snapshot_batch_request(runnable_ids)
+        with planning_context.span("snapshot_commit"):
+            inventory = copy.deepcopy(dict(inventory_snapshot or {}))
+            targets = [
+                inventory[iid]
+                for iid in runnable_ids
+                if iid in inventory
+            ]
+        planning_context.publish(
+            "snapshot_commit",
+            scanned=len(candidate_iids),
+            last_completed="immutable queue plan",
+        )
         targets_by_id = {str(item["spm"]): item for item in targets}
         action_kind = "failed_blender_export_and_unreal_retry"
         jobs = []
@@ -6291,6 +6585,8 @@ class App:
             "selected_iids": candidate_iids,
             "cfg": cfg,
             "tracker": tracker,
+            "deferred_status_updates": deferred_status_updates,
+            "deferred_logs": deferred_logs,
         }
 
     def _commit_failed_retry_plan(self, plan):
@@ -6346,6 +6642,25 @@ class App:
             ):
                 self._set_batch_queue_controls(False)
             return None
+        diagnostics = plan.get("planning_diagnostics") or {}
+        if diagnostics:
+            self.log(
+                "[retry planning diagnostics] "
+                + json.dumps(
+                    diagnostics,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        for update in plan.get("deferred_status_updates") or ():
+            self._set_failed_retry_automatic_status(
+                update["iid"],
+                update["status"],
+                **dict(update.get("kwargs") or {}),
+            )
+        for message in plan.get("deferred_logs") or ():
+            self.log(message)
         cfg = dict(plan.get("cfg") or {})
         try:
             save_config(cfg)
@@ -6682,9 +6997,12 @@ class App:
         )
 
     def _target_failure_result(self, iid, default_token="item_failed"):
+        context = self._failed_retry_planning_context()
         state = getattr(self, "state", {}) or {}
         lock = getattr(self, "state_lock", None)
-        if lock is None:
+        if context is not None:
+            entry = context.entry(iid)
+        elif lock is None:
             entry = state.get(str(iid))
         else:
             with lock:
@@ -6758,9 +7076,12 @@ class App:
             str(phase or ""),
             ("push_status", "blend_status", "spm_status"),
         )
+        context = self._failed_retry_planning_context()
         state = getattr(self, "state", {}) or {}
         lock = getattr(self, "state_lock", None)
-        if lock is None:
+        if context is not None:
+            entry = copy.deepcopy(context.entry(iid))
+        elif lock is None:
             entry = copy.deepcopy(state.get(str(iid), {}))
         else:
             with lock:
@@ -8442,7 +8763,13 @@ class App:
 
     def _repair_runtime_addon_dir(self):
         """Installed BWR addon folder, derived identically for read and write."""
-        return addon_dir_from_config(getattr(self, "cfg", {}) or {})
+        planning = self._failed_retry_planning_context()
+        cfg = (
+            planning.cfg_snapshot
+            if planning is not None
+            else getattr(self, "cfg", {}) or {}
+        )
+        return addon_dir_from_config(cfg)
 
     @staticmethod
     def _repair_runtime_code_paths(addon_dir):
@@ -8535,6 +8862,10 @@ class App:
             repair_runtime_receipt_needs_migration(candidate)
             and self._repair_contract_current(spm)
         ):
+            planning = self._failed_retry_planning_context()
+            if planning is not None:
+                planning.counters["runtime_receipt_migrations_deferred"] += 1
+                return True, ""
             try:
                 migrate_repair_runtime_receipt(
                     spm,
@@ -8567,9 +8898,13 @@ class App:
 
     def _repair_output_state_scoped(self, spm):
         """One semantic decision shared by row status and the ② queue gate."""
+        speedtree_spm = speedtree_output_spm_for(spm)
+        leaf_projection = {}
         leaf_ok, leaf_reason = self._leaf_reference_ready(
-            speedtree_output_spm_for(spm)
+            speedtree_spm,
+            contract_out=leaf_projection,
         )
+        leaf_contract = leaf_projection.get("contract")
         if not leaf_ok:
             return {
                 "current": False,
@@ -8651,7 +8986,9 @@ class App:
                 return state
 
         material_ok, material_reason = self._material_export_ready(
-            spm, content_receipt_current=receipt_current
+            spm,
+            content_receipt_current=receipt_current,
+            leaf_contract=leaf_contract,
         )
         if not material_ok:
             return {
@@ -8812,14 +9149,24 @@ class App:
         return repair_contract
 
     @staticmethod
-    def _leaf_reference_ready(spm):
+    def _leaf_reference_ready(spm, contract_out=None):
         contract = inspect_spm_leaf_contract(spm)
+        if isinstance(contract_out, dict):
+            contract_out["contract"] = contract
         return leaf_contract_user_message(contract)
 
     @staticmethod
-    def _material_export_ready(spm, content_receipt_current=False):
+    def _material_export_ready(
+        spm,
+        content_receipt_current=False,
+        leaf_contract=None,
+    ):
         speedtree_spm = speedtree_output_spm_for(spm)
-        contract = inspect_spm_leaf_contract(speedtree_spm)
+        contract = (
+            leaf_contract
+            if isinstance(leaf_contract, dict)
+            else inspect_spm_leaf_contract(speedtree_spm)
+        )
         exported = inspect_speedtree_material_export(speedtree_spm, contract)
         all_exported = inspect_all_speedtree_material_export(speedtree_spm)
         if all_exported.get("status") not in {"ok", "not_applicable"}:
@@ -12127,7 +12474,9 @@ class App:
             )
 
     def _push_dependency_paths(self):
-        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        planning = self._failed_retry_planning_context()
+        cfg = planning.cfg_snapshot if planning is not None else self.cfg
+        send2ue_dir = Path(cfg["send2ue_dir"])
         return [
             TOOL_DIR / "jobs" / "send2ue_push_job.py",
             TOOL_DIR / "jobs" / "vertex_color_contract.py",
@@ -12152,7 +12501,9 @@ class App:
 
     def _push_unreal_code_paths(self):
         """Code executed or consumed by the current Unreal ingest contract."""
-        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        planning = self._failed_retry_planning_context()
+        cfg = planning.cfg_snapshot if planning is not None else self.cfg
+        send2ue_dir = Path(cfg["send2ue_dir"])
         return [
             TOOL_DIR / "unreal_ingest.py",
             send2ue_dir / "dependencies" / "unreal.py",
@@ -12303,13 +12654,19 @@ class App:
 
     def _source_push_fingerprint(self, blend, iid=None):
         """Hash a large source blend once, then reuse its stable stat cache."""
+        planning = self._failed_retry_planning_context()
         if iid:
-            with self.state_lock:
+            if planning is not None:
                 cache = copy.deepcopy(
-                    self.state.get(iid, {}).get(
-                        "push_source_fingerprint_cache"
-                    )
+                    planning.entry(iid).get("push_source_fingerprint_cache")
                 )
+            else:
+                with self.state_lock:
+                    cache = copy.deepcopy(
+                        self.state.get(iid, {}).get(
+                            "push_source_fingerprint_cache"
+                        )
+                    )
         else:
             cache = None
         fingerprint, record, cache_hit = cached_push_source_fingerprint(
@@ -12317,12 +12674,18 @@ class App:
             self._push_source_dependency_paths(iid),
             cache=cache,
         )
-        if iid:
+        if iid and planning is None:
             with self.state_lock:
                 self.state.setdefault(iid, {})[
                     "push_source_fingerprint_cache"
                 ] = record
-        if cache_hit:
+        if planning is not None:
+            planning.counters[
+                "source_fingerprint_cache_hits"
+                if cache_hit
+                else "source_fingerprint_cache_misses"
+            ] += 1
+        if cache_hit and planning is None:
             self.log(f"[source hash cache] {Path(blend).name}: 재사용")
         return fingerprint
 
