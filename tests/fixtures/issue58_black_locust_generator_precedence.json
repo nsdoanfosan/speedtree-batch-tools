@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "source_issue": 58,
+  "description": "Sanitized tree target with a current side-provider receipt and a superseded cluster-provider declaration whose Generator is hidden.",
+  "asset_folder": "weed_black_locust_sample",
+  "target_spm": "SK_tree_black_locust_sample_01.spm",
+  "current_per_target": {
+    "atlas_manifest_schema_version": 1,
+    "spm": "{target}",
+    "blend_file": "{root}\\cluster\\SK_cluster_black_locust_side_sample.blend",
+    "source_collection": "Atlas_Branch_Plans",
+    "export_scope_id": "scope-current-side-provider",
+    "generator_variant_policy": "preserve_existing_slots",
+    "material_groups": [
+      {
+        "material": "M_cluster_black_locust_side_sample_01",
+        "material_id": 11,
+        "mesh_ids": [87]
+      }
+    ],
+    "generator_connection": {
+      "requested": false,
+      "complete": false,
+      "generator_variant_policy": "preserve_existing_slots",
+      "bindings": []
+    }
+  },
+  "stale_target_scope": {
+    "atlas_manifest_schema_version": 1,
+    "spm": "{target}",
+    "blend_file": "{root}\\cluster\\SK_cluster_black_locust_sample.blend",
+    "source_collection": "Atlas_Branch_Plans",
+    "export_scope_id": "scope-stale-cluster-provider",
+    "generator_variant_policy": "ensure_all_material_cutouts",
+    "material_groups": [
+      {
+        "material": "M_cluster_black_locust_sample_01",
+        "material_id": 8,
+        "mesh_ids": [93, 94, 95, 96]
+      }
+    ],
+    "generator_connection": {
+      "requested": true,
+      "complete": true,
+      "generator_variant_policy": "ensure_all_material_cutouts",
+      "bindings": [
+        {
+          "generator_guid": "active-leaf-guid",
+          "generator_name": "Leaf 11",
+          "slot_prefix": "Leaves:Type:0",
+          "target_material_id": 8,
+          "target_mesh_id": 93
+        },
+        {
+          "generator_guid": "hidden-leaf-guid",
+          "generator_name": "Leaf 12",
+          "slot_prefix": "Leaves:Type:0",
+          "target_material_id": 8,
+          "target_mesh_id": 93
+        },
+        {
+          "generator_guid": "hidden-leaf-guid",
+          "generator_name": "Leaf 12",
+          "slot_prefix": "Leaves:Type:1",
+          "target_material_id": 8,
+          "target_mesh_id": 94
+        },
+        {
+          "generator_guid": "hidden-leaf-guid",
+          "generator_name": "Leaf 12",
+          "slot_prefix": "Leaves:Type:2",
+          "target_material_id": 8,
+          "target_mesh_id": 95
+        },
+        {
+          "generator_guid": "hidden-leaf-guid",
+          "generator_name": "Leaf 12",
+          "slot_prefix": "Leaves:Type:3",
+          "target_material_id": 8,
+          "target_mesh_id": 96
+        }
+      ]
+    }
+  },
+  "live_generator_snapshot": {
+    "node_table": {
+      "stale": false,
+      "orphan_generator_guids": [],
+      "orphan_node_count": 0
+    },
+    "bindings": [
+      {
+        "generator_name": "Leaf 11",
+        "slot_prefix": "Leaves:Type:0",
+        "material_id": 8,
+        "mesh_id": 93,
+        "visible": true,
+        "export_participates": true
+      },
+      {
+        "generator_name": "Leaf 12",
+        "slot_prefix": "Leaves:Type:0",
+        "material_id": 8,
+        "mesh_id": 93,
+        "visible": false,
+        "export_participates": false
+      },
+      {
+        "generator_name": "Leaf 12",
+        "slot_prefix": "Leaves:Type:1",
+        "material_id": 8,
+        "mesh_id": 94,
+        "visible": false,
+        "export_participates": false
+      },
+      {
+        "generator_name": "Leaf 12",
+        "slot_prefix": "Leaves:Type:2",
+        "material_id": 8,
+        "mesh_id": 95,
+        "visible": false,
+        "export_participates": false
+      },
+      {
+        "generator_name": "Leaf 12",
+        "slot_prefix": "Leaves:Type:3",
+        "material_id": 8,
+        "mesh_id": 96,
+        "visible": false,
+        "export_participates": false
+      }
+    ]
+  }
+}

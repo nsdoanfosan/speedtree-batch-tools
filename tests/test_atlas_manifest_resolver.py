@@ -1,12 +1,15 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
+    diagnose_manifest_generator_candidates,
     resolution_evidence,
     resolve_atlas_manifests,
+    resolve_manifest_material_ownership,
 )
 
 
@@ -59,6 +62,95 @@ class AtlasManifestResolverTests(unittest.TestCase):
             raise AssertionError(kind)
         path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         return path
+
+    def precedence_fixture(self, temporary, fixture_name):
+        fixture_path = Path(__file__).parent / "fixtures" / fixture_name
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        root = Path(temporary) / fixture["asset_folder"]
+        root.mkdir()
+        target = root / fixture["target_spm"]
+        target.write_bytes(b"sanitized-spm")
+
+        def materialize(value):
+            if isinstance(value, dict):
+                return {key: materialize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [materialize(item) for item in value]
+            if isinstance(value, str):
+                return value.replace("{root}", str(root)).replace(
+                    "{target}", str(target)
+                )
+            return value
+
+        current = materialize(fixture["current_per_target"])
+        stale = materialize(fixture["stale_target_scope"])
+        authority_path = self.write_candidate(
+            root,
+            target,
+            "exact_per_target",
+            current,
+        )
+        mirror_path = self.write_candidate(
+            root,
+            target,
+            "exact_target_scope",
+            current,
+            name=f"{current['export_scope_id']}__{target.stem}.json",
+        )
+        stale_path = self.write_candidate(
+            root,
+            target,
+            "exact_target_scope",
+            stale,
+            name=f"{stale['export_scope_id']}__{target.stem}.json",
+        )
+
+        # Deliberately make the stale scope newest.  File time is evidence,
+        # never authority.
+        os.utime(authority_path, (1, 1))
+        os.utime(mirror_path, (2, 2))
+        os.utime(stale_path, (3, 3))
+        return {
+            "fixture": fixture,
+            "target": target,
+            "current": current,
+            "stale": stale,
+            "authority_path": authority_path,
+            "mirror_path": mirror_path,
+            "stale_path": stale_path,
+        }
+
+    def assert_stale_scope_is_diagnosed(self, case, live_bindings):
+        resolution = resolve_atlas_manifests(case["target"])
+        self.assertEqual(
+            [row["path"] for row in resolution["selected"]],
+            [
+                str(case["authority_path"].resolve()),
+                str(case["mirror_path"].resolve()),
+                str(case["stale_path"].resolve()),
+            ],
+        )
+        connection = resolution["selected"][0]["payload"][
+            "generator_connection"
+        ]
+        self.assertFalse(connection["requested"])
+        self.assertEqual(connection["bindings"], [])
+        diagnostics = diagnose_manifest_generator_candidates(
+            resolution,
+            live_bindings,
+        )
+        conflict = next(
+            row
+            for row in diagnostics["conflicting"]
+            if row["path"] == str(case["stale_path"].resolve())
+        )
+        self.assertEqual(
+            conflict["status"],
+            "manifest_candidate_live_conflict",
+        )
+        self.assertEqual(diagnostics["status"], "conflicting")
+        self.assertEqual(resolution["conflicting"], [])
+        return resolution, conflict
 
     def test_candidate_kind_and_precedence_matrix(self):
         kinds = (
@@ -159,6 +251,128 @@ class AtlasManifestResolverTests(unittest.TestCase):
                 [str(first.resolve()), str(second.resolve())],
             )
             self.assertEqual(resolution["conflicting"], [])
+
+    def test_silky_candidate_conflict_precedes_asset_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self.precedence_fixture(
+                temporary,
+                "issue58_silky_generator_precedence.json",
+            )
+            _resolution, conflict = self.assert_stale_scope_is_diagnosed(
+                case,
+                case["fixture"]["live_generator_topology"],
+            )
+
+            stale_slots = {
+                row["slot_prefix"]
+                for row in case["stale"]["generator_connection"]["bindings"]
+            }
+            live_slots = {
+                row["slot_prefix"]
+                for row in case["fixture"]["live_generator_topology"]
+            }
+            self.assertIn("Leaves:Type:3", stale_slots)
+            self.assertNotIn("Leaves:Type:3", live_slots)
+            self.assertIn("Material:Frond:0", live_slots)
+            self.assertTrue({
+                "generator_slot_missing",
+                "target_mesh_mismatch",
+            }.intersection(conflict["reasons"]))
+
+    def test_black_locust_candidate_conflict_precedes_asset_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self.precedence_fixture(
+                temporary,
+                "issue58_black_locust_generator_precedence.json",
+            )
+            live = case["fixture"]["live_generator_snapshot"]
+            _resolution, conflict = self.assert_stale_scope_is_diagnosed(
+                case,
+                live["bindings"],
+            )
+            self.assertFalse(live["node_table"]["stale"])
+            self.assertEqual(live["node_table"]["orphan_node_count"], 0)
+            visible_meshes = {
+                row["mesh_id"]
+                for row in live["bindings"]
+                if row["export_participates"]
+            }
+            hidden_declared_meshes = {
+                row["mesh_id"]
+                for row in live["bindings"]
+                if row["generator_name"] == "Leaf 12"
+                and not row["export_participates"]
+            }
+            self.assertEqual(visible_meshes, {93})
+            self.assertEqual(hidden_declared_meshes, {93, 94, 95, 96})
+            self.assertIn(
+                "declared_mesh_not_export_participating",
+                conflict["reasons"],
+            )
+
+    def test_birch_multi_provider_receipts_all_prove_live_ownership(self):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue58_birch_multi_provider_precedence.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / fixture["asset_folder"]
+            root.mkdir()
+            target = root / fixture["target_spm"]
+            target.write_bytes(b"sanitized-spm")
+
+            def materialize(value):
+                if isinstance(value, dict):
+                    return {
+                        key: materialize(item) for key, item in value.items()
+                    }
+                if isinstance(value, list):
+                    return [materialize(item) for item in value]
+                if isinstance(value, str):
+                    return value.replace("{root}", str(root)).replace(
+                        "{target}", str(target)
+                    )
+                return value
+
+            providers = fixture["providers"]
+            payloads = []
+            for index, provider in enumerate(providers):
+                if "mirror_of" in provider:
+                    payload = json.loads(json.dumps(
+                        payloads[int(provider["mirror_of"])]
+                    ))
+                else:
+                    payload = materialize(provider["payload"])
+                payloads.append(payload)
+                self.write_candidate(
+                    root,
+                    target,
+                    provider["kind"],
+                    payload,
+                    name=provider.get("name"),
+                )
+
+            resolution = resolve_atlas_manifests(target)
+            ownership = resolve_manifest_material_ownership(
+                resolution,
+                materialize(fixture["live_materials"]),
+                target_spm=target,
+            )
+            diagnostics = diagnose_manifest_generator_candidates(
+                resolution,
+                fixture["live_generator_topology"],
+            )
+
+            self.assertEqual(len(resolution["selected"]), 5)
+            self.assertEqual(ownership["status"], "proven")
+            self.assertEqual(
+                {row["material_id"] for row in ownership["materials"]},
+                {"16", "17", "18", "19"},
+            )
+            self.assertEqual(diagnostics["status"], "coherent")
+            self.assertEqual(diagnostics["conflicting"], [])
 
     def test_every_operational_precedence_disagreement_fails_closed(self):
         variants = {}

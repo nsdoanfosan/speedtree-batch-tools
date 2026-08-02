@@ -864,6 +864,100 @@ class GeneratorConnectionTests(unittest.TestCase):
             self.assertEqual(status["generator_connection_reason"],
                              "managed_mesh_asset_missing")
 
+    def test_manifest_candidate_conflict_precedes_black_locust_asset_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spm = root / "SK_tree_black_locust_sample_01.spm"
+            write_spm(
+                spm,
+                [material(
+                    "8",
+                    "M_cluster_black_locust_sample_01",
+                    [],
+                    (93, 94, 95, 96),
+                    managed=True,
+                )],
+                [
+                    generator("Leaf Mesh", "8", "93", 0, hidden=False),
+                    generator("Leaf Mesh", "8", "94", 1, hidden=True),
+                    generator("Leaf Mesh", "8", "95", 2, hidden=True),
+                    generator("Leaf Mesh", "8", "96", 3, hidden=True),
+                ],
+            )
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            scope_dir = root / ".atlas_leaf_speedtree_scopes"
+            target_dir.mkdir()
+            scope_dir.mkdir()
+            current = {
+                "spm": str(spm),
+                "blend_file": str(root / "cluster" / "side.blend"),
+                "source_collection": "Atlas_Branch_Plans",
+                "export_scope_id": "scope-current-side",
+                "material_groups": [{
+                    "material": "M_cluster_black_locust_side_sample_01",
+                    "material_id": 11,
+                    "mesh_ids": [87],
+                }],
+                "generator_connection": {
+                    "requested": False,
+                    "complete": False,
+                    "bindings": [],
+                },
+            }
+            stale = {
+                "spm": str(spm),
+                "blend_file": str(root / "cluster" / "main.blend"),
+                "source_collection": "Atlas_Branch_Plans",
+                "export_scope_id": "scope-stale-main",
+                "material_groups": [{
+                    "material": "M_cluster_black_locust_sample_01",
+                    "material_id": 8,
+                    "mesh_ids": [93, 94, 95, 96],
+                }],
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "bindings": [
+                        {
+                            "generator_guid": f"guid-{index}",
+                            "generator_name": f"Generator {index}",
+                            "slot_prefix": f"Leaves:Type:{index}",
+                            "target_material_id": 8,
+                            "target_mesh_id": mesh_id,
+                        }
+                        for index, mesh_id in enumerate((93, 94, 95, 96))
+                    ],
+                },
+            }
+            (target_dir / f"{spm.stem}.json").write_text(
+                json.dumps(current), encoding="utf-8"
+            )
+            (scope_dir / f"scope-stale-main__{spm.stem}.json").write_text(
+                json.dumps(stale), encoding="utf-8"
+            )
+
+            status = audit.inspect_leaf_generator_connection(
+                spm,
+                ["M_cluster_black_locust_sample_01"],
+                ["8"],
+                "M_cluster_black_locust_sample_01",
+            )
+
+            self.assertFalse(status["generator_connection_complete"])
+            self.assertFalse(status["generator_connection_update_needed"])
+            self.assertTrue(status["atlas_manifest_candidate_conflict"])
+            self.assertEqual(
+                status["generator_connection_reason"],
+                "atlas_manifest_candidate_conflict",
+            )
+            conflict = status[
+                "atlas_manifest_generator_diagnostics"
+            ]["conflicting"][0]
+            self.assertIn(
+                "declared_mesh_not_export_participating",
+                conflict["reasons"],
+            )
+
     def test_same_name_source_ids_are_audited_independently(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

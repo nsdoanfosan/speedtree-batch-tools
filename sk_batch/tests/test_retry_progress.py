@@ -185,6 +185,10 @@ def test_retry_planner_worker_contract_contains_no_tk_operation():
     attributes = {
         node.attr for node in ast.walk(build) if isinstance(node, ast.Attribute)
     }
+    names = {
+        node.id for node in ast.walk(build) if isinstance(node, ast.Name)
+    }
+    assert names.isdisjoint({"messagebox", "save_config"})
     assert attributes.isdisjoint(
         {
             "root",
@@ -194,6 +198,7 @@ def test_retry_planner_worker_contract_contains_no_tk_operation():
             "retry_target_var",
             "retry_liveness_var",
             "retry_diagnostic_var",
+            "_collect_cfg",
             "_enqueue_batch_job",
             "_set_batch_queue_controls",
         }
