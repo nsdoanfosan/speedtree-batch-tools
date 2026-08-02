@@ -378,14 +378,15 @@ current projection constants:
 | 3 | 1 | 2 | 1 | 1 | — | supported |
 | 4 | 1 | 3 | 1 | 2 | — | supported |
 | 5 | 1 | 3 | 1 | 2 | 1 | supported |
-| 6 | 1 | 4 | 1 | 2 | 1 | supported (current) |
+| 6 | 1 | 4 | 1 | 2 | 1 | supported |
+| 7 | 1 | 5 | 1 | 2 | 1 | supported (current) |
 
 Each supported tuple resolves through an immutable semantic registry entry
 that owns its frozen graph/core/membership/target projector callables and the
 authoritative fields that must match as one candidate. In particular, a
 target-v1 fingerprint cannot borrow a binding count or Mesh-ID list from a
 different historical candidate. The current writer also selects the explicit
-current dialect tuple (schema 6 here) instead of assembling versions from
+current dialect tuple (schema 7 here) instead of assembling versions from
 mutable current constants.
 Independent literal `backup.spm`, `receipt.json`, `after.spm`, and
 `expected.json` fixtures under `tests/fixtures/issue_41/` exercise both
@@ -412,7 +413,7 @@ Before Modeler is opened, the command captures an exact byte-for-byte preimage
 under `_spm_backups/stale_node_table_recovery/` and verifies an immutable
 SHA-bound receipt. The receipt contains versioned authoring-graph, Generator
 membership, required target-binding fingerprints, and immutable schema-5
-authoring/live scope requirements. New receipts use schema 6 with the same
+authoring/live scope requirements. New receipts use schema 7 with the same
 sealed-scope contract. It then waits for the
 user to save the file and requires repeated identical stat/size/SHA snapshots
 with successful parsing. Regex, independent ElementTree, target delivery, and
@@ -429,7 +430,7 @@ final source-SHA recheck. A privacy-safe blocked-event receipt records only the
 asset name, after SHA, and stable reason tokens. Missing/corrupt preimage or
 receipt evidence fails before Modeler launch.
 
-Core projection v4 hashes the complete ordered XML tree and removes or
+Core projection v5 hashes the complete ordered XML tree and removes or
 canonicalizes only path-specific no-edit Save rewrites reproduced across three
 exact before/after SPM pairs. It excludes the root session/generated blocks
 `Thumbnail`, `ThumbnailSize`, `Preview`, `Statistics`, `TreeInfo`,
@@ -440,13 +441,16 @@ AtlasMaker, material-map, atlas-mesh UserData, empty LOD, and redundant parent
 spline shapes; and Material preview/stream caches. It canonicalizes Generator
 and Link endpoint GUID spellings, the observed spline/mesh/color float rewrites,
 derived material texture sizes, and the stable direct-Assets kind partition
-while preserving order within every partition. Namespace-qualified or unknown
+while preserving order within every partition. V5 additionally excludes only
+the exact disabled/default Modeler 10.1.0 `Forces:Planar 2` shape at Generator
+Properties ancestry and neutralizes only DrawFlags view bit `0x8` at its exact
+root path. Namespace-qualified or unknown
 elements, authored properties, arbitrary UserData, non-default shapes,
 non-false collection rows, full Link subtrees, material filenames, mesh data,
 and all other root/settings content remain fingerprinted. Historical schemas 4
-and 5 continue to verify with the frozen core-v3 projector, while a successful
-reaudit derives current core-v4 evidence from the exact backup without rewriting
-the sealed receipt.
+and 5 continue to verify with the frozen core-v3 projector, schema 6 uses its
+immutable core-v4 projector, and a successful reaudit derives current core-v5
+evidence from the exact backup without rewriting the sealed receipt.
 
 개별 산출물: `export_prepare_plan.py`(SK/M_ 변경 예정 목록), `export_prepare_apply_queue.py`
 (`--apply`로 안전 항목 일괄 적용), `export_texture_plan.py`(②③ 작업표),

@@ -59,14 +59,14 @@ RECOVERY_CONTRACT = "speedtree_stale_node_table_interactive_recovery_v2"
 PREIMAGE_RECEIPT_KIND = "speedtree_stale_node_table_preimage_receipt"
 BLOCKED_EVENT_KIND = "speedtree_stale_node_table_recovery_blocked"
 CONTINUATION_CLAIM_KIND = "speedtree_stale_node_table_continuation_claim"
-AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 4
+AUTHORING_GRAPH_CORE_PROJECTION_VERSION = 5
 TARGET_BINDING_PROJECTION_VERSION = 2
 TARGET_REQUIREMENTS_VERSION = 1
 TARGET_REQUIREMENTS_POLICY = "explicit_sealed_scopes_v1"
 TARGET_SCOPE_MODE_STRICT_LEGACY = "strict_legacy"
 TARGET_SCOPE_MODE_EXPLICIT = "explicit_sealed_scopes"
-_CURRENT_RECEIPT_DIALECT_KEY = (6, 1, 4, 1, 2, 1)
-_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6})
+_CURRENT_RECEIPT_DIALECT_KEY = (7, 1, 5, 1, 2, 1)
+_KNOWN_RECEIPT_SCHEMAS = frozenset({2, 3, 4, 5, 6, 7})
 _KNOWN_UNSUPPORTED_RECEIPT_DIALECTS = frozenset({
     # A real Lauraceae receipt uses this tuple, but the historical core-v1
     # implementation is unavailable.  Its sanitized evidence fixture records
@@ -1280,6 +1280,110 @@ def _v4_generated_collection_default(element, prefix):
     return bool(name.startswith(prefix) and name != prefix and value == "false")
 
 
+def _v5_exact_default_spline(element, tag, points):
+    if (
+        not _v4_plain_tag(element, tag)
+        or element.attrib != {"DrawMode": "false"}
+        or _v4_has_significant_text_or_tail(element)
+        or len(element) != len(points)
+    ):
+        return False
+    fields = ("X", "Y", "TangentX", "TangentY", "Length")
+    for point, expected_values in zip(element, points):
+        if (
+            not _v4_plain_tag(point, "ControlPoint")
+            or point.attrib
+            or _v4_has_significant_text_or_tail(point)
+            or len(point) != len(fields)
+        ):
+            return False
+        for child, field, expected_text in zip(
+            point,
+            fields,
+            expected_values,
+        ):
+            if (
+                not _v4_plain_tag(child, field)
+                or child.attrib
+                or list(child)
+                or _v4_has_significant_tail(child)
+                or str(child.text or "") != expected_text
+            ):
+                return False
+    return True
+
+
+def _v5_default_disabled_planar_2(element):
+    if (
+        not _v4_plain_tag(element, "SplineProperty")
+        or element.attrib
+        or _v4_has_significant_text_or_tail(element)
+    ):
+        return False
+    children = list(element)
+    expected_scalars = (
+        ("Name", "Forces:Planar 2"),
+        ("Value", "0.25"),
+        ("Variance", "0"),
+        ("Enabled", "false"),
+        ("CohesionScale", "1"),
+        ("CohesionOffset", "0"),
+        ("Distribution", "0"),
+        ("ForceBehaviorID", "-1"),
+        ("Relative", "true"),
+    )
+    if len(children) != len(expected_scalars) + 2:
+        return False
+    for child, (expected_tag, expected_text) in zip(
+        children,
+        expected_scalars,
+    ):
+        if (
+            not _v4_plain_tag(child, expected_tag)
+            or child.attrib
+            or list(child)
+            or _v4_has_significant_tail(child)
+            or str(child.text or "") != expected_text
+        ):
+            return False
+    compound_parent = children[-2]
+    if (
+        not _v4_plain_tag(compound_parent, "CompoundParentSpline")
+        or compound_parent.attrib != {"Count": "1"}
+        or _v4_has_significant_text_or_tail(compound_parent)
+        or len(compound_parent) != 1
+        or not _v5_exact_default_spline(
+            compound_parent[0],
+            "Spline",
+            (
+                ("0", "1", "1", "0", "0"),
+                ("1", "1", "1", "0", "0"),
+            ),
+        )
+    ):
+        return False
+    return _v5_exact_default_spline(
+        children[-1],
+        "ProfileSpline",
+        (
+            ("0", "0", "1", "0", "0"),
+            ("1", "1", "1", "0", "0"),
+        ),
+    )
+
+
+def _v5_draw_flags_token(value):
+    raw_text = str(value or "")
+    text = raw_text.strip()
+    if raw_text != text or not re.fullmatch(r"\d+", text):
+        return raw_text
+    try:
+        value_without_view_bit = int(text, 10) & ~0x8
+    except (TypeError, ValueError):
+        return raw_text
+    return f"draw-flags-without-view-bit-0x8:{value_without_view_bit}"
+
+
 def _v4_generated_atlas_mesh_user_data(element):
     if (
         not _v4_plain_tag(element, "UserData")
@@ -1303,7 +1407,13 @@ def _v4_generated_atlas_mesh_user_data(element):
     )
 
 
-def _v4_child_is_excluded(parent_path, child, siblings=None):
+def _v4_child_is_excluded(
+    parent_path,
+    child,
+    siblings=None,
+    *,
+    projection_version=AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+):
     siblings = tuple(siblings or ())
     parent_key = _v4_path_key(parent_path)
     child_tag = _v4_tag_name(child.tag)
@@ -1315,15 +1425,26 @@ def _v4_child_is_excluded(parent_path, child, siblings=None):
         )
     if parent_key == ("SpeedTree", "Generators", "Generator", "Properties"):
         name = _v4_direct_child_text(child, "Name")
-        duplicate_count = sum(
+        collection_duplicate_count = sum(
             _v4_plain_tag(candidate, "Property")
             and _v4_direct_child_text(candidate, "Name") == name
             for candidate in siblings
         )
-        return _v4_generated_collection_default(
+        if _v4_generated_collection_default(
             child,
             "Generation:Collections:",
-        ) and duplicate_count == 1
+        ) and collection_duplicate_count == 1:
+            return True
+        planar_duplicate_count = sum(
+            _v4_plain_tag(candidate, "SplineProperty")
+            and _v4_direct_child_text(candidate, "Name") == name
+            for candidate in siblings
+        )
+        return bool(
+            projection_version >= 5
+            and _v5_default_disabled_planar_2(child)
+            and planar_duplicate_count == 1
+        )
     if parent_key in {
         ("SpeedTree", "Forces", "Force", "Properties"),
         ("SpeedTree", "Force", "Properties"),
@@ -1396,11 +1517,21 @@ def _v4_child_is_excluded(parent_path, child, siblings=None):
     return False
 
 
-def _v4_ordered_children(element, path):
+def _v4_ordered_children(
+    element,
+    path,
+    *,
+    projection_version=AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+):
     siblings = list(element)
     children = [
         child for child in siblings
-        if not _v4_child_is_excluded(path, child, siblings)
+        if not _v4_child_is_excluded(
+            path,
+            child,
+            siblings,
+            projection_version=projection_version,
+        )
     ]
     if _v4_path_key(path) == ("SpeedTree", "Assets"):
         # A no-edit Modeler Save stably partitions direct Assets children by
@@ -1431,6 +1562,7 @@ def _v4_projected_subtree(
     *,
     truthy_value=False,
     physics_bones_context=False,
+    projection_version=AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
 ):
     element_tag = _v4_tag_name(element.tag)
     path = tuple(path) + (element_tag,)
@@ -1442,6 +1574,11 @@ def _v4_projected_subtree(
         text = "<modeler-generated-guid>"
     elif path_key in _AUTHORING_GRAPH_V4_CANONICAL_GUID_PATHS:
         text = _v4_generator_guid_spelling(text)
+    elif (
+        projection_version >= 5
+        and path_key == ("SpeedTree", "DrawFlags8", "DrawFlags")
+    ):
+        text = _v5_draw_flags_token(text)
     elif path_key in {
         (
             "SpeedTree", "Generators", "Generator", "Extra",
@@ -1523,8 +1660,13 @@ def _v4_projected_subtree(
                 path,
                 truthy_value=child_truthy,
                 physics_bones_context=child_physics_bones,
+                projection_version=projection_version,
             )
-            for child in _v4_ordered_children(element, path)
+            for child in _v4_ordered_children(
+                element,
+                path,
+                projection_version=projection_version,
+            )
         ],
     }
     tail = str(element.tail or "")
@@ -1533,13 +1675,20 @@ def _v4_projected_subtree(
     return projected
 
 
-def _authoring_graph_core_projection(text):
-    """Project the full authored XML tree under fail-closed core-v4 rules."""
+def _authoring_graph_core_projection_for_version(text, projection_version):
+    """Project the authored XML tree under one immutable core dialect."""
     root = _v4_parse(text)
-    projected = _v4_projected_subtree(root)
+    projected = _v4_projected_subtree(
+        root,
+        projection_version=projection_version,
+    )
     root_children = [
         child for child in root
-        if not _v4_child_is_excluded((_v4_tag_name(root.tag),), child)
+        if not _v4_child_is_excluded(
+            (_v4_tag_name(root.tag),),
+            child,
+            projection_version=projection_version,
+        )
     ]
     generators = next(
         (child for child in root_children if _v4_plain_tag(child, "Generators")),
@@ -1572,7 +1721,7 @@ def _authoring_graph_core_projection(text):
     rows = {"root": projected}
     return {
         "contract": "speedtree_spm_authoring_graph_core_projection",
-        "version": 4,
+        "version": projection_version,
         "generator_count": generator_count,
         "link_count": link_count,
         "asset_identity_count": asset_identity_count,
@@ -1580,6 +1729,21 @@ def _authoring_graph_core_projection(text):
         "fingerprint": _json_fingerprint(rows),
         "_rows": rows,
     }
+
+
+def _legacy_authoring_graph_core_v4_projection(text):
+    """Reproduce immutable core-v4 for historical schema-6 receipts."""
+    return _authoring_graph_core_projection_for_version(text, 4)
+
+
+def _authoring_graph_core_projection(text):
+    """Project the full authored XML tree under current fail-closed rules."""
+    return _authoring_graph_core_projection_for_version(
+        text,
+        AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
+    )
+
+
 def _legacy_authoring_graph_core_v2_subtree(
     element,
     *,
@@ -1921,7 +2085,18 @@ def _authoring_graph_core_v3_candidates(snapshot, _expected_mesh_ids=()):
 
 
 def _authoring_graph_core_v4_candidates(snapshot, _expected_mesh_ids=()):
-    projection = _authoring_graph_core_projection(snapshot["text"])
+    projection = _legacy_authoring_graph_core_v4_projection(snapshot["text"])
+    return [{
+        key: value for key, value in projection.items()
+        if not key.startswith("_")
+    }]
+
+
+def _authoring_graph_core_v5_candidates(snapshot, _expected_mesh_ids=()):
+    projection = _authoring_graph_core_projection_for_version(
+        snapshot["text"],
+        5,
+    )
     return [{
         key: value for key, value in projection.items()
         if not key.startswith("_")
@@ -2613,7 +2788,7 @@ def _receipt_target_scopes(receipt):
             "authoring_mesh_ids": requested,
             "required_live_mesh_ids": list(requested),
         }
-    if schema_version not in {5, 6}:
+    if schema_version not in {5, 6, 7}:
         return None
     return _target_requirements_v1_scopes(requirements, requested)
 
@@ -2702,6 +2877,17 @@ _CORE_V4_POLICY = _ProjectionPolicy(
         "global_setting_count",
     ),
 )
+_CORE_V5_POLICY = _ProjectionPolicy(
+    "authoring_graph_core_projection",
+    _authoring_graph_core_v5_candidates,
+    (
+        "fingerprint",
+        "generator_count",
+        "link_count",
+        "asset_identity_count",
+        "global_setting_count",
+    ),
+)
 _MEMBERSHIP_V1_POLICY = _ProjectionPolicy(
     "generator_membership",
     _generator_membership_projection_v1,
@@ -2780,6 +2966,15 @@ _RECEIPT_DIALECTS = MappingProxyType({
         _TARGET_V2_POLICY,
         "explicit_sealed_scopes_v1",
     ),
+    (7, 1, 5, 1, 2, 1): _ReceiptDialect(
+        "schema7_graph1_core5_target2_requirements1",
+        (7, 1, 5, 1, 2, 1),
+        _GRAPH_V1_POLICY,
+        _CORE_V5_POLICY,
+        _MEMBERSHIP_V1_POLICY,
+        _TARGET_V2_POLICY,
+        "explicit_sealed_scopes_v1",
+    ),
 })
 
 
@@ -2838,7 +3033,7 @@ def _resolve_receipt_dialect_spec(receipt, snapshot=None):
             "authoring_graph_core_projection",
             "speedtree_spm_authoring_graph_core_projection",
         ),)
-    if schema_version in {5, 6}:
+    if schema_version in {5, 6, 7}:
         required_blocks += ((
             "target_requirements",
             "speedtree_stale_node_target_requirements",
