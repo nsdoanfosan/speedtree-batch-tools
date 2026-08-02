@@ -1320,7 +1320,11 @@ class RelationAndAuthorityTests(unittest.TestCase):
             cluster_sync,
             "spm_file_structural_semantic_fingerprint",
             return_value=semantic,
-        ) as structural:
+        ) as structural, mock.patch.object(
+            cluster_sync,
+            "inspect_normalization_source_identity",
+            return_value={"refresh_reasons": []},
+        ):
             first = cluster_sync._physical_refresh_state(
                 payload,
                 canonical,
