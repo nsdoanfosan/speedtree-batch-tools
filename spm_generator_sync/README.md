@@ -12,6 +12,23 @@ weed_black_locast
 
 `SPM_Generator_Sync.bat`을 더블클릭해 실행합니다.
 
+## 공식 exact-target repair 명령
+
+인자 없이 실행하면 기존 GUI가 그대로 열린다. 인자가 있으면 GUI 없이 current board의
+exact selector만 공용 durable FIFO에서 실행한다. `--target-spm`은 반복할 수 있지만,
+각 경로와 일치하는 follower/Cluster ON target만 계획에 남고 형제 SPM이나 전체 폴더로
+확대하지 않는다.
+
+```bat
+SPM_Generator_Sync.bat --repair-action generator-sync --target-spm "D:\...\SK_asset.spm" --parent-retry-id retry-118 --request-id repair-001 --receipt "D:\...\repair-001.json"
+SPM_Generator_Sync.bat --repair-action cluster-refresh --target-spm "D:\...\cluster\SK_cluster.spm" --parent-retry-id retry-118 --request-id repair-002 --receipt "D:\...\repair-002.json"
+SPM_Generator_Sync.bat --repair-action generator-sync-and-cluster --target-spm "D:\...\SK_asset.spm" --target-spm "D:\...\cluster\SK_cluster.spm" --parent-retry-id retry-118 --request-id repair-003 --receipt "D:\...\repair-003.json"
+```
+
+master 하나만 지정해 모든 follower로 fan-out하는 요청은 fail closed한다. queue lease,
+취소, liveness, bounded publish retry와 terminal receipt는 GUI connected-run과 같은
+내부 계약을 사용한다.
+
 적용·동기화·Cluster 관계 변경/갱신은 PCG와 SK Batch가 공유하는 프로세스 간
 FIFO에 클릭 즉시 등록된다. 같은 창의 로컬 대기열뿐 아니라 다른 BAT 창의 작업도
 같은 순서를 사용하며 실제 변경은 한 번에 하나만 실행한다. Cluster 갱신은 자기

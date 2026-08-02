@@ -58,6 +58,32 @@ from code_compile_gate import (
 _PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(REPO_DIR)
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
+from exact_target_command import (
+    build_exact_target_request,
+    run_exact_target_request,
+)
+from repair_orchestration import (
+    GENERATOR_SYNC_TOOL,
+    PCG_TEXTURE_TOOL,
+    REPAIR_PLAN_SCHEMA_VERSION,
+    RepairPlan,
+    STATUS_CANCELLED,
+    STATUS_CLUSTER,
+    STATUS_COMPLETED,
+    STATUS_FINAL_FAILED,
+    STATUS_GENERATOR,
+    STATUS_LABELS as AUTOMATIC_REPAIR_STATUS_LABELS,
+    STATUS_PENDING,
+    STATUS_PIPELINE,
+    STATUS_REAUDIT,
+    build_exact_target_repair_plan,
+    compact_success_message,
+    evidence_reason_codes,
+    fresh_repair_receipt_authoritative,
+    has_repair_contract_evidence,
+    repair_progress_payload,
+    stage_running_status,
+)
 from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
@@ -2272,12 +2298,14 @@ class App:
             self.btn_retry_failed,
             "체크 상태와 무관하게 현재 목록 전체의 실패/stale 이력을 "
             "원인별로 나눠 재시도합니다.\n"
+            "· Repair reason code: exact PCG 텍스처 또는 Generator/Cluster를 "
+            "자동 복구하고 fresh 재검증 후 Blender/Unreal 재시도\n"
             "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
             "③ Unreal Push까지 실행\n"
             "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
             "산출물과 입력 identity를 검증한 뒤 현재 Unreal 코드로만 재시도\n"
-            "재시도 가능한 실패가 아니거나 identity 검증에 실패한 항목은 정확한 "
-            "이유를 기록하고 안전하게 제외합니다.",
+            "BAT로 해결할 수 없거나 fresh 재검증에 실패한 항목만 최종 실패로 "
+            "남기고 사용자 조치와 원래 reason code를 기록합니다.",
         )
         self.btn_all = ttk.Button(
             actions,
@@ -3877,6 +3905,12 @@ class App:
                     job.get("recovery_requests") or [],
                     emit_done=False,
                 )
+            elif job["mode"] == "failed_retry_repair":
+                if lease is None:
+                    raise RuntimeError(
+                        "automatic exact repair requires a current shared queue lease"
+                    )
+                completed = self._run_failed_retry_repair_job(job, lease)
             else:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
@@ -4110,6 +4144,654 @@ class App:
                 ),
             }
 
+    def _failed_retry_durable_evidence(self, iid, repair_state=None):
+        """Return the saved structured failure plus current live provenance."""
+
+        with self.state_lock:
+            entry = copy.deepcopy(self.state.get(str(iid), {}) or {})
+        automation = entry.get("failed_retry_automation") or {}
+        automation_status = str(
+            automation.get("status")
+            if isinstance(automation, dict)
+            else ""
+        )
+        disposition = "candidate"
+        if automation_status == STATUS_COMPLETED:
+            disposition = "current_success"
+        elif automation_status == STATUS_CANCELLED:
+            disposition = "resumable_cancelled"
+        authoritative_result = None
+        authoritative_reader = getattr(
+            self,
+            "_target_authoritative_result",
+            None,
+        )
+        if callable(authoritative_reader):
+            authoritative_result = authoritative_reader(str(iid), "push")
+        normalized_outcome = str(
+            (authoritative_result or {}).get("outcome") or ""
+        )
+        if normalized_outcome == "completed":
+            disposition = "current_success"
+        elif normalized_outcome == "pending_unreal":
+            disposition = "current_wait"
+        elif (
+            normalized_outcome == "cancelled"
+            and disposition != "resumable_cancelled"
+        ):
+            disposition = "current_cancelled"
+        reason_token, evidence = self._target_failure_result(iid)
+        current_errors = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key in {
+                "push_status_error",
+                "blend_status_error",
+                "spm_status_error",
+            }
+        }
+        if disposition in {
+            "current_success",
+            "current_wait",
+            "current_cancelled",
+        }:
+            reason_token = disposition
+            evidence = {}
+            current_errors = {}
+        report_payloads = []
+        if disposition not in {
+            "current_success",
+            "current_wait",
+            "current_cancelled",
+        }:
+            pending = [evidence, current_errors]
+            report_paths = []
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if key in {"report", "audit_report", "report_file"}:
+                            if isinstance(child, (str, os.PathLike)):
+                                report_paths.append(Path(child))
+                        elif isinstance(child, (dict, list, tuple)):
+                            pending.append(child)
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(value)
+            seen_reports = set()
+            for report_path in report_paths:
+                absolute = report_path.expanduser().absolute()
+                key = os.path.normcase(str(absolute)).casefold()
+                if key in seen_reports:
+                    continue
+                seen_reports.add(key)
+                try:
+                    if not absolute.is_file() or absolute.stat().st_size > 64 * 1024 * 1024:
+                        continue
+                    payload = json.loads(absolute.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                report_payloads.append({
+                    "path": str(absolute),
+                    "payload": payload,
+                })
+        resumable = {}
+        if disposition == "resumable_cancelled" and isinstance(
+            automation, dict
+        ):
+            resumable = {
+                "original_failure": copy.deepcopy(
+                    automation.get("original_failure") or {}
+                ),
+                "plan": copy.deepcopy(automation.get("plan") or {}),
+                "cancelled_receipt": {
+                    key: copy.deepcopy(automation.get(key))
+                    for key in (
+                        "request_id",
+                        "parent_retry_id",
+                        "exact_spm",
+                        "status",
+                        "attempted_stages",
+                    )
+                },
+            }
+        return {
+            "schema_version": 1,
+            "queue_id": str(iid),
+            "terminal_disposition": disposition,
+            "current_phase_errors": current_errors,
+            "current_report_payloads": report_payloads,
+            "selected_failure": {
+                "reason_token": reason_token,
+                "evidence": copy.deepcopy(evidence),
+            },
+            "resumable_cancelled": resumable,
+            "current_repair_state": copy.deepcopy(
+                repair_state
+                if isinstance(repair_state, dict)
+                else self._failed_retry_repair_state(iid)
+            ),
+        }
+
+    def _set_failed_retry_automatic_status(
+        self,
+        iid,
+        status,
+        *,
+        plan=None,
+        attempted_stages=(),
+        completed_stages=0,
+        error="",
+        friendly_reason="",
+        remaining_action="",
+    ):
+        """Persist one non-failure transition or one terminal final failure."""
+
+        iid = str(iid)
+        label = AUTOMATIC_REPAIR_STATUS_LABELS.get(status, str(status))
+        plan_payload = (
+            plan.metadata() if hasattr(plan, "metadata")
+            else copy.deepcopy(dict(plan or {}))
+        )
+        progress = repair_progress_payload(
+            plan_payload,
+            status=status,
+            completed_stages=completed_stages,
+            attempted_stages=attempted_stages,
+            error=error,
+        )
+        progress.update({
+            "friendly_reason": str(friendly_reason or ""),
+            "remaining_action": str(remaining_action or ""),
+        })
+        display = label
+        if status == STATUS_FINAL_FAILED and friendly_reason:
+            display = f"실패 · {friendly_reason}"
+        elif status == STATUS_COMPLETED:
+            display = compact_success_message(attempted_stages)
+        self.ui_queue.put(("cell", (iid, "push_status", display)))
+        with self.state_lock:
+            entry = self.state.setdefault(iid, {})
+            automation = entry.setdefault("failed_retry_automation", {})
+            if "original_failure" not in automation:
+                automation["original_failure"] = {
+                    key: copy.deepcopy(value)
+                    for key, value in entry.items()
+                    if key.endswith("_status_error")
+                    or key.endswith("_status_kind")
+                }
+            automation.update(progress)
+            automation["plan"] = plan_payload
+            entry["push_status"] = display
+            entry["push_status_kind"] = (
+                "automatic_repair_failed"
+                if status == STATUS_FINAL_FAILED
+                else "automatic_repair"
+            )
+            if status == STATUS_FINAL_FAILED:
+                entry["push_status_error"] = {
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "kind": "automatic_repair_failed",
+                    "message": friendly_reason or "자동 복구 후 재검증 실패",
+                    "attempted_stages": copy.deepcopy(list(attempted_stages)),
+                    "remaining_action": str(remaining_action or ""),
+                    "reason_codes": list(plan_payload.get("reason_codes") or ()),
+                    "raw_error": str(error or ""),
+                }
+            else:
+                entry.pop("push_status_error", None)
+            save_state(self.state)
+        return progress
+
+    def _fresh_reaudit_after_exact_repair(self, item, stage):
+        """Run the existing read-only exact SPM audit after every BAT stage."""
+
+        iid = str(item["spm"])
+        stage_name = str(stage.get("stage") or "")
+        exact_spm = Path(item["spm"])
+        evidence = {}
+        if stage_name == "pcg_texture":
+            artifact = self._execute_material_preflight(
+                exact_spm,
+                speedtree_output_spm_for(exact_spm),
+                datetime.now().strftime("%Y%m%d_%H%M%S_reaudit"),
+            )
+            material_result = artifact.get("result") or {}
+            if (
+                artifact.get("code") != 0
+                or material_result.get("status") != "ok"
+            ):
+                raise RuntimeError(
+                    material_result.get("failure_reason")
+                    or material_result.get("error")
+                    or "PCG texture fresh material re-audit failed"
+                )
+            evidence["material_preflight_report"] = str(
+                artifact.get("report") or ""
+            )
+        if stage_name in {"generator_sync_and_cluster", "cluster_refresh"}:
+            providers = [
+                Path(path)
+                for path in stage.get("target_spms") or ()
+                if os.path.normcase(os.path.abspath(str(path))).casefold()
+                != os.path.normcase(os.path.abspath(str(exact_spm))).casefold()
+            ]
+            observations = []
+            for provider in providers:
+                observations.append(
+                    self._cluster_normalization_stage_observation(
+                        exact_spm,
+                        datetime.now().strftime("%Y%m%d_%H%M%S_reaudit"),
+                        provider,
+                        require_normalized=True,
+                    )
+                )
+            if stage_name == "generator_sync_and_cluster" and not observations:
+                raise RuntimeError(
+                    "Generator/Cluster fresh re-audit has no exact provider target"
+                )
+            evidence["cluster_observations"] = observations
+        self._job_check(iid, Path(item["spm"]))
+        state = self._failed_retry_repair_state(iid)
+        if state.get("kind") == "inspection_incomplete":
+            raise RuntimeError(state.get("reason") or "fresh re-audit incomplete")
+        return {
+            "stage": str(stage.get("stage") or ""),
+            "status": "audited",
+            "repair_state": copy.deepcopy(state),
+            "evidence": evidence,
+        }
+
+    def _run_failed_retry_repair_job(self, job, lease):
+        """Run exact BAT stages, fresh-audit, then re-enter the pipeline."""
+
+        from pcg_st9_texture_batch.exact_target_repair import (
+            execute_step3_standard,
+        )
+        from spm_generator_sync.exact_target_repair import (
+            execute_exact_generator_request,
+        )
+
+        executors = {
+            PCG_TEXTURE_TOOL: execute_step3_standard,
+            GENERATOR_SYNC_TOOL: execute_exact_generator_request,
+        }
+        targets_by_id = {
+            str(item["spm"]): item for item in job.get("targets") or ()
+        }
+        plans = list(job.get("repair_plans") or ())
+        total_stage_count = sum(len(plan.get("stages") or ()) for plan in plans)
+        global_completed = 0
+        outcomes = []
+        pipeline_targets = []
+
+        for plan in plans:
+            iid = str(plan["exact_spm"])
+            item = targets_by_id.get(iid)
+            attempted = []
+            if item is None:
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": "repair_inventory_target_missing",
+                    "evidence": {"plan": copy.deepcopy(plan)},
+                })
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    friendly_reason="자동 복구 대상이 current inventory에서 사라졌습니다.",
+                    remaining_action="목록을 다시 검사한 뒤 재시도하세요.",
+                )
+                continue
+
+            cancelled = False
+            failed = None
+            for stage_index, stage in enumerate(plan.get("stages") or (), 1):
+                if self.stop_flag.is_set():
+                    cancelled = True
+                    break
+                status = stage_running_status(stage)
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    status,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=stage_index - 1,
+                )
+                label = AUTOMATIC_REPAIR_STATUS_LABELS[status]
+                self.ui_queue.put((
+                    "progress",
+                    f"{Path(iid).name} · {label} · "
+                    f"완료 {global_completed}/{total_stage_count} · "
+                    f"남음 {max(0, total_stage_count - global_completed)}",
+                ))
+                receipt = LOG_DIR / (
+                    f"exact_repair_{plan['request_id']}_{stage_index}.json"
+                )
+                request = build_exact_target_request(
+                    tool=stage["tool"],
+                    repair_action=stage["repair_action"],
+                    target_spms=stage["target_spms"],
+                    repair_stage=stage["stage"],
+                    provenance={
+                        "reason_codes": list(plan.get("reason_codes") or ()),
+                        "evidence_sha256": plan.get("evidence_sha256"),
+                        "source": "sk_batch.failed_retry",
+                    },
+                    parent_retry_id=plan["parent_retry_id"],
+                    request_id=f"{plan['request_id']}-{stage_index}",
+                    receipt=receipt,
+                )
+                current_stage_status = [status]
+
+                def on_exact_progress(payload, asset=Path(iid).name):
+                    unit_stage = str(payload.get("unit_stage") or "")
+                    desired_status = (
+                        STATUS_CLUSTER
+                        if unit_stage == "cluster_refresh"
+                        else (
+                            STATUS_GENERATOR
+                            if unit_stage == "generator_sync"
+                            else current_stage_status[0]
+                        )
+                    )
+                    if desired_status != current_stage_status[0]:
+                        current_stage_status[0] = desired_status
+                        self._set_failed_retry_automatic_status(
+                            iid,
+                            desired_status,
+                            plan=plan,
+                            attempted_stages=attempted,
+                            completed_stages=stage_index - 1,
+                        )
+                    self.ui_queue.put((
+                        "progress",
+                        f"{asset} · "
+                        f"{payload.get('current_stage') or label} · "
+                        f"완료 {global_completed}/{total_stage_count} · "
+                        f"남음 {max(0, total_stage_count - global_completed)}",
+                    ))
+
+                terminal = run_exact_target_request(
+                    request,
+                    executors[stage["tool"]],
+                    inherited_lease=lease,
+                    cancel_event=self.stop_flag,
+                    on_progress=on_exact_progress,
+                )
+                attempted_row = {
+                    "stage": stage["stage"],
+                    "tool": stage["tool"],
+                    "repair_action": stage["repair_action"],
+                    "targets": list(stage["target_spms"]),
+                    "receipt": str(receipt),
+                    "status": terminal.get("status"),
+                }
+                attempted.append(attempted_row)
+                terminal_status = str(
+                    terminal.get("terminal_status")
+                    or terminal.get("status")
+                    or ""
+                )
+                if terminal_status == "cancelled":
+                    cancelled = True
+                    break
+                if terminal_status != "completed":
+                    failed = (
+                        "BAT exact repair failed",
+                        terminal.get("error")
+                        or str((terminal.get("result") or {}).get("reason") or ""),
+                    )
+                    break
+                global_completed += 1
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_REAUDIT,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=stage_index,
+                )
+                self.ui_queue.put((
+                    "progress",
+                    f"{Path(iid).name} · 재검증 중 · "
+                    f"완료 {global_completed}/{total_stage_count} · "
+                    f"남음 {max(0, total_stage_count - global_completed)}",
+                ))
+                try:
+                    attempted_row["fresh_reaudit"] = (
+                        self._fresh_reaudit_after_exact_repair(item, stage)
+                    )
+                except Exception as exc:
+                    failed = (
+                        "fresh re-audit failed",
+                        compact_error_message(exc, 400),
+                    )
+                    break
+
+            if cancelled:
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_CANCELLED,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=sum(
+                        row.get("status") == "completed" for row in attempted
+                    ),
+                )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "automatic_repair_cancelled",
+                    "evidence": {"attempted_stages": copy.deepcopy(attempted)},
+                })
+                continue
+            if failed is not None:
+                headline, raw_error = failed
+                friendly = (
+                    "자동 복구 단계가 끝났지만 fresh re-audit를 통과하지 못했습니다."
+                    if headline == "fresh re-audit failed"
+                    else "exact BAT 자동 복구가 완료되지 않았습니다."
+                )
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=sum(
+                        row.get("status") == "completed" for row in attempted
+                    ),
+                    error=raw_error,
+                    friendly_reason=friendly,
+                    remaining_action=(
+                        "receipt와 원래 reason code를 확인하고 해당 authoring 문제를 수정하세요."
+                    ),
+                )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": "automatic_repair_reaudit_failed",
+                    "evidence": {
+                        "attempted_stages": copy.deepcopy(attempted),
+                        "raw_error": raw_error,
+                        "reason_codes": list(plan.get("reason_codes") or ()),
+                    },
+                })
+                continue
+            self._set_failed_retry_automatic_status(
+                iid,
+                STATUS_PIPELINE,
+                plan=plan,
+                attempted_stages=attempted,
+                completed_stages=len(plan.get("stages") or ()),
+            )
+            item["_failed_retry_attempted_stages"] = attempted
+            pipeline_targets.append(item)
+
+        if pipeline_targets and not self.stop_flag.is_set():
+            self.ui_queue.put((
+                "progress",
+                f"Blender-Unreal 재시도 중 · 대상 {len(pipeline_targets)} · "
+                f"완료 0 · 남음 {len(pipeline_targets)}",
+            ))
+            self._run_full_pipeline(
+                pipeline_targets,
+                terminal_phase="push",
+                selected_scope=True,
+                emit_done=False,
+            )
+            pipeline_summary = copy.deepcopy(
+                getattr(self, "_phase_result_summary", None)
+                or self._summarize_phase_targets(pipeline_targets)
+            )
+            pipeline_by_id = {
+                str(row.get("target")): row
+                for row in pipeline_summary.get("target_outcomes") or ()
+            }
+            for item in pipeline_targets:
+                iid = str(item["spm"])
+                attempted = item.pop("_failed_retry_attempted_stages", [])
+                pipeline_row = pipeline_by_id.get(iid, {})
+                plan = next(
+                    plan for plan in plans if plan["exact_spm"] == iid
+                )
+                pipeline_outcome = str(pipeline_row.get("outcome") or "")
+                if pipeline_outcome == "completed":
+                    final_receipt = self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_COMPLETED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                    )
+                    if not fresh_repair_receipt_authoritative(
+                        final_receipt, plan
+                    ):
+                        raise RuntimeError(
+                            "fresh automatic repair receipt identity mismatch"
+                        )
+                elif pipeline_outcome == "pending_unreal":
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_PIPELINE,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                    )
+                elif pipeline_outcome == "cancelled" or (
+                    not pipeline_outcome and self.stop_flag.is_set()
+                ):
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_CANCELLED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                    )
+                    if not pipeline_row:
+                        pipeline_row = {
+                            "target": iid,
+                            "target_name": Path(iid).name,
+                            "outcome": "cancelled",
+                            "reason_token": "automatic_retry_cancelled",
+                            "evidence": {},
+                        }
+                else:
+                    evidence = copy.deepcopy(pipeline_row.get("evidence") or {})
+                    raw_error = str(
+                        evidence.get("message")
+                        or evidence.get("raw_error")
+                        or pipeline_row.get("reason_token")
+                        or "pipeline retry failed"
+                    )
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_FINAL_FAILED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                        error=raw_error,
+                        friendly_reason=(
+                            "BAT 복구와 fresh re-audit는 통과했지만 "
+                            "Blender/Unreal 재시도가 완료되지 않았습니다."
+                        ),
+                        remaining_action=(
+                            "상세 pipeline receipt를 확인한 뒤 남은 단계를 다시 실행하세요."
+                        ),
+                    )
+                outcomes.append(pipeline_row or {
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": "pipeline_retry_result_missing",
+                    "evidence": {},
+                })
+        elif pipeline_targets:
+            for item in pipeline_targets:
+                iid = str(item["spm"])
+                attempted = item.pop("_failed_retry_attempted_stages", [])
+                plan = next(
+                    plan for plan in plans if plan["exact_spm"] == iid
+                )
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_CANCELLED,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=len(attempted),
+                )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "automatic_retry_cancelled",
+                    "evidence": {"attempted_stages": copy.deepcopy(attempted)},
+                })
+
+        completed_count = sum(
+            row.get("outcome") == "completed" for row in outcomes
+        )
+        pending_count = sum(
+            row.get("outcome") == "pending_unreal" for row in outcomes
+        )
+        failed_count = sum(row.get("outcome") == "failed" for row in outcomes)
+        cancelled_count = sum(
+            row.get("outcome") == "cancelled" for row in outcomes
+        )
+        blocked_count = sum(
+            row.get("outcome") in {"blocked", "planned_excluded"}
+            for row in outcomes
+        )
+        owner_lost_count = sum(
+            row.get("outcome") == "owner_lost" for row in outcomes
+        )
+        summary = {
+            "selected_count": len(outcomes),
+            "completed_count": completed_count,
+            "pending_count": pending_count,
+            "blocked_count": blocked_count,
+            "owner_lost_count": owner_lost_count,
+            "planned_excluded_count": sum(
+                row.get("outcome") == "planned_excluded" for row in outcomes
+            ),
+            "dependency_blocked_count": sum(
+                row.get("outcome") == "blocked" for row in outcomes
+            ),
+            "failed_count": failed_count,
+            "cancelled_count": cancelled_count,
+            "target_outcomes": outcomes,
+            "shared_failures": [],
+        }
+        self._phase_result_summary = summary
+        return not (
+            failed_count
+            or blocked_count
+            or owner_lost_count
+            or cancelled_count
+        )
+
     def _failed_retry_parent_source_record(self, queue_id, parent_item):
         state_entry = self.state.get(queue_id, {})
         expected = str(parent_item.get("source_fingerprint") or "")
@@ -4187,6 +4869,91 @@ class App:
             iid: self._failed_retry_repair_state(iid)
             for iid in candidate_iids
         }
+        retry_run_id = (
+            "failed-retry-"
+            + datetime.now().strftime("%Y%m%dT%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:10]
+        )
+        automatic_plans = {}
+        unsupported_plans = {}
+        for iid in candidate_iids:
+            evidence = self._failed_retry_durable_evidence(
+                iid, repair_states[iid]
+            )
+            if not has_repair_contract_evidence(evidence):
+                continue
+            request_id = (
+                "repair-"
+                + hashlib.sha256(
+                    (iid + retry_run_id).encode("utf-8")
+                ).hexdigest()[:16]
+            )
+            try:
+                plan = build_exact_target_repair_plan(
+                    iid,
+                    evidence,
+                    inventory_paths=candidate_iids,
+                    parent_retry_id=retry_run_id,
+                    request_id=request_id,
+                )
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                raw_error = compact_error_message(exc, 240)
+                plan = RepairPlan(
+                    REPAIR_PLAN_SCHEMA_VERSION,
+                    request_id,
+                    retry_run_id,
+                    str(Path(iid).expanduser().absolute()),
+                    hashlib.sha256(json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode("utf-8")).hexdigest(),
+                    evidence_reason_codes(evidence),
+                    (),
+                    False,
+                    STATUS_FINAL_FAILED,
+                    "exact target/provenance 검증에 실패해 자동 복구를 시작하지 않았습니다.",
+                    "목록을 새로 검사해 canonical SPM identity를 갱신한 뒤 다시 실행하세요.",
+                )
+                unsupported_plans[iid] = plan
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    error=raw_error,
+                    friendly_reason=plan.friendly_reason,
+                    remaining_action=plan.remaining_action,
+                )
+                self.log(
+                    f"[automatic repair plan excluded] {Path(iid).name}: "
+                    f"{raw_error}"
+                )
+                continue
+            if plan.supported:
+                automatic_plans[iid] = plan
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_PENDING,
+                    plan=plan,
+                )
+            else:
+                unsupported_plans[iid] = plan
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    friendly_reason=plan.friendly_reason,
+                    remaining_action=plan.remaining_action,
+                )
+                self.log(
+                    f"[automatic repair unsupported] {Path(iid).name}: "
+                    f"{plan.friendly_reason} | remaining={plan.remaining_action} | "
+                    f"details reason_codes={','.join(plan.reason_codes)}"
+                )
+        bat_handled_ids = set(automatic_plans) | set(unsupported_plans)
         parent_statuses = {
             iid: UNREAL_PARENT_ABSENT for iid in candidate_iids
         }
@@ -4272,6 +5039,7 @@ class App:
             iid
             for iid, decision in decisions.items()
             if decision.classification == BLENDER_REBUILD
+            and iid not in bat_handled_ids
         }
         recovery_requests = []
 
@@ -4281,6 +5049,7 @@ class App:
                 for iid in group["selected_queue_ids"]
                 if decisions[iid].classification
                 == PENDING_UNREAL_VALIDATION
+                and iid not in bat_handled_ids
             ]
             if not pending_selected:
                 continue
@@ -4380,14 +5149,18 @@ class App:
             iid
             for iid in candidate_iids
             if decisions[iid].classification == BLENDER_REBUILD
+            and iid not in bat_handled_ids
         ]
         unreal_iids = [
             iid
             for iid in candidate_iids
             if decisions[iid].classification == UNREAL_ONLY
+            and iid not in bat_handled_ids
         ]
         skipped = []
         for iid in candidate_iids:
+            if iid in bat_handled_ids:
+                continue
             decision = decisions[iid]
             if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
                 continue
@@ -4406,22 +5179,33 @@ class App:
                 "전체 대상 실패/stale 재시도 제외:\n  - "
                 + "\n  - ".join(skipped)
             )
+        terminal_details = [
+            f"{Path(iid).name}: {plan.friendly_reason}\n"
+            "  attempted automatic repair: none\n"
+            f"  remaining action: {plan.remaining_action}\n"
+            f"  details reason_codes={','.join(plan.reason_codes)}"
+            for iid, plan in unsupported_plans.items()
+        ]
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
             iid for iid in candidate_iids if iid in eligible_set
         ]
-        if not eligible_iids:
+        if not eligible_iids and not automatic_plans:
             messagebox.showinfo(
                 "전체 실패 이력 재시도",
                 "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
                 "없습니다.\n\n"
-                + "\n".join(skipped[:8]),
+                + "\n".join((terminal_details + skipped)[:8]),
             )
             return
 
         cfg = dict(self._collect_cfg())
         save_config(cfg)
-        inventory, targets = self._snapshot_batch_request(eligible_iids)
+        runnable_ids = [
+            iid for iid in candidate_iids
+            if iid in eligible_set or iid in automatic_plans
+        ]
+        inventory, targets = self._snapshot_batch_request(runnable_ids)
         targets_by_id = {str(item["spm"]): item for item in targets}
         action_kind = "failed_blender_export_and_unreal_retry"
 
@@ -4467,6 +5251,52 @@ class App:
                     "execution_path": "immutable_unreal_only",
                     "selected_queue_ids": unreal_ids,
                     "eligibility": eligibility_receipt(unreal_ids),
+                },
+            })
+
+        repair_targets = [
+            targets_by_id[iid]
+            for iid in candidate_iids
+            if iid in automatic_plans and iid in targets_by_id
+        ]
+        if repair_targets:
+            repair_ids = [str(item["spm"]) for item in repair_targets]
+            self._enqueue_batch_job({
+                "label": (
+                    "automatic repair · exact BAT → fresh audit → "
+                    f"Blender/Unreal · {len(repair_targets)}"
+                ),
+                "mode": "failed_retry_repair",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": repair_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "repair_plans": [
+                    automatic_plans[iid].metadata()
+                    for iid in repair_ids
+                ],
+                "retry_metadata": {
+                    "schema_version": 1,
+                    "kind": action_kind,
+                    "partition": "exact_bat_repair",
+                    "execution_path": (
+                        "exact_bat_then_fresh_reaudit_then_blender_unreal"
+                    ),
+                    "selected_queue_ids": repair_ids,
+                    "eligibility": {
+                        "schema_version": 1,
+                        "items": [
+                            {
+                                "queue_id": iid,
+                                "repair_plan": automatic_plans[iid].metadata(),
+                            }
+                            for iid in repair_ids
+                        ],
+                    },
                 },
             })
 
