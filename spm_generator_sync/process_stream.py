@@ -23,12 +23,20 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
+
+
+REPO_DIR = Path(__file__).resolve().parents[1]
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_popen
 
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
@@ -117,184 +125,6 @@ class _BoundedTextTail:
 
     def text(self) -> str:
         return "\n".join(self._parts)
-
-
-class _WindowsJobOwner:
-    """One private Job Object assigned before the root process is resumed."""
-
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-    JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
-    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-
-    def __init__(self):
-        import ctypes
-        from ctypes import wintypes
-
-        self.ctypes = ctypes
-        self.wintypes = wintypes
-        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
-        self._closed = False
-
-        class IO_COUNTERS(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-                ("IoInfo", IO_COUNTERS),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("TotalUserTime", ctypes.c_longlong),
-                ("TotalKernelTime", ctypes.c_longlong),
-                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
-                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
-                ("TotalPageFaultCount", wintypes.DWORD),
-                ("TotalProcesses", wintypes.DWORD),
-                ("ActiveProcesses", wintypes.DWORD),
-                ("TotalTerminatedProcesses", wintypes.DWORD),
-            ]
-
-        self._accounting_type = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
-        self.kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        self.kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        self.kernel32.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        self.kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        self.kernel32.AssignProcessToJobObject.argtypes = [
-            wintypes.HANDLE,
-            wintypes.HANDLE,
-        ]
-        self.kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        self.kernel32.QueryInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-        ]
-        self.kernel32.QueryInformationJobObject.restype = wintypes.BOOL
-        self.kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        self.kernel32.TerminateJobObject.restype = wintypes.BOOL
-        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        self.kernel32.CloseHandle.restype = wintypes.BOOL
-        self.ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
-        self.ntdll.NtResumeProcess.restype = ctypes.c_long
-
-        self.handle = self.kernel32.CreateJobObjectW(None, None)
-        if not self.handle:
-            self._raise_last_error("process_tree_job_create_failed")
-        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        limits.BasicLimitInformation.LimitFlags = (
-            self.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        )
-        if not self.kernel32.SetInformationJobObject(
-            self.handle,
-            self.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
-        ):
-            error = ctypes.get_last_error()
-            self.close()
-            raise ProcessTerminationError(
-                "process_tree_job_limit_failed",
-                evidence={"winerror": error},
-            )
-
-    def _raise_last_error(self, token: str, *, pid=None) -> None:
-        raise ProcessTerminationError(
-            token,
-            pid=pid,
-            evidence={"winerror": self.ctypes.get_last_error()},
-        )
-
-    def creationflags(self, requested_flags: int) -> int:
-        return int(requested_flags) | WINDOWS_CREATE_SUSPENDED
-
-    def assign_and_resume(self, process: subprocess.Popen) -> None:
-        process_handle = self.wintypes.HANDLE(int(process._handle))
-        if not self.kernel32.AssignProcessToJobObject(self.handle, process_handle):
-            self._raise_last_error(
-                "process_tree_job_assign_failed",
-                pid=getattr(process, "pid", None),
-            )
-        status = int(self.ntdll.NtResumeProcess(process_handle))
-        if status != 0:
-            raise ProcessTerminationError(
-                "process_tree_resume_failed",
-                pid=getattr(process, "pid", None),
-                evidence={"ntstatus": f"0x{status & 0xFFFFFFFF:08x}"},
-            )
-
-    def active_process_count(self) -> int:
-        accounting = self._accounting_type()
-        if not self.kernel32.QueryInformationJobObject(
-            self.handle,
-            self.JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
-            self.ctypes.byref(accounting),
-            self.ctypes.sizeof(accounting),
-            None,
-        ):
-            self._raise_last_error("process_tree_query_failed")
-        return int(accounting.ActiveProcesses)
-
-    def is_empty(self) -> bool:
-        return self.active_process_count() == 0
-
-    def wait_empty(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while True:
-            if self.is_empty():
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(0.01, remaining))
-
-    def terminate(self, *, pid=None, exit_code: int = 1) -> None:
-        if self.is_empty():
-            return
-        if not self.kernel32.TerminateJobObject(self.handle, int(exit_code)):
-            self._raise_last_error("process_tree_terminate_failed", pid=pid)
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        handle = getattr(self, "handle", None)
-        if handle:
-            self.kernel32.CloseHandle(handle)
-            self.handle = None
 
 
 def _reader(
@@ -394,7 +224,7 @@ def _stop_exact_process(
     reason: str,
     terminate_grace: float,
     kill_grace: float,
-    owner: _WindowsJobOwner | None = None,
+    owner: object | None = None,
 ) -> str:
     """Idempotently stop the exact owned unit and absorb genuine exit races."""
 
@@ -409,6 +239,35 @@ def _stop_exact_process(
                     evidence={"phase": reason, "kill_grace": kill_grace},
                 )
         return f"{reason}_after_exit"
+
+    if os.name == "nt" and owner is not None:
+        # Windows Popen.terminate() is TerminateProcess, not a graceful signal.
+        # The caller has already raised its cooperative cancellation flag; give
+        # the child a bounded observation window, then force only this exact
+        # private Job and report the outcome truthfully as killed.
+        if owner.wait_empty(terminate_grace):
+            try:
+                process.wait(timeout=max(0.0, float(kill_grace)))
+            except subprocess.TimeoutExpired:
+                pass
+            return f"{reason}_after_exit"
+        owner.terminate(pid=pid)
+        if not owner.wait_empty(kill_grace):
+            raise ProcessTerminationError(
+                "process_tree_kill_grace_expired",
+                pid=pid,
+                evidence={"phase": reason, "kill_grace": kill_grace},
+            )
+        try:
+            process.wait(timeout=max(0.0, float(kill_grace)))
+        except subprocess.TimeoutExpired as exc:
+            if process.poll() is None:
+                raise ProcessTerminationError(
+                    "process_kill_grace_expired",
+                    pid=pid,
+                    evidence={"phase": reason, "kill_grace": kill_grace},
+                ) from exc
+        return f"{reason}_killed"
 
     try:
         process.terminate()
@@ -512,23 +371,27 @@ def run_streaming_process(
         raise ProcessCancelled(result)
 
     owner = None
-    if os.name == "nt" and popen_factory is _DEFAULT_POPEN:
-        owner = _WindowsJobOwner()
-        creationflags = owner.creationflags(creationflags)
+    shared_owned_launch = os.name == "nt" and popen_factory is _DEFAULT_POPEN
 
     process = None
     try:
-        process = popen_factory(
-            args,
-            cwd=str(Path(cwd)) if cwd is not None else None,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            creationflags=int(creationflags),
-        )
-        if owner is not None:
-            owner.assign_and_resume(process)
+        popen_kwargs = {
+            "cwd": str(Path(cwd)) if cwd is not None else None,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+            "creationflags": int(creationflags),
+        }
+        if shared_owned_launch:
+            process = owned_popen(
+                args,
+                source="spm_generator_sync.process_stream.run_streaming_process",
+                **popen_kwargs,
+            )
+            owner = process.speedtree_lifecycle_tree_job
+        else:
+            process = popen_factory(args, **popen_kwargs)
     except BaseException:
         if process is not None and process.poll() is None:
             try:
@@ -691,8 +554,7 @@ def run_streaming_process(
                     callback_error = exc
                     continue
                 if current_activity_state != activity_state:
-                    if activity_state is not activity_unset:
-                        last_activity = time.monotonic()
+                    last_activity = time.monotonic()
                     activity_state = current_activity_state
 
             if requested():

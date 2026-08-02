@@ -447,7 +447,7 @@ class ProcessStreamTests(unittest.TestCase):
         self.assertEqual(raised.exception.result.status, "cancelled_before_launch")
         self.assertEqual(launched, [])
 
-    def test_cancel_during_real_process_terminates_the_exact_child(self):
+    def test_cancel_during_real_process_forces_only_the_exact_owned_job(self):
         cancel = threading.Event()
         ready = threading.Event()
         raised = []
@@ -480,7 +480,7 @@ class ProcessStreamTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(raised), 1)
-        self.assertEqual(raised[0].result.status, "cancelled_terminated")
+        self.assertEqual(raised[0].result.status, "cancelled_killed")
         self.assertIsNotNone(raised[0].result.pid)
         self.assertIsNotNone(raised[0].result.returncode)
 

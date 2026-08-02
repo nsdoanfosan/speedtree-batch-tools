@@ -59,6 +59,28 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         # can become the thread that happens to trigger cyclic collection.
         gc.collect()
 
+    def test_connected_report_checkpoint_is_fsynced_and_atomic_on_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_dir = Path(temporary)
+            payload = {"schema_version": 2, "status": "running"}
+            with mock.patch.object(GUI, "REPORT_DIR", report_dir), mock.patch.object(
+                GUI.os, "fsync", wraps=GUI.os.fsync
+            ) as fsync:
+                path = GUI.write_connected_run_report(payload)
+            self.assertGreaterEqual(fsync.call_count, 1)
+            before = path.read_bytes()
+
+            with mock.patch.object(GUI, "REPORT_DIR", report_dir), mock.patch.object(
+                GUI.os, "replace", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    GUI.write_connected_run_report(
+                        {"schema_version": 2, "status": "partial"},
+                        path,
+                    )
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(report_dir.glob(".*.tmp")), [])
+
     def test_initial_fast_refresh_defers_physical_validation(self):
         app = GUI.App.__new__(GUI.App)
         app.persist_config = mock.Mock()
@@ -835,6 +857,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             GUI,
             "write_connected_run_report",
             return_value=Path(r"C:\reports\connected.json"),
+        ), mock.patch.object(
+            GUI,
+            "report_file_identity",
+            return_value={
+                "path": r"C:\reports\connected.json",
+                "sha256": "a" * 64,
+                "size": 100,
+            },
         ):
             app.apply_connected_board()
 
@@ -862,6 +892,172 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             "실패 1",
             app.status_var.set.call_args.args[0],
         )
+
+    def test_initial_checkpoint_failure_blocks_every_connected_mutation(self):
+        owner = Path(r"D:\Trees\Tree_elm")
+        scope = {
+            "groups": [{
+                "folder": owner,
+                "master": "SK_Tree_elm_01.spm",
+                "names": ["SK_Tree_elm_02.spm"],
+            }],
+            "cluster_rows": [],
+            "skipped": [],
+        }
+        app = GUI.App.__new__(GUI.App)
+        app.root = None
+        app.config = {}
+        app.verify_var = mock.Mock()
+        app.verify_var.get.return_value = False
+        app.root_var = mock.Mock()
+        app.root_var.get.return_value = str(owner)
+        app.connected_board_scope = mock.Mock(return_value=scope)
+        app._connected_scope_from_board = mock.Mock(return_value=scope)
+
+        def run_now(_label, work, _done, **_kwargs):
+            with self.assertRaisesRegex(OSError, "checkpoint unavailable"):
+                work(lambda *_args: None)
+
+        app._start_job = run_now
+        with mock.patch.object(
+            GUI.messagebox, "askyesno", return_value=True
+        ), mock.patch.object(
+            GUI.engine, "scan_tree_folders", return_value=[]
+        ), mock.patch.object(
+            GUI, "write_connected_run_report", side_effect=OSError(
+                "checkpoint unavailable"
+            )
+        ), mock.patch.object(
+            GUI.engine, "apply_group_transaction"
+        ) as mutation:
+            app.apply_connected_board()
+
+        mutation.assert_not_called()
+
+    def test_retry_helper_uses_callers_exact_validated_baseline(self):
+        app = GUI.App.__new__(GUI.App)
+        app._execute_cluster_refresh_rows = mock.Mock()
+        unit = {
+            "unit_id": "cluster_refresh:fixture",
+            "stage": "cluster_refresh",
+            "selector": {
+                "blend": r"D:\Trees\Tree_elm\Cluster\SK_branch_elm_01.blend",
+                "targets": [r"D:\Trees\Tree_elm\SK_Tree_elm_01.spm"],
+            },
+        }
+        runtime = {
+            "blend": Path(unit["selector"]["blend"]),
+            "on_target_spms": [Path(unit["selector"]["targets"][0])],
+        }
+        expected = {"digest": "validated", "stable": True}
+        current = {"digest": "changed", "stable": True}
+
+        with mock.patch.object(
+            GUI,
+            "dependency_identity",
+            return_value=current,
+        ):
+            outcome = app._execute_connected_runtime_unit(
+                unit,
+                runtime,
+                {},
+                False,
+                {},
+                expected,
+                lambda *_args: None,
+                lambda *_args: None,
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertIn("content_drift", outcome["reason"])
+        app._execute_cluster_refresh_rows.assert_not_called()
+
+    def test_latest_retry_report_ignores_newer_unanchored_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def queue_job(name, sequence, *, shared):
+                report_path = root / f"{name}.json"
+                payload = {
+                    "schema_version": 2,
+                    "run_id": name,
+                    "root": str(root),
+                    "status": "failed",
+                    "queue_identity": {
+                        "mode": "shared" if shared else "local_unanchored",
+                        "job_id": name,
+                        "sequence": sequence,
+                        "owner_id": "owner-fixture",
+                    },
+                    "unit_results": [{
+                        "unit_id": f"generator_sync:{name}",
+                        "stage": "generator_sync",
+                        "outcome": "failed",
+                        "failure": {"reason": "fixture"},
+                    }],
+                }
+                payload["summary"] = GUI.summarize_unit_results(
+                    payload["unit_results"]
+                )
+                report_path.write_text(
+                    GUI.json.dumps(payload),
+                    encoding="utf-8",
+                )
+                identity = GUI.report_file_identity(report_path)
+                memory_payload = dict(payload, report_identity=identity)
+                return {
+                    "id": name,
+                    "sequence": sequence,
+                    "terminal_at": float(sequence),
+                    "status": "failed",
+                    "last_lease": {"owner_id": "owner-fixture"},
+                    "result": GUI.shared_queue_result(
+                        memory_payload,
+                        sequence,
+                    ),
+                }
+
+            valid = queue_job("valid", 1, shared=True)
+            orphan = queue_job("orphan", 2, shared=False)
+
+            class QueueBackend:
+                def snapshot(self):
+                    return {"jobs": [valid, orphan]}
+
+            app = GUI.App.__new__(GUI.App)
+            app.shared_queue_runtime = type(
+                "Runtime",
+                (),
+                {"queue": QueueBackend()},
+            )()
+            payload, anchor = app._latest_connected_retry_report()
+
+            self.assertEqual(payload["run_id"], "valid")
+            self.assertEqual(anchor["queue_job_id"], "valid")
+
+    def test_connected_partial_ui_shows_exact_generator_and_cluster_counts(self):
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue101_connected_partial_run.json"
+        )
+        payload = GUI.json.loads(fixture.read_text(encoding="utf-8"))
+        payload["report_path"] = r"C:\reports\connected.json"
+        app = GUI.App.__new__(GUI.App)
+        app.refresh = mock.Mock()
+        app.status_var = mock.Mock()
+        app._show_job_info = mock.Mock()
+
+        app._show_connected_result(payload)
+
+        status = app.status_var.set.call_args.args[0]
+        self.assertIn("부분 완료", status)
+        self.assertIn("Generator 11/12", status)
+        self.assertIn("Cluster 31/39", status)
+        self.assertIn("실패 9", status)
+        detail = app._show_job_info.call_args.args[1]
+        self.assertIn("Generator Sync 성공: 11/12", detail)
+        self.assertIn("Cluster 갱신 성공: 31/39", detail)
 
     def test_connected_board_batch_rechecks_scope_when_its_queue_turn_starts(self):
         owner = Path(r"D:\Trees\Tree_elm")
@@ -912,6 +1108,14 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             GUI,
             "write_connected_run_report",
             return_value=Path(r"C:\reports\connected.json"),
+        ), mock.patch.object(
+            GUI,
+            "report_file_identity",
+            return_value={
+                "path": r"C:\reports\connected.json",
+                "sha256": "a" * 64,
+                "size": 100,
+            },
         ):
             app.apply_connected_board()
 
@@ -2033,6 +2237,80 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             self.assertEqual(app.job_failures, [])
             self.assertEqual(shared_results[0][0], True)
             self.assertEqual(shared_results[0][1]["outcome"], "completed")
+        finally:
+            root.destroy()
+
+    def test_partial_payload_keeps_counts_and_report_identity_in_shared_result(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = GUI.App.__new__(GUI.App)
+            app.root = root
+            app.job_queue = queue.Queue()
+            app.worker = None
+            app.status_var = tk.StringVar(root, value="대기")
+            app.progress_text_var = tk.StringVar(root, value="작업 대기")
+            app.progress_bar = ttk.Progressbar(root, maximum=100)
+            app.cancel_job_button = ttk.Button(root)
+            shared_results = []
+            completed = []
+
+            class Lease:
+                finished = False
+
+                def finish(self, *, success, result):
+                    self.finished = True
+                    shared_results.append((success, result))
+
+            class Runtime:
+                def enqueue(self, _label, _payload):
+                    return {"id": "shared-partial", "sequence": 1}
+
+                def wait_for_turn(self, _job_id, *, on_wait, cancel_event):
+                    return Lease()
+
+            app.shared_queue_runtime = Runtime()
+            payload = {
+                "status": "partial",
+                "summary": {
+                    "generator": {
+                        "succeeded": 11,
+                        "failed": 1,
+                        "pending": 0,
+                        "total": 12,
+                    },
+                    "cluster": {
+                        "succeeded": 31,
+                        "failed": 8,
+                        "pending": 0,
+                        "total": 39,
+                    },
+                    "failures": 9,
+                },
+                "report_identity": {
+                    "path": r"C:\reports\connected.json",
+                    "sha256": "b" * 64,
+                    "size": 4096,
+                },
+            }
+            app._start_job(
+                "partial receipt",
+                lambda _report: payload,
+                completed.append,
+            )
+            deadline = time.monotonic() + 3
+            while app.active_job is not None and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertEqual(completed, [payload])
+            self.assertEqual(shared_results[0][0], False)
+            receipt = shared_results[0][1]
+            self.assertEqual(receipt["outcome"], "partial")
+            self.assertEqual(receipt["counts"]["generator"]["succeeded"], 11)
+            self.assertEqual(receipt["counts"]["cluster"]["succeeded"], 31)
+            self.assertEqual(receipt["counts"]["failures"], 9)
+            self.assertEqual(receipt["report"]["sha256"], "b" * 64)
         finally:
             root.destroy()
 

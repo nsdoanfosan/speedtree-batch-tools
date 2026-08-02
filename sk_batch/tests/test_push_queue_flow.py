@@ -207,6 +207,311 @@ class PushQueueFlowTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def recoverable_multi_role_contract(
+        target,
+        providers,
+        *,
+        omit_second=False,
+        second_independent_error=False,
+    ):
+        target = Path(target).resolve()
+        dependencies = []
+        for index, (role, provider, mesh_ids) in enumerate(providers):
+            errors = [
+                "generator_export_evidence_stale_node_table",
+                "normalized_and_live_target_mesh_sets_differ",
+            ]
+            reason = "live_export_evidence_unavailable_stale_node_table"
+            if index == 1 and second_independent_error:
+                errors.append("declared_generator_binding_missing")
+                reason = "generator_connection_contract_incomplete"
+            target_deliveries = [] if index == 1 and omit_second else [{
+                "spm": str(target),
+                "delivery_decision": "blocked",
+                "delivery_reason": reason,
+                "generator_variant_policy": "ensure_all_material_cutouts",
+                "normalized_target_mesh_ids": list(mesh_ids),
+                "stale_node_table_target_mesh_ids": list(mesh_ids),
+                "live_node_table": {"stale": True},
+                "errors": errors,
+            }]
+            dependencies.append({
+                "role": role,
+                "spm": str(Path(provider).resolve()),
+                "normalized_variants_required": True,
+                "normalized_variants": {
+                    "status": "ready",
+                    "target_deliveries": target_deliveries,
+                },
+            })
+        return {
+            "tree_source_identities": [{
+                "target_spm": {
+                    "path": str(target),
+                    "sha256": "a" * 64,
+                },
+            }],
+            "dependencies": dependencies,
+            "handoff": {"status": "blocked", "errors": []},
+        }
+
+    def test_modeler_recovery_scope_unions_all_target_provider_roles(self):
+        gui = load_gui_module()
+        target = Path("black_locast") / "SK_tree_black_locast_02.spm"
+        providers = (
+            (
+                "branch",
+                Path("black_locast/cluster/SK_branch_black_locast_01.spm"),
+                [88],
+            ),
+            (
+                "cluster",
+                Path("black_locast/cluster/SK_cluster_black_locast_01.spm"),
+                [89, 90, 91, 92],
+            ),
+        )
+        contract = self.recoverable_multi_role_contract(target, providers)
+
+        scope = gui.cluster_stale_node_table_recovery_scope(
+            contract,
+            target.resolve(),
+            Path("live_audit.json"),
+        )
+
+        self.assertTrue(scope["available"])
+        self.assertEqual(scope["expected_mesh_ids"], [88, 89, 90, 91, 92])
+        self.assertEqual(
+            [row["normalized_target_mesh_ids"] for row in scope["provider_slices"]],
+            [[88], [89, 90, 91, 92]],
+        )
+        self.assertRegex(scope["scope_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_modeler_recovery_scope_rejects_partial_and_mixed_evidence(self):
+        gui = load_gui_module()
+        target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
+        providers = (
+            ("branch", Path("provider_branch.spm"), [88]),
+            ("cluster", Path("provider_cluster.spm"), [89, 90, 91, 92]),
+        )
+        partial = gui.cluster_stale_node_table_recovery_scope(
+            self.recoverable_multi_role_contract(
+                target,
+                providers,
+                omit_second=True,
+            ),
+            target,
+            Path("partial.json"),
+        )
+        mixed = gui.cluster_stale_node_table_recovery_scope(
+            self.recoverable_multi_role_contract(
+                target,
+                providers,
+                second_independent_error=True,
+            ),
+            target,
+            Path("mixed.json"),
+        )
+
+        self.assertFalse(partial["available"])
+        self.assertEqual(
+            partial["reason_token"],
+            "target_delivery_missing_or_ambiguous",
+        )
+        self.assertFalse(mixed["available"])
+        self.assertEqual(
+            mixed["reason_token"],
+            "target_delivery_not_stale_only",
+        )
+
+    def test_nonblocking_stale_node_table_never_starts_recovery(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = (Path("black_locast") / "SK_tree_black_locast_04.spm").resolve()
+        provider = Path("black_locast/cluster/SK_cluster_black_locast_01.spm").resolve()
+        contract = {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(target), "sha256": "c" * 64},
+            }],
+            "dependencies": [{
+                "role": "cluster",
+                "spm": str(provider),
+                "normalized_variants_required": True,
+                "normalized_variants": {
+                    "status": "ready",
+                    "delivery_mode": "render_connected",
+                    "delivery_errors": [],
+                    "delivery_blocked_targets": [],
+                    "target_deliveries": [{
+                        "spm": str(target),
+                        "delivery_decision": "normalize_part",
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                        "normalized_target_mesh_ids": [70, 71],
+                        "live_generator_delivery_complete": True,
+                        "live_node_table": {
+                            "stale": True,
+                            "orphan_node_count": 970,
+                            "total_node_count": 21249,
+                        },
+                        "errors": [],
+                    }],
+                },
+            }],
+            "handoff": {"status": "ready", "errors": []},
+        }
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": Path("tree04_live_audit.json"),
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ), mock.patch.object(
+            app,
+            "_attempt_stale_node_table_recovery",
+        ) as recovery_attempt:
+            result = app._cluster_normalization_stage_with_recovery(
+                target,
+                "tree04",
+                provider,
+                require_normalized=False,
+            )
+
+        self.assertEqual(result["status"], "current")
+        recovery_attempt.assert_not_called()
+
+    def test_stop_after_resume_claim_reports_the_committed_boundary(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.pending_batch_jobs = deque()
+        app.active_batch_job = {"id": 95}
+        app.shared_queue_runtime = None
+        app._ensure_batch_queue_state()
+        with app._recovery_commit_lock:
+            app._recovery_resume_commit = {
+                "job_id": 95,
+                "job_generation": 95,
+                "verified_after_raw_sha256": "b" * 64,
+            }
+
+        app.stop_batch()
+
+        self.assertTrue(app.stop_flag.is_set())
+        self.assertIn(
+            "재개 commit 뒤에 도착",
+            "\n".join(str(call.args[0]) for call in app.log.call_args_list),
+        )
+
+    def test_relation_plan_launches_manual_recovery_and_resumes_stage_once(self):
+        gui = load_gui_module()
+        from pcg_st9_texture_batch import stale_node_table_recovery as recovery
+
+        app = self.make_app(gui)
+        target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
+        provider = Path("black_locast/cluster/SK_branch_black_locast_01.spm").resolve()
+        providers = (
+            ("branch", provider, [88]),
+            (
+                "cluster",
+                Path("black_locast/cluster/SK_cluster_black_locast_01.spm"),
+                [89, 90, 91, 92],
+            ),
+        )
+        scope = gui.cluster_stale_node_table_recovery_scope(
+            self.recoverable_multi_role_contract(target, providers),
+            target,
+            Path("live_audit.json"),
+        )
+        exclusion = gui.TargetPlannedExclusionError(
+            "stale target",
+            reason_token="live_export_evidence_unavailable_stale_node_table",
+            target_spm=target,
+            producer_spm=provider,
+            evidence={"stale_node_table_recovery": scope},
+        )
+        resumed = {
+            "target_spm": str(target),
+            "live_audit_report": "fresh.json",
+            "selected_contract": {"handoff": {"status": "ready"}},
+        }
+        app.active_batch_job = {
+            "id": 95,
+            "shared_queue_job_id": "shared-95",
+            "shared_queue_sequence": 7,
+        }
+        active_lease = mock.Mock()
+        active_lease.job_id = "shared-95"
+        active_lease.finished = False
+        active_lease.renew_and_check_current.return_value = True
+        app._active_shared_queue_lease = active_lease
+        app.cfg = {"speedtree_exe": "SpeedTree_Modeler.exe"}
+        app._app_open = True
+        app._record_pipeline_planned_exclusion = mock.Mock()
+        observe = mock.Mock(side_effect=[exclusion, resumed])
+        captured = {}
+
+        def fake_recover(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            kwargs["launch_fn"](args[1], args[0])
+            kwargs["on_continuation_claimed"]({
+                "verified_after_raw_sha256": "b" * 64,
+            })
+            return {
+                "status": "repaired_reaudited_and_retried_once",
+                "after_raw_sha256": "b" * 64,
+                "retry_result": kwargs["retry"]({"verified": True}),
+            }
+
+        with mock.patch.object(
+            app,
+            "_cluster_normalization_stage_observation",
+            side_effect=observe,
+        ), mock.patch.object(
+            recovery,
+            "recover_stale_node_table",
+            side_effect=fake_recover,
+        ), mock.patch.object(
+            recovery,
+            "launch_modeler_for_manual_save",
+            return_value=object(),
+        ) as launch:
+            runnable, contracts = app._cluster_relation_input_plan(
+                [target],
+                "captured",
+                provider,
+            )
+
+        self.assertEqual(runnable, [target])
+        self.assertEqual(len(contracts), 1)
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(captured["args"][2], [88, 89, 90, 91, 92])
+        self.assertEqual(
+            captured["kwargs"]["expected_preimage_raw_sha256"],
+            "a" * 64,
+        )
+        self.assertTrue(captured["kwargs"]["guards"]["is_job_current"]())
+        self.assertTrue(captured["kwargs"]["guards"]["is_queue_current"]())
+        active_lease.renew_and_check_current.assert_called_once_with()
+        self.assertEqual(
+            app._recovery_resume_commit["verified_after_raw_sha256"],
+            "b" * 64,
+        )
+        launch.assert_called_once_with(
+            "SpeedTree_Modeler.exe",
+            target,
+        )
+        queued_kinds = []
+        while not app.ui_queue.empty():
+            queued_kinds.append(app.ui_queue.get_nowait()[0])
+        self.assertIn("modeler_recovery", queued_kinds)
+        app._record_pipeline_planned_exclusion.assert_not_called()
+
     def test_issue16_stale_node_target_is_excluded_with_operator_evidence(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -279,7 +584,8 @@ class PushQueueFlowTests(unittest.TestCase):
             self.assertIn("orphan GUIDs 2", status)
             self.assertIn("orphan Nodes 216495/223675", status)
             self.assertIn("Mesh IDs 16,17,18,19", status)
-            self.assertIn("action=regenerate/save", status)
+            self.assertIn("action=automatic Modeler recovery is disabled", status)
+            self.assertIn("re-run a live audit", status)
         self.assertEqual(
             entry["push_status_error"]["evidence"]["delivery_remedy"],
             (
@@ -333,7 +639,8 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("orphan GUIDs 2", message)
         self.assertIn("orphan Nodes 216495/223675", message)
         self.assertIn("Mesh IDs 16,17,18,19", message)
-        self.assertIn("action=regenerate/save", message)
+        self.assertIn("action=automatic Modeler recovery is disabled", message)
+        self.assertIn("re-run a live audit", message)
 
     def test_issue16_planned_exclusion_does_not_fan_out_shared_provider(self):
         gui = load_gui_module()

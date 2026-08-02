@@ -44,6 +44,8 @@ REPO_DIR = str(Path(SK_BATCH_DIR).parent)
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
+from process_lifecycle import owned_run
+
 from vertex_color_contract import (
     inspect_object_vertex_colors,
     pack_speedtree_vertex_payload,
@@ -422,8 +424,10 @@ def unreal_editor_running():
     if os.name != "nt":
         return None
     try:
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
+            source="sk_batch.jobs.send2ue_push_job.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             text=True,
             encoding="mbcs",

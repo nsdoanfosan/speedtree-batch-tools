@@ -94,55 +94,53 @@ def _load_state_pause_after_prune(
 
 
 class SkCommonOptimizationTests(unittest.TestCase):
-    def test_job_assignment_failure_keeps_tree_cleanup_fallback_available(self):
+    def test_job_attachment_shim_only_accepts_preassigned_shared_job(self):
         proc = mock.Mock()
-        with mock.patch(
-            "sk_common._create_kill_on_close_job",
-            side_effect=OSError("job assignment denied"),
-        ):
-            self.assertFalse(attach_process_kill_job(proc))
+        proc.speedtree_lifecycle_tree_job = None
+        self.assertFalse(attach_process_kill_job(proc))
+        self.assertIsNone(proc.sk_job_handle)
+        proc.speedtree_lifecycle_tree_job = shared_job = object()
+        self.assertTrue(attach_process_kill_job(proc))
+        self.assertIs(proc.sk_job_handle, shared_job)
 
+    def test_job_finalization_routes_through_shared_receipt_contract(self):
+        proc = mock.Mock()
+        proc.speedtree_lifecycle_launch_id = "launch-1"
+        with mock.patch(
+            "sk_common.complete_owned_process", return_value="process_tree_clean"
+        ) as complete:
+            self.assertTrue(close_process_kill_job(proc))
+        complete.assert_called_once_with(proc, reason="sk_worker_complete")
         self.assertIsNone(proc.sk_job_handle)
 
-    def test_job_handle_is_closed_at_most_once(self):
-        proc = mock.Mock()
-        proc.sk_job_handle = 123
-        with mock.patch("sk_common.os.name", "nt"), mock.patch(
-            "sk_common._close_windows_handle", return_value=True
-        ) as close_handle:
-            self.assertTrue(close_process_kill_job(proc))
-            self.assertFalse(close_process_kill_job(proc))
-
-        close_handle.assert_called_once_with(123)
-
-    def test_windows_tree_termination_uses_taskkill_for_descendants(self):
+    def test_tree_termination_uses_registered_exact_owned_tree(self):
         proc = mock.Mock()
         proc.pid = 1234
-        proc.poll.side_effect = [None, None, 1]
-        proc.wait.return_value = 1
-
-        with mock.patch("sk_common.os.name", "nt"):
-            with mock.patch("sk_common.subprocess.run") as run_mock:
-                run_mock.return_value.returncode = 0
-                self.assertTrue(terminate_process_tree(proc, wait_seconds=0.1))
-
-        self.assertEqual(
-            run_mock.call_args.args[0],
-            ["taskkill", "/PID", "1234", "/T", "/F"],
+        proc.speedtree_lifecycle_launch_id = "launch-1"
+        proc.poll.return_value = 1
+        with mock.patch(
+            "sk_common.terminate_owned_process", return_value="sk_stop_forced"
+        ) as terminate, mock.patch("sk_common.subprocess.run") as run_mock:
+            self.assertTrue(terminate_process_tree(proc, wait_seconds=0.1))
+        terminate.assert_called_once_with(
+            proc,
+            reason="sk_stop",
+            terminate_grace=0.1,
+            kill_grace=0.1,
         )
-        proc.kill.assert_not_called()
+        run_mock.assert_not_called()
 
-    def test_tree_termination_falls_back_to_parent_kill_when_taskkill_fails(self):
+    def test_unregistered_fallback_signals_only_retained_parent_handle(self):
         proc = mock.Mock()
         proc.pid = 5678
-        proc.poll.side_effect = [None, None, None, 1]
+        proc.speedtree_lifecycle_launch_id = None
+        proc.poll.side_effect = [None, None]
         proc.wait.side_effect = [subprocess.TimeoutExpired("wait", 0.1), 1]
 
-        with mock.patch("sk_common.os.name", "nt"):
-            with mock.patch("sk_common.subprocess.run") as run_mock:
-                run_mock.return_value.returncode = 1
-                self.assertFalse(terminate_process_tree(proc, wait_seconds=0.1))
-
+        with mock.patch("sk_common.subprocess.run") as run_mock:
+            self.assertFalse(terminate_process_tree(proc, wait_seconds=0.1))
+        run_mock.assert_not_called()
+        proc.terminate.assert_called_once_with()
         proc.kill.assert_called_once_with()
 
     def test_scan_prunes_backup_directories_without_losing_live_spms(self):

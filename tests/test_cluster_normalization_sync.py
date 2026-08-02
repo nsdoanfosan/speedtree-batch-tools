@@ -11,6 +11,12 @@ from cluster_normalization_sync import (
     validate_isolated_bark_recipe_bundle,
 )
 from cluster_bark_source_resolution import _provider_identity
+from generator_delivery_scope import (
+    CONTINUITY_ONLY_POLICY,
+    INTENT_KIND,
+    RUNTIME_INACTIVE_POLICY,
+    canonical_sha256,
+)
 
 
 def sha256(path):
@@ -156,6 +162,40 @@ def report_fingerprint(path):
     }
 
 
+def delivery_scope_intent(target, provider_blend, material_id=6):
+    identity = ["named", "frond", "frond", "material:frond:0"]
+    intent = {
+        "kind": INTENT_KIND,
+        "schema_version": 1,
+        "authority": {
+            "kind": "operator_recipe",
+            "id": "sanitized-issue-96",
+            "provenance": {"review": "explicit"},
+        },
+        "target": {
+            "spm": str(Path(target).resolve()),
+            "provider_blend": str(Path(provider_blend).resolve()),
+            "provider_scope_id": "sanitized-cluster-scope",
+            "material_id": material_id,
+        },
+        "authored_slots": [{
+            "slot_identity": identity,
+            "target_material_id": material_id,
+            "target_mesh_id": 93,
+        }],
+        "required_live_slot_identities": [],
+        "continuity_only_slots": [{
+            "slot_identity": identity,
+            "reason": "operator-authored continuity",
+            "policy": CONTINUITY_ONLY_POLICY,
+            "provenance": {"review": "explicit"},
+        }],
+        "runtime_inactive_policy": RUNTIME_INACTIVE_POLICY,
+    }
+    intent["intent_sha256"] = canonical_sha256(intent)
+    return intent
+
+
 class ClusterNormalizationSyncTests(unittest.TestCase):
     def fixture(self, temporary):
         owner = Path(temporary) / "Tree_elm"
@@ -269,6 +309,54 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 validate_isolated_bark_recipe_bundle(recipe),
                 bundle,
             )
+
+    def test_explicit_delivery_scope_is_validated_and_passed_through_verbatim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            intent = delivery_scope_intent(target, blend)
+            legacy_recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+
+            recipe = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+                delivery_scope_intents={str(target): intent},
+            )
+
+            self.assertEqual(
+                recipe["target_material_bindings"][0][
+                    "generator_delivery_scope_intent"
+                ],
+                intent,
+            )
+            self.assertEqual(
+                recipe["normalization_contract_sha256"],
+                legacy_recipe["normalization_contract_sha256"],
+            )
+
+    def test_tampered_delivery_scope_is_rejected_before_recipe_emission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            intent = delivery_scope_intent(target, blend)
+            intent["continuity_only_slots"] = []
+
+            with self.assertRaisesRegex(
+                ClusterNormalizationSyncError,
+                "Explicit Generator delivery scope is invalid",
+            ):
+                resolve_normalization_recipe(
+                    blend,
+                    [target],
+                    canonical_spm=source,
+                    unit_probe_path=unit_probe,
+                    delivery_scope_intents={str(target): intent},
+                )
 
     def test_isolated_bark_source_tree_mismatch_fails_before_recipe(self):
         with tempfile.TemporaryDirectory() as temporary:
