@@ -55,6 +55,142 @@ def _target(snapshot, target_id):
     )
 
 
+def _planning_owner(session="planning-session"):
+    return {
+        "owner_id": "sk_batch:test-host:runtime",
+        "hostname": "test-host",
+        "pid": 4242,
+        "process_marker": "test-process-start",
+        "planning_session_id": session,
+        "thread_name": "retry-planner-test",
+    }
+
+
+def test_dead_exact_planning_owner_reconciles_owner_lost(tmp_path):
+    clock = FakeClock()
+    target = str(tmp_path / "dead-planner.spm")
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts", clock=clock
+    )
+    tracker.start_planning(_planning_owner())
+
+    assert tracker.reconcile_planning_owner(False) is True
+    snapshot = tracker.snapshot(evaluate=False)
+    assert _target(snapshot, target)["stage"] == OWNER_LOST
+    assert snapshot["terminal_outcome"] == OWNER_LOST
+    assert snapshot["planning"]["status"] == OWNER_LOST
+    assert "exact planning owner" in snapshot["terminal_reason"]
+
+
+def test_missing_planning_owner_on_restored_receipt_is_not_running(tmp_path):
+    target = str(tmp_path / "legacy-stale-planning.spm")
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts"
+    )
+    payload = json.loads(tracker.path.read_text(encoding="utf-8"))
+    payload.pop("planning")
+    tracker.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = RetryProgressReceipt.load_latest(tmp_path / "receipts")
+    assert restored.reconcile_planning_owner(None) is True
+    snapshot = restored.snapshot(evaluate=False)
+    assert snapshot["run_state"] == "terminal"
+    assert _target(snapshot, target)["stage"] == FAILED
+    assert snapshot["terminal_reason"] == (
+        "planning owner identity missing on restore"
+    )
+
+
+def test_slow_heartbeating_planner_remains_live_without_fake_progress(tmp_path):
+    clock = FakeClock()
+    target = str(tmp_path / "slow-planner.spm")
+    tracker = RetryProgressReceipt.create(
+        [target],
+        receipt_dir=tmp_path / "receipts",
+        clock=clock,
+        stall_warning_seconds=10,
+        owner_lost_seconds=45,
+    )
+    tracker.start_planning(_planning_owner())
+
+    for _ in range(5):
+        clock.advance(30)
+        assert tracker.planning_heartbeat("planning-session") is True
+        assert tracker.reconcile_planning_owner(True) is False
+
+    snapshot = tracker.snapshot()
+    row = _target(snapshot, target)
+    assert row["stage"] == PLANNING
+    assert snapshot["run_state"] == "running"
+    assert snapshot["planning"]["liveness_state"] == "heartbeat_live"
+    assert snapshot["planning"]["progress_state"] == STALLED
+    assert row["wall_elapsed_seconds"] == 150
+    assert row["last_heartbeat_age_seconds"] == 0
+    assert row["last_progress_age_seconds"] == 150
+
+
+def test_wall_clock_without_heartbeat_cannot_remain_healthy_running(tmp_path):
+    clock = FakeClock()
+    target = str(tmp_path / "elapsed-only.spm")
+    tracker = RetryProgressReceipt.create(
+        [target],
+        receipt_dir=tmp_path / "receipts",
+        clock=clock,
+        owner_lost_seconds=45,
+    )
+    tracker.start_planning(_planning_owner())
+    clock.advance(46)
+
+    assert tracker.reconcile_planning_owner(True) is True
+    snapshot = tracker.snapshot(evaluate=False)
+    assert _target(snapshot, target)["wall_elapsed_seconds"] == 46
+    assert snapshot["run_state"] == "terminal"
+    assert snapshot["terminal_outcome"] == FAILED
+    assert snapshot["planning"]["liveness_state"] == FAILED
+
+
+def test_planning_commit_claim_is_exactly_once_and_cancel_safe(tmp_path):
+    target = str(tmp_path / "commit-race.spm")
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts"
+    )
+    tracker.start_planning(_planning_owner())
+    assert tracker.planning_ready("planning-session") is True
+    assert tracker.claim_planning_commit() is True
+    assert tracker.claim_planning_commit() is False
+    assert tracker.complete_planning_commit() is True
+    assert tracker.finish_planning(CANCELLED, "late cancel") is False
+    assert tracker.snapshot(evaluate=False)["planning"]["status"] == "committed"
+
+
+def test_terminal_wall_elapsed_freezes_and_terminal_plan_can_commit_ui_result(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = str(tmp_path / "classified-blocked.spm")
+    tracker = RetryProgressReceipt.create(
+        [target], receipt_dir=tmp_path / "receipts", clock=clock
+    )
+    tracker.start_planning(_planning_owner())
+    clock.advance(3)
+    tracker.transition(
+        target,
+        BLOCKED,
+        diagnostic="no retry evidence",
+        terminal_reason="not_retryable",
+        outcome=BLOCKED,
+    )
+    tracker.finalize("no retryable targets")
+    assert tracker.planning_ready("planning-session") is True
+    assert tracker.claim_planning_commit() is True
+    assert tracker.complete_planning_commit() is True
+    clock.advance(100)
+
+    snapshot = tracker.snapshot(evaluate=False)
+    assert _target(snapshot, target)["wall_elapsed_seconds"] == 3
+    assert snapshot["planning"]["wall_elapsed_seconds"] == 3
+
+
 def test_planning_queue_claim_stage_ages_and_bounded_diagnostic_are_durable(
     tmp_path,
 ):

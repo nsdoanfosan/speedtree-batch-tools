@@ -4156,7 +4156,7 @@ class PushQueueFlowTests(unittest.TestCase):
             },
         )
 
-    def test_failed_results_retry_incomplete_unreal_evidence_fails_closed(self):
+    def test_failed_results_retry_incomplete_unreal_evidence_rebuilds(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         iid = "incomplete_parent.spm"
@@ -4166,12 +4166,88 @@ class PushQueueFlowTests(unittest.TestCase):
             "push_paths": {"manifest": "parent.json"},
         }
 
-        with mock.patch.object(gui, "messagebox") as messages:
+        with mock.patch.object(gui, "save_config"):
             app.start_failed_results_retry()
 
-        self.assertEqual(jobs, [])
-        messages.showinfo.assert_called_once()
-        self.assertIn("manifest/checkpoint 불완전", app.log.call_args.args[0])
+        self.assertEqual([job["mode"] for job in jobs], ["pipeline"])
+        self.assertTrue(jobs[0]["force_rerun"])
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["eligibility"]["items"][0][
+                "reason_code"
+            ],
+            "unreal_parent_evidence_incomplete_full_rebuild",
+        )
+
+    def test_failed_results_retry_invalid_parent_rebuilds_exact_dependency(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        provider = "provider.spm"
+        tree = "tree.spm"
+        jobs = self.configure_failed_retry_start(app, [provider, tree])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = root / "parent.json"
+            checkpoint = root / "checkpoint.json"
+            manifest.write_text(
+                json.dumps({
+                    "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                    "report_path": str(root / "parent_report.json"),
+                    "items": [
+                        {
+                            "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                            "queue_id": provider,
+                            "source_fingerprint": "provider-source-v1",
+                            "fingerprint": "provider-item-v1",
+                            "depends_on_queue_ids": [],
+                        },
+                        {
+                            "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                            "queue_id": tree,
+                            "source_fingerprint": "tree-source-v1",
+                            "fingerprint": "tree-item-v1",
+                            "depends_on_queue_ids": [provider],
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            checkpoint.write_text(
+                json.dumps({"items": {tree: {"status": "data_error"}}}),
+                encoding="utf-8",
+            )
+            app.state = {
+                provider: {"push_status_kind": "imported_ok"},
+                tree: {
+                    "push_status_kind": "data_error",
+                    "push_paths": {
+                        "manifest": str(manifest),
+                        "checkpoint": str(checkpoint),
+                    },
+                },
+            }
+
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual([job["mode"] for job in jobs], ["pipeline"])
+        self.assertEqual(
+            [str(item["spm"]) for item in jobs[0]["targets"]],
+            [provider, tree],
+        )
+        eligibility = {
+            row["queue_id"]: row
+            for row in jobs[0]["retry_metadata"]["eligibility"]["items"]
+        }
+        self.assertEqual(
+            eligibility[provider]["reason_code"],
+            "unreal_dependency_full_rebuild_fallback",
+        )
+        self.assertTrue(eligibility[provider]["scheduled_as_dependency"])
+        self.assertEqual(
+            eligibility[tree]["reason_code"],
+            "unreal_parent_evidence_invalid_full_rebuild",
+        )
 
     def test_partial_retry_job_keeps_other_partition_in_fifo(self):
         gui = load_gui_module()
@@ -4410,6 +4486,35 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("remaining 1", outcome_text)
         self.assertIn("terminal outcome: pending", outcome_text)
         self.assertIn("current run continues after individual failures", outcome_text)
+
+    def test_retry_liveness_panel_does_not_call_elapsed_only_running(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            "evidence_state": "stalled",
+            "current_target_id": "C:/sanitized/planning.spm",
+            "targets": [{
+                "target_id": "C:/sanitized/planning.spm",
+                "target_name": "planning.spm",
+                "stage": "planning",
+                "terminal_at": None,
+                "wall_elapsed_seconds": 865,
+                "last_progress_age_seconds": 865,
+                "last_output_age_seconds": None,
+                "last_heartbeat_age_seconds": 865,
+            }],
+        })
+
+        outcome = app.retry_outcome_var.set.call_args.args[0]
+        liveness = app.retry_liveness_var.set.call_args.args[0]
+        self.assertIn("current state: stalled", outcome)
+        self.assertNotIn("current state: running", outcome)
+        self.assertIn("evidence state=stalled", liveness)
+        self.assertIn("wall elapsed 14m 25s", liveness)
 
     def test_retry_liveness_panel_shows_terminal_outcome_only_after_terminal(self):
         gui = load_gui_module()

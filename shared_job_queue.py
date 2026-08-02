@@ -369,6 +369,39 @@ class SharedJobQueue:
         # then replacing an intermediate state through one queue instance.
         self._thread_lock = threading.RLock()
 
+    def local_owner_identity(
+        self,
+        *,
+        owner_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return this queue client's exact local process identity."""
+
+        identity = {
+            "hostname": self._hostname,
+            "pid": self._pid,
+            "process_marker": self._process_marker,
+        }
+        if owner_id is not None:
+            identity["owner_id"] = _require_text(
+                owner_id,
+                field="owner_id",
+            )
+        return copy.deepcopy(identity)
+
+    def owner_process_alive(
+        self,
+        owner: Optional[Dict[str, Any]],
+    ) -> Optional[bool]:
+        """Probe one persisted PID + creation-marker owner read-only."""
+
+        if not isinstance(owner, dict):
+            return False
+        return self._process_alive(
+            owner.get("hostname"),
+            owner.get("pid"),
+            owner.get("process_marker"),
+        )
+
     def enqueue(
         self,
         app_id: str,

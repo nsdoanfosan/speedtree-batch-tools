@@ -7,7 +7,6 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 
 from failed_retry_eligibility import (  # noqa: E402
     BLENDER_REBUILD,
-    BLOCKED,
     CURRENT_BLENDER_EXCLUDED,
     UNREAL_ONLY,
     UNREAL_PARENT_CURRENT,
@@ -64,7 +63,7 @@ def test_current_immutable_unreal_failure_stays_unreal_only():
     assert decision.reason_code == "current_immutable_unreal_failure"
 
 
-def test_incomplete_unreal_parent_fails_closed_with_actionable_diagnostic():
+def test_incomplete_unreal_parent_uses_safe_full_rebuild_fallback():
     decision = classify_failed_retry(
         {"push_status_kind": "data_error"},
         CURRENT_REPAIR,
@@ -72,8 +71,10 @@ def test_incomplete_unreal_parent_fails_closed_with_actionable_diagnostic():
         unreal_parent_diagnostic="manifest/checkpoint pair is incomplete",
     )
 
-    assert decision.classification == BLOCKED
-    assert decision.reason_code == "unreal_parent_evidence_incomplete"
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == (
+        "unreal_parent_evidence_incomplete_full_rebuild"
+    )
     assert "manifest/checkpoint" in decision.diagnostic
 
 
@@ -91,11 +92,11 @@ def test_send2ue_report_routes_without_reading_localized_status_text():
     assert decision.reason_code == "structured_send2ue_export_failure"
 
 
-def test_bare_push_failure_kind_is_ambiguous_and_fails_closed():
+def test_bare_push_failure_kind_uses_safe_full_rebuild_fallback():
     decision = classify_failed_retry(
         {"push_status_kind": "data_error"},
         CURRENT_REPAIR,
     )
 
-    assert decision.classification == BLOCKED
-    assert decision.reason_code == "push_phase_evidence_missing"
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "push_phase_evidence_missing_full_rebuild"

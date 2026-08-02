@@ -213,6 +213,18 @@ class RetryProgressReceipt:
             "terminal_outcome": None,
             "stage": PLANNING,
             "current_target_id": ordered[0] if ordered else None,
+            "planning": {
+                "schema_version": 1,
+                "status": "unowned",
+                "owner": None,
+                "started_at": now,
+                "heartbeat_at": None,
+                "progress_at": now,
+                "plan_ready_at": None,
+                "commit_started_at": None,
+                "committed_at": None,
+                "terminal_reason": None,
+            },
             "queue_jobs": {},
             "lifecycle_events": [
                 {
@@ -424,6 +436,266 @@ class RetryProgressReceipt:
         except Exception:
             # Progress observation cannot change retry execution semantics.
             pass
+
+    def set_notify(self, notify):
+        """Install observation only after startup reconciliation is complete."""
+
+        with self._lock:
+            self._notify = notify
+
+    def _planning_locked(self):
+        planning = self._payload.get("planning")
+        return planning if isinstance(planning, dict) else None
+
+    def _planning_rows_locked(self):
+        return [
+            row
+            for row in self._targets_locked()
+            if row.get("stage") == PLANNING
+            or (
+                row.get("stage") == STALLED
+                and row.get("resume_stage") == PLANNING
+            )
+        ]
+
+    def start_planning(self, owner):
+        """Bind pre-enqueue planning to one exact process/session owner."""
+
+        if not isinstance(owner, dict):
+            raise ValueError("planning owner must be an object")
+        required = ("owner_id", "hostname", "pid", "planning_session_id")
+        if any(owner.get(key) in (None, "") for key in required):
+            raise ValueError("planning owner identity is incomplete")
+        now = self._now()
+        with self._lock:
+            if self._payload.get("terminal_at") is not None:
+                return False
+            planning = self._planning_locked()
+            if planning is None:
+                planning = {"schema_version": 1, "started_at": now}
+                self._payload["planning"] = planning
+            status = str(planning.get("status") or "unowned")
+            existing = planning.get("owner") or {}
+            if status != "unowned" and existing.get(
+                "planning_session_id"
+            ) != owner.get("planning_session_id"):
+                return False
+            planning.update({
+                "status": "active",
+                "owner": copy.deepcopy(owner),
+                "started_at": float(planning.get("started_at") or now),
+                "heartbeat_at": now,
+                "progress_at": float(planning.get("progress_at") or now),
+                "plan_ready_at": None,
+                "commit_started_at": None,
+                "committed_at": None,
+                "terminal_reason": None,
+                "owner_alive": True,
+                "owner_checked_at": now,
+            })
+            current = self._target_locked(
+                self._payload.get("current_target_id")
+            )
+            if current is not None and current in self._planning_rows_locked():
+                current["last_heartbeat_at"] = now
+            self._append_lifecycle_event_locked(
+                "planning_owner_started",
+                now,
+                owner_id=str(owner.get("owner_id")),
+                pid=int(owner.get("pid")),
+                planning_session_id=str(owner.get("planning_session_id")),
+            )
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        self._notify_snapshot()
+        return True
+
+    def planning_heartbeat(self, planning_session_id, *, thread_ident=None):
+        """Renew only the exact active planner without inventing progress."""
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None or planning.get("status") != "active":
+                return False
+            owner = planning.get("owner") or {}
+            if owner.get("planning_session_id") != str(planning_session_id):
+                return False
+            existing_thread = owner.get("thread_ident")
+            if (
+                existing_thread is not None
+                and thread_ident is not None
+                and int(existing_thread) != int(thread_ident)
+            ):
+                return False
+            if thread_ident is not None:
+                owner["thread_ident"] = int(thread_ident)
+            planning["heartbeat_at"] = now
+            planning["owner_alive"] = True
+            planning["owner_checked_at"] = now
+            current = self._target_locked(
+                self._payload.get("current_target_id")
+            )
+            if current is not None and current in self._planning_rows_locked():
+                current["last_heartbeat_at"] = now
+                current["updated_at"] = now
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        return True
+
+    def planning_ready(self, planning_session_id):
+        """Persist that a complete plan awaits the single UI-thread commit."""
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None or planning.get("status") != "active":
+                return False
+            owner = planning.get("owner") or {}
+            if owner.get("planning_session_id") != str(planning_session_id):
+                return False
+            planning["status"] = "ready"
+            planning["plan_ready_at"] = now
+            planning["heartbeat_at"] = now
+            self._append_lifecycle_event_locked(
+                "planning_ready",
+                now,
+                planning_session_id=str(planning_session_id),
+            )
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        self._notify_snapshot()
+        return True
+
+    def claim_planning_commit(self):
+        """Durably claim the only allowed plan commit/enqueue attempt."""
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None or planning.get("status") != "ready":
+                return False
+            planning["status"] = "committing"
+            planning["commit_started_at"] = now
+            self._append_lifecycle_event_locked("planning_commit_started", now)
+            self._touch_locked(now)
+            self._write_locked(write_latest=True)
+        return True
+
+    def complete_planning_commit(self):
+        """Record that every planned partition was handled exactly once."""
+
+        now = self._now()
+        with self._lock:
+            planning = self._planning_locked()
+            if planning is None or planning.get("status") != "committing":
+                return False
+            planning["status"] = "committed"
+            planning["committed_at"] = now
+            planning["heartbeat_at"] = now
+            self._append_lifecycle_event_locked("planning_commit_completed", now)
+            self._touch_locked(now)
+            self._finalize_if_terminal_locked(now)
+            self._write_locked(write_latest=True)
+        self._notify_snapshot()
+        return True
+
+    def _terminalize_planning_locked(self, stage, reason, now):
+        changed = False
+        for row in self._planning_rows_locked():
+            if row.get("stage") in TERMINAL_STAGES:
+                continue
+            self._transition_target_locked(
+                row,
+                stage,
+                now,
+                diagnostic=reason,
+                terminal_reason=reason,
+                outcome=stage,
+            )
+            changed = True
+        return changed
+
+    def finish_planning(self, stage, reason):
+        """Truthfully end an uncommitted plan as cancel/fail/owner loss."""
+
+        if stage not in {CANCELLED, FAILED, OWNER_LOST}:
+            raise ValueError("planning terminal stage is invalid")
+        now = self._now()
+        changed = False
+        with self._lock:
+            planning = self._planning_locked()
+            status = str((planning or {}).get("status") or "unowned")
+            if status in {"committed", "cancelled", "failed", "owner_lost"}:
+                return False
+            changed = self._terminalize_planning_locked(stage, reason, now)
+            if planning is None:
+                planning = {"schema_version": 1, "started_at": now}
+                self._payload["planning"] = planning
+            planning["status"] = stage
+            planning["terminal_reason"] = _bounded_diagnostic(reason)
+            planning["terminal_at"] = now
+            self._append_lifecycle_event_locked(
+                "planning_" + stage,
+                now,
+                detail=reason,
+            )
+            self._touch_locked(now)
+            self._finalize_if_terminal_locked(now, reason=reason)
+            self._write_locked(write_latest=True)
+            changed = True
+        if changed:
+            self._notify_snapshot()
+        return changed
+
+    def reconcile_planning_owner(self, owner_alive):
+        """Reconcile an uncommitted plan against its exact persisted owner."""
+
+        now = self._now()
+        with self._lock:
+            if not self._planning_rows_locked():
+                return False
+            planning = self._planning_locked()
+            if planning is None or not isinstance(planning.get("owner"), dict):
+                stage = FAILED
+                reason = "planning owner identity missing on restore"
+            else:
+                status = str(planning.get("status") or "unowned")
+                if status in {
+                    "committed",
+                    "cancelled",
+                    "failed",
+                    "owner_lost",
+                }:
+                    return False
+                planning["owner_alive"] = owner_alive
+                planning["owner_checked_at"] = now
+                heartbeat_at = planning.get("heartbeat_at")
+                heartbeat_age = (
+                    float("inf")
+                    if not isinstance(heartbeat_at, (int, float))
+                    else max(0.0, now - float(heartbeat_at))
+                )
+                if owner_alive is False:
+                    stage = OWNER_LOST
+                    reason = "exact planning owner process is absent"
+                elif status == "unowned":
+                    stage = FAILED
+                    reason = "planning owner was never established"
+                elif (
+                    status in {"active", "ready", "committing"}
+                    and heartbeat_age >= self.owner_lost_seconds
+                ):
+                    stage = FAILED
+                    reason = (
+                        "planning heartbeat expired while owner process "
+                        "remained present"
+                        if owner_alive is True
+                        else "planning heartbeat expired and owner is unverifiable"
+                    )
+                else:
+                    return False
+        return self.finish_planning(stage, reason)
 
     def assign_partition(self, partition, target_ids, execution_path):
         partition = str(partition)
@@ -895,9 +1167,44 @@ class RetryProgressReceipt:
                 job = jobs_by_id.get(str(receipt_job.get("job_id") or ""))
                 if job is None:
                     continue
-                receipt_job["status"] = job.get("status")
-                receipt_job["owner"] = self._owner_from_queue_record(job)
+                queue_status = job.get("status")
+                queue_owner = self._owner_from_queue_record(job)
+                if (
+                    receipt_job.get("status") != queue_status
+                    or receipt_job.get("owner") != queue_owner
+                ):
+                    changed = True
+                receipt_job["status"] = queue_status
+                receipt_job["owner"] = queue_owner
                 receipt_job["updated_at"] = self._now()
+                if queue_status == "running" and queue_owner:
+                    heartbeat_at = queue_owner.get("heartbeat_at")
+                    candidates = self._partition_targets_locked(partition)
+                    row = next(
+                        (
+                            item
+                            for item in candidates
+                            if item.get("stage") not in TERMINAL_STAGES
+                        ),
+                        None,
+                    )
+                    if row is not None:
+                        if row.get("stage") == SHARED_QUEUE_WAIT:
+                            self._transition_target_locked(
+                                row,
+                                CLAIMED,
+                                self._now(),
+                                diagnostic="restored exact shared queue lease",
+                            )
+                            changed = True
+                        if isinstance(heartbeat_at, (int, float)) and (
+                            row.get("last_heartbeat_at") is None
+                            or float(heartbeat_at)
+                            > float(row.get("last_heartbeat_at"))
+                        ):
+                            row["last_heartbeat_at"] = float(heartbeat_at)
+                            row["updated_at"] = self._now()
+                            changed = True
                 if job.get("status") == "failed" and (
                     job.get("failure_reason") == OWNER_LOST
                     or isinstance(job.get("last_expired_lease"), dict)
@@ -1057,10 +1364,76 @@ class RetryProgressReceipt:
             if evaluate:
                 notify = self._evaluate_liveness_locked(now)
             payload = copy.deepcopy(self._payload)
-        for row in payload.get("targets", []):
-            row["elapsed_seconds"] = max(
-                0.0, now - float(row.get("started_at") or now)
+        planning = payload.get("planning")
+        if isinstance(planning, dict):
+            planning_started = planning.get("started_at")
+            planning_end = (
+                planning.get("committed_at")
+                or planning.get("terminal_at")
+                or planning.get("plan_ready_at")
+                if planning.get("status") in {
+                    "committed",
+                    "cancelled",
+                    "failed",
+                    "owner_lost",
+                    "ready",
+                }
+                else now
             )
+            planning["wall_elapsed_seconds"] = (
+                None
+                if not isinstance(planning_started, (int, float))
+                else max(0.0, float(planning_end or now) - float(planning_started))
+            )
+            heartbeat_at = planning.get("heartbeat_at")
+            heartbeat_age = (
+                None
+                if not isinstance(heartbeat_at, (int, float))
+                else max(0.0, now - float(heartbeat_at))
+            )
+            progress_at = planning.get("progress_at")
+            progress_age = (
+                None
+                if not isinstance(progress_at, (int, float))
+                else max(0.0, now - float(progress_at))
+            )
+            planning["heartbeat_age_seconds"] = heartbeat_age
+            planning["progress_age_seconds"] = progress_age
+            status = str(planning.get("status") or "unowned")
+            if status in {"cancelled", "failed", "owner_lost"}:
+                liveness_state = status
+            elif status == "ready":
+                liveness_state = "plan_ready"
+            elif status == "committing":
+                liveness_state = "commit_in_progress"
+            elif status == "committed":
+                liveness_state = "committed"
+            elif planning.get("owner_alive") is False:
+                liveness_state = OWNER_LOST
+            elif heartbeat_age is None:
+                liveness_state = "owner_unknown"
+            elif heartbeat_age >= self.owner_lost_seconds:
+                liveness_state = STALLED
+            else:
+                liveness_state = "heartbeat_live"
+            planning["liveness_state"] = liveness_state
+            planning["progress_state"] = (
+                "unknown"
+                if progress_age is None
+                else STALLED
+                if progress_age >= self.stall_warning_seconds
+                else "recent"
+            )
+        for row in payload.get("targets", []):
+            row_end = row.get("terminal_at")
+            if not isinstance(row_end, (int, float)):
+                row_end = now
+            row["wall_elapsed_seconds"] = max(
+                0.0, float(row_end) - float(row.get("started_at") or now)
+            )
+            # Schema-1 readers keep the old field; the UI labels it as wall
+            # time and never treats its increase as execution evidence.
+            row["elapsed_seconds"] = row["wall_elapsed_seconds"]
             for field, output in (
                 ("last_progress_at", "last_progress_age_seconds"),
                 ("last_output_at", "last_output_age_seconds"),
@@ -1070,6 +1443,53 @@ class RetryProgressReceipt:
                 row[output] = (
                     None if value is None else max(0.0, now - float(value))
                 )
+            if (
+                isinstance(planning, dict)
+                and (
+                    row.get("stage") == PLANNING
+                    or (
+                        row.get("stage") == STALLED
+                        and row.get("resume_stage") == PLANNING
+                    )
+                )
+            ):
+                row["last_heartbeat_age_seconds"] = planning.get(
+                    "heartbeat_age_seconds"
+                )
+                row["last_progress_age_seconds"] = planning.get(
+                    "progress_age_seconds"
+                )
+        current = next(
+            (
+                row
+                for row in payload.get("targets", [])
+                if row.get("target_id") == payload.get("current_target_id")
+            ),
+            None,
+        )
+        if payload.get("terminal_at") is not None:
+            payload["evidence_state"] = "terminal"
+        elif current is None:
+            payload["evidence_state"] = "idle"
+        elif (
+            isinstance(planning, dict)
+            and (
+                current.get("stage") == PLANNING
+                or current.get("resume_stage") == PLANNING
+            )
+        ):
+            payload["evidence_state"] = planning.get("liveness_state")
+        elif current.get("stage") == STALLED:
+            payload["evidence_state"] = STALLED
+        elif current.get("last_heartbeat_age_seconds") is None:
+            payload["evidence_state"] = "heartbeat_unknown"
+        elif (
+            current.get("last_heartbeat_age_seconds")
+            >= self.owner_lost_seconds
+        ):
+            payload["evidence_state"] = OWNER_LOST
+        else:
+            payload["evidence_state"] = "heartbeat_live"
         if notify:
             self._notify_snapshot()
         return payload
