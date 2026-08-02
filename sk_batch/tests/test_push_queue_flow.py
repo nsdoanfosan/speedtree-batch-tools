@@ -1024,6 +1024,162 @@ class PushQueueFlowTests(unittest.TestCase):
             lease.result["error"],
         )
 
+    def test_latest_terminal_kinds_do_not_become_failures(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        kinds = {
+            "imported.spm": ("imported_ok", "완료"),
+            "ready.spm": ("ready", "준비됨"),
+            "pending.spm": (
+                "exported_pending_unreal",
+                "export 완료 · Unreal 대기",
+            ),
+            "cancelled.spm": (
+                "internal_error",
+                "본 세팅 실행 실패: 사용자 중지",
+            ),
+            "failed.spm": ("data_error", "실제 import 실패"),
+        }
+        targets = []
+        for name, (kind, message) in kinds.items():
+            target = Path(name)
+            iid = str(target)
+            targets.append({"spm": target})
+            app.state[iid] = {
+                "push_status": message,
+                "push_status_kind": kind,
+                "push_status_error": {
+                    "kind": kind,
+                    "message": message,
+                },
+            }
+        app._phase_failed_items = set(kinds)
+
+        summary = app._summarize_phase_targets(targets, phase="push")
+        outcomes = {
+            row["target_name"]: row["outcome"]
+            for row in summary["target_outcomes"]
+        }
+
+        self.assertEqual(summary["completed_count"], 2)
+        self.assertEqual(summary["pending_count"], 1)
+        self.assertEqual(summary["cancelled_count"], 1)
+        self.assertEqual(summary["failed_count"], 1)
+        self.assertEqual(outcomes["imported.spm"], "completed")
+        self.assertEqual(outcomes["ready.spm"], "completed")
+        self.assertEqual(outcomes["pending.spm"], "pending_unreal")
+        self.assertEqual(outcomes["cancelled.spm"], "cancelled")
+        self.assertEqual(outcomes["failed.spm"], "failed")
+
+    def test_all_completed_summary_overrides_late_stop_flag(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.stop_flag.set()
+        targets = [
+            {"spm": Path(f"completed_{index}.spm")}
+            for index in range(29)
+        ]
+        summary = {
+            "selected_count": 29,
+            "completed_count": 29,
+            "pending_count": 0,
+            "cancelled_count": 0,
+            "blocked_count": 0,
+            "owner_lost_count": 0,
+            "planned_excluded_count": 0,
+            "dependency_blocked_count": 0,
+            "failed_count": 0,
+            "target_outcomes": [
+                {
+                    "target": str(item["spm"]),
+                    "target_name": item["spm"].name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }
+                for item in targets
+            ],
+            "shared_failures": [],
+        }
+
+        class Lease:
+            def __init__(self):
+                self.finished = False
+                self.success = None
+                self.result = None
+                self.terminal_status = None
+
+            def finish(
+                self,
+                success=True,
+                result=None,
+                terminal_status=None,
+            ):
+                self.finished = True
+                self.success = success
+                self.result = result
+                self.terminal_status = terminal_status
+
+        lease = Lease()
+        app.shared_queue_runtime = mock.Mock(
+            wait_for_turn=mock.Mock(return_value=lease)
+        )
+
+        def run_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = summary
+            return False
+
+        app._run_full_pipeline = mock.Mock(side_effect=run_pipeline)
+        job = {
+            "id": 83,
+            "label": "sequence 83 replay",
+            "mode": "pipeline",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": targets,
+            "shared_queue_job_id": "sequence-83",
+        }
+        with mock.patch.object(
+            app,
+            "_freeze_batch_production_source_manifest",
+        ):
+            app._run_queued_batch_job(job)
+
+        self.assertTrue(lease.success)
+        self.assertIsNone(lease.terminal_status)
+        self.assertEqual(lease.result["outcome"], "completed")
+        self.assertEqual(lease.result["completed_count"], 29)
+        self.assertEqual(lease.result["failed_count"], 0)
+
+    def test_operator_cancel_is_durable_result_not_status_error(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        iid = "cancelled.spm"
+        with mock.patch.object(gui, "save_state"):
+            app._record_phase_status(
+                iid,
+                "spm_status",
+                "중지: 사용자 중지",
+                "cancelled",
+                "사용자 중지",
+            )
+
+        entry = app.state[iid]
+        self.assertEqual(entry["spm_status_kind"], "cancelled")
+        self.assertNotIn("spm_status_error", entry)
+        self.assertEqual(
+            entry["spm_status_result"]["outcome"],
+            "cancelled",
+        )
+        app._phase_failed_items = set()
+        summary = app._summarize_phase_targets(
+            [{"spm": Path(iid)}],
+            phase="spm",
+        )
+        self.assertEqual(summary["cancelled_count"], 1)
+        self.assertEqual(summary["failed_count"], 0)
+
     def test_truly_shared_failure_is_recorded_once_with_affected_targets(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -1285,12 +1441,13 @@ class PushQueueFlowTests(unittest.TestCase):
         ), mock.patch.object(
             gui, "close_process_kill_job", return_value=True
         ):
-            with self.assertRaisesRegex(RuntimeError, "사용자 중지"):
+            with self.assertRaisesRegex(RuntimeError, "사용자 중지") as caught:
                 app._run_limited(
                     ["worker.exe"],
                     "worker.log",
                     timeout=None,
                 )
+        self.assertEqual(caught.exception.kind, "cancelled")
 
     def test_process_runner_resets_inactivity_only_on_progress_marker(self):
         gui = load_gui_module()
@@ -3500,6 +3657,140 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("체크 상태와 무관하게 현재 목록 전체", source)
         self.assertNotIn("체크된 최근 실패", source)
 
+    def test_slow_complete_inventory_retry_planning_keeps_tk_responsive(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        candidate_ids = ["checked.spm", "unchecked.spm"]
+        self.configure_failed_retry_start(
+            app,
+            candidate_ids,
+            checked_ids=[candidate_ids[0]],
+        )
+        app._async_retry_planning_enabled = True
+        app._retry_planning_workers = set()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        ui_thread_ident = threading.get_ident()
+        app._ui_thread_ident = ui_thread_ident
+        events = []
+
+        class ThreadCheckedVar:
+            value = ""
+
+            def set(self, value):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker touched a Tk variable")
+                self.value = str(value)
+                events.append(("progress", self.value))
+
+        class ThreadCheckedRoot:
+            def update_idletasks(self):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker touched the Tk root")
+                events.append(("paint",))
+
+            def after(self, _delay, _callback):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker scheduled Tk work directly")
+                events.append(("after",))
+
+        app.progress_var = ThreadCheckedVar()
+        app.root = ThreadCheckedRoot()
+        app._set_batch_queue_controls = mock.Mock(
+            side_effect=lambda _busy: events.append(("controls",))
+        )
+        tracker = mock.Mock()
+        tracker.run_id = "slow-complete-inventory"
+        tracker.path = Path("retry-progress.json")
+        app._new_retry_progress = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (
+                events.append(("tracker",)) or tracker
+            )
+        )
+
+        planning_entered = threading.Event()
+        release_planning = threading.Event()
+        repair_threads = []
+
+        def slow_repair_state(_iid):
+            repair_threads.append(threading.get_ident())
+            planning_entered.set()
+            if not release_planning.wait(5):
+                raise AssertionError("test did not release slow planning")
+            return {
+                "current": False,
+                "push_ready": False,
+                "kind": "stale_content",
+                "reason": "deterministic slow complete-inventory planning",
+            }
+
+        app._failed_retry_repair_state = mock.Mock(
+            side_effect=slow_repair_state
+        )
+        enqueued = []
+
+        def enqueue_on_tk_thread(job):
+            if threading.get_ident() != ui_thread_ident:
+                raise AssertionError("worker committed a queue job")
+            enqueued.append(job)
+            events.append(("enqueue",))
+            return len(enqueued)
+
+        app._enqueue_batch_job = mock.Mock(side_effect=enqueue_on_tk_thread)
+
+        with mock.patch.object(gui, "save_config"):
+            run_id = app.start_failed_results_retry()
+            self.assertTrue(planning_entered.wait(1))
+            self.assertEqual(run_id, tracker.run_id)
+            self.assertEqual(
+                events[:4],
+                [
+                    ("controls",),
+                    ("progress", "retry stage=planning · 대상 2개"),
+                    ("paint",),
+                    ("tracker",),
+                ],
+            )
+            self.assertIn("대상 2개", app.progress_var.value)
+            self.assertFalse(enqueued)
+
+            worker = next(iter(app._retry_planning_workers))
+            release_planning.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            app._drain_ui_queue()
+
+        self.assertEqual(
+            app._failed_retry_repair_state.call_args_list,
+            [mock.call(iid) for iid in candidate_ids],
+        )
+        self.assertTrue(repair_threads)
+        self.assertTrue(
+            all(ident != ui_thread_ident for ident in repair_threads)
+        )
+        self.assertEqual(len(enqueued), 1)
+        self.assertEqual(
+            [str(item["spm"]) for item in enqueued[0]["targets"]],
+            candidate_ids,
+        )
+        self.assertIn(("enqueue",), events)
+
+        off_thread_errors = []
+
+        def attempt_off_thread_commit():
+            try:
+                app._commit_failed_retry_plan({})
+            except Exception as exc:
+                off_thread_errors.append(exc)
+
+        off_thread = threading.Thread(target=attempt_off_thread_commit)
+        off_thread.start()
+        off_thread.join(5)
+        self.assertFalse(off_thread.is_alive())
+        self.assertEqual(len(off_thread_errors), 1)
+        self.assertIsInstance(off_thread_errors[0], RuntimeError)
+        self.assertIn("Tk owner thread", str(off_thread_errors[0]))
+
     @staticmethod
     def write_unreal_retry_parent(gui, root, queue_id, status="data_error"):
         manifest_path = root / "parent.json"
@@ -4019,6 +4310,182 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertTrue(pending[0]["verify_existing_assets"])
         self.assertFalse(pending[1]["verify_existing_assets"])
+
+    def test_retry_liveness_panel_renders_required_operator_fields(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            "current_target_id": "C:/sanitized/SK_tree.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/already_done.spm",
+                    "target_name": "already_done.spm",
+                    "stage": "complete",
+                    "terminal_at": 9.0,
+                },
+                {
+                    "target_id": "C:/sanitized/SK_tree.spm",
+                    "target_name": "SK_tree.spm",
+                    "partition": "blender_export",
+                    "partition_ordinal": 2,
+                    "partition_total": 3,
+                    "stage": "send2ue",
+                    "terminal_at": None,
+                    "elapsed_seconds": 125,
+                    "last_progress_age_seconds": 8,
+                    "last_output_age_seconds": 32,
+                    "last_heartbeat_age_seconds": 1,
+                    "latest_diagnostic": "bounded sanitized diagnostic",
+                },
+            ],
+        })
+        target_text = app.retry_target_var.set.call_args.args[0]
+        live_text = app.retry_liveness_var.set.call_args.args[0]
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        diagnostic_text = app.retry_diagnostic_var.set.call_args.args[0]
+        self.assertIn("current target: SK_tree.spm", target_text)
+        self.assertIn("1/2 finished", target_text)
+        self.assertIn("partition=blender_export 2/3", target_text)
+        self.assertIn("current target stage=send2ue", live_text)
+        self.assertIn("elapsed 2m 05s", live_text)
+        self.assertIn("progress age 8s", live_text)
+        self.assertIn("output age 32s", live_text)
+        self.assertIn("heartbeat age 1s", live_text)
+        self.assertIn("retry scope: historical failed/stale selection", outcome_text)
+        self.assertIn("current state: running", outcome_text)
+        self.assertIn("success 1", outcome_text)
+        self.assertIn("failed 0", outcome_text)
+        self.assertIn("remaining 1", outcome_text)
+        self.assertIn("terminal outcome: pending", outcome_text)
+        self.assertEqual(
+            diagnostic_text, "latest: bounded sanitized diagnostic"
+        )
+
+    def test_retry_liveness_panel_keeps_individual_failure_nonterminal(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            # The per-target/root stage may say failed while another target
+            # runs; only terminal_at/run_state is a batch outcome.
+            "stage": "failed",
+            "terminal_at": None,
+            "current_target_id": "C:/sanitized/active.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/complete.spm",
+                    "target_name": "complete.spm",
+                    "stage": "complete",
+                    "terminal_at": 1.0,
+                },
+                {
+                    "target_id": "C:/sanitized/failed.spm",
+                    "target_name": "failed.spm",
+                    "stage": "failed",
+                    "terminal_at": 2.0,
+                },
+                {
+                    "target_id": "C:/sanitized/active.spm",
+                    "target_name": "active.spm",
+                    "stage": "blender",
+                    "terminal_at": None,
+                    "elapsed_seconds": 3,
+                    "last_progress_age_seconds": 1,
+                    "last_output_age_seconds": None,
+                    "last_heartbeat_age_seconds": 1,
+                },
+            ],
+        })
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        self.assertIn("current state: running", outcome_text)
+        self.assertIn("success 1", outcome_text)
+        self.assertIn("failed 1", outcome_text)
+        self.assertIn("remaining 1", outcome_text)
+        self.assertIn("terminal outcome: pending", outcome_text)
+        self.assertIn("current run continues after individual failures", outcome_text)
+
+    def test_retry_liveness_panel_shows_terminal_outcome_only_after_terminal(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.retry_target_var = mock.Mock()
+        app.retry_liveness_var = mock.Mock()
+        app.retry_outcome_var = mock.Mock()
+        app.retry_diagnostic_var = mock.Mock()
+        app._render_retry_progress({
+            "run_state": "terminal",
+            "stage": "failed",
+            "terminal_at": 9.0,
+            "terminal_outcome": "failed",
+            "terminal_reason": "all_retry_targets_failed",
+            "current_target_id": "C:/sanitized/failed.spm",
+            "targets": [
+                {
+                    "target_id": "C:/sanitized/failed.spm",
+                    "target_name": "failed.spm",
+                    "stage": "failed",
+                    "terminal_at": 9.0,
+                    "elapsed_seconds": 9,
+                    "last_progress_age_seconds": 1,
+                    "last_output_age_seconds": 1,
+                    "last_heartbeat_age_seconds": 1,
+                },
+            ],
+        })
+        outcome_text = app.retry_outcome_var.set.call_args.args[0]
+        self.assertIn("current state: terminal", outcome_text)
+        self.assertIn("terminal outcome: failed", outcome_text)
+        self.assertIn("all_retry_targets_failed", outcome_text)
+
+    def test_push_receipt_completion_follows_durable_target_state(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        sequence = []
+
+        def save_then_record(_state):
+            sequence.append("state_saved")
+
+        def record_retry(*args, **kwargs):
+            sequence.append(("receipt", args[1]))
+            return True
+
+        app._retry_transition = mock.Mock(side_effect=record_retry)
+        with mock.patch.object(gui, "save_state", side_effect=save_then_record):
+            app._set_push_state(
+                "C:/sanitized/tree.spm",
+                "imported_ok",
+                "Unreal imported",
+            )
+
+        self.assertEqual(
+            sequence,
+            [
+                "state_saved",
+                ("receipt", gui.RETRY_STAGE_POST_CHECK),
+                ("receipt", gui.RETRY_STAGE_COMPLETE),
+            ],
+        )
+
+    def test_push_state_persist_failure_cannot_seal_retry_receipt(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        with mock.patch.object(
+            gui, "save_state", side_effect=OSError("state disk unavailable")
+        ):
+            with self.assertRaises(OSError):
+                app._set_push_state(
+                    "C:/sanitized/tree.spm",
+                    "imported_ok",
+                    "Unreal imported",
+                )
+        app._retry_transition.assert_not_called()
 
 
 if __name__ == "__main__":

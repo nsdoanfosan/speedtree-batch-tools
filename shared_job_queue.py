@@ -533,6 +533,62 @@ class SharedJobQueue:
 
         return self._change(mutate)
 
+    def record_operator_close_request(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        owner_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist that the owning UI was closed while the job was live.
+
+        This event is deliberately non-terminal. The worker may still publish
+        a normal result before its process exits; otherwise ordinary lease
+        recovery later records ``owner_lost``. Keeping these as two ordered
+        events preserves the causal sequence without treating owner loss as
+        the batch's original outcome.
+        """
+
+        job_id = _require_text(job_id, field="job_id")
+        lease_token = _require_text(lease_token, field="lease_token")
+        expected_owner = (
+            None if owner_id is None else _require_text(owner_id, field="owner_id")
+        )
+
+        def mutate(state: Dict[str, Any], now: float) -> Dict[str, Any]:
+            job = self._find_job(state, job_id)
+            lease = self._require_lease(job, lease_token, expected_owner)
+            audit = job.get("termination_audit")
+            if not isinstance(audit, dict):
+                audit = {"schema_version": 1, "events": []}
+                job["termination_audit"] = audit
+            events = audit.get("events")
+            if not isinstance(events, list):
+                raise QueueStateError(
+                    f"invalid termination audit for job {job_id}"
+                )
+            if any(
+                isinstance(event, dict)
+                and event.get("kind") == "operator_close_requested"
+                for event in events
+            ):
+                return job
+            events.append({
+                "sequence": len(events) + 1,
+                "id": uuid.uuid4().hex,
+                "kind": "operator_close_requested",
+                "at": now,
+                "owner": {
+                    key: value
+                    for key, value in lease.items()
+                    if key not in {"token", "expires_at", "heartbeat_at"}
+                },
+                "batch_outcome_at_event": "running",
+            })
+            return job
+
+        return self._change(mutate)
+
     def complete(
         self,
         job_id: str,
@@ -540,13 +596,23 @@ class SharedJobQueue:
         *,
         result: Any = None,
         success: bool = True,
+        terminal_status: Optional[str] = None,
         owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Finish a leased job and release the global execution slot."""
+        """Finish a leased job with an explicit non-failure cancel when needed."""
 
         job_id = _require_text(job_id, field="job_id")
         lease_token = _require_text(lease_token, field="lease_token")
         result = _json_copy(result, field="result")
+        if terminal_status is not None:
+            terminal_status = _require_text(
+                terminal_status,
+                field="terminal_status",
+            ).casefold()
+            if terminal_status not in {"completed", "failed", "cancelled"}:
+                raise ValueError(
+                    "terminal_status must be completed, failed, or cancelled"
+                )
         expected_owner = (
             None
             if owner_id is None
@@ -556,9 +622,18 @@ class SharedJobQueue:
         def mutate(state: Dict[str, Any], now: float) -> Dict[str, Any]:
             job = self._find_job(state, job_id)
             lease = self._require_lease(job, lease_token, expected_owner)
-            job["status"] = "completed" if success else "failed"
+            job["status"] = terminal_status or (
+                "completed" if success else "failed"
+            )
             job["finished_at"] = now
             job["terminal_at"] = now
+            if job["status"] == "cancelled":
+                job["cancelled_at"] = now
+                job["cancel_reason"] = str(
+                    (result or {}).get("error")
+                    or (result or {}).get("outcome")
+                    or "operator_cancelled"
+                ) if isinstance(result, dict) else "operator_cancelled"
             job["result"] = result
             job["last_lease"] = {
                 key: value for key, value in lease.items() if key != "token"
@@ -1002,6 +1077,47 @@ class SharedJobQueue:
             job["failure_reason"] = "owner_lost"
             job["result"] = None
             job["lease"] = None
+            termination_audit = job.get("termination_audit")
+            if not isinstance(termination_audit, dict):
+                termination_audit = {"schema_version": 1, "events": []}
+                job["termination_audit"] = termination_audit
+            events = termination_audit.get("events")
+            if not isinstance(events, list):
+                raise QueueStateError(
+                    f"invalid termination audit for job {job['id']}"
+                )
+            operator_close = any(
+                isinstance(event, dict)
+                and event.get("kind") == "operator_close_requested"
+                for event in events
+            )
+            events.append({
+                "sequence": len(events) + 1,
+                "id": uuid.uuid4().hex,
+                "kind": "owner_lost_recovered",
+                "at": now,
+                "owner": {
+                    key: value
+                    for key, value in audit.items()
+                    if key not in {"recovered_at", "expires_at", "heartbeat_at"}
+                },
+                "trigger": (
+                    "operator_close_requested"
+                    if operator_close
+                    else "owner_process_disappeared"
+                ),
+                "terminal_reason": "owner_lost",
+                "original_batch_outcome": "unknown",
+            })
+            termination_audit["terminal_interpretation"] = {
+                "terminal_reason": "owner_lost",
+                "trigger": (
+                    "operator_close_requested"
+                    if operator_close
+                    else "owner_process_disappeared"
+                ),
+                "original_batch_outcome": "unknown",
+            }
             recovered = True
         return recovered
 

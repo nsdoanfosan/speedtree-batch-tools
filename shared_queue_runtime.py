@@ -49,13 +49,29 @@ class WaitAlreadyActive(RuntimeErrorBase):
 def _brief(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if job is None:
         return None
-    return {
+    brief = {
         "id": job["id"],
         "sequence": job["sequence"],
         "app_id": job["app_id"],
         "label": job.get("label"),
         "status": job["status"],
     }
+    lease = job.get("lease")
+    if isinstance(lease, dict):
+        brief["lease"] = {
+            key: lease.get(key)
+            for key in (
+                "owner_id",
+                "hostname",
+                "pid",
+                "process_marker",
+                "claimed_at",
+                "heartbeat_at",
+                "expires_at",
+            )
+            if lease.get(key) is not None
+        }
+    return brief
 
 
 class SharedQueueLease:
@@ -132,6 +148,7 @@ class SharedQueueLease:
         self,
         success: bool = True,
         result: Any = None,
+        terminal_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Stop heartbeating and complete the job exactly once locally."""
 
@@ -149,12 +166,27 @@ class SharedQueueLease:
                 self.token,
                 result=result,
                 success=bool(success),
+                terminal_status=terminal_status,
                 owner_id=self._runtime.owner_id,
             )
             self._finished_record = copy.deepcopy(completed)
             self.record = copy.deepcopy(completed)
             self._runtime._lease_finished(self)
             return copy.deepcopy(completed)
+
+    def record_operator_close(self) -> Dict[str, Any]:
+        """Durably mark a UI close request without releasing the lease."""
+
+        with self._finish_lock:
+            if self._finished_record is not None:
+                return copy.deepcopy(self._finished_record)
+            recorded = self._runtime.queue.record_operator_close_request(
+                self.job_id,
+                self.token,
+                owner_id=self._runtime.owner_id,
+            )
+            self.record = copy.deepcopy(recorded)
+            return copy.deepcopy(recorded)
 
     def acknowledge_release(self, request_id: str) -> Dict[str, Any]:
         """Acknowledge after the caller has stopped and joined its worker.
@@ -426,13 +458,15 @@ class SharedQueueRuntime:
             cancelled[job_id] = record
         return cancelled
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, operator_close: bool = False) -> None:
         """Close this runtime and cancel queued tickets, idempotently.
 
         Active leases deliberately keep heartbeating.  Only the code that has
         actually stopped or joined the asset worker may call ``lease.finish``;
         releasing here could let another GUI overlap a worker that is still
-        mutating shared applications or files.
+        mutating shared applications or files. A UI close first writes a
+        non-terminal owner event so later owner-loss recovery retains the
+        causal sequence.
         """
 
         with self._lock:
@@ -441,6 +475,11 @@ class SharedQueueRuntime:
             self._closed = True
             self._shutdown_event.set()
             pending_ids = list(self._pending)
+            active_leases = list(self._active.values())
+
+        if operator_close:
+            for lease in active_leases:
+                lease.record_operator_close()
 
         for job_id in pending_ids:
             try:

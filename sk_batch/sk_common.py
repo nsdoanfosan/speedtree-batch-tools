@@ -152,6 +152,10 @@ DEFAULT_CONFIG = {
     "headless_item_crash_retries": 2,
     "headless_batch_max_restarts": 10,
     "headless_job_timeout": 14_400,
+    # Observational warning only: the existing exact-owned process lifecycle
+    # remains the sole termination path for a retry worker tree.
+    "retry_stall_warning_seconds": 120,
+    "retry_owner_lost_seconds": 45,
     "process_poll_interval": 0.2,
 }
 
