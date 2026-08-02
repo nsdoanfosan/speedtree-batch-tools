@@ -1,0 +1,98 @@
+{
+  "contract": "speedtree_issue_102_leaf_material_canonicalization_evidence_v1",
+  "schema_version": 1,
+  "source_issue": 102,
+  "repo_baseline": "0e85e461c2f64a5917b1e95cac08a7828f9ca87b",
+  "production_observation": {
+    "modeler_root_metadata": {
+      "title": "Modeler 10.1.0",
+      "version": "8",
+      "version_string": "10.1.0"
+    },
+    "namespace_free": true,
+    "generator_type": "Leaf Mesh",
+    "literal_value_ancestry": "SpeedTree/Generators/Generator/Properties/Property/Value",
+    "property_shape": {
+      "property_attributes": 0,
+      "ordered_children": [
+        "Name",
+        "Value"
+      ],
+      "name_cardinality": 1,
+      "value_cardinality": 1
+    },
+    "type_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "material_transition": {
+      "before": "-1",
+      "after": "0",
+      "exact_change_count": 4
+    },
+    "paired_mesh": {
+      "before": "-10",
+      "after": "-10",
+      "exact_pair_count": 4
+    },
+    "material_table": {
+      "count_before": 5,
+      "count_after": 5,
+      "identity_order_equal": true,
+      "existing_core_v4_projection_equal": true,
+      "raw_subtree_byte_equal": false,
+      "raw_differences_covered_only_by_existing_core_v4_rules": true,
+      "contains_material_id_zero": false
+    },
+    "generator_membership_equal": true,
+    "required_live_delivery_equal": true,
+    "stale_after": false,
+    "orphan_owner_count_after": 0,
+    "orphan_node_count_after": 0,
+    "core_v4_uncovered_changes": [
+      "Leaves:Type:0:Material",
+      "Leaves:Type:1:Material",
+      "Leaves:Type:2:Material",
+      "Leaves:Type:3:Material"
+    ]
+  },
+  "synthetic_negative_control": {
+    "provenance": "sanitized_test_only_not_supported_ui_proof",
+    "material_table_contains_id_zero": true,
+    "material_value": "0",
+    "mesh_value": "130",
+    "material_zero_is_core_v4_observable": true,
+    "global_minus_one_zero_collapse_allowed": false
+  },
+  "required_proof_status": {
+    "supported_ui_save_only_reproduction": false,
+    "editor_state_equivalence": false,
+    "valid_material_zero_ui_negative_control": false,
+    "mesh_only_activation_equivalence": false,
+    "second_save_idempotence": false,
+    "exact_executable_launch_identity": false,
+    "implementation_authorized": false
+  },
+  "disposition": {
+    "status": "intended_fail_closed_blocker",
+    "product_contract_changed": false,
+    "asset_specific_exception_added": false,
+    "remediation": "keep current saved asset fail-closed until supported-UI proof can be completed under exclusive Modeler ownership"
+  },
+  "validation": {
+    "focused_issue_and_recovery_tests": 69,
+    "full_unittest_count": 1596,
+    "compile_gate_python_sources": 193,
+    "compile_gate_contract_groups": 4,
+    "compileall_passed": true
+  },
+  "sanitization": {
+    "contains_raw_spm_or_xml": false,
+    "contains_absolute_paths": false,
+    "contains_generator_guids": false,
+    "contains_private_material_names": false,
+    "contains_user_names": false
+  }
+}

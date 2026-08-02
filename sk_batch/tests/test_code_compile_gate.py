@@ -1,5 +1,6 @@
 import ast
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,12 +16,14 @@ from code_compile_gate import (  # noqa: E402
     GUI_PATH,
     PUSH_JOB_PATH,
     PRODUCTION_SOURCE_MANIFEST_VERSION,
+    _compile_repository_sources,
     compile_repository_sources,
     production_source_manifest,
     production_source_revision_state,
     run_gate,
     validate_gui_contracts,
     validate_push_job_contracts,
+    validate_production_source_manifest,
     validate_production_source_revision_report,
 )
 
@@ -124,6 +127,95 @@ class CodeCompileGateTests(unittest.TestCase):
             second = production_source_manifest(root)
             self.assertNotEqual(first.content_hash, second.content_hash)
             self.assertNotEqual(first.files[0].sha256, second.files[0].sha256)
+
+    def test_nested_worktree_and_git_ignored_sources_are_not_production(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            try:
+                subprocess.run(
+                    ["git", "init", "--quiet", str(root)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f"Git fixture setup unavailable: {exc}")
+
+            app = root / "app.py"
+            app.write_text("answer = 42\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "app.py"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            claude_worktree = (
+                root
+                / ".claude"
+                / "worktrees"
+                / "sanitized-ephemeral"
+            )
+            claude_worktree.mkdir(parents=True)
+            claude_source = claude_worktree / "worker.py"
+            claude_source.write_text("answer = 1\n", encoding="utf-8")
+
+            nested_vcs_root = root / "tool-cache" / "sanitized-worktree"
+            nested_vcs_root.mkdir(parents=True)
+            (nested_vcs_root / ".git").write_text(
+                "gitdir: sanitized-git-dir\n",
+                encoding="utf-8",
+            )
+            nested_source = nested_vcs_root / "helper.pyw"
+            nested_source.write_text("answer = 2\n", encoding="utf-8")
+
+            ignored_root = root / "ignored-helper-root"
+            ignored_root.mkdir()
+            ignored_source = ignored_root / "ignored.py"
+            ignored_source.write_text("answer = 3\n", encoding="utf-8")
+            exclude = root / ".git" / "info" / "exclude"
+            with exclude.open("a", encoding="utf-8") as handle:
+                handle.write("\nignored-helper-root/\n")
+
+            started = production_source_manifest(root)
+            compiled = _compile_repository_sources(root)
+            self.assertEqual(started, compiled)
+            self.assertEqual(started.source_count, 1)
+            self.assertEqual(
+                [record.path for record in started.files],
+                ["app.py"],
+            )
+
+            claude_source.write_text("def broken(:\n", encoding="utf-8")
+            nested_source.write_text("def broken(:\n", encoding="utf-8")
+            ignored_source.write_text("def broken(:\n", encoding="utf-8")
+            after_nested_mutation = production_source_manifest(root)
+            self.assertEqual(started, after_nested_mutation)
+            self.assertEqual(compile_repository_sources(root), 1)
+            self.assertEqual(
+                validate_production_source_manifest(
+                    started,
+                    after_nested_mutation,
+                    label="Parent production source",
+                ),
+                started,
+            )
+
+            app.write_text("answer = 43\n", encoding="utf-8")
+            changed_production = production_source_manifest(root)
+            self.assertNotEqual(
+                started.content_hash,
+                changed_production.content_hash,
+            )
+            with self.assertRaisesRegex(
+                CompileGateError,
+                "Parent production source revision mismatch",
+            ):
+                validate_production_source_manifest(
+                    started,
+                    changed_production,
+                    label="Parent production source",
+                )
 
     def test_production_source_revision_report_requires_exact_hash(self):
         with tempfile.TemporaryDirectory() as temporary:

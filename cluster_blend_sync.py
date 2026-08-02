@@ -34,6 +34,11 @@ from atlas_target_registry import (
     registry_path_for_blend,
     save_target_registry,
 )
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
 from cluster_spm_pair_contract import (
     ClusterSpmPairPathError,
     resolve_cluster_spm_pair,
@@ -629,25 +634,24 @@ def _spm_failure_inventory(path):
 
 
 def _scope_failure_diagnostics(blend, target):
-    scope_dir = Path(target).parent / ".atlas_leaf_speedtree_scopes"
-    if not scope_dir.is_dir():
-        return []
+    try:
+        resolution = resolve_atlas_manifests(
+            target,
+            expected_blend=blend,
+        )
+    except AtlasManifestResolutionError as exc:
+        return [{
+            "error": str(exc),
+            "atlas_manifest_resolution": exc.resolution,
+        }]
     rows = []
-    for path in sorted(scope_dir.glob(f"*__{Path(target).stem}.json")):
-        payload = _read_json(path)
-        if not payload:
-            rows.append({"path": str(path), "read_error": "invalid JSON"})
-            continue
-        payload_blend = str(payload.get("blend_file") or "")
-        if payload_blend and (
-            normalized_path_key(payload_blend)
-            != normalized_path_key(blend)
-        ):
-            continue
+    for selected in resolution["selected"]:
+        payload = selected["payload"]
         adoption = payload.get("source_material_adoption") or {}
         connection = payload.get("generator_connection") or {}
         rows.append({
-            "path": str(path),
+            "path": selected["path"],
+            "kind": selected["kind"],
             "export_scope_id": payload.get("export_scope_id"),
             "spm": payload.get("spm"),
             "material_groups": (
@@ -680,6 +684,7 @@ def _scope_failure_diagnostics(blend, target):
                 "complete": connection.get("complete"),
                 "bindings": connection.get("bindings") or [],
             },
+            "atlas_manifest_resolution": resolution_evidence(resolution),
         })
     return rows
 
@@ -1162,28 +1167,25 @@ def _physical_refresh_state(
 
 
 def _matching_scope_manifest(blend, target_spm):
-    """Return the newest Atlas scope manifest for this exact blend/target."""
+    """Return the resolver-selected Atlas manifest for this blend/target."""
     blend = Path(blend).expanduser().absolute()
     target = Path(target_spm).expanduser().absolute()
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-    if not scope_dir.is_dir():
+    try:
+        resolution = resolve_atlas_manifests(
+            target,
+            expected_blend=blend,
+        )
+    except AtlasManifestResolutionError as exc:
+        raise ClusterBlendSyncError(str(exc)) from exc
+    selected = resolution["selected"]
+    if not selected:
         return None
-    matches = []
-    for path in scope_dir.glob(f"*__{target.stem}.json"):
-        payload = _read_json(path)
-        if payload is None:
-            continue
-        payload_blend = str(payload.get("blend_file") or "").strip()
-        payload_spm = str(payload.get("spm") or "").strip()
-        if not payload_blend or normalized_path_key(payload_blend) != normalized_path_key(blend):
-            continue
-        if payload_spm and normalized_path_key(payload_spm) != normalized_path_key(target):
-            continue
-        matches.append((path.stat().st_mtime_ns, path, payload))
-    if not matches:
-        return None
-    _mtime, path, payload = max(matches, key=lambda row: row[0])
-    return {"path": str(path), "payload": payload}
+    match = selected[0]
+    return {
+        "path": match["path"],
+        "payload": match["payload"],
+        "resolution": resolution_evidence(resolution),
+    }
 
 
 def inspect_cluster_target(
@@ -1275,6 +1277,7 @@ def inspect_cluster_target(
             or payload.get("material_id")
         ),
         "manifest": match["path"],
+        "atlas_manifest_resolution": match["resolution"],
         "mesh_ids": list(payload.get("mesh_ids") or ()),
         **refresh,
     }

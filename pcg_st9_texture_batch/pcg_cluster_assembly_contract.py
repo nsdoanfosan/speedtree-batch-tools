@@ -31,6 +31,11 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
 from artifact_content_key import (
     ArtifactContentKeyChangedError,
     SHA256_ALGORITHM,
@@ -1380,27 +1385,14 @@ def _normalized_capture_texture_refs(normalized_variants):
 
 
 def _atlas_manifest_candidates(folder, target_spms):
-    """Return stable per-scope/per-target receipts before the rolling global file."""
+    """Return only shared-resolver-selected Atlas operational receipts."""
     paths = []
     for target in target_spms or []:
-        target = Path(target)
-        scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-        if scope_dir.is_dir():
-            paths.extend(sorted(scope_dir.glob(f"*__{target.stem}.json")))
-        target_receipt = (
-            target.parent
-            / ".atlas_leaf_speedtree_targets"
-            / f"{target.stem}.json"
-        )
-        if target_receipt.is_file():
-            paths.append(target_receipt)
-    # A stable receipt set is authoritative.  The legacy global file is a
-    # rolling last-export snapshot, so it may only be consulted when no
-    # target/scope receipt exists at all.
-    if not paths:
-        global_manifest = Path(folder) / "speedtree_import_manifest.json"
-        if global_manifest.is_file():
-            paths.append(global_manifest)
+        try:
+            resolution = resolve_atlas_manifests(target)
+        except AtlasManifestResolutionError as exc:
+            raise ClusterAssemblyReceiptError(str(exc)) from exc
+        paths.extend(Path(row["path"]) for row in resolution["selected"])
     unique = []
     seen = set()
     for path in paths:
@@ -2145,7 +2137,7 @@ def _inactive_causal_path_evidence(binding):
 
 
 STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
-STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
+STALE_NODE_TABLE_RECOVERY_MODE = "owned_semantic_uia_modeler_save_watch"
 STALE_NODE_TABLE_REMEDY = (
     "대상 SPM의 저장된 <Node> 테이블이 현재 Generator 그래프와 맞지 않습니다"
     " (없는 Generator에 노드가 남아 있음). Generator 연결 자체는 정상이며 export"
@@ -2155,17 +2147,25 @@ STALE_NODE_TABLE_REMEDY = (
 
 
 def _stale_node_table_recovery_contract():
-    """Describe the safe recovery boundary without claiming unattended save."""
+    """Describe the gated exact-PID semantic Modeler recovery boundary."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": STALE_NODE_TABLE_RECOVERY_MODE,
         "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
-        "modeler_auto_save": False,
+        "modeler_auto_save": True,
+        "modeler_auto_save_mode": "exact_owned_pid_document_menu_uia_invoke",
         "modeler_process_kill": False,
         "direct_spm_xml_edit": False,
         "ui_input_simulation": False,
         "automatic_rollback": False,
-        "requires_user_save": True,
+        "requires_user_save": False,
+        "requires_node_table_stale": True,
+        "requires_nonzero_orphan_owners": True,
+        "requires_nonzero_orphan_nodes": True,
+        "requires_complete_sealed_scope": True,
+        "closes_exact_document_after_valid_reaudit": True,
+        "keeps_owned_modeler_session_alive": True,
+        "unrelated_modeler_session_adoption": False,
         "requires_exact_preimage_backup": True,
         "requires_immutable_preimage_receipt": True,
         "authoring_graph_projection_version": 1,
@@ -2947,18 +2947,29 @@ def _atlas_normalized_variants(
     }
     if not allowed_spms:
         return None
+    atlas_resolutions = []
+    for target in target_spms or []:
+        try:
+            atlas_resolutions.append(resolve_atlas_manifests(target))
+        except AtlasManifestResolutionError as exc:
+            raise ClusterAssemblyReceiptError(str(exc)) from exc
     candidates = []
     stale = []
-    for manifest_path in _atlas_manifest_candidates(folder, target_spms):
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ClusterAssemblyReceiptError(
-                f"Atlas normalized variant manifest is unreadable: {manifest_path}: {exc}"
-            ) from exc
-        manifest_spm = Path(
-            str(payload.get("spm") or "")
-        ).resolve(strict=False)
+    selected_records = []
+    seen_selected_paths = set()
+    for resolution in atlas_resolutions:
+        for row in resolution["selected"]:
+            path = Path(row["path"])
+            key = _normalized_identity_path(path)
+            if key not in seen_selected_paths:
+                seen_selected_paths.add(key)
+                selected_records.append((
+                    row,
+                    Path(resolution["target_spm"]).resolve(strict=False),
+                ))
+    for selected_record, manifest_spm in selected_records:
+        manifest_path = Path(selected_record["path"])
+        payload = selected_record["payload"]
         if manifest_spm not in allowed_spms:
             continue
         groups = [
@@ -3128,6 +3139,9 @@ def _atlas_normalized_variants(
             for key in sorted(selected["target_deliveries"])
         ]
         contract["target_deliveries"] = target_deliveries
+        contract["atlas_manifest_resolutions"] = [
+            resolution_evidence(row) for row in atlas_resolutions
+        ]
         contract["delivery_mode"] = _aggregate_target_deliveries(
             target_deliveries
         )

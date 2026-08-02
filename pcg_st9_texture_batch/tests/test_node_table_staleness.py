@@ -258,10 +258,17 @@ class DeliveryClassificationTests(unittest.TestCase):
             evidence["stale_node_table_target_mesh_ids"], [130, 131]
         )
         recovery = evidence["stale_node_table_recovery"]
-        self.assertEqual(recovery["mode"], "interactive_modeler_save_watch")
-        self.assertFalse(recovery["modeler_auto_save"])
+        self.assertEqual(
+            recovery["mode"],
+            "owned_semantic_uia_modeler_save_watch",
+        )
+        self.assertTrue(recovery["modeler_auto_save"])
         self.assertFalse(recovery["direct_spm_xml_edit"])
-        self.assertTrue(recovery["requires_user_save"])
+        self.assertFalse(recovery["requires_user_save"])
+        self.assertTrue(recovery["requires_node_table_stale"])
+        self.assertTrue(recovery["requires_nonzero_orphan_owners"])
+        self.assertTrue(recovery["requires_nonzero_orphan_nodes"])
+        self.assertTrue(recovery["requires_complete_sealed_scope"])
         self.assertTrue(recovery["automatic_reaudit"])
 
     def test_an_independent_fault_keeps_the_original_reason(self):
@@ -282,7 +289,7 @@ class DeliveryClassificationTests(unittest.TestCase):
         self.assertIsNone(evidence.get("delivery_remedy"))
         self.assertEqual(
             evidence["stale_node_table_recovery"]["mode"],
-            "interactive_modeler_save_watch",
+            "owned_semantic_uia_modeler_save_watch",
         )
 
     def test_unexplained_missing_mesh_id_keeps_the_original_reason(self):
