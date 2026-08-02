@@ -70,6 +70,45 @@ class ClusterBlendSyncError(RuntimeError):
     """Actionable Cluster blend relationship or apply failure."""
 
 
+class RelationValidationCache:
+    """One relation generation's thread-safe exact validation memo."""
+
+    def __init__(self):
+        self._values = {}
+        self._guard = threading.RLock()
+        self._key_locks = {}
+
+    def get_or_compute(self, key, factory):
+        with self._guard:
+            if key in self._values:
+                return self._values[key]
+            key_lock = self._key_locks.setdefault(key, threading.RLock())
+        with key_lock:
+            with self._guard:
+                if key in self._values:
+                    return self._values[key]
+            value = factory()
+            with self._guard:
+                self._values[key] = value
+            return value
+
+    def seed(self, key, value):
+        """Install exact evidence produced earlier in the same refresh."""
+        with self._guard:
+            self._values.setdefault(key, value)
+
+
+def _validation_cache_value(validation_cache, key, factory):
+    if validation_cache is None:
+        return factory()
+    get_or_compute = getattr(validation_cache, "get_or_compute", None)
+    if callable(get_or_compute):
+        return get_or_compute(key, factory)
+    if key not in validation_cache:
+        validation_cache[key] = factory()
+    return validation_cache[key]
+
+
 def normalized_path_key(path):
     return os.path.normcase(os.path.abspath(str(Path(path)))).casefold()
 
@@ -863,13 +902,18 @@ def _sha256_file(path):
     )
 
 
-def _physical_capture_manifest_for_blend(blend):
+def _physical_capture_manifest_for_blend(blend, validation_cache=None):
     blend = Path(blend).expanduser().absolute()
     stem = blend.stem
     if stem.casefold().startswith("sk_"):
         stem = stem[3:]
     path = blend.with_name(f"{stem}_auto_capture_manifest.json")
-    payload = _read_json(path)
+    cache_key = ("capture_manifest", normalized_path_key(path))
+    payload = _validation_cache_value(
+        validation_cache,
+        cache_key,
+        lambda: _read_json(path),
+    )
     if not payload:
         return {"path": path, "active": False, "contract_sha256": None}
     active = (
@@ -988,7 +1032,9 @@ def _target_scope_refresh_reasons(payload, target_spm):
     return reasons
 
 
-def _physical_refresh_state(payload, canonical_spm, blend):
+def _physical_refresh_state(
+    payload, canonical_spm, blend, *, validation_cache=None,
+):
     receipt = payload.get("normalized_prototype_receipt")
     if not isinstance(receipt, dict):
         return {
@@ -1006,18 +1052,38 @@ def _physical_refresh_state(payload, canonical_spm, blend):
     reasons = []
     canonical = Path(canonical_spm).expanduser().absolute()
     recorded_source_rows = _recorded_source_spm_rows(receipt, canonical)
-    current_source_sha256 = _sha256_file(canonical) if canonical.is_file() else None
+    def current_sha256(path):
+        candidate = Path(path).expanduser().absolute()
+        if not candidate.is_file():
+            return None
+        cache_key = ("sha256", normalized_path_key(candidate))
+        return _validation_cache_value(
+            validation_cache,
+            cache_key,
+            lambda: _sha256_file(candidate),
+        )
+
+    current_source_sha256 = current_sha256(canonical)
     current_source_semantic = None
     legacy_semantic_migration = None
     if not current_source_sha256:
         reasons.append("canonical_source_missing")
     else:
         try:
-            current_source_semantic = (
-                spm_file_structural_semantic_fingerprint(
-                    canonical,
-                    raw_sha256=current_source_sha256,
-                )
+            semantic_key = (
+                "spm_structural_semantic",
+                normalized_path_key(canonical),
+                current_source_sha256,
+            )
+            current_source_semantic = _validation_cache_value(
+                validation_cache,
+                semantic_key,
+                lambda: (
+                    spm_file_structural_semantic_fingerprint(
+                        canonical,
+                        raw_sha256=current_source_sha256,
+                    )
+                ),
             )
         except (OSError, ValueError, ET.ParseError):
             reasons.append("canonical_source_semantic_unavailable")
@@ -1048,15 +1114,16 @@ def _physical_refresh_state(payload, canonical_spm, blend):
     recorded_fbx_rows = _recorded_source_fbx_rows(receipt)
     for recorded in recorded_fbx_rows:
         source_fbx = Path(recorded["path"])
-        current_fbx_sha256 = (
-            _sha256_file(source_fbx) if source_fbx.is_file() else None
-        )
+        current_fbx_sha256 = current_sha256(source_fbx)
         if not current_fbx_sha256:
             reasons.append("source_fbx_missing")
         elif current_fbx_sha256.casefold() != recorded["sha256"]:
             reasons.append("source_fbx_changed")
 
-    capture = _physical_capture_manifest_for_blend(blend)
+    capture = _physical_capture_manifest_for_blend(
+        blend,
+        validation_cache=validation_cache,
+    )
     recorded_capture_sha256 = str(
         receipt.get("physical_capture_contract_sha256") or ""
     ) or None
@@ -1126,6 +1193,7 @@ def inspect_cluster_target(
     *,
     canonical_spm=None,
     verify_physical=True,
+    validation_cache=None,
 ):
     target = Path(target_spm).expanduser().absolute()
     if not relation_on:
@@ -1162,7 +1230,12 @@ def inspect_cluster_target(
         else Path(blend).expanduser().absolute().with_suffix(".spm")
     )
     if verify_physical:
-        refresh = _physical_refresh_state(payload, canonical, blend)
+        refresh = _physical_refresh_state(
+            payload,
+            canonical,
+            blend,
+            validation_cache=validation_cache,
+        )
         for reason in _target_scope_refresh_reasons(payload, target):
             if reason not in refresh["refresh_reasons"]:
                 refresh["refresh_reasons"].append(reason)
@@ -1211,6 +1284,7 @@ def discover_cluster_blend_relations(
     owner_folder,
     *,
     verify_physical=True,
+    validation_cache=None,
 ):
     """Discover normalized Cluster blends and their owner-folder ON/OFF state.
 
@@ -1219,6 +1293,8 @@ def discover_cluster_blend_relations(
     owner-folder ``SK_*.spm`` files.
     """
     owner = Path(owner_folder).expanduser().absolute()
+    if validation_cache is None:
+        validation_cache = RelationValidationCache()
     targets = owner_sk_spms(owner)
     rows = []
     for source in cluster_authoring_sources(owner):
@@ -1257,6 +1333,7 @@ def discover_cluster_blend_relations(
                 relation_on,
                 canonical_spm=canonical,
                 verify_physical=verify_physical,
+                validation_cache=validation_cache,
             )
             relation_rows.append({
                 "target_spm": target,

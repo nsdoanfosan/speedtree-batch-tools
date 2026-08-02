@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 
@@ -34,6 +36,165 @@ _SAMPLED_DOMAIN = b"speedtree-live-artifact-sample-v1\0"
 
 class ArtifactContentKeyChangedError(RuntimeError):
     """The artifact did not remain one stable snapshot while it was read."""
+
+
+class ConcurrentContentDigestMemo:
+    """Refresh-local single-flight memo for exact artifact digests.
+
+    Callers own the cache lifetime and must key entries with an already
+    observed path/size/mtime identity.  The memo never turns metadata into
+    authority: one caller still computes the full digest for every unseeded
+    key, while concurrent consumers wait for that exact result instead of
+    opening the same large file again.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._values = {}
+        self._pending = {}
+        self._counts = {
+            "hits": 0,
+            "misses": 0,
+            "waits": 0,
+            "seeds": 0,
+        }
+
+    def get_or_compute(self, key, compute):
+        owner = False
+        with self._lock:
+            future = self._pending.get(key)
+            if future is not None:
+                self._counts["waits"] += 1
+            elif key in self._values:
+                self._counts["hits"] += 1
+                return self._values[key]
+            else:
+                future = Future()
+                self._pending[key] = future
+                self._counts["misses"] += 1
+                owner = True
+        if not owner:
+            return future.result()
+        try:
+            result = compute()
+        except BaseException as exc:
+            with self._lock:
+                self._pending.pop(key, None)
+                self._values.pop(key, None)
+                future.set_exception(exc)
+            raise
+        with self._lock:
+            existing = self._values.get(key)
+            if existing is not None and existing != result:
+                self._pending.pop(key, None)
+                self._values.pop(key, None)
+                error = ValueError(
+                    "Conflicting exact result for one artifact identity"
+                )
+                future.set_exception(error)
+                raise error
+            self._values[key] = result
+            self._pending.pop(key, None)
+            future.set_result(result)
+        return result
+
+    def get_or_compute_verified(self, key, compute):
+        """Single-flight a fresh authority read and reject identity conflicts.
+
+        Unlike ``get_or_compute``, an already stored value is not authority for
+        a later read.  The caller recomputes current exact evidence while
+        concurrent callers still share that one read.  Reusing metadata after
+        a same-size/restored-mtime replacement therefore fails closed instead
+        of silently returning the earlier digest or validation result.
+        """
+        owner = False
+        with self._lock:
+            future = self._pending.get(key)
+            if future is None:
+                future = Future()
+                self._pending[key] = future
+                self._counts["misses"] += 1
+                owner = True
+            else:
+                self._counts["waits"] += 1
+        if not owner:
+            return future.result()
+        try:
+            result = compute()
+        except BaseException as exc:
+            with self._lock:
+                self._pending.pop(key, None)
+                self._values.pop(key, None)
+                future.set_exception(exc)
+            raise
+        with self._lock:
+            existing = self._values.get(key)
+            if existing is not None and existing != result:
+                self._pending.pop(key, None)
+                self._values.pop(key, None)
+                error = ValueError(
+                    "Artifact content changed without an identity change"
+                )
+                future.set_exception(error)
+                raise error
+            self._values[key] = result
+            self._pending.pop(key, None)
+            future.set_result(result)
+        return result
+
+    def seed(self, key, value):
+        """Publish a digest already computed from the same exact bytes."""
+        with self._lock:
+            existing = self._values.get(key)
+            if existing is not None and existing != value:
+                raise ValueError(
+                    "Conflicting exact digest for one artifact identity"
+                )
+            if existing is None:
+                self._values[key] = value
+                self._counts["seeds"] += 1
+        return value
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._values.get(key, default)
+
+    def items(self):
+        with self._lock:
+            return tuple(self._values.items())
+
+    def metrics(self):
+        with self._lock:
+            logical_bytes = sum(
+                int(key[1])
+                for key in self._values
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 3
+                    and isinstance(key[1], int)
+                )
+            )
+            return {
+                **self._counts,
+                "unique_files": len(self._values),
+                "logical_bytes": logical_bytes,
+                "pending": len(self._pending),
+            }
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._values
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._values[key]
+
+    def __setitem__(self, key, value):
+        self.seed(key, value)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._values)
 
 
 def _stat_identity(stat):

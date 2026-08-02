@@ -1405,7 +1405,10 @@ class GuiSyncStateTests(unittest.TestCase):
 
             threads[0].target()
             make_report.assert_called_once_with(
-                {"tree_root": "new"}, pcg_targets={"meshes": []})
+                {"tree_root": "new"},
+                pcg_targets={"meshes": []},
+                session_evidence={},
+            )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertEqual(len(app.root.callbacks), 1)
             delay, callback = app.root.callbacks.pop()

@@ -3124,6 +3124,7 @@ class GuiLabelTests(unittest.TestCase):
                 progress_callback=mock.ANY,
                 item_callback=mock.ANY,
                 cancel_check=mock.ANY,
+                session_evidence={},
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3375,6 +3376,7 @@ class GuiLabelTests(unittest.TestCase):
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
                 cancel_check=mock.ANY,
+                session_evidence={},
             )
             write_snapshot.assert_called_once_with(
                 report,
@@ -3562,7 +3564,9 @@ class GuiLabelTests(unittest.TestCase):
             )
 
         make_report.assert_called_once_with(
-            app.cfg, targets=[r"D:\Trees\ladyfern"]
+            app.cfg,
+            targets=[r"D:\Trees\ladyfern"],
+            mutation_authority=True,
         )
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(
@@ -3677,6 +3681,7 @@ class GuiLabelTests(unittest.TestCase):
         make_report.assert_called_once_with(
             app.cfg,
             targets=[folder],
+            mutation_authority=True,
         )
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(

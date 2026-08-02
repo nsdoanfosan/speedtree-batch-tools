@@ -18,6 +18,11 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from artifact_content_key import (
+    ArtifactContentKeyChangedError,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+)
 from speedtree_preview_texture_contract import (
     PREVIEW_FALLBACK_CAPABILITY,
     PREVIEW_FALLBACK_SCHEMA_FIELD,
@@ -308,16 +313,77 @@ def _file_sha256(path, memo=None):
         stat.st_size,
         stat.st_mtime_ns,
     )
+    def compute():
+        try:
+            snapshot = file_content_key_snapshot(
+                candidate, SHA256_ALGORITHM
+            )
+        except ArtifactContentKeyChangedError as exc:
+            raise OSError(str(exc)) from exc
+        if (
+            snapshot["size"], snapshot["mtime_ns"]
+        ) != (
+            stat.st_size, stat.st_mtime_ns
+        ):
+            raise OSError(
+                "File identity changed before its exact digest was captured: "
+                + str(candidate)
+            )
+        return snapshot["digest"]
+
+    single_flight = getattr(memo, "get_or_compute_verified", None)
+    if callable(single_flight):
+        try:
+            return single_flight(cache_key, compute)
+        except ValueError as exc:
+            raise OSError(
+                "File content changed without an identity change: "
+                + str(candidate)
+            ) from exc
     if memo is not None and cache_key in memo:
-        return memo[cache_key]
-    digest = hashlib.sha256()
-    with candidate.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    result = digest.hexdigest()
+        result = compute()
+        if memo[cache_key] != result:
+            raise OSError(
+                "File content changed without an identity change: "
+                + str(candidate)
+            )
+        return result
+    result = compute()
     if memo is not None:
         memo[cache_key] = result
     return result
+
+
+def _json_document(
+        path, *, file_sha256_memo=None, json_document_memo=None):
+    """Parse one exact content-bound JSON document per live report."""
+    candidate = Path(path)
+    before = candidate.stat()
+    digest = _file_sha256(candidate, memo=file_sha256_memo)
+    cache_key = (
+        os.path.abspath(str(candidate)).casefold(),
+        before.st_size,
+        before.st_mtime_ns,
+        digest,
+    )
+    if json_document_memo is not None and cache_key in json_document_memo:
+        return json_document_memo[cache_key]
+    raw = candidate.read_bytes()
+    after = candidate.stat()
+    if (
+        (before.st_size, before.st_mtime_ns)
+        != (after.st_size, after.st_mtime_ns)
+        or len(raw) != after.st_size
+        or hashlib.sha256(raw).hexdigest() != digest
+    ):
+        raise OSError(
+            "JSON document changed while its exact identity was captured: "
+            + str(candidate)
+        )
+    payload = json.loads(raw.decode("utf-8"))
+    if json_document_memo is not None:
+        json_document_memo[cache_key] = payload
+    return payload
 
 
 def _blender_bake_map_role(value):
@@ -340,6 +406,7 @@ def validate_blender_cluster_bake_receipt_for_consumption(
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
     file_sha256_memo=None,
+    json_document_memo=None,
 ):
     """Validate preview capability/schema plus live manifest-owned bytes."""
     if not receipt_declares_preview_fallback(receipt):
@@ -375,7 +442,11 @@ def validate_blender_cluster_bake_receipt_for_consumption(
     ):
         return "blender_cluster_bake_capture_boundary_mismatch"
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = _json_document(
+            manifest_path,
+            file_sha256_memo=file_sha256_memo,
+            json_document_memo=json_document_memo,
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return "blender_cluster_bake_capture_manifest_invalid"
     if not isinstance(payload, dict):
@@ -495,6 +566,7 @@ def resolve_blender_cluster_bake_origin(
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
     file_sha256_memo=None,
+    json_document_memo=None,
 ):
     """Return one normalized, live-proven Blender bake origin receipt.
 
@@ -567,6 +639,7 @@ def resolve_blender_cluster_bake_origin(
                 asset_root,
                 consumption_context=consumption_context,
                 file_sha256_memo=file_sha256_memo,
+                json_document_memo=json_document_memo,
             )
         )
         if stored_issue:
@@ -597,7 +670,11 @@ def resolve_blender_cluster_bake_origin(
     ):
         return {}, "blender_cluster_bake_capture_boundary_mismatch"
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = _json_document(
+            manifest_path,
+            file_sha256_memo=file_sha256_memo,
+            json_document_memo=json_document_memo,
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return {}, "blender_cluster_bake_capture_manifest_invalid"
     if (
@@ -757,6 +834,7 @@ def resolve_blender_cluster_bake_origin(
         asset_root,
         consumption_context=consumption_context,
         file_sha256_memo=file_sha256_memo,
+        json_document_memo=json_document_memo,
     )
     return ({}, issue) if issue else (receipt, "")
 

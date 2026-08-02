@@ -19,6 +19,7 @@ from atlas_target_registry import (  # noqa: E402
     registry_path_for_blend,
     save_target_registry,
 )
+from mutation_plan_authority import path_state  # noqa: E402
 
 
 def load_pcg_gui():
@@ -80,6 +81,36 @@ class AtlasTargetRegistryTests(unittest.TestCase):
             self.assertEqual(contract["error_code"], 13)
             self.assertEqual(registry_path_for_blend(blend).read_bytes(), before)
             self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    def test_compare_and_swap_rejects_registry_drift_before_replace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "M_leaf_elm_atlas_01.blend"
+            blend.touch()
+            first = root / "SK_Tree_elm_01.spm"
+            second = root / "SK_Tree_elm_02.spm"
+            third = root / "SK_Tree_elm_03.spm"
+            save_target_registry(blend, [first])
+            expected = path_state(registry_path_for_blend(blend))
+            save_target_registry(blend, [second])
+
+            with self.assertRaises(TargetRegistryPublishError) as caught:
+                save_target_registry(
+                    blend,
+                    [third],
+                    expected_registry_state=expected,
+                )
+
+            self.assertEqual(
+                caught.exception.connected_retry_contract[
+                    "operation_phase"
+                ],
+                "registry_compare_and_swap",
+            )
+            self.assertEqual(
+                load_target_registry(blend)["target_spms"],
+                [str(second.absolute())],
+            )
 
     def test_exact_registry_replaces_inferred_one_target_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:

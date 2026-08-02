@@ -116,6 +116,24 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
         self.assertNotIn("ready", loaded)
         self.assertNotIn("authority", loaded)
 
+    def test_display_payload_tamper_is_marked_untrusted_and_not_painted(self):
+        self._write(report={
+            "items": [{
+                "folder": str(self.root / "Tree" / "tree_elm"),
+                "name": "tree_elm",
+                "status": "ready",
+            }],
+        })
+        payload = json.loads(self.snapshot.read_text(encoding="utf-8"))
+        payload["display_report"]["items"][0]["status"] = "spoofed"
+        self.snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = self._read()
+
+        self.assertEqual(loaded["cache_state"], "untrusted_payload")
+        self.assertEqual(loaded["context_state"], "unknown")
+        self.assertFalse(loaded["can_display"])
+
     def test_projection_omits_actual_fleet_heavy_fields_but_keeps_ui_state(self):
         target = {
             "spm": str(self.root / "Tree" / "SK_tree.spm"),
@@ -138,6 +156,38 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
                 "actions": ["② 아틀라스 생성"],
                 "leaf_atlas_lineage": {"rows": list(range(1000))},
                 "assembly_handoff": {"rows": list(range(1000))},
+                "preserved_cluster_materials": [
+                    {"payload": "x" * 4096}
+                ],
+                "cluster_assembly": {
+                    "hierarchy": {
+                        "name": "Cluster",
+                        "path": str(self.root / "Tree" / "Cluster"),
+                    },
+                    "canonical_bark": {
+                        "status": "ready",
+                        "canonical_material": "M_bark_tree_01",
+                    },
+                    "handoff": {
+                        "status": "pending_export",
+                        "skeleton_wind_contract": {
+                            "status": "ready",
+                            "lod_count": 4,
+                        },
+                    },
+                    "dependencies": [{
+                        "spm": str(self.root / "Tree" / "Cluster" / "a.spm"),
+                        "role": "leaf",
+                        "decision": "pending_export",
+                        "source_mesh_ids": [1, 2],
+                        "source_materials": [{
+                            "material_name": "M_leaf",
+                            "normalized_variants": "x" * 8192,
+                        }],
+                        "normalized_variants": "x" * 32768,
+                    }],
+                    "normalized_delivery": "x" * 65536,
+                },
                 "leaf_mesh_sources": [{
                     "atlas_base": "M_leaf",
                     "atlas_blends": [],
@@ -162,6 +212,31 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
         projected_target = item["leaf_mesh_sources"][0]["targets"][0]
         self.assertNotIn("leaf_atlas_lineage", item)
         self.assertNotIn("assembly_handoff", item)
+        self.assertNotIn("preserved_cluster_materials", item)
+        projected_assembly = item["cluster_assembly"]
+        self.assertEqual(
+            projected_assembly["canonical_bark"]["status"], "ready"
+        )
+        self.assertEqual(
+            projected_assembly["canonical_bark"]["canonical_material"],
+            "M_bark_tree_01",
+        )
+        self.assertEqual(
+            projected_assembly["handoff"]["skeleton_wind_contract"],
+            {"status": "ready", "lod_count": 4},
+        )
+        self.assertEqual(
+            projected_assembly["dependencies"][0]["role"], "leaf"
+        )
+        self.assertEqual(
+            projected_assembly["dependencies"][0]["source_materials"],
+            [{"material_name": "M_leaf"}],
+        )
+        self.assertNotIn("normalized_delivery", projected_assembly)
+        self.assertNotIn(
+            "normalized_variants",
+            projected_assembly["dependencies"][0],
+        )
         self.assertNotIn("source_material_statuses", projected_target)
         self.assertNotIn("expected_generator_bindings", projected_target)
         self.assertNotIn("source_generator_bindings", projected_target)

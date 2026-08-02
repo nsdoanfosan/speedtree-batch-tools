@@ -9,6 +9,13 @@ from pathlib import Path
 
 import addon_utils
 
+TOOL_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+sys.path.insert(0, str(TOOL_DIR))
+
+from mutation_plan_authority import validate_child_authority
+
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
@@ -16,6 +23,8 @@ def parse_args():
     parser.add_argument("--blend", required=True)
     parser.add_argument("--spm", action="append", default=[], required=True)
     parser.add_argument("--report", required=True)
+    parser.add_argument("--authority-json", required=True)
+    parser.add_argument("--authority-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -42,6 +51,10 @@ def main():
     registry_path = None
     registry_bytes = None
     try:
+        authority = validate_child_authority(
+            args.authority_json,
+            args.authority_sha256,
+        )
         enabled = addon_utils.enable(
             "atlas_leaf_mesh_builder", default_set=False, persistent=False
         )
@@ -80,6 +93,10 @@ def main():
         remaining = [
             path for key, path in registered.items() if key not in seen
         ]
+        if registry_path.read_bytes() != registry_bytes:
+            raise RuntimeError(
+                "Atlas target registry changed during removal; rolling back"
+            )
         payload = save_target_registry(blend, remaining)
         report = {
             "status": "ok",
@@ -88,6 +105,10 @@ def main():
             "remaining_target_spms": payload["target_spms"],
             "registry_path": payload["registry_path"],
             "results": cleanups,
+            "authority_sha256": authority.get(
+                "parent_authority_sha256"
+            ),
+            "authority_unit": authority.get("unit_id"),
         }
     except Exception as exc:
         restored = restore_cleanups(cleanups)
@@ -99,6 +120,7 @@ def main():
             "traceback": traceback.format_exc(),
             "restored_spms": restored,
             "results": cleanups,
+            "authority_document_sha256": args.authority_sha256,
         }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
