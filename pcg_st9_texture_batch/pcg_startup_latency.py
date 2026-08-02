@@ -47,9 +47,12 @@ STARTUP_TOTAL_INVOCATION_RULES = {
     },
     "spm_analysis_calls": {
         "cardinality": "spm_count",
-        # The 597-SPM fixture currently uses 18,837 calls (31.55/file).
-        # Keep enough headroom for ordinary call-graph refactors while still
-        # rejecting the hundreds-per-file amplification this guard targets.
+        # Calibration receipt: tests/fixtures/
+        # issue134_startup_guard_calibration.json.  The 597-SPM fixture uses
+        # 18,837 calls (31.5528/file); a read-only audit of an 11-SPM real
+        # production folder used 253 (23.0/file).  Deliberate 50% headroom on
+        # the larger measured ratio gives ceil(31.5528 * 1.5) = 48, while a
+        # 597-calls-per-SPM amplification still fails deterministically.
         "per_item_limit": 48,
     },
     "legacy_receipt_inspection_calls": {
