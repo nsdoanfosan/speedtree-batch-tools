@@ -113,6 +113,15 @@ UNSUPPORTED_CLUSTER_HANDOFF_CODES = _registered_codes(
 UNSUPPORTED_PREFLIGHT_ERROR_CODES = _registered_codes(
     disposition=UNSUPPORTED, note="preflight_error",
 )
+UNSUPPORTED_MODELER_SCOPE_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="modeler_recovery_scope",
+)
+FATAL_MODELER_SCOPE_CODES = _registered_codes(
+    disposition=FATAL, note="modeler_recovery_scope",
+)
+UNSUPPORTED_FAILURE_WRAPPER_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="failure_wrapper",
+)
 
 FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
 UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
@@ -584,6 +593,21 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다.",
             "사전 검사 보고서의 원본 오류를 확인한 뒤 검사를 다시 실행하세요. BAT가 원인을 추측해 성공 처리하지 않습니다.",
         )
+    if (
+        codes & (UNSUPPORTED_MODELER_SCOPE_CODES | FATAL_MODELER_SCOPE_CODES)
+        and not codes & MODELER_NODE_TABLE_REASON_CODES
+    ):
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "SpeedTree Node table 복구에 필요한 exact 대상 범위 증거가 없거나 손상되었습니다.",
+            "fresh live audit으로 대상 SPM, provider, Mesh ID 범위를 다시 확정한 뒤 재시도하세요.",
+        )
+    if codes & UNSUPPORTED_FAILURE_WRAPPER_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "이전 자동 복구가 실패했지만 재시도할 구체 원인이 영수증에 남지 않았습니다.",
+            "fresh audit으로 실제 원인 코드를 다시 생성한 뒤 해당 exact 복구를 재시도하세요.",
+        )
 
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     if recipe_codes and _validated_recipe(evidence) is None:
@@ -593,7 +617,7 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             "권위 있는 current material binding recipe가 없어 BAT가 연결을 추측하지 않습니다.",
         )
 
-    if "normalized_generator_node_table_stale" in codes:
+    if codes & MODELER_NODE_TABLE_REASON_CODES:
         recovery = _first_nested_mapping(
             evidence,
             "stale_node_table_recovery",
@@ -714,6 +738,9 @@ def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[
     if codes & (
         UNSUPPORTED_CLUSTER_HANDOFF_CODES
         | UNSUPPORTED_PREFLIGHT_ERROR_CODES
+        | UNSUPPORTED_MODELER_SCOPE_CODES
+        | FATAL_MODELER_SCOPE_CODES
+        | UNSUPPORTED_FAILURE_WRAPPER_CODES
     ):
         decision = repair_ui_decision(evidence)
         return decision["reason"], decision["action"]

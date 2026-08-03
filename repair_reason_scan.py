@@ -38,6 +38,15 @@ REASON_LIST_NAMES = frozenset({
     "issues", "issue", "reasons", "reason_codes", "codes",
 })
 
+# Failure/status kinds can be persisted as a target's reason token even when
+# the defining module stores them in a named set and compares them later.
+# Keep this list narrow: collecting every module-level string collection would
+# turn ordinary schema keys and configuration values into fake reason codes.
+REASON_COLLECTION_NAMES = frozenset({
+    "UNREAL_RECOVERY_FAILURE_KINDS",
+    "BLENDER_EXPORT_RETRY_FAILURE_KINDS",
+})
+
 _MUTATORS = frozenset({"append", "add", "extend", "update"})
 
 # Gates rarely build the evidence dict inline.  They call a local helper --
@@ -46,6 +55,14 @@ _MUTATORS = frozenset({"append", "add", "extend", "update"})
 # the code.  Without this rule the whole `atlas_consumer_integrity` family,
 # including the code that blocked the blackgum Cluster, is invisible.
 _ISSUE_FUNCTION = re.compile(r"(issue|reason|block|exclusion)", re.IGNORECASE)
+
+_REASON_ARGUMENT_NAMES = frozenset({
+    "reason",
+    "reason_code",
+    "reason_token",
+    "failure_kind",
+    "terminal_reason",
+})
 
 
 def _string_constants(node):
@@ -60,6 +77,19 @@ def _string_constants(node):
     elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         for element in node.elts:
             yield from _string_constants(element)
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"frozenset", "list", "set", "tuple"}
+    ):
+        for argument in node.args:
+            yield from _string_constants(argument)
+    elif isinstance(node, ast.IfExp):
+        yield from _string_constants(node.body)
+        yield from _string_constants(node.orelse)
+    elif isinstance(node, ast.BoolOp):
+        for value in node.values:
+            yield from _string_constants(value)
 
 
 def _is_reason_key(name) -> bool:
@@ -73,6 +103,25 @@ def scan_module(path: Path) -> set[str]:
     except SyntaxError:
         return set()
     found: set[str] = set()
+    reason_function_args: dict[str, set[int]] = {}
+    for definition in ast.walk(tree):
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = [
+            *definition.args.posonlyargs,
+            *definition.args.args,
+        ]
+        if positional and positional[0].arg in {"self", "cls"}:
+            positional = positional[1:]
+        indexes = {
+            index
+            for index, argument in enumerate(positional)
+            if argument.arg.casefold() in _REASON_ARGUMENT_NAMES
+        }
+        if indexes:
+            reason_function_args.setdefault(definition.name, set()).update(
+                indexes
+            )
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values):
@@ -98,6 +147,9 @@ def scan_module(path: Path) -> set[str]:
             )
             if name and _ISSUE_FUNCTION.search(name) and node.args:
                 found.update(_string_constants(node.args[0]))
+            for index in reason_function_args.get(name, ()):
+                if index < len(node.args):
+                    found.update(_string_constants(node.args[index]))
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Subscript) and isinstance(
@@ -105,6 +157,17 @@ def scan_module(path: Path) -> set[str]:
                 ):
                     if _is_reason_key(target.slice.value):
                         found.update(_string_constants(node.value))
+                elif (
+                    isinstance(target, ast.Name)
+                    and target.id in REASON_COLLECTION_NAMES
+                ):
+                    found.update(_string_constants(node.value))
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id in REASON_COLLECTION_NAMES
+            ):
+                found.update(_string_constants(node.value))
     return found
 
 

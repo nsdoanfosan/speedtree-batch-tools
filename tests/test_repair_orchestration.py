@@ -156,6 +156,27 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertEqual(plan.initial_status, STATUS_FINAL_FAILED)
         self.assertEqual(plan.friendly_reason, decision["reason"])
 
+    def test_scope_only_failure_has_one_exact_korean_action(self):
+        decision = repair_ui_decision({
+            "reason_code": "stale_target_mesh_scope_missing",
+        })
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertEqual(
+            decision["reason"],
+            "SpeedTree Node table 복구에 필요한 exact 대상 범위 증거가 없거나 손상되었습니다.",
+        )
+        self.assertIn("대상 SPM, provider, Mesh ID 범위", decision["action"])
+
+    def test_failure_wrapper_requires_actual_reason_before_retry(self):
+        decision = repair_ui_decision({
+            "reason_code": "automatic_repair_reaudit_failed",
+        })
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("구체 원인이 영수증에 남지 않았습니다", decision["reason"])
+        self.assertIn("실제 원인 코드", decision["action"])
+
     def test_generator_delivery_is_explicit_automatic_repair(self):
         decision = repair_ui_decision({
             "delivery_reason": "generator_connection_contract_incomplete",
@@ -184,6 +205,23 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertEqual(plan.stages[0]["tool"], MODELER_RECOVERY_TOOL)
         self.assertEqual(
             plan.stages[0]["producer_spm"], str(self.cluster)
+        )
+
+    def test_live_export_stale_alias_uses_same_sealed_modeler_repair(self):
+        evidence = {
+            "reason_code": "live_export_evidence_unavailable_stale_node_table",
+            "stale_node_table_recovery": self.modeler_scope(),
+            "producer_spm": str(self.cluster),
+        }
+
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            MODELER_NODE_TABLE_RECOVERY,
         )
 
     def test_malformed_modeler_scope_fails_before_exact_execution(self):

@@ -5,7 +5,9 @@ silently before it existed, and each failure mode had already reached
 production: a blocked target with no recovery path, and no record that a
 recovery path was ever possible.
 """
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,7 +27,16 @@ from repair_reason_registry import (  # noqa: E402
     codes_with,
     disposition_of,
 )
-from repair_reason_scan import emitted_reason_codes  # noqa: E402
+from repair_reason_scan import emitted_reason_codes, scan_module  # noqa: E402
+
+
+OBSERVED_TOKEN_FIXTURE = (
+    REPO_DIR
+    / "sk_batch"
+    / "tests"
+    / "fixtures"
+    / "issue138_observed_reason_tokens.json"
+)
 
 
 class ReasonRegistryCoverageTests(unittest.TestCase):
@@ -142,6 +153,22 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         )
         self.assertEqual(quiet, [])
 
+    def test_sanitized_observed_tokens_are_registered_and_decided(self):
+        payload = json.loads(
+            OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
+        )
+        tokens = set(payload["tokens"])
+
+        self.assertEqual(len(tokens), 20)
+        self.assertEqual(tokens - set(REASON_REGISTRY), set())
+        self.assertEqual(
+            sorted(
+                token for token in tokens
+                if disposition_of(token) == UNCLASSIFIED
+            ),
+            [],
+        )
+
 
 class ReasonScanTests(unittest.TestCase):
     def test_scan_finds_codes_through_every_supported_shape(self):
@@ -165,6 +192,41 @@ class ReasonScanTests(unittest.TestCase):
         self.assertIsNone(CODE_TOKEN.match("Cluster is not ready"))
         self.assertIsNone(CODE_TOKEN.match("D:/Assets/SK_x.spm"))
         self.assertIsNotNone(CODE_TOKEN.match("cluster_relation_stale"))
+
+    def test_scan_descends_dynamic_literals_and_reason_parameters(self):
+        source = '''
+UNREAL_RECOVERY_FAILURE_KINDS = frozenset({"data_error"})
+
+def unavailable(reason_token):
+    return {"reason_token": reason_token}
+
+def result(classification, reason_code):
+    return {"classification": classification, "reason": reason_code}
+
+def emit(flag, first):
+    unavailable("stale_target_mesh_scope_missing")
+    result("blocked", "structured_blender_failure")
+    return {
+        "reason_token": (
+            "automatic_repair_reaudit_failed"
+            if flag else "automatic_repair_failed"
+        ),
+        "reason": first or "retry_evidence_ambiguous",
+    }
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "synthetic_reasons.py"
+            module.write_text(source, encoding="utf-8")
+            codes = scan_module(module)
+
+        self.assertTrue({
+            "data_error",
+            "stale_target_mesh_scope_missing",
+            "structured_blender_failure",
+            "automatic_repair_reaudit_failed",
+            "automatic_repair_failed",
+            "retry_evidence_ambiguous",
+        }.issubset(codes))
 
 
 if __name__ == "__main__":
