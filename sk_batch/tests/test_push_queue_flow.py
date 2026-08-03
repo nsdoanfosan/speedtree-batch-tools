@@ -1726,6 +1726,50 @@ class PushQueueFlowTests(unittest.TestCase):
             "data_error",
         )
 
+    def test_blender_failure_persists_structured_repair_report(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"blender_parallel_jobs": 1}
+        report = {
+            "reason_token": "atlas_manifest_mirror_conflict_repairable",
+            "evidence": {
+                "status": "repairable",
+                "target_spm": "sanitized-target.spm",
+            },
+            "repair_disposition": gui.REPAIR_UI_AUTOMATIC,
+            "reason_ko": "동일 원본의 낡은 Atlas manifest 미러 충돌",
+            "action_ko": "exact BAT로 낡은 미러를 갱신",
+            "stage": "canonical_atlas_manifest_preflight",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spm = Path(temp_dir) / "Cluster" / "SK_leaf_test_01.spm"
+            spm.parent.mkdir(parents=True)
+            spm.write_bytes(b"spm")
+            app._job_blender = mock.Mock(side_effect=gui.BatchItemError(
+                "sanitized automatic repair request",
+                kind="automatic_repair_pending",
+                report=report,
+            ))
+            app._publish_repair_stage_contract = mock.Mock()
+            with mock.patch.object(
+                gui, "LOG_DIR", Path(temp_dir) / "logs"
+            ), mock.patch.object(gui, "save_state"):
+                app._run_batch(
+                    "blender",
+                    [{"spm": spm, "checked": True}],
+                    emit_done=False,
+                )
+
+        saved = app.state[str(spm)]["blend_status_error"]
+        self.assertEqual(saved["kind"], "automatic_repair_pending")
+        self.assertEqual(saved["reason_token"], report["reason_token"])
+        self.assertEqual(saved["evidence"], report["evidence"])
+        self.assertEqual(saved["failure_report"], report)
+        self.assertIn(
+            "자동 복구 대기",
+            app.state[str(spm)]["blend_status"],
+        )
+
     def test_blender_repair_waits_for_cluster_sources_before_root_assets(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -3665,7 +3709,70 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertIn('text="↻ 전체 실패 이력 재시도"', source)
         self.assertIn("체크 상태와 무관하게 현재 목록 전체", source)
+        self.assertIn('text="↻ 체크 항목 실패 재시도"', source)
+        self.assertIn("체크하지 않은 항목은 계획·검증·실행 대상에 포함하지 않습니다", source)
         self.assertNotIn("체크된 최근 실패", source)
+
+    def test_checked_failed_retry_snapshots_and_enqueues_only_checked_rows(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        checked = "checked_failed.spm"
+        unchecked = "unchecked_failed.spm"
+        jobs = self.configure_failed_retry_start(
+            app,
+            [checked, unchecked],
+            checked_ids=[checked],
+        )
+        app.state = {
+            iid: {
+                "blend_status_kind": "data_error",
+                "blend_status": "실패: Blender Repair failed",
+                "blend_status_error": {
+                    "kind": "data_error",
+                    "message": "Blender Repair failed",
+                },
+            }
+            for iid in (checked, unchecked)
+        }
+        app._failed_retry_repair_state.return_value = {
+            "current": False,
+            "push_ready": False,
+            "kind": "inspection_incomplete",
+            "reason": "failed Blender attempt has no current output",
+        }
+
+        with mock.patch.object(gui, "save_config"):
+            app.start_checked_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(
+            [str(item["spm"]) for item in jobs[0]["targets"]],
+            [checked],
+        )
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["selected_queue_ids"],
+            [checked],
+        )
+        app._snapshot_batch_request.assert_called_once_with([checked])
+
+    def test_checked_failed_retry_with_no_checks_does_not_plan(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        jobs = self.configure_failed_retry_start(
+            app,
+            ["unchecked.spm"],
+            checked_ids=[],
+        )
+
+        with mock.patch.object(gui, "messagebox") as messages:
+            app.start_checked_failed_results_retry()
+
+        self.assertEqual(jobs, [])
+        app._collect_cfg.assert_not_called()
+        app._snapshot_batch_request.assert_not_called()
+        title, body = messages.showinfo.call_args.args
+        self.assertEqual(title, "체크 항목 실패 재시도")
+        self.assertEqual(body, "체크한 재시도 대상이 없습니다.")
 
     def test_slow_complete_inventory_retry_planning_keeps_tk_responsive(self):
         gui = load_gui_module()

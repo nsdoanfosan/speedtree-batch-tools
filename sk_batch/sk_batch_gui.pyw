@@ -63,6 +63,7 @@ from exact_target_command import (
     run_exact_target_request,
 )
 from repair_orchestration import (
+    ATLAS_MANIFEST_MIRROR_REPAIR,
     GENERATOR_SYNC_TOOL,
     PCG_TEXTURE_TOOL,
     REPAIR_PLAN_SCHEMA_VERSION,
@@ -263,6 +264,7 @@ PLANNED_EXCLUSION_KINDS = frozenset({
     "source_review",
     "stale_execution_freeze",
 })
+_INLINE_ATLAS_REPAIR_LOCK = threading.RLock()
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
@@ -2158,6 +2160,20 @@ class BatchItemError(RuntimeError):
         self.report_file = report_file
 
 
+class InlineAtlasRepairRequested(BatchItemError):
+    """Internal control flow for a read-only child audit's exact repair."""
+
+    def __init__(self, target_spm, report, *, log_file=None, report_file=None):
+        self.target_spm = Path(target_spm)
+        super().__init__(
+            "Atlas manifest exact repair requested",
+            kind="automatic_repair_requested",
+            report=report,
+            log_file=log_file,
+            report_file=report_file,
+        )
+
+
 class TargetPlannedExclusionError(BatchItemError):
     """One target is blocked without making its shared provider fail."""
 
@@ -2494,6 +2510,17 @@ class App:
             "산출물과 입력 identity를 검증한 뒤 현재 Unreal 코드로만 재시도\n"
             "BAT로 해결할 수 없거나 fresh 재검증에 실패한 항목만 최종 실패로 "
             "남기고 사용자 조치와 원래 reason code를 기록합니다.",
+        )
+        self.btn_retry_checked = ttk.Button(
+            actions,
+            text="↻ 체크 항목 실패 재시도",
+            command=self.start_checked_failed_results_retry,
+        )
+        self.btn_retry_checked.pack(side="left", padx=(2, 6))
+        Tooltip(
+            self.btn_retry_checked,
+            "현재 체크한 항목만 실패/stale 이력을 판정하고 재시도합니다.\n"
+            "체크하지 않은 항목은 계획·검증·실행 대상에 포함하지 않습니다.",
         )
         self.btn_all = ttk.Button(
             actions,
@@ -4212,7 +4239,7 @@ class App:
         # visible inventory, so only those controls are frozen.
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push",
-            "btn_retry_failed", "btn_all",
+            "btn_retry_failed", "btn_retry_checked", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
         ):
             button = getattr(self, name, None)
@@ -4317,6 +4344,7 @@ class App:
         self._active_retry_metadata = copy.deepcopy(
             job.get("retry_metadata") or {}
         )
+        self._inline_atlas_repair_results = {}
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
@@ -4804,6 +4832,7 @@ class App:
             "_retry_checkpoint_output_lines",
             "_phase_failed_items",
             "_phase_result_summary",
+            "_inline_atlas_repair_results",
         ):
             self.__dict__.pop(key, None)
         if self.pending_batch_jobs:
@@ -5418,9 +5447,10 @@ class App:
                 continue
             if failed is not None:
                 headline, raw_error = failed
+                reaudit_failed = headline == "fresh re-audit failed"
                 friendly = (
                     "자동 복구 단계가 끝났지만 fresh re-audit를 통과하지 못했습니다."
-                    if headline == "fresh re-audit failed"
+                    if reaudit_failed
                     else "exact BAT 자동 복구가 완료되지 않았습니다."
                 )
                 self._set_failed_retry_automatic_status(
@@ -5441,7 +5471,11 @@ class App:
                     "target": iid,
                     "target_name": Path(iid).name,
                     "outcome": "failed",
-                    "reason_token": "automatic_repair_reaudit_failed",
+                    "reason_token": (
+                        "automatic_repair_reaudit_failed"
+                        if reaudit_failed
+                        else "automatic_repair_failed"
+                    ),
                     "evidence": {
                         "attempted_stages": copy.deepcopy(attempted),
                         "raw_error": raw_error,
@@ -5781,14 +5815,48 @@ class App:
 
     def start_failed_results_retry(self):
         """Plan complete-inventory retry work without blocking the Tk thread."""
+        return self._start_failed_results_retry(
+            list(self.items),
+            scope="all",
+            dialog_title="전체 실패 이력 재시도",
+            empty_message="현재 목록 전체에 재시도할 대상이 없습니다.",
+        )
+
+    def start_checked_failed_results_retry(self):
+        """Plan failed/stale retry work for the exact checked rows only."""
+        return self._start_failed_results_retry(
+            [
+                iid
+                for iid, item in self.items.items()
+                if bool(item.get("checked"))
+            ],
+            scope="checked",
+            dialog_title="체크 항목 실패 재시도",
+            empty_message="체크한 재시도 대상이 없습니다.",
+        )
+
+    def _start_failed_results_retry(
+        self,
+        candidate_iids,
+        *,
+        scope,
+        dialog_title,
+        empty_message,
+    ):
+        """Snapshot one explicit retry scope and plan it off the Tk thread."""
         self._close_cell_editor()
-        candidate_iids = list(self.items)
+        candidate_iids = list(candidate_iids)
         if not candidate_iids:
             messagebox.showinfo(
-                "전체 실패 이력 재시도",
-                "현재 목록 전체에 재시도할 대상이 없습니다.",
+                dialog_title,
+                empty_message,
             )
             return
+        retry_request = {
+            "scope": str(scope),
+            "dialog_title": str(dialog_title),
+            "empty_message": str(empty_message),
+        }
         cfg = dict(self._collect_cfg())
         inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
             candidate_iids
@@ -5847,6 +5915,7 @@ class App:
                         "cfg": cfg,
                     }
                 if plan is not None:
+                    plan["_retry_request"] = copy.deepcopy(retry_request)
                     tracker.planning_ready(planning_session_id)
                     planning_finished.set()
                     self.ui_queue.put(("retry_plan_ready", plan))
@@ -5887,6 +5956,7 @@ class App:
             cfg,
             inventory_snapshot=inventory_snapshot,
         )
+        plan["_retry_request"] = copy.deepcopy(retry_request)
         return self._commit_failed_retry_plan(plan)
 
     def _build_failed_retry_plan(
@@ -6963,6 +7033,11 @@ class App:
         """Main-thread half of planning: message boxes, Tk, and enqueue."""
         if not isinstance(plan, dict):
             return None
+        retry_request = copy.deepcopy(plan.get("_retry_request") or {})
+        retry_scope = str(retry_request.get("scope") or "all")
+        dialog_title = str(
+            retry_request.get("dialog_title") or "전체 실패 이력 재시도"
+        )
         ui_thread_ident = getattr(
             self,
             "_ui_thread_ident",
@@ -7012,7 +7087,12 @@ class App:
                         "cached retry plan input changed before commit; replanning",
                     )
                 self._skip_retry_plan_cache_once = True
-                self.root.after(0, self.start_failed_results_retry)
+                restart = (
+                    self.start_checked_failed_results_retry
+                    if retry_scope == "checked"
+                    else self.start_failed_results_retry
+                )
+                self.root.after(0, restart)
                 return None
         if error:
             if tracker is not None:
@@ -7099,9 +7179,13 @@ class App:
             if tracker is not None:
                 tracker.complete_planning_commit()
             messagebox.showinfo(
-                "전체 실패 이력 재시도",
-                "현재 목록 전체에 재시도 가능한 실패/stale 이력이 "
-                "없습니다.\n\n"
+                dialog_title,
+                (
+                    "체크 항목에 재시도 가능한 실패/stale 이력이 없습니다."
+                    if retry_scope == "checked"
+                    else "현재 목록 전체에 재시도 가능한 실패/stale 이력이 없습니다."
+                )
+                + "\n\n"
                 + "\n".join((plan.get("skipped") or [])[:8]),
                 parent=getattr(self, "root", None),
             )
@@ -8177,6 +8261,8 @@ class App:
             terminal_stage = RETRY_STAGE_CANCELLED
         elif kind == "owner_lost":
             terminal_stage = RETRY_STAGE_OWNER_LOST
+        elif kind == "automatic_repair_pending":
+            terminal_stage = RETRY_STAGE_BLOCKED
         elif kind in PLANNED_EXCLUSION_KINDS or kind in {
                 "dependency_blocked",
                 "manual_required",
@@ -8220,6 +8306,10 @@ class App:
     def _failure_status_text(reason, kind):
         if kind in {"cancelled", "stopped"}:
             return f"중지: {reason}"
+        if kind == "automatic_repair_pending":
+            return f"자동 복구 대기: {reason}"
+        if kind == "automatic_repair_failed":
+            return f"자동 복구 실패: {reason}"
         if kind == "manual_required":
             return reason
         if kind in PUSH_ABORT_KINDS:
@@ -8528,6 +8618,8 @@ class App:
                 status_text = self._failure_status_text(reason, kind)
                 tag = {
                     "cancelled": "중지",
+                    "automatic_repair_pending": "자동 복구 대기",
+                    "automatic_repair_failed": "자동 복구 실패",
                     "manual_required": "수동",
                     "unreal_crash": "Unreal 중단",
                     "unreal_unavailable": "Unreal 중단",
@@ -8540,6 +8632,24 @@ class App:
                     details["log"] = str(exc.log_file)
                 if getattr(exc, "report_file", None):
                     details["report"] = str(exc.report_file)
+                exception_report = copy.deepcopy(
+                    getattr(exc, "report", {}) or {}
+                )
+                if exception_report:
+                    details["failure_report"] = exception_report
+                    for report_key in (
+                        "reason_token",
+                        "evidence",
+                        "issues",
+                        "repair_disposition",
+                        "reason_ko",
+                        "action_ko",
+                        "stage",
+                    ):
+                        if report_key in exception_report:
+                            details[report_key] = copy.deepcopy(
+                                exception_report[report_key]
+                            )
                 self._record_phase_status(
                     iid,
                     column,
@@ -9929,6 +10039,141 @@ class App:
             )
         return Path(result.get("canonical_spm") or spm)
 
+    def _run_inline_atlas_manifest_repair(self, spm, failure_report):
+        """Run one exact mirror repair under the already-owned batch lease."""
+
+        from pcg_st9_texture_batch.exact_target_repair import (
+            execute_step3_standard,
+        )
+
+        spm = Path(spm).expanduser().absolute()
+        lease = getattr(self, "_active_shared_queue_lease", None)
+        if lease is None or getattr(lease, "finished", False):
+            raise BatchItemError(
+                "Atlas manifest 자동 복구에 필요한 현재 공용 대기열 소유권이 없습니다.",
+                kind="automatic_repair_pending",
+                report=copy.deepcopy(failure_report),
+            )
+        key = os.path.normcase(os.path.abspath(str(spm))).casefold()
+        with _INLINE_ATLAS_REPAIR_LOCK:
+            memo = self.__dict__.setdefault("_inline_atlas_repair_results", {})
+            cached = memo.get(key)
+            if cached is not None:
+                cached_status = str(
+                    cached.get("terminal_status")
+                    or cached.get("status")
+                    or ""
+                )
+                if cached_status != "completed":
+                    terminal = copy.deepcopy(cached)
+                else:
+                    current_plan = atlas_manifest_mirror_repair_plan(spm)
+                    if current_plan.get("status") == "not_needed":
+                        terminal = copy.deepcopy(cached)
+                    else:
+                        # A later producer can make the same mirror stale again
+                        # during one long batch. Current evidence, not the earlier
+                        # successful receipt, decides whether another exact repair
+                        # is required.
+                        cached = None
+            if cached is None:
+                active_job = getattr(self, "active_batch_job", None) or {}
+                retry_metadata = copy.deepcopy(
+                    getattr(self, "_active_retry_metadata", {}) or {}
+                )
+                queue_identity = str(
+                    active_job.get("shared_queue_job_id")
+                    or active_job.get("id")
+                    or "direct-batch"
+                )
+                request_hash = hashlib.sha256(
+                    (queue_identity + "\0" + key).encode("utf-8")
+                ).hexdigest()[:16]
+                request_id = f"inline-atlas-{request_hash}"
+                receipt = LOG_DIR / f"exact_repair_{request_id}.json"
+                parent_retry_id = str(
+                    retry_metadata.get("progress_run_id")
+                    or active_job.get("shared_queue_job_id")
+                    or f"sk-batch-{active_job.get('id') or 'direct'}"
+                )
+                reason_codes = sorted(set(
+                    evidence_reason_codes(failure_report)
+                    or ["atlas_manifest_mirror_conflict_repairable"]
+                ))
+                request = build_exact_target_request(
+                    tool=PCG_TEXTURE_TOOL,
+                    repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
+                    target_spms=[spm],
+                    repair_stage="atlas_manifest_repair",
+                    provenance={
+                        "reason_codes": reason_codes,
+                        "source": "sk_batch.inline_atlas_preflight",
+                    },
+                    parent_retry_id=parent_retry_id,
+                    request_id=request_id,
+                    receipt=receipt,
+                )
+
+                def on_progress(payload):
+                    stage = str(
+                        payload.get("current_stage")
+                        or "Atlas manifest 자동 복구"
+                    )
+                    self.ui_queue.put((
+                        "progress",
+                        f"{spm.name} · {stage}",
+                    ))
+                    self._retry_transition(
+                        str(spm),
+                        RETRY_STAGE_BLENDER,
+                        stage,
+                        progress=bool(payload.get("completed")),
+                        output=True,
+                        heartbeat=True,
+                    )
+
+                terminal = run_exact_target_request(
+                    request,
+                    execute_step3_standard,
+                    inherited_lease=lease,
+                    cancel_event=self.stop_flag,
+                    on_progress=on_progress,
+                )
+                memo[key] = copy.deepcopy(terminal)
+            terminal_status = str(
+                terminal.get("terminal_status")
+                or terminal.get("status")
+                or ""
+            )
+            if terminal_status == "cancelled":
+                raise BatchItemError(
+                    "Atlas manifest 자동 복구가 취소되었습니다.",
+                    kind="cancelled",
+                    report=terminal,
+                )
+            if terminal_status != "completed":
+                raw_error = str(
+                    terminal.get("error")
+                    or (terminal.get("result") or {}).get("reason")
+                    or "exact BAT Atlas manifest 복구 실패"
+                )
+                raise BatchItemError(
+                    "Atlas manifest 자동 복구 실패: "
+                    + compact_error_message(raw_error, 320),
+                    kind="automatic_repair_failed",
+                    report={
+                        "repair_disposition": REPAIR_UI_BLOCKED,
+                        "original_failure": copy.deepcopy(failure_report),
+                        "exact_repair_receipt": copy.deepcopy(terminal),
+                    },
+                )
+            result = copy.deepcopy(terminal.get("result") or {})
+            self.log(
+                "[자동 복구 완료] Canonical PCG → Atlas manifest · "
+                f"{spm.name}"
+            )
+            return copy.deepcopy(result.get("canonical_refresh") or {})
+
     def _refresh_canonical_atlas_manifests(self, spm):
         """Synchronize canonical PCG output into Atlas before Blender starts."""
         spm = Path(spm)
@@ -9951,9 +10196,22 @@ class App:
             failure_report = copy.deepcopy(getattr(exc, "report", {}) or {})
             decision = repair_ui_decision(failure_report)
             automatic = decision["status"] == REPAIR_UI_AUTOMATIC
-            status_prefix = "자동 복구 대상" if automatic else "최종 차단"
+            if automatic:
+                return self._run_inline_atlas_manifest_repair(
+                    spm,
+                    {
+                        "status": "automatic_repair_pending",
+                        "stage": "canonical_atlas_manifest_preflight",
+                        "spm": str(spm),
+                        "error": str(exc),
+                        "repair_disposition": decision["status"],
+                        "reason_ko": decision["reason"],
+                        "action_ko": decision["action"],
+                        **failure_report,
+                    },
+                )
             raise BatchItemError(
-                f"{status_prefix}: Canonical PCG → Atlas 사전 검사 · "
+                "최종 차단: Canonical PCG → Atlas 사전 검사 · "
                 f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
                 report={
@@ -10832,15 +11090,45 @@ class App:
             attempt_pre_fingerprint = pre_discovery_fingerprint
             attempt_pre_records = pre_discovery_records
             for attempt in range(2):
-                raw_audit = self._refresh_stale_cluster_receipt_uncached(
-                    spm,
-                    (
-                        stamp
-                        if attempt == 0
-                        else f"{stamp}_retry{attempt}"
-                    ),
-                    _raw_only=True,
+                audit_stamp = (
+                    stamp
+                    if attempt == 0
+                    else f"{stamp}_retry{attempt}"
                 )
+                try:
+                    raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                        spm,
+                        audit_stamp,
+                        _raw_only=True,
+                    )
+                except InlineAtlasRepairRequested as repair_request:
+                    self._run_inline_atlas_manifest_repair(
+                        repair_request.target_spm,
+                        repair_request.report,
+                    )
+                    try:
+                        raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                            spm,
+                            f"{audit_stamp}_atlas_repaired",
+                            _raw_only=True,
+                        )
+                    except InlineAtlasRepairRequested as repeated:
+                        raise BatchItemError(
+                            "Atlas manifest 자동 복구 후 재검사에도 같은 충돌이 남았습니다.",
+                            kind="automatic_repair_failed",
+                            report={
+                                "stage": "cluster_assembly_live_audit",
+                                "repair_disposition": REPAIR_UI_BLOCKED,
+                                "first_failure": copy.deepcopy(
+                                    repair_request.report
+                                ),
+                                "repeated_failure": copy.deepcopy(
+                                    repeated.report
+                                ),
+                            },
+                            log_file=repeated.log_file,
+                            report_file=repeated.report_file,
+                        ) from repeated
                 post_discovery_records = []
                 post_discovery_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
@@ -11173,10 +11461,64 @@ class App:
                 and persistence.get("live_audit_complete") is True
             )
             if code != 0 and not persistence_only_failure:
+                failure_report = copy.deepcopy(
+                    (payload or {}).get("failure") or {}
+                )
+                failure_token = str(
+                    failure_report.get("reason_token") or ""
+                )
+                if failure_token.startswith("atlas_manifest_"):
+                    decision = repair_ui_decision(failure_report)
+                    repair_evidence = failure_report.get("evidence") or {}
+                    repair_target = str(
+                        repair_evidence.get("target_spm") or ""
+                    )
+                    if (
+                        decision["status"] == REPAIR_UI_AUTOMATIC
+                        and repair_target
+                    ):
+                        raise InlineAtlasRepairRequested(
+                            repair_target,
+                            {
+                                "status": "automatic_repair_pending",
+                                "stage": "cluster_assembly_live_audit",
+                                "owner_spm": str(spm),
+                                "repair_disposition": decision["status"],
+                                "reason_ko": decision["reason"],
+                                "action_ko": decision["action"],
+                                **failure_report,
+                            },
+                            log_file=log_file,
+                            report_file=audit_report,
+                        )
+                    status_prefix = (
+                        "자동 복구 실패"
+                        if decision["status"] == REPAIR_UI_AUTOMATIC
+                        else "최종 차단"
+                    )
+                    raise BatchItemError(
+                        f"{status_prefix}: Cluster Assembly live audit · "
+                        f"원인: {decision['reason']} · 조치: {decision['action']}",
+                        kind=(
+                            "automatic_repair_failed"
+                            if decision["status"] == REPAIR_UI_AUTOMATIC
+                            else "data_error"
+                        ),
+                        report={
+                            "stage": "cluster_assembly_live_audit",
+                            "repair_disposition": decision["status"],
+                            "reason_ko": decision["reason"],
+                            "action_ko": decision["action"],
+                            **failure_report,
+                        },
+                        log_file=log_file,
+                        report_file=audit_report,
+                    )
                 raise BatchItemError(
                     "Cluster Assembly live audit process failed: "
                     f"{spm.name} (exit {code})",
                     kind="internal_error",
+                    report=payload if isinstance(payload, dict) else None,
                     log_file=log_file,
                     report_file=audit_report,
                 )

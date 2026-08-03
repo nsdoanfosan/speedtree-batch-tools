@@ -2962,6 +2962,147 @@ class BlendLiveStatusTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
+    def test_cluster_live_audit_asset_failure_requests_exact_atlas_repair(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {
+            "cluster_receipt_refresh_timeout": 321,
+            "child_stage_inactivity_timeout": 30,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            target = cluster / "SK_leaf_elm_01.spm"
+            spm.write_bytes(b"tree")
+            target.write_bytes(b"leaf")
+            expected = gui._PROCESS_PRODUCTION_SOURCE_MANIFEST
+            app._active_production_source_manifest = expected
+
+            def run_audit(command, *_args, **_kwargs):
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                revision = {
+                    "manifest_schema_version": expected.schema_version,
+                    "expected_content_hash": expected.content_hash,
+                    "started": expected.as_dict(),
+                    "finished": expected.as_dict(),
+                    "matches_expected": True,
+                    "stable": True,
+                }
+                report.write_text(json.dumps({
+                    "status": "failed",
+                    "stage": "asset_audit",
+                    "error": "sanitized stale mirror conflict",
+                    "production_source_revision": revision,
+                    "failure": {
+                        "reason_token": (
+                            "atlas_manifest_mirror_conflict_repairable"
+                        ),
+                        "evidence": {
+                            "status": "repairable",
+                            "reason_code": (
+                                "atlas_manifest_mirror_conflict_repairable"
+                            ),
+                            "target_spm": str(target),
+                            "authority": str(cluster / "authority.json"),
+                            "mirrors": [str(cluster / "stale.json")],
+                        },
+                    },
+                    "items": [],
+                }), encoding="utf-8")
+                return 1, Path(temporary) / "asset_audit.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "production_source_manifest",
+                return_value=expected,
+            ), mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=FileNotFoundError,
+            ), self.assertRaises(gui.InlineAtlasRepairRequested) as raised:
+                app._refresh_stale_cluster_receipt_uncached(
+                    spm,
+                    "20260803_120000",
+                    _raw_only=True,
+                )
+
+        self.assertEqual(raised.exception.target_spm, target)
+        self.assertEqual(
+            raised.exception.report["reason_token"],
+            "atlas_manifest_mirror_conflict_repairable",
+        )
+        self.assertNotIn("revision mismatch", str(raised.exception).casefold())
+
+    def test_cluster_live_audit_repairs_then_retries_inside_same_batch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            target = cluster / "SK_leaf_elm_01.spm"
+            spm.write_bytes(b"tree")
+            target.write_bytes(b"leaf")
+            request = gui.InlineAtlasRepairRequested(
+                target,
+                {
+                    "reason_token": (
+                        "atlas_manifest_mirror_conflict_repairable"
+                    ),
+                    "evidence": {
+                        "status": "repairable",
+                        "target_spm": str(target),
+                    },
+                },
+            )
+            raw_audit = {
+                "requested_spm": str(spm),
+                "payload": {"items": [{"status": "ok"}]},
+                "audit_report": str(Path(temporary) / "audit.json"),
+            }
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="stable-input"
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ())
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=()
+            )
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=[request, raw_audit]
+            )
+            app._run_inline_atlas_manifest_repair = mock.Mock(
+                return_value={"status": "updated"}
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                return_value={"status": "ready"}
+            )
+
+            result = app._refresh_stale_cluster_receipt(
+                spm,
+                "20260803_120000",
+            )
+
+        self.assertEqual(result, {"status": "ready"})
+        app._run_inline_atlas_manifest_repair.assert_called_once_with(
+            target,
+            request.report,
+        )
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+
     def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
         gui = load_gui_module()
         app = self.make_app(gui)

@@ -157,6 +157,57 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
             )
             self.assertFalse(revision["stable"])
 
+    def test_asset_audit_failure_keeps_revision_and_exact_repair_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "audit.json"
+            expected = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+            target = Path(temporary) / "Cluster" / "SK_leaf_test_01.spm"
+            failure = audit.AtlasManifestResolutionError(
+                "sanitized stale mirror conflict",
+                {"target_spm": str(target)},
+            )
+            repair_plan = {
+                "status": "repairable",
+                "reason_code": "atlas_manifest_mirror_conflict_repairable",
+                "target_spm": str(target),
+                "authority": str(Path(temporary) / "authority.json"),
+                "mirrors": [str(Path(temporary) / "stale.json")],
+            }
+
+            with mock.patch.object(
+                audit,
+                "load_config",
+                return_value={},
+            ), mock.patch.object(
+                audit,
+                "make_report",
+                side_effect=failure,
+            ), mock.patch.object(
+                audit,
+                "atlas_manifest_mirror_repair_plan",
+                return_value=repair_plan,
+            ):
+                with self.assertRaises(audit.AtlasManifestResolutionError):
+                    self._run_main(
+                        "--expected-production-source-revision",
+                        expected,
+                        "--no-receipt",
+                        "--json",
+                        str(report_path),
+                    )
+
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["stage"], "asset_audit")
+            self.assertTrue(
+                payload["production_source_revision"]["matches_expected"]
+            )
+            self.assertEqual(
+                payload["failure"]["reason_token"],
+                "atlas_manifest_mirror_conflict_repairable",
+            )
+            self.assertEqual(payload["failure"]["evidence"], repair_plan)
+
     def test_cli_publishes_folder_progress_and_stage_markers(self):
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "audit.json"
