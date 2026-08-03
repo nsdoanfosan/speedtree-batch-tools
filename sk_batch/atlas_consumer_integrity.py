@@ -554,6 +554,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
     receipts = resolve_canonical_atlas_producer_receipts(target)
     reachability = _generator_reachability(root)
     integrity_issues = []
+    suppressed_generator_pairs = []
     invalid_material_ids = set()
     invalid_mesh_ids = set()
 
@@ -822,11 +823,33 @@ def audit_atlas_consumer_integrity(target_spm, root):
             pair_reasons.append(
                 "Selected manifests assign Material and Mesh to different groups"
             )
-        if pair_reasons:
+        if pair_reasons and not slot["hidden"]:
             add_generator_issue(
                 "generator_cross_group_pair",
                 "; ".join(pair_reasons),
             )
+        elif pair_reasons:
+            # A hidden Generator does not participate in the export, so the
+            # ownership of its Material/Mesh pair cannot damage anything the
+            # target produces.  `Hidden` is read at the top of this function
+            # and was already carried into the issue payload -- it was simply
+            # never consulted, and six such pairs are the only thing blocking
+            # SK_tree_scotspine_02.  The rest of the pipeline already treats
+            # Hidden as inactive when deciding what a Generator delivers.
+            #
+            # Recorded rather than dropped: an operator asking "why was this
+            # not flagged" gets an answer, and a pair that stops being hidden
+            # starts blocking again on the next audit.
+            suppressed_generator_pairs.append({
+                "reason": "; ".join(pair_reasons),
+                "generator_index": slot["generator_index"],
+                "generator_guid": slot["generator_guid"],
+                "generator_name": slot["generator_name"],
+                "slot_prefix": slot["slot_prefix"],
+                "material_id": material_id,
+                "mesh_id": mesh_id,
+                "suppressed_because": "generator_hidden",
+            })
 
     managed_candidate_count = sum(row["managed"] for row in material_nodes) + sum(
         row["managed"] for rows in mesh_rows_by_id.values() for row in rows
@@ -1100,6 +1123,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
             for row in blocking_assets
         ],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "review_policy": (
             "No mutation is authorized by this evidence. Only an explicit "
             "retired scope with a same-producer successor is marked eligible; "
@@ -1162,5 +1186,6 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "generations": generations,
         "generator_slots": reachability["slots"],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "repair_input": repair_input,
     }
