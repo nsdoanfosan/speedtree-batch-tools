@@ -6855,6 +6855,15 @@ class App:
                 progress=False,
             )
             entry = effective_entries.get(iid, {})
+            push_status_kind = str(entry.get("push_status_kind") or "")
+            if (
+                push_status_kind == "imported_ok"
+                and repair_states[iid].get("current") is True
+            ):
+                # A content-proven successful ingest is not a failed Unreal
+                # parent. Unknown Repair state still takes the existing
+                # fail-closed parent path; known stale state rebuilds below.
+                continue
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
@@ -6867,9 +6876,7 @@ class App:
                     "전체 Blender→Push를 명시적으로 실행하세요"
                 )
                 continue
-            if str(entry.get("push_status_kind") or "") not in (
-                UNREAL_RECOVERY_FAILURE_KINDS
-            ):
+            if push_status_kind not in UNREAL_RECOVERY_FAILURE_KINDS:
                 parent_statuses[iid] = UNREAL_PARENT_INVALID
                 parent_diagnostics[iid] = (
                     "Unreal parent는 있으나 retryable ingest 실패 상태가 아님"
