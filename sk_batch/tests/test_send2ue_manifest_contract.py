@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -225,6 +226,81 @@ class Send2ueManifestContractTests(unittest.TestCase):
             )
             self.assertFalse(result[0]["identity_changed"])
             self.assertTrue(result[0]["asset_path_changed"])
+
+    def test_missing_descriptor_is_rebound_to_cache_local_current_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "SK_legacy_01.json"
+            source.write_text(
+                json.dumps({
+                    "schema_version": 3,
+                    "mesh_name": "SK_legacy_01",
+                    "materials": [{"master_preset": "tree"}],
+                }),
+                encoding="utf-8",
+            )
+            source_before = source.read_bytes()
+            source_sha256 = hashlib.sha256(source_before).hexdigest()
+            asset = self._asset(
+                "/Game/Tree/SK_legacy_01",
+                source,
+            )
+            asset["asset_data"][
+                "_material_pipeline_json_sha256"
+            ] = source_sha256
+            for groups in (
+                asset["pre_import_commands"],
+                asset["post_import_commands"],
+            ):
+                groups[0][-1] = groups[0][-1].replace(
+                    ")",
+                    ", expected_mesh_name='SK_legacy_01', "
+                    f"sidecar_sha256='{source_sha256}')",
+                )
+
+            def validate(value, expected_mesh_name):
+                if value != descriptor(expected_mesh_name):
+                    raise ValueError("unexpected descriptor")
+
+            result = normalize_manifest_handoff_sidecars(
+                [asset],
+                root / "export",
+                sidecar_descriptor_builder=descriptor,
+                sidecar_descriptor_validator=validate,
+            )
+
+            normalized_path = Path(
+                asset["asset_data"]["_material_pipeline_json_path"]
+            )
+            normalized_bytes = normalized_path.read_bytes()
+            normalized_sha256 = hashlib.sha256(
+                normalized_bytes
+            ).hexdigest()
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertNotEqual(normalized_path, source)
+            self.assertTrue(result[0]["identity_changed"])
+            self.assertEqual(
+                asset["asset_data"]["_material_pipeline_json_sha256"],
+                normalized_sha256,
+            )
+            normalized = json.loads(normalized_bytes)
+            self.assertEqual(
+                normalized["speedtree_handoff_contract"],
+                descriptor("SK_legacy_01"),
+            )
+            commands = sum(
+                asset["pre_import_commands"]
+                + asset["post_import_commands"],
+                [],
+            )
+            self.assertTrue(
+                all(
+                    normalized_path.as_posix() in line
+                    and normalized_sha256 in line
+                    for line in commands
+                    if "json_path=" in line
+                )
+            )
 
     def test_distinct_empty_sidecars_preserve_public_asset_ordinals(self):
         with tempfile.TemporaryDirectory() as temp_dir:

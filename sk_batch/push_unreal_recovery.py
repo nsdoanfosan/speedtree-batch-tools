@@ -26,7 +26,8 @@ from sk_common import (
     file_content_fingerprint,
     file_content_snapshot,
 )
-from speedtree_pipeline_contract import is_live_spm
+from send2ue_manifest_contract import normalize_manifest_handoff_sidecars
+from speedtree_pipeline_contract import is_live_spm, shared_contract_api
 
 
 RECOVERY_SCHEMA_VERSION = 1
@@ -369,6 +370,192 @@ def _refresh_handoff_files(records, regenerated_paths):
     return result
 
 
+def _full_blender_rebuild_required(message):
+    return PushUnrealRecoveryError(
+        "non-Assembly material handoff cannot be safely rebound; "
+        "full Blender rebuild required: "
+        + str(message)
+    )
+
+
+def _validate_material_intent_capability(payload, api, asset_index):
+    """Mirror the pure material-intent half of Unreal's current preflight."""
+    materials = payload.get("materials", [])
+    if not isinstance(materials, list):
+        raise _full_blender_rebuild_required(
+            f"asset #{asset_index + 1} materials is not a list"
+        )
+    for material_index, entry in enumerate(materials):
+        if not isinstance(entry, dict):
+            raise _full_blender_rebuild_required(
+                f"asset #{asset_index + 1} materials[{material_index}] "
+                "is not an object"
+            )
+        name = str(entry.get("name") or "")
+        is_tree = str(
+            entry.get("master_preset") or ""
+        ).strip().casefold() == "tree"
+        intent = entry.get("speedtree_intent")
+        if is_tree and intent is None:
+            raise _full_blender_rebuild_required(
+                f"asset #{asset_index + 1} tree material {name!r} has no "
+                "speedtree_intent"
+            )
+        if intent is None:
+            continue
+        if not is_tree:
+            raise _full_blender_rebuild_required(
+                f"asset #{asset_index + 1} material {name!r} has a "
+                "speedtree_intent without master_preset 'tree'"
+            )
+        validate_intent = getattr(
+            api, "validate_material_intent_for_name", None
+        )
+        build_intent = getattr(api, "build_material_intent", None)
+        if not callable(validate_intent) or not callable(build_intent):
+            raise _full_blender_rebuild_required(
+                "current SpeedTree material-intent API is unavailable"
+            )
+        try:
+            validated = validate_intent(intent, name)
+            expected = build_intent(
+                name,
+                explicit_tree_part=str(entry.get("tree_part") or ""),
+                explicit_tree_shading=str(
+                    entry.get("tree_shading") or ""
+                ),
+                instance_profile=str(entry.get("instance_profile") or ""),
+            )
+            for key, expected_value in expected.items():
+                if validated.get(key) != expected_value:
+                    raise ValueError(
+                        f"speedtree_intent {key} mismatch: "
+                        f"{validated.get(key)!r} != {expected_value!r}"
+                    )
+            if expected.get("instance_profile"):
+                entry_mode = str(
+                    entry.get("material_instance_mode") or ""
+                ).strip().casefold()
+                if entry_mode != expected.get("material_instance_mode"):
+                    raise ValueError(
+                        "material_instance_mode mismatch: "
+                        f"{entry_mode!r} != "
+                        f"{expected.get('material_instance_mode')!r}"
+                    )
+        except Exception as exc:
+            raise _full_blender_rebuild_required(
+                f"asset #{asset_index + 1} material {name!r} has an "
+                f"incompatible speedtree_intent: {exc}"
+            ) from exc
+
+
+def _validate_non_assembly_handoff_sidecars(item, contract_api=None):
+    """Classify immutable non-Assembly sidecars under the current schema.
+
+    A completely absent descriptor is the sole legacy shape that can be
+    derived from the receipt-backed sidecar mesh identity.  An existing but
+    incompatible descriptor is ambiguous and must return to Blender.
+    """
+    if item.get("cluster_assembly") is not None:
+        return []
+    sidecar_assets = []
+    for index, asset in enumerate(item.get("assets") or []):
+        data = asset.get("asset_data") if isinstance(asset, dict) else None
+        data = data if isinstance(data, dict) else {}
+        if data.get("_asset_type") not in {"SkeletalMesh", "StaticMesh"}:
+            continue
+        sidecar_value = data.get("_material_pipeline_json_path")
+        if sidecar_value:
+            sidecar_assets.append((index, data, Path(sidecar_value)))
+    if not sidecar_assets:
+        return []
+
+    api = contract_api or shared_contract_api()
+    receipt_by_path = {}
+    for record in item.get("handoff_files") or []:
+        path = _identity_path(record, "handoff file")
+        receipt_by_path[_normalized_path(path)] = record
+
+    plans = []
+    for index, data, sidecar_path in sidecar_assets:
+        receipt = receipt_by_path.get(_normalized_path(sidecar_path))
+        if receipt is None:
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar has no immutable receipt: "
+                f"{sidecar_path}"
+            )
+        validate_content_identity(
+            receipt,
+            f"material sidecar for asset #{index + 1}",
+        )
+        try:
+            sidecar_bytes = sidecar_path.read_bytes()
+            actual_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
+            payload = json.loads(sidecar_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar is unreadable: "
+                f"{sidecar_path} ({exc})"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar is not an object: {sidecar_path}"
+            )
+        expected_sha256 = str(
+            data.get("_material_pipeline_json_sha256") or ""
+        ).casefold()
+        if not expected_sha256:
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar SHA receipt is missing"
+            )
+        if expected_sha256 != actual_sha256.casefold():
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar SHA does not match its manifest"
+            )
+        saved_name = str(payload.get("mesh_name") or "").strip()
+        expected_name = str(
+            data.get("_material_pipeline_expected_mesh_name")
+            or str(data.get("asset_path") or "").rsplit("/", 1)[-1]
+        ).strip()
+        if (
+            not saved_name
+            or not expected_name
+            or saved_name.casefold() != expected_name.casefold()
+        ):
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar mesh identity is ambiguous: "
+                f"saved={saved_name!r} expected={expected_name!r}"
+            )
+        _validate_material_intent_capability(payload, api, index)
+
+        if "speedtree_handoff_contract" not in payload:
+            plans.append({
+                "asset_index": index,
+                "sidecar": str(sidecar_path.resolve()),
+                "mesh_name": saved_name,
+                "requires_derivation": True,
+            })
+            continue
+        descriptor = payload.get("speedtree_handoff_contract")
+        if not isinstance(descriptor, dict):
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar descriptor is malformed"
+            )
+        try:
+            api.validate_sidecar_descriptor(descriptor, saved_name)
+        except Exception as exc:
+            raise _full_blender_rebuild_required(
+                f"asset #{index + 1} sidecar descriptor is incompatible: {exc}"
+            ) from exc
+        plans.append({
+            "asset_index": index,
+            "sidecar": str(sidecar_path.resolve()),
+            "mesh_name": saved_name,
+            "requires_derivation": False,
+        })
+    return plans
+
+
 def _checkout_asset_paths(item):
     result = []
     for asset in item.get("assets") or []:
@@ -400,6 +587,7 @@ def validate_unreal_only_recovery_evidence(
     current_source_record,
     current_source_fingerprint,
     rebindable_code_paths,
+    sidecar_contract_api=None,
 ):
     """Prove that one parent export is eligible for Unreal-only recovery.
 
@@ -439,6 +627,10 @@ def validate_unreal_only_recovery_evidence(
         rebindable_code_paths=rebindable_code_paths,
     )
     validate_item_artifacts(parent_item)
+    _validate_non_assembly_handoff_sidecars(
+        parent_item,
+        contract_api=sidecar_contract_api,
+    )
     return True
 
 
@@ -455,6 +647,7 @@ def recover_manifest_item(
     report_path,
     selected,
     recovered_at=None,
+    sidecar_contract_api=None,
 ):
     """Create one current-code item after validating immutable parent evidence."""
     parent_source_record = (
@@ -474,18 +667,76 @@ def recover_manifest_item(
             if rebindable_code_paths is None
             else rebindable_code_paths
         ),
+        sidecar_contract_api=sidecar_contract_api,
     )
 
-    current_code_files = [code_file_identity(path) for path in runtime_code_paths]
+    shared_contract_source = getattr(
+        shared_contract_api, "__wrapped__", shared_contract_api
+    )
+    derivation_code_paths = [
+        Path(__file__).resolve(),
+        Path(normalize_manifest_handoff_sidecars.__code__.co_filename).resolve(),
+        Path(shared_contract_source.__code__.co_filename).resolve(),
+    ]
+    current_code_files = []
+    current_code_keys = set()
+
+    def add_current_code_file(path):
+        key = _normalized_path(path)
+        if key in current_code_keys:
+            return
+        current_code_keys.add(key)
+        current_code_files.append(code_file_identity(path))
+
+    for code_path in [*runtime_code_paths, *derivation_code_paths]:
+        add_current_code_file(code_path)
     old_code_revision = code_revision(parent_item.get("code_files") or [])
-    new_code_revision = code_revision(current_code_files)
     recovered = copy.deepcopy(parent_item)
     recovered["source_fingerprint"] = current_source_fingerprint
-    recovered["code_files"] = current_code_files
 
     assembly = recovered.get("cluster_assembly")
     regenerated_sidecars = []
-    if assembly is not None:
+    if assembly is None:
+        sidecar_plans = _validate_non_assembly_handoff_sidecars(
+            parent_item,
+            contract_api=sidecar_contract_api,
+        )
+        api = None
+        if sidecar_plans:
+            api = sidecar_contract_api or shared_contract_api()
+            api_path = getattr(api, "__file__", None)
+            if api_path:
+                api_path = Path(api_path).resolve()
+                derivation_code_paths.append(api_path)
+                add_current_code_file(api_path)
+        if any(plan["requires_derivation"] for plan in sidecar_plans):
+            recovery_root = (
+                Path(report_path).resolve().parent
+                / (Path(report_path).stem + "_handoff")
+            )
+            try:
+                normalization = normalize_manifest_handoff_sidecars(
+                    recovered.get("assets") or [],
+                    recovery_root,
+                    sidecar_descriptor_builder=(
+                        api.build_sidecar_descriptor
+                    ),
+                    sidecar_descriptor_validator=(
+                        api.validate_sidecar_descriptor
+                    ),
+                    normalize_mesh_file=False,
+                )
+            except RuntimeError as exc:
+                raise _full_blender_rebuild_required(exc) from exc
+            regenerated_sidecars = [
+                Path(row["normalized_sidecar"])
+                for row in normalization
+                if row.get("identity_changed")
+            ]
+            recovered["handoff_files"] = _refresh_handoff_files(
+                recovered.get("handoff_files"), regenerated_sidecars
+            )
+    else:
         try:
             ingest_plan = build_unreal_ingest_plan(
                 assembly.get("manifest"),
@@ -501,6 +752,8 @@ def recover_manifest_item(
             recovered.get("handoff_files"), regenerated_sidecars
         )
 
+    recovered["code_files"] = current_code_files
+    new_code_revision = code_revision(current_code_files)
     recovered["checkout_asset_paths"] = _checkout_asset_paths(recovered)
     recovered["report_path"] = str(Path(report_path).resolve())
     recovered["verify_existing_assets"] = not bool(selected)
@@ -542,6 +795,13 @@ def recover_manifest_item(
         ),
         "regenerated_sidecars": [
             str(path.resolve()) for path in regenerated_sidecars
+        ],
+        "derivation_code_files": [
+            copy.deepcopy(record)
+            for record in current_code_files
+            if _normalized_path(record["path"]) in {
+                _normalized_path(path) for path in derivation_code_paths
+            }
         ],
     }
     contract = {

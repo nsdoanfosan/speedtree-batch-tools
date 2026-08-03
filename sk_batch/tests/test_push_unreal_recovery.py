@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -19,6 +20,31 @@ from push_unreal_recovery import (  # noqa: E402
     recover_manifest_item,
 )
 import push_unreal_recovery as recovery_module  # noqa: E402
+
+
+class FakeSidecarContract:
+    @staticmethod
+    def build_sidecar_descriptor(mesh_name, source=None):
+        result = {
+            "kind": "speedtree",
+            "version": 1,
+            "fingerprint": "current-test-contract",
+            "asset_kind": "speedtree",
+            "mesh_name": mesh_name,
+        }
+        if source:
+            result["source"] = copy.deepcopy(source)
+        return result
+
+    @classmethod
+    def validate_sidecar_descriptor(cls, value, expected_mesh_name):
+        expected = cls.build_sidecar_descriptor(
+            expected_mesh_name,
+            source=(value.get("source") if isinstance(value, dict) else None),
+        )
+        if value != expected:
+            raise ValueError("descriptor does not match current contract")
+        return value
 
 
 class PushUnrealRecoveryTests(unittest.TestCase):
@@ -61,6 +87,77 @@ class PushUnrealRecoveryTests(unittest.TestCase):
             "report_path": "old-item-report.json",
             "export_report_path": "old-export-report.json",
         }
+
+    @staticmethod
+    def material_asset(sidecar, mesh_name):
+        sidecar_sha256 = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+        sidecar_argument = sidecar.as_posix()
+        asset_path = "/Game/Test/" + mesh_name
+        command = (
+            "_p.process_mesh("
+            f"_asset_path, json_path={sidecar_argument!r}, "
+            f"expected_mesh_name={mesh_name!r}, "
+            f"sidecar_sha256={sidecar_sha256!r})"
+        )
+        return {
+            "asset_data": {
+                "_asset_type": "SkeletalMesh",
+                "asset_path": asset_path,
+                "_material_pipeline_expected_mesh_name": mesh_name,
+                "_material_pipeline_json_path": str(sidecar),
+                "_material_pipeline_json_sha256": sidecar_sha256,
+            },
+            "pre_import_commands": [[command]],
+            "post_import_commands": [[command]],
+        }
+
+    def recover_current_item(self, root, parent_item, blend, runtime):
+        source_record = {
+            "fingerprint": "parent-source",
+            "snapshot": self.snapshot(blend, [runtime]),
+        }
+        return recover_manifest_item(
+            parent_item,
+            parent_manifest_path=root / "parent.json",
+            parent_report_path=root / "parent_report.json",
+            parent_source_record=source_record,
+            current_source_record=source_record,
+            current_source_fingerprint="parent-source",
+            runtime_code_paths=[runtime],
+            rebindable_code_paths=[runtime],
+            report_path=root / "retry_report.json",
+            selected=True,
+            sidecar_contract_api=FakeSidecarContract,
+        )
+
+    @staticmethod
+    def write_recovery_inputs(
+        root,
+        *,
+        descriptor,
+        mesh_name="SK_test",
+        tree_material=False,
+    ):
+        blend = root / "source.blend"
+        runtime = root / "unreal_ingest.py"
+        exported = root / "mesh.fbx"
+        sidecar = root / "material.json"
+        blend.write_bytes(b"blend")
+        runtime.write_bytes(b"runtime")
+        exported.write_bytes(b"fbx")
+        payload = {
+            "schema_version": 3,
+            "mesh_name": mesh_name,
+            "material_master": "tree" if tree_material else "prop",
+            "materials": [{
+                "name": "M_test",
+                **({"master_preset": "tree"} if tree_material else {}),
+            }],
+        }
+        if descriptor is not None:
+            payload["speedtree_handoff_contract"] = descriptor
+        sidecar.write_text(json.dumps(payload), encoding="utf-8")
+        return blend, runtime, exported, sidecar
 
     def test_retry_manifest_rejects_tool_owned_backup_queue_item(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,6 +244,213 @@ class PushUnrealRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 result["exported_files"], untouched_parent["exported_files"]
             )
+
+    def test_compatible_non_assembly_sidecar_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            descriptor = FakeSidecarContract.build_sidecar_descriptor(
+                "SK_test"
+            )
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor=descriptor,
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            parent_item["assets"] = [
+                self.material_asset(sidecar, "SK_test")
+            ]
+
+            result = self.recover_current_item(
+                root, parent_item, blend, runtime
+            )
+
+            self.assertEqual(
+                result["assets"][0]["asset_data"][
+                    "_material_pipeline_json_path"
+                ],
+                str(sidecar),
+            )
+            self.assertEqual(result["recovery"]["regenerated_sidecars"], [])
+
+    def test_legacy_non_assembly_sidecar_is_rebound_without_parent_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor=None,
+                mesh_name="SK_weed_deadbranches_a_01",
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            parent_item["assets"] = [
+                self.material_asset(
+                    sidecar,
+                    "SK_weed_deadbranches_a_01",
+                )
+            ]
+            parent_before = copy.deepcopy(parent_item)
+            sidecar_before = sidecar.read_bytes()
+
+            result = self.recover_current_item(
+                root, parent_item, blend, runtime
+            )
+
+            recovered_data = result["assets"][0]["asset_data"]
+            recovered_sidecar = Path(
+                recovered_data["_material_pipeline_json_path"]
+            )
+            recovered_payload = json.loads(
+                recovered_sidecar.read_text(encoding="utf-8")
+            )
+            recovered_sha256 = hashlib.sha256(
+                recovered_sidecar.read_bytes()
+            ).hexdigest()
+            self.assertEqual(parent_item, parent_before)
+            self.assertEqual(sidecar.read_bytes(), sidecar_before)
+            self.assertNotEqual(recovered_sidecar, sidecar)
+            self.assertEqual(
+                recovered_payload["speedtree_handoff_contract"],
+                FakeSidecarContract.build_sidecar_descriptor(
+                    "SK_weed_deadbranches_a_01"
+                ),
+            )
+            self.assertEqual(
+                recovered_data["_material_pipeline_json_sha256"],
+                recovered_sha256,
+            )
+            self.assertEqual(
+                result["recovery"]["regenerated_sidecars"],
+                [str(recovered_sidecar.resolve())],
+            )
+            derivation_names = {
+                Path(record["path"]).name
+                for record in result["recovery"]["derivation_code_files"]
+            }
+            self.assertIn("push_unreal_recovery.py", derivation_names)
+            self.assertIn("send2ue_manifest_contract.py", derivation_names)
+            commands = sum(
+                result["assets"][0]["pre_import_commands"]
+                + result["assets"][0]["post_import_commands"],
+                [],
+            )
+            self.assertTrue(
+                all(
+                    recovered_sidecar.as_posix() in line
+                    and recovered_sha256 in line
+                    and "expected_mesh_name=" in line
+                    and "SK_weed_deadbranches_a_01" in line
+                    for line in commands
+                )
+            )
+
+    def test_legacy_tree_material_without_intent_requires_blender_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor=None,
+                tree_material=True,
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            parent_item["assets"] = [
+                self.material_asset(sidecar, "SK_test")
+            ]
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError,
+                "tree material.*speedtree_intent",
+            ):
+                self.recover_current_item(
+                    root, parent_item, blend, runtime
+                )
+
+    def test_legacy_sidecar_with_incomplete_command_binding_requires_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor=None,
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            asset = self.material_asset(sidecar, "SK_test")
+            for group_key in ("pre_import_commands", "post_import_commands"):
+                asset[group_key][0][0] = asset[group_key][0][0].replace(
+                    "sidecar_sha256=",
+                    "legacy_sidecar_digest=",
+                )
+            parent_item["assets"] = [asset]
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError,
+                "full Blender rebuild required.*sidecar_sha256",
+            ):
+                self.recover_current_item(
+                    root, parent_item, blend, runtime
+                )
+
+    def test_non_assembly_sidecar_fingerprint_drift_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor=None,
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            parent_item["assets"] = [
+                self.material_asset(sidecar, "SK_test")
+            ]
+            original_stat = sidecar.stat()
+            changed = sidecar.read_text(encoding="utf-8").replace(
+                "SK_test", "SK_tast"
+            )
+            sidecar.write_text(changed, encoding="utf-8")
+            os.utime(
+                sidecar,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError,
+                "handoff file #1 content changed",
+            ):
+                self.recover_current_item(
+                    root, parent_item, blend, runtime
+                )
+
+    def test_incompatible_non_assembly_descriptor_requires_blender_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend, runtime, exported, sidecar = self.write_recovery_inputs(
+                root,
+                descriptor={
+                    "kind": "speedtree",
+                    "version": 0,
+                    "mesh_name": "SK_test",
+                },
+            )
+            parent_item = self.parent_item(
+                blend, exported, sidecar, runtime
+            )
+            parent_item["assets"] = [
+                self.material_asset(sidecar, "SK_test")
+            ]
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError,
+                "full Blender rebuild required",
+            ):
+                self.recover_current_item(
+                    root, parent_item, blend, runtime
+                )
 
     def test_export_time_dependency_change_requires_full_push(self):
         with tempfile.TemporaryDirectory() as temp_dir:

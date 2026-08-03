@@ -17,12 +17,22 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
 
 MESH_ASSET_TYPES = {"SkeletalMesh", "StaticMesh"}
 MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
+MATERIAL_PIPELINE_JSON_SHA256_KEY = "_material_pipeline_json_sha256"
+MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN = re.compile(
+    r"(?P<prefix>\bsidecar_sha256\s*=\s*)"
+    r"(?P<quote>['\"])(?P<sha256>[0-9a-fA-F]{64})(?P=quote)"
+)
+MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN = re.compile(
+    r"(?P<prefix>\bexpected_mesh_name\s*=\s*)"
+    r"(?P<quote>['\"])(?P<mesh>[^'\"]+)(?P=quote)"
+)
 
 
 def is_actionable_cluster_assembly_manifest(manifest):
@@ -170,19 +180,57 @@ def manifest_checkout_asset_paths(manifest_assets):
     return paths
 
 
+def _sidecar_path_variants(path):
+    return {
+        str(path),
+        str(path).replace("\\", "/"),
+        str(path).replace("/", "\\"),
+        str(path).replace("\\", "\\\\"),
+        str(path).replace("/", "\\\\"),
+    }
+
+
 def _replace_sidecar_path(line, source_path, target_path):
     value = str(line)
-    source_variants = {
-        str(source_path),
-        str(source_path).replace("\\", "/"),
-        str(source_path).replace("/", "\\"),
-        str(source_path).replace("\\", "\\\\"),
-        str(source_path).replace("/", "\\\\"),
-    }
+    source_variants = _sidecar_path_variants(source_path)
     target = str(target_path).replace("\\", "/")
     for source in source_variants:
         value = value.replace(source, target)
     return value
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _replace_sidecar_sha256(line, target_sha256):
+    if not target_sha256:
+        return str(line)
+    return MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN.sub(
+        lambda match: (
+            match.group("prefix")
+            + match.group("quote")
+            + target_sha256
+            + match.group("quote")
+        ),
+        str(line),
+    )
+
+
+def _replace_expected_mesh_name(line, expected_mesh_name):
+    return MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN.sub(
+        lambda match: (
+            match.group("prefix")
+            + match.group("quote")
+            + str(expected_mesh_name)
+            + match.group("quote")
+        ),
+        str(line),
+    )
 
 
 def _normalize_command_groups(
@@ -192,7 +240,14 @@ def _normalize_command_groups(
     target_asset_path,
     source_sidecar,
     normalized_sidecar,
+    normalized_sidecar_sha256,
+    expected_mesh_name,
+    require_sidecar_binding=False,
 ):
+    binding_count = 0
+    normalized_sidecar_path = str(
+        Path(normalized_sidecar).resolve()
+    ).replace("\\", "/")
     for group_key in ("pre_import_commands", "post_import_commands"):
         groups = manifest_asset.get(group_key)
         if not isinstance(groups, list):
@@ -204,11 +259,57 @@ def _normalize_command_groups(
                 continue
             normalized_commands = []
             for line in commands:
+                original = str(line)
+                is_sidecar_binding = bool(
+                    "json_path" in original
+                    and any(
+                        spelling and spelling in original
+                        for spelling in _sidecar_path_variants(source_sidecar)
+                    )
+                )
+                if require_sidecar_binding and is_sidecar_binding:
+                    binding_count += 1
+                    if not MATERIAL_PIPELINE_SIDECAR_SHA_PATTERN.search(
+                        original
+                    ):
+                        raise RuntimeError(
+                            "Send2UE material command has no valid "
+                            "sidecar_sha256 binding"
+                        )
+                    if not MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN.search(
+                        original
+                    ):
+                        raise RuntimeError(
+                            "Send2UE material command has no valid "
+                            "expected_mesh_name binding"
+                        )
                 value = _replace_sidecar_path(
-                    line,
+                    original,
                     source_sidecar,
                     normalized_sidecar,
                 )
+                value = _replace_sidecar_sha256(
+                    value,
+                    normalized_sidecar_sha256,
+                )
+                value = _replace_expected_mesh_name(
+                    value,
+                    expected_mesh_name,
+                )
+                if require_sidecar_binding and is_sidecar_binding:
+                    expected_match = (
+                        MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN.search(value)
+                    )
+                    if (
+                        normalized_sidecar_path not in value
+                        or normalized_sidecar_sha256 not in value
+                        or expected_match is None
+                        or expected_match.group("mesh") != expected_mesh_name
+                    ):
+                        raise RuntimeError(
+                            "Send2UE material command sidecar binding could "
+                            "not be rebound exactly"
+                        )
                 value = value.replace(
                     str(source_asset_path),
                     str(target_asset_path),
@@ -222,6 +323,11 @@ def _normalize_command_groups(
                 normalized_commands.append(value)
             normalized_groups.append(normalized_commands)
         manifest_asset[group_key] = normalized_groups
+    if require_sidecar_binding and binding_count == 0:
+        raise RuntimeError(
+            "Send2UE material commands do not reference the recorded sidecar"
+        )
+    return binding_count
 
 
 def _normalized_sidecar_path(export_root, source_path, asset_path):
@@ -287,6 +393,8 @@ def normalize_manifest_handoff_sidecars(
     export_root,
     *,
     sidecar_descriptor_builder,
+    sidecar_descriptor_validator=None,
+    normalize_mesh_file=True,
 ):
     """Align each manifest destination with its authored Export Empty identity.
 
@@ -311,8 +419,9 @@ def normalize_manifest_handoff_sidecars(
                 "Send2UE material sidecar is missing: " + str(source_path)
             )
         try:
-            source_data = json.loads(source_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            source_bytes = source_path.read_bytes()
+            source_data = json.loads(source_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
             raise RuntimeError(
                 f"Send2UE material sidecar could not be read: "
                 f"{source_path} ({exc})"
@@ -322,10 +431,24 @@ def normalize_manifest_handoff_sidecars(
                 "Send2UE material sidecar is not an object: "
                 + str(source_path)
             )
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        expected_sha256 = str(
+            asset_data.get(MATERIAL_PIPELINE_JSON_SHA256_KEY) or ""
+        ).casefold()
+        if expected_sha256 and expected_sha256 != source_sha256.casefold():
+            raise RuntimeError(
+                "Send2UE material sidecar changed after its manifest receipt: "
+                + str(source_path)
+            )
 
         expected_name = asset_path.rsplit("/", 1)[-1]
         saved_name = str(source_data.get("mesh_name") or "").strip()
         descriptor = source_data.get("speedtree_handoff_contract")
+        if descriptor is not None and not isinstance(descriptor, dict):
+            raise RuntimeError(
+                "Send2UE material sidecar descriptor is not an object: "
+                + str(source_path)
+            )
         descriptor_name = (
             str(descriptor.get("mesh_name") or "").strip()
             if isinstance(descriptor, dict)
@@ -338,6 +461,17 @@ def normalize_manifest_handoff_sidecars(
                 "Send2UE material sidecar identity is inconsistent: "
                 f"{saved_name!r} != {descriptor_name!r} ({source_path})"
             )
+        if isinstance(descriptor, dict) and sidecar_descriptor_validator:
+            try:
+                sidecar_descriptor_validator(
+                    descriptor,
+                    saved_name or descriptor_name or expected_name,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Send2UE material sidecar descriptor is incompatible: "
+                    f"{source_path} ({exc})"
+                ) from exc
         authored_name = saved_name or descriptor_name or expected_name
         destination_folder = asset_path.rsplit("/", 1)[0]
         target_asset_path = destination_folder + "/" + authored_name
@@ -354,23 +488,36 @@ def normalize_manifest_handoff_sidecars(
 
         needs_identity_normalization = (
             not saved_name
-            or (
-                isinstance(descriptor, dict)
-                and not descriptor_name
-            )
+            or descriptor is None
+            or not descriptor_name
         )
 
         normalized_path = source_path
         if needs_identity_normalization:
             normalized_data = copy.deepcopy(source_data)
             normalized_data["mesh_name"] = authored_name
-            if isinstance(descriptor, dict):
-                normalized_data["speedtree_handoff_contract"] = (
-                    sidecar_descriptor_builder(
+            normalized_descriptor = sidecar_descriptor_builder(
+                authored_name,
+                source=(
+                    descriptor.get("source")
+                    if isinstance(descriptor, dict)
+                    else None
+                ),
+            )
+            if sidecar_descriptor_validator:
+                try:
+                    sidecar_descriptor_validator(
+                        normalized_descriptor,
                         authored_name,
-                        source=descriptor.get("source"),
                     )
-                )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Send2UE generated an incompatible material sidecar "
+                        f"descriptor for {source_path} ({exc})"
+                    ) from exc
+            normalized_data["speedtree_handoff_contract"] = (
+                normalized_descriptor
+            )
             normalized_path = _normalized_sidecar_path(
                 export_root,
                 source_path,
@@ -390,21 +537,32 @@ def normalize_manifest_handoff_sidecars(
             )
             os.replace(temporary, normalized_path)
 
+        normalized_sha256 = _file_sha256(normalized_path)
+
         asset_data["asset_path"] = target_asset_path
-        exported_mesh = _normalize_exported_mesh_file(
-            asset_data,
-            export_root,
-            authored_name,
+        exported_mesh = (
+            _normalize_exported_mesh_file(
+                asset_data,
+                export_root,
+                authored_name,
+            )
+            if normalize_mesh_file
+            else None
         )
         asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(
             normalized_path.resolve()
         ).replace("\\", "/")
+        asset_data[MATERIAL_PIPELINE_JSON_SHA256_KEY] = normalized_sha256
+        asset_data["_material_pipeline_expected_mesh_name"] = authored_name
         _normalize_command_groups(
             manifest_asset,
             source_asset_path=asset_path,
             target_asset_path=target_asset_path,
             source_sidecar=source_path,
             normalized_sidecar=normalized_path,
+            normalized_sidecar_sha256=normalized_sha256,
+            expected_mesh_name=authored_name,
+            require_sidecar_binding=needs_identity_normalization,
         )
         results.append(
             {
@@ -413,6 +571,7 @@ def normalize_manifest_handoff_sidecars(
                 "source_sidecar": str(source_path.resolve()),
                 "normalized_sidecar": str(normalized_path.resolve()),
                 "identity_changed": needs_identity_normalization,
+                "sidecar_sha256": normalized_sha256,
                 "asset_path_changed": (
                     asset_path.casefold() != target_asset_path.casefold()
                 ),
