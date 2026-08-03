@@ -177,6 +177,21 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("구체 원인이 영수증에 남지 않았습니다", decision["reason"])
         self.assertIn("실제 원인 코드", decision["action"])
 
+    def test_visible_generator_pair_has_exact_korean_manual_action(self):
+        decision = repair_ui_decision({
+            "reason_code": "generator_cross_group_pair",
+        })
+        plan = self.plan({"reason_code": "generator_cross_group_pair"})
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertEqual(
+            decision["reason"],
+            "표시되는 Generator가 해당 Material이 소유하지 않는 Mesh를 참조합니다.",
+        )
+        self.assertIn("Material ID, Mesh ID", decision["action"])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.friendly_reason, decision["reason"])
+
     def test_generator_delivery_is_explicit_automatic_repair(self):
         decision = repair_ui_decision({
             "delivery_reason": "generator_connection_contract_incomplete",
@@ -281,6 +296,30 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("필수 정규화 Cluster variant", decision["reason"])
         self.assertTrue(plan.supported)
         self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+
+    def test_atlas_receipt_and_lineage_reasons_route_cluster_refresh(self):
+        cases = {
+            "atlas_manifest_authority_missing": "producer 영수증이 없습니다",
+            "atlas_manifest_resolution_conflict": "영수증들이 서로 충돌합니다",
+            "lineage_unproven": "producer 계보가 증명되지 않았습니다",
+        }
+        for reason_code, korean_reason in cases.items():
+            with self.subTest(reason_code=reason_code):
+                evidence = {"reason_code": reason_code}
+                decision = repair_ui_decision(evidence)
+                plan = self.plan(evidence)
+
+                self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+                self.assertIn(korean_reason, decision["reason"])
+                self.assertTrue(plan.supported)
+                self.assertEqual(
+                    [stage["repair_action"] for stage in plan.stages],
+                    [CLUSTER_REFRESH],
+                )
+                self.assertEqual(
+                    plan.stages[0]["target_spms"],
+                    [str(self.target)],
+                )
 
     def test_missing_cluster_tga_is_exact_korean_final_block(self):
         evidence = {

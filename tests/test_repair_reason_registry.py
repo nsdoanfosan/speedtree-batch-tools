@@ -37,12 +37,30 @@ OBSERVED_TOKEN_FIXTURE = (
     / "fixtures"
     / "issue138_observed_reason_tokens.json"
 )
+OBSERVED_INTEGRITY_FIXTURE = (
+    REPO_DIR
+    / "sk_batch"
+    / "tests"
+    / "fixtures"
+    / "issue138_observed_integrity_reasons.json"
+)
 
 
 class ReasonRegistryCoverageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.emitted = emitted_reason_codes(REPO_DIR)
+        queue_payload = json.loads(
+            OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
+        )
+        integrity_payload = json.loads(
+            OBSERVED_INTEGRITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        cls.observed = set(queue_payload["tokens"])
+        cls.observed.update(
+            integrity_payload["integrity_issue_occurrences"]
+        )
+        cls.observed.update(integrity_payload["blocking_target_counts"])
 
     def test_every_emitted_reason_code_is_registered(self):
         """A new block cannot ship without a disposition.
@@ -71,20 +89,25 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         )
         self.assertEqual(invalid, [])
 
-    def test_repairable_codes_are_actually_emitted(self):
-        """No dead vocabulary.
+    def test_repairable_codes_are_emitted_or_observed(self):
+        """No dead vocabulary, including reason fields the AST cannot name.
 
         `repair_orchestration` mapped 20+ repairable codes that no module ever
         emitted, so the planner could not fire on them however correct the
         mapping was. A repair path that nothing can trigger is not a repair
         path.
         """
-        dead = sorted(set(codes_with(REPAIRABLE)) - set(self.emitted))
+        dead = sorted(
+            set(codes_with(REPAIRABLE))
+            - set(self.emitted)
+            - self.observed
+        )
         self.assertEqual(
             dead,
             [],
-            "codes registered as repairable that no production module emits; "
-            "either wire the emitter or drop the mapping",
+            "codes registered as repairable that no production module emits "
+            "and no sanitized runtime snapshot observed; either wire/observe "
+            "the emitter or drop the mapping",
         )
 
     def test_unclassified_debt_never_grows(self):
@@ -160,6 +183,23 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         tokens = set(payload["tokens"])
 
         self.assertEqual(len(tokens), 20)
+        self.assertEqual(tokens - set(REASON_REGISTRY), set())
+        self.assertEqual(
+            sorted(
+                token for token in tokens
+                if disposition_of(token) == UNCLASSIFIED
+            ),
+            [],
+        )
+
+    def test_sanitized_integrity_reasons_are_registered_and_decided(self):
+        payload = json.loads(
+            OBSERVED_INTEGRITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        tokens = set(payload["integrity_issue_occurrences"])
+        tokens.update(payload["blocking_target_counts"])
+
+        self.assertEqual(len(tokens), 4)
         self.assertEqual(tokens - set(REASON_REGISTRY), set())
         self.assertEqual(
             sorted(

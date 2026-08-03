@@ -122,6 +122,9 @@ FATAL_MODELER_SCOPE_CODES = _registered_codes(
 UNSUPPORTED_FAILURE_WRAPPER_CODES = _registered_codes(
     disposition=UNSUPPORTED, note="failure_wrapper",
 )
+UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="visible_generator_pair",
+)
 
 FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
 UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
@@ -149,6 +152,10 @@ REASON_LABELS_KO = {
     "atlas_generator_connection_missing": "Atlas Generator 연결이 누락되었습니다",
     "normalized_prototype_zero_match": "정규화된 prototype 연결 대상을 찾지 못했습니다",
     "generator_connection_contract_incomplete": "Generator 연결 계약이 불완전합니다",
+    "generator_cross_group_pair": "표시되는 Generator의 Material/Mesh 소유 관계가 일치하지 않습니다",
+    "atlas_manifest_authority_missing": "현재 대상의 Atlas producer 영수증이 없습니다",
+    "atlas_manifest_resolution_conflict": "현재 Atlas producer 영수증들이 서로 충돌합니다",
+    "lineage_unproven": "일부 Atlas asset의 current producer 계보가 증명되지 않았습니다",
     "normalized_generator_delivery_incomplete": "정규화된 Generator 전달이 불완전합니다",
     "cluster_stale": "Cluster 결과가 오래되었습니다",
     "cluster_relation_stale": "Cluster 관계가 오래되었습니다",
@@ -608,6 +615,12 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             "이전 자동 복구가 실패했지만 재시도할 구체 원인이 영수증에 남지 않았습니다.",
             "fresh audit으로 실제 원인 코드를 다시 생성한 뒤 해당 exact 복구를 재시도하세요.",
         )
+    if codes & UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "표시되는 Generator가 해당 Material이 소유하지 않는 Mesh를 참조합니다.",
+            "오류 행의 Generator, Material ID, Mesh ID를 확인해 visible 연결을 수정한 뒤 다시 검사하세요.",
+        )
 
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     if recipe_codes and _validated_recipe(evidence) is None:
@@ -741,6 +754,7 @@ def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[
         | UNSUPPORTED_MODELER_SCOPE_CODES
         | FATAL_MODELER_SCOPE_CODES
         | UNSUPPORTED_FAILURE_WRAPPER_CODES
+        | UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES
     ):
         decision = repair_ui_decision(evidence)
         return decision["reason"], decision["action"]

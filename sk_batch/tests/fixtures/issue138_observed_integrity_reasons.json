@@ -1,0 +1,12 @@
+{
+  "kind": "issue138_sanitized_observed_integrity_reasons",
+  "source": "GitHub PR 148 comments 5162805074 and 5162945710; reason names and aggregate counts only",
+  "integrity_issue_occurrences": {
+    "atlas_manifest_authority_missing": 7,
+    "atlas_manifest_resolution_conflict": 3,
+    "generator_cross_group_pair": 6
+  },
+  "blocking_target_counts": {
+    "lineage_unproven": 9
+  }
+}

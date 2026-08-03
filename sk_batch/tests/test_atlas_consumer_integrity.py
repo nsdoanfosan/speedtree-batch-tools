@@ -362,9 +362,15 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 "spm": str(spm),
                 "mesh_file_reference_contract": first,
             })
+            atlas_issue = next(
+                issue for issue in issues
+                if issue["code"] == "ATLAS_MANAGED_ASSET_INTEGRITY_STALE"
+            )
+            self.assertIn("producer 계보가 증명되지 않은", atlas_issue["message"])
+            self.assertIn("Mesh ID 7", atlas_issue["message"])
             self.assertIn(
-                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
-                {issue["code"] for issue in issues},
+                "exact Cluster 갱신을 먼저 실행",
+                atlas_issue["details"]["operator_action_ko"],
             )
 
     def test_current_default_cutout_generation_is_not_orphaned(self):
@@ -1090,6 +1096,58 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 )["classification"],
                 "ambiguous",
             )
+            message, action = preflight._atlas_integrity_failure_message(
+                integrity
+            )
+            self.assertIn("Leaf 0", message)
+            self.assertIn("Material 10, Mesh 2", message)
+            self.assertIn("visible 연결을 수정", action)
+
+    def test_hidden_cross_group_pair_does_not_block_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_hidden_cross_group.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_leaf_a", [1], "scope-current")
+            add_external_mesh(assets, root, 1, "scope-current")
+            add_material(assets, 20, "M_leaf_b", [2], "scope-current")
+            add_external_mesh(assets, root, 2, "scope-current")
+            add_generator(model, 10, 1, index=0)
+            add_generator(model, 10, 2, index=1, hidden=True)
+            write_spm(spm, model)
+            receipt = write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_hidden_cross_group.json",
+                "scope-current",
+                10,
+                "M_leaf_a",
+                [1],
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            payload["speedtree_material_groups"].append({
+                "collection": "AtlasLeavesB",
+                "material": "M_leaf_b",
+                "material_id": 20,
+                "mesh_ids": [2],
+            })
+            receipt.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
+
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertNotIn(
+                "generator_cross_group_pair",
+                {row["code"] for row in integrity["integrity_issues"]},
+            )
+            hidden_mesh = next(
+                row for row in integrity["managed_meshes"]
+                if row["mesh_id"] == 2
+            )
+            self.assertTrue(hidden_mesh["generator_references"][0]["hidden"])
 
     def test_managed_generator_reference_without_guid_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

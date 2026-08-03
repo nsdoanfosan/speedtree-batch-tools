@@ -369,7 +369,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
     "generator_cross_group_pair": ReasonRow(
-        UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
+        UNSUPPORTED, "sk_batch/atlas_consumer_integrity.py", "visible_generator_pair",
     ),
     "generator_guid_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
@@ -797,10 +797,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         UNSUPPORTED, "cluster_export_handoff_contract.py", "export_hierarchy",
     ),
     "atlas_manifest_authority_missing": ReasonRow(
-        UNSUPPORTED, "sk_batch/atlas_consumer_integrity.py", "atlas_ownership",
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
     ),
     "atlas_manifest_resolution_conflict": ReasonRow(
-        UNSUPPORTED, "sk_batch/atlas_consumer_integrity.py", "atlas_ownership",
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
     ),
     "atlas_marker_kind_mismatch": ReasonRow(
         FATAL, "sk_batch/atlas_consumer_integrity.py", "atlas_integrity",
@@ -879,6 +879,9 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "live_export_evidence_unavailable_stale_node_table": ReasonRow(
         REPAIRABLE, "sk_batch/sk_batch_gui.pyw", "modeler_node_table",
+    ),
+    "lineage_unproven": ReasonRow(
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
     ),
     "manual_required": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
@@ -1050,7 +1053,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
 
 # Seeded on 2026-08-03.  Lower it in the same commit that classifies a code;
 # never raise it.  A new block ships with a disposition or it does not ship.
-UNCLASSIFIED_CEILING = 190
+UNCLASSIFIED_CEILING = 189
 
 # The planner now derives its vocabulary exclusively from emitted registry
 # rows.  Historical aliases with no production emitter were deleted rather

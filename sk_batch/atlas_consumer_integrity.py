@@ -832,7 +832,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
             pair_reasons.append(
                 "Selected manifests assign Material and Mesh to different groups"
             )
-        if pair_reasons:
+        if pair_reasons and not slot["hidden"]:
             add_generator_issue(
                 "generator_cross_group_pair",
                 "; ".join(pair_reasons),
