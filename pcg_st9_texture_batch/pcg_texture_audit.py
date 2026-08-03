@@ -7797,6 +7797,46 @@ def _audit_report_folders(
     # Asset folders are independent read-only audits. Running four at a time
     # keeps OneDrive I/O bounded. The shared blend-index session is explicitly
     # bound inside audit_one; no mutable folder result is shared between tasks.
+    def _audit_failure_item(folder, exc):
+        """Represent one unauditable folder without losing the other folders.
+
+        The reason token is the precise one when the failure is a manifest
+        ownership conflict -- that code is registered `unsupported`, so it
+        reaches the operator as a named row with an action -- and the generic
+        `asset_audit_failed` otherwise.
+        """
+        path = Path(folder)
+        precise = isinstance(exc, AtlasManifestResolutionError)
+        return {
+            "folder": str(path),
+            "name": path.name,
+            "status": "audit_failed",
+            "actions": [
+                "이 폴더의 감사가 실패해 결과를 신뢰할 수 없습니다",
+                "표시된 원인을 해결한 뒤 이 폴더만 다시 검사하세요",
+            ],
+            "reason_token": (
+                "atlas_manifest_ownership_conflict"
+                if precise
+                else "asset_audit_failed"
+            ),
+            "evidence": {
+                "folder": str(path),
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:2000],
+            },
+            "target_spm_statuses": [],
+            "target_mesh_names": [],
+            "pcg_target_mesh_names": [],
+            "pcg_target_meshes": [],
+            "pcg_mesh_names": [],
+            "pcg_data_assets": [],
+            "level_mesh_names": [],
+            "level_placements": [],
+            "duplicate_target_mesh_names": [],
+            "duplicate_pcg_target_mesh_names": [],
+        }
+
     indexed_items = {}
     with ThreadPoolExecutor(
         max_workers=min(4, total_folders),
@@ -7824,7 +7864,17 @@ def _audit_report_folders(
                     pending.cancel()
                 raise RuntimeError("PCG folder audit cancelled")
             index, folder = futures[future]
-            indexed_items[index] = future.result()
+            try:
+                indexed_items[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 - one folder must not end the run
+                # A folder that cannot be audited is a blocked folder, not the
+                # end of the report.  Before this, one asset with a conflicted
+                # Atlas manifest -- three targets currently have one -- raised
+                # out of its worker and terminated the whole-tree audit, so no
+                # Cluster Assembly receipt could be regenerated for any asset
+                # in the fleet and every downstream assembly build was skipped.
+                # Same target-local isolation as #16, one layer up.
+                indexed_items[index] = _audit_failure_item(folder, exc)
             if item_callback is not None:
                 item_callback(indexed_items[index], folder)
             completed += 1
