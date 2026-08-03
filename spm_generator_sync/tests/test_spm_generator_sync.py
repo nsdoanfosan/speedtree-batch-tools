@@ -14,7 +14,13 @@ from unittest import mock
 TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
-from spm_generator_sync import spm_generator_sync as sync
+import spm_generator_sync as sync
+
+# CI discovers this directory directly, where ``spm_generator_sync`` is the
+# implementation module.  A repository-wide run can already have imported the
+# package of the same name; in that case select its implementation submodule.
+if not hasattr(sync, "SPMDocument"):
+    from spm_generator_sync import spm_generator_sync as sync
 from atlas_manifest_resolver import (
     GENERATOR_BINDING_OWNERSHIP_CONTRACT,
     GENERATOR_BINDING_OWNERSHIP_VERSION,
