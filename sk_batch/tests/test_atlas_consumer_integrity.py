@@ -392,6 +392,98 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 {"current_default_cutout"},
             )
 
+    def test_complete_unselected_groups_from_one_current_authority_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_cluster_blackgum_pattern.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            groups = [
+                {
+                    "collection": "Green",
+                    "material": "M_cluster_green",
+                    "material_id": 8,
+                    "mesh_ids": [1, 2],
+                },
+                {
+                    "collection": "stem",
+                    "material": "M_cluster_stem",
+                    "material_id": 9,
+                    "mesh_ids": [3, 4],
+                },
+                {
+                    "collection": "Small",
+                    "material": "M_cluster_small",
+                    "material_id": 10,
+                    "mesh_ids": [5, 6],
+                },
+            ]
+            for group in groups:
+                add_material(
+                    assets,
+                    group["material_id"],
+                    group["material"],
+                    group["mesh_ids"],
+                    "scope-current",
+                    group=group["collection"],
+                )
+                for mesh_id in group["mesh_ids"]:
+                    add_external_mesh(
+                        assets,
+                        root,
+                        mesh_id,
+                        "scope-current",
+                        group=group["collection"],
+                    )
+            add_generator(model, 8, -10)
+            write_spm(spm, model)
+            write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_cluster_blackgum_pattern.json",
+                "scope-current",
+                8,
+                "M_cluster_green",
+                [1, 2],
+                groups=groups,
+            )
+            before = spm.read_bytes()
+
+            report = inspect_spm_mesh_file_references(spm)
+
+            self.assertEqual(spm.read_bytes(), before)
+            self.assertEqual(report["status"], "ok")
+            integrity = report["atlas_consumer_integrity"]
+            self.assertFalse(integrity["blocking"])
+            self.assertEqual(integrity["managed_orphan_mesh_count"], 0)
+            self.assertEqual(integrity["managed_orphan_material_count"], 0)
+            self.assertEqual(
+                integrity["classification_counts"],
+                {
+                    "current_default_cutout": 3,
+                    "current_unused_group": 6,
+                },
+            )
+            self.assertEqual(
+                {
+                    row["material_id"]: row["classification"]
+                    for row in integrity["managed_materials"]
+                },
+                {
+                    8: "current_default_cutout",
+                    9: "current_unused_group",
+                    10: "current_unused_group",
+                },
+            )
+            self.assertEqual(
+                {
+                    row["usage"] for row in report["references"]
+                    if row["mesh_id"] in {3, 4, 5, 6}
+                },
+                {"current_unused_group"},
+            )
+            self.assertEqual(integrity["repair_input"]["candidates"], [])
+
     def test_foreign_scope_and_untagged_manual_assets_are_protected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
