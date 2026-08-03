@@ -516,7 +516,7 @@ def assign_authored_nodes_to_components(
         nearest = nearest_by_component.get(row["component_id"])
         unmatched.append({
             **row,
-            "reason": (
+            "match_diagnostic": (
                 "no_state_mesh_candidate"
                 if nearest is None
                 else "bounded_one_to_one_candidate_unavailable"

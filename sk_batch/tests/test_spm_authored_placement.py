@@ -8,9 +8,13 @@ from pathlib import Path
 
 
 SK_BATCH = Path(__file__).resolve().parents[1]
+REPO_DIR = SK_BATCH.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
 if str(SK_BATCH) not in sys.path:
     sys.path.insert(0, str(SK_BATCH))
 
+from repair_orchestration import REASON_KEYS  # noqa: E402
 from spm_authored_placement import (  # noqa: E402
     SpmAuthoredPlacementError,
     assign_authored_nodes_to_components,
@@ -220,7 +224,22 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
                 result["assignments"]["component-b"]["node_guid"], "b"
             )
             self.assertEqual(
-                result["unmatched"][0]["reason"], "no_state_mesh_candidate"
+                result["unmatched"][0]["match_diagnostic"],
+                "no_state_mesh_candidate",
+            )
+
+            def emitted_mapping_keys(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        yield key
+                        yield from emitted_mapping_keys(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from emitted_mapping_keys(child)
+
+            self.assertTrue(
+                REASON_KEYS.isdisjoint(emitted_mapping_keys(result)),
+                "placement diagnostics must not masquerade as repair reasons",
             )
 
     def test_global_assignment_preserves_maximum_bounded_cardinality(self):
