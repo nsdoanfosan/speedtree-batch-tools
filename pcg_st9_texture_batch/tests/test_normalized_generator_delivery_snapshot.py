@@ -1,3 +1,4 @@
+import copy
 import gzip
 import json
 import sys
@@ -20,12 +21,16 @@ from pcg_cluster_assembly_contract import (  # noqa: E402
     _normalized_generator_delivery,
 )
 import pcg_texture_audit as audit_module  # noqa: E402
+from atlas_manifest_resolver import (  # noqa: E402
+    generator_binding_ownership_fingerprint,
+)
 from generator_delivery_scope import (  # noqa: E402
     CONTINUITY_ONLY_POLICY,
     INTENT_KIND,
     RESOLVED_KIND,
     RUNTIME_INACTIVE_POLICY,
     SCOPE_KIND,
+    canonical_slot_identity,
     canonical_sha256,
 )
 
@@ -231,18 +236,18 @@ def write_unused_base_delivery_spm(path):
 
 def declared_bindings(generator_guid=None):
     generator_guid = (
-        GENERATOR_GUID.upper() if generator_guid is None else generator_guid
+        GENERATOR_GUID if generator_guid is None else generator_guid
     )
     return [
         {
             "state": "already_connected",
-            # Deliberately differs from the live XML enumeration.  A GUID is
-            # present, so array position must never become identity.
+            # Deliberately differs from the live XML enumeration.  Exact GUID
+            # and slot identity, rather than array position, owns the match.
             "generator_index": 20,
             "generator_name": "generator 20",
             "generator_guid": generator_guid,
             "generator_type": "Leaf Mesh",
-            "slot_prefix": slot_prefix.upper(),
+            "slot_prefix": slot_prefix,
             "target_material_id": 4,
             "target_mesh_id": mesh_id,
         }
@@ -330,6 +335,90 @@ def explicit_delivery_payload(spm, required_indices, generator_guid=None):
     return payload
 
 
+def explicit_ownership_payload(
+    spm,
+    current_indices,
+    *,
+    required_indices=None,
+    current_overrides=None,
+):
+    """Return one historical producer scope plus explicit current ownership."""
+
+    required_indices = (
+        set(range(len(SLOT_PREFIXES)))
+        if required_indices is None
+        else set(required_indices)
+    )
+    payload = explicit_delivery_payload(
+        spm,
+        required_indices,
+        generator_guid=GENERATOR_GUID,
+    )
+    connection = payload["generator_connection"]
+    authored = copy.deepcopy(connection["bindings"])
+    exact_authored = [
+        {
+            "slot_identity": list(canonical_slot_identity(row)),
+            "target_material_id": row["target_material_id"],
+            "target_mesh_id": row["target_mesh_id"],
+        }
+        for row in authored
+    ]
+    intent = connection["delivery_scope"]["intent"]
+    intent["authored_slots"] = copy.deepcopy(exact_authored)
+    intent["required_live_slot_identities"] = [
+        copy.deepcopy(row["slot_identity"])
+        for index, row in enumerate(exact_authored)
+        if index in required_indices
+    ]
+    intent["continuity_only_slots"] = [
+        {
+            "slot_identity": copy.deepcopy(row["slot_identity"]),
+            "reason": "operator-authored continuity fixture",
+            "policy": CONTINUITY_ONLY_POLICY,
+            "provenance": {
+                "fixture": "issue-163-explicit-ownership",
+                "authority_revision": 1,
+            },
+        }
+        for index, row in enumerate(exact_authored)
+        if index not in required_indices
+    ]
+    intent.pop("intent_sha256", None)
+    intent["intent_sha256"] = canonical_sha256(intent)
+    resolved = connection["delivery_scope"]["resolved"]
+    resolved["intent_sha256"] = intent["intent_sha256"]
+    resolved["bindings_sha256"] = canonical_sha256(exact_authored)
+    resolved.pop("resolved_sha256", None)
+    resolved["resolved_sha256"] = canonical_sha256(resolved)
+    connection["authored_bindings"] = authored
+    overrides = dict(current_overrides or {})
+    current = []
+    for index in current_indices:
+        row = copy.deepcopy(authored[index])
+        row.update(copy.deepcopy(overrides.get(index) or {}))
+        current.append(row)
+    connection["bindings"] = copy.deepcopy(current)
+    projected = [
+        {
+            "generator_guid": row["generator_guid"],
+            "slot_prefix": row["slot_prefix"],
+            "target_material_id": row["target_material_id"],
+            "target_mesh_id": row["target_mesh_id"],
+        }
+        for row in current
+    ]
+    payload["generator_binding_ownership"] = {
+        "contract": "atlas_generator_current_binding_ownership",
+        "version": 1,
+        "basis": "live_spm_material_mesh_projection",
+        "binding_count": len(projected),
+        "fingerprint": generator_binding_ownership_fingerprint(projected),
+        "bindings": projected,
+    }
+    return payload
+
+
 def delivery_variants():
     return [
         {"target_mesh_id": mesh_id}
@@ -363,11 +452,18 @@ def snapshot_binding(
     }
 
 
-def fake_snapshot(spm, bindings, mesh_ids, total_node_count=1):
+def fake_snapshot(
+    spm,
+    bindings,
+    mesh_ids,
+    total_node_count=1,
+    *,
+    spm_text_sha256="a" * 64,
+):
     return {
         "contract": "speedtree_live_generator_delivery_snapshot_v1",
         "spm": str(Path(spm).resolve(strict=False)),
-        "spm_text_sha256": "a" * 64,
+        "spm_text_sha256": spm_text_sha256,
         "total_node_count": total_node_count,
         "leaf_generator_bindings": bindings,
         "mesh_asset_ids": list(mesh_ids),
@@ -481,20 +577,20 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         self.assertEqual(delivery["delivery_scope_mode"], "legacy_strict")
         self.assertIsNone(delivery["recovery_target_scope"])
 
-    def test_guid_case_slot_case_and_manifest_index_share_one_identity(self):
+    def test_legacy_guid_case_slot_case_and_manifest_index_share_one_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
-            write_blackgum_delivery_spm(
-                target,
-                connected=True,
-                node_guid=GENERATOR_GUID.upper(),
-            )
+            write_blackgum_delivery_spm(target, connected=True)
 
             snapshot = audit_module.live_generator_delivery_snapshot(target)
+            payload = delivery_payload()
+            for row in payload["generator_connection"]["bindings"]:
+                row["generator_guid"] = row["generator_guid"].upper()
+                row["slot_prefix"] = row["slot_prefix"].upper()
             delivery = _normalized_generator_delivery(
                 audit_module,
                 target,
-                delivery_payload(),
+                payload,
                 {"material_id": 4},
                 delivery_variants(),
             )
@@ -829,8 +925,8 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             for row in delivery["binding_outcomes"]
         ))
 
-    def test_modeler_shortened_guid_is_the_same_declared_generator(self):
-        """The RFC and Modeler spellings resolve to one Generator identity."""
+    def test_legacy_modeler_shortened_guid_is_same_declared_generator(self):
+        """Pre-contract receipts retain their semantic compatibility join."""
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "SK_bush_blackgum_02.spm"
             write_blackgum_delivery_spm(
@@ -868,7 +964,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         )
         self.assertTrue(delivery["live_generator_delivery_complete"])
 
-    def test_both_guid_spellings_share_one_slot_identity(self):
+    def test_legacy_guid_spellings_share_one_comparison_identity(self):
         minted = _delivery_binding_slot_identity({
             "generator_guid": MINTED_GENERATOR_GUID,
             "slot_prefix": "Leaves:Type:0",
@@ -1069,6 +1165,297 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             [row["status"] for row in delivery["binding_outcomes"]],
             ["completed", "continuity_only", "continuity_only", "continuity_only"],
         )
+
+    def test_explicit_ownership_audits_only_retained_black_locust_slots(self):
+        target = "SK_branch_black_locust_01.spm"
+        retained = (0, 3)
+        successor_mesh_ids = (230, 231)
+        rows = [
+            snapshot_binding(SLOT_PREFIXES[index], TARGET_MESH_IDS[index])
+            for index in retained
+        ]
+        rows.extend(
+            snapshot_binding(
+                SLOT_PREFIXES[index],
+                mesh_id,
+                material_id=10,
+            )
+            for index, mesh_id in zip((1, 2), successor_mesh_ids)
+        )
+
+        class HandoffAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS + successor_mesh_ids,
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            HandoffAudit,
+            target,
+            explicit_ownership_payload(target, retained),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
+        )
+        self.assertEqual(delivery["declared_binding_count"], 2)
+        self.assertEqual(delivery["active_required_binding_count"], 2)
+        self.assertEqual(
+            delivery["delivery_scope_required_live_slot_count"], 2
+        )
+        self.assertEqual(
+            delivery["current_required_target_mesh_ids"],
+            [TARGET_MESH_IDS[0], TARGET_MESH_IDS[3]],
+        )
+        self.assertEqual(
+            delivery["normalized_target_mesh_ids"], list(TARGET_MESH_IDS)
+        )
+        self.assertEqual(
+            delivery["recovery_target_scope"]["authoring_mesh_ids"],
+            [TARGET_MESH_IDS[0], TARGET_MESH_IDS[3]],
+        )
+        self.assertEqual(
+            delivery["recovery_target_scope"]["required_live_mesh_ids"],
+            [TARGET_MESH_IDS[0], TARGET_MESH_IDS[3]],
+        )
+        self.assertEqual(
+            delivery["delivery_scope_postwrite_validation_mode"],
+            "historical_production_proof",
+        )
+        self.assertFalse(
+            delivery["delivery_scope_postwrite_matches_current"]
+        )
+
+    def test_explicit_ownership_ignores_other_provider_on_shared_material(self):
+        target = "SK_branch_black_locust_shared_material.spm"
+        retained = (0, 3)
+        successor_mesh_ids = (230, 231)
+        rows = [
+            snapshot_binding(SLOT_PREFIXES[index], TARGET_MESH_IDS[index])
+            for index in retained
+        ]
+        # The successor deliberately uses the same Material ID.  Ownership is
+        # still disjoint by exact semantic slot and Mesh pair.
+        rows.extend(
+            snapshot_binding(
+                SLOT_PREFIXES[index],
+                mesh_id,
+                material_id=4,
+            )
+            for index, mesh_id in zip((1, 2), successor_mesh_ids)
+        )
+
+        class SharedMaterialAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS + successor_mesh_ids,
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            SharedMaterialAudit,
+            target,
+            explicit_ownership_payload(target, retained),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["live_export_participating_target_mesh_ids"],
+            [TARGET_MESH_IDS[0], TARGET_MESH_IDS[3]],
+        )
+        self.assertEqual(len(delivery["live_generator_bindings"]), 2)
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
+        )
+
+    def test_explicit_ownership_keeps_case_only_live_slots_distinct(self):
+        target = "SK_branch_black_locust_case_distinct.spm"
+        current = snapshot_binding(SLOT_PREFIXES[0], TARGET_MESH_IDS[0])
+        rows = [
+            current,
+            {
+                **snapshot_binding(
+                    SLOT_PREFIXES[0].upper(), 230, material_id=4
+                ),
+                "generator_guid": GENERATOR_GUID,
+            },
+            {
+                **snapshot_binding(SLOT_PREFIXES[0], 231, material_id=4),
+                "generator_guid": GENERATOR_GUID.upper(),
+            },
+        ]
+
+        class CaseDistinctAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS + (230, 231),
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            CaseDistinctAudit,
+            target,
+            explicit_ownership_payload(target, (0,)),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(len(delivery["live_generator_bindings"]), 1)
+        self.assertEqual(
+            delivery["live_generator_bindings"][0]["slot_prefix"],
+            SLOT_PREFIXES[0],
+        )
+        self.assertEqual(
+            delivery["live_generator_bindings"][0]["generator_guid"],
+            GENERATOR_GUID,
+        )
+
+    def test_explicit_current_slot_outside_exact_authored_scope_fails_closed(self):
+        target = "SK_branch_black_locust_foreign_exact_slot.spm"
+        foreign_slot = SLOT_PREFIXES[0].upper()
+        rows = [snapshot_binding(foreign_slot, TARGET_MESH_IDS[0])]
+
+        class ForeignCurrentSlotAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS,
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            ForeignCurrentSlotAudit,
+            target,
+            explicit_ownership_payload(
+                target,
+                (0,),
+                current_overrides={0: {"slot_prefix": foreign_slot}},
+            ),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertIn(
+            "current_generator_ownership_outside_sealed_authored_scope",
+            delivery["errors"],
+        )
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_CONNECTION_INCOMPLETE,
+        )
+
+    def test_explicit_zero_current_ownership_is_relinquished_asset_only(self):
+        target = "SK_branch_black_locust_01.spm"
+        successor_mesh_ids = (230, 231, 232, 233)
+        rows = [
+            snapshot_binding(slot, mesh_id, material_id=10)
+            for slot, mesh_id in zip(SLOT_PREFIXES, successor_mesh_ids)
+        ]
+
+        class FullyRelinquishedAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS + successor_mesh_ids,
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            FullyRelinquishedAudit,
+            target,
+            explicit_ownership_payload(target, ()),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+        )
+        self.assertEqual(delivery["delivery_decision"], "pass_through")
+        self.assertEqual(
+            delivery["delivery_reason"],
+            "generator_current_ownership_relinquished",
+        )
+        self.assertEqual(delivery["declared_binding_count"], 0)
+        self.assertEqual(
+            delivery["delivery_scope_required_live_slot_count"], 0
+        )
+        self.assertEqual(
+            delivery["delivery_scope_continuity_only_slot_count"], 0
+        )
+        self.assertIsNone(delivery["recovery_target_scope"])
+
+    def test_explicit_material_default_mesh_is_semantic_not_asset_id(self):
+        target = "SK_branch_black_locust_default_cutout.spm"
+        successor_mesh_ids = (230, 231, 232)
+        rows = [
+            snapshot_binding(SLOT_PREFIXES[0], -10),
+            *[
+                snapshot_binding(slot, mesh_id, material_id=10)
+                for slot, mesh_id in zip(
+                    SLOT_PREFIXES[1:], successor_mesh_ids
+                )
+            ],
+        ]
+
+        class MaterialDefaultAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    rows,
+                    TARGET_MESH_IDS + successor_mesh_ids,
+                    spm_text_sha256="b" * 64,
+                )
+
+        delivery = _normalized_generator_delivery(
+            MaterialDefaultAudit,
+            target,
+            explicit_ownership_payload(
+                target,
+                (0,),
+                current_overrides={0: {"target_mesh_id": -10}},
+            ),
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
+        )
+        self.assertEqual(
+            delivery["current_required_target_mesh_ids"], [-10]
+        )
+        self.assertEqual(
+            delivery["live_export_participating_target_mesh_ids"], [-10]
+        )
+        self.assertEqual(
+            delivery["binding_outcomes"][0]["target_mesh_id"], -10
+        )
+        self.assertIsNone(delivery["recovery_target_scope"])
 
     def test_explicit_empty_required_scope_is_distinct_from_runtime_inactive(self):
         rows = [

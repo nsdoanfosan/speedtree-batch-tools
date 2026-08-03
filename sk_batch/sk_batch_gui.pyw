@@ -64,6 +64,8 @@ from exact_target_command import (
 )
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
+    ATLAS_PRODUCER_REFRESH,
+    ATLAS_SLOT_OWNERSHIP_RECONCILE,
     ALL_REPAIR_CONTRACT_CODES,
     DURABLE_FAILURE_REASON_CODES,
     GENERATOR_SYNC_TOOL,
@@ -5654,16 +5656,25 @@ class App:
         executor = executors.get(tool)
         if executor is None:
             raise RuntimeError(f"unsupported exact repair tool: {tool}")
+        provenance = {
+            "reason_codes": list(plan.get("reason_codes") or ()),
+            "evidence_sha256": plan.get("evidence_sha256"),
+            "source": str(provenance_source),
+        }
+        if stage.get("repair_action") == ATLAS_SLOT_OWNERSHIP_RECONCILE:
+            provenance["ownership_plan"] = copy.deepcopy(
+                stage.get("ownership_plan")
+            )
+        if stage.get("repair_action") == ATLAS_PRODUCER_REFRESH:
+            provenance["producer_relation"] = copy.deepcopy(
+                stage.get("producer_relation")
+            )
         request = build_exact_target_request(
             tool=tool,
             repair_action=stage["repair_action"],
             target_spms=stage["target_spms"],
             repair_stage=stage["stage"],
-            provenance={
-                "reason_codes": list(plan.get("reason_codes") or ()),
-                "evidence_sha256": plan.get("evidence_sha256"),
-                "source": str(provenance_source),
-            },
+            provenance=provenance,
             parent_retry_id=plan["parent_retry_id"],
             request_id=f"{plan['request_id']}-{stage_index}",
             receipt=receipt,
@@ -10894,13 +10905,61 @@ class App:
         return Path(result.get("canonical_spm") or spm)
 
     def _run_inline_atlas_manifest_repair(self, spm, failure_report):
-        """Run one exact mirror repair under the already-owned batch lease."""
+        """Run one exact Atlas repair under the already-owned batch lease."""
 
         from pcg_st9_texture_batch.exact_target_repair import (
             execute_step3_standard,
         )
 
         spm = Path(spm).expanduser().absolute()
+        reason_codes = sorted(set(evidence_reason_codes(failure_report)))
+        ownership_route = bool({
+            "atlas_manifest_ownership_conflict",
+            "atlas_manifest_resolution_conflict",
+        }.intersection(reason_codes))
+        ownership_plan = None
+        if ownership_route:
+            from spm_generator_sync.exact_target_repair import (
+                execute_exact_generator_request,
+            )
+            from atlas_slot_ownership import (
+                AtlasSlotOwnershipError,
+                plan_atlas_slot_ownership_reconciliation,
+                validate_atlas_slot_ownership_plan,
+            )
+
+            evidence = failure_report.get("evidence") or {}
+            supplied_plan = (
+                evidence.get("ownership_plan")
+                if isinstance(evidence, dict)
+                else None
+            )
+            try:
+                ownership_plan = validate_atlas_slot_ownership_plan(
+                    supplied_plan,
+                    target_spm=spm,
+                    require_repairable=True,
+                )
+            except (AtlasSlotOwnershipError, OSError, ValueError) as exc:
+                raise BatchItemError(
+                    "최종 차단: live SPM 기반 Atlas slot ownership 계획이 "
+                    "없거나 더 이상 유효하지 않습니다.",
+                    kind="data_error",
+                    report={
+                        "repair_disposition": REPAIR_UI_BLOCKED,
+                        "original_failure": copy.deepcopy(failure_report),
+                        "ownership_plan_error": str(exc),
+                    },
+                ) from exc
+            repair_action = ATLAS_SLOT_OWNERSHIP_RECONCILE
+            repair_tool = GENERATOR_SYNC_TOOL
+            repair_stage = "atlas_slot_ownership_reconcile"
+            executor = execute_exact_generator_request
+        else:
+            repair_action = ATLAS_MANIFEST_MIRROR_REPAIR
+            repair_tool = PCG_TEXTURE_TOOL
+            repair_stage = "atlas_manifest_repair"
+            executor = execute_step3_standard
         lease = getattr(self, "_active_shared_queue_lease", None)
         if lease is None or getattr(lease, "finished", False):
             raise BatchItemError(
@@ -10909,9 +10968,10 @@ class App:
                 report=copy.deepcopy(failure_report),
             )
         key = os.path.normcase(os.path.abspath(str(spm))).casefold()
+        memo_key = f"{repair_action}\0{key}"
         with _INLINE_ATLAS_REPAIR_LOCK:
             memo = self.__dict__.setdefault("_inline_atlas_repair_results", {})
-            cached = memo.get(key)
+            cached = memo.get(memo_key)
             if cached is not None:
                 cached_status = str(
                     cached.get("terminal_status")
@@ -10921,14 +10981,24 @@ class App:
                 if cached_status != "completed":
                     terminal = copy.deepcopy(cached)
                 else:
-                    current_plan = atlas_manifest_mirror_repair_plan(spm)
-                    if current_plan.get("status") == "not_needed":
+                    if ownership_route:
+                        current_plan = (
+                            plan_atlas_slot_ownership_reconciliation(spm)
+                        )
+                        repair_is_current = (
+                            current_plan.get("status") == "current"
+                        )
+                    else:
+                        current_plan = atlas_manifest_mirror_repair_plan(spm)
+                        repair_is_current = (
+                            current_plan.get("status") == "not_needed"
+                        )
+                    if repair_is_current:
                         terminal = copy.deepcopy(cached)
                     else:
-                        # A later producer can make the same mirror stale again
+                        # A later producer can change mirror or slot ownership
                         # during one long batch. Current evidence, not the earlier
-                        # successful receipt, decides whether another exact repair
-                        # is required.
+                        # receipt, decides whether another exact repair is needed.
                         cached = None
             if cached is None:
                 active_job = getattr(self, "active_batch_job", None) or {}
@@ -10941,7 +11011,13 @@ class App:
                     or "direct-batch"
                 )
                 request_hash = hashlib.sha256(
-                    (queue_identity + "\0" + key).encode("utf-8")
+                    (
+                        queue_identity
+                        + "\0"
+                        + repair_action
+                        + "\0"
+                        + key
+                    ).encode("utf-8")
                 ).hexdigest()[:16]
                 request_id = f"inline-atlas-{request_hash}"
                 receipt = LOG_DIR / f"exact_repair_{request_id}.json"
@@ -10950,19 +11026,25 @@ class App:
                     or active_job.get("shared_queue_job_id")
                     or f"sk-batch-{active_job.get('id') or 'direct'}"
                 )
-                reason_codes = sorted(set(
-                    evidence_reason_codes(failure_report)
-                    or ["atlas_manifest_mirror_conflict_repairable"]
-                ))
+                reason_codes = reason_codes or [
+                    "atlas_manifest_ownership_conflict"
+                    if ownership_route
+                    else "atlas_manifest_mirror_conflict_repairable"
+                ]
+                provenance = {
+                    "reason_codes": reason_codes,
+                    "source": "sk_batch.inline_atlas_preflight",
+                }
+                if ownership_route:
+                    provenance["ownership_plan"] = copy.deepcopy(
+                        ownership_plan
+                    )
                 request = build_exact_target_request(
-                    tool=PCG_TEXTURE_TOOL,
-                    repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
+                    tool=repair_tool,
+                    repair_action=repair_action,
                     target_spms=[spm],
-                    repair_stage="atlas_manifest_repair",
-                    provenance={
-                        "reason_codes": reason_codes,
-                        "source": "sk_batch.inline_atlas_preflight",
-                    },
+                    repair_stage=repair_stage,
+                    provenance=provenance,
                     parent_retry_id=parent_retry_id,
                     request_id=request_id,
                     receipt=receipt,
@@ -10988,12 +11070,12 @@ class App:
 
                 terminal = run_exact_target_request(
                     request,
-                    execute_step3_standard,
+                    executor,
                     inherited_lease=lease,
                     cancel_event=self.stop_flag,
                     on_progress=on_progress,
                 )
-                memo[key] = copy.deepcopy(terminal)
+                memo[memo_key] = copy.deepcopy(terminal)
             terminal_status = str(
                 terminal.get("terminal_status")
                 or terminal.get("status")
@@ -11022,11 +11104,36 @@ class App:
                     },
                 )
             result = copy.deepcopy(terminal.get("result") or {})
+            if ownership_route:
+                try:
+                    canonical_refresh = refresh_atlas_manifests_for_spm(
+                        spm,
+                        require_complete=True,
+                    )
+                except CanonicalOutputManifestError as exc:
+                    raise BatchItemError(
+                        "Atlas slot ownership 복구 후 canonical manifest "
+                        "재검증에 실패했습니다: "
+                        + compact_error_message(str(exc), 320),
+                        kind="automatic_repair_failed",
+                        report={
+                            "repair_disposition": REPAIR_UI_BLOCKED,
+                            "original_failure": copy.deepcopy(failure_report),
+                            "exact_repair_receipt": copy.deepcopy(terminal),
+                            "post_repair_failure": copy.deepcopy(
+                                getattr(exc, "report", {}) or {}
+                            ),
+                        },
+                    ) from exc
+            else:
+                canonical_refresh = copy.deepcopy(
+                    result.get("canonical_refresh") or {}
+                )
             self.log(
                 "[자동 복구 완료] Canonical PCG → Atlas manifest · "
                 f"{spm.name}"
             )
-            return copy.deepcopy(result.get("canonical_refresh") or {})
+            return canonical_refresh
 
     def _refresh_canonical_atlas_manifests(self, spm):
         """Synchronize canonical PCG output into Atlas before Blender starts."""

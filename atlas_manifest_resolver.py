@@ -20,6 +20,7 @@ operational payloads.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -28,6 +29,14 @@ from pathlib import Path
 
 RESOLUTION_SCHEMA_VERSION = 1
 SUPPORTED_ATLAS_SCHEMA_VERSIONS = {1}
+GENERATOR_BINDING_OWNERSHIP_CONTRACT = (
+    "atlas_generator_current_binding_ownership"
+)
+GENERATOR_BINDING_OWNERSHIP_VERSION = 1
+GENERATOR_SLOT_CREATION_PROVENANCE_CONTRACT = (
+    "atlas_generator_slot_creation_provenance"
+)
+GENERATOR_SLOT_CREATION_PROVENANCE_VERSION = 1
 
 KIND_PRECEDENCE = {
     "exact_per_target": 0,
@@ -53,6 +62,23 @@ class AtlasManifestResolutionError(RuntimeError):
     def __init__(self, message, resolution):
         super().__init__(message)
         self.resolution = resolution
+
+
+class _GeneratorContractError(ValueError):
+    """One explicit Generator ownership/provenance block is untrustworthy."""
+
+    def __init__(self, reason, **details):
+        super().__init__(reason)
+        self.reason = str(reason)
+        self.details = dict(details)
+
+
+class _GeneratorBindingOwnershipContractError(_GeneratorContractError):
+    """One explicit current-binding ownership block is not trustworthy."""
+
+
+class _GeneratorSlotCreationProvenanceContractError(_GeneratorContractError):
+    """One explicit slot-creation provenance block is not trustworthy."""
 
 
 def normalized_manifest_path(path, *, relative_to=None):
@@ -164,7 +190,371 @@ def _claim_projection(group):
     return _without_derived_texture_fields(copy.deepcopy(group))
 
 
+def _integer_claim_value(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_generator_target_material_id(value):
+    """Return one semantic Material ID, or ``None`` when invalid."""
+    normalized = _integer_claim_value(value)
+    return normalized if normalized is not None and normalized > 0 else None
+
+
+def normalize_generator_target_mesh_id(value):
+    """Return a positive Mesh ID or SpeedTree's default-cutout sentinel."""
+    normalized = _integer_claim_value(value)
+    if normalized == -10 or (normalized is not None and normalized > 0):
+        return normalized
+    return None
+
+
+def _canonical_json_sha256(value):
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def generator_binding_ownership_projection(bindings):
+    """Return the canonical current-owner rows shared with reconcilers."""
+    rows = []
+    for binding in bindings or []:
+        if not isinstance(binding, dict):
+            continue
+        rows.append({
+            "generator_guid": str(
+                binding.get("generator_guid") or ""
+            ).strip(),
+            "slot_prefix": str(binding.get("slot_prefix") or "").strip(),
+            "target_material_id": normalize_generator_target_material_id(
+                binding.get("target_material_id")
+            ),
+            "target_mesh_id": normalize_generator_target_mesh_id(
+                binding.get("target_mesh_id")
+            ),
+        })
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["generator_guid"],
+            row["slot_prefix"],
+        ),
+    )
+
+
+def generator_binding_ownership_fingerprint(bindings):
+    return _canonical_json_sha256(
+        generator_binding_ownership_projection(bindings)
+    )
+
+
+def generator_slot_creation_provenance_fingerprint(slots):
+    """Fingerprint full creator rows without turning them into ownership."""
+    normalized = []
+    for slot in slots or []:
+        if not isinstance(slot, dict):
+            continue
+        row = copy.deepcopy(slot)
+        row["generator_guid"] = str(
+            row.get("generator_guid") or ""
+        ).strip()
+        row["slot_prefix"] = str(row.get("slot_prefix") or "").strip()
+        normalized.append(row)
+    normalized.sort(key=lambda row: (
+        row["generator_guid"],
+        row["slot_prefix"],
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    ))
+    return _canonical_json_sha256(normalized)
+
+
+def _generator_binding_slot_identity(binding, *, require_guid=False):
+    """Return an opaque Generator/slot identity without folding GUID case."""
+    guid = str(binding.get("generator_guid") or "").strip()
+    slot = str(binding.get("slot_prefix") or "").strip()
+    if require_guid and not guid:
+        return None, slot
+    if guid:
+        return ("guid", guid), slot
+    index = str(binding.get("generator_index") or "").strip()
+    name = str(binding.get("generator_name") or "").strip().casefold()
+    owner = (
+        ("index", index)
+        if index
+        else ("name", name)
+        if name
+        else None
+    )
+    return owner, slot
+
+
+def _generator_binding_claim_projection(binding, *, require_guid=False):
+    owner, slot = _generator_binding_slot_identity(
+        binding,
+        require_guid=require_guid,
+    )
+    if owner is None or not slot:
+        return None
+    owner_kind, owner_value = owner
+    projection = {
+        "generator_identity": {
+            "kind": owner_kind,
+            "value": owner_value,
+        },
+        "slot_prefix": slot,
+        "target_material_id": normalize_generator_target_material_id(
+            binding.get("target_material_id")
+        ),
+        "target_mesh_id": normalize_generator_target_mesh_id(
+            binding.get("target_mesh_id")
+        ),
+    }
+    return projection
+
+
+def _explicit_generator_binding_ownership(payload):
+    """Validate and normalize an additive current-ownership contract.
+
+    ``generator_connection.bindings`` remains immutable authored/run evidence.
+    Once this block exists, including with an empty list, only this block
+    carries current binding ownership.
+    """
+    if "generator_binding_ownership" not in payload:
+        return None
+    contract = payload.get("generator_binding_ownership")
+    if not isinstance(contract, dict):
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_not_object"
+        )
+    if contract.get("contract") != GENERATOR_BINDING_OWNERSHIP_CONTRACT:
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_contract_invalid",
+            contract=contract.get("contract"),
+        )
+    version = contract.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_version_invalid",
+            version=version,
+        )
+    if version != GENERATOR_BINDING_OWNERSHIP_VERSION:
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_version_unsupported",
+            version=version,
+        )
+    bindings = contract.get("bindings")
+    if not isinstance(bindings, list):
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_bindings_not_list"
+        )
+    count = contract.get("binding_count")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count != len(bindings)
+    ):
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_binding_count_invalid",
+            binding_count=count,
+            actual_binding_count=len(bindings),
+        )
+
+    normalized = []
+    seen = set()
+    for ordinal, raw_binding in enumerate(bindings):
+        if not isinstance(raw_binding, dict):
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_binding_not_object",
+                binding_index=ordinal,
+            )
+        binding = copy.deepcopy(raw_binding)
+        guid = str(binding.get("generator_guid") or "").strip()
+        slot = str(binding.get("slot_prefix") or "").strip()
+        material_id = normalize_generator_target_material_id(
+            binding.get("target_material_id")
+        )
+        mesh_id = normalize_generator_target_mesh_id(
+            binding.get("target_mesh_id")
+        )
+        if not guid:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_generator_guid_missing",
+                binding_index=ordinal,
+            )
+        if not slot:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_slot_prefix_missing",
+                binding_index=ordinal,
+            )
+        if material_id is None:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_target_material_id_invalid",
+                binding_index=ordinal,
+            )
+        if mesh_id is None:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_target_mesh_id_invalid",
+                binding_index=ordinal,
+            )
+        key = (guid, slot)
+        if key in seen:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_duplicate_slot",
+                binding_index=ordinal,
+                generator_guid=guid,
+                slot_prefix=slot,
+            )
+        seen.add(key)
+        binding["generator_guid"] = guid
+        binding["slot_prefix"] = slot
+        binding["target_material_id"] = material_id
+        binding["target_mesh_id"] = mesh_id
+        normalized.append(binding)
+    fingerprint = str(contract.get("fingerprint") or "").strip()
+    expected_fingerprint = generator_binding_ownership_fingerprint(normalized)
+    if fingerprint != expected_fingerprint:
+        raise _GeneratorBindingOwnershipContractError(
+            "generator_binding_ownership_fingerprint_invalid",
+            fingerprint=fingerprint,
+            expected_fingerprint=expected_fingerprint,
+        )
+    return normalized
+
+
+def _current_generator_bindings(payload):
+    explicit = _explicit_generator_binding_ownership(payload)
+    if explicit is not None:
+        return explicit, True
+    connection = payload.get("generator_connection") or {}
+    bindings = connection.get("bindings") or []
+    return [row for row in bindings if isinstance(row, dict)], False
+
+
+def manifest_current_generator_bindings(payload):
+    """Return current bindings, preferring explicit authority even when empty."""
+    bindings, _explicit = _current_generator_bindings(payload)
+    return copy.deepcopy(bindings)
+
+
+def _explicit_generator_slot_creation_provenance(payload):
+    if "generator_slot_creation_provenance" not in payload:
+        return None
+    provenance = payload.get("generator_slot_creation_provenance")
+    error = _GeneratorSlotCreationProvenanceContractError
+    if not isinstance(provenance, dict):
+        raise error("generator_slot_creation_provenance_not_object")
+    if (
+        provenance.get("contract")
+        != GENERATOR_SLOT_CREATION_PROVENANCE_CONTRACT
+    ):
+        raise error(
+            "generator_slot_creation_provenance_contract_invalid",
+            contract=provenance.get("contract"),
+        )
+    version = provenance.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise error(
+            "generator_slot_creation_provenance_version_invalid",
+            version=version,
+        )
+    if version != GENERATOR_SLOT_CREATION_PROVENANCE_VERSION:
+        raise error(
+            "generator_slot_creation_provenance_version_unsupported",
+            version=version,
+        )
+    slots = provenance.get("slots")
+    if not isinstance(slots, list):
+        raise error("generator_slot_creation_provenance_slots_not_list")
+    count = provenance.get("slot_count")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count != len(slots)
+    ):
+        raise error(
+            "generator_slot_creation_provenance_slot_count_invalid",
+            slot_count=count,
+            actual_slot_count=len(slots),
+        )
+
+    normalized = []
+    seen = set()
+    for ordinal, raw_slot in enumerate(slots):
+        if not isinstance(raw_slot, dict):
+            raise error(
+                "generator_slot_creation_provenance_slot_not_object",
+                slot_index=ordinal,
+            )
+        slot = copy.deepcopy(raw_slot)
+        guid = str(slot.get("generator_guid") or "").strip()
+        prefix = str(slot.get("slot_prefix") or "").strip()
+        if not guid:
+            raise error(
+                "generator_slot_creation_provenance_generator_guid_missing",
+                slot_index=ordinal,
+            )
+        if not prefix:
+            raise error(
+                "generator_slot_creation_provenance_slot_prefix_missing",
+                slot_index=ordinal,
+            )
+        key = (guid, prefix)
+        if key in seen:
+            raise error(
+                "generator_slot_creation_provenance_duplicate_slot",
+                slot_index=ordinal,
+                generator_guid=guid,
+                slot_prefix=prefix,
+            )
+        seen.add(key)
+        slot["generator_guid"] = guid
+        slot["slot_prefix"] = prefix
+        normalized.append(slot)
+
+    fingerprint = str(provenance.get("fingerprint") or "").strip()
+    expected_fingerprint = generator_slot_creation_provenance_fingerprint(
+        normalized
+    )
+    if fingerprint != expected_fingerprint:
+        raise error(
+            "generator_slot_creation_provenance_fingerprint_invalid",
+            fingerprint=fingerprint,
+            expected_fingerprint=expected_fingerprint,
+        )
+    return normalized
+
+
+def manifest_generator_slot_creation_provenance(payload):
+    """Return immutable creator rows without treating them as current owners."""
+    explicit = _explicit_generator_slot_creation_provenance(payload)
+    if explicit is not None:
+        return copy.deepcopy(explicit)
+    connection = payload.get("generator_connection") or {}
+    return [
+        copy.deepcopy(row)
+        for row in connection.get("bindings") or []
+        if isinstance(row, dict) and row.get("created_slot")
+    ]
+
+
 def _candidate_claims(payload, source_identity, kind):
+    # Creator history is deliberately not projected as ownership, but an
+    # explicit block must still validate fail-closed before this receipt can
+    # participate in resolution.
+    _explicit_generator_slot_creation_provenance(payload)
     claims = {}
     for group in _material_groups(payload):
         name = str(group.get("material") or "").strip().casefold()
@@ -178,24 +568,48 @@ def _candidate_claims(payload, source_identity, kind):
         if material_id:
             claims[f"material_id:{material_id}"] = projection
 
-    connection = payload.get("generator_connection") or {}
-    for binding in connection.get("bindings") or []:
-        if not isinstance(binding, dict):
-            continue
-        slot = str(binding.get("slot_prefix") or "").strip().casefold()
-        guid = str(binding.get("generator_guid") or "").strip().casefold()
-        index = str(binding.get("generator_index") or "").strip()
-        name = str(binding.get("generator_name") or "").strip().casefold()
-        owner = (
-            guid
-            or (f"index:{index}" if index else "")
-            or (f"name:{name}" if name else "")
+    bindings, explicit = _current_generator_bindings(payload)
+    binding_keys = set()
+    for binding in bindings:
+        projection = _generator_binding_claim_projection(
+            binding,
+            require_guid=explicit,
         )
-        if not owner or not slot:
+        if projection is None:
             continue
-        claims[f"generator:{owner}:{slot}"] = {
+        identity = projection["generator_identity"]
+        slot = projection["slot_prefix"]
+        if projection["target_material_id"] is None:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_target_material_id_invalid"
+                if explicit
+                else "legacy_generator_binding_target_material_id_invalid",
+                generator_identity=copy.deepcopy(identity),
+                slot_prefix=slot,
+            )
+        if projection["target_mesh_id"] is None:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_target_mesh_id_invalid"
+                if explicit
+                else "legacy_generator_binding_target_mesh_id_invalid",
+                generator_identity=copy.deepcopy(identity),
+                slot_prefix=slot,
+            )
+        claim_key = (
+            f"generator:{identity['kind']}:{identity['value']}:slot:{slot}"
+        )
+        if claim_key in binding_keys:
+            raise _GeneratorBindingOwnershipContractError(
+                "generator_binding_ownership_duplicate_slot"
+                if explicit
+                else "legacy_generator_binding_duplicate_slot",
+                generator_identity=copy.deepcopy(identity),
+                slot_prefix=slot,
+            )
+        binding_keys.add(claim_key)
+        claims[claim_key] = {
             "source_identity": source_identity,
-            "binding": _without_derived_texture_fields(copy.deepcopy(binding)),
+            "binding": projection,
         }
 
     if not claims:
@@ -208,8 +622,17 @@ def _candidate_claims(payload, source_identity, kind):
         )
         claims[f"record:{record_key}"] = {
             "source_identity": source_identity,
-            "generator_connection": _without_derived_texture_fields(
-                copy.deepcopy(connection)
+            "current_generator_bindings": sorted(
+                (
+                    _generator_binding_claim_projection(
+                        binding,
+                        require_guid=explicit,
+                    )
+                    for binding in bindings
+                ),
+                key=lambda row: json.dumps(
+                    row or {}, sort_keys=True, separators=(",", ":")
+                ),
             ),
             "collection_tombstone": _without_derived_texture_fields(
                 copy.deepcopy(payload.get("collection_tombstone"))
@@ -450,7 +873,18 @@ def resolve_atlas_manifests(
                 "source_identity": source_identity,
             })
             continue
-        claims = _candidate_claims(payload, source_identity, kind)
+        try:
+            claims = _candidate_claims(payload, source_identity, kind)
+        except _GeneratorContractError as exc:
+            row = {
+                **base,
+                "reason": exc.reason,
+                "source_identity": source_identity,
+                "contract_error": copy.deepcopy(exc.details),
+            }
+            resolution["conflicting"].append(row)
+            fatal.append(row)
+            continue
         valid.append({
             **base,
             "reason": "operational_candidate",
@@ -480,9 +914,20 @@ def resolve_atlas_manifests(
                 path,
                 target_parent=target.parent,
             )
-            row["ownership_claims"] = sorted(
-                _candidate_claims(payload, row["source_identity"], kind)
-            )
+            try:
+                row["ownership_claims"] = sorted(
+                    _candidate_claims(
+                        payload,
+                        row["source_identity"],
+                        kind,
+                    )
+                )
+            except _GeneratorContractError as exc:
+                row["ownership_claims"] = []
+                row["ownership_contract_error"] = {
+                    "reason": exc.reason,
+                    **copy.deepcopy(exc.details),
+                }
         resolution["shadowed"].append(row)
 
     if fatal:
@@ -552,6 +997,8 @@ _MIRROR_OWNERSHIP_FIELDS = (
     "material_groups",
     "speedtree_material_groups",
     "generator_connection",
+    "generator_binding_ownership",
+    "generator_slot_creation_provenance",
     "collection_tombstone",
 )
 
@@ -904,10 +1351,15 @@ def resolve_manifest_material_ownership(
 
 
 def _binding_identity_matches(declared, live):
-    slot = str(declared.get("slot_prefix") or "").strip().casefold()
-    if slot != str(live.get("slot_prefix") or "").strip().casefold():
+    slot = str(declared.get("slot_prefix") or "").strip()
+    if slot != str(live.get("slot_prefix") or "").strip():
         return False
-    for field in ("generator_guid", "generator_index", "generator_name"):
+    declared_guid = str(declared.get("generator_guid") or "").strip()
+    if declared_guid:
+        return declared_guid == str(
+            live.get("generator_guid") or ""
+        ).strip()
+    for field in ("generator_index", "generator_name"):
         left = declared.get(field)
         right = live.get(field)
         if left not in {None, ""} and right not in {None, ""}:
@@ -923,6 +1375,9 @@ def diagnose_manifest_generator_candidates(resolution, live_bindings):
     for selected in resolution.get("selected") or []:
         payload = selected.get("payload") or {}
         connection = payload.get("generator_connection") or {}
+        declared_bindings, explicit_ownership = _current_generator_bindings(
+            payload
+        )
         requested = connection.get("requested") is True
         row = {
             "path": selected.get("path", ""),
@@ -934,16 +1389,14 @@ def diagnose_manifest_generator_candidates(resolution, live_bindings):
             "reasons": [],
             "binding_results": [],
         }
-        if not requested:
+        # The explicit block is authoritative independently of the legacy
+        # request bit.  That bit remains relevant only to compatibility
+        # receipts that do not yet carry current ownership.
+        if not requested and not explicit_ownership:
             candidates.append(row)
             continue
 
-        declared_bindings = [
-            binding
-            for binding in connection.get("bindings") or []
-            if isinstance(binding, dict)
-        ]
-        if not declared_bindings:
+        if not declared_bindings and requested and not explicit_ownership:
             row["reasons"].append("declared_generator_bindings_missing")
         for declared in declared_bindings:
             matches = [
@@ -977,29 +1430,34 @@ def diagnose_manifest_generator_candidates(resolution, live_bindings):
             })
             row["reasons"].extend(errors)
 
-        exporting_meshes = {}
-        for current in live:
-            if not current.get(
-                "export_participates", current.get("visible", True)
-            ):
-                continue
-            material_id = _integer_text(current.get("material_id"))
-            mesh_id = _integer_text(current.get("mesh_id"))
-            if material_id and mesh_id:
-                exporting_meshes.setdefault(material_id, set()).add(mesh_id)
-        for group in _material_groups(payload):
-            material_id = _integer_text(group.get("material_id"))
-            declared_meshes = set(_group_mesh_ids(group))
-            missing = sorted(
-                declared_meshes - exporting_meshes.get(material_id, set())
-            )
-            if missing:
-                row["reasons"].append(
-                    "declared_mesh_not_export_participating"
+        # Legacy receipts conflate the producer's complete asset inventory
+        # with current Generator ownership. Preserve their old diagnostic
+        # until they are migrated. An explicit ownership block deliberately
+        # permits generated Material/Mesh variants to remain unbound.
+        if not explicit_ownership:
+            exporting_meshes = {}
+            for current in live:
+                if not current.get(
+                    "export_participates", current.get("visible", True)
+                ):
+                    continue
+                material_id = _integer_text(current.get("material_id"))
+                mesh_id = _integer_text(current.get("mesh_id"))
+                if material_id and mesh_id:
+                    exporting_meshes.setdefault(material_id, set()).add(mesh_id)
+            for group in _material_groups(payload):
+                material_id = _integer_text(group.get("material_id"))
+                declared_meshes = set(_group_mesh_ids(group))
+                missing = sorted(
+                    declared_meshes - exporting_meshes.get(material_id, set())
                 )
-                row.setdefault("non_export_participating_mesh_ids", []).extend(
-                    missing
-                )
+                if missing:
+                    row["reasons"].append(
+                        "declared_mesh_not_export_participating"
+                    )
+                    row.setdefault(
+                        "non_export_participating_mesh_ids", []
+                    ).extend(missing)
 
         row["reasons"] = sorted(set(row["reasons"]))
         row["status"] = (

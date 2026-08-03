@@ -51,8 +51,11 @@ from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
+    manifest_current_generator_bindings,
+    manifest_generator_slot_creation_provenance,
+    normalize_generator_target_material_id,
+    normalize_generator_target_mesh_id,
     resolve_atlas_manifests,
-    selected_manifest_payload,
 )
 from cluster_blend_sync import discover_cluster_blend_relations
 from speedtree_export_options_contract import require_texture_skip_writing
@@ -723,8 +726,8 @@ def _path_identity(path: Path | str) -> str:
     return os.path.normcase(str(value))
 
 
-def _atlas_target_relation_manifest(spm_path: Path) -> dict:
-    """Load the shared-resolver authority for one exact Atlas target."""
+def _atlas_target_relation_records(spm_path: Path) -> list[dict]:
+    """Load every additive exact authority selected for one Atlas target."""
     try:
         resolution = resolve_atlas_manifests(
             spm_path,
@@ -735,7 +738,120 @@ def _atlas_target_relation_manifest(spm_path: Path) -> dict:
             "Atlas manifest resolution failed for the exact target SPM: "
             f"{exc}"
         ) from exc
-    return selected_manifest_payload(resolution)
+    return [
+        {
+            "path": str(row.get("path") or ""),
+            "kind": str(row.get("kind") or ""),
+            "precedence": row.get("precedence"),
+            "source_identity": copy.deepcopy(
+                row.get("source_identity") or {}
+            ),
+            "payload": copy.deepcopy(row.get("payload") or {}),
+        }
+        for row in resolution.get("selected") or []
+        if str(row.get("kind") or "").startswith("exact_")
+    ]
+
+
+def _atlas_target_relation_manifest(spm_path: Path) -> dict:
+    """Compatibility view of the first selected exact Atlas authority."""
+    records = _atlas_target_relation_records(spm_path)
+    return copy.deepcopy(records[0]["payload"]) if records else {}
+
+
+def _atlas_binding_key(binding: dict) -> tuple[str, str] | None:
+    key = (
+        str(binding.get("generator_guid") or "").strip(),
+        str(binding.get("slot_prefix") or "").strip(),
+    )
+    return key if all(key) else None
+
+
+def _atlas_source_identity_key(record: dict) -> tuple[str, str, str]:
+    identity = record.get("source_identity") or {}
+    return (
+        str(identity.get("blend_file") or ""),
+        str(identity.get("source_collection") or ""),
+        str(identity.get("export_scope_id") or ""),
+    )
+
+
+def _atlas_evidence_text(value, *, fold=False) -> str:
+    text = "" if value is None else str(value).strip()
+    return text.casefold() if fold else text
+
+
+def _atlas_adoption_projection(adoption: dict) -> tuple[str, tuple[str, ...]]:
+    if not isinstance(adoption, dict) or not adoption:
+        return "", ()
+    return (
+        _atlas_evidence_text(adoption.get("material_id")),
+        tuple(
+            _atlas_evidence_text(value)
+            for value in adoption.get("original_mesh_ids") or []
+        ),
+    )
+
+
+def _merge_atlas_binding_evidence(
+    existing: dict,
+    incoming: dict,
+    *,
+    path: Path,
+    key: tuple[str, str],
+) -> dict:
+    """Merge coherent mirrors without hiding conflicting source evidence."""
+    if (
+        existing["_atlas_source_identity_key"]
+        != incoming["_atlas_source_identity_key"]
+    ):
+        raise SyncError(
+            "Multiple Atlas providers claim the same current Generator slot: "
+            f"{path.name} · {key[0]} · {key[1]}"
+        )
+
+    fields = (
+        ("target_material_id", False),
+        ("target_mesh_id", False),
+        ("source_material_id", False),
+        ("source_material_name", True),
+        ("source_mesh_id", False),
+    )
+    merged = copy.deepcopy(existing)
+    for field_name, fold in fields:
+        left = _atlas_evidence_text(existing.get(field_name), fold=fold)
+        right = _atlas_evidence_text(incoming.get(field_name), fold=fold)
+        if left and right and left != right:
+            raise SyncError(
+                "Atlas Generator mirror has conflicting binding evidence: "
+                f"{path.name} · {key[0]} · {key[1]} · {field_name}"
+            )
+        if not left and right:
+            merged[field_name] = copy.deepcopy(incoming.get(field_name))
+
+    left_adoption = existing.get("_atlas_source_material_adoption") or {}
+    right_adoption = incoming.get("_atlas_source_material_adoption") or {}
+    left_projection = _atlas_adoption_projection(left_adoption)
+    right_projection = _atlas_adoption_projection(right_adoption)
+    if (
+        left_adoption
+        and right_adoption
+        and left_projection != right_projection
+    ):
+        raise SyncError(
+            "Atlas Generator mirror has conflicting source material adoption: "
+            f"{path.name} · {key[0]} · {key[1]}"
+        )
+    if not left_adoption and right_adoption:
+        merged["_atlas_source_material_adoption"] = copy.deepcopy(
+            right_adoption
+        )
+
+    for field_name, value in incoming.items():
+        current = merged.get(field_name)
+        if field_name not in merged or current is None or current == "":
+            merged[field_name] = copy.deepcopy(value)
+    return merged
 
 
 def _material_cutout_ids(material: ET.Element | None) -> list[str]:
@@ -780,28 +896,177 @@ class SPMDocument:
             "Material_v8": {}, "Mesh": {},
         }
         self.pending_asset_elements: list[ET.Element] = []
+        self.atlas_relation_records = (
+            _atlas_target_relation_records(self.path) if full else []
+        )
+        self.atlas_relation_manifests = [
+            copy.deepcopy(record["payload"])
+            for record in self.atlas_relation_records
+        ]
         self.atlas_relation_manifest = (
-            _atlas_target_relation_manifest(self.path) if full else {}
+            copy.deepcopy(self.atlas_relation_manifests[0])
+            if self.atlas_relation_manifests else {}
         )
         self.atlas_relation_bindings: dict[tuple[str, str], dict] = {}
-        for binding in (
-            self.atlas_relation_manifest.get("generator_connection") or {}
-        ).get("bindings") or []:
-            if not isinstance(binding, dict):
-                continue
-            key = (
-                str(binding.get("generator_guid") or "").strip(),
-                str(binding.get("slot_prefix") or "").strip(),
-            )
-            if not all(key):
-                continue
-            previous = self.atlas_relation_bindings.get(key)
-            if previous is not None and previous != binding:
-                raise SyncError(
-                    "Atlas target manifest에 충돌하는 Generator binding이 "
-                    f"있습니다: {self.path.name} · {key[0]} · {key[1]}"
+        self.atlas_created_slot_provenance: dict[
+            tuple[str, str], dict
+        ] = {}
+        self.atlas_created_slot_provenance_sources: dict[
+            tuple[str, str], dict
+        ] = {}
+        for record in self.atlas_relation_records:
+            payload = record["payload"]
+            try:
+                current_bindings = manifest_current_generator_bindings(
+                    payload
                 )
-            self.atlas_relation_bindings[key] = binding
+                creation_provenance = (
+                    manifest_generator_slot_creation_provenance(payload)
+                )
+            except ValueError as exc:
+                raise SyncError(
+                    "Atlas Generator ownership/provenance contract is "
+                    "invalid: "
+                    f"{record['path']} · {exc}"
+                ) from exc
+
+            historical_bindings: dict[tuple[str, str], dict] = {}
+            for binding in (
+                payload.get("generator_connection") or {}
+            ).get("bindings") or []:
+                if not isinstance(binding, dict):
+                    continue
+                key = _atlas_binding_key(binding)
+                if key is None:
+                    continue
+                previous = historical_bindings.get(key)
+                if previous is not None:
+                    raise SyncError(
+                        "Atlas target manifest has duplicate historical "
+                        "Generator binding identity: "
+                        f"{record['path']} · {key[0]} · {key[1]}"
+                    )
+                historical_bindings[key] = copy.deepcopy(binding)
+
+            source_identity_key = _atlas_source_identity_key(record)
+            adoption = payload.get("source_material_adoption")
+            if adoption is not None and not isinstance(adoption, dict):
+                raise SyncError(
+                    "Atlas source material adoption must be an object: "
+                    f"{record['path']}"
+                )
+            adoption = adoption or {}
+            for binding in current_bindings:
+                if not isinstance(binding, dict):
+                    continue
+                key = _atlas_binding_key(binding)
+                if key is None:
+                    continue
+                target_material_id = normalize_generator_target_material_id(
+                    binding.get("target_material_id")
+                )
+                target_mesh_id = normalize_generator_target_mesh_id(
+                    binding.get("target_mesh_id")
+                )
+                if target_material_id is None or target_mesh_id is None:
+                    field_name = (
+                        "target_material_id"
+                        if target_material_id is None
+                        else "target_mesh_id"
+                    )
+                    raise SyncError(
+                        "Atlas current Generator binding has an invalid "
+                        "semantic target ID: "
+                        f"{record['path']} · {key[0]} · {key[1]} · "
+                        f"{field_name}"
+                    )
+                binding = copy.deepcopy(binding)
+                binding["target_material_id"] = target_material_id
+                binding["target_mesh_id"] = target_mesh_id
+                historical = historical_bindings.get(key) or {}
+                for field_name, fold in (
+                    ("source_material_id", False),
+                    ("source_material_name", True),
+                    ("source_mesh_id", False),
+                ):
+                    left = _atlas_evidence_text(
+                        historical.get(field_name), fold=fold
+                    )
+                    right = _atlas_evidence_text(
+                        binding.get(field_name), fold=fold
+                    )
+                    if left and right and left != right:
+                        raise SyncError(
+                            "Atlas current ownership conflicts with its "
+                            "historical source evidence: "
+                            f"{record['path']} · {key[0]} · {key[1]} · "
+                            f"{field_name}"
+                        )
+                enriched = copy.deepcopy(historical)
+                enriched.update(copy.deepcopy(binding))
+                enriched["generator_guid"] = key[0]
+                enriched["slot_prefix"] = key[1]
+                enriched["_atlas_source_identity_key"] = (
+                    source_identity_key
+                )
+                enriched["_atlas_source_identity"] = copy.deepcopy(
+                    record.get("source_identity") or {}
+                )
+                enriched["_atlas_manifest_path"] = record["path"]
+                enriched["_atlas_source_material_adoption"] = (
+                    copy.deepcopy(adoption)
+                )
+                previous = self.atlas_relation_bindings.get(key)
+                if previous is None:
+                    self.atlas_relation_bindings[key] = enriched
+                else:
+                    self.atlas_relation_bindings[key] = (
+                        _merge_atlas_binding_evidence(
+                            previous,
+                            enriched,
+                            path=self.path,
+                            key=key,
+                        )
+                    )
+
+            creation_keys = set()
+            for slot in creation_provenance:
+                if not isinstance(slot, dict):
+                    continue
+                key = _atlas_binding_key(slot)
+                if key is None:
+                    continue
+                if key in creation_keys:
+                    raise SyncError(
+                        "Atlas target manifest has duplicate Generator slot "
+                        "creation provenance: "
+                        f"{record['path']} · {key[0]} · {key[1]}"
+                    )
+                creation_keys.add(key)
+                normalized_slot = copy.deepcopy(slot)
+                normalized_slot["generator_guid"] = key[0]
+                normalized_slot["slot_prefix"] = key[1]
+                previous = self.atlas_created_slot_provenance.get(key)
+                previous_source = (
+                    self.atlas_created_slot_provenance_sources.get(key) or {}
+                ).get("source_identity_key")
+                if previous is not None and (
+                    previous_source != source_identity_key
+                    or previous != normalized_slot
+                ):
+                    raise SyncError(
+                        "Atlas target manifests have conflicting Generator "
+                        "slot creation provenance: "
+                        f"{self.path.name} · {key[0]} · {key[1]}"
+                    )
+                self.atlas_created_slot_provenance[key] = normalized_slot
+                self.atlas_created_slot_provenance_sources[key] = {
+                    "source_identity_key": source_identity_key,
+                    "source_identity": copy.deepcopy(
+                        record.get("source_identity") or {}
+                    ),
+                    "manifest_path": record["path"],
+                }
         if full:
             self._index_assets(text)
         try:
@@ -1547,9 +1812,14 @@ def _atlas_binding_target_local_value(
             f"{binding.get('slot_prefix')}"
         )
 
-    adoption = source_document.atlas_relation_manifest.get(
-        "source_material_adoption"
-    ) or {}
+    if "_atlas_source_material_adoption" in binding:
+        adoption = binding.get("_atlas_source_material_adoption") or {}
+    else:
+        # Direct callers constructing a legacy binding by hand retain the
+        # historical singular-manifest compatibility path.
+        adoption = source_document.atlas_relation_manifest.get(
+            "source_material_adoption"
+        ) or {}
     if (
         str(adoption.get("material_id") or "").strip()
         == source_material_id
@@ -1595,10 +1865,10 @@ def strip_atlas_created_variant_slots_from_clone(
     """Remove relationship-owned variant slots before cloning a Generator."""
     guid = source_document.generator_guid(source_generator)
     bindings = [
-        binding
-        for (binding_guid, _slot), binding
-        in source_document.atlas_relation_bindings.items()
-        if binding_guid == guid and binding.get("created_slot")
+        provenance
+        for (binding_guid, _slot), provenance
+        in source_document.atlas_created_slot_provenance.items()
+        if binding_guid == guid
     ]
     properties = clone.find("Properties")
     if not bindings or properties is None:
@@ -1634,11 +1904,6 @@ def strip_atlas_created_variant_slots_from_clone(
         if parent_name and before is not None:
             authored_counts[parent_name].add(before)
     for parent_name, counts in authored_counts.items():
-        if len(counts) != 1:
-            raise SyncError(
-                "Atlas 관계 manifest의 authored variant count가 "
-                f"충돌합니다: {source_document.path.name} · {parent_name}"
-            )
         parent = next(
             (
                 prop
@@ -1652,10 +1917,31 @@ def strip_atlas_created_variant_slots_from_clone(
                 "Atlas 관계 manifest가 가리키는 variant parent가 "
                 f"없습니다: {source_document.path.name} · {parent_name}"
             )
+        remaining_indices = []
+        prefix = f"{parent_name}:"
+        for prop in list(properties):
+            name = _property_name(prop)
+            if not name.startswith(prefix):
+                continue
+            index_text = name[len(prefix):].split(":", 1)[0]
+            try:
+                index = int(index_text)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                remaining_indices.append(index)
+        # Separate providers may have created slots at different moments, so
+        # their recorded pre-create counts can legitimately differ. Restore
+        # the earliest authored floor while retaining any non-Atlas slot that
+        # remains after exact creator-owned properties are removed.
+        restored_count = max(
+            min(counts),
+            max(remaining_indices, default=-1) + 1,
+        )
         _set_child_text(
             parent,
             "MultiPropertyChildren",
-            str(next(iter(counts))),
+            str(restored_count),
         )
     return removed
 

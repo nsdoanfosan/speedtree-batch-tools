@@ -4,13 +4,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from atlas_producer_rebind import build_atlas_producer_rebind_proof
+from atlas_slot_ownership import plan_atlas_slot_ownership_reconciliation
+from atlas_target_registry import save_target_registry
+from cluster_spm_pair_contract import bootstrap_cluster_authoring
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
+    ATLAS_PRODUCER_REFRESH,
+    ATLAS_SLOT_OWNERSHIP_RECONCILE,
     CLUSTER_REFRESH,
     GENERATOR_SYNC,
     GENERATOR_SYNC_AND_CLUSTER,
+    GENERATOR_SYNC_TOOL,
     MODELER_NODE_TABLE_RECOVERY,
     MODELER_RECOVERY_TOOL,
+    PCG_TEXTURE_TOOL,
     REPAIR_UI_AUTOMATIC,
     REPAIR_UI_BLOCKED,
     STATUS_COMPLETED,
@@ -68,6 +76,64 @@ class RepairOrchestrationTests(unittest.TestCase):
         ) + "\n").encode("utf-8")).hexdigest()
         return scope
 
+    def live_ownership_plan(self):
+        target_dir = self.target.parent / ".atlas_leaf_speedtree_targets"
+        scope_dir = self.target.parent / ".atlas_leaf_speedtree_scopes"
+        target_dir.mkdir(exist_ok=True)
+        scope_dir.mkdir(exist_ok=True)
+
+        def payload(scope, material_id, mesh_id):
+            return {
+                "spm": str(self.target),
+                "blend_file": str(self.root / f"M_{scope}.blend"),
+                "source_collection": f"Atlas_{scope}",
+                "export_scope_id": scope,
+                "material_groups": [{
+                    "material": f"M_{scope}",
+                    "material_id": material_id,
+                    "mesh_ids": [mesh_id],
+                }],
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "bindings": [{
+                        "generator_guid": "guid-arbitrary",
+                        "slot_prefix": "Leaves:Type:137",
+                        "target_material_id": material_id,
+                        "target_mesh_id": mesh_id,
+                    }],
+                },
+            }
+
+        (target_dir / f"{self.target.stem}.json").write_text(
+            json.dumps(payload("scope-a", 10, 100)),
+            encoding="utf-8",
+        )
+        (scope_dir / f"scope-b__{self.target.stem}.json").write_text(
+            json.dumps(payload("scope-b", 20, 200)),
+            encoding="utf-8",
+        )
+        text = self.target.read_text(encoding="utf-8")
+        snapshot = {
+            "spm": str(self.target),
+            "spm_text_sha256": hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest(),
+            "leaf_generator_bindings": [{
+                "generator_guid": "guid-arbitrary",
+                "slot_prefix": "Leaves:Type:137",
+                "generator_index": 2,
+                "generator_name": "Leaf",
+                "generator_type": "Leaf Mesh",
+                "material_id": 20,
+                "mesh_id": 200,
+            }],
+        }
+        return plan_atlas_slot_ownership_reconciliation(
+            self.target,
+            live_snapshot=snapshot,
+        )
+
     def test_texture_reason_uses_standard_step3_without_force(self):
         plan = self.plan({
             "reason_code": "texture_set_incomplete",
@@ -97,14 +163,14 @@ class RepairOrchestrationTests(unittest.TestCase):
             plan.stages[0]["target_spms"], [str(self.target)]
         )
 
-    def test_ambiguous_atlas_ownership_conflict_is_friendly_unsupported(self):
+    def test_unproven_atlas_ownership_conflict_fails_closed(self):
         plan = self.plan({
             "reason_code": "atlas_manifest_ownership_conflict",
             "reason": "different source identity",
         })
         self.assertFalse(plan.supported)
         self.assertIn("ownership", plan.friendly_reason)
-        self.assertIn("덮어쓸 수 없습니다", plan.remaining_action)
+        self.assertIn("fresh live audit", plan.remaining_action)
 
     def test_operator_message_has_one_korean_atlas_disposition(self):
         repairable = repair_ui_decision({
@@ -118,8 +184,8 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("낡은 Atlas manifest 미러", repairable["reason"])
         self.assertIn("exact BAT", repairable["action"])
         self.assertEqual(blocked["status"], REPAIR_UI_BLOCKED)
-        self.assertIn("서로 다른 원본", blocked["reason"])
-        self.assertIn("임의로 덮어쓰지 않습니다", blocked["action"])
+        self.assertIn("exact live SPM ownership 계획", blocked["reason"])
+        self.assertIn("Generator GUID", blocked["action"])
 
     def test_registered_unsupported_reason_has_owner_cause_and_action(self):
         decision = repair_ui_decision({
@@ -291,29 +357,126 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertTrue(plan.supported)
         self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
 
-    def test_atlas_receipt_and_lineage_reasons_route_cluster_refresh(self):
-        cases = {
-            "atlas_manifest_authority_missing": "producer 영수증이 없습니다",
-            "atlas_manifest_resolution_conflict": "영수증들이 서로 충돌합니다",
-            "lineage_unproven": "producer 계보가 증명되지 않았습니다",
-        }
-        for reason_code, korean_reason in cases.items():
-            with self.subTest(reason_code=reason_code):
-                evidence = {"reason_code": reason_code}
-                decision = repair_ui_decision(evidence)
-                plan = self.plan(evidence)
+    def test_lineage_reason_still_routes_cluster_refresh(self):
+        evidence = {"reason_code": "lineage_unproven"}
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
 
-                self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
-                self.assertIn(korean_reason, decision["reason"])
-                self.assertTrue(plan.supported)
-                self.assertEqual(
-                    [stage["repair_action"] for stage in plan.stages],
-                    [CLUSTER_REFRESH],
-                )
-                self.assertEqual(
-                    plan.stages[0]["target_spms"],
-                    [str(self.target)],
-                )
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertIn("producer 계보가 증명되지 않았습니다", decision["reason"])
+        self.assertTrue(plan.supported)
+        self.assertEqual(
+            [stage["repair_action"] for stage in plan.stages],
+            [CLUSTER_REFRESH],
+        )
+
+    def test_missing_atlas_authority_without_exact_relation_fails_closed(self):
+        evidence = {"reason_code": "atlas_manifest_authority_missing"}
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("exact 증명이 없습니다", decision["reason"])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
+
+    def test_atlas_resolution_conflict_without_plan_fails_closed(self):
+        evidence = {"reason_code": "atlas_manifest_resolution_conflict"}
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertIn("exact live SPM ownership 계획", decision["reason"])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
+
+    def test_proven_atlas_conflict_routes_slot_ownership_reconcile(self):
+        ownership_plan = self.live_ownership_plan()
+        self.assertEqual(ownership_plan["status"], "repairable")
+        evidence = {
+            "reason_code": "atlas_manifest_resolution_conflict",
+            "resolution": {
+                "reason_code": "atlas_manifest_ownership_conflict",
+            },
+            "live_spm_ownership_plan": ownership_plan,
+        }
+
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(len(plan.stages), 1)
+        self.assertEqual(plan.stages[0]["tool"], GENERATOR_SYNC_TOOL)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            ATLAS_SLOT_OWNERSHIP_RECONCILE,
+        )
+        self.assertEqual(
+            plan.stages[0]["ownership_plan"]["plan_sha256"],
+            ownership_plan["plan_sha256"],
+        )
+
+    def test_proven_missing_authority_routes_exact_atlas_producer_refresh(self):
+        legacy = self.cluster.with_name("atlas_producer.spm")
+        canonical = self.cluster.with_name("SK_atlas_producer.spm")
+        legacy.write_bytes(b"legacy-producer")
+        bootstrap_cluster_authoring(legacy)
+        blend = self.root / "M_atlas_producer.blend"
+        blend.write_bytes(b"blend")
+        save_target_registry(blend, [self.target, legacy])
+        manifest = (
+            legacy.parent
+            / ".atlas_leaf_speedtree_targets"
+            / f"{legacy.stem}.json"
+        )
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({
+            "spm": str(legacy),
+            "blend_file": str(blend),
+            "source_collection": "Atlas_Producer",
+            "export_scope_id": "scope-producer",
+            "material_groups": [{
+                "material_id": 7,
+                "mesh_ids": [4, 5, 6, 7, 8],
+            }],
+            "generator_connection": {
+                "requested": False,
+                "complete": False,
+            },
+        }), encoding="utf-8")
+        relation = build_atlas_producer_rebind_proof(
+            canonical,
+            manifest,
+            inventory_paths=[canonical],
+        )
+        evidence = {
+            "reason_code": "atlas_manifest_authority_missing",
+            "atlas_producer_relation": relation,
+        }
+
+        decision = repair_ui_decision(evidence)
+        plan = build_exact_target_repair_plan(
+            canonical,
+            evidence,
+            inventory_paths=[canonical],
+            parent_retry_id="retry-atlas",
+            request_id="request-atlas",
+        )
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(len(plan.stages), 1)
+        self.assertEqual(plan.stages[0]["tool"], PCG_TEXTURE_TOOL)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            ATLAS_PRODUCER_REFRESH,
+        )
+        self.assertEqual(plan.stages[0]["target_spms"], [str(canonical)])
+        self.assertEqual(
+            plan.stages[0]["producer_relation"]["proof_sha256"],
+            relation["proof_sha256"],
+        )
 
     def test_missing_cluster_tga_is_exact_korean_final_block(self):
         evidence = {

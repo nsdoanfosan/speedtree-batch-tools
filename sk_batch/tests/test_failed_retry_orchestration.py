@@ -641,13 +641,35 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             built["deferred_status_updates"][0]["kwargs"]["plan"].reason_codes,
         )
 
-    def test_atlas_receipt_and_lineage_blocks_enter_exact_cluster_refresh(self):
+    def test_lineage_block_enters_exact_cluster_refresh(self):
+        gui = load_gui_module()
+        inventory = {str(self.first): {"spm": self.first}}
+        app = self.app(gui)
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "lineage_unproven",
+            "canonical_spm": str(self.first),
+        })
+
+        built = app._build_failed_retry_plan(
+            [str(self.first)],
+            {"push_transport": "rpc"},
+            inventory_snapshot=inventory,
+        )
+
+        self.assertEqual(len(built["jobs"]), 1)
+        self.assertEqual(built["skipped"], [])
+        plan = built["jobs"][0]["repair_plans"][0]
+        self.assertEqual(
+            [stage["repair_action"] for stage in plan["stages"]],
+            ["cluster-refresh"],
+        )
+
+    def test_unproven_or_conflicting_atlas_authority_is_skipped_fail_closed(self):
         gui = load_gui_module()
         inventory = {str(self.first): {"spm": self.first}}
         for reason_code in (
             "atlas_manifest_authority_missing",
             "atlas_manifest_resolution_conflict",
-            "lineage_unproven",
         ):
             with self.subTest(reason_code=reason_code):
                 app = self.app(gui)
@@ -662,16 +684,11 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                     inventory_snapshot=inventory,
                 )
 
-                self.assertEqual(len(built["jobs"]), 1)
-                self.assertEqual(built["skipped"], [])
-                plan = built["jobs"][0]["repair_plans"][0]
+                self.assertEqual(built["jobs"], [])
+                self.assertTrue(built["skipped"])
                 self.assertEqual(
-                    [stage["repair_action"] for stage in plan["stages"]],
-                    ["cluster-refresh"],
-                )
-                self.assertEqual(
-                    plan["stages"][0]["target_spms"],
-                    [str(self.first)],
+                    built["deferred_status_updates"][0]["status"],
+                    gui.STATUS_FINAL_FAILED,
                 )
 
     def test_planner_keeps_dependency_blocked_consumer_with_cluster_repair(self):

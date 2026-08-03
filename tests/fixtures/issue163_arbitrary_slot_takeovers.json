@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "source_issue": 163,
+  "description": "Arbitrary sparse Generator slots survive repeated partial handoffs across four providers while immutable authored bindings and creator provenance remain historical evidence.",
+  "target_spm": "SK_issue163_arbitrary_slots.spm",
+  "leaf_generator_guid": "QWxwaGFCZXRhR3VpZA==",
+  "frond_generator_guid": "RnJvbmRDYXNlR3VpZA==",
+  "providers": [
+    {
+      "scope": "scope-a",
+      "blend": "A.blend",
+      "collection": "Provider A",
+      "material": "M_provider_a",
+      "material_id": 10,
+      "mesh_ids": [100, 107, 142, 1100],
+      "legacy_bindings": [
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:0", "target_material_id": 10, "target_mesh_id": 100, "state": "changed"},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:7", "target_material_id": 10, "target_mesh_id": 107, "state": "changed", "created_slot": true},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:42", "target_material_id": 10, "target_mesh_id": 142, "state": "changed", "created_slot": true},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:100", "target_material_id": 10, "target_mesh_id": 1100, "state": "changed", "created_slot": true}
+      ],
+      "created_slots": [
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:7", "variant_parent_property": "Leaves:Type", "variant_parent_children_before": 1, "variant_parent_children_after": 101, "created_property_names": ["Leaves:Type:7:Material", "Leaves:Type:7:Mesh", "Leaves:Type:7:Weight"]},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:42", "variant_parent_property": "Leaves:Type", "variant_parent_children_before": 1, "variant_parent_children_after": 101, "created_property_names": ["Leaves:Type:42:Material", "Leaves:Type:42:Mesh", "Leaves:Type:42:Weight"]},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:100", "variant_parent_property": "Leaves:Type", "variant_parent_children_before": 1, "variant_parent_children_after": 101, "created_property_names": ["Leaves:Type:100:Material", "Leaves:Type:100:Mesh", "Leaves:Type:100:Weight"]}
+      ]
+    },
+    {
+      "scope": "scope-b",
+      "blend": "B.blend",
+      "collection": "Provider B",
+      "material": "M_provider_b",
+      "material_id": 20,
+      "mesh_ids": [207],
+      "legacy_bindings": [
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:7", "target_material_id": 20, "target_mesh_id": 207, "state": "changed"}
+      ],
+      "created_slots": []
+    },
+    {
+      "scope": "scope-c",
+      "blend": "C.blend",
+      "collection": "Provider C",
+      "material": "M_provider_c",
+      "material_id": 30,
+      "mesh_ids": [307, 3100],
+      "legacy_bindings": [
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:7", "target_material_id": 30, "target_mesh_id": 307, "state": "changed"},
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:100", "target_material_id": 30, "target_mesh_id": 3100, "state": "changed"}
+      ],
+      "created_slots": []
+    },
+    {
+      "scope": "scope-d",
+      "blend": "D.blend",
+      "collection": "Provider D",
+      "material": "M_provider_d",
+      "material_id": 40,
+      "mesh_ids": [442, 4900],
+      "legacy_bindings": [
+        {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "generator_name": "Leaf Sparse", "slot_prefix": "Leaves:Type:42", "target_material_id": 40, "target_mesh_id": 442, "state": "changed"},
+        {"generator_guid": "RnJvbmRDYXNlR3VpZA==", "generator_name": "Frond Sparse", "slot_prefix": "Material:Frond:900", "target_material_id": 40, "target_mesh_id": 4900, "state": "changed"}
+      ],
+      "created_slots": []
+    }
+  ],
+  "phases": [
+    {
+      "name": "initial_a",
+      "owners": {
+        "scope-a": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:0", "target_material_id": 10, "target_mesh_id": 100},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:7", "target_material_id": 10, "target_mesh_id": 107},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:42", "target_material_id": 10, "target_mesh_id": 142}
+        ]
+      }
+    },
+    {
+      "name": "a_to_b",
+      "owners": {
+        "scope-a": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:0", "target_material_id": 10, "target_mesh_id": 100},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:42", "target_material_id": 10, "target_mesh_id": 142}
+        ],
+        "scope-b": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:7", "target_material_id": 20, "target_mesh_id": 207}
+        ]
+      }
+    },
+    {
+      "name": "b_to_c_and_add_high",
+      "owners": {
+        "scope-a": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:0", "target_material_id": 10, "target_mesh_id": 100},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:42", "target_material_id": 10, "target_mesh_id": 142}
+        ],
+        "scope-c": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:7", "target_material_id": 30, "target_mesh_id": 307},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:100", "target_material_id": 30, "target_mesh_id": 3100}
+        ]
+      }
+    },
+    {
+      "name": "return_to_a_with_three_providers",
+      "owners": {
+        "scope-a": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:0", "target_material_id": 10, "target_mesh_id": 100},
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:7", "target_material_id": 10, "target_mesh_id": 107}
+        ],
+        "scope-c": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:100", "target_material_id": 30, "target_mesh_id": 3100}
+        ],
+        "scope-d": [
+          {"generator_guid": "QWxwaGFCZXRhR3VpZA==", "slot_prefix": "Leaves:Type:42", "target_material_id": 40, "target_mesh_id": 442},
+          {"generator_guid": "RnJvbmRDYXNlR3VpZA==", "slot_prefix": "Material:Frond:900", "target_material_id": 40, "target_mesh_id": 4900}
+        ]
+      }
+    }
+  ]
+}

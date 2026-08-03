@@ -33,6 +33,8 @@ from atlas_target_registry import (
 )
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
+    manifest_current_generator_bindings,
+    normalize_generator_target_mesh_id,
     resolution_evidence,
     resolve_atlas_manifests,
 )
@@ -44,12 +46,14 @@ from artifact_content_key import (
 )
 from generator_delivery_scope import (
     GeneratorDeliveryScopeError,
+    POSTWRITE_MODE_HISTORICAL_PROOF,
     canonical_sha256,
     canonical_slot_identity,
     validate_resolved_delivery_scope,
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     spm_file_structural_semantic_fingerprint,
@@ -2090,12 +2094,48 @@ def _positive_asset_id(value):
     return parsed if parsed > 0 else None
 
 
+def _generator_target_mesh_id(value, *, allow_material_default=False):
+    """Return a current Generator Mesh value, optionally including ``-10``.
+
+    ``-10`` selects the Material's default/random cutout and is therefore a
+    valid live binding value, but it is not itself an asset ID.  Keep that
+    distinction explicit so asset-existence checks remain positive-ID-only.
+    """
+
+    parsed = normalize_generator_target_mesh_id(value)
+    if parsed == -10 and not allow_material_default:
+        return None
+    return parsed
+
+
 def _delivery_binding_slot_identity(binding):
-    """Use authored Generator identity, never XML array position."""
-    # Legacy audit snapshots can omit Generator type/name while retaining the
-    # semantic slot prefix.  Preserve that established matching behavior here;
-    # explicit authored scope validation uses the strict shared default.
-    return canonical_slot_identity(binding, strict=False)
+    """Return the legacy live-audit comparison identity.
+
+    Persisted ownership and delivery-scope contracts use exact opaque GUID and
+    slot-prefix strings.  Historical Atlas receipts predate that rule and may
+    contain the alternate Modeler GUID spelling or casing differences, so the
+    board's compatibility join remains semantic without weakening the sealed
+    contract hash helpers.
+    """
+
+    prefix = str(
+        binding.get("slot_prefix")
+        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
+    ).strip().casefold()
+    guid = generator_guid_key(binding.get("generator_guid"))
+    if guid and prefix:
+        return ("guid", guid, prefix)
+    identity = (
+        "named",
+        str(binding.get("generator_type") or "").strip().casefold(),
+        str(binding.get("generator_name") or "").strip().casefold(),
+        prefix,
+    )
+    if not prefix:
+        raise GeneratorDeliveryScopeError(
+            "slot identity has no semantic prefix"
+        )
+    return identity
 
 
 def _stale_node_table_evidence(binding):
@@ -2328,13 +2368,24 @@ def _normalized_generator_delivery(
 ):
     """Classify one target SPM from declared and current Generator evidence."""
     connection = payload.get("generator_connection")
-    bindings = [
-        dict(row)
-        for row in (
-            connection.get("bindings") if isinstance(connection, dict) else []
-        ) or []
-        if isinstance(row, dict)
-    ]
+    explicit_ownership = "generator_binding_ownership" in payload
+    ownership_contract_error = None
+    if explicit_ownership:
+        try:
+            bindings = manifest_current_generator_bindings(payload)
+        except ValueError as exc:
+            bindings = []
+            ownership_contract_error = str(exc)
+    else:
+        bindings = [
+            dict(row)
+            for row in (
+                connection.get("bindings")
+                if isinstance(connection, dict)
+                else []
+            ) or []
+            if isinstance(row, dict)
+        ]
     requested = (
         connection.get("requested")
         if isinstance(connection, dict)
@@ -2377,6 +2428,7 @@ def _normalized_generator_delivery(
         "generator_connection_complete_scope": (
             "fresh_live_export_delivery"
         ),
+        "generator_binding_ownership_explicit": explicit_ownership,
         "generator_variant_policy": variant_policy or None,
         "delivery_scope_mode": "legacy_strict",
         "delivery_scope_intent_sha256": None,
@@ -2417,6 +2469,11 @@ def _normalized_generator_delivery(
         "binding_mismatches": [],
         "errors": [],
     }
+    if ownership_contract_error is not None:
+        evidence["errors"].append(
+            "generator_binding_ownership_invalid:"
+            + ownership_contract_error
+        )
     if (
         requested is False
         and declared_complete is False
@@ -2442,7 +2499,7 @@ def _normalized_generator_delivery(
         evidence["errors"].append(
             "generator_variant_policy_mismatch"
         )
-    if not bindings:
+    if not bindings and not explicit_ownership:
         evidence["errors"].append("generator_bindings_missing")
     if evidence["errors"]:
         return _finalize_normalized_generator_delivery(evidence)
@@ -2546,9 +2603,21 @@ def _normalized_generator_delivery(
     evidence["live_node_table"] = (
         dict(live_node_table) if isinstance(live_node_table, dict) else None
     )
-    slot_identity = _delivery_binding_slot_identity
+    # Explicit v1 ownership keys are opaque exact-case identities.  Keep the
+    # historical semantic GUID/case compatibility join only for receipts that
+    # predate that contract.
+    slot_identity = (
+        canonical_slot_identity
+        if explicit_ownership
+        else _delivery_binding_slot_identity
+    )
+    current_slot_identities = {
+        tuple(slot_identity(row)) for row in bindings
+    }
     explicit_scope = connection.get("delivery_scope") is not None
     scope_contract = None
+    effective_required_slot_identities = set()
+    effective_continuity_slot_identities = set()
     if explicit_scope:
         try:
             provider_blend = str(payload.get("blend_file") or "").strip()
@@ -2556,13 +2625,55 @@ def _normalized_generator_delivery(
                 raise GeneratorDeliveryScopeError(
                     "explicit delivery scope manifest has no provider blend"
                 )
-            scope_contract = validate_resolved_delivery_scope(
-                connection,
-                target_spm=production_spm,
-                material_id=expected_material_id,
-                provider_blend=provider_blend,
-                target_spm_postwrite_sha256=snapshot_sha256,
+            postwrite_options = (
+                {
+                    "postwrite_validation_mode": (
+                        POSTWRITE_MODE_HISTORICAL_PROOF
+                    )
+                }
+                if explicit_ownership
+                else {}
             )
+            try:
+                scope_contract = validate_resolved_delivery_scope(
+                    connection,
+                    target_spm=production_spm,
+                    material_id=expected_material_id,
+                    provider_blend=provider_blend,
+                    target_spm_postwrite_sha256=snapshot_sha256,
+                    **postwrite_options,
+                )
+            except GeneratorDeliveryScopeError:
+                # Historical receipts used SpeedTree's semantic GUID dialect
+                # and case join.  Revalidate only that sealed legacy shape;
+                # current exact-ownership receipts never take this fallback.
+                if explicit_ownership:
+                    raise
+                legacy_connection = copy.deepcopy(connection)
+                legacy_bindings = []
+                for raw_binding in legacy_connection.get("bindings") or []:
+                    binding = dict(raw_binding)
+                    identity = _delivery_binding_slot_identity(binding)
+                    if identity[0] == "guid":
+                        binding["generator_guid"] = identity[1]
+                        binding["slot_prefix"] = identity[2]
+                    else:
+                        binding["generator_type"] = identity[1]
+                        binding["generator_name"] = identity[2]
+                        binding["slot_prefix"] = identity[3]
+                    legacy_bindings.append(binding)
+                legacy_connection["bindings"] = legacy_bindings
+                scope_contract = validate_resolved_delivery_scope(
+                    legacy_connection,
+                    target_spm=production_spm,
+                    material_id=expected_material_id,
+                    provider_blend=provider_blend,
+                    target_spm_postwrite_sha256=snapshot_sha256,
+                    **postwrite_options,
+                )
+                evidence["delivery_scope_identity_compatibility"] = (
+                    "legacy_semantic_guid_slot_join"
+                )
         except GeneratorDeliveryScopeError as exc:
             evidence["delivery_scope_mode"] = "explicit_invalid"
             evidence["errors"].append(
@@ -2573,34 +2684,83 @@ def _normalized_generator_delivery(
         evidence["delivery_scope_intent_sha256"] = scope_contract[
             "intent_sha256"
         ]
-        evidence["delivery_scope_required_live_slot_count"] = len(
+        evidence["delivery_scope_postwrite_validation_mode"] = (
+            scope_contract.get("postwrite_validation_mode")
+        )
+        evidence["delivery_scope_postwrite_matches_current"] = (
+            scope_contract.get("target_spm_postwrite_matches_current")
+        )
+        authored_slot_identities = scope_contract[
+            "authored_slot_identities"
+        ]
+        foreign_current_slots = sorted(
+            current_slot_identities.difference(authored_slot_identities)
+        )
+        if foreign_current_slots:
+            evidence["errors"].append(
+                "current_generator_ownership_outside_sealed_authored_scope"
+            )
+            evidence["binding_mismatches"].append({
+                "reason": (
+                    "current_generator_ownership_outside_sealed_authored_scope"
+                ),
+                "slot_identities": [
+                    list(identity) for identity in foreign_current_slots
+                ],
+            })
+        effective_required_slot_identities = current_slot_identities.intersection(
             scope_contract["required_live_slot_identities"]
         )
+        effective_continuity_slot_identities = (
+            current_slot_identities.intersection(
+                scope_contract["continuity_only_slot_identities"]
+            )
+        )
+        evidence["delivery_scope_required_live_slot_count"] = len(
+            effective_required_slot_identities
+        )
         evidence["delivery_scope_continuity_only_slot_count"] = len(
-            scope_contract["continuity_only_slot_identities"]
+            effective_continuity_slot_identities
         )
-        required_slot_identities = scope_contract[
-            "required_live_slot_identities"
-        ]
-        recovery_target_scope = {
-            "contract": "speedtree_stale_node_recovery_target_scope",
-            "schema_version": 1,
-            "policy": "explicit_sealed_scopes_v1",
-            "delivery_scope_intent_sha256": scope_contract["intent_sha256"],
-            "authoring_mesh_ids": sorted({
-                row["target_mesh_id"]
-                for row in scope_contract["authored_slots"]
-            }),
-            "required_live_mesh_ids": sorted({
-                row["target_mesh_id"]
-                for row in scope_contract["authored_slots"]
-                if tuple(row["slot_identity"]) in required_slot_identities
-            }),
+        effective_authored_slot_identities = (
+            current_slot_identities.intersection(authored_slot_identities)
+        )
+        effective_positive_mesh_by_slot = {
+            tuple(slot_identity(row)): _positive_asset_id(
+                row.get("target_mesh_id")
+            )
+            for row in bindings
+            if tuple(slot_identity(row))
+            in effective_authored_slot_identities
         }
-        recovery_target_scope["scope_sha256"] = canonical_sha256(
-            recovery_target_scope
-        )
-        evidence["recovery_target_scope"] = recovery_target_scope
+        authoring_mesh_ids = sorted({
+            mesh_id
+            for mesh_id in effective_positive_mesh_by_slot.values()
+            if mesh_id is not None
+        })
+        required_live_mesh_ids = sorted({
+            effective_positive_mesh_by_slot.get(identity)
+            for identity in effective_required_slot_identities
+            if effective_positive_mesh_by_slot.get(identity) is not None
+        })
+        # Material-default ``-10`` bindings need no Mesh asset recovery.  Do
+        # not publish an unusable empty recovery scope for a sentinel-only
+        # owner; live ownership remains fully auditable below.
+        if authoring_mesh_ids:
+            recovery_target_scope = {
+                "contract": "speedtree_stale_node_recovery_target_scope",
+                "schema_version": 1,
+                "policy": "explicit_sealed_scopes_v1",
+                "delivery_scope_intent_sha256": scope_contract[
+                    "intent_sha256"
+                ],
+                "authoring_mesh_ids": authoring_mesh_ids,
+                "required_live_mesh_ids": required_live_mesh_ids,
+            }
+            recovery_target_scope["scope_sha256"] = canonical_sha256(
+                recovery_target_scope
+            )
+            evidence["recovery_target_scope"] = recovery_target_scope
 
     def export_participates(row):
         return bool(
@@ -2611,8 +2771,12 @@ def _normalized_generator_delivery(
     relevant_live_bindings = [
         dict(row)
         for row in live_bindings
-        if _positive_asset_id(row.get("material_id"))
-        == expected_material_id
+        if (
+            tuple(slot_identity(row)) in current_slot_identities
+            if explicit_ownership
+            else _positive_asset_id(row.get("material_id"))
+            == expected_material_id
+        )
     ]
     export_participating_bindings = [
         row for row in relevant_live_bindings
@@ -2622,14 +2786,24 @@ def _normalized_generator_delivery(
         dict(row) for row in export_participating_bindings
     ]
     live_mesh_ids = sorted({
-        _positive_asset_id(row.get("mesh_id"))
+        _generator_target_mesh_id(
+            row.get("mesh_id"),
+            allow_material_default=explicit_ownership,
+        )
         for row in export_participating_bindings
-        if _positive_asset_id(row.get("mesh_id")) is not None
+        if _generator_target_mesh_id(
+            row.get("mesh_id"),
+            allow_material_default=explicit_ownership,
+        ) is not None
     })
     evidence[
         "live_export_participating_target_mesh_ids"
     ] = live_mesh_ids
-    if normalized_mesh_ids != declared_mesh_ids:
+    if (
+        normalized_mesh_ids != declared_mesh_ids
+        if not explicit_ownership
+        else not set(declared_mesh_ids).issubset(normalized_mesh_ids)
+    ):
         evidence["errors"].append(
             "normalized_and_declared_target_mesh_sets_differ"
         )
@@ -2696,12 +2870,10 @@ def _normalized_generator_delivery(
             planned_inactive_slots.add(declared_slot)
 
     if explicit_scope:
-        required_slot_identities = scope_contract[
-            "required_live_slot_identities"
-        ]
-        continuity_only_slot_identities = scope_contract[
-            "continuity_only_slot_identities"
-        ]
+        required_slot_identities = effective_required_slot_identities
+        continuity_only_slot_identities = (
+            effective_continuity_slot_identities
+        )
         required_bindings = [
             row for row in bindings
             if tuple(slot_identity(row)) in required_slot_identities
@@ -2718,9 +2890,15 @@ def _normalized_generator_delivery(
             if tuple(slot_identity(row)) in required_slot_identities
         ]
     current_required_mesh_ids = sorted({
-        _positive_asset_id(row.get("target_mesh_id"))
+        _generator_target_mesh_id(
+            row.get("target_mesh_id"),
+            allow_material_default=explicit_ownership,
+        )
         for row in required_bindings
-        if _positive_asset_id(row.get("target_mesh_id")) is not None
+        if _generator_target_mesh_id(
+            row.get("target_mesh_id"),
+            allow_material_default=explicit_ownership,
+        ) is not None
     })
     evidence["active_required_binding_count"] = len(required_bindings)
     evidence["planned_inactive_binding_count"] = len(planned_inactive_slots)
@@ -2756,17 +2934,21 @@ def _normalized_generator_delivery(
         target_material_id = _positive_asset_id(
             declared.get("target_material_id")
         )
-        target_mesh_id = _positive_asset_id(declared.get("target_mesh_id"))
+        target_mesh_id = _generator_target_mesh_id(
+            declared.get("target_mesh_id"),
+            allow_material_default=explicit_ownership,
+        )
         declared_slot = tuple(slot_identity(declared))
         continuity_only = declared_slot in continuity_only_slot_identities
         current_rows = live_by_slot.get(declared_slot) or []
         current = current_rows[0] if len(current_rows) == 1 else None
         if target_material_id != expected_material_id:
             errors.append("target_material_not_normalized_material")
-        if target_mesh_id not in set(normalized_mesh_ids):
-            errors.append("target_mesh_not_normalized_variant")
-        if target_mesh_id not in set(live_asset_mesh_ids):
-            errors.append("target_mesh_asset_missing")
+        if target_mesh_id != -10:
+            if target_mesh_id not in set(normalized_mesh_ids):
+                errors.append("target_mesh_not_normalized_variant")
+            if target_mesh_id not in set(live_asset_mesh_ids):
+                errors.append("target_mesh_asset_missing")
         if not current_rows:
             # Retain the established error token for report compatibility.  It
             # now means the semantic slot is absent from the unfiltered live
@@ -2778,7 +2960,10 @@ def _normalized_generator_delivery(
             current_material_id = _positive_asset_id(
                 current.get("material_id")
             )
-            current_mesh_id = _positive_asset_id(current.get("mesh_id"))
+            current_mesh_id = _generator_target_mesh_id(
+                current.get("mesh_id"),
+                allow_material_default=explicit_ownership,
+            )
             if current_material_id != target_material_id:
                 errors.append("visible_generator_material_mismatch")
             if current_mesh_id != target_mesh_id:
@@ -2863,6 +3048,15 @@ def _normalized_generator_delivery(
         evidence["delivery_decision"] = "pass_through"
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
+        )
+    elif explicit_ownership and not bindings and not evidence["errors"]:
+        # A fully relinquished provider still owns its generated assets and
+        # immutable authoring history, but it owns no current Generator slot.
+        # Treat that valid zero-cardinality current projection as asset-only.
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "generator_current_ownership_relinquished"
         )
     elif (
         explicit_scope

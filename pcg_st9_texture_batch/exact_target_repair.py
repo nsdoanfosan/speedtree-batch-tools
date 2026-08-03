@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,15 +19,56 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from exact_target_command import build_exact_target_request, run_exact_target_request
+from atlas_producer_rebind import (
+    AtlasProducerRebindProofError,
+    apply_atlas_producer_registry_rebind,
+    build_atlas_producer_rebind_proof,
+    plan_atlas_producer_registry_rebind,
+    validate_atlas_producer_rebind_proof,
+    validate_atlas_producer_refresh_receipt,
+)
+from atlas_target_registry import (
+    capture_target_registry_preimage,
+    load_target_registry,
+    registry_path_for_blend,
+    restore_target_registry_preimage,
+)
 from atlas_manifest_resolver import repair_atlas_manifest_mirrors
 from pcg_canonical_outputs import refresh_atlas_manifests_for_spm
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
+    ATLAS_PRODUCER_REFRESH,
     PCG_TEXTURE_TOOL,
     STEP3_STANDARD,
     canonical_exact_spm,
 )
 from shared_queue_runtime import WaitCancelled
+
+
+class AtlasProducerRefreshRollbackError(RuntimeError):
+    """Producer failed and the exact registry rollback also failed."""
+
+    def __init__(self, original_error, rollback_error, *, evidence):
+        self.original_error = original_error
+        self.rollback_error = rollback_error
+        self.evidence = copy.deepcopy(evidence)
+        super().__init__(
+            "Atlas producer refresh failed and exact registry rollback was "
+            f"blocked: producer={original_error}; rollback={rollback_error}"
+        )
+
+
+class AtlasProducerRefreshCommittedError(RuntimeError):
+    """Child reporting failed after the canonical producer had committed."""
+
+    def __init__(self, original_error, *, receipt):
+        self.original_error = original_error
+        self.canonical_receipt = copy.deepcopy(receipt)
+        super().__init__(
+            "Atlas producer child/reporting failed after the canonical "
+            "receipt committed; registry remains canonical: "
+            f"{original_error}"
+        )
 
 
 def _load_gui_module():
@@ -57,6 +99,93 @@ def _same_path(left, right) -> bool:
         return os.path.samefile(left, right)
     except OSError:
         return False
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _producer_relation_from_request(request: Mapping):
+    if request.get("repair_action") != ATLAS_PRODUCER_REFRESH:
+        raise ValueError("request is not an Atlas producer refresh action")
+    targets = list(request.get("target_spms") or ())
+    if len(targets) != 1:
+        raise ValueError("Atlas producer refresh requires one exact target")
+    canonical = Path(targets[0]).expanduser().absolute()
+    if not canonical.is_file() or canonical.suffix.casefold() != ".spm":
+        raise FileNotFoundError(
+            f"exact Atlas producer target does not exist: {canonical}"
+        )
+    relation = (request.get("provenance") or {}).get("producer_relation")
+    if not isinstance(relation, Mapping):
+        raise AtlasProducerRebindProofError(
+            "exact Atlas producer relation proof is missing"
+        )
+    proof = validate_atlas_producer_rebind_proof(
+        relation,
+        canonical_spm=canonical,
+    )
+    if proof["producer"]["connection_mode"] != "assets_only":
+        raise AtlasProducerRebindProofError(
+            "exact Atlas producer refresh currently supports assets-only producers"
+        )
+    return canonical, proof
+
+
+def build_exact_atlas_producer_refresh_plan(request: Mapping):
+    """Revalidate proof/registry state and return a non-mutating exact plan."""
+
+    canonical, proof = _producer_relation_from_request(request)
+    blend = proof["producer"]["blend"]["path"]
+    legacy = proof["legacy_spm"]["path"]
+    registry = load_target_registry(blend)
+    if not registry:
+        raise AtlasProducerRebindProofError(
+            "Atlas producer registry disappeared after audit"
+        )
+    targets = registry["target_spms"]
+    legacy_on = any(_same_path(value, legacy) for value in targets)
+    canonical_on = any(_same_path(value, canonical) for value in targets)
+    if legacy_on:
+        fresh = build_atlas_producer_rebind_proof(
+            canonical,
+            proof["legacy_manifest"]["path"],
+            inventory_paths=[canonical],
+        )
+        if fresh["proof_sha256"] != proof["proof_sha256"]:
+            raise AtlasProducerRebindProofError(
+                "Atlas producer relation changed after audit"
+            )
+        registry_status = "rebind_required"
+    elif canonical_on:
+        for record in (
+            proof["canonical_spm"],
+            proof["legacy_manifest"],
+            proof["pair"]["receipt"],
+            proof["producer"]["blend"],
+        ):
+            path = Path(record["path"])
+            if not path.is_file() or _sha256_file(path) != record["sha256"]:
+                raise AtlasProducerRebindProofError(
+                    "Atlas producer authority changed after registry rebind"
+                )
+        registry_status = "already_rebound"
+    else:
+        raise AtlasProducerRebindProofError(
+            "Atlas producer registry contains neither exact legacy nor canonical target"
+        )
+    return {
+        "status": "ready",
+        "canonical_spm": str(canonical),
+        "producer_blend": blend,
+        "registry_status": registry_status,
+        "proof": proof,
+        "registry_plan": plan_atlas_producer_registry_rebind(proof),
+    }
 
 
 def _exact_item(module, report, target: Path) -> tuple[dict, list[str]]:
@@ -181,8 +310,316 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     return module, app, plan, canonical
 
 
+def _run_exact_atlas_producer_refresh(
+    request: Mapping,
+    refresh_plan: Mapping,
+):
+    """Run the direct one-path assets-only Blender producer."""
+
+    module = _load_gui_module()
+    cfg = dict(module.load_config())
+    proof = refresh_plan["proof"]
+    canonical = Path(refresh_plan["canonical_spm"])
+    blend = Path(refresh_plan["producer_blend"])
+    legacy_manifest_path = Path(proof["legacy_manifest"]["path"])
+    if _sha256_file(legacy_manifest_path) != proof["legacy_manifest"]["sha256"]:
+        raise AtlasProducerRebindProofError(
+            "legacy Atlas receipt changed before Blender producer launch"
+        )
+    legacy_manifest = json.loads(
+        legacy_manifest_path.read_text(encoding="utf-8")
+    )
+    textures = legacy_manifest.get("textures") or {}
+    albedo = Path(str(textures.get("albedo") or ""))
+    alpha = Path(str(textures.get("alpha") or ""))
+    if not albedo.is_file() or not alpha.is_file():
+        raise AtlasProducerRebindProofError(
+            "assets-only producer source Albedo/Alpha is missing"
+        )
+    material_name = str(
+        legacy_manifest.get("atlas_asset_name")
+        or legacy_manifest.get("material_name")
+        or proof["producer"]["source_collection"]
+    ).strip()
+    if not material_name:
+        raise AtlasProducerRebindProofError(
+            "assets-only producer material identity is missing"
+        )
+
+    module.REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = "exact_atlas_producer_" + "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in str(request.get("request_id") or "request")
+    )
+    report_path = module.REPORT_DIR / f"{stem}.json"
+    proof_path = module.REPORT_DIR / f"{stem}.proof.json"
+    authority_path = module.REPORT_DIR / f"{stem}.authority.json"
+    proof_path.write_text(
+        json.dumps(proof, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    canonical_manifest = (
+        canonical.parent
+        / ".atlas_leaf_speedtree_targets"
+        / f"{canonical.stem}.json"
+    )
+    global_manifest = canonical.parent / "speedtree_import_manifest.json"
+    import_readme = canonical.parent / "README_SPEEDTREE_IMPORT.md"
+    child_payload = {
+        "albedo": str(albedo),
+        "alpha": str(alpha),
+        "material_name": material_name,
+        "blend_out": str(blend),
+        "spms": [str(canonical)],
+        "target_map_json": "",
+        "build_spm": True,
+        "reuse_existing_blend": True,
+        "registry_managed_externally": True,
+        "producer_refresh_proof_json": str(proof_path),
+        "quality": "SPEEDTREE_LOW",
+        "plate_mode": "SINGLE",
+    }
+    blender_exe = cfg.get("blender_exe", "")
+    config_keys = ("blender_exe", "atlas_job_timeout")
+    config_projection = module.mutation_config_projection(cfg, config_keys)
+    target_memberships = [
+        canonical.parent / "meshes",
+        canonical.parent / ".atlas_leaf_speedtree_targets",
+        canonical.parent / ".atlas_leaf_speedtree_scopes",
+    ]
+    observed_memberships = [
+        *target_memberships,
+        blend.parent / "_atlas_job_work",
+    ]
+    authority = module.capture_runtime_mutation_authority(
+        action="atlas_producer_refresh",
+        unit_id="atlas-producer-refresh",
+        payload=child_payload,
+        paths=[
+            albedo,
+            alpha,
+            blend,
+            canonical,
+            canonical_manifest,
+            global_manifest,
+            import_readme,
+            registry_path_for_blend(blend),
+            proof_path,
+        ],
+        write_paths=[
+            blend,
+            canonical,
+            canonical_manifest,
+            global_manifest,
+            import_readme,
+        ],
+        memberships=observed_memberships,
+        write_memberships=target_memberships,
+        config_projection=config_projection,
+        tool_paths=[
+            blender_exe,
+            module.blender_user_startup_path(blender_exe),
+            TOOL_DIR / "jobs" / "atlas_blend_job.py",
+        ],
+    )
+    module.require_mutation_authority_unit(
+        authority,
+        "atlas-producer-refresh",
+        current_payload=child_payload,
+        current_config=config_projection,
+    )
+    authority_sha256 = module.write_child_mutation_authority(
+        authority,
+        "atlas-producer-refresh",
+        authority_path,
+    )
+    command = module.atlas_blender_command(blender_exe) + [
+        "--albedo", str(albedo),
+        "--alpha", str(alpha),
+        "--material-name", material_name,
+        "--blend-out", str(blend),
+        "--report", str(report_path),
+        "--quality", "SPEEDTREE_LOW",
+        "--plate-mode", "SINGLE",
+        "--reuse-existing-blend",
+        "--registry-managed-externally",
+        "--producer-refresh-proof-json", str(proof_path),
+        "--spm", str(canonical),
+        "--build-spm",
+        "--authority-json", str(authority_path),
+        "--authority-sha256", authority_sha256,
+    ]
+    result = module.owned_run(
+        command,
+        source="pcg_st9_texture_batch.exact_target_repair.atlas_producer",
+        run_factory=module.subprocess.run,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=cfg.get("atlas_job_timeout", 1800),
+        creationflags=0x08000000,
+    )
+    data = (
+        json.loads(report_path.read_text(encoding="utf-8"))
+        if report_path.is_file()
+        else {}
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            data.get("error") or (result.stderr or result.stdout)[-400:]
+        )
+    module.validate_step2_job_report(data, require_generator_connections=False)
+    receipt = validate_atlas_producer_refresh_receipt(
+        proof,
+        manifest_path=canonical_manifest,
+    )
+    module.complete_mutation_authority_unit(
+        authority,
+        "atlas-producer-refresh",
+        post_paths=[
+            blend,
+            canonical,
+            canonical_manifest,
+            global_manifest,
+            import_readme,
+        ],
+    )
+    return {
+        "report_path": str(report_path),
+        "blender_report": data,
+        "canonical_receipt": receipt,
+    }
+
+
+def execute_exact_atlas_producer_refresh(
+    request: Mapping, *, progress, cancel_event, lease
+):
+    if cancel_event.is_set():
+        raise WaitCancelled("exact Atlas producer refresh cancelled")
+    renew = getattr(lease, "renew_and_check_current", lambda: True)
+    if not renew():
+        raise RuntimeError("shared queue lease is no longer current")
+    progress("Atlas producer 관계 검증", completed=0, remaining=1)
+    refresh_plan = build_exact_atlas_producer_refresh_plan(request)
+    registry_preimage = capture_target_registry_preimage(
+        refresh_plan["producer_blend"]
+    )
+    registry_result = None
+    producer_started = False
+    producer_committed = False
+    producer_result = None
+    try:
+        registry_result = apply_atlas_producer_registry_rebind(
+            refresh_plan["registry_plan"]
+        )
+        if cancel_event.is_set():
+            raise WaitCancelled("exact Atlas producer refresh cancelled")
+        if not renew():
+            raise RuntimeError("shared queue lease became stale")
+        progress(
+            "Atlas producer canonical 영수증 생성",
+            completed=0,
+            remaining=1,
+        )
+        producer_started = True
+        producer_result = _run_exact_atlas_producer_refresh(
+            request,
+            refresh_plan,
+        )
+        producer_committed = True
+        progress(
+            "Atlas producer canonical 영수증 생성",
+            completed=1,
+            remaining=0,
+        )
+    except Exception as original_error:
+        rebind_committed = bool(
+            isinstance(registry_result, Mapping)
+            and registry_result.get("committed") is True
+        )
+        committed_receipt = None
+        if producer_committed:
+            committed_receipt = (
+                (producer_result or {}).get("canonical_receipt")
+                if isinstance(producer_result, Mapping)
+                else None
+            )
+        elif producer_started:
+            canonical = Path(refresh_plan["canonical_spm"])
+            canonical_manifest = (
+                canonical.parent
+                / ".atlas_leaf_speedtree_targets"
+                / f"{canonical.stem}.json"
+            )
+            try:
+                committed_receipt = validate_atlas_producer_refresh_receipt(
+                    refresh_plan["proof"],
+                    manifest_path=canonical_manifest,
+                )
+            except Exception:
+                committed_receipt = None
+
+        if committed_receipt is not None:
+            # The child can lose its report/nonzero handshake after the
+            # staged target transaction committed.  Rolling only the registry
+            # back here would create the inverse split-brain state.
+            raise AtlasProducerRefreshCommittedError(
+                original_error,
+                receipt=committed_receipt,
+            ) from original_error
+
+        if rebind_committed:
+            expected_post_state = registry_result.get("registry_state")
+            try:
+                rollback = restore_target_registry_preimage(
+                    registry_preimage,
+                    expected_registry_state=expected_post_state,
+                )
+            except Exception as rollback_error:
+                raise AtlasProducerRefreshRollbackError(
+                    original_error,
+                    rollback_error,
+                    evidence={
+                        "registry_preimage_state": registry_preimage.get(
+                            "state"
+                        ),
+                        "expected_rebound_state": expected_post_state,
+                        "rollback_contract": getattr(
+                            rollback_error,
+                            "connected_retry_contract",
+                            None,
+                        ),
+                    },
+                ) from original_error
+            try:
+                original_error.add_note(
+                    "Atlas producer registry rebind was rolled back to its "
+                    "exact byte preimage after producer failure "
+                    f"({rollback['registry_state']['sha256']})."
+                )
+            except AttributeError:
+                pass
+        raise
+    return {
+        "status": "completed",
+        "outcome": "completed",
+        "shared_queue_success": True,
+        "exact_target": refresh_plan["canonical_spm"],
+        "registry_rebind": registry_result,
+        "producer": producer_result,
+    }
+
+
 def execute_step3_standard(request: Mapping, *, progress, cancel_event, lease):
     action = request.get("repair_action")
+    if action == ATLAS_PRODUCER_REFRESH:
+        return execute_exact_atlas_producer_refresh(
+            request,
+            progress=progress,
+            cancel_event=cancel_event,
+            lease=lease,
+        )
     if action not in {STEP3_STANDARD, ATLAS_MANIFEST_MIRROR_REPAIR}:
         raise ValueError("PCG exact-target adapter repair action is unsupported")
     if len(request.get("target_spms") or ()) != 1:
@@ -258,8 +695,16 @@ def _parser():
     )
     parser.add_argument(
         "--repair-action",
-        choices=[STEP3_STANDARD, ATLAS_MANIFEST_MIRROR_REPAIR],
+        choices=[
+            STEP3_STANDARD,
+            ATLAS_MANIFEST_MIRROR_REPAIR,
+            ATLAS_PRODUCER_REFRESH,
+        ],
         required=True,
+    )
+    parser.add_argument(
+        "--producer-relation",
+        help="sealed Atlas producer relation JSON (required for its action)",
     )
     parser.add_argument("--target-spm", action="append", required=True)
     parser.add_argument("--parent-retry-id", required=True)
@@ -270,11 +715,24 @@ def _parser():
 
 
 def main(argv=None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     provenance = {
         "source": "PCG_ST9_Texture_Batch.bat",
         "reason_codes": args.reason_code or ["public_exact_target_request"],
     }
+    if args.repair_action == ATLAS_PRODUCER_REFRESH:
+        if not args.producer_relation:
+            parser.error("--producer-relation is required for Atlas producer refresh")
+        try:
+            producer_relation = json.loads(
+                Path(args.producer_relation).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read --producer-relation: {exc}")
+        if not isinstance(producer_relation, dict):
+            parser.error("--producer-relation must contain a JSON object")
+        provenance["producer_relation"] = producer_relation
     request = build_exact_target_request(
         tool=PCG_TEXTURE_TOOL,
         repair_action=args.repair_action,

@@ -1,14 +1,117 @@
+import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import atlas_slot_ownership as ownership
+from atlas_producer_rebind import build_atlas_producer_rebind_proof
+from atlas_target_registry import (
+    load_target_registry,
+    registry_path_for_blend,
+    save_target_registry,
+)
+from cluster_spm_pair_contract import bootstrap_cluster_authoring
 from pcg_st9_texture_batch import exact_target_repair as pcg_exact
 from spm_generator_sync import exact_target_repair as generator_exact
 
 
 class ExactTargetBackendTests(unittest.TestCase):
+    def ownership_plan(self, root):
+        target = Path(root) / "SK_exact.spm"
+        target.write_bytes(b"spm")
+        manifest = Path(root) / "ownership.json"
+        manifest.write_text("{}", encoding="utf-8")
+        payload = {"spm": str(target), "generator_connection": {}}
+        encoded = ownership._pretty_json_bytes(payload)
+        plan = {
+            "contract": ownership.PLAN_CONTRACT,
+            "schema_version": ownership.PLAN_SCHEMA_VERSION,
+            "target_spm": str(target),
+            "status": "repairable",
+            "reason_code": "live_spm_ownership_reconciliation_required",
+            "spm_sha256": "a" * 64,
+            "spm_text_sha256": "b" * 64,
+            "manifest_preconditions": [{
+                "path": str(manifest),
+                "sha256": "c" * 64,
+            }],
+            "provider_updates": [],
+            "takeovers": [],
+            "blocking": [],
+            "ignored_candidates": [],
+            "writes": [{
+                "path": str(manifest),
+                "before_sha256": "c" * 64,
+                "after_sha256": ownership._sha256_bytes(encoded),
+                "payload": payload,
+            }],
+        }
+        plan["plan_sha256"] = ownership._plan_hash(plan)
+        return target, plan
+
+    def ownership_request(self, target, plan):
+        return {
+            "repair_action": generator_exact.ATLAS_SLOT_OWNERSHIP_RECONCILE,
+            "target_spms": [str(target)],
+            "provenance": {"ownership_plan": copy.deepcopy(plan)},
+        }
+
+    def producer_relation(self, root):
+        root = Path(root)
+        cluster = root / "Tree" / "cluster"
+        cluster.mkdir(parents=True)
+        legacy = cluster / "cluster_leaf.spm"
+        legacy.write_bytes(b"legacy")
+        bootstrap_cluster_authoring(legacy)
+        canonical = cluster / "SK_cluster_leaf.spm"
+        blend = root / "atlas" / "M_leaf.blend"
+        blend.parent.mkdir()
+        blend.write_bytes(b"blend")
+        unrelated = root / "Tree" / "SK_tree.spm"
+        unrelated.write_bytes(b"tree")
+        save_target_registry(blend, [unrelated, legacy])
+        manifest = (
+            cluster
+            / ".atlas_leaf_speedtree_targets"
+            / f"{legacy.stem}.json"
+        )
+        manifest.parent.mkdir()
+        albedo = cluster / "leaf.tga"
+        alpha = cluster / "leaf_Opacity.tga"
+        albedo.write_bytes(b"albedo")
+        alpha.write_bytes(b"alpha")
+        manifest.write_text(json.dumps({
+            "spm": str(legacy),
+            "blend_file": str(blend),
+            "source_collection": "M_leaf",
+            "export_scope_id": "scope-leaf",
+            "atlas_asset_name": "M_leaf",
+            "material_groups": [{
+                "material_id": 5,
+                "mesh_ids": [3, 4, 5, 6],
+            }],
+            "textures": {"albedo": str(albedo), "alpha": str(alpha)},
+            "generator_connection": {
+                "requested": False,
+                "complete": False,
+            },
+        }), encoding="utf-8")
+        proof = build_atlas_producer_rebind_proof(
+            canonical,
+            manifest,
+            inventory_paths=[canonical],
+        )
+        request = {
+            "repair_action": pcg_exact.ATLAS_PRODUCER_REFRESH,
+            "target_spms": [str(canonical)],
+            "provenance": {"producer_relation": copy.deepcopy(proof)},
+            "request_id": "producer-test",
+        }
+        return request, proof, blend, legacy, canonical
+
     def test_pcg_inventory_selection_requires_one_exact_identity(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -152,6 +255,400 @@ class ExactTargetBackendTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "sibling followers"):
                     generator_exact.exact_runtime_scope([master])
+
+    def test_ownership_backend_plan_only_callable_never_applies(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, plan = self.ownership_plan(folder)
+            request = self.ownership_request(target, plan)
+
+            with mock.patch.object(
+                generator_exact,
+                "plan_atlas_slot_ownership_reconciliation",
+                return_value=copy.deepcopy(plan),
+            ), mock.patch.object(
+                generator_exact,
+                "apply_atlas_slot_ownership_reconciliation",
+            ) as apply:
+                fresh = generator_exact.build_exact_atlas_slot_ownership_plan(
+                    request
+                )
+
+            self.assertEqual(fresh["plan_sha256"], plan["plan_sha256"])
+            apply.assert_not_called()
+
+    def test_ownership_backend_applies_only_fresh_matching_sealed_plan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, plan = self.ownership_plan(folder)
+            request = self.ownership_request(target, plan)
+            progress = mock.Mock()
+            cancel = SimpleNamespace(is_set=lambda: False)
+            lease = SimpleNamespace(renew_and_check_current=lambda: True)
+
+            with mock.patch.object(
+                generator_exact,
+                "plan_atlas_slot_ownership_reconciliation",
+                return_value=copy.deepcopy(plan),
+            ), mock.patch.object(
+                generator_exact,
+                "apply_atlas_slot_ownership_reconciliation",
+                return_value={"apply_status": "reconciled"},
+            ) as apply:
+                result = (
+                    generator_exact.execute_exact_atlas_slot_ownership_request(
+                        request,
+                        progress=progress,
+                        cancel_event=cancel,
+                        lease=lease,
+                    )
+                )
+
+            self.assertTrue(result["shared_queue_success"])
+            apply.assert_called_once()
+            self.assertEqual(
+                apply.call_args.args[0]["plan_sha256"],
+                plan["plan_sha256"],
+            )
+
+    def test_ownership_backend_rejects_changed_fresh_plan_before_apply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, plan = self.ownership_plan(folder)
+            request = self.ownership_request(target, plan)
+            changed = copy.deepcopy(plan)
+            changed["takeovers"] = [{"reason_code": "changed"}]
+            changed["plan_sha256"] = ownership._plan_hash(changed)
+
+            with mock.patch.object(
+                generator_exact,
+                "plan_atlas_slot_ownership_reconciliation",
+                return_value=changed,
+            ), mock.patch.object(
+                generator_exact,
+                "apply_atlas_slot_ownership_reconciliation",
+            ) as apply, self.assertRaises(
+                ownership.AtlasSlotOwnershipError
+            ) as raised:
+                generator_exact.build_exact_atlas_slot_ownership_plan(request)
+
+            self.assertEqual(
+                raised.exception.reason_code,
+                "exact_live_spm_ownership_plan_changed",
+            )
+            apply.assert_not_called()
+
+    def test_producer_refresh_plan_is_read_only_and_exact(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, proof, blend, legacy, canonical = (
+                self.producer_relation(folder)
+            )
+
+            plan = pcg_exact.build_exact_atlas_producer_refresh_plan(request)
+
+            self.assertEqual(plan["status"], "ready")
+            self.assertEqual(plan["canonical_spm"], str(canonical))
+            self.assertEqual(
+                plan["proof"]["proof_sha256"], proof["proof_sha256"]
+            )
+            self.assertIn(
+                str(legacy), load_target_registry(blend)["target_spms"]
+            )
+
+    def test_producer_refresh_real_authority_seals_every_exact_write_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, _blend, _legacy, canonical = (
+                self.producer_relation(folder)
+            )
+            plan = pcg_exact.build_exact_atlas_producer_refresh_plan(request)
+            pcg_exact.apply_atlas_producer_registry_rebind(
+                plan["registry_plan"]
+            )
+            module = pcg_exact._load_gui_module()
+            reports = Path(folder) / "reports"
+            captured = {}
+
+            def stop_after_capture(command, **_kwargs):
+                authority_path = Path(
+                    command[command.index("--authority-json") + 1]
+                )
+                captured.update(json.loads(
+                    authority_path.read_text(encoding="utf-8")
+                ))
+                return SimpleNamespace(
+                    returncode=1,
+                    stderr="capture sentinel",
+                    stdout="",
+                )
+
+            with mock.patch.object(
+                module,
+                "REPORT_DIR",
+                reports,
+            ), mock.patch.object(
+                module,
+                "load_config",
+                return_value={
+                    "blender_exe": str(Path(__file__).resolve()),
+                    "atlas_job_timeout": 5,
+                },
+            ), mock.patch.object(
+                module,
+                "owned_run",
+                side_effect=stop_after_capture,
+            ), self.assertRaisesRegex(RuntimeError, "capture sentinel"):
+                pcg_exact._run_exact_atlas_producer_refresh(request, plan)
+
+            sealed = {
+                str(Path(path).absolute()).casefold()
+                for path in captured["path_names"]
+            }
+            writes = {
+                str(Path(path).absolute()).casefold()
+                for path in captured["write_path_names"]
+            }
+            expected = {
+                str(path.absolute()).casefold()
+                for path in (
+                    canonical,
+                    canonical.parent
+                    / ".atlas_leaf_speedtree_targets"
+                    / f"{canonical.stem}.json",
+                    canonical.parent / "speedtree_import_manifest.json",
+                    canonical.parent / "README_SPEEDTREE_IMPORT.md",
+                )
+            }
+            self.assertTrue(writes.issubset(sealed))
+            self.assertTrue(expected.issubset(sealed))
+
+    def test_producer_refresh_retry_accepts_already_rebound_registry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, blend, legacy, canonical = (
+                self.producer_relation(folder)
+            )
+            first = pcg_exact.build_exact_atlas_producer_refresh_plan(
+                request
+            )
+            applied = pcg_exact.apply_atlas_producer_registry_rebind(
+                first["registry_plan"]
+            )
+
+            retry = pcg_exact.build_exact_atlas_producer_refresh_plan(
+                request
+            )
+            second = pcg_exact.apply_atlas_producer_registry_rebind(
+                retry["registry_plan"]
+            )
+
+            self.assertEqual(applied["status"], "applied")
+            self.assertEqual(retry["registry_status"], "already_rebound")
+            self.assertEqual(second["status"], "up_to_date")
+            targets = load_target_registry(blend)["target_spms"]
+            self.assertIn(str(canonical), targets)
+            self.assertNotIn(str(legacy), targets)
+
+    def test_producer_refresh_executor_uses_rebind_then_direct_runner(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, _blend, _legacy, _canonical = (
+                self.producer_relation(folder)
+            )
+            progress = mock.Mock()
+            cancel = SimpleNamespace(is_set=lambda: False)
+            lease = SimpleNamespace(renew_and_check_current=lambda: True)
+
+            with mock.patch.object(
+                pcg_exact,
+                "apply_atlas_producer_registry_rebind",
+                return_value={"status": "applied"},
+            ) as rebind, mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+                return_value={"canonical_receipt": {"status": "validated"}},
+            ) as producer:
+                result = pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=progress,
+                    cancel_event=cancel,
+                    lease=lease,
+                )
+
+            self.assertTrue(result["shared_queue_success"])
+            rebind.assert_called_once()
+            producer.assert_called_once()
+
+    def test_producer_failure_rolls_registry_back_to_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, blend, legacy, _canonical = (
+                self.producer_relation(folder)
+            )
+            registry_path = registry_path_for_blend(blend)
+            original_bytes = registry_path.read_bytes()
+            cancel = SimpleNamespace(is_set=lambda: False)
+            lease = SimpleNamespace(renew_and_check_current=lambda: True)
+
+            with mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+                side_effect=RuntimeError("Blender producer failed"),
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "Blender producer failed",
+            ):
+                pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=mock.Mock(),
+                    cancel_event=cancel,
+                    lease=lease,
+                )
+
+            self.assertEqual(registry_path.read_bytes(), original_bytes)
+            self.assertIn(
+                str(legacy), load_target_registry(blend)["target_spms"]
+            )
+
+    def test_cancel_after_rebind_rolls_registry_back_before_producer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, blend, legacy, _canonical = (
+                self.producer_relation(folder)
+            )
+            registry_path = registry_path_for_blend(blend)
+            original_bytes = registry_path.read_bytes()
+            cancel_check = mock.Mock(side_effect=[False, True])
+            cancel = SimpleNamespace(is_set=cancel_check)
+            lease = SimpleNamespace(renew_and_check_current=lambda: True)
+
+            with mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+            ) as producer, self.assertRaises(pcg_exact.WaitCancelled):
+                pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=mock.Mock(),
+                    cancel_event=cancel,
+                    lease=lease,
+                )
+
+            producer.assert_not_called()
+            self.assertEqual(registry_path.read_bytes(), original_bytes)
+            self.assertIn(
+                str(legacy), load_target_registry(blend)["target_spms"]
+            )
+
+    def test_lease_loss_after_rebind_rolls_registry_back(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, blend, legacy, _canonical = (
+                self.producer_relation(folder)
+            )
+            registry_path = registry_path_for_blend(blend)
+            original_bytes = registry_path.read_bytes()
+            renew = mock.Mock(side_effect=[True, False])
+            lease = SimpleNamespace(renew_and_check_current=renew)
+
+            with mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+            ) as producer, self.assertRaisesRegex(
+                RuntimeError,
+                "lease became stale",
+            ):
+                pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=mock.Mock(),
+                    cancel_event=SimpleNamespace(is_set=lambda: False),
+                    lease=lease,
+                )
+
+            producer.assert_not_called()
+            self.assertEqual(registry_path.read_bytes(), original_bytes)
+            self.assertIn(
+                str(legacy), load_target_registry(blend)["target_spms"]
+            )
+
+    def test_registry_rollback_drift_preserves_both_errors_and_external_edit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, _proof, blend, _legacy, canonical = (
+                self.producer_relation(folder)
+            )
+            external = Path(folder) / "Tree" / "SK_external.spm"
+            external.write_bytes(b"external")
+
+            def drift_then_fail(_request, _plan):
+                save_target_registry(blend, [canonical, external])
+                raise RuntimeError("Blender producer failed")
+
+            with mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+                side_effect=drift_then_fail,
+            ), self.assertRaises(
+                pcg_exact.AtlasProducerRefreshRollbackError
+            ) as raised:
+                pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=mock.Mock(),
+                    cancel_event=SimpleNamespace(is_set=lambda: False),
+                    lease=SimpleNamespace(
+                        renew_and_check_current=lambda: True
+                    ),
+                )
+
+            self.assertEqual(
+                str(raised.exception.original_error),
+                "Blender producer failed",
+            )
+            self.assertIn(
+                "changed after authority seal",
+                str(raised.exception.rollback_error),
+            )
+            self.assertEqual(
+                load_target_registry(blend)["target_spms"],
+                [str(canonical.absolute()), str(external.absolute())],
+            )
+
+    def test_committed_canonical_receipt_keeps_registry_on_child_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            request, proof, blend, legacy, canonical = (
+                self.producer_relation(folder)
+            )
+
+            def commit_then_report_failure(_request, _plan):
+                legacy_manifest = Path(proof["legacy_manifest"]["path"])
+                payload = json.loads(
+                    legacy_manifest.read_text(encoding="utf-8")
+                )
+                canonical_manifest = (
+                    canonical.parent
+                    / ".atlas_leaf_speedtree_targets"
+                    / f"{canonical.stem}.json"
+                )
+                payload["spm"] = str(canonical)
+                payload["target_manifest"] = str(canonical_manifest)
+                canonical_manifest.write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                raise RuntimeError("child report was lost")
+
+            with mock.patch.object(
+                pcg_exact,
+                "_run_exact_atlas_producer_refresh",
+                side_effect=commit_then_report_failure,
+            ), self.assertRaises(
+                pcg_exact.AtlasProducerRefreshCommittedError
+            ) as raised:
+                pcg_exact.execute_exact_atlas_producer_refresh(
+                    request,
+                    progress=mock.Mock(),
+                    cancel_event=SimpleNamespace(is_set=lambda: False),
+                    lease=SimpleNamespace(
+                        renew_and_check_current=lambda: True
+                    ),
+                )
+
+            self.assertEqual(
+                str(raised.exception.original_error),
+                "child report was lost",
+            )
+            targets = load_target_registry(blend)["target_spms"]
+            self.assertIn(str(canonical.absolute()), targets)
+            self.assertNotIn(str(legacy.absolute()), targets)
 
 
 if __name__ == "__main__":

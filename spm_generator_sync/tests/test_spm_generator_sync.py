@@ -15,6 +15,20 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 import spm_generator_sync as sync
+
+# CI discovers this directory directly, where ``spm_generator_sync`` is the
+# implementation module.  A repository-wide run can already have imported the
+# package of the same name; in that case select its implementation submodule.
+if not hasattr(sync, "SPMDocument"):
+    from spm_generator_sync import spm_generator_sync as sync
+from atlas_manifest_resolver import (
+    GENERATOR_BINDING_OWNERSHIP_CONTRACT,
+    GENERATOR_BINDING_OWNERSHIP_VERSION,
+    GENERATOR_SLOT_CREATION_PROVENANCE_CONTRACT,
+    GENERATOR_SLOT_CREATION_PROVENANCE_VERSION,
+    generator_binding_ownership_fingerprint,
+    generator_slot_creation_provenance_fingerprint,
+)
 from speedtree_legacy_cluster_contract import (
     LEGACY_CLUSTER_MARKER_VALUES,
     RECEIPT_KIND,
@@ -294,6 +308,50 @@ def with_assets(text, assets):
 
 
 class GeneratorSyncTests(unittest.TestCase):
+    def atlas_ownership_block(self, bindings):
+        return {
+            "contract": GENERATOR_BINDING_OWNERSHIP_CONTRACT,
+            "version": GENERATOR_BINDING_OWNERSHIP_VERSION,
+            "binding_count": len(bindings),
+            "fingerprint": generator_binding_ownership_fingerprint(bindings),
+            "bindings": copy.deepcopy(bindings),
+        }
+
+    def atlas_creation_block(self, slots):
+        return {
+            "contract": GENERATOR_SLOT_CREATION_PROVENANCE_CONTRACT,
+            "version": GENERATOR_SLOT_CREATION_PROVENANCE_VERSION,
+            "slot_count": len(slots),
+            "fingerprint": generator_slot_creation_provenance_fingerprint(
+                slots
+            ),
+            "slots": copy.deepcopy(slots),
+        }
+
+    def write_atlas_candidate(
+        self,
+        folder,
+        target,
+        kind,
+        payload,
+        *,
+        scope="",
+    ):
+        if kind == "exact_per_target":
+            directory = folder / ".atlas_leaf_speedtree_targets"
+            directory.mkdir(exist_ok=True)
+            path = directory / f"{target.stem}.json"
+        elif kind == "exact_target_scope":
+            directory = folder / ".atlas_leaf_speedtree_scopes"
+            directory.mkdir(exist_ok=True)
+            path = directory / f"{scope}__{target.stem}.json"
+        elif kind == "exact_global_target":
+            path = folder / "speedtree_import_manifest.json"
+        else:
+            raise AssertionError(kind)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
     def test_scan_nests_cluster_normalized_blends_under_owner_not_as_spm_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -679,6 +737,36 @@ class GeneratorSyncTests(unittest.TestCase):
                     ],
                 },
             }
+            historical_bindings = manifest["generator_connection"][
+                "bindings"
+            ]
+            current_bindings = [{
+                "generator_guid": "leaf-mesh-b",
+                "slot_prefix": "Leaves:Type:0",
+                "target_material_id": 12,
+                "target_mesh_id": 20,
+            }]
+            creation_slots = [copy.deepcopy(historical_bindings[1])]
+            manifest["generator_binding_ownership"] = {
+                "contract": GENERATOR_BINDING_OWNERSHIP_CONTRACT,
+                "version": GENERATOR_BINDING_OWNERSHIP_VERSION,
+                "binding_count": len(current_bindings),
+                "fingerprint": generator_binding_ownership_fingerprint(
+                    current_bindings
+                ),
+                "bindings": current_bindings,
+            }
+            manifest["generator_slot_creation_provenance"] = {
+                "contract": GENERATOR_SLOT_CREATION_PROVENANCE_CONTRACT,
+                "version": GENERATOR_SLOT_CREATION_PROVENANCE_VERSION,
+                "slot_count": len(creation_slots),
+                "fingerprint": (
+                    generator_slot_creation_provenance_fingerprint(
+                        creation_slots
+                    )
+                ),
+                "slots": creation_slots,
+            }
             manifest_dir = folder / ".atlas_leaf_speedtree_targets"
             manifest_dir.mkdir()
             (manifest_dir / "tree_01.json").write_text(
@@ -691,6 +779,22 @@ class GeneratorSyncTests(unittest.TestCase):
                 "BranchSmall": None,
                 "End 2": "End",
             }
+
+            source_document = sync.SPMDocument.from_path(master, full=True)
+            self.assertEqual(
+                set(source_document.atlas_relation_bindings),
+                {("leaf-mesh-b", "Leaves:Type:0")},
+            )
+            self.assertEqual(
+                source_document.atlas_relation_bindings[
+                    ("leaf-mesh-b", "Leaves:Type:0")
+                ]["source_material_id"],
+                12,
+            )
+            self.assertEqual(
+                set(source_document.atlas_created_slot_provenance),
+                {("leaf-mesh-b", "Leaves:Type:1")},
+            )
 
             plan = sync.build_sync_plan(master, target, mapping)
             patched = sync.SPMDocument(
@@ -737,6 +841,382 @@ class GeneratorSyncTests(unittest.TestCase):
             }
             self.assertNotIn("managed_01", copied_names)
             self.assertNotIn("managed_02", copied_names)
+
+    def test_three_provider_atlas_relations_aggregate_with_local_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "tree_01.spm"
+            source_root = ET.fromstring(make_master())
+            source_generator = next(
+                item
+                for item in source_root.findall("./Generators/Generator")
+                if item.findtext("GUID") == "leaf-mesh-b"
+            )
+            properties = source_generator.find("Properties")
+            properties.append(ET.fromstring(
+                "<Property><Name>Leaves:Type</Name>"
+                "<MultiPropertyChildren>43</MultiPropertyChildren>"
+                "</Property>"
+            ))
+            for slot, material_id, mesh_id in (
+                (7, 20, 207),
+                (42, 30, 342),
+            ):
+                properties.append(ET.fromstring(property_xml(
+                    f"Leaves:Type:{slot}:Material", str(material_id)
+                )))
+                properties.append(ET.fromstring(property_xml(
+                    f"Leaves:Type:{slot}:Mesh", str(mesh_id)
+                )))
+                properties.append(ET.fromstring(property_xml(
+                    f"Leaves:Type:{slot}:Weight", "1"
+                )))
+            properties.append(ET.fromstring(property_xml(
+                "Leaves:Type:20:Material", "99"
+            )))
+            write_spm(
+                source,
+                ET.tostring(source_root, encoding="unicode"),
+            )
+
+            def binding(slot, material_id, target_mesh_id, source_mesh_id):
+                return {
+                    "generator_guid": "leaf-mesh-b",
+                    "generator_name": "Leaf 2",
+                    "slot_prefix": f"Leaves:Type:{slot}",
+                    "source_material_id": material_id,
+                    "source_material_name": f"M_provider_{material_id}",
+                    "source_mesh_id": source_mesh_id,
+                    "target_material_id": material_id,
+                    "target_mesh_id": target_mesh_id,
+                }
+
+            def current(binding_row):
+                return {
+                    key: binding_row[key]
+                    for key in (
+                        "generator_guid",
+                        "slot_prefix",
+                        "target_material_id",
+                        "target_mesh_id",
+                    )
+                }
+
+            def creator(slot, before):
+                prefix = f"Leaves:Type:{slot}"
+                return {
+                    "generator_guid": "leaf-mesh-b",
+                    "generator_name": "Leaf 2",
+                    "slot_prefix": prefix,
+                    "variant_parent_property": "Leaves:Type",
+                    "variant_parent_children_before": before,
+                    "created_property_names": [
+                        f"{prefix}:Material",
+                        f"{prefix}:Mesh",
+                        f"{prefix}:Weight",
+                    ],
+                }
+
+            def provider_payload(
+                scope,
+                material_id,
+                mesh_ids,
+                historical,
+                current_rows,
+                created_rows,
+                original_mesh_ids,
+            ):
+                return {
+                    "spm": str(source),
+                    "blend_file": str(folder / f"{scope}.blend"),
+                    "source_collection": f"Provider {scope}",
+                    "export_scope_id": scope,
+                    "material_groups": [{
+                        "material": f"M_provider_{material_id}",
+                        "material_id": material_id,
+                        "mesh_ids": mesh_ids,
+                    }],
+                    "source_material_adoption": {
+                        "material_id": material_id,
+                        "original_mesh_ids": original_mesh_ids,
+                    },
+                    "generator_connection": {
+                        "requested": True,
+                        "complete": True,
+                        "bindings": copy.deepcopy(historical),
+                    },
+                    "generator_binding_ownership": (
+                        self.atlas_ownership_block(current_rows)
+                    ),
+                    "generator_slot_creation_provenance": (
+                        self.atlas_creation_block(created_rows)
+                    ),
+                }
+
+            a0 = binding(0, 10, 100, 1000)
+            a7 = binding(7, 10, 107, 1007)
+            b7 = binding(7, 20, 207, 2007)
+            c42 = binding(42, 30, 342, 3042)
+            c42.update(creator(42, 8))
+            c42["created_slot"] = True
+            payload_a = provider_payload(
+                "scope-a", 10, [100, 107], [a0, a7],
+                [current(a0)], [creator(7, 1)], [1000, 1007],
+            )
+            payload_b = provider_payload(
+                "scope-b", 20, [207], [b7],
+                [current(b7)], [], [2007],
+            )
+            payload_c = provider_payload(
+                "scope-c", 30, [342], [c42],
+                [current(c42)], [creator(42, 8)], [3042],
+            )
+            # Provider C deliberately remains a legacy receipt. Aggregation
+            # must preserve both current-binding and creator-row fallback.
+            payload_c.pop("generator_binding_ownership")
+            payload_c.pop("generator_slot_creation_provenance")
+            self.write_atlas_candidate(
+                folder, source, "exact_per_target", payload_a
+            )
+            self.write_atlas_candidate(
+                folder, source, "exact_target_scope", payload_b,
+                scope="scope-b",
+            )
+            self.write_atlas_candidate(
+                folder, source, "exact_target_scope", payload_c,
+                scope="scope-c",
+            )
+
+            document = sync.SPMDocument.from_path(source, full=True)
+            self.assertEqual(len(document.atlas_relation_records), 3)
+            self.assertEqual(set(document.atlas_relation_bindings), {
+                ("leaf-mesh-b", "Leaves:Type:0"),
+                ("leaf-mesh-b", "Leaves:Type:7"),
+                ("leaf-mesh-b", "Leaves:Type:42"),
+            })
+            self.assertEqual(
+                document.atlas_relation_bindings[
+                    ("leaf-mesh-b", "Leaves:Type:7")
+                ]["source_mesh_id"],
+                2007,
+            )
+            self.assertEqual(
+                document.atlas_relation_bindings[
+                    ("leaf-mesh-b", "Leaves:Type:7")
+                ]["_atlas_source_material_adoption"],
+                {"material_id": 20, "original_mesh_ids": [2007]},
+            )
+            target_document = mock.Mock()
+            target_document.path = folder / "target.spm"
+            target_document.asset_names_by_id = {
+                "Material_v8": {"220": "M_provider_20"},
+            }
+            target_document.asset_elements_by_id = {
+                "Material_v8": {
+                    "220": ET.fromstring(
+                        '<Material_v8 ID="220" Name="M_provider_20">'
+                        "<CutoutMeshID>9207</CutoutMeshID>"
+                        "</Material_v8>"
+                    ),
+                },
+            }
+            self.assertEqual(
+                sync._atlas_binding_target_local_value(
+                    document,
+                    target_document,
+                    document.atlas_relation_bindings[
+                        ("leaf-mesh-b", "Leaves:Type:7")
+                    ],
+                    "Mesh",
+                ),
+                "9207",
+            )
+            self.assertEqual(set(
+                document.atlas_created_slot_provenance
+            ), {
+                ("leaf-mesh-b", "Leaves:Type:7"),
+                ("leaf-mesh-b", "Leaves:Type:42"),
+            })
+
+            clone = copy.deepcopy(source_generator)
+            removed = sync.strip_atlas_created_variant_slots_from_clone(
+                document,
+                source_generator,
+                clone,
+            )
+            self.assertEqual(len(removed), 6)
+            self.assertIsNone(
+                property_value(clone, "Leaves:Type:7:Material")
+            )
+            self.assertIsNone(
+                property_value(clone, "Leaves:Type:42:Material")
+            )
+            self.assertEqual(
+                property_value(clone, "Leaves:Type:20:Material"), "99"
+            )
+            parent = next(
+                prop
+                for prop in clone.findall("./Properties/Property")
+                if prop.findtext("Name") == "Leaves:Type"
+            )
+            self.assertEqual(parent.findtext("MultiPropertyChildren"), "21")
+
+            conflicting_mirror = copy.deepcopy(payload_b)
+            conflicting_mirror["generator_connection"]["bindings"][0][
+                "source_mesh_id"
+            ] = 9999
+            conflicting_mirror["source_material_adoption"][
+                "original_mesh_ids"
+            ] = [9999]
+            self.write_atlas_candidate(
+                folder,
+                source,
+                "exact_global_target",
+                conflicting_mirror,
+            )
+            with self.assertRaisesRegex(
+                sync.SyncError,
+                "conflicting binding evidence",
+            ):
+                sync.SPMDocument.from_path(source, full=True)
+
+    def test_three_provider_duplicate_creator_provenance_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "tree_01.spm"
+            write_spm(source, make_master())
+
+            def provider(scope, slot, material_id, creator_before=None):
+                binding = {
+                    "generator_guid": "leaf-mesh-b",
+                    "slot_prefix": f"Leaves:Type:{slot}",
+                    "target_material_id": material_id,
+                    "target_mesh_id": material_id * 100 + slot,
+                }
+                creators = []
+                if creator_before is not None:
+                    creators.append({
+                        "generator_guid": "leaf-mesh-b",
+                        "slot_prefix": "Leaves:Type:42",
+                        "variant_parent_property": "Leaves:Type",
+                        "variant_parent_children_before": creator_before,
+                        "created_property_names": [
+                            "Leaves:Type:42:Material",
+                            "Leaves:Type:42:Mesh",
+                        ],
+                    })
+                return {
+                    "spm": str(source),
+                    "blend_file": str(folder / f"{scope}.blend"),
+                    "source_collection": scope,
+                    "export_scope_id": scope,
+                    "material_groups": [{
+                        "material": f"M_{scope}",
+                        "material_id": material_id,
+                        "mesh_ids": [binding["target_mesh_id"]],
+                    }],
+                    "generator_connection": {
+                        "requested": True,
+                        "complete": True,
+                        "bindings": [copy.deepcopy(binding)],
+                    },
+                    "generator_binding_ownership": (
+                        self.atlas_ownership_block([binding])
+                    ),
+                    "generator_slot_creation_provenance": (
+                        self.atlas_creation_block(creators)
+                    ),
+                }
+
+            self.write_atlas_candidate(
+                folder,
+                source,
+                "exact_per_target",
+                provider("scope-a", 0, 10, creator_before=1),
+            )
+            self.write_atlas_candidate(
+                folder,
+                source,
+                "exact_target_scope",
+                provider("scope-b", 7, 20, creator_before=8),
+                scope="scope-b",
+            )
+            self.write_atlas_candidate(
+                folder,
+                source,
+                "exact_target_scope",
+                provider("scope-c", 100, 30),
+                scope="scope-c",
+            )
+
+            with self.assertRaisesRegex(
+                sync.SyncError,
+                "conflicting Generator slot creation provenance",
+            ):
+                sync.SPMDocument.from_path(source, full=True)
+
+    def test_spm_consumer_enforces_semantic_target_id_domain(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "tree_01.spm"
+            write_spm(source, make_master())
+            binding = {
+                "generator_guid": "leaf-mesh-b",
+                "slot_prefix": "Leaves:Type:0",
+                "target_material_id": 10,
+                "target_mesh_id": 100,
+            }
+
+            def records(binding_row):
+                return [{
+                    "path": str(folder / "receipt.json"),
+                    "kind": "exact_per_target",
+                    "precedence": 0,
+                    "source_identity": {
+                        "blend_file": str(folder / "provider.blend"),
+                        "source_collection": "provider",
+                        "export_scope_id": "scope-provider",
+                    },
+                    "payload": {
+                        "generator_connection": {
+                            "complete": True,
+                            "bindings": [copy.deepcopy(binding_row)],
+                        },
+                    },
+                }]
+
+            for field, value in (
+                ("target_material_id", 0),
+                ("target_material_id", -1),
+                ("target_mesh_id", 0),
+                ("target_mesh_id", -1),
+                ("target_mesh_id", -11),
+            ):
+                with self.subTest(field=field, value=value):
+                    invalid = {**binding, field: value}
+                    with mock.patch.object(
+                        sync,
+                        "_atlas_target_relation_records",
+                        return_value=records(invalid),
+                    ), self.assertRaisesRegex(
+                        sync.SyncError,
+                        "invalid semantic target ID",
+                    ):
+                        sync.SPMDocument.from_path(source, full=True)
+
+            sentinel = {**binding, "target_mesh_id": -10}
+            with mock.patch.object(
+                sync,
+                "_atlas_target_relation_records",
+                return_value=records(sentinel),
+            ):
+                document = sync.SPMDocument.from_path(source, full=True)
+            self.assertEqual(
+                document.atlas_relation_bindings[
+                    ("leaf-mesh-b", "Leaves:Type:0")
+                ]["target_mesh_id"],
+                -10,
+            )
 
     def test_scale_risk_uses_tree_radius_and_blocks_dangerous_apply(self):
         with tempfile.TemporaryDirectory() as temp:

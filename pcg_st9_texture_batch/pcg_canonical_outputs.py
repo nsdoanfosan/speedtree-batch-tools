@@ -349,6 +349,25 @@ def refresh_atlas_manifests_for_spm(
         atlas_resolution = resolve_atlas_manifests(target)
     except AtlasManifestResolutionError as exc:
         repair = atlas_manifest_mirror_repair_plan(target, exc.resolution)
+        if (
+            repair.get("reason_code")
+            == "atlas_manifest_ownership_conflict"
+        ):
+            # A different producer/source identity is never a mirror rewrite.
+            # It can still be an intentional handoff when the current live SPM
+            # uniquely resolves every opaque (Generator GUID, slot prefix).
+            # Seal that independent plan into the failure evidence so the
+            # exact Generator Sync executor can revalidate it before applying.
+            from atlas_slot_ownership import (
+                plan_atlas_slot_ownership_reconciliation,
+            )
+
+            repair = {
+                **repair,
+                "ownership_plan": (
+                    plan_atlas_slot_ownership_reconciliation(target)
+                ),
+            }
         raise CanonicalOutputManifestError(
             str(exc),
             report={

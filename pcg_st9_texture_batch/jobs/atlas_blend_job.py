@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--build-spm", action="store_true")
     parser.add_argument("--target-map-json", default="")
     parser.add_argument("--reuse-existing-blend", action="store_true")
+    parser.add_argument("--registry-managed-externally", action="store_true")
+    parser.add_argument("--producer-refresh-proof-json", default="")
     parser.add_argument("--work-dir", default="")
     parser.add_argument("--authority-json", required=True)
     parser.add_argument("--authority-sha256", required=True)
@@ -213,6 +215,81 @@ def apply_mapped_targets(props, targets, material_name):
     return results
 
 
+def apply_exact_assets_only_target(
+    props,
+    target_spm,
+    material_name,
+    producer_refresh_proof,
+):
+    """Atomically update exactly one SPM, independent of the props registry.
+
+    The add-on's ordinary one-path helper rolls back only the SPM itself.  An
+    Atlas export also writes meshes plus global, target, and scope receipts,
+    so the exact repair deliberately enters the add-on's staged filesystem
+    transaction while still passing just the one canonical target.
+    """
+
+    from atlas_leaf_mesh_builder.speedtree import (
+        _export_or_update_speedtree_spm_path_impl,
+        _validate_staged_speedtree_targets,
+        target_manifest_path,
+    )
+    from atlas_leaf_mesh_builder.speedtree_transaction import (
+        cleanup_pending_transaction_roots,
+        execute_atomic_target_update,
+    )
+    from atlas_producer_rebind import (
+        validate_atlas_producer_refresh_manifest,
+    )
+
+    exact_target = Path(target_spm).expanduser().absolute()
+
+    def build_staged_target(staged_target, production_target):
+        return _export_or_update_speedtree_spm_path_impl(
+            props,
+            staged_target,
+            atlas_asset_name=material_name,
+            source_material_names=None,
+            source_material_ids=None,
+            allow_create=False,
+            production_target_spm=production_target,
+        )
+
+    def validate_staged_target(staged_targets, states):
+        references = _validate_staged_speedtree_targets(
+            staged_targets,
+            states,
+        )
+        if len(staged_targets) != 1:
+            raise RuntimeError(
+                "producer refresh transaction escaped its one-target boundary"
+            )
+        staged_manifest = target_manifest_path(staged_targets[0])
+        payload = json.loads(staged_manifest.read_text(encoding="utf-8"))
+        canonical_manifest = target_manifest_path(exact_target)
+        validate_atlas_producer_refresh_manifest(
+            producer_refresh_proof,
+            payload,
+            manifest_path=canonical_manifest,
+        )
+        return references
+
+    try:
+        results = execute_atomic_target_update(
+            [exact_target],
+            build_staged_target,
+            validate_staged_target,
+            allow_create=False,
+        )
+    finally:
+        cleanup_pending_transaction_roots()
+    if not isinstance(results, list) or len(results) != 1:
+        raise RuntimeError(
+            "producer refresh transaction returned a non-exact result set"
+        )
+    return results[0]
+
+
 def main():
     args = parse_args()
     report = {"status": "error"}
@@ -232,6 +309,12 @@ def main():
             "target_map_json": str(args.target_map_json),
             "build_spm": bool(args.build_spm),
             "reuse_existing_blend": bool(args.reuse_existing_blend),
+            "registry_managed_externally": bool(
+                args.registry_managed_externally
+            ),
+            "producer_refresh_proof_json": str(
+                args.producer_refresh_proof_json
+            ),
             "quality": str(args.quality),
             "plate_mode": str(args.plate_mode),
         })
@@ -240,6 +323,39 @@ def main():
         if mapped_targets and (not args.build_spm or not args.spm):
             raise RuntimeError(
                 "--target-map-json은 --build-spm 및 동일한 --spm 목록과 함께 사용해야 함")
+        producer_refresh_proof = None
+        canonical_manifest_path = None
+        if args.producer_refresh_proof_json:
+            from atlas_producer_rebind import (
+                validate_atlas_producer_rebind_proof,
+            )
+            proof_path = Path(args.producer_refresh_proof_json)
+            producer_refresh_proof = validate_atlas_producer_rebind_proof(
+                json.loads(proof_path.read_text(encoding="utf-8"))
+            )
+            canonical = producer_refresh_proof["canonical_spm"]["path"]
+            if (
+                not args.registry_managed_externally
+                or not args.reuse_existing_blend
+                or not args.build_spm
+                or mapped_targets
+                or len(args.spm) != 1
+                or bool(args.work_dir)
+                or str(Path(args.spm[0]).resolve(strict=False)).casefold()
+                != str(Path(canonical).resolve(strict=False)).casefold()
+                or producer_refresh_proof["producer"]["connection_mode"]
+                != "assets_only"
+            ):
+                raise RuntimeError(
+                    "producer refresh requires one exact assets-only canonical SPM "
+                    "with externally managed registry"
+                )
+            canonical_path = Path(canonical)
+            canonical_manifest_path = (
+                canonical_path.parent
+                / ".atlas_leaf_speedtree_targets"
+                / f"{canonical_path.stem}.json"
+            )
         blend_out = Path(args.blend_out)
         if args.reuse_existing_blend:
             if not blend_out.is_file():
@@ -263,8 +379,15 @@ def main():
         from atlas_leaf_mesh_builder.source_index import (
             current_blend_source_index,
         )
-        work_dir = args.work_dir or str(Path(args.blend_out).parent / "_atlas_job_work")
-        Path(work_dir).mkdir(parents=True, exist_ok=True)
+        if producer_refresh_proof is not None:
+            # The direct staged exporter receives canonical.parent explicitly;
+            # do not create or touch the legacy blend-side _atlas_job_work.
+            work_dir = str(canonical_path.parent)
+        else:
+            work_dir = args.work_dir or str(
+                Path(args.blend_out).parent / "_atlas_job_work"
+            )
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
         props.output_dir = work_dir
         props.quality = args.quality
         props.surface_mode = args.plate_mode
@@ -288,25 +411,39 @@ def main():
         if mesh_count == 0:
             raise RuntimeError("사용할 잎 메시가 없음 (알파 아일랜드/기존 Collection 확인)")
 
-        if args.reuse_existing_blend:
+        if args.reuse_existing_blend and producer_refresh_proof is None:
             from atlas_leaf_mesh_builder.target_registry import load_target_registry
             if load_target_registry(blend_out) is not None:
                 sync_spm_target_registry(props, initialize_missing=False)
         else:
             props.speedtree_spm_items.clear()
-        for spm in args.spm:
-            add_spm_target_item(props, spm)
+        if producer_refresh_proof is None:
+            for spm in args.spm:
+                add_spm_target_item(props, spm)
 
         blend_out.parent.mkdir(parents=True, exist_ok=True)
         if not args.reuse_existing_blend:
             bpy.ops.wm.save_as_mainfile(filepath=str(blend_out))
-        save_spm_target_registry(props)
+        if not args.registry_managed_externally:
+            save_spm_target_registry(props)
+
+        # In exact producer mode, finish every potentially fallible Blender
+        # persistence/index step before the staged SPM transaction commits.
+        # The transaction is then the final production mutation in this job.
+        blend_source_index = None
+        if producer_refresh_proof is not None:
+            if bpy.data.is_dirty:
+                bpy.ops.wm.save_mainfile()
+            blend_source_index = current_blend_source_index(
+                expected_blend_path=blend_out,
+            )
 
         spm_summary = None
         target_results = []
         generator_connections_complete = None
         if args.build_spm and args.spm:
-            spm_backups = backup_spms(args.spm)
+            if producer_refresh_proof is None:
+                spm_backups = backup_spms(args.spm)
             if mapped_targets:
                 target_results = apply_mapped_targets(
                     props, mapped_targets, args.material_name)
@@ -318,19 +455,47 @@ def main():
                     raise RuntimeError("일부 최종 SK Generator 연결이 완료되지 않음")
                 spm_summary = json.dumps(target_results, ensure_ascii=False)
             else:
-                # Legacy CLI compatibility: without a target map, retain the
-                # previous asset-registration-only operator behavior.
-                spm_result = bpy.ops.atlas_leaf.build_speedtree_spm()
-                if "FINISHED" not in spm_result:
-                    raise RuntimeError(f"SPM 반영 실패: {spm_result}")
-                spm_summary = props.last_report
-        # Persist the exact datablocks that Blender will index. The resulting
-        # SHA-bound row is the only source-image authority consumed by PCG.
-        if bpy.data.is_dirty:
-            bpy.ops.wm.save_mainfile()
-        blend_source_index = current_blend_source_index(
-            expected_blend_path=blend_out,
-        )
+                if producer_refresh_proof is not None:
+                    exported = apply_exact_assets_only_target(
+                        props,
+                        args.spm[0],
+                        args.material_name,
+                        producer_refresh_proof,
+                    )
+                    spm_summary = json.dumps({
+                        "spm": str(exported[0]),
+                        "manifest": str(exported[1]),
+                        "action": exported[3],
+                        "material_id": exported[4],
+                        "mesh_ids": list(exported[5]),
+                    }, ensure_ascii=False)
+                else:
+                    # Legacy CLI compatibility: without a target map, retain
+                    # the multi-target operator behavior.
+                    spm_result = bpy.ops.atlas_leaf.build_speedtree_spm()
+                    if "FINISHED" not in spm_result:
+                        raise RuntimeError(f"SPM 반영 실패: {spm_result}")
+                    spm_summary = props.last_report
+        producer_refresh_receipt = None
+        if producer_refresh_proof is not None:
+            from atlas_producer_rebind import (
+                validate_atlas_producer_refresh_receipt,
+            )
+            producer_refresh_receipt = (
+                validate_atlas_producer_refresh_receipt(
+                    producer_refresh_proof,
+                    manifest_path=canonical_manifest_path,
+                )
+            )
+        if blend_source_index is None:
+            # Persist the exact datablocks that Blender will index. The
+            # resulting SHA-bound row is the only source-image authority
+            # consumed by PCG.
+            if bpy.data.is_dirty:
+                bpy.ops.wm.save_mainfile()
+            blend_source_index = current_blend_source_index(
+                expected_blend_path=blend_out,
+            )
 
         report = {
             "status": "ok",
@@ -347,6 +512,7 @@ def main():
             "reused_existing_blend": bool(args.reuse_existing_blend),
             "blend_backup": str(blend_backup) if blend_backup else None,
             "spm_backups": [str(backup) for _target, backup in spm_backups],
+            "producer_refresh_receipt": producer_refresh_receipt,
             "authority_sha256": authority.get(
                 "parent_authority_sha256"
             ),
