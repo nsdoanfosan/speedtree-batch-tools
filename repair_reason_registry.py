@@ -518,7 +518,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "normalized_generator_node_table_stale": ReasonRow(
         REPAIRABLE,
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "cluster_refresh",
+        "modeler_node_table",
     ),
     "normalized_variants_required": ReasonRow(
         REPAIRABLE,

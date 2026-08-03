@@ -65,6 +65,8 @@ from exact_target_command import (
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
     GENERATOR_SYNC_TOOL,
+    MODELER_NODE_TABLE_RECOVERY,
+    MODELER_RECOVERY_TOOL,
     PCG_TEXTURE_TOOL,
     REPAIR_PLAN_SCHEMA_VERSION,
     REPAIR_UI_AUTOMATIC,
@@ -5275,11 +5277,96 @@ class App:
             execute_exact_generator_request,
         )
 
+        def execute_modeler_node_table(
+            request,
+            *,
+            progress,
+            cancel_event,
+            lease,
+        ):
+            del lease
+            if cancel_event.is_set():
+                raise WaitCancelled("Modeler Node table repair cancelled")
+            scope = copy.deepcopy(stage.get("recovery_scope") or {})
+            producer_spm = stage.get("producer_spm")
+            target_spms = list(request.get("target_spms") or ())
+            if (
+                scope.get("available") is not True
+                or not producer_spm
+                or len(target_spms) != 1
+            ):
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": "sealed Modeler Node table scope is incomplete",
+                }
+            target_spm = Path(target_spms[0])
+            synthetic = TargetPlannedExclusionError(
+                "sealed Modeler Node table repair",
+                reason_token="normalized_generator_node_table_stale",
+                target_spm=target_spm,
+                producer_spm=producer_spm,
+                evidence={
+                    "issue_codes": [
+                        "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+                    ],
+                    "stale_node_table_recovery": scope,
+                },
+            )
+            progress(
+                "modeler_node_table_recovery",
+                completed=0,
+                remaining=1,
+                unit_stage="modeler_node_table_recovery",
+            )
+            try:
+                resolution = self._attempt_stale_node_table_recovery(
+                    synthetic,
+                    f"exact_{request['request_id']}",
+                    producer_spm,
+                    require_normalized=False,
+                )
+            except BatchItemError as exc:
+                if exc.kind == "cancelled":
+                    raise WaitCancelled(str(exc)) from exc
+                raise
+            if resolution is None:
+                attempt = synthetic.evidence.get("recovery_attempt") or {}
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": str(
+                        attempt.get("reason_token")
+                        or "sealed Modeler Node table repair failed"
+                    ),
+                    "recovery_attempt": copy.deepcopy(attempt),
+                }
+            progress(
+                "modeler_node_table_recovery",
+                completed=1,
+                remaining=0,
+                unit_stage="modeler_node_table_recovery",
+            )
+            return {
+                "outcome": "completed",
+                "shared_queue_success": True,
+                "live_resolution": copy.deepcopy(resolution),
+            }
+
         executors = {
             PCG_TEXTURE_TOOL: execute_step3_standard,
             GENERATOR_SYNC_TOOL: execute_exact_generator_request,
+            MODELER_RECOVERY_TOOL: execute_modeler_node_table,
         }
         tool = str(stage.get("tool") or "")
+        if (
+            tool == MODELER_RECOVERY_TOOL
+            and stage.get("repair_action") != MODELER_NODE_TABLE_RECOVERY
+        ):
+            raise RuntimeError(
+                "unsupported SpeedTree Modeler exact repair action: "
+                + str(stage.get("repair_action") or "")
+            )
         executor = executors.get(tool)
         if executor is None:
             raise RuntimeError(f"unsupported exact repair tool: {tool}")
@@ -12064,12 +12151,6 @@ class App:
         ):
             return None
 
-        # The semantic Modeler Save path owns this action until it is exposed
-        # as an exact-target executor.  Treating stale authored Node data as a
-        # Cluster refresh would report success without repairing the SPM.
-        if "normalized_generator_node_table_stale" in reason_codes:
-            return None
-
         def attach_attempt(payload):
             attempt = copy.deepcopy(payload)
             exclusion.evidence["repair_attempt"] = attempt
@@ -12248,10 +12329,18 @@ class App:
                         kind="cancelled",
                         report=cached,
                     )
+                if cached_status == "owner_lost":
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                        kind="owner_lost",
+                        report=cached,
+                    )
                 attach_attempt(cached)
                 return None
 
             attempted = []
+            planned_stages = list(plan.get("stages") or ())
+            modeler_live_resolution = None
             self.ui_queue.put((
                 "progress",
                 f"{target.name} · Generator/Cluster exact 자동 복구 시작",
@@ -12261,7 +12350,7 @@ class App:
                 f"{target.name} · provider={producer.name} · "
                 f"reasons={','.join(sorted(reason_codes))}"
             )
-            for stage_index, stage in enumerate(plan.get("stages") or (), 1):
+            for stage_index, stage in enumerate(planned_stages, 1):
                 if self.stop_flag.is_set():
                     cancelled = {
                         "status": "cancelled",
@@ -12300,6 +12389,18 @@ class App:
                     or terminal.get("status")
                     or ""
                 )
+                terminal_result = terminal.get("result") or {}
+                if (
+                    len(planned_stages) == 1
+                    and stage.get("repair_action")
+                    == MODELER_NODE_TABLE_RECOVERY
+                    and isinstance(
+                        terminal_result.get("live_resolution"), dict
+                    )
+                ):
+                    modeler_live_resolution = copy.deepcopy(
+                        terminal_result["live_resolution"]
+                    )
                 attempted.append({
                     "stage": stage["stage"],
                     "tool": stage["tool"],
@@ -12322,6 +12423,26 @@ class App:
                         report=cancelled,
                     )
                 if terminal_status != "completed":
+                    if terminal.get("failure_kind") == "owner_lost":
+                        owner_lost = {
+                            "reason_token": "shared_queue_lease_owner_lost",
+                            "request_id": request_id,
+                            "attempted_stages": copy.deepcopy(attempted),
+                            "error": compact_error_message(
+                                terminal.get("error")
+                                or "exact repair owner lost",
+                                320,
+                            ),
+                        }
+                        memo[request_id] = {
+                            "status": "owner_lost",
+                            **copy.deepcopy(owner_lost),
+                        }
+                        raise BatchItemError(
+                            "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                            kind="owner_lost",
+                            report=owner_lost,
+                        )
                     failed = {
                         "status": "failed",
                         "reason_token": "exact_relation_repair_failed",
@@ -12350,6 +12471,8 @@ class App:
                 "progress",
                 f"{target.name} · exact 자동 복구 완료 · live 재검증 중",
             ))
+            if modeler_live_resolution is not None:
+                return modeler_live_resolution
             return fresh_reaudit(attempted)
 
     def _cluster_normalization_stage_with_recovery(
@@ -12397,15 +12520,7 @@ class App:
                         "producer_spm": str(producer_spm),
                     },
                 )
-            recovered = self._attempt_stale_node_table_recovery(
-                exc,
-                stamp,
-                producer_spm,
-                require_normalized=require_normalized,
-            )
-            if recovered is None:
-                raise
-            return recovered
+            raise
 
     def _attempt_stale_node_table_recovery(
         self,
@@ -12436,7 +12551,11 @@ class App:
                 "status": "not_started",
                 "reason_token": "initiating_job_cancelled",
             }
-            return None
+            raise BatchItemError(
+                "SpeedTree Node table 자동 복구가 사용자에 의해 취소되었습니다.",
+                kind="cancelled",
+                report=copy.deepcopy(exclusion.evidence["recovery_attempt"]),
+            )
 
         from pcg_st9_texture_batch.stale_node_table_recovery import (
             StaleNodeTableRecoveryError,
@@ -12565,6 +12684,30 @@ class App:
                 on_continuation_claimed=mark_resume_committed,
             )
         except StaleNodeTableRecoveryError as exc:
+            if exc.reason_token in {
+                "initiating_job_cancelled",
+                "initiating_app_closed",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구가 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
+            if exc.reason_token in {
+                "initiating_job_generation_stale",
+                "initiating_queue_lease_lost",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구의 실행 소유권을 잃었습니다.",
+                    kind="owner_lost",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
             continuation_failed = exc.reason_token in {
                 "continuation_callback_failed",
                 "continuation_claim_publish_failed",

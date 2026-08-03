@@ -29,18 +29,21 @@ REPAIR_RECEIPT_SCHEMA_VERSION = 1
 
 PCG_TEXTURE_TOOL = "pcg_st9_texture_batch"
 GENERATOR_SYNC_TOOL = "spm_generator_sync"
+MODELER_RECOVERY_TOOL = "speedtree_modeler"
 
 STEP3_STANDARD = "step3-standard"
 ATLAS_MANIFEST_MIRROR_REPAIR = "atlas-manifest-mirror-repair"
 GENERATOR_SYNC = "generator-sync"
 CLUSTER_REFRESH = "cluster-refresh"
 GENERATOR_SYNC_AND_CLUSTER = "generator-sync-and-cluster"
+MODELER_NODE_TABLE_RECOVERY = "modeler-node-table-recovery"
 
 STATUS_PENDING = "automatic_repair_pending"
 STATUS_TEXTURE = "pcg_texture_repair_running"
 STATUS_ATLAS = "atlas_manifest_repair_running"
 STATUS_GENERATOR = "generator_sync_running"
 STATUS_CLUSTER = "cluster_refresh_running"
+STATUS_MODELER = "modeler_node_table_recovery_running"
 STATUS_REAUDIT = "fresh_reaudit_running"
 STATUS_PIPELINE = "blender_unreal_retry_running"
 STATUS_COMPLETED = "automatic_repair_completed"
@@ -53,6 +56,7 @@ STATUS_LABELS = {
     STATUS_ATLAS: "Atlas manifest 복구 중",
     STATUS_GENERATOR: "Generator Sync 중",
     STATUS_CLUSTER: "Cluster 갱신 중",
+    STATUS_MODELER: "SpeedTree Node table 복구 중",
     STATUS_REAUDIT: "재검증 중",
     STATUS_PIPELINE: "Blender-Unreal 재시도 중",
     STATUS_COMPLETED: "자동 복구 완료",
@@ -85,6 +89,9 @@ GENERATOR_AND_CLUSTER_REASON_CODES = _registered_codes(
 )
 CLUSTER_STALE_REASON_CODES = _registered_codes(
     disposition=REPAIRABLE, note="cluster_refresh",
+)
+MODELER_NODE_TABLE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="modeler_node_table",
 )
 
 UNSUPPORTED_ATLAS_MANIFEST_CODES = _registered_codes(
@@ -434,6 +441,70 @@ def _first_nested_mapping(
     return None
 
 
+def _validated_modeler_recovery_scope(
+    evidence: Mapping[str, Any],
+    canonical: Path,
+) -> dict[str, Any] | None:
+    scope = _first_nested_mapping(evidence, "stale_node_table_recovery")
+    if not isinstance(scope, Mapping):
+        return None
+    if (
+        scope.get("available") is not True
+        or scope.get("schema_version") != 2
+        or scope.get("mode") != "owned_semantic_uia_modeler_save_watch"
+        or scope.get("scope_policy")
+        != "explicit_sealed_delivery_scopes_v1"
+        or not scope.get("target_spm")
+        or _path_key(scope["target_spm"]) != _path_key(canonical)
+    ):
+        return None
+
+    def canonical_mesh_ids(key: str) -> list[int] | None:
+        values = scope.get(key)
+        if not isinstance(values, (list, tuple)):
+            return None
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return None
+        normalized = sorted(set(values))
+        return normalized if list(values) == normalized else None
+
+    authoring_mesh_ids = canonical_mesh_ids("authoring_mesh_ids")
+    required_live_mesh_ids = canonical_mesh_ids("required_live_mesh_ids")
+    if (
+        not authoring_mesh_ids
+        or not required_live_mesh_ids
+        or not set(required_live_mesh_ids).issubset(authoring_mesh_ids)
+    ):
+        return None
+    preimage = str(scope.get("target_preimage_raw_sha256") or "").casefold()
+    if len(preimage) != 64 or any(
+        character not in "0123456789abcdef" for character in preimage
+    ):
+        return None
+    scope_sha256 = str(scope.get("scope_sha256") or "").casefold()
+    sealed = {
+        name: value for name, value in scope.items()
+        if name != "scope_sha256"
+    }
+    expected_scope_sha256 = hashlib.sha256((json.dumps(
+        sealed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n").encode("utf-8")).hexdigest()
+    if (
+        len(scope_sha256) != 64
+        or scope_sha256 != expected_scope_sha256
+    ):
+        return None
+    return copy.deepcopy(dict(scope))
+
+
 def _reason_labels_ko(codes: set[str]) -> list[str]:
     return [
         REASON_LABELS_KO[code]
@@ -527,7 +598,18 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             evidence,
             "stale_node_table_recovery",
         )
-        if not recovery or recovery.get("available") is not True:
+        recovery_target = (
+            recovery.get("target_spm")
+            if isinstance(recovery, Mapping)
+            else None
+        )
+        if (
+            not recovery_target
+            or _validated_modeler_recovery_scope(
+                evidence, Path(recovery_target)
+            )
+            is None
+        ):
             return decision(
                 REPAIR_UI_BLOCKED,
                 "SpeedTree Generator Node table이 오래되었지만 자동 저장할 exact target 범위가 증명되지 않았습니다.",
@@ -572,8 +654,8 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
     return decision(
         REPAIR_UI_BLOCKED,
-        "자동 복구 가능한 구조화 원인을 확인하지 못했습니다.",
-        "현재 검사에서 정확한 원인과 대상 증거를 다시 생성해야 합니다.",
+        "이 차단 사유에는 등록된 자동 복구 동작이 없습니다.",
+        "표시된 원인 코드와 감사 증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요.",
     )
 
 
@@ -728,6 +810,7 @@ def build_exact_target_repair_plan(
     generator = bool(codes & GENERATOR_REASON_CODES)
     generator_cluster = bool(codes & GENERATOR_AND_CLUSTER_REASON_CODES)
     cluster_stale = bool(codes & CLUSTER_STALE_REASON_CODES)
+    modeler_node_table = bool(codes & MODELER_NODE_TABLE_REASON_CODES)
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     recipe = _validated_recipe(evidence) if recipe_codes else None
 
@@ -804,6 +887,55 @@ def build_exact_target_repair_plan(
             continue
         if _path_key(resolved) != _path_key(canonical):
             exact_clusters.append(resolved)
+
+    if modeler_node_table:
+        recovery_scope = _validated_modeler_recovery_scope(
+            evidence, canonical
+        )
+        node_provider = None
+        provider_value = evidence.get("producer_spm")
+        try:
+            if provider_value:
+                node_provider = canonical_exact_spm(
+                    provider_value,
+                    inventory,
+                    require_exists=require_exists,
+                )
+        except (FileNotFoundError, ValueError):
+            node_provider = None
+        if node_provider is None:
+            unique_clusters = {
+                _path_key(candidate): candidate
+                for candidate in exact_clusters
+            }
+            if len(unique_clusters) == 1:
+                node_provider = next(iter(unique_clusters.values()))
+        if (
+            recovery_scope is None
+            or not node_provider
+            or _path_key(node_provider) == _path_key(canonical)
+        ):
+            return RepairPlan(
+                REPAIR_PLAN_SCHEMA_VERSION,
+                str(request_id),
+                str(parent_retry_id),
+                canonical,
+                evidence_sha256,
+                tuple(sorted(codes)),
+                (),
+                False,
+                STATUS_FINAL_FAILED,
+                "Node table 자동 복구의 exact target/provider 범위를 하나로 증명하지 못했습니다.",
+                "fresh live audit로 대상 SPM과 현재 Cluster provider를 다시 확정하세요.",
+            )
+        add(
+            "modeler_node_table_recovery",
+            MODELER_RECOVERY_TOOL,
+            MODELER_NODE_TABLE_RECOVERY,
+            [canonical],
+            producer_spm=node_provider,
+            recovery_scope=copy.deepcopy(recovery_scope),
+        )
 
     needs_cluster = generator_cluster or cluster_stale or recipe is not None
     cluster_targets = []
@@ -887,6 +1019,7 @@ def stage_running_status(stage: Mapping[str, Any]) -> str:
         "generator_sync": STATUS_GENERATOR,
         "generator_sync_and_cluster": STATUS_GENERATOR,
         "cluster_refresh": STATUS_CLUSTER,
+        "modeler_node_table_recovery": STATUS_MODELER,
     }.get(str(stage.get("stage") or ""), STATUS_PENDING)
 
 
@@ -935,6 +1068,8 @@ def compact_success_message(attempted_stages: Sequence[Mapping[str, Any]]) -> st
         names.append("Atlas manifest")
     if stage_names & {"generator_sync", "generator_sync_and_cluster"}:
         names.append("Generator")
+    if "modeler_node_table_recovery" in stage_names:
+        names.append("SpeedTree Node table")
     if stage_names & {"cluster_refresh", "generator_sync_and_cluster"}:
         names.append("Cluster")
     names.extend(("Blender", "Unreal"))

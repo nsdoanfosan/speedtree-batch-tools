@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -8,6 +9,8 @@ from repair_orchestration import (
     CLUSTER_REFRESH,
     GENERATOR_SYNC,
     GENERATOR_SYNC_AND_CLUSTER,
+    MODELER_NODE_TABLE_RECOVERY,
+    MODELER_RECOVERY_TOOL,
     REPAIR_UI_AUTOMATIC,
     REPAIR_UI_BLOCKED,
     STATUS_COMPLETED,
@@ -45,6 +48,25 @@ class RepairOrchestrationTests(unittest.TestCase):
             parent_retry_id="retry-118",
             request_id="request-1",
         )
+
+    def modeler_scope(self):
+        scope = {
+            "schema_version": 2,
+            "available": True,
+            "mode": "owned_semantic_uia_modeler_save_watch",
+            "scope_policy": "explicit_sealed_delivery_scopes_v1",
+            "target_spm": str(self.target),
+            "target_preimage_raw_sha256": "a" * 64,
+            "authoring_mesh_ids": [1, 2],
+            "required_live_mesh_ids": [1],
+        }
+        scope["scope_sha256"] = hashlib.sha256((json.dumps(
+            scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n").encode("utf-8")).hexdigest()
+        return scope
 
     def test_texture_reason_uses_standard_step3_without_force(self):
         plan = self.plan({
@@ -99,6 +121,23 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("서로 다른 원본", blocked["reason"])
         self.assertIn("임의로 덮어쓰지 않습니다", blocked["action"])
 
+    def test_unclassified_reason_has_explicit_korean_cause_and_action(self):
+        decision = repair_ui_decision({
+            "reason_code": "managed_mesh_owner_ambiguous",
+        })
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertEqual(
+            decision["reason"],
+            "이 차단 사유에는 등록된 자동 복구 동작이 없습니다.",
+        )
+        self.assertEqual(
+            decision["action"],
+            "표시된 원인 코드와 감사 증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요.",
+        )
+        self.assertTrue(any("가" <= ch <= "힣" for ch in decision["reason"]))
+        self.assertTrue(any("가" <= ch <= "힣" for ch in decision["action"]))
+
     def test_unsealed_stale_node_table_is_explicit_final_block(self):
         evidence = {
             "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
@@ -130,17 +169,65 @@ class RepairOrchestrationTests(unittest.TestCase):
     def test_sealed_stale_node_table_has_one_automatic_disposition(self):
         evidence = {
             "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
-            "stale_node_table_recovery": {
-                "available": True,
-                "target_spm": str(self.target),
-            },
+            "stale_node_table_recovery": self.modeler_scope(),
+            "producer_spm": str(self.cluster),
         }
         decision = repair_ui_decision(evidence)
         plan = self.plan(evidence)
 
         self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
         self.assertTrue(plan.supported)
-        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            MODELER_NODE_TABLE_RECOVERY,
+        )
+        self.assertEqual(plan.stages[0]["tool"], MODELER_RECOVERY_TOOL)
+        self.assertEqual(
+            plan.stages[0]["producer_spm"], str(self.cluster)
+        )
+
+    def test_malformed_modeler_scope_fails_before_exact_execution(self):
+        scope = self.modeler_scope()
+        scope["required_live_mesh_ids"] = [99]
+        sealed = {
+            key: value for key, value in scope.items()
+            if key != "scope_sha256"
+        }
+        scope["scope_sha256"] = hashlib.sha256((json.dumps(
+            sealed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n").encode("utf-8")).hexdigest()
+
+        plan = self.plan({
+            "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+            "stale_node_table_recovery": scope,
+            "producer_spm": str(self.cluster),
+        })
+
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.initial_status, STATUS_FINAL_FAILED)
+        self.assertEqual(plan.stages, ())
+        self.assertIn("exact target 범위", plan.friendly_reason)
+
+    def test_restored_node_table_evidence_resolves_one_nested_provider(self):
+        plan = self.plan({
+            "selected_failure": {
+                "reason_token": "normalized_generator_node_table_stale",
+                "target_spm": str(self.target),
+                "producer_spm": str(self.cluster),
+                "stale_node_table_recovery": self.modeler_scope(),
+            },
+        })
+
+        self.assertTrue(plan.supported)
+        self.assertEqual(len(plan.stages), 1)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            MODELER_NODE_TABLE_RECOVERY,
+        )
+        self.assertEqual(plan.stages[0]["producer_spm"], str(self.cluster))
 
     def test_missing_normalized_variant_routes_to_exact_cluster_refresh(self):
         evidence = {

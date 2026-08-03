@@ -69,6 +69,26 @@ class PushQueueFlowTests(unittest.TestCase):
             )
         )
 
+    @staticmethod
+    def sealed_modeler_scope(target):
+        scope = {
+            "schema_version": 2,
+            "available": True,
+            "mode": "owned_semantic_uia_modeler_save_watch",
+            "scope_policy": "explicit_sealed_delivery_scopes_v1",
+            "target_spm": str(Path(target).resolve()),
+            "target_preimage_raw_sha256": "a" * 64,
+            "authoring_mesh_ids": [1, 2],
+            "required_live_mesh_ids": [1],
+        }
+        scope["scope_sha256"] = hashlib.sha256((json.dumps(
+            scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n").encode("utf-8")).hexdigest()
+        return scope
+
     def test_issue16_captured_live_delivery_is_four_runnable_one_blocked(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -677,6 +697,184 @@ class PushQueueFlowTests(unittest.TestCase):
             "unsupported",
         )
 
+    def test_registered_stale_node_reason_selects_modeler_action(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_blackgum_01.spm"
+            provider = root / "cluster" / "SK_cluster_blackgum_01.spm"
+            provider.parent.mkdir(parents=True)
+            target.write_bytes(b"sanitized-target")
+            provider.write_bytes(b"sanitized-provider")
+            app.items = {
+                str(target): {"spm": target},
+                str(provider): {"spm": provider},
+            }
+            app.active_batch_job = {
+                "id": 112,
+                "shared_queue_job_id": "shared-112",
+            }
+            app._active_retry_metadata = {}
+            lease = mock.Mock()
+            lease.job_id = "shared-112"
+            lease.finished = False
+            lease.renew_and_check_current.return_value = True
+            app._active_shared_queue_lease = lease
+            exclusion = gui.TargetPlannedExclusionError(
+                "Node table is stale",
+                reason_token="normalized_generator_node_table_stale",
+                target_spm=target,
+                producer_spm=provider,
+                evidence={
+                    "issue_codes": [
+                        "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+                    ],
+                    "stale_node_table_recovery": (
+                        self.sealed_modeler_scope(target)
+                    ),
+                },
+            )
+            fresh = {
+                "status": "current",
+                "target_spm": str(target),
+                "live_audit_report": str(root / "fresh.json"),
+                "selected_contract": {"handoff": {"status": "ready"}},
+            }
+            execute = mock.Mock(return_value={
+                "status": "completed",
+                "terminal_status": "completed",
+                "result": {"outcome": "completed"},
+            })
+            with mock.patch.object(
+                app,
+                "_cluster_normalization_stage_observation",
+                side_effect=[exclusion, fresh],
+            ), mock.patch.object(
+                app,
+                "_execute_exact_repair_stage",
+                side_effect=execute,
+            ), mock.patch.object(gui, "LOG_DIR", root):
+                runnable, _contracts = app._cluster_relation_input_plan(
+                    [target], "node_table", provider
+                )
+
+        self.assertEqual(runnable, [target])
+        _plan, stage = execute.call_args.args[:2]
+        self.assertEqual(stage["tool"], gui.MODELER_RECOVERY_TOOL)
+        self.assertEqual(
+            stage["repair_action"], gui.MODELER_NODE_TABLE_RECOVERY
+        )
+        self.assertNotEqual(stage["repair_action"], "cluster-refresh")
+
+    def test_stale_node_gate_never_falls_back_outside_registry_action(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("missing") / "SK_tree_blackgum_01.spm"
+        provider = Path("missing") / "cluster" / "SK_cluster_blackgum_01.spm"
+        app.active_batch_job = {"id": 113}
+        app._active_retry_metadata = {}
+        exclusion = gui.TargetPlannedExclusionError(
+            "Node table is stale",
+            reason_token="normalized_generator_node_table_stale",
+            target_spm=target,
+            producer_spm=provider,
+            evidence={
+                "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],
+                "stale_node_table_recovery": {
+                    "available": True,
+                    "target_spm": str(target.resolve()),
+                    "target_preimage_raw_sha256": "a" * 64,
+                },
+            },
+        )
+
+        with mock.patch.object(
+            app,
+            "_cluster_normalization_stage_observation",
+            side_effect=exclusion,
+        ), mock.patch.object(
+            app,
+            "_attempt_stale_node_table_recovery",
+        ) as private_recovery:
+            with self.assertRaises(gui.TargetPlannedExclusionError):
+                app._cluster_normalization_stage_with_recovery(
+                    target,
+                    "missing_scope",
+                    provider,
+                    require_normalized=False,
+                )
+
+        private_recovery.assert_not_called()
+        self.assertEqual(
+            exclusion.evidence["repair_attempt"]["reason_token"],
+            "exact_target_plan_invalid",
+        )
+
+    def test_modeler_registry_stage_executes_sealed_recovery_under_exact_receipt(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_blackgum_01.spm"
+            provider = root / "cluster" / "SK_cluster_blackgum_01.spm"
+            provider.parent.mkdir(parents=True)
+            target.write_bytes(b"sanitized-target")
+            provider.write_bytes(b"sanitized-provider")
+            evidence = {
+                "reason_token": "normalized_generator_node_table_stale",
+                "target_spm": str(target),
+                "producer_spm": str(provider),
+                "stale_node_table_recovery": self.sealed_modeler_scope(
+                    target
+                ),
+            }
+            plan = gui.build_exact_target_repair_plan(
+                target,
+                evidence,
+                inventory_paths=[target, provider],
+                parent_retry_id="retry-modeler",
+                request_id="request-modeler",
+            ).metadata()
+            stage = plan["stages"][0]
+            receipt = root / "modeler-exact-receipt.json"
+            lease = mock.Mock()
+            lease.finished = False
+            lease.renew_and_check_current.return_value = True
+            resolution = {
+                "status": "current",
+                "target_spm": str(target),
+                "selected_contract": {"handoff": {"status": "ready"}},
+            }
+            with mock.patch.object(
+                app,
+                "_attempt_stale_node_table_recovery",
+                return_value=resolution,
+            ) as recover:
+                terminal = app._execute_exact_repair_stage(
+                    plan,
+                    stage,
+                    lease,
+                    stage_index=1,
+                    receipt=receipt,
+                    provenance_source="sanitized.test",
+                )
+
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+
+        self.assertEqual(terminal["terminal_status"], "completed")
+        self.assertEqual(payload["terminal_status"], "completed")
+        self.assertEqual(
+            payload["result"]["live_resolution"], resolution
+        )
+        synthetic = recover.call_args.args[0]
+        self.assertEqual(
+            synthetic.reason_token,
+            "normalized_generator_node_table_stale",
+        )
+        self.assertEqual(synthetic.target_spm, target)
+        self.assertEqual(synthetic.producer_spm, provider)
+
     def test_failed_registered_relation_repair_is_not_enqueued_twice(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -809,82 +1007,97 @@ class PushQueueFlowTests(unittest.TestCase):
         from pcg_st9_texture_batch import speedtree_modeler_uia as semantic_uia
 
         app = self.make_app(gui)
-        target = (Path("black_locast") / "SK_tree_black_locast_02.spm").resolve()
-        provider = Path("black_locast/cluster/SK_branch_black_locast_01.spm").resolve()
-        providers = (
-            ("branch", provider, [88], [88]),
-            (
-                "cluster",
-                Path("black_locast/cluster/SK_cluster_black_locast_01.spm"),
-                [89, 90, 91, 92],
-                [89],
-            ),
-        )
-        scope = gui.cluster_stale_node_table_recovery_scope(
-            self.recoverable_multi_role_contract(target, providers),
-            target,
-            Path("live_audit.json"),
-        )
-        exclusion = gui.TargetPlannedExclusionError(
-            "stale target",
-            reason_token="live_export_evidence_unavailable_stale_node_table",
-            target_spm=target,
-            producer_spm=provider,
-            evidence={"stale_node_table_recovery": scope},
-        )
-        resumed = {
-            "target_spm": str(target),
-            "live_audit_report": "fresh.json",
-            "selected_contract": {"handoff": {"status": "ready"}},
-        }
-        app.active_batch_job = {
-            "id": 95,
-            "shared_queue_job_id": "shared-95",
-            "shared_queue_sequence": 7,
-        }
-        active_lease = mock.Mock()
-        active_lease.job_id = "shared-95"
-        active_lease.finished = False
-        active_lease.renew_and_check_current.return_value = True
-        app._active_shared_queue_lease = active_lease
-        app.cfg = {"speedtree_exe": "SpeedTree_Modeler.exe"}
-        app._app_open = True
-        app._record_pipeline_planned_exclusion = mock.Mock()
-        observe = mock.Mock(side_effect=[exclusion, resumed])
-        captured = {}
-
-        def fake_recover(*args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            kwargs["on_continuation_claimed"]({
-                "verified_after_raw_sha256": "b" * 64,
-            })
-            return {
-                "status": "repaired_reaudited_and_retried_once",
-                "after_raw_sha256": "b" * 64,
-                "retry_result": kwargs["retry"]({"verified": True}),
-            }
-
-        semantic_session = mock.Mock()
-        semantic_session.is_compatible.return_value = True
-        with mock.patch.object(
-            app,
-            "_cluster_normalization_stage_observation",
-            side_effect=observe,
-        ), mock.patch.object(
-            recovery,
-            "recover_stale_node_table",
-            side_effect=fake_recover,
-        ), mock.patch.object(
-            semantic_uia,
-            "SpeedTreeModelerRecoverySession",
-            return_value=semantic_session,
-        ) as session_factory:
-            runnable, contracts = app._cluster_relation_input_plan(
-                [target],
-                "captured",
-                provider,
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_black_locast_02.spm"
+            provider = root / "cluster" / "SK_branch_black_locast_01.spm"
+            cluster_provider = (
+                root / "cluster" / "SK_cluster_black_locast_01.spm"
             )
+            provider.parent.mkdir(parents=True)
+            for path in (target, provider, cluster_provider):
+                path.write_bytes(b"sanitized-spm")
+            providers = (
+                ("branch", provider, [88], [88]),
+                ("cluster", cluster_provider, [89, 90, 91, 92], [89]),
+            )
+            scope = gui.cluster_stale_node_table_recovery_scope(
+                self.recoverable_multi_role_contract(target, providers),
+                target,
+                root / "live_audit.json",
+            )
+            exclusion = gui.TargetPlannedExclusionError(
+                "stale target",
+                reason_token=(
+                    "live_export_evidence_unavailable_stale_node_table"
+                ),
+                target_spm=target,
+                producer_spm=provider,
+                evidence={
+                    "issue_codes": [
+                        "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+                    ],
+                    "stale_node_table_recovery": scope,
+                },
+            )
+            resumed = {
+                "target_spm": str(target),
+                "live_audit_report": str(root / "fresh.json"),
+                "selected_contract": {"handoff": {"status": "ready"}},
+            }
+            app.items = {
+                str(path): {"spm": path}
+                for path in (target, provider, cluster_provider)
+            }
+            app.active_batch_job = {
+                "id": 95,
+                "shared_queue_job_id": "shared-95",
+                "shared_queue_sequence": 7,
+            }
+            app._active_retry_metadata = {}
+            active_lease = mock.Mock()
+            active_lease.job_id = "shared-95"
+            active_lease.finished = False
+            active_lease.renew_and_check_current.return_value = True
+            app._active_shared_queue_lease = active_lease
+            app.cfg = {"speedtree_exe": "SpeedTree_Modeler.exe"}
+            app._app_open = True
+            app._record_pipeline_planned_exclusion = mock.Mock()
+            observe = mock.Mock(side_effect=[exclusion, resumed])
+            captured = {}
+
+            def fake_recover(*args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                kwargs["on_continuation_claimed"]({
+                    "verified_after_raw_sha256": "b" * 64,
+                })
+                return {
+                    "status": "repaired_reaudited_and_retried_once",
+                    "after_raw_sha256": "b" * 64,
+                    "retry_result": kwargs["retry"]({"verified": True}),
+                }
+
+            semantic_session = mock.Mock()
+            semantic_session.is_compatible.return_value = True
+            with mock.patch.object(
+                app,
+                "_cluster_normalization_stage_observation",
+                side_effect=observe,
+            ), mock.patch.object(
+                recovery,
+                "recover_stale_node_table",
+                side_effect=fake_recover,
+            ), mock.patch.object(
+                semantic_uia,
+                "SpeedTreeModelerRecoverySession",
+                return_value=semantic_session,
+            ) as session_factory, mock.patch.object(gui, "LOG_DIR", root):
+                runnable, contracts = app._cluster_relation_input_plan(
+                    [target],
+                    "captured",
+                    provider,
+                )
 
         self.assertEqual(runnable, [target])
         self.assertEqual(len(contracts), 1)
@@ -905,7 +1118,10 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertTrue(captured["kwargs"]["guards"]["is_job_current"]())
         self.assertTrue(captured["kwargs"]["guards"]["is_queue_current"]())
-        active_lease.renew_and_check_current.assert_called_once_with()
+        self.assertGreaterEqual(
+            active_lease.renew_and_check_current.call_count,
+            2,
+        )
         self.assertEqual(
             app._recovery_resume_commit["verified_after_raw_sha256"],
             "b" * 64,
@@ -3070,9 +3286,9 @@ class PushQueueFlowTests(unittest.TestCase):
                 "ready": False,
                 "reason": (
                     f"필수 Cluster 단계 · {failed_cluster.name} · 원인: "
-                    f"{failed_cluster.name}: 자동 복구 가능한 구조화 원인을 "
-                    "확인하지 못했습니다. · 조치: 현재 검사에서 정확한 "
-                    "원인과 대상 증거를 다시 생성해야 합니다."
+                    f"{failed_cluster.name}: 이 차단 사유에는 등록된 자동 "
+                    "복구 동작이 없습니다. · 조치: 표시된 원인 코드와 감사 "
+                    "증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요."
                 ),
                 "kind": "dependency_blocked",
             }],
