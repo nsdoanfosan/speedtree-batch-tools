@@ -278,6 +278,9 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 Counter({
                     "active": fixture["expected"]["active"],
                     "managed_orphan": fixture["expected"]["managed_orphan"],
+                    "current_preserved_unreferenced": fixture["expected"][
+                        "current_preserved_unreferenced"
+                    ],
                 }),
             )
             integrity = first["atlas_consumer_integrity"]
@@ -320,11 +323,21 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 for row in integrity["managed_meshes"]
                 if row["mesh_id"] in {51, 62}
             }
+            # These two carry an exact claim from a selected current
+            # authority, so they are preserved rather than counted as stale.
+            # The target still blocks -- on the 45 lineage-unproven assets,
+            # which is what this fixture exists to prove.
             self.assertEqual(
                 {
                     row["orphan_reason"] for row in authoritative.values()
                 },
-                {"authoritative_current_unreferenced"},
+                {"authoritative_current_variant_not_selected"},
+            )
+            self.assertEqual(
+                {
+                    row["classification"] for row in authoritative.values()
+                },
+                {"current_preserved_unreferenced"},
             )
             self.assertFalse(any(
                 row["automatic_action_eligible"]

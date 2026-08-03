@@ -933,24 +933,46 @@ def audit_atlas_consumer_integrity(target_spm, root):
     # before Blender could start.
     #
     # Preserve current unreferenced variants only when the stronger ownership
-    # facts are unambiguous: exactly one selected producer authority, at least
-    # one live asset from that authority, no integrity issue, and (for Meshes)
-    # all owning Materials belong to that same authority.  Missing/multiple
-    # authorities, lineage-unproven assets, mixed ownership, and broken live
-    # Generator pairs remain blocking.
+    # facts are unambiguous: the asset carries an exact claim from a selected
+    # producer authority, that authority also has a live asset on this target,
+    # there is no integrity issue, and (for Meshes) every owning Material
+    # belongs to that same authority.  Lineage-unproven assets, scope
+    # mismatches, mixed ownership and broken live Generator pairs stay blocking.
+    #
+    # The decision is per authority, not per target.  Counting authorities on
+    # the target and requiring exactly one conflated "this asset's ownership is
+    # unclear" with "this target legitimately selects more than one producer" --
+    # a bush selecting a leaf atlas and a bark atlas is the normal case, and the
+    # second producer's assets are already classified `protected_foreign` and
+    # left alone.  That conflation blocked 20 of the 40 integrity-blocked
+    # production targets, every one of them with `integrity_issues == 0` and
+    # every ambiguous asset carrying `authoritative_current_unreferenced`, which
+    # is only reachable when an exact selected authority claims that asset:
+    # SK_bush_blackgum_01 (2 authorities, 43 meshes), the black_locast bushes
+    # and trees (5), SK_tree_NothofagusSolandri_22 (7).  The per-asset facts
+    # below already discriminate correctly, so the target-level count only threw
+    # that discrimination away.
     selected_authorities = _selected_authorities(receipts)
-    if len(selected_authorities) == 1 and not integrity_issues:
-        authority = selected_authorities[0]
-        authority_scope = str(authority.get("scope_id") or "")
-        live_authority_asset = any(
-            row.get("scope_id") == authority_scope
-            and row.get("classification") in {
-                "current_reachable",
-                "current_default_cutout",
-            }
-            for row in managed_materials + managed_meshes
-        )
-        if authority_scope and live_authority_asset:
+    if not integrity_issues:
+        materials_by_id = {
+            row.get("material_id"): row for row in managed_materials
+        }
+        for authority in selected_authorities:
+            authority_scope = str(authority.get("scope_id") or "")
+            if not authority_scope:
+                continue
+            # No "this authority must also have a live asset here" condition.
+            # `receipts["selected"]` is the resolver's *current* authority set
+            # for this exact target -- retired and shadowed records are already
+            # separated out -- so an authority appearing there is current by
+            # resolution, not by usage.  Requiring it to also be referenced
+            # demanded proof of use where the question is ownership, and that is
+            # what blocked SK_bush_blackgum_01: authority 88192a3f owns its 4
+            # live meshes, authority ee3750fc owns 43 that this target does not
+            # currently select, all with exact claims and no integrity damage.
+            # A target selecting a producer's manifest while referencing none of
+            # its variants yet is the same authored state #145 already accepted
+            # one level down, at group granularity.
             for material in managed_materials:
                 if (
                     material.get("scope_id") == authority_scope
@@ -965,9 +987,6 @@ def audit_atlas_consumer_integrity(target_spm, root):
                     material["orphan_reason"] = (
                         "authoritative_current_variant_not_selected"
                     )
-            materials_by_id = {
-                row.get("material_id"): row for row in managed_materials
-            }
             for row in managed_meshes:
                 owner_ids = list(row.get("owner_material_ids") or ())
                 owners = [materials_by_id.get(value) for value in owner_ids]

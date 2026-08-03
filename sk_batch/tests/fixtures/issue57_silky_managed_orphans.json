@@ -1,110 +1,120 @@
 {
-  "kind": "issue57_silky_managed_orphan_structure",
-  "target_name": "SK_bush_Silky_Dogwood_01.spm",
-  "active_mesh_ids": [106, 107, 108, 109],
-  "generations": [
+ "kind": "issue57_silky_managed_orphan_structure",
+ "target_name": "SK_bush_Silky_Dogwood_01.spm",
+ "active_mesh_ids": [
+  106,
+  107,
+  108,
+  109
+ ],
+ "generations": [
+  {
+   "name": "legacy_groupless_leaf",
+   "scope_id": "M_leaf_silky_dogwood_atlas_01",
+   "blend_file": "",
+   "source_collection": "",
+   "operational": false,
+   "direct_mesh_markers": false,
+   "groups": [
     {
-      "name": "legacy_groupless_leaf",
-      "scope_id": "M_leaf_silky_dogwood_atlas_01",
-      "blend_file": "",
-      "source_collection": "",
-      "operational": false,
-      "direct_mesh_markers": false,
-      "groups": [
-        {
-          "material_id": 8,
-          "material_name": "M_leaf_silky_dogwood_atlas_01",
-          "group": "",
-          "mesh_start": 7,
-          "mesh_count": 44
-        }
-      ]
-    },
-    {
-      "name": "M_cluster_exact_scope",
-      "scope_id": "3dadb0deef164e1d8bd79a12c690f423",
-      "blend_file": "C:/sources/M_cluster_silky_dogwood_atlas_01.blend",
-      "source_collection": "M_cluster_silky_dogwood_atlas_01",
-      "operational": true,
-      "direct_mesh_markers": false,
-      "groups": [
-        {
-          "material_id": 9,
-          "material_name": "M_cluster_silky_dogwood_atlas_01",
-          "group": "M_cluster_silky_dogwood_atlas_01",
-          "mesh_start": 51,
-          "mesh_count": 11
-        }
-      ]
-    },
-    {
-      "name": "M_leaf_exact_scope",
-      "scope_id": "b6466b300681495884043ff28119ae3c",
-      "blend_file": "C:/sources/M_leaf_silky_dogwood_atlas_01.blend",
-      "source_collection": "M_leaf_silky_dogwood_atlas_01",
-      "operational": true,
-      "per_target_mirror": true,
-      "direct_mesh_markers": true,
-      "groups": [
-        {
-          "material_id": 10,
-          "material_name": "M_leaf_silky_dogwood_atlas_01_green",
-          "group": "Green",
-          "mesh_start": 62,
-          "mesh_count": 33
-        },
-        {
-          "material_id": 11,
-          "material_name": "M_leaf_silky_dogwood_atlas_01_stem",
-          "group": "Stem",
-          "mesh_start": 95,
-          "mesh_count": 4
-        },
-        {
-          "material_id": 12,
-          "material_name": "M_leaf_silky_dogwood_atlas_01_green_light",
-          "group": "Green_Light",
-          "mesh_start": 99,
-          "mesh_count": 2
-        },
-        {
-          "material_id": 13,
-          "material_name": "M_leaf_silky_dogwood_atlas_01_big",
-          "group": "big",
-          "mesh_start": 101,
-          "mesh_count": 5
-        }
-      ]
-    },
-    {
-      "name": "SK_cluster_active_scope",
-      "scope_id": "325c673752d647d4a3c69d89357f4ec3",
-      "blend_file": "C:/sources/SK_cluster_Silky_Dogwood_01.blend",
-      "source_collection": "Atlas_Branch_Plans",
-      "operational": true,
-      "direct_mesh_markers": false,
-      "groups": [
-        {
-          "material_id": 1,
-          "material_name": "M_cluster_Silky_Dogwood_01",
-          "group": "Atlas_Branch_Plans",
-          "mesh_start": 106,
-          "mesh_count": 4
-        }
-      ]
+     "material_id": 8,
+     "material_name": "M_leaf_silky_dogwood_atlas_01",
+     "group": "",
+     "mesh_start": 7,
+     "mesh_count": 44
     }
-  ],
-  "expected": {
-    "external_mesh_references": 103,
-    "active": 4,
-    "managed_orphan": 99,
-    "missing": 0,
-    "orphan_missing": 0,
-    "selected_source_scopes": 3,
-    "selected_manifest_paths": 4,
-    "classification_counts": {
-      "ambiguous": 105,
-      "current_reachable": 5
+   ]
+  },
+  {
+   "name": "M_cluster_exact_scope",
+   "scope_id": "3dadb0deef164e1d8bd79a12c690f423",
+   "blend_file": "C:/sources/M_cluster_silky_dogwood_atlas_01.blend",
+   "source_collection": "M_cluster_silky_dogwood_atlas_01",
+   "operational": true,
+   "direct_mesh_markers": false,
+   "groups": [
+    {
+     "material_id": 9,
+     "material_name": "M_cluster_silky_dogwood_atlas_01",
+     "group": "M_cluster_silky_dogwood_atlas_01",
+     "mesh_start": 51,
+     "mesh_count": 11
     }
+   ]
+  },
+  {
+   "name": "M_leaf_exact_scope",
+   "scope_id": "b6466b300681495884043ff28119ae3c",
+   "blend_file": "C:/sources/M_leaf_silky_dogwood_atlas_01.blend",
+   "source_collection": "M_leaf_silky_dogwood_atlas_01",
+   "operational": true,
+   "per_target_mirror": true,
+   "direct_mesh_markers": true,
+   "groups": [
+    {
+     "material_id": 10,
+     "material_name": "M_leaf_silky_dogwood_atlas_01_green",
+     "group": "Green",
+     "mesh_start": 62,
+     "mesh_count": 33
+    },
+    {
+     "material_id": 11,
+     "material_name": "M_leaf_silky_dogwood_atlas_01_stem",
+     "group": "Stem",
+     "mesh_start": 95,
+     "mesh_count": 4
+    },
+    {
+     "material_id": 12,
+     "material_name": "M_leaf_silky_dogwood_atlas_01_green_light",
+     "group": "Green_Light",
+     "mesh_start": 99,
+     "mesh_count": 2
+    },
+    {
+     "material_id": 13,
+     "material_name": "M_leaf_silky_dogwood_atlas_01_big",
+     "group": "big",
+     "mesh_start": 101,
+     "mesh_count": 5
+    }
+   ]
+  },
+  {
+   "name": "SK_cluster_active_scope",
+   "scope_id": "325c673752d647d4a3c69d89357f4ec3",
+   "blend_file": "C:/sources/SK_cluster_Silky_Dogwood_01.blend",
+   "source_collection": "Atlas_Branch_Plans",
+   "operational": true,
+   "direct_mesh_markers": false,
+   "groups": [
+    {
+     "material_id": 1,
+     "material_name": "M_cluster_Silky_Dogwood_01",
+     "group": "Atlas_Branch_Plans",
+     "mesh_start": 106,
+     "mesh_count": 4
+    }
+   ]
   }
+ ],
+ "expected": {
+  "external_mesh_references": 103,
+  "active": 4,
+  "managed_orphan": 44,
+  "missing": 0,
+  "orphan_missing": 0,
+  "selected_source_scopes": 3,
+  "selected_manifest_paths": 4,
+  "classification_counts": {
+   "ambiguous": 45,
+   "current_preserved_unreferenced": 60,
+   "current_reachable": 5
+  },
+  "current_preserved_unreferenced": 55
+ },
+ "notes": {
+  "preservation": "60 assets carry an exact claim from a selected current authority and are preserved; the 45 lineage-unproven assets keep the target blocking, which is what this fixture exists to prove."
+ }
 }
