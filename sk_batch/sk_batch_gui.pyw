@@ -64,6 +64,8 @@ from exact_target_command import (
 )
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
+    ALL_REPAIR_CONTRACT_CODES,
+    DURABLE_FAILURE_REASON_CODES,
     GENERATOR_SYNC_TOOL,
     MODELER_NODE_TABLE_RECOVERY,
     MODELER_RECOVERY_TOOL,
@@ -4941,6 +4943,274 @@ class App:
             value = self.state.get(str(iid), {})
             return copy.deepcopy(value if isinstance(value, dict) else {})
 
+    @staticmethod
+    def _canonical_receipt_sha256(value):
+        return hashlib.sha256(json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest()
+
+    def _failure_record_provenance(self, iid):
+        """Bind one durable failure to target bytes and running code."""
+
+        target = Path(iid).expanduser().absolute()
+        source_identity = self._artifact_path_identity(target)
+        manifest = getattr(
+            self,
+            "_active_production_source_manifest",
+            None,
+        ) or _PROCESS_PRODUCTION_SOURCE_MANIFEST
+        return {
+            "schema_version": 1,
+            "target_source": source_identity,
+            "production_source_revision": str(manifest.content_hash),
+        }
+
+    def _bind_failure_record(self, iid, kind, reason, details=None):
+        provenance = self._failure_record_provenance(iid)
+        dependency_artifacts = (
+            (details or {}).get("dependency_artifacts")
+            if isinstance(details, dict)
+            else None
+        )
+        if isinstance(dependency_artifacts, dict):
+            provenance["dependency_artifacts"] = copy.deepcopy(
+                dependency_artifacts
+            )
+        evidence = {
+            "kind": str(kind),
+            "message": str(reason),
+            "details": copy.deepcopy(details or {}),
+        }
+        return {
+            "failure_provenance": provenance,
+            "production_source_revision": provenance[
+                "production_source_revision"
+            ],
+            "provenance_sha256": self._canonical_receipt_sha256(provenance),
+            "evidence_sha256": self._canonical_receipt_sha256(evidence),
+        }
+
+    @staticmethod
+    def _content_identity_matches(recorded, current):
+        if not isinstance(recorded, dict) or not isinstance(current, dict):
+            return False
+        if not isinstance(recorded.get("exists"), bool) or not isinstance(
+            current.get("exists"), bool
+        ):
+            return False
+        if bool(recorded.get("exists")) != bool(current.get("exists")):
+            return False
+        try:
+            same_path = _normalized_path(recorded.get("path") or "") == (
+                _normalized_path(current.get("path") or "")
+            )
+        except (OSError, ValueError):
+            return False
+        if not same_path:
+            return False
+        if recorded.get("exists") is not True:
+            return True
+        return bool(
+            str(recorded.get("fingerprint") or "").casefold()
+            == str(current.get("fingerprint") or "").casefold()
+            and recorded.get("fingerprint")
+            and str(recorded.get("fingerprint_algorithm") or "")
+            == str(current.get("fingerprint_algorithm") or "")
+            and int(recorded.get("size", -1))
+            == int(current.get("size", -2))
+        )
+
+    def _failure_record_freshness(self, iid, error):
+        """Cheaply decide whether a saved failure still describes reality."""
+
+        if not isinstance(error, dict):
+            return {
+                "status": "invalid",
+                "reason": "저장된 실패 행에 구조화된 오류가 없습니다.",
+            }
+        provenance = error.get("failure_provenance")
+        if not isinstance(provenance, dict):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행에 target content key가 없어 폐기했습니다.",
+            }
+        if error.get("provenance_sha256") != self._canonical_receipt_sha256(
+            provenance
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 provenance checksum이 일치하지 않습니다.",
+            }
+        recorded_revision = str(
+            provenance.get("production_source_revision") or ""
+        )
+        if str(error.get("production_source_revision") or "") != (
+            recorded_revision
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 direct source revision이 일치하지 않습니다.",
+            }
+        current_revision = str(
+            (
+                getattr(self, "_active_production_source_manifest", None)
+                or _PROCESS_PRODUCTION_SOURCE_MANIFEST
+            ).content_hash
+        )
+        if not recorded_revision or recorded_revision != current_revision:
+            return {
+                "status": "invalid",
+                "reason": (
+                    "과거 실패 행을 만든 production source revision이 "
+                    "현재 코드와 달라 폐기했습니다."
+                ),
+                "recorded_revision": recorded_revision,
+                "current_revision": current_revision,
+            }
+        recorded_source = provenance.get("target_source")
+        try:
+            current = self._failure_record_provenance(iid)["target_source"]
+        except (OSError, ValueError) as exc:
+            return {
+                "status": "invalid",
+                "reason": f"target content key를 다시 확인할 수 없습니다: {exc}",
+            }
+        if not self._content_identity_matches(recorded_source, current):
+            return {
+                "status": "invalid",
+                "reason": "target content key가 과거 실패 행 이후 변경되었습니다.",
+                "recorded_source": copy.deepcopy(recorded_source),
+                "current_source": current,
+            }
+        dependency_artifacts = provenance.get("dependency_artifacts")
+        if isinstance(dependency_artifacts, dict):
+            for dependency, artifact in dependency_artifacts.items():
+                phase = str(
+                    (artifact or {}).get("phase")
+                    if isinstance(artifact, dict)
+                    else ""
+                )
+                identities = (
+                    (artifact or {}).get("artifact_identity")
+                    if isinstance(artifact, dict)
+                    else None
+                )
+                if not isinstance(identities, dict) or not identities:
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "과거 dependency 행에 producer artifact "
+                            f"content key가 없습니다: {Path(dependency).name}"
+                        ),
+                    }
+                if phase not in {"blender", "push"}:
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "과거 dependency 행에 producer artifact phase가 "
+                            f"없습니다: {Path(dependency).name}"
+                        ),
+                    }
+                current_verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase=phase,
+                )
+                if str(current_verdict.get("status") or "") != str(
+                    artifact.get("status") or ""
+                ):
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "producer artifact 상태가 과거 dependency 행 "
+                            f"이후 변경되었습니다: {Path(dependency).name}"
+                        ),
+                        "recorded_status": str(
+                            artifact.get("status") or ""
+                        ),
+                        "current_status": str(
+                            current_verdict.get("status") or ""
+                        ),
+                    }
+                for recorded_identity in identities.values():
+                    if not isinstance(recorded_identity, dict):
+                        return {
+                            "status": "invalid",
+                            "reason": "과거 producer artifact identity가 손상되었습니다.",
+                        }
+                    current_identity = self._artifact_path_identity(
+                        recorded_identity.get("path") or ""
+                    )
+                    if not self._content_identity_matches(
+                        recorded_identity,
+                        current_identity,
+                    ):
+                        return {
+                            "status": "invalid",
+                            "reason": (
+                                "producer artifact content key가 과거 "
+                                "dependency 행 이후 변경되었습니다: "
+                                f"{Path(dependency).name}"
+                            ),
+                            "recorded_artifact": copy.deepcopy(
+                                recorded_identity
+                            ),
+                            "current_artifact": current_identity,
+                        }
+        evidence = {
+            "kind": str(error.get("kind") or ""),
+            "message": str(error.get("message") or ""),
+            "details": {
+                key: copy.deepcopy(value)
+                for key, value in error.items()
+                if key not in {
+                    "time",
+                    "kind",
+                    "message",
+                    "failure_provenance",
+                    "production_source_revision",
+                    "provenance_sha256",
+                    "evidence_sha256",
+                }
+            },
+        }
+        if error.get("evidence_sha256") != self._canonical_receipt_sha256(
+            evidence
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 evidence checksum이 일치하지 않습니다.",
+            }
+        return {
+            "status": "current",
+            "reason": "target content key와 production source revision이 일치합니다.",
+            "production_source_revision": current_revision,
+        }
+
+    def _effective_failure_entry(self, iid, entry):
+        """Drop only invalid saved errors before retry routing."""
+
+        effective = copy.deepcopy(entry if isinstance(entry, dict) else {})
+        verdicts = {}
+        for column in ("push_status", "blend_status", "spm_status"):
+            error_key = f"{column}_error"
+            error = effective.get(error_key)
+            if not isinstance(error, dict):
+                continue
+            verdict = self._failure_record_freshness(iid, error)
+            verdicts[column] = verdict
+            if verdict.get("status") == "current":
+                continue
+            effective.pop(error_key, None)
+            # Keep the phase marker only as a route to current validation.
+            # The bound error/cause is void, so dependency and exact-repair
+            # logic cannot obey it.  Parent artifact validation may still use
+            # the phase marker to choose Unreal rebind vs Blender rebuild.
+        return effective, verdicts
+
     def _failed_retry_repair_state(self, iid):
         """Return one live provenance decision, never a saved table label."""
         try:
@@ -4959,11 +5229,22 @@ class App:
                 ),
             }
 
-    def _failed_retry_durable_evidence(self, iid, repair_state=None):
+    def _failed_retry_durable_evidence(
+        self,
+        iid,
+        repair_state=None,
+        *,
+        entry_override=None,
+        failure_record_verdicts=None,
+    ):
         """Return the saved structured failure plus current live provenance."""
 
         context = self._failed_retry_planning_context()
-        entry = self._failed_retry_state_entry(iid)
+        entry = (
+            copy.deepcopy(entry_override)
+            if isinstance(entry_override, dict)
+            else self._failed_retry_state_entry(iid)
+        )
         automation = entry.get("failed_retry_automation") or {}
         automation_status = str(
             automation.get("status")
@@ -4995,7 +5276,7 @@ class App:
             and disposition != "resumable_cancelled"
         ):
             disposition = "current_cancelled"
-        reason_token, evidence = self._target_failure_result(iid)
+        reason_token, evidence = self._failure_result_from_entry(entry)
         current_errors = {
             key: copy.deepcopy(value)
             for key, value in entry.items()
@@ -5114,7 +5395,10 @@ class App:
             "current_repair_state": copy.deepcopy(
                 repair_state
                 if isinstance(repair_state, dict)
-                else self._failed_retry_repair_state(iid)
+                    else self._failed_retry_repair_state(iid)
+            ),
+            "failure_record_freshness": copy.deepcopy(
+                failure_record_verdicts or {}
             ),
         }
 
@@ -6086,6 +6370,9 @@ class App:
         """Capture one bounded generation, then build without Tk or live state."""
         candidate_iids = list(candidate_iids)
         cfg = dict(cfg)
+        cfg["_planning_production_source_revision"] = str(
+            _PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+        )
         if inventory_snapshot is None:
             inventory_snapshot, _targets = self._snapshot_batch_request(
                 candidate_iids
@@ -6224,6 +6511,7 @@ class App:
         """Return immutable queue jobs from one RetryPlanningContext."""
         candidate_iids = list(candidate_iids)
         cfg = dict(cfg)
+        self._pipeline_dependency_artifact_cache = {}
         deferred_status_updates = []
         deferred_logs = []
 
@@ -6235,11 +6523,18 @@ class App:
             })
 
         repair_states = {}
+        effective_entries = {}
+        failure_record_verdicts = {}
         fresh_candidate_iids = []
         with planning_context.span("cheap_candidate_discovery"):
             for index, iid in enumerate(candidate_iids, start=1):
                 planning_context.check_cancel()
-                entry = planning_context.entry(iid)
+                entry, record_verdicts = self._effective_failure_entry(
+                    iid,
+                    planning_context.entry(iid),
+                )
+                effective_entries[iid] = entry
+                failure_record_verdicts[iid] = record_verdicts
                 saved_signature = self._normalized_live_status_signature(
                     entry.get("live_status_signature")
                 )
@@ -6303,8 +6598,31 @@ class App:
                     ),
                     progress=False,
                 )
-                repair_states[iid] = self._failed_retry_repair_state(iid)
-                planning_context.counters["repair_state_validations"] += 1
+                current_failure_record = any(
+                    verdict.get("status") == "current"
+                    for verdict in failure_record_verdicts.get(iid, {}).values()
+                )
+                if current_failure_record:
+                    repair_states[iid] = {
+                        "current": False,
+                        "push_ready": False,
+                        "kind": "recorded_failure_current",
+                        "reason": (
+                            "저장된 실패 행의 target content key와 "
+                            "production source revision이 current입니다."
+                        ),
+                    }
+                    planning_context.counters[
+                        "current_failure_records_reused"
+                    ] += 1
+                else:
+                    repair_states[iid] = self._failed_retry_repair_state(iid)
+                    planning_context.counters[
+                        "invalid_failure_records_reaudited"
+                    ] += 1
+                    planning_context.counters[
+                        "repair_state_validations"
+                    ] += 1
                 planning_context.publish(
                     "repair_state_validation",
                     current_target=iid,
@@ -6326,7 +6644,10 @@ class App:
             planning_context.check_cancel()
             with planning_context.span("durable_evidence_load"):
                 evidence = self._failed_retry_durable_evidence(
-                    iid, repair_states[iid]
+                    iid,
+                    repair_states[iid],
+                    entry_override=effective_entries[iid],
+                    failure_record_verdicts=failure_record_verdicts[iid],
                 )
             planning_context.counters["durable_evidence_rows"] += 1
             planning_context.publish(
@@ -6340,6 +6661,22 @@ class App:
                 last_completed=iid,
             )
             if not has_repair_contract_evidence(evidence):
+                continue
+            reason_codes = (
+                set(evidence_reason_codes(evidence))
+                & ALL_REPAIR_CONTRACT_CODES
+            )
+            if reason_codes and reason_codes.issubset(
+                DURABLE_FAILURE_REASON_CODES
+            ):
+                # These are real terminal failures, not informational facts.
+                # Their recovery owner is the phase-aware retry classifier
+                # below (Unreal-only vs Blender rebuild), not an exact BAT
+                # mutation plan.  The classifier always emits a runnable job
+                # or an explicit Korean blocked row.
+                planning_context.counters[
+                    "durable_failures_routed_by_phase"
+                ] += 1
                 continue
             request_id = (
                 "repair-"
@@ -6418,7 +6755,7 @@ class App:
         }
 
         def blocked_dependencies(iid):
-            entry = planning_context.entry(iid)
+            entry = effective_entries.get(iid, {})
             dependencies = []
             for status_column, error_column in (
                 ("push_status_kind", "push_status_error"),
@@ -6511,7 +6848,7 @@ class App:
                 ),
                 progress=False,
             )
-            entry = planning_context.entry(iid)
+            entry = effective_entries.get(iid, {})
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
@@ -6620,7 +6957,7 @@ class App:
 
         def classify(iid):
             return classify_failed_retry(
-                planning_context.entry(iid),
+                effective_entries.get(iid, {}),
                 repair_states[iid],
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
@@ -7369,25 +7706,247 @@ class App:
         }
         self._enqueue_batch_job(job)
 
-    @staticmethod
     def _pipeline_dependency_blocks(
+        self,
         targets,
         dependency_map,
         root_failed_ids,
     ):
-        """Return exact consumer blocks from the validated dependency map."""
+        """Block only failed dependencies whose saved output is not current."""
         failed = {str(value) for value in root_failed_ids}
         blocked = {}
+        verdicts_by_target = {}
+        reused_by_target = self.__dict__.setdefault(
+            "_pipeline_dependency_reuse_evidence", {}
+        )
         for item in targets:
             iid = str(item["spm"])
-            causes = tuple(
-                dependency
-                for dependency in dependency_map.get(iid, ())
-                if dependency in failed
-            )
+            causes = []
+            verdicts = {}
+            for dependency in dependency_map.get(iid, ()):
+                if dependency not in failed:
+                    continue
+                verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase="blender",
+                )
+                verdicts[dependency] = verdict
+                if verdict["status"] == "current":
+                    reused_by_target.setdefault(iid, {})[
+                        dependency
+                    ] = copy.deepcopy(verdict)
+                    self.log(
+                        "[의존 산출물 재사용] "
+                        f"{Path(iid).name}: {Path(dependency).name}의 "
+                        "기존 Blender 산출물이 current이므로 이번 실패 "
+                        "행으로 consumer를 차단하지 않습니다."
+                    )
+                    continue
+                causes.append(dependency)
             if causes:
-                blocked[iid] = causes
+                blocked[iid] = tuple(causes)
+                verdicts_by_target[iid] = verdicts
+        self._pipeline_dependency_artifact_verdicts = verdicts_by_target
         return blocked
+
+    @staticmethod
+    def _dependency_artifact_state_label(status):
+        return {
+            "missing": "산출물 없음",
+            "stale": "산출물 낡음",
+            "waiting": "산출물 생성/반영 대기",
+            "current": "산출물 current",
+        }.get(str(status or ""), "산출물 검증 실패")
+
+    @staticmethod
+    def _artifact_path_identity(path):
+        candidate = Path(path).expanduser().absolute()
+        try:
+            return {
+                "path": str(candidate),
+                "exists": True,
+                **sampled_file_content_snapshot(candidate),
+            }
+        except FileNotFoundError:
+            return {"path": str(candidate), "exists": False}
+        except OSError as exc:
+            return {
+                "path": str(candidate),
+                "exists": None,
+                "error": compact_error_message(exc, 160),
+            }
+
+    def _dependency_artifact_identity(self, dependency, phase, verdict):
+        paths = {
+            "producer_spm": Path(dependency),
+            "producer_blend": blend_path_for(dependency),
+        }
+        if phase == "blender":
+            paths["producer_repair_report"] = repair_pipeline_report_path(
+                Path(dependency)
+            )
+        manifest = str((verdict or {}).get("manifest") or "")
+        if manifest:
+            paths["producer_push_manifest"] = Path(manifest)
+        return {
+            name: self._artifact_path_identity(path)
+            for name, path in paths.items()
+        }
+
+    @staticmethod
+    def _saved_dependency_blender_receipt_current(dependency):
+        """Read-only content-key check for an existing producer output."""
+
+        try:
+            report = load_current_repair_pipeline_report(
+                Path(dependency),
+                migrate_legacy=False,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return str(
+            (report.get("handoff_preflight") or {}).get("status") or ""
+        ) in {"ok", "source_review"}
+
+    def _current_push_output_artifact_state(self, dependency):
+        """Validate persisted export/import evidence despite a new failed row."""
+        iid = str(dependency)
+        entry = self._failed_retry_state_entry(iid)
+        source_cache = entry.get("push_source_fingerprint_cache") or {}
+        export_cache = entry.get("push_export_cache") or {}
+        if (
+            source_cache.get("version")
+            != PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
+            or not source_cache.get("fingerprint")
+        ):
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": "current Push 입력 영수증이 없습니다.",
+            }
+        try:
+            current_snapshot = push_source_snapshot(
+                blend_path_for(dependency),
+                self._push_source_dependency_paths(dependency),
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": f"Push 입력 파일을 확인할 수 없습니다: {exc}",
+            }
+        if source_cache.get("snapshot") != current_snapshot:
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Blender 또는 Push 입력이 영수증 이후 변경되었습니다.",
+            }
+        if export_cache.get("source_fingerprint") != source_cache.get(
+            "fingerprint"
+        ):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export 영수증이 current 입력과 일치하지 않습니다.",
+            }
+        manifest_path = Path(export_cache.get("manifest") or "")
+        if not manifest_path.is_file():
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": f"Push export manifest가 없습니다: {manifest_path}",
+            }
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_item = next(
+                row for row in (manifest.get("items") or ())
+                if str((row or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError) as exc:
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": f"Push export manifest의 exact 항목이 유효하지 않습니다: {exc}",
+            }
+        if not manifest_item_files_match(manifest_item):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export 파일 fingerprint가 current manifest와 다릅니다.",
+            }
+        export_fingerprint = export_cache.get("fingerprint")
+        if not export_fingerprint or manifest_item.get(
+            "fingerprint"
+        ) != export_fingerprint:
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export fingerprint가 manifest와 일치하지 않습니다.",
+            }
+        if entry.get("push_import_fingerprint") == export_fingerprint:
+            return {
+                "status": "current",
+                "phase": "push",
+                "reason": "current export가 Unreal import 영수증과 일치합니다.",
+                "manifest": str(manifest_path),
+                "fingerprint": export_fingerprint,
+            }
+        return {
+            "status": "waiting",
+            "phase": "push",
+            "reason": "current export는 있으나 Unreal import 완료 영수증이 없습니다.",
+            "manifest": str(manifest_path),
+            "fingerprint": export_fingerprint,
+        }
+
+    def _dependency_artifact_verdict(self, dependency, *, phase):
+        """Return artifact truth independently of this run's failure row."""
+        dependency = str(dependency)
+        cache = self.__dict__.setdefault(
+            "_pipeline_dependency_artifact_cache", {}
+        )
+        key = (str(phase), _normalized_path(dependency))
+        if key in cache:
+            return copy.deepcopy(cache[key])
+        if phase == "push":
+            verdict = self._current_push_output_artifact_state(dependency)
+        else:
+            blend = blend_path_for(Path(dependency))
+            if not blend.is_file():
+                verdict = {
+                    "status": "missing",
+                    "phase": "blender",
+                    "output_kind": "missing_blend",
+                    "reason": f"Blender 산출물이 없습니다: {blend}",
+                }
+            elif self._saved_dependency_blender_receipt_current(
+                Path(dependency)
+            ):
+                verdict = {
+                    "status": "current",
+                    "phase": "blender",
+                    "reason": (
+                        "saved Blender/Repair 영수증이 current producer "
+                        "SPM content key와 일치합니다."
+                    ),
+                }
+            else:
+                verdict = {
+                    "status": "stale",
+                    "phase": "blender",
+                    "output_kind": "repair_receipt_not_current",
+                    "reason": (
+                        "Blender/Repair 영수증이 current producer SPM "
+                        "content key와 일치하지 않습니다."
+                    ),
+                }
+        verdict["artifact_identity"] = self._dependency_artifact_identity(
+            dependency,
+            phase,
+            verdict,
+        )
+        cache[key] = copy.deepcopy(verdict)
+        return verdict
 
     @staticmethod
     def _filter_pipeline_excluded_targets(targets, excluded_ids):
@@ -7509,6 +8068,7 @@ class App:
         *,
         persist,
         publish_repair_contract=False,
+        dependency_verdicts=None,
     ):
         iid = str(item["spm"])
         root_decisions = []
@@ -7520,17 +8080,39 @@ class App:
             decision["status"] == REPAIR_UI_AUTOMATIC
             for _, decision in root_decisions
         )
+        dependency_verdicts = (
+            dependency_verdicts
+            if isinstance(dependency_verdicts, dict)
+            else {}
+        )
         status_prefix = "자동 복구 대상" if automatic else "최종 차단"
         names = ", ".join(name for name, _ in root_decisions)
-        root_causes = " | ".join(
+        artifact_causes = []
+        artifact_actions = []
+        for value in blocked_sources:
+            verdict = dependency_verdicts.get(value) or {}
+            status = str(verdict.get("status") or "stale")
+            label = self._dependency_artifact_state_label(status)
+            artifact_causes.append(
+                f"{Path(value).name}: {label} · "
+                f"{verdict.get('reason') or 'current 증거 없음'}"
+            )
+            artifact_actions.append(
+                f"{Path(value).name}의 exact 산출물을 다시 생성한 뒤 "
+                "current 영수증으로 재검증"
+            )
+        root_causes = " | ".join(artifact_causes) or " | ".join(
             f"{name}: {decision['reason']}"
             for name, decision in root_decisions
-        ) or "상위 Cluster의 구조화된 실패 원인을 확인하지 못했습니다."
-        root_actions = " | ".join(dict.fromkeys(
-            decision["action"] for _, decision in root_decisions
-        )) or "상위 Cluster의 current audit 증거를 다시 생성해야 합니다."
+        ) or "상위 Cluster의 current 산출물 증거를 확인하지 못했습니다."
+        root_actions = " | ".join(dict.fromkeys(artifact_actions)) or (
+            " | ".join(dict.fromkeys(
+                decision["action"] for _, decision in root_decisions
+            ))
+            or "상위 Cluster의 current 산출물 증거를 다시 생성해야 합니다."
+        )
         reason = (
-            f"필수 Cluster 단계 · {names} · 원인: {root_causes} · "
+            f"필수 producer 산출물 · {names} · 원인: {root_causes} · "
             f"조치: {root_actions}"
         )
         self._record_phase_status(
@@ -7548,6 +8130,9 @@ class App:
                     name: copy.deepcopy(decision)
                     for name, decision in root_decisions
                 },
+                "dependency_artifacts": copy.deepcopy(
+                    dependency_verdicts
+                ),
             },
             persist=persist,
         )
@@ -7630,17 +8215,8 @@ class App:
             f"[{status_prefix}] {status_summary}"
         )
 
-    def _target_failure_result(self, iid, default_token="item_failed"):
-        context = self._failed_retry_planning_context()
-        state = getattr(self, "state", {}) or {}
-        lock = getattr(self, "state_lock", None)
-        if context is not None:
-            entry = context.entry(iid)
-        elif lock is None:
-            entry = state.get(str(iid))
-        else:
-            with lock:
-                entry = state.get(str(iid))
+    @staticmethod
+    def _failure_result_from_entry(entry, default_token="item_failed"):
         entry = dict(entry) if isinstance(entry, dict) else {}
         for column in ("push_status", "blend_status", "spm_status"):
             kind = str(entry.get(f"{column}_kind") or "")
@@ -7658,6 +8234,19 @@ class App:
             }
             return reason_token, evidence
         return default_token, {}
+
+    def _target_failure_result(self, iid, default_token="item_failed"):
+        context = self._failed_retry_planning_context()
+        state = getattr(self, "state", {}) or {}
+        lock = getattr(self, "state_lock", None)
+        if context is not None:
+            entry = context.entry(iid)
+        elif lock is None:
+            entry = state.get(str(iid))
+        else:
+            with lock:
+                entry = state.get(str(iid))
+        return self._failure_result_from_entry(entry, default_token)
 
     def _target_failure_kind(self, iid):
         state = getattr(self, "state", {}) or {}
@@ -7678,7 +8267,11 @@ class App:
             return "cancelled"
         if normalized in {"completed", "imported_ok", "ready"}:
             return "completed"
-        if normalized in {"exported_pending_unreal", "importing"}:
+        if normalized in {
+            "exported_pending_unreal",
+            "importing",
+            "dependency_waiting",
+        }:
             return "pending_unreal"
         if normalized in {"cancelled", "stopped"}:
             return "cancelled"
@@ -7913,22 +8506,44 @@ class App:
                     for value in dependency_map.get(iid, ())
                     if value in root_failed_ids
                 ]
-                reason_token = (
-                    "shared_dependency_failed"
-                    if blocked_by
-                    else "dependency_root_reason_missing"
+                recorded_token, recorded_evidence = (
+                    self._target_failure_result(
+                        iid,
+                        default_token=(
+                            "shared_dependency_failed"
+                            if blocked_by
+                            else "dependency_root_reason_missing"
+                        ),
+                    )
                 )
+                artifact_rows = recorded_evidence.get(
+                    "dependency_artifacts"
+                ) or {}
+                artifact_statuses = {
+                    str((row or {}).get("status") or "")
+                    for row in artifact_rows.values()
+                    if isinstance(row, dict)
+                }
+                if "missing" in artifact_statuses:
+                    reason_token = "dependency_output_missing"
+                elif "stale" in artifact_statuses:
+                    reason_token = "dependency_output_stale"
+                else:
+                    reason_token = "dependency_root_reason_missing"
+                evidence = {
+                    "blocked_by": blocked_by,
+                    "declared_dependencies": list(
+                        dependency_map.get(iid, ())
+                    ),
+                    "recorded_wrapper": recorded_token,
+                }
+                evidence.update(recorded_evidence)
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
                     "outcome": "blocked",
                     "reason_token": reason_token,
-                    "evidence": {
-                        "blocked_by": blocked_by,
-                        "declared_dependencies": list(
-                            dependency_map.get(iid, ())
-                        ),
-                    },
+                    "evidence": evidence,
                 })
                 continue
             if iid in failed:
@@ -7958,6 +8573,20 @@ class App:
                 "reason_token": None,
                 "evidence": {},
             })
+
+        reuse_evidence = getattr(
+            self, "_pipeline_dependency_reuse_evidence", {}
+        ) or {}
+        for row in outcomes:
+            reused = reuse_evidence.get(row.get("target"))
+            if not reused:
+                continue
+            row.setdefault("evidence", {})[
+                "dependency_resolution"
+            ] = "current_output_reused"
+            row["evidence"]["dependency_artifacts"] = copy.deepcopy(
+                reused
+            )
 
         shared_failures = []
         for dependency in sorted(set(root_failed_ids) - set(selected)):
@@ -8011,6 +8640,9 @@ class App:
         self._pipeline_root_failed_items = set()
         self._pipeline_blocked_items = set()
         self._pipeline_planned_exclusions = {}
+        self._pipeline_dependency_artifact_cache = {}
+        self._pipeline_dependency_artifact_verdicts = {}
+        self._pipeline_dependency_reuse_evidence = {}
         self._active_pipeline_selected_targets = list(targets)
         self.__dict__.pop("_phase_result_summary", None)
         try:
@@ -8030,6 +8662,9 @@ class App:
                 "_pipeline_blocked_items",
                 "_pipeline_planned_exclusions",
                 "_active_pipeline_selected_targets",
+                "_pipeline_dependency_artifact_cache",
+                "_pipeline_dependency_artifact_verdicts",
+                "_pipeline_dependency_reuse_evidence",
             ):
                 self.__dict__.pop(key, None)
 
@@ -8124,6 +8759,11 @@ class App:
                             blocked_sources,
                             persist=True,
                             publish_repair_contract=True,
+                            dependency_verdicts=(
+                                self._pipeline_dependency_artifact_verdicts.get(
+                                    iid, {}
+                                )
+                            ),
                         )
                 blocked_consumer_ids.update(stage_blocked)
                 if stage_blocked:
@@ -8192,7 +8832,12 @@ class App:
             self.log(f"🌙 {label} 종료")
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
-                break
+                if pipeline_abort or self.stop_flag.is_set():
+                    break
+                # Item-local failures are inputs to the next dependency gate,
+                # not a fleet-wide abort.  The next stage either reuses a
+                # current producer output or records its exact missing/stale
+                # artifact for only the mapped consumers.
         planned_excluded_ids = set(
             getattr(self, "_pipeline_planned_exclusions", {}) or {}
         )
@@ -8417,6 +9062,9 @@ class App:
             }
             if details:
                 durable_entry.update(details)
+            durable_entry.update(
+                self._bind_failure_record(iid, kind, reason, details)
+            )
             if kind in {"cancelled", "stopped"}:
                 durable_entry["outcome"] = "cancelled"
                 state_entry[f"{column}_result"] = durable_entry
@@ -8445,6 +9093,8 @@ class App:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self._phase_abort_reason = None
         self._phase_failed_items = set()
+        if phase in {"blender", "push"}:
+            self._pipeline_dependency_artifact_cache = {}
         requested_targets = list(targets)
         self._active_push_dependency_map = {}
         self._active_push_auto_added_ids = set()
@@ -8517,6 +9167,13 @@ class App:
                                     "push_status",
                                     blocked_sources,
                                     persist=True,
+                                    dependency_verdicts=(
+                                        getattr(
+                                            self,
+                                            "_pipeline_dependency_artifact_verdicts",
+                                            {},
+                                        ).get(iid, {})
+                                    ),
                                 )
                     removed_roots = {
                         iid for iid in upstream_root_failed
@@ -8673,18 +9330,77 @@ class App:
                     dependencies = self._active_push_dependency_map.get(
                         iid, ()
                     )
-                    blocked = [
-                        dependency
-                        for dependency in dependencies
-                        if dependency in failed_items
-                    ]
+                    blocked = []
+                    waiting = []
+                    verdicts = {}
+                    for dependency in dependencies:
+                        if dependency not in failed_items:
+                            continue
+                        verdict = self._dependency_artifact_verdict(
+                            dependency,
+                            phase="push",
+                        )
+                        verdicts[dependency] = verdict
+                        if verdict["status"] == "current":
+                            self.__dict__.setdefault(
+                                "_pipeline_dependency_reuse_evidence", {}
+                            ).setdefault(iid, {})[
+                                dependency
+                            ] = copy.deepcopy(verdict)
+                            self.log(
+                                "[의존 산출물 재사용] "
+                                f"{spm.name}: {Path(dependency).name}의 "
+                                "기존 Unreal import가 current이므로 이번 "
+                                "실패 행으로 consumer를 차단하지 않습니다."
+                            )
+                        elif verdict["status"] == "waiting":
+                            waiting.append(dependency)
+                        else:
+                            blocked.append(dependency)
+                    if waiting and not blocked:
+                        reason = " | ".join(
+                            f"{Path(value).name}: "
+                            f"{verdicts[value].get('reason')}"
+                            for value in waiting
+                        )
+                        message = (
+                            "필수 producer Unreal 산출물 대기: " + reason
+                        )
+                        self._set_push_state(
+                            iid,
+                            "dependency_waiting",
+                            "대기: " + message,
+                            details={
+                                "reason_token": "dependency_waiting",
+                                "blocked_by": list(waiting),
+                                "dependency_artifacts": copy.deepcopy(
+                                    verdicts
+                                ),
+                            },
+                            message=message,
+                        )
+                        self.log(f"[의존 산출물 대기] {spm.name}: {reason}")
+                        return
                     if blocked:
+                        reason = " | ".join(
+                            f"{Path(value).name}: "
+                            f"{self._dependency_artifact_state_label(verdicts[value].get('status'))}"
+                            f" · {verdicts[value].get('reason')}"
+                            for value in blocked
+                        )
                         raise BatchItemError(
-                            "required Cluster Push did not complete: "
-                            + ", ".join(
-                                sorted(Path(value).name for value in blocked)
-                            ),
+                            "필수 producer Unreal 산출물이 current가 아닙니다: "
+                            + reason,
                             kind="dependency_blocked",
+                            report={
+                                "reason_token": "shared_dependency_failed",
+                                "evidence": {
+                                    "blocked_by": list(blocked),
+                                    "dependency_artifacts": copy.deepcopy(
+                                        verdicts
+                                    ),
+                                },
+                            },
                         )
                 if phase == "blender" and not is_cluster_source_spm(spm):
                     blocked_sources = [
@@ -13707,6 +14423,7 @@ class App:
             "imported_ok",
             "cancelled",
             "stopped",
+            "dependency_waiting",
         }
         self.ui_queue.put(("cell", (iid, "push_status", status_text)))
         with self.state_lock:
@@ -13751,6 +14468,14 @@ class App:
                 }
                 if details:
                     error.update(details)
+                error.update(
+                    self._bind_failure_record(
+                        iid,
+                        kind,
+                        error_message,
+                        details,
+                    )
+                )
                 entry["push_status_error"] = error
                 entry.pop("push_status_result", None)
             if details:
@@ -13797,6 +14522,14 @@ class App:
                 progress_message,
                 terminal_reason="operator_cancelled",
                 outcome=RETRY_STAGE_CANCELLED,
+            )
+        elif kind == "dependency_waiting":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
             )
         else:
             terminal_stage = (
@@ -14714,6 +15447,8 @@ class App:
             if item.get("queue_id")
         }
         dependency_blocked_ids = set()
+        dependency_waiting_ids = set()
+        external_current_dependencies = {}
         for item in exported:
             iid = str(item.get("queue_id") or "")
             unavailable = [
@@ -14723,37 +15458,78 @@ class App:
             ]
             if not unavailable:
                 continue
-            details = []
+            blocked = []
+            waiting = []
+            verdicts = {}
             for dependency in unavailable:
-                provider_state = self.state.get(dependency, {})
-                provider_reason = (
-                    (provider_state.get("push_status_error") or {}).get(
-                        "message"
+                verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase="push",
+                )
+                verdicts[dependency] = verdict
+                status = str(verdict.get("status") or "stale")
+                if status == "current":
+                    external_current_dependencies.setdefault(iid, set()).add(
+                        dependency
                     )
-                    or provider_state.get("push_status")
-                    or "export 산출물 없음"
+                    self.__dict__.setdefault(
+                        "_pipeline_dependency_reuse_evidence", {}
+                    ).setdefault(iid, {})[dependency] = copy.deepcopy(verdict)
+                    self.log(
+                        "[의존 산출물 재사용] "
+                        f"{Path(iid).name}: {Path(dependency).name}의 "
+                        "기존 Unreal import 영수증이 current이므로 진행합니다."
+                    )
+                elif status == "waiting":
+                    waiting.append(dependency)
+                else:
+                    blocked.append(dependency)
+            if blocked:
+                reason = "필수 producer 산출물이 current가 아닙니다: " + " | ".join(
+                    f"{Path(dependency).name}: "
+                    f"{self._dependency_artifact_state_label(verdicts[dependency].get('status'))} · "
+                    f"{verdicts[dependency].get('reason') or 'current 증거 없음'}"
+                    for dependency in blocked
                 )
-                details.append(
-                    f"{Path(dependency).name} ({compact_error_message(provider_reason, 80)})"
+                self._set_push_state(
+                    iid,
+                    "dependency_blocked",
+                    self._failure_status_text(reason, "dependency_blocked"),
+                    details={
+                        "reason_token": "shared_dependency_failed",
+                        "blocked_by": blocked,
+                        "dependency_artifacts": copy.deepcopy(verdicts),
+                    },
+                    message=reason,
                 )
-            reason = (
-                "required Cluster export did not complete: "
-                + ", ".join(details)
-            )
-            self._set_push_state(
-                iid,
-                "dependency_blocked",
-                self._failure_status_text(reason, "dependency_blocked"),
-                message=reason,
-            )
-            failed_items.add(iid)
-            dependency_blocked_ids.add(iid)
-        if dependency_blocked_ids:
+                failed_items.add(iid)
+                dependency_blocked_ids.add(iid)
+                continue
+            if waiting:
+                reason = "필수 producer의 current export는 있으나 Unreal 반영 완료를 기다립니다: " + ", ".join(
+                    Path(dependency).name for dependency in waiting
+                )
+                self._set_push_state(
+                    iid,
+                    "dependency_waiting",
+                    f"대기: {reason}",
+                    details={
+                        "blocked_by": waiting,
+                        "dependency_artifacts": copy.deepcopy(verdicts),
+                    },
+                    message=reason,
+                )
+                dependency_waiting_ids.add(iid)
+                self.log(f"[의존 산출물 대기] {Path(iid).name}: {reason}")
+        unavailable_consumer_ids = (
+            dependency_blocked_ids | dependency_waiting_ids
+        )
+        if unavailable_consumer_ids:
             exported = [
                 item
                 for item in exported
                 if str(item.get("queue_id") or "")
-                not in dependency_blocked_ids
+                not in unavailable_consumer_ids
             ]
 
         if self.stop_flag.is_set():
@@ -14772,9 +15548,13 @@ class App:
         pending = []
         for item in exported:
             iid = str(item["queue_id"])
-            item["depends_on_queue_ids"] = list(
-                dependency_map.get(iid, ())
-            )
+            item["depends_on_queue_ids"] = [
+                dependency
+                for dependency in dependency_map.get(iid, ())
+                if dependency not in external_current_dependencies.get(
+                    iid, set()
+                )
+            ]
             entry = self.state.setdefault(iid, {})
             import_cache_matches = (
                 not self.force_rerun

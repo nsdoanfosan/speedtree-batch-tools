@@ -70,6 +70,15 @@ class PushQueueFlowTests(unittest.TestCase):
         )
 
     @staticmethod
+    def dependency_artifact_fixture():
+        return json.loads(
+            (
+                FIXTURE_DIR
+                / "issue138_dependency_artifact_verdicts.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    @staticmethod
     def sealed_modeler_scope(target):
         scope = {
             "schema_version": 2,
@@ -1682,6 +1691,22 @@ class PushQueueFlowTests(unittest.TestCase):
                 "message": "shared provider failed its own postcondition",
             },
         }
+        for root in roots:
+            app.state[str(root)] = {
+                "blend_status_kind": "dependency_blocked",
+                "blend_status_error": {
+                    "kind": "dependency_blocked",
+                    "message": "provider output stale",
+                    "reason_token": "shared_dependency_failed",
+                    "blocked_by": [str(provider)],
+                    "dependency_artifacts": {
+                        str(provider): {
+                            "status": "stale",
+                            "reason": "saved output key changed",
+                        }
+                    },
+                },
+            }
 
         summary = app._build_pipeline_result_summary(
             [{"spm": root} for root in roots],
@@ -1699,10 +1724,466 @@ class PushQueueFlowTests(unittest.TestCase):
             [str(root) for root in roots],
         )
         self.assertTrue(all(
-            row["reason_token"] == "shared_dependency_failed"
+            row["reason_token"] == "dependency_output_stale"
             and row["evidence"]["blocked_by"] == [str(provider)]
             for row in summary["target_outcomes"]
         ))
+
+    def test_failed_row_does_not_block_current_dependency_outputs(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        fixture = self.dependency_artifact_fixture()
+        provider = Path("Cluster") / "SK_provider_current.spm"
+        consumers = [
+            Path(f"SK_consumer_{index:02d}.spm")
+            for index in range(
+                fixture["shared_dependency_failed_targets"]
+            )
+        ]
+        dependency_map = {
+            str(consumer): (str(provider),)
+            for consumer in consumers
+        }
+        app._dependency_artifact_verdict = mock.Mock(return_value={
+            "status": "current",
+            "phase": "blender",
+            "reason": "current Repair output receipt",
+        })
+
+        blocked = app._pipeline_dependency_blocks(
+            [{"spm": consumer} for consumer in consumers],
+            dependency_map,
+            {str(provider)},
+        )
+
+        self.assertEqual(blocked, {})
+        self.assertEqual(
+            app._dependency_artifact_verdict.call_count,
+            fixture["shared_dependency_failed_targets"],
+        )
+        self.assertEqual(
+            fixture["current_consumer_evidence"]
+            + fixture["consumer_own_evidence_blocking"],
+            fixture["shared_dependency_failed_targets"],
+        )
+        self.assertEqual(
+            fixture["expected_dependency_blocked_after_artifact_check"],
+            0,
+        )
+        app._active_blender_dependency_map = dependency_map
+        own_blocked = consumers[
+            fixture["current_consumer_evidence"]:
+        ]
+        app._pipeline_planned_exclusions = {
+            str(consumer): {
+                "target": str(consumer),
+                "target_name": consumer.name,
+                "outcome": "planned_excluded",
+                "reason_token": "lineage_unproven",
+                "evidence": {"source": "consumer_own_evidence"},
+            }
+            for consumer in own_blocked
+        }
+        summary = app._build_pipeline_result_summary(
+            [{"spm": consumer} for consumer in consumers],
+            {str(provider)},
+            set(),
+            None,
+        )
+
+        self.assertEqual(
+            summary["completed_count"],
+            fixture["expected_current_consumers_released"],
+        )
+        self.assertEqual(
+            summary["blocked_count"],
+            fixture["expected_consumer_own_blocks_preserved"],
+        )
+        self.assertEqual(summary["dependency_blocked_count"], 0)
+        self.assertEqual(summary["shared_failures"], [])
+        current_row = next(
+            row for row in summary["target_outcomes"]
+            if row["outcome"] == "completed"
+        )
+        self.assertEqual(
+            current_row["evidence"]["dependency_resolution"],
+            "current_output_reused",
+        )
+
+    def test_missing_and_stale_dependency_outputs_are_named_in_korean(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        missing = str(Path("Cluster") / "SK_missing_output.spm")
+        stale = str(Path("Cluster") / "SK_stale_output.spm")
+        consumer = Path("SK_consumer_blocked.spm")
+        app._dependency_artifact_verdict = mock.Mock(side_effect=lambda value, **_: {
+            "status": "missing" if value == missing else "stale",
+            "phase": "blender",
+            "reason": (
+                "blend 파일이 없습니다."
+                if value == missing
+                else "SPM이 영수증 이후 변경되었습니다."
+            ),
+        })
+
+        blocked = app._pipeline_dependency_blocks(
+            [{"spm": consumer}],
+            {str(consumer): (missing, stale)},
+            {missing, stale},
+        )
+        with mock.patch.object(gui, "save_state"):
+            app._record_pipeline_dependency_block(
+                {"spm": consumer},
+                "blend_status",
+                blocked[str(consumer)],
+                persist=False,
+                dependency_verdicts=(
+                    app._pipeline_dependency_artifact_verdicts[
+                        str(consumer)
+                    ]
+                ),
+            )
+
+        entry = app.state[str(consumer)]
+        self.assertEqual(entry["blend_status_kind"], "dependency_blocked")
+        self.assertIn("산출물 없음", entry["blend_status"])
+        self.assertIn("산출물 낡음", entry["blend_status"])
+        evidence = entry["blend_status_error"]["dependency_artifacts"]
+        self.assertEqual(evidence[missing]["status"], "missing")
+        self.assertEqual(evidence[stale]["status"], "stale")
+        app._active_blender_dependency_map = {
+            str(consumer): (missing, stale)
+        }
+        summary = app._build_pipeline_result_summary(
+            [{"spm": consumer}],
+            {missing, stale},
+            {str(consumer)},
+            None,
+        )
+        row = summary["target_outcomes"][0]
+        self.assertEqual(row["reason_token"], "dependency_output_missing")
+        self.assertNotEqual(row["reason_token"], "shared_dependency_failed")
+
+    def test_failure_record_is_bound_to_target_content_and_code_revision(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_bound_failure.spm"
+            target.write_bytes(b"source-v1")
+            iid = str(target)
+            with mock.patch.object(gui, "save_state"):
+                app._record_phase_status(
+                    iid,
+                    "blend_status",
+                    "실패: test",
+                    "data_error",
+                    "구조화된 테스트 실패",
+                    details={"reason_token": "data_error"},
+                )
+            error = copy.deepcopy(
+                app.state[iid]["blend_status_error"]
+            )
+
+            self.assertEqual(
+                app._failure_record_freshness(iid, error)["status"],
+                "current",
+            )
+            self.assertEqual(len(error["evidence_sha256"]), 64)
+            self.assertEqual(len(error["provenance_sha256"]), 64)
+            self.assertEqual(
+                error["production_source_revision"],
+                gui._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash,
+            )
+            target.touch()
+            self.assertEqual(
+                app._failure_record_freshness(iid, error)["status"],
+                "current",
+            )
+            target.write_bytes(b"source-v2-changed")
+            changed = app._failure_record_freshness(iid, error)
+
+        self.assertEqual(changed["status"], "invalid")
+        self.assertIn("content key", changed["reason"])
+
+    def test_failure_record_from_old_code_revision_is_invalidated(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_old_revision.spm"
+            target.write_bytes(b"source")
+            iid = str(target)
+            with mock.patch.object(gui, "save_state"):
+                app._record_phase_status(
+                    iid,
+                    "push_status",
+                    "실패: old code",
+                    "internal_error",
+                    "old code failure",
+                )
+            error = copy.deepcopy(app.state[iid]["push_status_error"])
+            error["failure_provenance"][
+                "production_source_revision"
+            ] = "0" * 64
+            error["provenance_sha256"] = app._canonical_receipt_sha256(
+                error["failure_provenance"]
+            )
+            verdict = app._failure_record_freshness(iid, error)
+
+        self.assertEqual(verdict["status"], "invalid")
+        self.assertIn("revision", verdict["reason"])
+
+    def test_dependency_record_is_invalidated_when_producer_artifact_changes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            consumer = root / "SK_consumer.spm"
+            provider = root / "Cluster" / "SK_provider.spm"
+            provider.parent.mkdir()
+            consumer.write_bytes(b"consumer")
+            provider.write_bytes(b"provider")
+            provider_blend = gui.blend_path_for(provider)
+            provider_blend.write_bytes(b"provider-output-v1")
+            artifact_identity = app._dependency_artifact_identity(
+                provider,
+                "blender",
+                {},
+            )
+            details = {
+                "blocked_by": [str(provider)],
+                "dependency_artifacts": {
+                    str(provider): {
+                        "status": "stale",
+                        "phase": "blender",
+                        "reason": "saved producer failure",
+                        "artifact_identity": artifact_identity,
+                    },
+                },
+            }
+            binding = app._bind_failure_record(
+                str(consumer),
+                "dependency_blocked",
+                "producer output stale",
+                details,
+            )
+            error = {
+                "kind": "dependency_blocked",
+                "message": "producer output stale",
+                **copy.deepcopy(details),
+                **binding,
+            }
+            self.assertEqual(
+                app._failure_record_freshness(str(consumer), error)[
+                    "status"
+                ],
+                "current",
+            )
+            provider_blend.write_bytes(b"provider-output-v2-changed")
+            verdict = app._failure_record_freshness(
+                str(consumer), error
+            )
+
+        self.assertEqual(verdict["status"], "invalid")
+        self.assertIn("producer artifact content key", verdict["reason"])
+
+    def test_dependency_record_is_invalidated_when_import_status_changes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            consumer = root / "SK_consumer.spm"
+            provider = root / "SK_provider.spm"
+            consumer.write_bytes(b"consumer")
+            provider.write_bytes(b"provider")
+            details = {
+                "blocked_by": [str(provider)],
+                "dependency_artifacts": {
+                    str(provider): {
+                        "status": "waiting",
+                        "phase": "push",
+                        "reason": "Unreal import receipt pending",
+                        "artifact_identity": app._dependency_artifact_identity(
+                            provider,
+                            "push",
+                            {},
+                        ),
+                    },
+                },
+            }
+            error = {
+                "kind": "dependency_blocked",
+                "message": "provider import pending",
+                **copy.deepcopy(details),
+                **app._bind_failure_record(
+                    str(consumer),
+                    "dependency_blocked",
+                    "provider import pending",
+                    details,
+                ),
+            }
+            with mock.patch.object(
+                app,
+                "_dependency_artifact_verdict",
+                return_value={"status": "current", "phase": "push"},
+            ):
+                verdict = app._failure_record_freshness(
+                    str(consumer), error
+                )
+
+        self.assertEqual(verdict["status"], "invalid")
+        self.assertIn("artifact 상태", verdict["reason"])
+
+    def test_legacy_failure_without_content_key_is_removed_before_routing(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "legacy_failure.spm"
+        effective, verdicts = app._effective_failure_entry(iid, {
+            "push_status_kind": "data_error",
+            "push_status_error": {
+                "kind": "data_error",
+                "message": "old unbound failure",
+            },
+        })
+
+        self.assertEqual(effective["push_status_kind"], "data_error")
+        self.assertNotIn("push_status_error", effective)
+        self.assertEqual(verdicts["push_status"]["status"], "invalid")
+        self.assertIn("content key", verdicts["push_status"]["reason"])
+
+    def test_blender_dependency_verdict_reads_saved_output_truth(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._repair_output_state = mock.Mock(
+            side_effect=AssertionError("dependency gate must not run full audit")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            dependency = Path(temporary) / "Cluster" / "SK_provider.spm"
+            dependency.parent.mkdir()
+            dependency.write_bytes(b"producer")
+            blend = gui.blend_path_for(dependency)
+            blend.write_bytes(b"saved blend")
+            with mock.patch.object(
+                app,
+                "_saved_dependency_blender_receipt_current",
+                return_value=True,
+            ) as current_receipt:
+                current = app._dependency_artifact_verdict(
+                    dependency,
+                    phase="blender",
+                )
+            app._pipeline_dependency_artifact_cache.clear()
+            with mock.patch.object(
+                app,
+                "_saved_dependency_blender_receipt_current",
+                return_value=False,
+            ):
+                stale = app._dependency_artifact_verdict(
+                    dependency,
+                    phase="blender",
+                )
+            app._pipeline_dependency_artifact_cache.clear()
+            blend.unlink()
+            missing = app._dependency_artifact_verdict(
+                dependency,
+                phase="blender",
+            )
+
+        self.assertEqual(current["status"], "current")
+        self.assertEqual(stale["status"], "stale")
+        self.assertEqual(missing["status"], "missing")
+        self.assertIn("Blender 산출물이 없습니다", missing["reason"])
+        current_receipt.assert_called_once_with(dependency)
+        app._repair_output_state.assert_not_called()
+
+    def test_dependency_receipt_check_never_migrates_saved_reports(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        dependency = Path("sanitized") / "SK_provider.spm"
+        with mock.patch.object(
+            gui,
+            "load_current_repair_pipeline_report",
+            return_value={"handoff_preflight": {"status": "ok"}},
+        ) as load_report:
+            current = app._saved_dependency_blender_receipt_current(
+                dependency
+            )
+
+        self.assertTrue(current)
+        load_report.assert_called_once_with(
+            dependency,
+            migrate_legacy=False,
+        )
+
+    def test_push_dependency_verdict_reuses_current_import_receipt(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dependency = root / "Cluster" / "SK_provider.spm"
+            dependency.parent.mkdir()
+            dependency.write_bytes(b"spm")
+            manifest = root / "push_manifest.json"
+            manifest.write_text(json.dumps({
+                "items": [{
+                    "queue_id": str(dependency),
+                    "fingerprint": "export-current",
+                    "exported_files": [],
+                    "handoff_files": [],
+                    "code_files": [],
+                }],
+            }), encoding="utf-8")
+            snapshot = {"blend": {"size": 5}}
+            app.state[str(dependency)] = {
+                "push_status_kind": "data_error",
+                "push_status": "실패: 이번 실행의 RPC 오류",
+                "push_source_fingerprint_cache": {
+                    "version": gui.PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+                    "fingerprint": "source-current",
+                    "snapshot": snapshot,
+                },
+                "push_export_cache": {
+                    "source_fingerprint": "source-current",
+                    "manifest": str(manifest),
+                    "fingerprint": "export-current",
+                },
+                "push_import_fingerprint": "export-current",
+            }
+            app._push_source_dependency_paths = mock.Mock(return_value=[])
+            with mock.patch.object(
+                gui,
+                "push_source_snapshot",
+                return_value=snapshot,
+            ):
+                verdict = app._current_push_output_artifact_state(
+                    dependency
+                )
+
+        self.assertEqual(verdict["status"], "current")
+        self.assertIn("Unreal import 영수증", verdict["reason"])
+
+    def test_dependency_waiting_is_pending_not_terminal_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._retry_transition = mock.Mock()
+        iid = str(Path("SK_waiting_consumer.spm"))
+        with mock.patch.object(gui, "save_state"):
+            app._set_push_state(
+                iid,
+                "dependency_waiting",
+                "대기: producer Unreal import 완료 영수증 대기",
+                details={"blocked_by": ["SK_provider.spm"]},
+            )
+
+        entry = app.state[iid]
+        self.assertEqual(entry["push_status_kind"], "dependency_waiting")
+        self.assertNotIn("push_status_error", entry)
+        outcome = app._target_authoritative_result(iid, "push")
+        self.assertEqual(outcome["outcome"], "pending_unreal")
+        transition = app._retry_transition.call_args
+        self.assertEqual(transition.args[1], gui.RETRY_STAGE_POST_CHECK)
+        self.assertNotIn("terminal_reason", transition.kwargs)
 
     def test_dependency_wrapper_without_exact_root_is_loud_provenance_failure(self):
         gui = load_gui_module()
@@ -3132,6 +3613,59 @@ class PushQueueFlowTests(unittest.TestCase):
             "dependency_blocked",
         )
 
+    def test_rpc_push_continues_when_failed_provider_import_is_current(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        cluster = Path("Tree_elm") / "Cluster" / "SK_cluster_current.spm"
+        root = Path("Tree_elm") / "SK_Tree_elm.spm"
+        cluster_item = {"spm": cluster, "checked": False}
+        root_item = {"spm": root, "checked": True}
+        expanded = [cluster_item, root_item]
+        app.items = {str(item["spm"]): item for item in expanded}
+        attempted = []
+
+        def fake_push(_iid, spm):
+            attempted.append(spm)
+            if spm == cluster:
+                raise gui.BatchItemError(
+                    "이번 실행의 producer RPC 실패",
+                    kind="data_error",
+                )
+
+        with mock.patch.object(
+            gui,
+            "expand_push_targets",
+            return_value=(
+                expanded,
+                {str(root): (str(cluster),)},
+                {str(cluster)},
+            ),
+        ), mock.patch.object(
+            app, "_push_preflight", return_value=(expanded, None)
+        ), mock.patch.object(
+            app,
+            "_dependency_artifact_verdict",
+            return_value={
+                "status": "current",
+                "phase": "push",
+                "reason": "current Unreal import receipt",
+            },
+        ), mock.patch.object(
+            app, "_job_push", side_effect=fake_push
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch(
+                "push",
+                [root_item],
+                emit_done=False,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(attempted, [cluster, root])
+        self.assertNotEqual(
+            app.state.get(str(root), {}).get("push_status_kind"),
+            "dependency_blocked",
+        )
+
     def test_full_pipeline_does_not_forward_failed_items_to_later_phases(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -3280,19 +3814,14 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(blender_attempts, [unrelated_tree])
         self.assertEqual(push_attempts, [unrelated_tree])
         self.assertEqual(preflight_inputs, [[unrelated_tree]])
-        self.assertEqual(
-            blocked_contracts_at_push_expand,
-            [{
-                "ready": False,
-                "reason": (
-                    f"필수 Cluster 단계 · {failed_cluster.name} · 원인: "
-                    f"{failed_cluster.name}: 이 차단 사유에는 등록된 자동 "
-                    "복구 동작이 없습니다. · 조치: 표시된 원인 코드와 감사 "
-                    "증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요."
-                ),
-                "kind": "dependency_blocked",
-            }],
-        )
+        self.assertEqual(len(blocked_contracts_at_push_expand), 1)
+        blocked_contract = blocked_contracts_at_push_expand[0]
+        self.assertFalse(blocked_contract["ready"])
+        self.assertEqual(blocked_contract["kind"], "dependency_blocked")
+        self.assertIn("필수 producer 산출물", blocked_contract["reason"])
+        self.assertIn(failed_cluster.name, blocked_contract["reason"])
+        self.assertIn("산출물 없음", blocked_contract["reason"])
+        self.assertIn("current", blocked_contract["reason"])
         self.assertEqual(
             [item["spm"] for item in expand_push.call_args.args[0]],
             [unrelated_tree],
@@ -3321,6 +3850,70 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("completed 1", final_progress)
         self.assertIn("blocked 1", final_progress)
         self.assertIn("failed 1", final_progress)
+
+    def test_full_pipeline_starts_consumer_when_saved_provider_is_current(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        provider = Path("Tree_blackgum") / "Cluster" / "SK_cluster_blackgum.spm"
+        consumer = Path("Tree_blackgum") / "SK_bush_blackgum.spm"
+        provider_item = {"spm": provider, "checked": False}
+        consumer_item = {"spm": consumer, "checked": True}
+        app.items = {
+            str(provider): provider_item,
+            str(consumer): consumer_item,
+        }
+        calls = []
+
+        def fake_batch(phase, phase_targets, emit_done=False):
+            del emit_done
+            calls.append((phase, [item["spm"] for item in phase_targets]))
+            app._phase_failed_items = (
+                {str(provider)}
+                if phase == "spm" and provider_item in phase_targets
+                else set()
+            )
+            app._phase_abort_reason = None
+            return not app._phase_failed_items
+
+        app._run_batch = mock.Mock(side_effect=fake_batch)
+        with mock.patch.object(
+            gui,
+            "expand_blender_repair_targets",
+            return_value=(
+                [provider_item, consumer_item],
+                {str(consumer): (str(provider),)},
+                {str(provider)},
+            ),
+        ), mock.patch.object(
+            app,
+            "_dependency_artifact_verdict",
+            return_value={
+                "status": "current",
+                "phase": "blender",
+                "reason": "current saved provider output",
+            },
+        ):
+            result = app._run_full_pipeline(
+                [consumer_item],
+                terminal_phase="blender",
+            )
+
+        downstream = [
+            names for phase, names in calls
+            if phase == "blender" and consumer in names
+        ]
+        self.assertEqual(downstream, [[consumer]])
+        self.assertTrue(result)
+        self.assertEqual(
+            app._phase_result_summary["dependency_blocked_count"],
+            0,
+        )
+        row = app._phase_result_summary["target_outcomes"][0]
+        self.assertEqual(row["outcome"], "completed")
+        self.assertEqual(
+            row["evidence"]["dependency_resolution"],
+            "current_output_reused",
+        )
 
     def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
         gui = load_gui_module()
@@ -4192,6 +4785,110 @@ class PushQueueFlowTests(unittest.TestCase):
             app.state[str(root)]["push_status_error"]["message"],
         )
 
+    def test_headless_continues_consumer_when_failed_provider_import_is_current(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app._phase_failed_items = set()
+        provider = Path("Tree") / "Cluster" / "SK_provider.spm"
+        consumer = Path("Tree") / "SK_consumer.spm"
+        app._active_push_dependency_map = {
+            str(consumer): (str(provider),)
+        }
+        app.cfg = {"blender_parallel_jobs": 1}
+        targets = [
+            {"spm": provider, "checked": False},
+            {"spm": consumer, "checked": True},
+        ]
+        consumer_export = {
+            "queue_id": str(consumer),
+            "fingerprint": "consumer-v1",
+            "report_path": "consumer-report.json",
+            "assets": [],
+        }
+
+        def export_item(iid, _spm, _stamp):
+            if iid == str(provider):
+                raise gui.BatchItemError(
+                    "이번 실행의 provider export 오판",
+                    kind="data_error",
+                )
+            return consumer_export
+
+        with mock.patch.object(
+            app, "_export_manifest_item", side_effect=export_item
+        ), mock.patch.object(
+            app,
+            "_dependency_artifact_verdict",
+            return_value={
+                "status": "current",
+                "phase": "push",
+                "reason": "기존 Unreal import 영수증 current",
+            },
+        ), mock.patch.object(
+            app, "_run_headless_import_items", return_value=True
+        ) as run_import, mock.patch.object(gui, "save_state"):
+            app._run_headless_push_batch(targets, emit_done=False)
+
+        run_import.assert_called_once()
+        pending = run_import.call_args.args[0]
+        self.assertEqual([row["queue_id"] for row in pending], [str(consumer)])
+        self.assertEqual(pending[0]["depends_on_queue_ids"], [])
+        self.assertEqual(
+            app._pipeline_dependency_reuse_evidence[str(consumer)][
+                str(provider)
+            ]["status"],
+            "current",
+        )
+
+    def test_headless_reports_waiting_without_terminal_consumer_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        app._phase_failed_items = set()
+        provider = Path("Tree") / "Cluster" / "SK_provider_wait.spm"
+        consumer = Path("Tree") / "SK_consumer_wait.spm"
+        app._active_push_dependency_map = {
+            str(consumer): (str(provider),)
+        }
+        app.cfg = {"blender_parallel_jobs": 1}
+        targets = [
+            {"spm": provider, "checked": False},
+            {"spm": consumer, "checked": True},
+        ]
+
+        def export_item(iid, _spm, _stamp):
+            if iid == str(provider):
+                raise gui.BatchItemError("provider unavailable", kind="data_error")
+            return {
+                "queue_id": str(consumer),
+                "fingerprint": "consumer-v1",
+                "report_path": "consumer-report.json",
+                "assets": [],
+            }
+
+        with mock.patch.object(
+            app, "_export_manifest_item", side_effect=export_item
+        ), mock.patch.object(
+            app,
+            "_dependency_artifact_verdict",
+            return_value={
+                "status": "waiting",
+                "phase": "push",
+                "reason": "export current, Unreal import 영수증 대기",
+            },
+        ), mock.patch.object(
+            app,
+            "_run_headless_import_items",
+            side_effect=AssertionError("waiting consumer must not enter Unreal"),
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_headless_push_batch(targets, emit_done=False)
+
+        self.assertFalse(result)
+        entry = app.state[str(consumer)]
+        self.assertEqual(entry["push_status_kind"], "dependency_waiting")
+        self.assertNotIn("push_status_error", entry)
+
     def test_cached_manifest_item_finds_recovered_item_after_provider(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -4299,6 +4996,14 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             for iid in (checked, unchecked)
         }
+        for iid in (checked, unchecked):
+            app.state[iid]["blend_status_error"].update(
+                app._bind_failure_record(
+                    iid,
+                    "data_error",
+                    "Blender Repair failed",
+                )
+            )
         app._failed_retry_repair_state.return_value = {
             "current": False,
             "push_ready": False,

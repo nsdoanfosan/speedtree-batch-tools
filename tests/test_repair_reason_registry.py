@@ -21,6 +21,7 @@ from repair_reason_registry import (  # noqa: E402
     INFORMATIONAL,
     REASON_REGISTRY,
     REPAIRABLE,
+    UNSUPPORTED,
     UNCLASSIFIED,
     UNCLASSIFIED_CEILING,
     UNEMITTED_PLANNER_CODES,
@@ -175,6 +176,56 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             if disposition_of(code) == INFORMATIONAL
         )
         self.assertEqual(quiet, [])
+
+    def test_observed_standalone_terminal_failures_are_not_informational(self):
+        payload = json.loads(
+            OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
+        )
+        terminal = payload["standalone_terminal_failure_tokens"]
+
+        self.assertEqual(
+            terminal,
+            {
+                "data_error": 24,
+                "unreal_unavailable": 4,
+                "internal_error": 3,
+            },
+        )
+        self.assertEqual(
+            sorted(
+                token for token in terminal
+                if disposition_of(token) == INFORMATIONAL
+            ),
+            [],
+            "a standalone terminal failure cannot use the informational bucket",
+        )
+        self.assertTrue(
+            all(disposition_of(token) == UNSUPPORTED for token in terminal)
+        )
+
+    def test_generic_terminal_failure_is_visible_but_does_not_mask_repair(self):
+        generic = {"reason_token": "data_error"}
+        self.assertTrue(orchestration.has_repair_contract_evidence(generic))
+        decision = orchestration.repair_ui_decision(generic)
+        self.assertEqual(decision["status"], orchestration.REPAIR_UI_BLOCKED)
+        self.assertIn("실패", decision["reason"])
+
+        target = str(REPO_DIR / "sanitized" / "SK_target.spm")
+        plan = orchestration.build_exact_target_repair_plan(
+            target,
+            {
+                "reason_codes": [
+                    "data_error",
+                    "canonical_output_missing",
+                ],
+            },
+            inventory_paths=[target],
+            parent_retry_id="parent",
+            request_id="request",
+            require_exists=False,
+        )
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.stages[0]["stage"], "pcg_texture")
 
     def test_sanitized_observed_tokens_are_registered_and_decided(self):
         payload = json.loads(

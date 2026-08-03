@@ -125,6 +125,10 @@ UNSUPPORTED_FAILURE_WRAPPER_CODES = _registered_codes(
 UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES = _registered_codes(
     disposition=UNSUPPORTED, note="visible_generator_pair",
 )
+UNSUPPORTED_DURABLE_FAILURE_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="durable_failure",
+)
+DURABLE_FAILURE_REASON_CODES = UNSUPPORTED_DURABLE_FAILURE_CODES
 
 FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
 UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
@@ -177,6 +181,11 @@ REASON_LABELS_KO = {
     "pcg_cluster_handoff_not_ready": "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다",
     "preflight_error": "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다",
     "dependency_root_reason_missing": "의존 작업의 실제 실패 원인이 영수증에서 유실되었습니다",
+    "dependency_output_missing": "필수 producer 산출물이 없습니다",
+    "dependency_output_stale": "필수 producer 산출물이 현재 입력보다 오래되었습니다",
+    "data_error": "작업 데이터 처리에 실패했습니다",
+    "internal_error": "BAT 내부 실행 오류가 발생했습니다",
+    "unreal_unavailable": "Unreal 실행 상태가 현재 Push 방식과 맞지 않습니다",
 }
 
 REASON_KEYS = frozenset({
@@ -621,6 +630,27 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             "표시되는 Generator가 해당 Material이 소유하지 않는 Mesh를 참조합니다.",
             "오류 행의 Generator, Material ID, Mesh ID를 확인해 visible 연결을 수정한 뒤 다시 검사하세요.",
         )
+    dependency_output_codes = {
+        "dependency_output_missing",
+        "dependency_output_stale",
+    }
+    if codes and codes.issubset(dependency_output_codes):
+        return decision(
+            REPAIR_UI_BLOCKED,
+            labels[0] if labels else "필수 producer 산출물이 current가 아닙니다.",
+            "오류 행에 표시된 producer의 exact 산출물과 content key를 다시 생성한 뒤 해당 consumer만 재검사하세요.",
+        )
+    generic_terminal_codes = {
+        "data_error",
+        "internal_error",
+        "unreal_unavailable",
+    }
+    if codes and codes.issubset(generic_terminal_codes):
+        return decision(
+            REPAIR_UI_BLOCKED,
+            labels[0] if labels else "현재 작업이 구조화된 실패로 종료되었습니다.",
+            "같은 행의 상세 증거와 report 경로에서 실제 하위 원인을 확인한 뒤 해당 대상만 다시 실행하세요.",
+        )
 
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     if recipe_codes and _validated_recipe(evidence) is None:
@@ -879,6 +909,10 @@ def build_exact_target_repair_plan(
     explicit_blockers = codes & (
         UNSUPPORTED_REASON_CODES | FATAL_REASON_CODES
     )
+    if codes - UNSUPPORTED_DURABLE_FAILURE_CODES:
+        explicit_blockers.difference_update(
+            UNSUPPORTED_DURABLE_FAILURE_CODES
+        )
     if recipe is not None:
         explicit_blockers.difference_update(recipe_codes)
     if explicit_blockers:
