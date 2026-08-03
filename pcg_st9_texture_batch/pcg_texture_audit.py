@@ -7391,6 +7391,8 @@ def write_csv(report, csv_path):
         missing_maps = sorted(
             set(m for c in item["cluster_items"] for m in c["missing_export_maps"])
         )
+        failure = item.get("failure") or {}
+        failure_evidence = failure.get("evidence") or item.get("evidence") or {}
         rows.append(
             {
                 "name": item["name"],
@@ -7408,6 +7410,12 @@ def write_csv(report, csv_path):
                     f"{entry['mesh_name']}={entry['status']}"
                     for entry in item.get("target_spm_statuses", [])
                 ),
+                "reason_token": (
+                    item.get("reason_token")
+                    or failure.get("reason_token")
+                    or ""
+                ),
+                "failure_target_spm": failure_evidence.get("target_spm") or "",
                 "actions": " | ".join(item["actions"]),
             }
         )
@@ -7415,7 +7423,8 @@ def write_csv(report, csv_path):
         "name", "status", "folder", "chosen_spm", "sbs", "clusters",
         "missing_m_prefix", "missing_export_maps", "normal_convention",
         "pcg_target_meshes", "duplicate_pcg_target_meshes",
-        "target_spm_statuses", "actions",
+        "target_spm_statuses", "reason_token", "failure_target_spm",
+        "actions",
     ]
     with Path(csv_path).open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -7709,6 +7718,127 @@ def canonical_cluster_provider_map(
 
 
 
+def _atlas_manifest_failure_target(folder, error):
+    """Return the exact local SPM owned by one folder-level Atlas failure.
+
+    Atlas providers can be shared across folders, so a typed resolver error is
+    local only when its own evidence identifies an SPM below the folder being
+    audited.  Missing, relative, or external identities remain fatal to the
+    report instead of being attributed to the wrong asset.
+    """
+    resolution = getattr(error, "resolution", None)
+    target_value = (
+        resolution.get("target_spm")
+        if isinstance(resolution, dict)
+        else None
+    )
+    if not target_value:
+        return None
+    target = Path(str(target_value)).expanduser()
+    if not target.is_absolute():
+        return None
+    try:
+        folder_path = Path(folder).expanduser().resolve(strict=False)
+        target_path = target.resolve(strict=False)
+        target_path.relative_to(folder_path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return target_path
+
+
+def _atlas_manifest_failure_item(folder, target_spm, error):
+    """Build a schema-complete, fail-closed row for one conflicted folder."""
+    folder_path = Path(folder).expanduser().resolve(strict=False)
+    resolution = dict(getattr(error, "resolution", None) or {})
+    try:
+        repair_plan = atlas_manifest_mirror_repair_plan(
+            target_spm,
+            resolution=resolution,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as plan_error:
+        repair_plan = {
+            "schema_version": 1,
+            "status": "unrepairable",
+            "reason_code": "atlas_manifest_ownership_conflict",
+            "reason": str(plan_error),
+            "target_spm": str(target_spm),
+            "authority": None,
+            "mirrors": [],
+            "resolution": resolution_evidence(resolution),
+        }
+    reason_token = str(
+        repair_plan.get("reason_code")
+        or "atlas_manifest_ownership_conflict"
+    )
+    evidence = dict(repair_plan)
+    evidence.update({
+        "folder": str(folder_path),
+        "target_spm": str(target_spm),
+        "error_type": type(error).__name__,
+        "error": str(error)[:2000],
+    })
+    evidence.setdefault("resolution", resolution_evidence(resolution))
+    failure = {
+        "scope": "folder",
+        "reason_token": reason_token,
+        "evidence": evidence,
+    }
+    actions = [
+        f"Resolve the Atlas manifest conflict for {target_spm.name}",
+        "Re-run the audit for this folder after its ownership is authoritative",
+    ]
+    texture_dir = folder_path / "texture"
+    return {
+        "folder": str(folder_path),
+        "name": folder_path.name,
+        "source_spms": [],
+        "sk_spms": [],
+        "loose_sk_spms": [],
+        "chosen_spm": None,
+        "materials": [],
+        "materials_missing_m_prefix": [],
+        "material_renames_needed": [],
+        "sbs_files": [],
+        "texture_dir": str(texture_dir),
+        "texture_dirs": [],
+        "m_graph_names": {},
+        "cluster_items": [],
+        "preserved_cluster_materials": [],
+        "leaf_mesh_sources": [],
+        "leaf_atlas_lineage": {},
+        "leaf_source_provenance": {},
+        "leaf_atlas_inventory": [],
+        "legacy_cluster_states": [],
+        "leaf_mesh_target_spms": [],
+        "managed_leaf_outputs": [],
+        "cluster_assembly": {},
+        "cluster_hierarchy": {},
+        "cluster_source_rows": [],
+        "assembly_handoff": {},
+        "ignored_cluster_spms": [],
+        "source_refs": [],
+        "normal_convention": "unknown",
+        "ao_policy": "use source AO if present; otherwise derive HBAO from height",
+        "sdf_policy": "connect opacity if needed, set SDF to 0",
+        "target_spm_statuses": [],
+        "target_mesh_names": [],
+        "pcg_target_mesh_names": [],
+        "pcg_target_meshes": [],
+        "pcg_mesh_names": [],
+        "pcg_data_assets": [],
+        "level_mesh_names": [],
+        "level_placements": [],
+        "duplicate_target_mesh_names": [],
+        "duplicate_pcg_target_mesh_names": [],
+        "status": "audit_failed",
+        "actions": actions,
+        "audit_complete": False,
+        "reason_token": reason_token,
+        "evidence": evidence,
+        "failure": failure,
+    }
+
+
 def _audit_one_with_handoff_scope(
         audit_one, folder, *, content_snapshots=None,
         spm_content_keys=None, session_metrics=None,
@@ -7727,7 +7857,13 @@ def _audit_one_with_handoff_scope(
     _PENDING_DECODED_HANDOFF.set(None)
     _PENDING_RAW_SPM_HANDOFF.set(None)
     try:
-        return audit_one(folder)
+        try:
+            return audit_one(folder)
+        except AtlasManifestResolutionError as error:
+            target_spm = _atlas_manifest_failure_target(folder, error)
+            if target_spm is None:
+                raise
+            return _atlas_manifest_failure_item(folder, target_spm, error)
     finally:
         _PENDING_DECODED_HANDOFF.set(None)
         _PENDING_RAW_SPM_HANDOFF.set(None)
@@ -7797,46 +7933,6 @@ def _audit_report_folders(
     # Asset folders are independent read-only audits. Running four at a time
     # keeps OneDrive I/O bounded. The shared blend-index session is explicitly
     # bound inside audit_one; no mutable folder result is shared between tasks.
-    def _audit_failure_item(folder, exc):
-        """Represent one unauditable folder without losing the other folders.
-
-        The reason token is the precise one when the failure is a manifest
-        ownership conflict -- that code is registered `unsupported`, so it
-        reaches the operator as a named row with an action -- and the generic
-        `asset_audit_failed` otherwise.
-        """
-        path = Path(folder)
-        precise = isinstance(exc, AtlasManifestResolutionError)
-        return {
-            "folder": str(path),
-            "name": path.name,
-            "status": "audit_failed",
-            "actions": [
-                "이 폴더의 감사가 실패해 결과를 신뢰할 수 없습니다",
-                "표시된 원인을 해결한 뒤 이 폴더만 다시 검사하세요",
-            ],
-            "reason_token": (
-                "atlas_manifest_ownership_conflict"
-                if precise
-                else "asset_audit_failed"
-            ),
-            "evidence": {
-                "folder": str(path),
-                "error_type": type(exc).__name__,
-                "error": str(exc)[:2000],
-            },
-            "target_spm_statuses": [],
-            "target_mesh_names": [],
-            "pcg_target_mesh_names": [],
-            "pcg_target_meshes": [],
-            "pcg_mesh_names": [],
-            "pcg_data_assets": [],
-            "level_mesh_names": [],
-            "level_placements": [],
-            "duplicate_target_mesh_names": [],
-            "duplicate_pcg_target_mesh_names": [],
-        }
-
     indexed_items = {}
     with ThreadPoolExecutor(
         max_workers=min(4, total_folders),
@@ -7864,17 +7960,7 @@ def _audit_report_folders(
                     pending.cancel()
                 raise RuntimeError("PCG folder audit cancelled")
             index, folder = futures[future]
-            try:
-                indexed_items[index] = future.result()
-            except Exception as exc:  # noqa: BLE001 - one folder must not end the run
-                # A folder that cannot be audited is a blocked folder, not the
-                # end of the report.  Before this, one asset with a conflicted
-                # Atlas manifest -- three targets currently have one -- raised
-                # out of its worker and terminated the whole-tree audit, so no
-                # Cluster Assembly receipt could be regenerated for any asset
-                # in the fleet and every downstream assembly build was skipped.
-                # Same target-local isolation as #16, one layer up.
-                indexed_items[index] = _audit_failure_item(folder, exc)
+            indexed_items[index] = future.result()
             if item_callback is not None:
                 item_callback(indexed_items[index], folder)
             completed += 1
@@ -8102,6 +8188,12 @@ def make_report(
             for name in folder_matches
             for path in sorted(target_mesh_map.get(name, []))
         ]
+        if item.get("audit_complete") is False:
+            # The resolver failure is the authoritative state for this folder.
+            # Do not let a shallower filename/material probe replace it with
+            # needs_sk, needs_m_prefix, or another apparent success state.
+            item["target_spm_statuses"] = []
+            continue
         item["target_spm_statuses"] = [
             target_spm_status(item["folder"], name)
             for name in workflow_mesh_names
@@ -8132,7 +8224,7 @@ def make_report(
         ]
         item["duplicate_pcg_target_mesh_names"] = duplicates
         item["duplicate_target_mesh_names"] = duplicates
-        if duplicates:
+        if duplicates and item.get("audit_complete") is not False:
             item["status"] = "needs_duplicate_review"
             item["actions"] = unique([
                 "같은 PCG 대상이 여러 폴더에 매칭됨",
@@ -8140,6 +8232,19 @@ def make_report(
     counts = {}
     for item in items:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
+    failed_folder_count = int(counts.get("audit_failed", 0))
+    if failed_folder_count and failed_folder_count == len(items):
+        report_status = "failed"
+    elif failed_folder_count:
+        report_status = "partial"
+    else:
+        report_status = "ok"
+    folder_failures = [
+        item["failure"]
+        for item in items
+        if item.get("audit_complete") is False
+        and isinstance(item.get("failure"), dict)
+    ]
     target_status_counts = {}
     for item in items:
         for entry in item.get("target_spm_statuses", []):
@@ -8202,6 +8307,7 @@ def make_report(
     )
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "status": report_status,
         "config": cfg,
         "startup_timing": {
             "schema_version": 1,
@@ -8246,13 +8352,49 @@ def make_report(
         "summary": {
             "total": len(items),
             "by_status": counts,
+            "failed_folder_count": failed_folder_count,
+            "completed_folder_count": len(items) - failed_folder_count,
             "pcg_target_status_counts": target_status_counts,
         },
+        "failures": folder_failures,
         "items": items,
     }
+    if report_status == "failed":
+        report["stage"] = "asset_audit"
+        report["error_type"] = "FolderAuditFailure"
+        report["error"] = "Every selected folder failed its authoritative audit"
+        if len(folder_failures) == 1:
+            report["failure"] = folder_failures[0]
+        else:
+            report["failure"] = {
+                "scope": "report",
+                # Every localized row above is a typed Atlas failure.  Use the
+                # conservative non-automatic Atlas disposition for an
+                # aggregate: SK Batch can route it as a data error without
+                # choosing an arbitrary target to repair.
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {
+                    "status": "unrepairable",
+                    "reason_code": "atlas_manifest_ownership_conflict",
+                    "reason": (
+                        "multiple selected folders have independent Atlas "
+                        "manifest failures"
+                    ),
+                    "failed_folder_count": failed_folder_count,
+                    "failures": folder_failures,
+                },
+            }
     if report_cache is not None:
         _publish_report_session_evidence(report_cache, session_evidence)
     return report
+
+
+def _report_live_audit_complete(report):
+    """Whether every selected folder reached an authoritative audit result."""
+    items = (report or {}).get("items") or []
+    if any(item.get("audit_complete") is False for item in items):
+        return False
+    return (report or {}).get("status") not in {"partial", "failed"}
 
 
 def persist_cluster_assembly_receipts_safely(report):
@@ -8263,6 +8405,7 @@ def persist_cluster_assembly_receipts_safely(report):
     reported as a warning instead of making the PCG GUI unusable.
     """
     unchanged = []
+    live_audit_complete = _report_live_audit_complete(report)
     try:
         written = persist_cluster_assembly_receipts(
             report,
@@ -8273,7 +8416,7 @@ def persist_cluster_assembly_receipts_safely(report):
             "status": "warning",
             "stage": "receipt_persistence",
             "code": "RECEIPT_PERSISTENCE_FAILED",
-            "live_audit_complete": True,
+            "live_audit_complete": live_audit_complete,
             "written": [],
             "unchanged": [],
             "error": f"{type(exc).__name__}: {exc}",
@@ -8289,7 +8432,7 @@ def persist_cluster_assembly_receipts_safely(report):
             "status": "ok",
             "stage": "receipt_persistence",
             "code": code,
-            "live_audit_complete": True,
+            "live_audit_complete": live_audit_complete,
             "written": written,
             "unchanged": unchanged,
             "error": "",
@@ -8486,6 +8629,7 @@ def main():
     emit_progress_marker(
         CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER,
         total=(report.get("summary") or {}).get("total", 0),
+        status=report.get("status", "ok"),
     )
     revision_finished = production_source_manifest(BATCH_TOOLS_DIR)
     revision_state = production_source_revision_state(
@@ -8527,7 +8671,7 @@ def main():
             "status": "not_requested",
             "stage": "receipt_persistence",
             "code": "RECEIPT_NOT_REQUESTED",
-            "live_audit_complete": True,
+            "live_audit_complete": _report_live_audit_complete(report),
             "written": [],
             "unchanged": [],
             "error": "",
@@ -8541,10 +8685,19 @@ def main():
     )
     save_spm_analysis_cache()
     write_report_outputs(report, args.json_path, args.csv_path)
+    final_status = report.get("status", "ok")
+    if final_status == "failed":
+        emit_progress_marker(
+            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
+            stage="asset_audit",
+            error="folder_audit_failed",
+        )
     emit_progress_marker(
         CLUSTER_LIVE_AUDIT_DONE_MARKER,
-        status=report.get("status", "ok"),
+        status=final_status,
     )
+    if final_status == "failed":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
