@@ -13,7 +13,8 @@ The registry exists so that set can never drift unobserved again:
 * `repairable`   -- the exact-target repair planner owns a recovery for it.
 * `unsupported`  -- no automatic path; the operator gets a friendly action.
 * `fatal`        -- real data damage; automatic recovery would hide it.
-* `informational`-- a fact/wrapper that cannot itself terminate a target.
+* `informational`-- a fact/wrapper that only annotates another result.  It
+  cannot stand alone as a target's terminal reason or final outcome token.
 * `unclassified` -- **not decided yet.**  Seeded from the codes that were
   invisible to the contract on 2026-08-03.  A debt marker, not an answer:
   `UNCLASSIFIED_CEILING` may only ever move down.
@@ -321,6 +322,15 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "dependency_root_reason_missing": ReasonRow(
         FATAL, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
+    ),
+    "dependency_output_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_artifact",
+    ),
+    "dependency_output_stale": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_artifact",
+    ),
+    "dependency_waiting": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "dependency_lifecycle",
     ),
     "declared_generator_slot_not_declared_exactly_once": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
@@ -854,7 +864,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         REPAIRABLE, "pcg_st9_texture_batch/pcg_texture_gui.pyw", "pcg_texture",
     ),
     "data_error": ReasonRow(
-        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+        UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "durable_failure",
     ),
     "diagnostic_only_legacy_shadow": ReasonRow(
         INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
@@ -872,7 +882,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/unreal_ingest.py", "durable_status",
     ),
     "internal_error": ReasonRow(
-        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+        UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "durable_failure",
     ),
     "interpreter_exit": ReasonRow(
         UNSUPPORTED, "process_lifecycle.py", "process_lifecycle",
@@ -1032,7 +1042,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_validation_route",
     ),
     "unreal_unavailable": ReasonRow(
-        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+        UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "durable_failure",
     ),
     "unreal_crash": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",

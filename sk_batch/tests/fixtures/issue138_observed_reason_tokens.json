@@ -1,6 +1,6 @@
 {
   "kind": "issue138_sanitized_observed_reason_tokens",
-  "source": "GitHub PR 148 comment 5162631576; token names and counts only",
+  "source": "GitHub PR 148 comments 5162631576 and 5163298420; token names and counts only",
   "captured_target_count": 92,
   "tokens": {
     "data_error": 25,
@@ -23,5 +23,13 @@
     "structured_blender_failure": 1,
     "blender_output_not_current": 1,
     "operator_release_requested": 1
+  },
+  "standalone_terminal_failure_tokens": {
+    "data_error": 24,
+    "unreal_unavailable": 4,
+    "internal_error": 3
+  },
+  "dependency_wrapper_tokens": {
+    "shared_dependency_failed": 19
   }
 }

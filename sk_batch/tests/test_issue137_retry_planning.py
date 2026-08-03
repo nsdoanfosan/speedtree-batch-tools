@@ -139,7 +139,7 @@ def test_sanitized_154_target_benchmark_preserves_classification_and_dedupes_io(
     )
 
     assert result["classification_signature_sha256"] == (
-        "1f272cf0a48da46e5e9dc96968e434440c6311472d30fa84f1912125396aed54"
+        "87699b9d06e1f56749d9d819fe83dd0464e8449933fec1b136d580a983681a38"
     )
     assert result["partition_counts"] == {
         "unreal_ingest": 10,
@@ -157,8 +157,9 @@ def test_sanitized_154_target_benchmark_preserves_classification_and_dedupes_io(
     planner = result["planner_diagnostics"]["counters"]
     assert planner["durable_current_excluded"] == 100
     assert planner["repair_state_validations"] == 54
-    assert planner["durable_report_cache_misses"] == 2
-    assert planner["durable_report_cache_hits"] == 8
+    assert planner["invalid_failure_records_reaudited"] == 54
+    assert planner.get("durable_report_cache_misses", 0) == 0
+    assert planner.get("durable_report_cache_hits", 0) == 0
     assert planner["parent_manifest_cache_misses"] == 1
     assert planner["parent_manifest_cache_hits"] == 9
     assert planner["parent_checkpoint_cache_misses"] == 1
@@ -276,7 +277,12 @@ def test_plan_receipt_reuses_unchanged_assets_and_invalidates_changed_asset(
         first: {"spm": Path(first), "checked": True},
         second: {"spm": Path(second), "checked": False},
     }
-    cfg = {"push_transport": "headless"}
+    cfg = {
+        "push_transport": "headless",
+        "_planning_production_source_revision": (
+            gui._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+        ),
+    }
     signature = planning_input_signature(targets, state, cfg, inventory)
 
     old_tracker = RetryProgressReceipt.create(
@@ -379,6 +385,16 @@ def test_plan_receipt_reuses_unchanged_assets_and_invalidates_changed_asset(
     assert changed["file_identities_sha256"] != (
         signature["file_identities_sha256"]
     )
+    old_revision = planning_input_signature(
+        targets,
+        state,
+        {
+            **cfg,
+            "_planning_production_source_revision": "0" * 64,
+        },
+        inventory,
+    )
+    assert old_revision["snapshot_sha256"] != signature["snapshot_sha256"]
 
 
 def test_plan_cache_hydration_skips_committed_deferred_side_effects(tmp_path):

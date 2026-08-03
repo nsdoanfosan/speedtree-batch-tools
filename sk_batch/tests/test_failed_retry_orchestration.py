@@ -1,3 +1,4 @@
+import copy
 import queue
 import sys
 import tempfile
@@ -696,8 +697,42 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                 },
             },
         }
+        app.state[cluster_iid]["push_status_error"].update(
+            app._bind_failure_record(
+                cluster_iid,
+                "data_error",
+                "sanitized cluster failure",
+                {"reason_code": "texture_set_incomplete"},
+            )
+        )
+        consumer_details = {
+            "blocked_by": [cluster_iid],
+            "dependency_artifacts": {
+                cluster_iid: {
+                    "status": "missing",
+                    "phase": "blender",
+                    "reason": "sanitized missing provider output",
+                    "artifact_identity": app._dependency_artifact_identity(
+                        self.first,
+                        "blender",
+                        {},
+                    ),
+                },
+            },
+        }
+        app.state[consumer_iid]["blend_status_error"].update(
+            copy.deepcopy(consumer_details)
+        )
+        app.state[consumer_iid]["blend_status_error"].update(
+            app._bind_failure_record(
+                consumer_iid,
+                "dependency_blocked",
+                "sanitized dependency block",
+                consumer_details,
+            )
+        )
 
-        def evidence(iid, _repair_state=None):
+        def evidence(iid, _repair_state=None, **_kwargs):
             if iid == cluster_iid:
                 return {
                     "reason_code": "texture_set_incomplete",
