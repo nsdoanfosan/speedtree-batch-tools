@@ -926,6 +926,64 @@ def audit_atlas_consumer_integrity(target_spm, root):
             "automatic_action_eligible": eligible,
         })
 
+    # A current Atlas producer may publish several complete material groups
+    # while one exact SpeedTree target selects only a subset of those groups.
+    # Treating every asset in an entirely unselected sibling group as stale
+    # makes a coherent target impossible to export (the blackgum Cluster, for
+    # example, selects Green while preserving the current Stem/Small groups).
+    #
+    # This exception is deliberately narrow.  It applies only when one exact
+    # producer authority is selected, another group from that same authority
+    # is live, the Material itself is unreferenced, and every Mesh owned solely
+    # by that Material is likewise unreferenced.  A partially disconnected
+    # group, mixed ownership, multiple authorities, or any integrity issue
+    # remains ambiguous and blocking.
+    selected_authorities = _selected_authorities(receipts)
+    if len(selected_authorities) == 1 and not integrity_issues:
+        authority = selected_authorities[0]
+        authority_scope = str(authority.get("scope_id") or "")
+        live_sibling = any(
+            row.get("scope_id") == authority_scope
+            and row.get("classification") in {
+                "current_reachable",
+                "current_default_cutout",
+            }
+            for row in managed_materials
+        )
+        if authority_scope and live_sibling:
+            for material in managed_materials:
+                material_id = material.get("material_id")
+                if not (
+                    material.get("scope_id") == authority_scope
+                    and material.get("classification") == "ambiguous"
+                    and material.get("orphan_reason")
+                    == "authoritative_current_unreferenced"
+                    and not material.get("generator_references")
+                ):
+                    continue
+                group_meshes = [
+                    row for row in managed_meshes
+                    if row.get("owner_material_ids") == [material_id]
+                ]
+                if not group_meshes or not all(
+                    row.get("scope_id") == authority_scope
+                    and row.get("classification") == "ambiguous"
+                    and row.get("orphan_reason")
+                    == "authoritative_current_unreferenced"
+                    and not row.get("generator_references")
+                    for row in group_meshes
+                ):
+                    continue
+                material["classification"] = "current_unused_group"
+                material["orphan_reason"] = (
+                    "authoritative_current_group_not_selected_by_generator"
+                )
+                for row in group_meshes:
+                    row["classification"] = "current_unused_group"
+                    row["orphan_reason"] = (
+                        "authoritative_current_group_not_selected_by_generator"
+                    )
+
     managed_assets = managed_materials + managed_meshes
     classification_counts = dict(sorted(Counter(
         row["classification"] for row in managed_assets
@@ -958,6 +1016,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "superseded_with_proven_successor",
         "current_reachable",
         "current_default_cutout",
+        "current_unused_group",
         "protected_foreign",
     )
     for (scope_id, _identity_hash, manifest_paths), rows in sorted(
