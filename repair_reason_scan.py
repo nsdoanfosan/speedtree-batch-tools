@@ -67,8 +67,34 @@ _REASON_ARGUMENT_NAMES = frozenset({
     "default_reason_token",
 })
 
+# Expanding a local name into a plain ``reason``/``result`` field pulls in
+# human-facing diagnostics and ordinary state labels. These keys, by contrast,
+# are code-bearing at runtime and are safe conservative local-name sinks.
+_LOCAL_REASON_SINK_KEYS = frozenset({
+    "blocked_reason_token",
+    "code",
+    "codes",
+    "delivery_reason",
+    "issue_code",
+    "issue_codes",
+    "reason_code",
+    "reason_codes",
+    "reason_token",
+    "terminal_reason",
+})
 
-def _string_constants(node):
+_LOCAL_REASON_KEYWORD_NAMES = frozenset({
+    "default_reason_token",
+    "default_token",
+    "failure_kind",
+    "reason_code",
+    "reason_token",
+    "terminal_reason",
+})
+
+
+def _string_constants(node, bindings=None):
+    bindings = bindings or {}
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         # Runtime extraction normalizes evidence tokens with ``casefold()``.
         # The source scan must do the same or uppercase issue constants such
@@ -77,26 +103,262 @@ def _string_constants(node):
         normalized = node.value.strip().casefold()
         if CODE_TOKEN.match(normalized):
             yield normalized
+    elif isinstance(node, ast.Name):
+        yield from bindings.get(node.id, ())
     elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         for element in node.elts:
-            yield from _string_constants(element)
+            yield from _string_constants(element, bindings)
     elif (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in {"frozenset", "list", "set", "tuple"}
     ):
         for argument in node.args:
-            yield from _string_constants(argument)
+            yield from _string_constants(argument, bindings)
     elif isinstance(node, ast.IfExp):
-        yield from _string_constants(node.body)
-        yield from _string_constants(node.orelse)
+        yield from _string_constants(node.body, bindings)
+        yield from _string_constants(node.orelse, bindings)
     elif isinstance(node, ast.BoolOp):
         for value in node.values:
-            yield from _string_constants(value)
+            yield from _string_constants(value, bindings)
 
 
 def _is_reason_key(name) -> bool:
     return isinstance(name, str) and name.casefold() in REASON_KEYS
+
+
+def _flow_reason_name_constants(tree: ast.AST) -> set[str]:
+    """Resolve local literal carriers at every supported reason-code sink."""
+
+    found: set[str] = set()
+
+    def scan_expression(node, state):
+        if node is None:
+            return
+        for child in ast.walk(node):
+            if isinstance(child, ast.Dict):
+                has_explicit_wrapper_code = any(
+                    isinstance(key, ast.Constant)
+                    and str(key.value or "").casefold()
+                    in {"code", "reason_code", "reason_token"}
+                    and bool(set(_string_constants(value, state)))
+                    for key, value in zip(child.keys, child.values)
+                )
+                for key, value in zip(child.keys, child.values):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and (
+                            str(key.value or "").casefold()
+                            in _LOCAL_REASON_SINK_KEYS
+                            or (
+                                str(key.value or "").casefold() == "reason"
+                                and has_explicit_wrapper_code
+                            )
+                        )
+                    ):
+                        found.update(_string_constants(value, state))
+            elif isinstance(child, ast.Call):
+                for keyword in child.keywords:
+                    if str(keyword.arg or "").casefold() in (
+                        _LOCAL_REASON_SINK_KEYS
+                        | _LOCAL_REASON_KEYWORD_NAMES
+                    ):
+                        found.update(
+                            _string_constants(keyword.value, state)
+                        )
+            elif isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and str(target.slice.value or "").casefold()
+                        in _LOCAL_REASON_SINK_KEYS
+                    ):
+                        found.update(
+                            _string_constants(child.value, state)
+                        )
+            elif (
+                isinstance(child, ast.AnnAssign)
+                and isinstance(child.target, ast.Subscript)
+                and isinstance(child.target.slice, ast.Constant)
+                and str(child.target.slice.value or "").casefold()
+                in _LOCAL_REASON_SINK_KEYS
+            ):
+                found.update(_string_constants(child.value, state))
+
+    def dedupe(states, limit=256):
+        unique = []
+        seen = set()
+        for state in states:
+            key = tuple(sorted(
+                (name, tuple(sorted(values)))
+                for name, values in state.items()
+                if values
+            ))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(state)
+        if len(unique) > limit:
+            # Losing a path can hide a newly emitted blocker and make the
+            # registry ratchet pass vacuously. Conservatively merge instead:
+            # this may over-report a literal, but it cannot under-report one.
+            merged = {}
+            for state in unique:
+                for name, values in state.items():
+                    merged.setdefault(name, set()).update(values)
+            return [merged]
+        return unique
+
+    def compared_name(test):
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and len(test.comparators) == 1
+            and isinstance(test.left, ast.Name)
+        ):
+            return None
+        comparator = test.comparators[0]
+        if (
+            isinstance(test.ops[0], (ast.Eq, ast.NotEq))
+            and isinstance(comparator, ast.Constant)
+            and isinstance(comparator.value, str)
+        ):
+            return (
+                test.left.id,
+                {comparator.value.strip().casefold()},
+                isinstance(test.ops[0], ast.Eq),
+            )
+        if isinstance(test.ops[0], (ast.In, ast.NotIn)) and isinstance(
+            comparator, (ast.List, ast.Tuple, ast.Set)
+        ):
+            constants = set(_string_constants(comparator))
+            if constants:
+                return (
+                    test.left.id,
+                    constants,
+                    isinstance(test.ops[0], ast.In),
+                )
+        return None
+
+    def refine(states, test, truth):
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return refine(states, test.operand, not truth)
+        comparison = compared_name(test)
+        if comparison is None:
+            return [dict(state) for state in states]
+        name, constants, positive = comparison
+        wants_match = truth is positive
+        refined = []
+        for state in states:
+            values = set(state.get(name, ()))
+            if not values:
+                refined.append(dict(state))
+                continue
+            remaining = (
+                constants & values
+                if wants_match
+                else values - constants
+            )
+            if remaining:
+                updated = dict(state)
+                updated[name] = remaining
+                refined.append(updated)
+        return refined
+
+    def assign_name(state, name, value):
+        updated = dict(state)
+        constants = set(_string_constants(value, state))
+        if constants:
+            updated[name] = constants
+        else:
+            updated.pop(name, None)
+        return updated
+
+    def run_block(statements, states):
+        states = dedupe(states)
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                run_block(statement.body, [{}])
+                continue
+            if isinstance(statement, ast.ClassDef):
+                run_block(statement.body, [{}])
+                continue
+            if isinstance(statement, ast.If):
+                scan_expression(statement.test, {})
+                true_states = run_block(
+                    statement.body,
+                    refine(states, statement.test, True),
+                )
+                false_states = run_block(
+                    statement.orelse,
+                    refine(states, statement.test, False),
+                )
+                states = dedupe([*true_states, *false_states])
+                continue
+            if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+                scan_expression(
+                    statement.test if isinstance(statement, ast.While)
+                    else statement.iter,
+                    {},
+                )
+                body_states = run_block(
+                    statement.body,
+                    [dict(state) for state in states],
+                )
+                states = run_block(
+                    statement.orelse,
+                    dedupe([*states, *body_states]),
+                )
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    scan_expression(item.context_expr, {})
+                states = run_block(statement.body, states)
+                continue
+            if isinstance(statement, ast.Try):
+                branches = [run_block(statement.body, states)]
+                branches.extend(
+                    run_block(handler.body, states)
+                    for handler in statement.handlers
+                )
+                states = run_block(
+                    statement.finalbody,
+                    run_block(
+                        statement.orelse,
+                        dedupe([
+                            state
+                            for branch in branches
+                            for state in branch
+                        ]),
+                    ),
+                )
+                continue
+
+            next_states = []
+            for state in states:
+                scan_expression(statement, state)
+                updated = dict(state)
+                if isinstance(statement, ast.Assign):
+                    for target in statement.targets:
+                        if isinstance(target, ast.Name):
+                            updated = assign_name(
+                                updated, target.id, statement.value
+                            )
+                elif (
+                    isinstance(statement, ast.AnnAssign)
+                    and isinstance(statement.target, ast.Name)
+                    and statement.value is not None
+                ):
+                    updated = assign_name(
+                        updated, statement.target.id, statement.value
+                    )
+                next_states.append(updated)
+            states = dedupe(next_states)
+        return states
+
+    run_block(getattr(tree, "body", ()), [{}])
+    return found
 
 
 def scan_module(path: Path) -> set[str]:
@@ -139,6 +401,7 @@ def scan_module(path: Path) -> set[str]:
                 and argument.arg.casefold() in _REASON_ARGUMENT_NAMES
             ):
                 found.update(_string_constants(default))
+    found.update(_flow_reason_name_constants(tree))
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values):
@@ -195,7 +458,7 @@ def scan_module(path: Path) -> set[str]:
 def production_sources(root: Path | None = None):
     root = Path(root or REPO_DIR)
     for path in sorted(root.rglob("*.py")) + sorted(root.rglob("*.pyw")):
-        if SKIP_PARTS & set(path.parts):
+        if SKIP_PARTS & set(path.relative_to(root).parts):
             continue
         if path.name.startswith("test_"):
             continue
@@ -214,20 +477,34 @@ def emitted_reason_codes(root: Path | None = None) -> dict[str, list[str]]:
     return {code: sorted(paths) for code, paths in sorted(result.items())}
 
 
-if __name__ == "__main__":  # pragma: no cover - operator convenience
-    import sys
+def main(root: Path | None = None) -> int:
+    """Print registry coverage and return a process exit status."""
+    root = Path(root or REPO_DIR)
+    source_count = sum(1 for _path in production_sources(root))
+
     from repair_reason_registry import REASON_REGISTRY, UNCLASSIFIED
 
-    emitted = emitted_reason_codes()
+    emitted = emitted_reason_codes(root)
     unregistered = sorted(set(emitted) - set(REASON_REGISTRY))
     unclassified = sorted(
         code for code, row in REASON_REGISTRY.items()
         if row.disposition == UNCLASSIFIED
     )
+    print(f"production sources scanned: {source_count}")
     print(f"emitted reason codes      : {len(emitted)}")
     print(f"registered                : {len(REASON_REGISTRY)}")
     print(f"unregistered (must be 0)  : {len(unregistered)}")
     print(f"still unclassified        : {len(unclassified)}")
+    if not source_count:
+        print("  ERROR no production sources were scanned")
     for code in unregistered:
         print(f"  UNREGISTERED {code:<52} {emitted[code][0]}")
-    sys.exit(1 if unregistered else 0)
+    if source_count and not emitted:
+        print("  ERROR production sources emitted no reason codes")
+    return 1 if not source_count or not emitted or unregistered else 0
+
+
+if __name__ == "__main__":  # pragma: no cover - operator convenience
+    import sys
+
+    sys.exit(main())

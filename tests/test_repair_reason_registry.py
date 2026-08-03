@@ -9,6 +9,8 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -31,7 +33,13 @@ from repair_reason_registry import (  # noqa: E402
     disposition_of,
     reason_row,
 )
-from repair_reason_scan import emitted_reason_codes, scan_module  # noqa: E402
+from repair_reason_scan import (  # noqa: E402
+    SKIP_PARTS,
+    emitted_reason_codes,
+    main as reason_scan_main,
+    production_sources,
+    scan_module,
+)
 
 
 OBSERVED_TOKEN_FIXTURE = (
@@ -53,7 +61,28 @@ OBSERVED_INTEGRITY_FIXTURE = (
 class ReasonRegistryCoverageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.production_sources = list(production_sources(REPO_DIR))
+        if not cls.production_sources:
+            raise AssertionError(
+                "repair reason coverage cannot run: production source scan "
+                "returned no files; check repository-relative skip filtering"
+            )
+        if len(cls.production_sources) < 100:
+            raise AssertionError(
+                "repair reason coverage scanned an implausibly small source "
+                f"set ({len(cls.production_sources)} < 100)"
+            )
         cls.emitted = emitted_reason_codes(REPO_DIR)
+        if not cls.emitted:
+            raise AssertionError(
+                "repair reason coverage cannot run: production source scan "
+                "emitted no reason codes"
+            )
+        if len(cls.emitted) < 300:
+            raise AssertionError(
+                "repair reason coverage emitted an implausibly small code "
+                f"set ({len(cls.emitted)} < 300)"
+            )
         queue_payload = json.loads(
             OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
         )
@@ -84,6 +113,20 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             "repair_reason_registry.REASON_REGISTRY. Add each one with a "
             "disposition -- 'unsupported' is a valid, honest answer:\n"
             + detail,
+        )
+
+    def test_registered_owner_is_one_of_each_codes_production_emitters(self):
+        mismatches = [
+            (code, REASON_REGISTRY[code].owner, tuple(emitters))
+            for code, emitters in self.emitted.items()
+            if code in REASON_REGISTRY
+            and REASON_REGISTRY[code].disposition in BLOCKING_DISPOSITIONS
+            and REASON_REGISTRY[code].owner not in emitters
+        ]
+        self.assertEqual(
+            mismatches,
+            [],
+            "registry owner must name a production module that emits the code",
         )
 
     def test_registered_dispositions_are_valid(self):
@@ -320,6 +363,47 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
 
 
 class ReasonScanTests(unittest.TestCase):
+    def test_skip_parts_are_scoped_to_descendants_of_the_scan_root(self):
+        source = '''
+def gate():
+    return {"reason": "ancestor_scoped_reason"}
+'''
+        ignored_source = '''
+def gate():
+    return {"reason": "repository_internal_ignored_reason"}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "work" / "checkout"
+            root.mkdir(parents=True)
+            included = root / "production_gate.py"
+            included.write_text(source, encoding="utf-8")
+            for skip_part in SKIP_PARTS:
+                ignored = root / skip_part / "ignored_gate.py"
+                ignored.parent.mkdir(parents=True)
+                ignored.write_text(ignored_source, encoding="utf-8")
+
+            sources = {
+                path.relative_to(root).as_posix()
+                for path in production_sources(root)
+            }
+            emitted = emitted_reason_codes(root)
+
+        self.assertEqual(sources, {"production_gate.py"})
+        self.assertIn("ancestor_scoped_reason", emitted)
+        self.assertNotIn("repository_internal_ignored_reason", emitted)
+
+    def test_command_fails_when_no_production_sources_are_scanned(self):
+        output = StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            with redirect_stdout(output):
+                exit_code = reason_scan_main(Path(temporary))
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn(
+            "ERROR no production sources were scanned",
+            output.getvalue(),
+        )
+
     def test_scan_finds_codes_through_every_supported_shape(self):
         module = REPO_DIR / "sk_batch" / "atlas_consumer_integrity.py"
         codes = emitted_reason_codes(REPO_DIR)
@@ -333,6 +417,24 @@ class ReasonScanTests(unittest.TestCase):
             "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
             codes["normalized_generator_delivery_incomplete"],
         )
+        self.assertIn(
+            "sk_batch/cluster_assembly_handoff_contract.py",
+            codes["generator_connection_contract_incomplete"],
+        )
+        self.assertNotIn(
+            "sk_batch/cluster_assembly_handoff_contract.py",
+            codes["generator_connection_incomplete"],
+        )
+        for role_reason in (
+            "actual_fbx_partial_pair",
+            "fbx_role_missing_from_pcg_receipt",
+            "pcg_receipt_blocked",
+            "pcg_receipt_fbx_decision_mismatch",
+        ):
+            self.assertIn(
+                "sk_batch/cluster_assembly_handoff_contract.py",
+                codes[role_reason],
+            )
         self.assertTrue(module.is_file())
 
     def test_scan_ignores_prose_and_paths(self):
@@ -376,6 +478,38 @@ def emit(flag, first):
             "automatic_repair_failed",
             "retry_evidence_ambiguous",
         }.issubset(codes))
+
+    def test_scan_follows_local_literal_names_into_reason_fields(self):
+        source = '''
+def gate(blocked):
+    evidence = "local_reason_one"
+    if blocked:
+        evidence = "local_reason_two"
+    alias = evidence
+    delivery = "local_delivery_reason"
+    terminal = "local_terminal_reason"
+    keyword = "local_keyword_reason"
+    payload = {
+        "code": "local_reason_wrapper",
+        "reason": alias,
+        "delivery_reason": delivery,
+    }
+    payload["terminal_reason"] = terminal
+    emit(reason_token=keyword)
+    return payload
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "synthetic_local_reason.py"
+            module.write_text(source, encoding="utf-8")
+            emitted = scan_module(module)
+
+        self.assertTrue({
+            "local_reason_one",
+            "local_reason_two",
+            "local_delivery_reason",
+            "local_terminal_reason",
+            "local_keyword_reason",
+        }.issubset(emitted))
 
     def test_new_helper_emission_is_unknown_to_registry_and_fails_closed(self):
         source = '''

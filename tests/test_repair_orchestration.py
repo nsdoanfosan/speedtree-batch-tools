@@ -196,6 +196,52 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("Generator", decision["reason"])
         self.assertIn("Cluster 갱신", decision["action"])
 
+    def test_role_handoff_wrapper_defers_to_generator_connection_repair(self):
+        evidence = {
+            "producer_spm": str(self.cluster),
+            "issues": [{
+                "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
+                "reason": "generator_connection_contract_incomplete",
+                "spm": str(self.cluster),
+            }],
+        }
+
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(
+            [stage["repair_action"] for stage in plan.stages],
+            [GENERATOR_SYNC_AND_CLUSTER],
+        )
+
+    def test_role_handoff_wrapper_defers_to_variant_refresh(self):
+        evidence = {
+            "issues": [{
+                "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
+                "reason": "normalized_variants_required",
+                "spm": str(self.cluster),
+            }],
+        }
+
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+
+    def test_role_handoff_wrapper_without_inner_reason_fails_closed(self):
+        evidence = {"reason_code": "cluster_role_handoff_blocked"}
+
+        decision = repair_ui_decision(evidence)
+        plan = self.plan(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.initial_status, STATUS_FINAL_FAILED)
+
     def test_sealed_stale_node_table_has_one_automatic_disposition(self):
         evidence = {
             "issue_codes": ["NORMALIZED_GENERATOR_NODE_TABLE_STALE"],

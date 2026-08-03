@@ -12465,6 +12465,18 @@ class App:
             or {}
         )
 
+        live_contract = copy.deepcopy(raw_audit.get("selected_contract"))
+        if not isinstance(live_contract, dict):
+            try:
+                from cluster_assembly_handoff_contract import (
+                    select_cluster_contract,
+                )
+                live_contract = select_cluster_contract(payload, spm)
+            except (ImportError, ValueError):
+                live_contract = None
+        if not isinstance(live_contract, dict):
+            live_contract = None
+
         live_issues = []
         for audit_item in payload.get("items") or []:
             handoff = (
@@ -12481,19 +12493,52 @@ class App:
 
         if actual_failure:
             decision = repair_ui_decision({"issues": live_issues})
-            status_prefix = (
-                "자동 복구 대상"
-                if decision["status"] == REPAIR_UI_AUTOMATIC
-                else "최종 차단"
-            )
+            provider = None
+            if (
+                live_contract is not None
+                and self._cluster_contract_identifies_requested_spm(
+                    live_contract,
+                    spm,
+                )
+            ):
+                sealed_provider = self._single_cluster_issue_provider(
+                    live_contract,
+                    live_issues,
+                )
+                if sealed_provider is not None and (
+                    decision["status"] == REPAIR_UI_AUTOMATIC
+                    or cluster_target_delivery_block(
+                        live_contract,
+                        spm,
+                        sealed_provider,
+                    ) is not None
+                ):
+                    provider = sealed_provider
+            if provider is not None:
+                raise self._registered_relation_exclusion(
+                    spm,
+                    provider,
+                    live_contract,
+                    live_issues,
+                    audit_report=audit_report,
+                    log_file=log_file,
+                    decision=decision,
+                )
             raise BatchItemError(
-                f"{status_prefix}: {spm.name} Cluster Assembly 데이터 검사 · "
-                f"원인: {decision['reason']} · 조치: {decision['action']}",
+                f"최종 차단: {spm.name} Cluster Assembly 데이터 검사 · "
+                f"원인: {decision['reason']} · "
+                f"조치: {decision['action']}",
                 kind="data_error",
                 report={
                     "stage": "cluster_assembly_live_audit",
                     "spm": str(spm),
-                    "repair_disposition": decision["status"],
+                    "repair_disposition": REPAIR_UI_BLOCKED,
+                    "registry_repair_disposition": decision["status"],
+                    "repair_scope": (
+                        "exact_provider_unsealed"
+                        if decision["status"] == REPAIR_UI_AUTOMATIC
+                        else "registry_terminal"
+                    ),
                     "reason_ko": decision["reason"],
                     "action_ko": decision["action"],
                     "issues": copy.deepcopy(live_issues),
@@ -12503,17 +12548,6 @@ class App:
                 report_file=audit_report,
             )
 
-        live_contract = copy.deepcopy(raw_audit.get("selected_contract"))
-        if not isinstance(live_contract, dict):
-            try:
-                from cluster_assembly_handoff_contract import (
-                    select_cluster_contract,
-                )
-                live_contract = select_cluster_contract(payload, spm)
-            except (ImportError, ValueError):
-                live_contract = None
-        if not isinstance(live_contract, dict):
-            live_contract = None
         if (
             live_contract is not None
             and not self._cluster_contract_identifies_requested_spm(
@@ -12618,6 +12652,173 @@ class App:
             ),
         }
 
+    @staticmethod
+    def _single_cluster_issue_provider(contract, issues):
+        """Seal every blocking issue to one exact contract dependency."""
+        dependencies = [
+            row
+            for row in (contract or {}).get("dependencies") or ()
+            if isinstance(row, dict)
+        ]
+        candidates = []
+        for dependency in dependencies:
+            aliases = []
+            for field in (
+                "spm",
+                "output_spm",
+                "authoring_spm",
+                "source_spm",
+            ):
+                value = dependency.get(field)
+                if isinstance(value, dict):
+                    value = value.get("path")
+                if not value:
+                    continue
+                path = Path(str(value)).expanduser()
+                if not path.is_absolute() or path.suffix.casefold() != ".spm":
+                    continue
+                aliases.append(path.resolve(strict=False))
+            if not aliases:
+                continue
+            candidates.append({
+                "provider": aliases[0],
+                "alias_keys": {
+                    normalized_folder_key(path) for path in aliases
+                },
+                "role": str(dependency.get("role") or "").casefold(),
+            })
+
+        selected = {}
+        for issue in issues or ():
+            if not isinstance(issue, dict):
+                return None
+            issue_path_keys = set()
+            for field in (
+                "spm",
+                "provider_spm",
+                "output_spm",
+                "authoring_spm",
+                "source_spm",
+            ):
+                value = issue.get(field)
+                if isinstance(value, dict):
+                    value = value.get("path")
+                if value:
+                    path = Path(str(value)).expanduser()
+                    if (
+                        not path.is_absolute()
+                        or path.suffix.casefold() != ".spm"
+                    ):
+                        return None
+                    issue_path_keys.add(normalized_folder_key(
+                        path.resolve(strict=False)
+                    ))
+            role = str(issue.get("role") or "").casefold()
+            if not issue_path_keys and not role:
+                return None
+            matches = [
+                row
+                for row in candidates
+                if (
+                    not issue_path_keys
+                    or issue_path_keys <= row["alias_keys"]
+                )
+                and (not role or row["role"] == role)
+            ]
+            unique = {
+                normalized_folder_key(row["provider"]): row["provider"]
+                for row in matches
+            }
+            if len(unique) != 1:
+                return None
+            selected.update(unique)
+        if len(selected) != 1:
+            return None
+        return next(iter(selected.values()))
+
+    def _registered_relation_exclusion(
+        self,
+        target,
+        producer,
+        contract,
+        issues,
+        *,
+        audit_report,
+        log_file,
+        decision=None,
+    ):
+        """Create the one typed control flow admitted by direct repair."""
+        target = Path(target).resolve(strict=False)
+        producer = Path(producer).resolve(strict=False)
+        issues = [
+            copy.deepcopy(row) for row in issues if isinstance(row, dict)
+        ]
+        decision = decision or repair_ui_decision({"issues": issues})
+        reason_codes = tuple(decision.get("reason_codes") or ())
+        reason_token = (
+            reason_codes[0]
+            if reason_codes
+            else "registered_reason_has_no_exact_action"
+        )
+        blocking_codes = sorted({
+            str(issue.get("code") or "")
+            for issue in issues
+            if issue.get("code")
+        })
+        evidence = {
+            "audit_report": str(audit_report),
+            "target_spm": str(target),
+            "producer_spm": str(producer),
+            "issue_codes": blocking_codes,
+            "issues": issues,
+            "push_readiness": "blocked_by_current_live_delivery",
+            "sync_outcome_authoritative": False,
+            "normalization_postcondition": "not_run",
+        }
+        target_block = cluster_target_delivery_block(
+            contract,
+            target,
+            producer,
+        )
+        if target_block:
+            # The target-local summary below deliberately strips raw
+            # Generator GUIDs. Keep the broader issue rows only for generic
+            # relation blockers that do not have this sealed delivery shape.
+            evidence.pop("issues", None)
+            reason_token = target_block["reason_token"]
+            evidence.update({
+                "target_spm": target_block["target_spm"],
+                "target_name": target_block["target_name"],
+                "delivery_mode": target_block["delivery_mode"],
+                "delivery_errors": target_block["delivery_errors"],
+                "delivery_remedy": target_block["delivery_remedy"],
+                "stale_node_table_target_mesh_ids": target_block[
+                    "stale_node_table_target_mesh_ids"
+                ],
+                "live_node_table": target_block["live_node_table"],
+                "stale_node_table_recovery": (
+                    cluster_stale_node_table_recovery_scope(
+                        contract,
+                        target,
+                        audit_report,
+                    )
+                ),
+            })
+        summary = target_planned_exclusion_summary(
+            target,
+            reason_token,
+            evidence,
+        )
+        return TargetPlannedExclusionError(
+            "현재 Generator/Cluster 전달이 차단됨: " + summary,
+            reason_token=reason_token,
+            target_spm=target,
+            producer_spm=producer,
+            evidence=evidence,
+            log_file=log_file,
+            report_file=audit_report,
+        )
+
     def _cluster_normalization_stage_observation(
         self,
         target_spm,
@@ -12709,81 +12910,47 @@ class App:
                 "spm": str(producer),
             })
         if blocking:
+            decision = repair_ui_decision({"issues": blocking})
             target_block = cluster_target_delivery_block(
                 contract,
                 target,
                 producer,
             )
-            blocking_codes = {
-                str(issue.get("code") or "")
-                for issue in blocking
-                if isinstance(issue, dict)
-            }
             if (
-                target_block
-                and not global_issues
-                and blocking_codes
-                <= {
-                    "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
-                    "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
-                }
+                not global_issues
+                and (
+                    decision["status"] == REPAIR_UI_AUTOMATIC
+                    or target_block is not None
+                )
             ):
-                reason_token = target_block["reason_token"]
-                evidence = {
-                    "audit_report": str(audit_report),
-                    "target_spm": target_block["target_spm"],
-                    "target_name": target_block["target_name"],
-                    "delivery_mode": target_block["delivery_mode"],
-                    "delivery_errors": target_block["delivery_errors"],
-                    "delivery_remedy": target_block["delivery_remedy"],
-                    "stale_node_table_target_mesh_ids": target_block[
-                        "stale_node_table_target_mesh_ids"
-                    ],
-                    "live_node_table": target_block["live_node_table"],
-                    "issue_codes": sorted(blocking_codes),
-                    "push_readiness": "blocked_by_current_live_delivery",
-                    "sync_outcome_authoritative": False,
-                    "normalization_postcondition": "not_run",
-                }
-                evidence["stale_node_table_recovery"] = (
-                    cluster_stale_node_table_recovery_scope(
-                        contract,
-                        target,
-                        audit_report,
-                    )
-                )
-                summary = target_planned_exclusion_summary(
+                raise self._registered_relation_exclusion(
                     target,
-                    reason_token,
-                    evidence,
-                )
-                raise TargetPlannedExclusionError(
-                    "현재 Generator 전달이 차단됨: " + summary,
-                    reason_token=reason_token,
-                    target_spm=target,
-                    producer_spm=producer,
-                    evidence=evidence,
+                    producer,
+                    contract,
+                    blocking,
+                    audit_report=audit_report,
                     log_file=log_file,
-                    report_file=audit_report,
+                    decision=decision,
                 )
             summary = cluster_issue_summary(blocking)
             stage = "출력" if require_normalized else "입력"
-            decision = repair_ui_decision({"issues": blocking})
-            status_prefix = (
-                "자동 복구 대상"
-                if decision["status"] == REPAIR_UI_AUTOMATIC
-                else "최종 차단"
-            )
             raise BatchItemError(
-                f"{status_prefix}: {target.name} Cluster 정규화 {stage} 검사 · "
-                f"원인: {decision['reason']} · 조치: {decision['action']}",
+                f"최종 차단: {target.name} Cluster 정규화 {stage} 검사 · "
+                f"원인: {decision['reason']} · "
+                f"조치: {decision['action']}",
                 kind="data_error",
                 report={
                     "stage": "cluster_normalization_validation",
                     "validation_side": stage,
                     "target_spm": str(target),
                     "producer_spm": str(producer),
-                    "repair_disposition": decision["status"],
+                    "repair_disposition": REPAIR_UI_BLOCKED,
+                    "registry_repair_disposition": decision["status"],
+                    "repair_scope": (
+                        "global_or_multi_provider"
+                        if decision["status"] == REPAIR_UI_AUTOMATIC
+                        else "registry_terminal"
+                    ),
                     "reason_ko": decision["reason"],
                     "action_ko": decision["action"],
                     "issues": copy.deepcopy(blocking),
@@ -13251,6 +13418,43 @@ class App:
                 )
             raise
 
+    def _cluster_receipt_with_registered_relation_recovery(
+        self,
+        target_spm,
+        stamp,
+    ):
+        """Repair one sealed strict-audit blocker, then audit strictly again."""
+        target = Path(target_spm).resolve(strict=False)
+        try:
+            return self._refresh_stale_cluster_receipt(target, stamp)
+        except TargetPlannedExclusionError as exclusion:
+            recovered = self._attempt_registered_relation_repair(
+                exclusion,
+                f"{stamp}_strict_relation_repair",
+                exclusion.producer_spm,
+                require_normalized=True,
+            )
+            if recovered is None:
+                raise
+            try:
+                return self._refresh_stale_cluster_receipt(
+                    target,
+                    f"{stamp}_strict_relation_reaudit",
+                )
+            except TargetPlannedExclusionError as fresh_exclusion:
+                fresh_attempt = {
+                    "status": "repaired_but_strict_reaudit_blocked",
+                    "reason_token": str(fresh_exclusion.reason_token),
+                    "target_spm": str(target),
+                    "producer_spm": str(fresh_exclusion.producer_spm),
+                }
+                fresh_exclusion.evidence["repair_attempt"] = fresh_attempt
+                if isinstance(fresh_exclusion.report, dict):
+                    fresh_exclusion.report.setdefault("evidence", {})[
+                        "repair_attempt"
+                    ] = copy.deepcopy(fresh_attempt)
+                raise
+
     def _attempt_stale_node_table_recovery(
         self,
         exclusion,
@@ -13668,7 +13872,10 @@ class App:
             nonlocal cluster_receipt_resolution, cluster_receipt_resolved
             if not cluster_receipt_resolved:
                 cluster_receipt_resolution = (
-                    self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
+                    self._cluster_receipt_with_registered_relation_recovery(
+                        speedtree_spm,
+                        stamp,
+                    )
                 )
                 cluster_receipt_resolved = True
             return cluster_receipt_resolution

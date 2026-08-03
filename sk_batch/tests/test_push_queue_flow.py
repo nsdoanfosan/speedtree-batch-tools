@@ -569,6 +569,424 @@ class PushQueueFlowTests(unittest.TestCase):
             "\n".join(str(call.args[0]) for call in app.log.call_args_list),
         )
 
+    def test_target_local_automatic_gate_dispatches_without_code_allowlist(self):
+        gui = load_gui_module()
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        provider = Path(
+            "Tree_elm/Cluster/SK_cluster_elm_01.spm"
+        ).resolve()
+        cases = (
+            ("NORMALIZED_VARIANTS_REQUIRED", True),
+            ("NORMALIZED_VARIANTS_STALE", True),
+            ("CANONICAL_BARK_NORMALIZATION_REQUIRED", False),
+        )
+
+        for issue_code, require_normalized in cases:
+            with self.subTest(issue_code=issue_code):
+                app = self.make_app(gui)
+                issue = {
+                    "code": issue_code,
+                    "role": "cluster",
+                    "spm": str(provider),
+                }
+                contract = {
+                    "tree_source_identities": [{"spm": str(target)}],
+                    "dependencies": [{
+                        "role": "cluster",
+                        "spm": str(provider),
+                    }],
+                    "handoff": {"errors": [issue]},
+                }
+                raw_audit = {
+                    "selected_contract": contract,
+                    "audit_report": "target_local_live_audit.json",
+                    "payload": {"items": [{}]},
+                }
+                fresh = {
+                    "status": "current",
+                    "target_spm": str(target),
+                    "selected_contract": {
+                        "handoff": {"status": "ready"},
+                    },
+                }
+                attempt = mock.Mock(return_value=fresh)
+                with mock.patch.object(
+                    app,
+                    "_refresh_stale_cluster_receipt_uncached",
+                    return_value=raw_audit,
+                ), mock.patch.object(
+                    app,
+                    "_attempt_registered_relation_repair",
+                    side_effect=attempt,
+                ):
+                    result = app._cluster_normalization_stage_with_recovery(
+                        target,
+                        "target_local",
+                        provider,
+                        require_normalized=require_normalized,
+                    )
+
+                self.assertEqual(result, fresh)
+                attempt.assert_called_once()
+                exclusion = attempt.call_args.args[0]
+                self.assertIsInstance(
+                    exclusion,
+                    gui.TargetPlannedExclusionError,
+                )
+                self.assertEqual(exclusion.producer_spm, provider)
+                self.assertIn(
+                    issue_code,
+                    exclusion.evidence["issue_codes"],
+                )
+
+    def test_global_automatic_gate_is_final_without_automatic_label(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        provider = Path(
+            "Tree_elm/Cluster/SK_cluster_elm_01.spm"
+        ).resolve()
+        issue = {
+            "code": "NORMALIZED_VARIANTS_REQUIRED",
+            "role": "cluster",
+        }
+        raw_audit = {
+            "selected_contract": {
+                "tree_source_identities": [{"spm": str(target)}],
+                "dependencies": [{
+                    "role": "cluster",
+                    "spm": str(provider),
+                }],
+                "handoff": {"errors": [issue]},
+            },
+            "audit_report": "global_live_audit.json",
+            "payload": {"items": [{}]},
+        }
+
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt_uncached",
+            return_value=raw_audit,
+        ), mock.patch.object(
+            app,
+            "_attempt_registered_relation_repair",
+        ) as attempt, self.assertRaises(gui.BatchItemError) as raised:
+            app._cluster_normalization_stage_with_recovery(
+                target,
+                "global",
+                provider,
+                require_normalized=True,
+            )
+
+        self.assertNotIsInstance(
+            raised.exception,
+            gui.TargetPlannedExclusionError,
+        )
+        self.assertEqual(raised.exception.kind, "data_error")
+        self.assertEqual(
+            raised.exception.report["repair_disposition"],
+            gui.REPAIR_UI_BLOCKED,
+        )
+        self.assertEqual(
+            raised.exception.report["registry_repair_disposition"],
+            gui.REPAIR_UI_AUTOMATIC,
+        )
+        self.assertNotIn("자동 복구 대상", str(raised.exception))
+        attempt.assert_not_called()
+
+    def test_provider_seal_rejects_conflicting_role_and_path_aliases(self):
+        gui = load_gui_module()
+        provider_a = Path("cluster/SK_cluster_a.spm").resolve()
+        provider_b = Path("cluster/SK_cluster_b.spm").resolve()
+        contract = {
+            "dependencies": [
+                {"role": "branch", "spm": str(provider_a)},
+                {"role": "leaf", "spm": str(provider_b)},
+            ],
+        }
+
+        self.assertIsNone(gui.App._single_cluster_issue_provider(
+            contract,
+            [{
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "role": "leaf",
+                "spm": str(provider_a),
+            }],
+        ))
+        self.assertIsNone(gui.App._single_cluster_issue_provider(
+            contract,
+            [{
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "role": "branch",
+                "spm": str(provider_a),
+                "output_spm": str(provider_b),
+            }],
+        ))
+
+    def test_strict_stale_node_block_builds_scope_before_disposition(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("black_locast/SK_tree_black_locast_02.spm").resolve()
+        provider = Path(
+            "black_locast/cluster/SK_cluster_black_locast_01.spm"
+        ).resolve()
+        contract = self.recoverable_multi_role_contract(
+            target,
+            (("cluster", provider, [89, 90], [89]),),
+        )
+        normalized = contract["dependencies"][0]["normalized_variants"]
+        blocked_row = copy.deepcopy(normalized["target_deliveries"][0])
+        normalized["delivery_blocked_targets"] = [blocked_row]
+        issue = {
+            "code": "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
+            "role": "cluster",
+            "spm": str(provider),
+        }
+        contract["handoff"]["errors"] = [issue]
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": "strict_stale_node_live_audit.json",
+            "payload": {"items": [{
+                "cluster_assembly": {
+                    "handoff": {"errors": [issue]},
+                },
+            }]},
+        }
+
+        with self.assertRaises(
+            gui.TargetPlannedExclusionError
+        ) as raised:
+            app._evaluate_cluster_receipt_live_audit(target, raw_audit)
+
+        exclusion = raised.exception
+        self.assertEqual(
+            exclusion.reason_token,
+            "live_export_evidence_unavailable_stale_node_table",
+        )
+        self.assertEqual(exclusion.producer_spm, provider)
+        self.assertTrue(
+            exclusion.evidence["stale_node_table_recovery"]["available"]
+        )
+
+    def test_strict_live_audit_repairs_one_sealed_provider_then_reaudits(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        provider = Path(
+            "Tree_elm/Cluster/SK_cluster_elm_01.spm"
+        ).resolve()
+        issue = {
+            "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
+            "role": "cluster",
+            "reason": "normalized_variants_required",
+        }
+        contract = {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(target)},
+            }],
+            "dependencies": [{
+                "role": "cluster",
+                "spm": str(provider),
+            }],
+            "handoff": {"errors": [issue]},
+        }
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": "strict_live_audit.json",
+            "payload": {"items": [{
+                "cluster_assembly": {
+                    "handoff": {"errors": [issue]},
+                },
+            }]},
+        }
+        with self.assertRaises(
+            gui.TargetPlannedExclusionError
+        ) as blocked:
+            app._evaluate_cluster_receipt_live_audit(target, raw_audit)
+
+        exclusion = blocked.exception
+        self.assertEqual(exclusion.target_spm, target)
+        self.assertEqual(exclusion.producer_spm, provider)
+        strict_fresh = {
+            "policy": "live_audit_authoritative",
+            "selected_contract": {"handoff": {"status": "ready"}},
+        }
+        relation_fresh = {"status": "normalized"}
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt",
+            side_effect=[exclusion, strict_fresh],
+        ) as refresh, mock.patch.object(
+            app,
+            "_attempt_registered_relation_repair",
+            return_value=relation_fresh,
+        ) as attempt:
+            result = app._cluster_receipt_with_registered_relation_recovery(
+                target,
+                "strict",
+            )
+
+        self.assertEqual(result, strict_fresh)
+        attempt.assert_called_once_with(
+            exclusion,
+            "strict_strict_relation_repair",
+            provider,
+            require_normalized=True,
+        )
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(
+            refresh.call_args_list[1].args,
+            (target, "strict_strict_relation_reaudit"),
+        )
+
+    def test_strict_live_audit_multi_provider_automatic_is_final(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        providers = [
+            Path(f"Tree_elm/Cluster/SK_cluster_elm_0{i}.spm").resolve()
+            for i in (1, 2)
+        ]
+        issues = [
+            {
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "role": f"cluster_{index}",
+                "spm": str(provider),
+            }
+            for index, provider in enumerate(providers, 1)
+        ]
+        contract = {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(target)},
+            }],
+            "dependencies": [
+                {
+                    "role": f"cluster_{index}",
+                    "spm": str(provider),
+                }
+                for index, provider in enumerate(providers, 1)
+            ],
+            "handoff": {"errors": issues},
+        }
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": "strict_multi_live_audit.json",
+            "payload": {"items": [{
+                "cluster_assembly": {
+                    "handoff": {"errors": issues},
+                },
+            }]},
+        }
+
+        with self.assertRaises(gui.BatchItemError) as raised:
+            app._evaluate_cluster_receipt_live_audit(target, raw_audit)
+
+        self.assertNotIsInstance(
+            raised.exception,
+            gui.TargetPlannedExclusionError,
+        )
+        self.assertEqual(
+            raised.exception.report["repair_disposition"],
+            gui.REPAIR_UI_BLOCKED,
+        )
+        self.assertEqual(
+            raised.exception.report["registry_repair_disposition"],
+            gui.REPAIR_UI_AUTOMATIC,
+        )
+        self.assertNotIn("자동 복구 대상", str(raised.exception))
+
+    def test_strict_live_audit_wrong_owner_identity_never_repairs(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        wrong_target = Path("Tree_elm/SK_Tree_elm_02.spm").resolve()
+        provider = Path(
+            "Tree_elm/Cluster/SK_cluster_elm_01.spm"
+        ).resolve()
+        issue = {
+            "code": "NORMALIZED_VARIANTS_REQUIRED",
+            "role": "cluster",
+            "spm": str(provider),
+        }
+        contract = {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(wrong_target)},
+            }],
+            "dependencies": [{
+                "role": "cluster",
+                "spm": str(provider),
+            }],
+            "handoff": {"errors": [issue]},
+        }
+        raw_audit = {
+            "selected_contract": contract,
+            "audit_report": "strict_wrong_owner_live_audit.json",
+            "payload": {"items": [{
+                "cluster_assembly": {
+                    "handoff": {"errors": [issue]},
+                },
+            }]},
+        }
+
+        with self.assertRaises(gui.BatchItemError) as raised:
+            app._evaluate_cluster_receipt_live_audit(target, raw_audit)
+
+        self.assertNotIsInstance(
+            raised.exception,
+            gui.TargetPlannedExclusionError,
+        )
+        self.assertEqual(
+            raised.exception.report["repair_disposition"],
+            gui.REPAIR_UI_BLOCKED,
+        )
+        self.assertEqual(
+            raised.exception.report["registry_repair_disposition"],
+            gui.REPAIR_UI_AUTOMATIC,
+        )
+
+    def test_strict_reaudit_block_stays_typed_with_attempt_evidence(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").resolve()
+        provider = Path(
+            "Tree_elm/Cluster/SK_cluster_elm_01.spm"
+        ).resolve()
+        first = gui.TargetPlannedExclusionError(
+            "first strict block",
+            reason_token="normalized_variants_required",
+            target_spm=target,
+            producer_spm=provider,
+            evidence={"issue_codes": ["NORMALIZED_VARIANTS_REQUIRED"]},
+        )
+        fresh = gui.TargetPlannedExclusionError(
+            "fresh strict block",
+            reason_token="normalized_variants_required",
+            target_spm=target,
+            producer_spm=provider,
+            evidence={"issue_codes": ["NORMALIZED_VARIANTS_REQUIRED"]},
+        )
+        with mock.patch.object(
+            app,
+            "_refresh_stale_cluster_receipt",
+            side_effect=[first, fresh],
+        ), mock.patch.object(
+            app,
+            "_attempt_registered_relation_repair",
+            return_value={"status": "normalized"},
+        ), self.assertRaises(
+            gui.TargetPlannedExclusionError
+        ) as raised:
+            app._cluster_receipt_with_registered_relation_recovery(
+                target,
+                "strict_repeat",
+            )
+
+        self.assertIs(raised.exception, fresh)
+        self.assertEqual(
+            fresh.evidence["repair_attempt"]["status"],
+            "repaired_but_strict_reaudit_blocked",
+        )
+
     def test_registered_relation_repair_reaches_runnable_once_without_fanout(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2577,7 +2995,8 @@ class PushQueueFlowTests(unittest.TestCase):
             for node in ast.walk(job)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_refresh_stale_cluster_receipt"
+            and node.func.attr
+            == "_cluster_receipt_with_registered_relation_recovery"
         ]
         mesh_calls = [
             node

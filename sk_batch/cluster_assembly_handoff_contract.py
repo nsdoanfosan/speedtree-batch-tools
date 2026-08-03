@@ -945,21 +945,30 @@ def _dependency_artifact_validation(contract, spm_path):
     return validations
 
 
+def _blocked_role_reconciliation(reason):
+    """Expose role blockers as literal issue emissions to the registry scan."""
+    return "blocked", reason
+
+
 def _reconcile_role(receipt_row, actual):
     receipt_decision = str((receipt_row or {}).get("decision") or "")
     actual_decision = actual["decision"]
     if actual_decision == "blocked":
-        return "blocked", "actual_fbx_partial_pair"
+        return _blocked_role_reconciliation("actual_fbx_partial_pair")
     if receipt_row is None:
         if actual_decision == "pass_through":
             return "pass_through", "receipt_and_fbx_absent"
-        return "blocked", "fbx_role_missing_from_pcg_receipt"
+        return _blocked_role_reconciliation(
+            "fbx_role_missing_from_pcg_receipt"
+        )
     if receipt_decision == "blocked":
-        return "blocked", "pcg_receipt_blocked"
+        return _blocked_role_reconciliation("pcg_receipt_blocked")
     if receipt_decision in {"pending_export", ""}:
         return actual_decision, "pending_receipt_resolved_by_actual_fbx"
     if receipt_decision != actual_decision:
-        return "blocked", "pcg_receipt_fbx_decision_mismatch"
+        return _blocked_role_reconciliation(
+            "pcg_receipt_fbx_decision_mismatch"
+        )
     return actual_decision, "pcg_receipt_and_actual_fbx_agree"
 
 
@@ -1110,9 +1119,14 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             evidence = "asset_registration_only"
         elif delivery_mode == "connection_incomplete":
             row["decision"] = "blocked"
-            row["reconciliation"] = "generator_connection_incomplete"
+            # The Atlas resolver also emits ``generator_connection_incomplete``
+            # as a rejected-candidate diagnostic. A role handoff is a target
+            # blocker and must use the canonical repairable contract token.
+            row["reconciliation"] = (
+                "generator_connection_contract_incomplete"
+            )
             decision = "blocked"
-            evidence = "generator_connection_incomplete"
+            evidence = "generator_connection_contract_incomplete"
         elif decision == "normalize_part" and not _normalized_variants_ready(
             row.get("normalized_variants"),
             spm_path=spm_path,

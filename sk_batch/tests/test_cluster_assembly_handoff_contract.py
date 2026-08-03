@@ -850,7 +850,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(branch["decision"], "blocked")
             self.assertEqual(
                 branch["reconciliation"],
-                "generator_connection_incomplete",
+                "generator_connection_contract_incomplete",
             )
 
     def test_bark_block_identifies_exact_provider_and_material(self):

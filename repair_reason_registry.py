@@ -237,6 +237,11 @@ POLICY_CONTRACTS = {
         "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다.",
         "handoff 영수증의 상세 원인을 확인하고 누락된 Cluster 입력 또는 bark 정규화를 완료한 뒤 재검사하세요.",
     ),
+    "cluster_handoff_wrapper": _terminal(
+        "Cluster role handoff가 차단되었지만 하위 원인을 확인하지 못했습니다.",
+        "handoff issue의 reason 코드를 fresh audit으로 다시 생성한 뒤 해당 exact 원인만 복구하세요.",
+        fallback_only=True,
+    ),
     "preflight_error": _terminal(
         "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다.",
         "사전 검사 보고서의 원본 오류를 확인한 뒤 검사를 다시 실행하세요.",
@@ -423,6 +428,10 @@ for _policy_name in (
 
 
 _REASON_SEEDS: dict[str, ReasonRow] = {
+    "actual_fbx_partial_pair": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
+    ),
     "access_violation_exhausted": ReasonRow(
         UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_crash",
     ),
@@ -654,7 +663,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "cluster_role_handoff_blocked": ReasonRow(
         UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
-        "cluster_handoff",
+        "cluster_handoff_wrapper",
     ),
     "cluster_tga_basename_invalid": ReasonRow(
         UNSUPPORTED,
@@ -958,6 +967,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff",
     ),
+    "pcg_receipt_blocked": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
+    ),
+    "pcg_receipt_fbx_decision_mismatch": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
+    ),
     "pipeline_retry_result_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
     ),
@@ -996,9 +1013,21 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
         "receipt_status",
     ),
+    "receipt_not_applicable": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
+    ),
+    "receipt_persisted": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
+    ),
     "receipt_persistence_failed": ReasonRow(
         UNSUPPORTED, "pcg_st9_texture_batch/pcg_texture_audit.py",
         "receipt_persistence",
+    ),
+    "receipt_unchanged": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
     ),
     "registered_reason_has_no_exact_action": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_plan",
@@ -1267,6 +1296,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "exported_pending_unreal": ReasonRow(
         INFORMATIONAL, "sk_batch/jobs/send2ue_push_job.py", "durable_status",
+    ),
+    "fbx_role_missing_from_pcg_receipt": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
     ),
     "foreign_or_manual_userdata": ReasonRow(
         INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",

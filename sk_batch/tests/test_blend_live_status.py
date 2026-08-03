@@ -3659,14 +3659,20 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
                 self.assertTrue(waiter_started.wait(5))
                 release.set()
-                with self.assertRaises(gui.BatchItemError) as first_raised:
+                with self.assertRaises(
+                    gui.TargetPlannedExclusionError
+                ) as first_raised:
                     first_future.result(timeout=5)
-                with self.assertRaises(gui.BatchItemError) as second_raised:
+                with self.assertRaises(
+                    gui.TargetPlannedExclusionError
+                ) as second_raised:
                     second_future.result(timeout=5)
 
         self.assertEqual(app._run_limited.call_count, 1)
-        self.assertEqual(first_raised.exception.kind, "data_error")
-        self.assertEqual(second_raised.exception.kind, "data_error")
+        self.assertEqual(first_raised.exception.kind, "planned_excluded")
+        self.assertEqual(second_raised.exception.kind, "planned_excluded")
+        self.assertEqual(first_raised.exception.producer_spm, producer)
+        self.assertEqual(second_raised.exception.producer_spm, producer)
         self.assertIn("필수 정규화 Cluster variant", str(first_raised.exception))
         self.assertIn("필수 정규화 Cluster variant", str(second_raised.exception))
 
