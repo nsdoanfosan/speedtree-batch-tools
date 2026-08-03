@@ -17,6 +17,8 @@ if str(REPO_DIR) not in sys.path:
 
 import repair_orchestration as orchestration  # noqa: E402
 from repair_reason_registry import (  # noqa: E402
+    BLOCKING_DISPOSITIONS,
+    FATAL,
     DISPOSITIONS,
     INFORMATIONAL,
     REASON_REGISTRY,
@@ -27,6 +29,7 @@ from repair_reason_registry import (  # noqa: E402
     UNEMITTED_PLANNER_CODES,
     codes_with,
     disposition_of,
+    reason_row,
 )
 from repair_reason_scan import emitted_reason_codes, scan_module  # noqa: E402
 
@@ -112,14 +115,10 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         )
 
     def test_unclassified_debt_never_grows(self):
-        """The ceiling is a ratchet, not a budget."""
+        """The domain disposition work is complete, not merely ratcheted."""
         unclassified = codes_with(UNCLASSIFIED)
-        self.assertLessEqual(
-            len(unclassified),
-            UNCLASSIFIED_CEILING,
-            "more unclassified reason codes than the recorded ceiling. "
-            "Classify the new code instead of raising UNCLASSIFIED_CEILING.",
-        )
+        self.assertEqual(UNCLASSIFIED_CEILING, 0)
+        self.assertEqual(unclassified, ())
 
     def test_planner_vocabulary_is_registered_or_declared_unemitted(self):
         """Every code the planner claims must be real or admitted as not real."""
@@ -143,13 +142,72 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             "these codes now have a real emitter; remove them from "
             "UNEMITTED_PLANNER_CODES and register them instead",
         )
+        self.assertEqual(UNEMITTED_PLANNER_CODES, frozenset())
 
     def test_disposition_of_is_fail_closed_for_unknown_codes(self):
-        self.assertEqual(disposition_of("no_such_reason_code"), UNCLASSIFIED)
+        self.assertEqual(disposition_of("no_such_reason_code"), UNSUPPORTED)
+        unknown = reason_row("no_such_reason_code")
+        self.assertEqual(unknown.owner, "unregistered_runtime_reason")
+        self.assertTrue(unknown.friendly_cause)
+        self.assertTrue(unknown.operator_action)
+        self.assertTrue(orchestration.has_repair_contract_evidence({
+            "reason_token": "no_such_reason_code",
+        }))
         self.assertEqual(
             disposition_of("generator_connection_contract_incomplete"),
             REPAIRABLE,
         )
+
+    def test_every_blocking_row_has_one_complete_domain_contract(self):
+        invalid = []
+        for code, row in REASON_REGISTRY.items():
+            if row.disposition == INFORMATIONAL:
+                continue
+            if row.disposition not in BLOCKING_DISPOSITIONS:
+                invalid.append((code, "disposition"))
+            if not row.owner or not row.policy:
+                invalid.append((code, "owner/policy"))
+            if not row.friendly_cause or not row.operator_action:
+                invalid.append((code, "operator presentation"))
+            if row.disposition == REPAIRABLE:
+                if not row.repair_action or not row.evidence_requirements:
+                    invalid.append((code, "repair action/evidence"))
+            elif row.repair_action or row.evidence_requirements:
+                invalid.append((code, "terminal row advertises repair"))
+            if row.phase_routed and not (
+                row.disposition == UNSUPPORTED and row.fallback_only
+            ):
+                invalid.append((code, "phase route is not fallback terminal"))
+        self.assertEqual(invalid, [])
+
+    def test_representative_domain_dispositions_are_explicit(self):
+        repairable = reason_row("output_set_incomplete")
+        unsupported = reason_row("managed_mesh_owner_ambiguous")
+        fatal = reason_row("duplicate_material_id")
+
+        self.assertEqual(repairable.disposition, REPAIRABLE)
+        self.assertEqual(repairable.repair_action, "step3-standard")
+        self.assertIn("exact_inventory_spm", repairable.evidence_requirements)
+        self.assertEqual(unsupported.disposition, UNSUPPORTED)
+        self.assertEqual(unsupported.owner, "sk_batch/atlas_consumer_integrity.py")
+        self.assertTrue(unsupported.operator_action)
+        self.assertEqual(fatal.disposition, FATAL)
+        self.assertEqual(fatal.owner, "sk_batch/atlas_consumer_integrity.py")
+        self.assertTrue(fatal.operator_action)
+
+    def test_historical_planner_only_aliases_are_not_contract_rows(self):
+        aliases = {
+            "cluster_stale",
+            "managed_texture_set_stale",
+            "generator_slot_pair_drift",
+            "canonical_texture_output_unmapped",
+            "atlas_strict_material_binding_conflict",
+            "blender_cluster_bake_map_role_mismatch",
+        }
+        self.assertEqual(aliases & set(REASON_REGISTRY), set())
+        self.assertTrue(all(
+            reason_row(code).disposition == UNSUPPORTED for code in aliases
+        ))
 
     def test_informational_codes_cannot_enter_repair_admission(self):
         """A quiet fact/wrapper can never become a target verdict by itself."""
@@ -318,6 +376,54 @@ def emit(flag, first):
             "automatic_repair_failed",
             "retry_evidence_ambiguous",
         }.issubset(codes))
+
+    def test_new_helper_emission_is_unknown_to_registry_and_fails_closed(self):
+        source = '''
+def add_blocking_issue(code, details):
+    return {"code": code, "details": details}
+
+def gate():
+    return add_blocking_issue("brand_new_blocking_code", {})
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "synthetic_gate.py"
+            module.write_text(source, encoding="utf-8")
+            emitted = scan_module(module)
+
+        self.assertIn("brand_new_blocking_code", emitted)
+        self.assertNotIn("brand_new_blocking_code", REASON_REGISTRY)
+        self.assertEqual(
+            reason_row("brand_new_blocking_code").disposition,
+            UNSUPPORTED,
+        )
+
+    def test_scan_finds_reason_defaults_and_keyword_overrides(self):
+        source = '''
+def target_failure(iid, default_token="item_failed"):
+    return {"reason_token": default_token}
+
+def route(aborted):
+    return target_failure(
+        "target",
+        default_token=(
+            "pipeline_aborted" if aborted else "dependency_root_reason_missing"
+        ),
+    )
+
+def terminal(*, default_reason_token="owner_lost"):
+    return {"terminal_reason": default_reason_token}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "synthetic_default_gate.py"
+            module.write_text(source, encoding="utf-8")
+            emitted = scan_module(module)
+
+        self.assertTrue({
+            "item_failed",
+            "pipeline_aborted",
+            "dependency_root_reason_missing",
+            "owner_lost",
+        }.issubset(emitted))
 
 
 if __name__ == "__main__":
