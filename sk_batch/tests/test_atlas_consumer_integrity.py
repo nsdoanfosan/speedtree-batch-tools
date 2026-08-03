@@ -1148,6 +1148,25 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 if row["mesh_id"] == 2
             )
             self.assertTrue(hidden_mesh["generator_references"][0]["hidden"])
+            self.assertEqual(
+                integrity["suppressed_generator_pairs"],
+                [{
+                    "code": "generator_cross_group_pair",
+                    "reason": "SPM Material does not own the referenced Mesh; Selected manifests assign Material and Mesh to different groups",
+                    "suppression_reason": "hidden_generator_not_exported",
+                    "generator_index": 1,
+                    "generator_guid": "leaf-guid-1",
+                    "generator_name": "Leaf 1",
+                    "slot_prefix": "Leaves:Type:1",
+                    "material_id": 10,
+                    "mesh_id": 2,
+                    "hidden": True,
+                }],
+            )
+            self.assertEqual(
+                integrity["repair_input"]["suppressed_generator_pairs"],
+                integrity["suppressed_generator_pairs"],
+            )
 
     def test_managed_generator_reference_without_guid_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

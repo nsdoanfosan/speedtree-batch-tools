@@ -766,6 +766,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
 
     generator_material_references = defaultdict(list)
     generator_mesh_references = defaultdict(list)
+    suppressed_generator_pairs = []
     for slot in reachability["slots"]:
         material_id = slot.get("material_id")
         mesh_id = slot.get("mesh_id")
@@ -832,11 +833,25 @@ def audit_atlas_consumer_integrity(target_spm, root):
             pair_reasons.append(
                 "Selected manifests assign Material and Mesh to different groups"
             )
-        if pair_reasons and not slot["hidden"]:
-            add_generator_issue(
-                "generator_cross_group_pair",
-                "; ".join(pair_reasons),
-            )
+        if pair_reasons:
+            if slot["hidden"]:
+                suppressed_generator_pairs.append({
+                    "code": "generator_cross_group_pair",
+                    "reason": "; ".join(pair_reasons),
+                    "suppression_reason": "hidden_generator_not_exported",
+                    "generator_index": slot["generator_index"],
+                    "generator_guid": slot["generator_guid"],
+                    "generator_name": slot["generator_name"],
+                    "slot_prefix": slot["slot_prefix"],
+                    "material_id": material_id,
+                    "mesh_id": mesh_id,
+                    "hidden": True,
+                })
+            else:
+                add_generator_issue(
+                    "generator_cross_group_pair",
+                    "; ".join(pair_reasons),
+                )
 
     managed_candidate_count = sum(row["managed"] for row in material_nodes) + sum(
         row["managed"] for rows in mesh_rows_by_id.values() for row in rows
@@ -1087,6 +1102,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
             for row in blocking_assets
         ],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "review_policy": (
             "No mutation is authorized by this evidence. Only an explicit "
             "retired scope with a same-producer successor is marked eligible; "
@@ -1149,5 +1165,6 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "generations": generations,
         "generator_slots": reachability["slots"],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "repair_input": repair_input,
     }
