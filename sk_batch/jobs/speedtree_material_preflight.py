@@ -947,6 +947,73 @@ def _issue(code, scope, entity, message, severity="error", details=None):
     return row
 
 
+def _atlas_integrity_failure_message(integrity):
+    """Return one Korean cause/action with the exact offending identities."""
+    integrity = integrity or {}
+    issues = list(integrity.get("integrity_issues") or ())
+    codes = {str(row.get("code") or "") for row in issues}
+    if "atlas_manifest_authority_missing" in codes:
+        return (
+            "현재 대상의 Atlas producer 영수증이 없습니다.",
+            "BAT가 exact Cluster 갱신으로 producer 영수증을 다시 만든 뒤 fresh audit을 실행합니다.",
+        )
+    if "atlas_manifest_resolution_conflict" in codes:
+        return (
+            "현재 Atlas producer 영수증들이 서로 충돌합니다.",
+            "BAT가 exact Cluster 갱신으로 current 영수증을 다시 게시한 뒤 fresh audit을 실행합니다.",
+        )
+    visible_pairs = [
+        row for row in issues
+        if row.get("code") == "generator_cross_group_pair"
+        and row.get("hidden") is not True
+    ]
+    if visible_pairs:
+        pairs = ", ".join(
+            f"{row.get('generator_name') or '이름 없음'}"
+            f"(Material {row.get('material_id')}, Mesh {row.get('mesh_id')})"
+            for row in visible_pairs[:8]
+        )
+        return (
+            "표시되는 Generator의 Material/Mesh 소유 관계가 일치하지 않습니다: "
+            + pairs,
+            "표시된 Generator, Material ID, Mesh ID의 visible 연결을 수정한 뒤 다시 검사하세요.",
+        )
+
+    lineage_mesh_ids = [
+        row.get("mesh_id")
+        for row in integrity.get("managed_meshes") or ()
+        if row.get("orphan_reason") == "lineage_unproven"
+    ]
+    lineage_material_ids = [
+        row.get("material_id")
+        for row in integrity.get("managed_materials") or ()
+        if row.get("orphan_reason") == "lineage_unproven"
+    ]
+    if lineage_mesh_ids or lineage_material_ids:
+        identities = []
+        if lineage_material_ids:
+            identities.append(
+                "Material ID " + ", ".join(
+                    str(value) for value in lineage_material_ids[:8]
+                )
+            )
+        if lineage_mesh_ids:
+            identities.append(
+                "Mesh ID " + ", ".join(
+                    str(value) for value in lineage_mesh_ids[:12]
+                )
+            )
+        return (
+            "current Atlas producer 계보가 증명되지 않은 asset이 남았습니다: "
+            + " · ".join(identities),
+            "BAT가 exact Cluster 갱신을 먼저 실행합니다. fresh audit 뒤에도 남으면 표시된 ID의 Atlas 원본 연결을 수정하세요.",
+        )
+    return (
+        "Atlas 관리 asset의 current 소유 증거가 불완전합니다.",
+        "상세 integrity issue와 Material/Mesh ID를 확인한 뒤 다시 검사하세요.",
+    )
+
+
 def preflight_contract_issues(report):
     """Map legacy workflow statuses to stable, additive issue codes."""
     issues = []
@@ -1021,14 +1088,20 @@ def preflight_contract_issues(report):
         )
     atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
     if atlas_integrity.get("blocking"):
+        integrity_message, integrity_action = (
+            _atlas_integrity_failure_message(atlas_integrity)
+        )
         issues.append(
             _issue(
                 "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
                 "atlas_builder",
                 report.get("spm"),
-                atlas_integrity.get("receipt_resolution_error")
-                or "Atlas builder-managed superseded or ambiguous assets remain in the SPM",
+                integrity_message,
                 details={
+                    "operator_action_ko": integrity_action,
+                    "receipt_resolution_error": atlas_integrity.get(
+                        "receipt_resolution_error"
+                    ) or "",
                     "classification_counts": atlas_integrity.get(
                         "classification_counts"
                     )
@@ -1330,23 +1403,15 @@ def main():
                 status="blocked",
             )
         elif atlas_integrity.get("blocking"):
-            stale_count = int(
-                atlas_integrity.get("managed_orphan_mesh_count") or 0
+            integrity_message, integrity_action = (
+                _atlas_integrity_failure_message(atlas_integrity)
             )
             report["status"] = "blocked"
             report["classification"] = (
                 "atlas_managed_asset_integrity_stale"
             )
-            report["error"] = (
-                "Atlas consumer integrity audit found "
-                f"{stale_count} builder-managed Mesh asset(s) that are "
-                "superseded or ambiguous despite having no missing file."
-            )
-            report["remediation"] = (
-                "Review the content-addressed Atlas repair input, then run "
-                "the separately approved recovery workflow. This preflight "
-                "does not delete or repair SPM assets."
-            )
+            report["error"] = integrity_message
+            report["remediation"] = integrity_action
             report["atlas_consumer_repair_input"] = (
                 atlas_integrity.get("repair_input") or {}
             )

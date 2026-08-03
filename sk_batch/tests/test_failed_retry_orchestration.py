@@ -76,7 +76,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             "parent_retry_id": "parent-118",
             "exact_spm": str(path),
             "evidence_sha256": "a" * 64,
-            "reason_codes": ["managed_texture_set_incomplete"],
+            "reason_codes": ["texture_set_incomplete"],
             "stages": [{
                 "stage": "pcg_texture",
                 "tool": "pcg_st9_texture_batch",
@@ -526,7 +526,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                     "push_status_kind": "legacy raw state is #107-owned",
                     "push_status_error": {
                         "kind": "data_error",
-                        "reason_code": "managed_texture_set_incomplete",
+                        "reason_code": "texture_set_incomplete",
                         "time": "2026-07-01T00:00:00",
                     },
                 }
@@ -549,7 +549,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         app = self.app(gui)
         iid = str(self.first)
         app._failed_retry_durable_evidence = mock.Mock(return_value={
-            "reason_code": "managed_texture_set_incomplete",
+            "reason_code": "texture_set_incomplete",
             "canonical_spm": iid,
         })
         app._snapshot_batch_request = mock.Mock(return_value=(
@@ -610,6 +610,69 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         app._enqueue_batch_job.assert_called_once_with(job)
         tracker.complete_planning_commit.assert_called_once_with()
 
+    def test_unclassified_reason_is_visible_instead_of_silent_continue(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        iid = str(self.first)
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "managed_mesh_owner_ambiguous",
+            "canonical_spm": iid,
+        })
+        inventory = {iid: {"spm": self.first}}
+
+        built = app._build_failed_retry_plan(
+            [iid],
+            {"push_transport": "rpc"},
+            inventory_snapshot=inventory,
+        )
+
+        self.assertEqual(built["jobs"], [])
+        self.assertTrue(any(
+            "managed_mesh_owner_ambiguous" in row
+            for row in built["skipped"]
+        ))
+        self.assertEqual(
+            built["deferred_status_updates"][0]["status"],
+            gui.STATUS_FINAL_FAILED,
+        )
+        self.assertIn(
+            "managed_mesh_owner_ambiguous",
+            built["deferred_status_updates"][0]["kwargs"]["plan"].reason_codes,
+        )
+
+    def test_atlas_receipt_and_lineage_blocks_enter_exact_cluster_refresh(self):
+        gui = load_gui_module()
+        inventory = {str(self.first): {"spm": self.first}}
+        for reason_code in (
+            "atlas_manifest_authority_missing",
+            "atlas_manifest_resolution_conflict",
+            "lineage_unproven",
+        ):
+            with self.subTest(reason_code=reason_code):
+                app = self.app(gui)
+                app._failed_retry_durable_evidence = mock.Mock(return_value={
+                    "reason_code": reason_code,
+                    "canonical_spm": str(self.first),
+                })
+
+                built = app._build_failed_retry_plan(
+                    [str(self.first)],
+                    {"push_transport": "rpc"},
+                    inventory_snapshot=inventory,
+                )
+
+                self.assertEqual(len(built["jobs"]), 1)
+                self.assertEqual(built["skipped"], [])
+                plan = built["jobs"][0]["repair_plans"][0]
+                self.assertEqual(
+                    [stage["repair_action"] for stage in plan["stages"]],
+                    ["cluster-refresh"],
+                )
+                self.assertEqual(
+                    plan["stages"][0]["target_spms"],
+                    [str(self.first)],
+                )
+
     def test_planner_keeps_dependency_blocked_consumer_with_cluster_repair(self):
         gui = load_gui_module()
         app = self.app(gui)
@@ -620,7 +683,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                 "push_status_kind": "data_error",
                 "push_status_error": {
                     "kind": "data_error",
-                    "reason_code": "managed_texture_set_incomplete",
+                    "reason_code": "texture_set_incomplete",
                     "message": "sanitized cluster failure",
                 },
             },
@@ -637,7 +700,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         def evidence(iid, _repair_state=None):
             if iid == cluster_iid:
                 return {
-                    "reason_code": "managed_texture_set_incomplete",
+                    "reason_code": "texture_set_incomplete",
                     "canonical_spm": iid,
                 }
             return {
@@ -725,7 +788,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             "reason": "repair evidence",
         })
         app._failed_retry_durable_evidence = mock.Mock(return_value={
-            "reason_code": "managed_texture_set_incomplete",
+            "reason_code": "texture_set_incomplete",
             "canonical_spm": str(missing),
         })
 
@@ -745,7 +808,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(entry["push_status_kind"], "automatic_repair_failed")
         self.assertIn(
-            "managed_texture_set_incomplete",
+            "texture_set_incomplete",
             entry["push_status_error"]["reason_codes"],
         )
 

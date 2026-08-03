@@ -1,0 +1,78 @@
+{
+  "kind": "issue138_multi_authority_consumer_profile",
+  "source": "sanitized SK_bush_blackgum_01 structural counts from PR 148 comment 5162805074",
+  "profiles": [
+    {
+      "name": "blackgum_multi_authority_consumer",
+      "target_name": "SK_bush_blackgum_sanitized.spm",
+      "authorities": [
+        {
+          "name": "leaf_provider",
+          "scope": "scope-current-leaf",
+          "blend_file": "C:/sanitized/leaf-provider.blend",
+          "source_collection": "LeafAtlas",
+          "groups": [
+            {
+              "material_id": 10,
+              "material_name": "M_leaf_active",
+              "group": "LeafActive",
+              "mesh_start": 1,
+              "mesh_count": 10,
+              "generator_mesh_ids": [1, 2]
+            },
+            {
+              "material_id": 11,
+              "material_name": "M_leaf_variants",
+              "group": "LeafVariants",
+              "mesh_start": 11,
+              "mesh_count": 9
+            }
+          ]
+        },
+        {
+          "name": "bark_provider",
+          "scope": "scope-current-bark",
+          "blend_file": "C:/sanitized/bark-provider.blend",
+          "source_collection": "BarkAtlas",
+          "groups": [
+            {
+              "material_id": 20,
+              "material_name": "M_bark_active",
+              "group": "BarkActive",
+              "mesh_start": 20,
+              "mesh_count": 10,
+              "generator_mesh_ids": [20, 21]
+            },
+            {
+              "material_id": 21,
+              "material_name": "M_bark_variants_a",
+              "group": "BarkVariantsA",
+              "mesh_start": 30,
+              "mesh_count": 9
+            },
+            {
+              "material_id": 22,
+              "material_name": "M_bark_variants_b",
+              "group": "BarkVariantsB",
+              "mesh_start": 39,
+              "mesh_count": 9
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "selected_authorities": 2,
+        "checked_references": 47,
+        "active_managed_mesh_count": 4,
+        "managed_orphan_mesh_count": 0,
+        "managed_orphan_material_count": 0,
+        "preserved_unreferenced_mesh_count": 43,
+        "preserved_unreferenced_material_count": 3,
+        "classification_counts": {
+          "current_preserved_unreferenced": 46,
+          "current_reachable": 6
+        }
+      }
+    }
+  ]
+}

@@ -27,6 +27,11 @@ SILKY_FIXTURE = (
     / "fixtures"
     / "issue57_silky_managed_orphans.json"
 )
+CURRENT_AUTHORITY_FIXTURE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "issue138_current_authority_variants.json"
+)
 
 
 def marker(kind, scope, group="leaf"):
@@ -154,7 +159,7 @@ def write_receipt(
 
 
 class AtlasConsumerIntegrityTests(unittest.TestCase):
-    def test_silky_4_active_and_99_managed_orphans_is_not_healthy(self):
+    def test_silky_lineage_unproven_assets_stay_blocking(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = json.loads(SILKY_FIXTURE.read_text(encoding="utf-8"))
             root = Path(temporary)
@@ -273,6 +278,9 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 Counter({
                     "active": fixture["expected"]["active"],
                     "managed_orphan": fixture["expected"]["managed_orphan"],
+                    "current_preserved_unreferenced": fixture["expected"][
+                        "preserved_unreferenced"
+                    ],
                 }),
             )
             integrity = first["atlas_consumer_integrity"]
@@ -317,9 +325,15 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             }
             self.assertEqual(
                 {
+                    row["classification"] for row in authoritative.values()
+                },
+                {"current_preserved_unreferenced"},
+            )
+            self.assertEqual(
+                {
                     row["orphan_reason"] for row in authoritative.values()
                 },
-                {"authoritative_current_unreferenced"},
+                {"authoritative_current_variant_not_selected"},
             )
             self.assertFalse(any(
                 row["automatic_action_eligible"]
@@ -348,9 +362,15 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 "spm": str(spm),
                 "mesh_file_reference_contract": first,
             })
+            atlas_issue = next(
+                issue for issue in issues
+                if issue["code"] == "ATLAS_MANAGED_ASSET_INTEGRITY_STALE"
+            )
+            self.assertIn("producer 계보가 증명되지 않은", atlas_issue["message"])
+            self.assertIn("Mesh ID 7", atlas_issue["message"])
             self.assertIn(
-                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
-                {issue["code"] for issue in issues},
+                "exact Cluster 갱신을 먼저 실행",
+                atlas_issue["details"]["operator_action_ko"],
             )
 
     def test_current_default_cutout_generation_is_not_orphaned(self):
@@ -461,7 +481,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 integrity["classification_counts"],
                 {
                     "current_default_cutout": 3,
-                    "current_unused_group": 6,
+                    "current_preserved_unreferenced": 6,
                 },
             )
             self.assertEqual(
@@ -471,8 +491,8 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 },
                 {
                     8: "current_default_cutout",
-                    9: "current_unused_group",
-                    10: "current_unused_group",
+                    9: "current_preserved_unreferenced",
+                    10: "current_preserved_unreferenced",
                 },
             )
             self.assertEqual(
@@ -480,9 +500,233 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                     row["usage"] for row in report["references"]
                     if row["mesh_id"] in {3, 4, 5, 6}
                 },
-                {"current_unused_group"},
+                {"current_preserved_unreferenced"},
             )
             self.assertEqual(integrity["repair_input"]["candidates"], [])
+
+    def test_exact_selected_authority_does_not_require_live_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_selected_but_unused.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_leaf_unused", [1], "scope-current")
+            add_external_mesh(assets, root, 1, "scope-current")
+            write_spm(spm, model)
+            write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_selected_but_unused.json",
+                "scope-current",
+                10,
+                "M_leaf_unused",
+                [1],
+            )
+
+            report = inspect_spm_mesh_file_references(spm)
+
+            integrity = report["atlas_consumer_integrity"]
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertEqual(integrity["active_managed_mesh_count"], 0)
+            self.assertEqual(
+                integrity["classification_counts"],
+                {"current_preserved_unreferenced": 2},
+            )
+
+    def test_sanitized_production_profiles_reach_material_preflight(self):
+        fixture = json.loads(
+            CURRENT_AUTHORITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        for profile in fixture["profiles"]:
+            with self.subTest(profile=profile["name"]):
+                temporary_context = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary_context.cleanup)
+                temporary = temporary_context.name
+                root = Path(temporary)
+                spm = root / profile["target_name"]
+                model = ET.Element("SpeedTreeModel")
+                assets = ET.SubElement(model, "Assets")
+                generator_index = 0
+
+                receipt_rows = []
+                for authority in profile["authorities"]:
+                    receipt_groups = []
+                    for group in authority["groups"]:
+                        mesh_ids = list(range(
+                            group["mesh_start"],
+                            group["mesh_start"] + group["mesh_count"],
+                        ))
+                        receipt_groups.append({
+                            "collection": group["group"],
+                            "material": group["material_name"],
+                            "material_id": group["material_id"],
+                            "mesh_ids": mesh_ids,
+                        })
+                        add_material(
+                            assets,
+                            group["material_id"],
+                            group["material_name"],
+                            mesh_ids,
+                            authority["scope"],
+                            group=group["group"],
+                        )
+                        for mesh_id in mesh_ids:
+                            add_external_mesh(
+                                assets,
+                                root,
+                                mesh_id,
+                                authority["scope"],
+                                group=group["group"],
+                            )
+                        for mesh_id in group.get("generator_mesh_ids", []):
+                            add_generator(
+                                model,
+                                group["material_id"],
+                                mesh_id,
+                                generator_index,
+                            )
+                            generator_index += 1
+                    receipt_rows.append((authority, receipt_groups))
+
+                write_spm(spm, model)
+                for authority, receipt_groups in receipt_rows:
+                    first_group = receipt_groups[0]
+                    write_receipt(
+                        spm,
+                        ".atlas_leaf_speedtree_scopes",
+                        f"{authority['scope']}__{spm.stem}.json",
+                        authority["scope"],
+                        first_group["material_id"],
+                        first_group["material"],
+                        first_group["mesh_ids"],
+                        blend=authority["blend_file"],
+                        collection=authority["source_collection"],
+                        groups=receipt_groups,
+                    )
+                before = spm.read_bytes()
+
+                report = inspect_spm_mesh_file_references(spm)
+
+                self.assertEqual(spm.read_bytes(), before)
+                self.assertEqual(report["status"], "ok")
+                self.assertEqual(
+                    report["checked_references"],
+                    profile["expected"]["checked_references"],
+                )
+                integrity = report["atlas_consumer_integrity"]
+                self.assertFalse(integrity["blocking"])
+                self.assertEqual(
+                    len(integrity["selected_authorities"]),
+                    profile["expected"]["selected_authorities"],
+                )
+                for key in (
+                    "active_managed_mesh_count",
+                    "managed_orphan_mesh_count",
+                    "managed_orphan_material_count",
+                    "classification_counts",
+                ):
+                    self.assertEqual(integrity[key], profile["expected"][key])
+                self.assertEqual(
+                    sum(
+                        row["classification"]
+                        == "current_preserved_unreferenced"
+                        for row in integrity["managed_meshes"]
+                    ),
+                    profile["expected"][
+                        "preserved_unreferenced_mesh_count"
+                    ],
+                )
+                self.assertEqual(
+                    sum(
+                        row["classification"]
+                        == "current_preserved_unreferenced"
+                        for row in integrity["managed_materials"]
+                    ),
+                    profile["expected"][
+                        "preserved_unreferenced_material_count"
+                    ],
+                )
+                self.assertEqual(integrity["repair_input"]["candidates"], [])
+                issue_codes = {
+                    issue["code"]
+                    for issue in preflight.preflight_contract_issues({
+                        "spm": str(spm),
+                        "mesh_file_reference_contract": report,
+                    })
+                }
+                self.assertNotIn(
+                    "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
+                    issue_codes,
+                )
+                preflight_report = root / "preflight.json"
+                args = argparse.Namespace(
+                    spm=str(spm),
+                    speedtree_exe="SpeedTree.exe",
+                    fbx_ini="Options.ini",
+                    speedtree_cli="speedtree_cli.py",
+                    report=str(preflight_report),
+                    timeout=30,
+                )
+                with mock.patch.object(
+                    preflight,
+                    "parse_args",
+                    return_value=args,
+                ), mock.patch.object(
+                    preflight,
+                    "read_tree_instance_profile",
+                    return_value="sanitized-profile",
+                ), mock.patch.object(
+                    preflight,
+                    "load_speedtree_cli",
+                    return_value=object(),
+                ), mock.patch.object(
+                    preflight,
+                    "run_export",
+                    return_value={"status": "ok"},
+                ) as export, mock.patch.object(
+                    preflight,
+                    "inspect_speedtree_material_export",
+                    return_value={"status": "ok", "missing_materials": []},
+                ), mock.patch.object(
+                    preflight,
+                    "inspect_all_speedtree_material_export",
+                    return_value={"status": "ok", "missing_materials": []},
+                ), mock.patch.object(
+                    preflight,
+                    "inspect_speedtree_texture_sources",
+                    return_value={
+                        "status": "ok",
+                        "stmat": None,
+                        "missing_sources": [],
+                    },
+                ), mock.patch.object(
+                    preflight,
+                    "resolve_texture_bindings",
+                    return_value={},
+                ), mock.patch.object(
+                    preflight,
+                    "augment_texture_readiness_contract",
+                    return_value={"status": "ok", "missing": []},
+                ), mock.patch.object(
+                    preflight,
+                    "load_pcg_texture_config",
+                    return_value={},
+                ), mock.patch.object(
+                    preflight,
+                    "attach_pipeline_contract",
+                    return_value=None,
+                ):
+                    preflight.main()
+                export.assert_called_once()
+                emitted = json.loads(
+                    preflight_report.read_text(encoding="utf-8")
+                )
+                self.assertEqual(emitted["status"], "ok")
+                self.assertNotEqual(
+                    emitted.get("classification"),
+                    "atlas_managed_asset_integrity_stale",
+                )
 
     def test_foreign_scope_and_untagged_manual_assets_are_protected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -552,7 +796,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 {2: "protected_foreign", 3: "protected_manual"},
             )
 
-    def test_missing_file_status_remains_separate_from_integrity_status(self):
+    def test_missing_current_variant_still_blocks_as_missing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_missing_and_stale.spm"
@@ -575,12 +819,12 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
 
             report = inspect_spm_mesh_file_references(spm)
 
-            self.assertEqual(report["status"], "orphan_missing_mesh_assets")
-            self.assertEqual(report["missing"], [])
-            self.assertEqual(len(report["orphan_missing"]), 1)
-            self.assertTrue(report["atlas_consumer_integrity"]["blocking"])
+            self.assertEqual(report["status"], "missing_mesh_files")
+            self.assertEqual(len(report["missing"]), 1)
+            self.assertEqual(report["orphan_missing"], [])
+            self.assertFalse(report["atlas_consumer_integrity"]["blocking"])
 
-    def test_preflight_blocks_before_export_and_emits_repair_input(self):
+    def test_preflight_reaches_export_for_current_unreferenced_variant(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_integrity_preflight.spm"
@@ -622,27 +866,51 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 preflight,
                 "load_speedtree_cli",
                 return_value=object(),
-            ), mock.patch.object(preflight, "run_export") as export:
-                with self.assertRaises(SystemExit):
-                    preflight.main()
-
-            export.assert_not_called()
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["status"], "blocked")
-            self.assertEqual(
-                report["classification"],
-                "atlas_managed_asset_integrity_stale",
-            )
-            self.assertEqual(
-                len(report["atlas_consumer_repair_input"]["content_sha256"]),
-                64,
-            )
-            self.assertIn(
-                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
-                {
-                    issue["code"]
-                    for issue in report["speedtree_pipeline_contract"]["issues"]
+            ), mock.patch.object(
+                preflight,
+                "run_export",
+                return_value={"status": "ok"},
+            ) as export, mock.patch.object(
+                preflight,
+                "inspect_speedtree_material_export",
+                return_value={"status": "ok", "missing_materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_all_speedtree_material_export",
+                return_value={"status": "ok", "missing_materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_speedtree_texture_sources",
+                return_value={
+                    "status": "ok",
+                    "stmat": None,
+                    "missing_sources": [],
                 },
+            ), mock.patch.object(
+                preflight,
+                "resolve_texture_bindings",
+                return_value={},
+            ), mock.patch.object(
+                preflight,
+                "augment_texture_readiness_contract",
+                return_value={"status": "ok", "missing": []},
+            ), mock.patch.object(
+                preflight,
+                "load_pcg_texture_config",
+                return_value={},
+            ), mock.patch.object(
+                preflight,
+                "attach_pipeline_contract",
+                return_value=None,
+            ):
+                preflight.main()
+
+            export.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "ok")
+            self.assertNotEqual(
+                report.get("classification"),
+                "atlas_managed_asset_integrity_stale",
             )
 
     def test_manifest_receipt_change_invalidates_cached_integrity_audit(self):
@@ -827,6 +1095,77 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                     if row["mesh_id"] == 2
                 )["classification"],
                 "ambiguous",
+            )
+            message, action = preflight._atlas_integrity_failure_message(
+                integrity
+            )
+            self.assertIn("Leaf 0", message)
+            self.assertIn("Material 10, Mesh 2", message)
+            self.assertIn("visible 연결을 수정", action)
+
+    def test_hidden_cross_group_pair_does_not_block_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_hidden_cross_group.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_leaf_a", [1], "scope-current")
+            add_external_mesh(assets, root, 1, "scope-current")
+            add_material(assets, 20, "M_leaf_b", [2], "scope-current")
+            add_external_mesh(assets, root, 2, "scope-current")
+            add_generator(model, 10, 1, index=0)
+            add_generator(model, 10, 2, index=1, hidden=True)
+            write_spm(spm, model)
+            receipt = write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_hidden_cross_group.json",
+                "scope-current",
+                10,
+                "M_leaf_a",
+                [1],
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            payload["speedtree_material_groups"].append({
+                "collection": "AtlasLeavesB",
+                "material": "M_leaf_b",
+                "material_id": 20,
+                "mesh_ids": [2],
+            })
+            receipt.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
+
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertNotIn(
+                "generator_cross_group_pair",
+                {row["code"] for row in integrity["integrity_issues"]},
+            )
+            hidden_mesh = next(
+                row for row in integrity["managed_meshes"]
+                if row["mesh_id"] == 2
+            )
+            self.assertTrue(hidden_mesh["generator_references"][0]["hidden"])
+            self.assertEqual(
+                integrity["suppressed_generator_pairs"],
+                [{
+                    "code": "generator_cross_group_pair",
+                    "reason": "SPM Material does not own the referenced Mesh; Selected manifests assign Material and Mesh to different groups",
+                    "suppression_reason": "hidden_generator_not_exported",
+                    "generator_index": 1,
+                    "generator_guid": "leaf-guid-1",
+                    "generator_name": "Leaf 1",
+                    "slot_prefix": "Leaves:Type:1",
+                    "material_id": 10,
+                    "mesh_id": 2,
+                    "hidden": True,
+                }],
+            )
+            self.assertEqual(
+                integrity["repair_input"]["suppressed_generator_pairs"],
+                integrity["suppressed_generator_pairs"],
             )
 
     def test_managed_generator_reference_without_guid_fails_closed(self):

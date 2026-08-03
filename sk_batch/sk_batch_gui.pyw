@@ -65,6 +65,8 @@ from exact_target_command import (
 from repair_orchestration import (
     ATLAS_MANIFEST_MIRROR_REPAIR,
     GENERATOR_SYNC_TOOL,
+    MODELER_NODE_TABLE_RECOVERY,
+    MODELER_RECOVERY_TOOL,
     PCG_TEXTURE_TOOL,
     REPAIR_PLAN_SCHEMA_VERSION,
     REPAIR_UI_AUTOMATIC,
@@ -265,6 +267,7 @@ PLANNED_EXCLUSION_KINDS = frozenset({
     "stale_execution_freeze",
 })
 _INLINE_ATLAS_REPAIR_LOCK = threading.RLock()
+_REGISTERED_RELATION_REPAIR_LOCK = threading.RLock()
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
@@ -4345,6 +4348,7 @@ class App:
             job.get("retry_metadata") or {}
         )
         self._inline_atlas_repair_results = {}
+        self._registered_relation_repair_results = {}
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
@@ -5253,8 +5257,18 @@ class App:
             "evidence": evidence,
         }
 
-    def _run_failed_retry_repair_job(self, job, lease):
-        """Run exact BAT stages, fresh-audit, then re-enter the pipeline."""
+    def _execute_exact_repair_stage(
+        self,
+        plan,
+        stage,
+        lease,
+        *,
+        stage_index,
+        receipt,
+        provenance_source,
+        on_progress=None,
+    ):
+        """Execute one registry-selected stage through the shared BAT path."""
 
         from pcg_st9_texture_batch.exact_target_repair import (
             execute_step3_standard,
@@ -5263,10 +5277,123 @@ class App:
             execute_exact_generator_request,
         )
 
+        def execute_modeler_node_table(
+            request,
+            *,
+            progress,
+            cancel_event,
+            lease,
+        ):
+            del lease
+            if cancel_event.is_set():
+                raise WaitCancelled("Modeler Node table repair cancelled")
+            scope = copy.deepcopy(stage.get("recovery_scope") or {})
+            producer_spm = stage.get("producer_spm")
+            target_spms = list(request.get("target_spms") or ())
+            if (
+                scope.get("available") is not True
+                or not producer_spm
+                or len(target_spms) != 1
+            ):
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": "sealed Modeler Node table scope is incomplete",
+                }
+            target_spm = Path(target_spms[0])
+            synthetic = TargetPlannedExclusionError(
+                "sealed Modeler Node table repair",
+                reason_token="normalized_generator_node_table_stale",
+                target_spm=target_spm,
+                producer_spm=producer_spm,
+                evidence={
+                    "issue_codes": [
+                        "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+                    ],
+                    "stale_node_table_recovery": scope,
+                },
+            )
+            progress(
+                "modeler_node_table_recovery",
+                completed=0,
+                remaining=1,
+                unit_stage="modeler_node_table_recovery",
+            )
+            try:
+                resolution = self._attempt_stale_node_table_recovery(
+                    synthetic,
+                    f"exact_{request['request_id']}",
+                    producer_spm,
+                    require_normalized=False,
+                )
+            except BatchItemError as exc:
+                if exc.kind == "cancelled":
+                    raise WaitCancelled(str(exc)) from exc
+                raise
+            if resolution is None:
+                attempt = synthetic.evidence.get("recovery_attempt") or {}
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": str(
+                        attempt.get("reason_token")
+                        or "sealed Modeler Node table repair failed"
+                    ),
+                    "recovery_attempt": copy.deepcopy(attempt),
+                }
+            progress(
+                "modeler_node_table_recovery",
+                completed=1,
+                remaining=0,
+                unit_stage="modeler_node_table_recovery",
+            )
+            return {
+                "outcome": "completed",
+                "shared_queue_success": True,
+                "live_resolution": copy.deepcopy(resolution),
+            }
+
         executors = {
             PCG_TEXTURE_TOOL: execute_step3_standard,
             GENERATOR_SYNC_TOOL: execute_exact_generator_request,
+            MODELER_RECOVERY_TOOL: execute_modeler_node_table,
         }
+        tool = str(stage.get("tool") or "")
+        if (
+            tool == MODELER_RECOVERY_TOOL
+            and stage.get("repair_action") != MODELER_NODE_TABLE_RECOVERY
+        ):
+            raise RuntimeError(
+                "unsupported SpeedTree Modeler exact repair action: "
+                + str(stage.get("repair_action") or "")
+            )
+        executor = executors.get(tool)
+        if executor is None:
+            raise RuntimeError(f"unsupported exact repair tool: {tool}")
+        request = build_exact_target_request(
+            tool=tool,
+            repair_action=stage["repair_action"],
+            target_spms=stage["target_spms"],
+            repair_stage=stage["stage"],
+            provenance={
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "evidence_sha256": plan.get("evidence_sha256"),
+                "source": str(provenance_source),
+            },
+            parent_retry_id=plan["parent_retry_id"],
+            request_id=f"{plan['request_id']}-{stage_index}",
+            receipt=receipt,
+        )
+        return run_exact_target_request(
+            request,
+            executor,
+            inherited_lease=lease,
+            cancel_event=self.stop_flag,
+            on_progress=on_progress,
+        )
+
+    def _run_failed_retry_repair_job(self, job, lease):
+        """Run exact BAT stages, fresh-audit, then re-enter the pipeline."""
         targets_by_id = {
             str(item["spm"]): item for item in job.get("targets") or ()
         }
@@ -5326,20 +5453,6 @@ class App:
                 receipt = LOG_DIR / (
                     f"exact_repair_{plan['request_id']}_{stage_index}.json"
                 )
-                request = build_exact_target_request(
-                    tool=stage["tool"],
-                    repair_action=stage["repair_action"],
-                    target_spms=stage["target_spms"],
-                    repair_stage=stage["stage"],
-                    provenance={
-                        "reason_codes": list(plan.get("reason_codes") or ()),
-                        "evidence_sha256": plan.get("evidence_sha256"),
-                        "source": "sk_batch.failed_retry",
-                    },
-                    parent_retry_id=plan["parent_retry_id"],
-                    request_id=f"{plan['request_id']}-{stage_index}",
-                    receipt=receipt,
-                )
                 current_stage_status = [status]
 
                 def on_exact_progress(payload, asset=Path(iid).name):
@@ -5370,11 +5483,13 @@ class App:
                         f"남음 {max(0, total_stage_count - global_completed)}",
                     ))
 
-                terminal = run_exact_target_request(
-                    request,
-                    executors[stage["tool"]],
-                    inherited_lease=lease,
-                    cancel_event=self.stop_flag,
+                terminal = self._execute_exact_repair_stage(
+                    plan,
+                    stage,
+                    lease,
+                    stage_index=stage_index,
+                    receipt=receipt,
+                    provenance_source="sk_batch.failed_retry",
                     on_progress=on_exact_progress,
                 )
                 attempted_row = {
@@ -7798,12 +7913,22 @@ class App:
                     for value in dependency_map.get(iid, ())
                     if value in root_failed_ids
                 ]
+                reason_token = (
+                    "shared_dependency_failed"
+                    if blocked_by
+                    else "dependency_root_reason_missing"
+                )
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
                     "outcome": "blocked",
-                    "reason_token": "shared_dependency_failed",
-                    "evidence": {"blocked_by": blocked_by},
+                    "reason_token": reason_token,
+                    "evidence": {
+                        "blocked_by": blocked_by,
+                        "declared_dependencies": list(
+                            dependency_map.get(iid, ())
+                        ),
+                    },
                 })
                 continue
             if iid in failed:
@@ -7848,7 +7973,7 @@ class App:
                 continue
             reason_token, evidence = self._target_failure_result(
                 dependency,
-                default_token="shared_dependency_failed",
+                default_token="dependency_root_reason_missing",
             )
             shared_failures.append({
                 "dependency": dependency,
@@ -11994,6 +12119,362 @@ class App:
             runnable_relation_targets.append(target)
         return runnable_relation_targets, live_target_contracts
 
+    def _attempt_registered_relation_repair(
+        self,
+        exclusion,
+        stamp,
+        producer_spm,
+        *,
+        require_normalized,
+    ):
+        """Run a relation gate's registered repair under its current lease.
+
+        The relation audit and failed-retry button share the same plan builder
+        and exact executor.  An unsupported reason remains a visible target
+        exclusion; cancellation or lost queue ownership remains a lifecycle
+        terminal and is never relabelled as damaged target data.
+        """
+
+        target = Path(exclusion.target_spm).resolve(strict=False)
+        producer = Path(producer_spm).resolve(strict=False)
+        durable_evidence = copy.deepcopy(exclusion.evidence)
+        durable_evidence.pop("repair_attempt", None)
+        repair_evidence = {
+            "reason_token": str(exclusion.reason_token),
+            "target_spm": str(target),
+            "producer_spm": str(producer),
+            "evidence": durable_evidence,
+        }
+        reason_codes = set(evidence_reason_codes(repair_evidence))
+        if not reason_codes or not has_repair_contract_evidence(
+            repair_evidence
+        ):
+            return None
+
+        def attach_attempt(payload):
+            attempt = copy.deepcopy(payload)
+            exclusion.evidence["repair_attempt"] = attempt
+            report = getattr(exclusion, "report", None)
+            if isinstance(report, dict):
+                report.setdefault("evidence", {})["repair_attempt"] = (
+                    copy.deepcopy(attempt)
+                )
+
+        if self.stop_flag.is_set():
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                kind="cancelled",
+                report={
+                    "reason_token": "operator_cancelled",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                },
+            )
+
+        active_job = getattr(self, "active_batch_job", None)
+        if not isinstance(active_job, dict) or not active_job.get("id"):
+            attach_attempt({
+                "status": "not_started",
+                "reason_token": "initiating_job_context_missing",
+                "reason_codes": sorted(reason_codes),
+            })
+            return None
+
+        inventory_paths = []
+        seen_inventory = set()
+
+        def add_inventory(value):
+            if not value:
+                return
+            path = Path(value).resolve(strict=False)
+            key = os.path.normcase(os.path.abspath(str(path))).casefold()
+            if key not in seen_inventory:
+                seen_inventory.add(key)
+                inventory_paths.append(path)
+
+        add_inventory(target)
+        add_inventory(producer)
+        for source_name in ("_active_batch_inventory", "items"):
+            source = getattr(self, source_name, None)
+            if not isinstance(source, dict):
+                continue
+            for iid, item in source.items():
+                add_inventory(
+                    item.get("spm") if isinstance(item, dict) else iid
+                )
+
+        retry_metadata = copy.deepcopy(
+            getattr(self, "_active_retry_metadata", {}) or {}
+        )
+        queue_identity = str(
+            active_job.get("shared_queue_job_id")
+            or active_job.get("id")
+        )
+        parent_retry_id = str(
+            retry_metadata.get("progress_run_id")
+            or active_job.get("shared_queue_job_id")
+            or f"sk-batch-{active_job['id']}"
+        )
+        request_digest = hashlib.sha256(json.dumps(
+            {
+                "queue_identity": queue_identity,
+                "target_spm": str(target),
+                "producer_spm": str(producer),
+                "reason_codes": sorted(reason_codes),
+                "evidence": repair_evidence,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest()[:16]
+        request_id = f"cluster-relation-{request_digest}"
+
+        try:
+            repair_plan = build_exact_target_repair_plan(
+                target,
+                repair_evidence,
+                inventory_paths=inventory_paths,
+                parent_retry_id=parent_retry_id,
+                request_id=request_id,
+            )
+        except (FileNotFoundError, TypeError, ValueError) as exc:
+            attach_attempt({
+                "status": "not_started",
+                "reason_token": "exact_target_plan_invalid",
+                "reason_codes": sorted(reason_codes),
+                "error": compact_error_message(exc, 320),
+            })
+            return None
+
+        plan = repair_plan.metadata()
+        if not repair_plan.supported:
+            attach_attempt({
+                "status": "unsupported",
+                "reason_token": "registered_reason_has_no_exact_action",
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "reason_ko": repair_plan.friendly_reason,
+                "action_ko": repair_plan.remaining_action,
+            })
+            return None
+
+        lease = getattr(self, "_active_shared_queue_lease", None)
+        captured_shared_job_id = active_job.get("shared_queue_job_id")
+        lease_job_id = getattr(lease, "job_id", None)
+        if (
+            lease is None
+            or getattr(lease, "finished", False)
+            or (
+                captured_shared_job_id
+                and lease_job_id != captured_shared_job_id
+            )
+        ):
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구의 공용 대기열 소유권이 없습니다.",
+                kind="owner_lost",
+                report={
+                    "reason_token": "shared_queue_lease_owner_lost",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "request_id": request_id,
+                },
+            )
+        renew = getattr(lease, "renew_and_check_current", None)
+        if renew is not None and not renew():
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구의 공용 대기열 lease가 만료되었습니다.",
+                kind="owner_lost",
+                report={
+                    "reason_token": "shared_queue_lease_owner_lost",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "request_id": request_id,
+                },
+            )
+
+        def fresh_reaudit(attempted_stages):
+            try:
+                return self._cluster_normalization_stage_observation(
+                    target,
+                    f"{stamp}_registered_repair_reaudit",
+                    producer,
+                    require_normalized=require_normalized,
+                )
+            except TargetPlannedExclusionError as fresh_exclusion:
+                fresh_attempt = {
+                    "status": "repaired_but_reaudit_blocked",
+                    "request_id": request_id,
+                    "reason_codes": list(plan.get("reason_codes") or ()),
+                    "attempted_stages": copy.deepcopy(attempted_stages),
+                }
+                fresh_exclusion.evidence["repair_attempt"] = fresh_attempt
+                if isinstance(fresh_exclusion.report, dict):
+                    fresh_exclusion.report.setdefault("evidence", {})[
+                        "repair_attempt"
+                    ] = copy.deepcopy(fresh_attempt)
+                raise
+
+        with _REGISTERED_RELATION_REPAIR_LOCK:
+            memo = self.__dict__.setdefault(
+                "_registered_relation_repair_results", {}
+            )
+            cached = copy.deepcopy(memo.get(request_id))
+            if cached is not None:
+                cached_status = str(cached.get("status") or "")
+                if cached_status == "completed":
+                    return fresh_reaudit(cached.get("attempted_stages") or ())
+                if cached_status == "cancelled":
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cached,
+                    )
+                if cached_status == "owner_lost":
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                        kind="owner_lost",
+                        report=cached,
+                    )
+                attach_attempt(cached)
+                return None
+
+            attempted = []
+            planned_stages = list(plan.get("stages") or ())
+            modeler_live_resolution = None
+            self.ui_queue.put((
+                "progress",
+                f"{target.name} · Generator/Cluster exact 자동 복구 시작",
+            ))
+            self.log(
+                "[자동 복구 시작] Generator/Cluster exact target · "
+                f"{target.name} · provider={producer.name} · "
+                f"reasons={','.join(sorted(reason_codes))}"
+            )
+            for stage_index, stage in enumerate(planned_stages, 1):
+                if self.stop_flag.is_set():
+                    cancelled = {
+                        "status": "cancelled",
+                        "reason_token": "operator_cancelled",
+                        "request_id": request_id,
+                        "attempted_stages": copy.deepcopy(attempted),
+                    }
+                    memo[request_id] = copy.deepcopy(cancelled)
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cancelled,
+                    )
+                receipt = LOG_DIR / (
+                    f"exact_repair_{request_id}_{stage_index}.json"
+                )
+
+                def on_progress(payload, asset=target.name):
+                    self.ui_queue.put((
+                        "progress",
+                        f"{asset} · "
+                        f"{payload.get('current_stage') or stage['stage']}",
+                    ))
+
+                terminal = self._execute_exact_repair_stage(
+                    plan,
+                    stage,
+                    lease,
+                    stage_index=stage_index,
+                    receipt=receipt,
+                    provenance_source="sk_batch.cluster_relation",
+                    on_progress=on_progress,
+                )
+                terminal_status = str(
+                    terminal.get("terminal_status")
+                    or terminal.get("status")
+                    or ""
+                )
+                terminal_result = terminal.get("result") or {}
+                if (
+                    len(planned_stages) == 1
+                    and stage.get("repair_action")
+                    == MODELER_NODE_TABLE_RECOVERY
+                    and isinstance(
+                        terminal_result.get("live_resolution"), dict
+                    )
+                ):
+                    modeler_live_resolution = copy.deepcopy(
+                        terminal_result["live_resolution"]
+                    )
+                attempted.append({
+                    "stage": stage["stage"],
+                    "tool": stage["tool"],
+                    "repair_action": stage["repair_action"],
+                    "targets": list(stage["target_spms"]),
+                    "receipt": str(receipt),
+                    "status": terminal_status,
+                })
+                if terminal_status == "cancelled":
+                    cancelled = {
+                        "status": "cancelled",
+                        "reason_token": "operator_cancelled",
+                        "request_id": request_id,
+                        "attempted_stages": copy.deepcopy(attempted),
+                    }
+                    memo[request_id] = copy.deepcopy(cancelled)
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cancelled,
+                    )
+                if terminal_status != "completed":
+                    if terminal.get("failure_kind") == "owner_lost":
+                        owner_lost = {
+                            "reason_token": "shared_queue_lease_owner_lost",
+                            "request_id": request_id,
+                            "attempted_stages": copy.deepcopy(attempted),
+                            "error": compact_error_message(
+                                terminal.get("error")
+                                or "exact repair owner lost",
+                                320,
+                            ),
+                        }
+                        memo[request_id] = {
+                            "status": "owner_lost",
+                            **copy.deepcopy(owner_lost),
+                        }
+                        raise BatchItemError(
+                            "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                            kind="owner_lost",
+                            report=owner_lost,
+                        )
+                    failed = {
+                        "status": "failed",
+                        "reason_token": "exact_relation_repair_failed",
+                        "request_id": request_id,
+                        "reason_codes": list(plan.get("reason_codes") or ()),
+                        "attempted_stages": copy.deepcopy(attempted),
+                        "error": compact_error_message(
+                            terminal.get("error")
+                            or (terminal.get("result") or {}).get("reason")
+                            or "exact BAT repair failed",
+                            320,
+                        ),
+                    }
+                    memo[request_id] = copy.deepcopy(failed)
+                    attach_attempt(failed)
+                    return None
+
+            completed = {
+                "status": "completed",
+                "request_id": request_id,
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "attempted_stages": copy.deepcopy(attempted),
+            }
+            memo[request_id] = copy.deepcopy(completed)
+            self.ui_queue.put((
+                "progress",
+                f"{target.name} · exact 자동 복구 완료 · live 재검증 중",
+            ))
+            if modeler_live_resolution is not None:
+                return modeler_live_resolution
+            return fresh_reaudit(attempted)
+
     def _cluster_normalization_stage_with_recovery(
         self,
         target_spm,
@@ -12011,15 +12492,35 @@ class App:
                 require_normalized=require_normalized,
             )
         except TargetPlannedExclusionError as exc:
-            recovered = self._attempt_stale_node_table_recovery(
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Generator/Cluster 검사가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(target_spm),
+                        "producer_spm": str(producer_spm),
+                    },
+                )
+            recovered = self._attempt_registered_relation_repair(
                 exc,
                 stamp,
                 producer_spm,
                 require_normalized=require_normalized,
             )
-            if recovered is None:
-                raise
-            return recovered
+            if recovered is not None:
+                return recovered
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(target_spm),
+                        "producer_spm": str(producer_spm),
+                    },
+                )
+            raise
 
     def _attempt_stale_node_table_recovery(
         self,
@@ -12050,7 +12551,11 @@ class App:
                 "status": "not_started",
                 "reason_token": "initiating_job_cancelled",
             }
-            return None
+            raise BatchItemError(
+                "SpeedTree Node table 자동 복구가 사용자에 의해 취소되었습니다.",
+                kind="cancelled",
+                report=copy.deepcopy(exclusion.evidence["recovery_attempt"]),
+            )
 
         from pcg_st9_texture_batch.stale_node_table_recovery import (
             StaleNodeTableRecoveryError,
@@ -12179,6 +12684,30 @@ class App:
                 on_continuation_claimed=mark_resume_committed,
             )
         except StaleNodeTableRecoveryError as exc:
+            if exc.reason_token in {
+                "initiating_job_cancelled",
+                "initiating_app_closed",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구가 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
+            if exc.reason_token in {
+                "initiating_job_generation_stale",
+                "initiating_queue_lease_lost",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구의 실행 소유권을 잃었습니다.",
+                    kind="owner_lost",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
             continuation_failed = exc.reason_token in {
                 "continuation_callback_failed",
                 "continuation_claim_publish_failed",

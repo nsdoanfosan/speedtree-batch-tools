@@ -97,13 +97,15 @@
   "expected": {
     "external_mesh_references": 103,
     "active": 4,
-    "managed_orphan": 99,
+    "managed_orphan": 44,
+    "preserved_unreferenced": 55,
     "missing": 0,
     "orphan_missing": 0,
     "selected_source_scopes": 3,
     "selected_manifest_paths": 4,
     "classification_counts": {
-      "ambiguous": 105,
+      "ambiguous": 45,
+      "current_preserved_unreferenced": 60,
       "current_reachable": 5
     }
   }

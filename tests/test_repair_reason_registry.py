@@ -1,11 +1,13 @@
 """The repair contract must cover every reason code the pipeline can emit.
 
-These four assertions are the whole point of the registry.  Each one failed
+These assertions are the whole point of the registry.  Each one failed
 silently before it existed, and each failure mode had already reached
 production: a blocked target with no recovery path, and no record that a
 recovery path was ever possible.
 """
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +18,7 @@ if str(REPO_DIR) not in sys.path:
 import repair_orchestration as orchestration  # noqa: E402
 from repair_reason_registry import (  # noqa: E402
     DISPOSITIONS,
+    INFORMATIONAL,
     REASON_REGISTRY,
     REPAIRABLE,
     UNCLASSIFIED,
@@ -24,19 +27,46 @@ from repair_reason_registry import (  # noqa: E402
     codes_with,
     disposition_of,
 )
-from repair_reason_scan import emitted_reason_codes  # noqa: E402
+from repair_reason_scan import emitted_reason_codes, scan_module  # noqa: E402
+
+
+OBSERVED_TOKEN_FIXTURE = (
+    REPO_DIR
+    / "sk_batch"
+    / "tests"
+    / "fixtures"
+    / "issue138_observed_reason_tokens.json"
+)
+OBSERVED_INTEGRITY_FIXTURE = (
+    REPO_DIR
+    / "sk_batch"
+    / "tests"
+    / "fixtures"
+    / "issue138_observed_integrity_reasons.json"
+)
 
 
 class ReasonRegistryCoverageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.emitted = emitted_reason_codes(REPO_DIR)
+        queue_payload = json.loads(
+            OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
+        )
+        integrity_payload = json.loads(
+            OBSERVED_INTEGRITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        cls.observed = set(queue_payload["tokens"])
+        cls.observed.update(
+            integrity_payload["integrity_issue_occurrences"]
+        )
+        cls.observed.update(integrity_payload["blocking_target_counts"])
 
     def test_every_emitted_reason_code_is_registered(self):
         """A new block cannot ship without a disposition.
 
         This is the assertion that ends the discovery loop.  On 2026-08-03 the
-        planner owned 31 codes while production emitted 174, and the only way
+        planner owned 31 codes while production emitted 226, and the only way
         to learn that a block was unrepairable was to watch a batch stop.
         """
         unregistered = sorted(set(self.emitted) - set(REASON_REGISTRY))
@@ -59,20 +89,25 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         )
         self.assertEqual(invalid, [])
 
-    def test_repairable_codes_are_actually_emitted(self):
-        """No dead vocabulary.
+    def test_repairable_codes_are_emitted_or_observed(self):
+        """No dead vocabulary, including reason fields the AST cannot name.
 
         `repair_orchestration` mapped 20+ repairable codes that no module ever
         emitted, so the planner could not fire on them however correct the
         mapping was. A repair path that nothing can trigger is not a repair
         path.
         """
-        dead = sorted(set(codes_with(REPAIRABLE)) - set(self.emitted))
+        dead = sorted(
+            set(codes_with(REPAIRABLE))
+            - set(self.emitted)
+            - self.observed
+        )
         self.assertEqual(
             dead,
             [],
-            "codes registered as repairable that no production module emits; "
-            "either wire the emitter or drop the mapping",
+            "codes registered as repairable that no production module emits "
+            "and no sanitized runtime snapshot observed; either wire/observe "
+            "the emitter or drop the mapping",
         )
 
     def test_unclassified_debt_never_grows(self):
@@ -115,6 +150,65 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             REPAIRABLE,
         )
 
+    def test_informational_codes_cannot_enter_repair_admission(self):
+        """A quiet fact/wrapper can never become a target verdict by itself."""
+        admitted = sorted(
+            code for code in codes_with(INFORMATIONAL)
+            if orchestration.has_repair_contract_evidence({
+                "reason_token": code,
+            })
+        )
+        self.assertEqual(
+            admitted,
+            [],
+            "informational-only evidence entered target repair/final planning",
+        )
+
+    def test_codes_emitted_by_terminal_fallbacks_are_not_informational(self):
+        terminal_fallbacks = {
+            "pcg_cluster_handoff_not_ready",
+            "preflight_error",
+            "dependency_root_reason_missing",
+        }
+        quiet = sorted(
+            code for code in terminal_fallbacks
+            if disposition_of(code) == INFORMATIONAL
+        )
+        self.assertEqual(quiet, [])
+
+    def test_sanitized_observed_tokens_are_registered_and_decided(self):
+        payload = json.loads(
+            OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
+        )
+        tokens = set(payload["tokens"])
+
+        self.assertEqual(len(tokens), 20)
+        self.assertEqual(tokens - set(REASON_REGISTRY), set())
+        self.assertEqual(
+            sorted(
+                token for token in tokens
+                if disposition_of(token) == UNCLASSIFIED
+            ),
+            [],
+        )
+
+    def test_sanitized_integrity_reasons_are_registered_and_decided(self):
+        payload = json.loads(
+            OBSERVED_INTEGRITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        tokens = set(payload["integrity_issue_occurrences"])
+        tokens.update(payload["blocking_target_counts"])
+
+        self.assertEqual(len(tokens), 4)
+        self.assertEqual(tokens - set(REASON_REGISTRY), set())
+        self.assertEqual(
+            sorted(
+                token for token in tokens
+                if disposition_of(token) == UNCLASSIFIED
+            ),
+            [],
+        )
+
 
 class ReasonScanTests(unittest.TestCase):
     def test_scan_finds_codes_through_every_supported_shape(self):
@@ -125,6 +219,11 @@ class ReasonScanTests(unittest.TestCase):
             "sk_batch/atlas_consumer_integrity.py",
             codes["managed_mesh_owner_ambiguous"],
         )
+        self.assertIn("normalized_generator_delivery_incomplete", codes)
+        self.assertIn(
+            "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+            codes["normalized_generator_delivery_incomplete"],
+        )
         self.assertTrue(module.is_file())
 
     def test_scan_ignores_prose_and_paths(self):
@@ -133,6 +232,41 @@ class ReasonScanTests(unittest.TestCase):
         self.assertIsNone(CODE_TOKEN.match("Cluster is not ready"))
         self.assertIsNone(CODE_TOKEN.match("D:/Assets/SK_x.spm"))
         self.assertIsNotNone(CODE_TOKEN.match("cluster_relation_stale"))
+
+    def test_scan_descends_dynamic_literals_and_reason_parameters(self):
+        source = '''
+UNREAL_RECOVERY_FAILURE_KINDS = frozenset({"data_error"})
+
+def unavailable(reason_token):
+    return {"reason_token": reason_token}
+
+def result(classification, reason_code):
+    return {"classification": classification, "reason": reason_code}
+
+def emit(flag, first):
+    unavailable("stale_target_mesh_scope_missing")
+    result("blocked", "structured_blender_failure")
+    return {
+        "reason_token": (
+            "automatic_repair_reaudit_failed"
+            if flag else "automatic_repair_failed"
+        ),
+        "reason": first or "retry_evidence_ambiguous",
+    }
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "synthetic_reasons.py"
+            module.write_text(source, encoding="utf-8")
+            codes = scan_module(module)
+
+        self.assertTrue({
+            "data_error",
+            "stale_target_mesh_scope_missing",
+            "structured_blender_failure",
+            "automatic_repair_reaudit_failed",
+            "automatic_repair_failed",
+            "retry_evidence_ambiguous",
+        }.issubset(codes))
 
 
 if __name__ == "__main__":

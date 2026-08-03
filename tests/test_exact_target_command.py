@@ -148,6 +148,21 @@ class ExactTargetCommandTests(unittest.TestCase):
             "failed",
         )
 
+    def test_executor_failure_preserves_lifecycle_kind(self):
+        runtime = FakeRuntime()
+
+        class OwnerLostError(RuntimeError):
+            kind = "owner_lost"
+
+        def fail(*_args, **_kwargs):
+            raise OwnerLostError("exact lease expired")
+
+        terminal = run_exact_target_request(self.request, fail, runtime=runtime)
+        payload = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["failure_kind"], "owner_lost")
+        self.assertEqual(payload["failure_kind"], "owner_lost")
+
     def test_cancel_is_terminal_130_and_not_a_failure(self):
         runtime = FakeRuntime()
 

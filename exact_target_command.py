@@ -219,9 +219,11 @@ def run_exact_target_request(
         finish_owned_lease("cancelled", terminal)
         return terminal
     except Exception as exc:
+        failure_kind = str(getattr(exc, "kind", None) or "internal_error")
         terminal = publish(
             "failed",
             terminal_status="failed",
+            failure_kind=failure_kind,
             completed_at=datetime.now(timezone.utc).isoformat(),
             exit_code=1,
             error=f"{type(exc).__name__}: {exc}",

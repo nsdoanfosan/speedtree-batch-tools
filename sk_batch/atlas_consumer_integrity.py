@@ -514,6 +514,16 @@ def _asset_source_identity(receipt):
     return dict((receipt or {}).get("source_identity") or {})
 
 
+def _asset_authority_key(row):
+    """Return the exact selected authority that classified one asset."""
+    identity = row.get("source_identity") or {}
+    scope_id = str(row.get("scope_id") or "").strip().casefold()
+    producer = str(identity.get("producer_identity_sha256") or "").strip()
+    if not scope_id or not producer or identity.get("complete") is not True:
+        return None
+    return scope_id, producer
+
+
 def _selected_authorities(receipts):
     grouped = defaultdict(list)
     for receipt in receipts.get("selected") or []:
@@ -756,6 +766,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
 
     generator_material_references = defaultdict(list)
     generator_mesh_references = defaultdict(list)
+    suppressed_generator_pairs = []
     for slot in reachability["slots"]:
         material_id = slot.get("material_id")
         mesh_id = slot.get("mesh_id")
@@ -823,10 +834,24 @@ def audit_atlas_consumer_integrity(target_spm, root):
                 "Selected manifests assign Material and Mesh to different groups"
             )
         if pair_reasons:
-            add_generator_issue(
-                "generator_cross_group_pair",
-                "; ".join(pair_reasons),
-            )
+            if slot["hidden"]:
+                suppressed_generator_pairs.append({
+                    "code": "generator_cross_group_pair",
+                    "reason": "; ".join(pair_reasons),
+                    "suppression_reason": "hidden_generator_not_exported",
+                    "generator_index": slot["generator_index"],
+                    "generator_guid": slot["generator_guid"],
+                    "generator_name": slot["generator_name"],
+                    "slot_prefix": slot["slot_prefix"],
+                    "material_id": material_id,
+                    "mesh_id": mesh_id,
+                    "hidden": True,
+                })
+            else:
+                add_generator_issue(
+                    "generator_cross_group_pair",
+                    "; ".join(pair_reasons),
+                )
 
     managed_candidate_count = sum(row["managed"] for row in material_nodes) + sum(
         row["managed"] for rows in mesh_rows_by_id.values() for row in rows
@@ -926,63 +951,66 @@ def audit_atlas_consumer_integrity(target_spm, root):
             "automatic_action_eligible": eligible,
         })
 
-    # A current Atlas producer may publish several complete material groups
-    # while one exact SpeedTree target selects only a subset of those groups.
-    # Treating every asset in an entirely unselected sibling group as stale
-    # makes a coherent target impossible to export (the blackgum Cluster, for
-    # example, selects Green while preserving the current Stem/Small groups).
+    # Generator reachability is not an age signal. Current Atlas producers may
+    # publish more Materials/Mesh variants than an exact SpeedTree target
+    # selects, both across whole groups and within one group. Calling those
+    # unselected variants "stale" blocked coherent targets such as blackgum
+    # before Blender could start.
     #
-    # This exception is deliberately narrow.  It applies only when one exact
-    # producer authority is selected, another group from that same authority
-    # is live, the Material itself is unreferenced, and every Mesh owned solely
-    # by that Material is likewise unreferenced.  A partially disconnected
-    # group, mixed ownership, multiple authorities, or any integrity issue
-    # remains ambiguous and blocking.
-    selected_authorities = _selected_authorities(receipts)
-    if len(selected_authorities) == 1 and not integrity_issues:
-        authority = selected_authorities[0]
-        authority_scope = str(authority.get("scope_id") or "")
-        live_sibling = any(
-            row.get("scope_id") == authority_scope
-            and row.get("classification") in {
-                "current_reachable",
-                "current_default_cutout",
-            }
-            for row in managed_materials
-        )
-        if authority_scope and live_sibling:
-            for material in managed_materials:
-                material_id = material.get("material_id")
-                if not (
-                    material.get("scope_id") == authority_scope
-                    and material.get("classification") == "ambiguous"
-                    and material.get("orphan_reason")
-                    == "authoritative_current_unreferenced"
-                    and not material.get("generator_references")
-                ):
-                    continue
-                group_meshes = [
-                    row for row in managed_meshes
-                    if row.get("owner_material_ids") == [material_id]
-                ]
-                if not group_meshes or not all(
-                    row.get("scope_id") == authority_scope
-                    and row.get("classification") == "ambiguous"
-                    and row.get("orphan_reason")
-                    == "authoritative_current_unreferenced"
-                    and not row.get("generator_references")
-                    for row in group_meshes
-                ):
-                    continue
-                material["classification"] = "current_unused_group"
-                material["orphan_reason"] = (
-                    "authoritative_current_group_not_selected_by_generator"
+    # Preserve current unreferenced variants per asset. A SpeedTree target can
+    # legitimately consume several disjoint Atlas producers (for example leaf
+    # and bark); counting authorities for the whole target discarded the exact
+    # claim already proved for each asset and falsely blocked those consumers.
+    #
+    # No live-use condition belongs here. `receipts["selected"]` is the current
+    # exact-target authority set; retired and shadowed records are already kept
+    # elsewhere. Requiring Generator use would confuse ownership with use and
+    # would keep a legitimately selected provider's unused variants blocked.
+    # Each preserved asset must carry a complete exact selected claim; a Mesh
+    # is preserved only when every owning Material has that same exact
+    # authority. Lineage-unproven, scope-mismatched, mixed-owner, and damaged
+    # assets remain ambiguous and blocking.
+    if not integrity_issues:
+        for material in managed_materials:
+            if (
+                material.get("classification") == "ambiguous"
+                and material.get("orphan_reason")
+                == "authoritative_current_unreferenced"
+                and not material.get("generator_references")
+                and _asset_authority_key(material) is not None
+            ):
+                material["classification"] = (
+                    "current_preserved_unreferenced"
                 )
-                for row in group_meshes:
-                    row["classification"] = "current_unused_group"
-                    row["orphan_reason"] = (
-                        "authoritative_current_group_not_selected_by_generator"
-                    )
+                material["orphan_reason"] = (
+                    "authoritative_current_variant_not_selected"
+                )
+        materials_by_id = {
+            row.get("material_id"): row for row in managed_materials
+        }
+        for row in managed_meshes:
+            authority_key = _asset_authority_key(row)
+            owner_ids = list(row.get("owner_material_ids") or ())
+            owners = [materials_by_id.get(value) for value in owner_ids]
+            if (
+                row.get("classification") == "ambiguous"
+                and row.get("orphan_reason")
+                == "authoritative_current_unreferenced"
+                and not row.get("generator_references")
+                and authority_key is not None
+                and owner_ids
+                and all(
+                    owner is not None
+                    and _asset_authority_key(owner) == authority_key
+                    for owner in owners
+                )
+            ):
+                row["classification"] = (
+                    "current_preserved_unreferenced"
+                )
+                row["orphan_reason"] = (
+                    "authoritative_current_variant_not_selected"
+                )
 
     managed_assets = managed_materials + managed_meshes
     classification_counts = dict(sorted(Counter(
@@ -1016,7 +1044,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "superseded_with_proven_successor",
         "current_reachable",
         "current_default_cutout",
-        "current_unused_group",
+        "current_preserved_unreferenced",
         "protected_foreign",
     )
     for (scope_id, _identity_hash, manifest_paths), rows in sorted(
@@ -1074,6 +1102,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
             for row in blocking_assets
         ],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "review_policy": (
             "No mutation is authorized by this evidence. Only an explicit "
             "retired scope with a same-producer successor is marked eligible; "
@@ -1136,5 +1165,6 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "generations": generations,
         "generator_slots": reachability["slots"],
         "integrity_issues": integrity_issues,
+        "suppressed_generator_pairs": suppressed_generator_pairs,
         "repair_input": repair_input,
     }

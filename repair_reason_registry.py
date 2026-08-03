@@ -1,9 +1,9 @@
 """One disposition per reason code the pipeline can block on.
 
 Before this registry existed the repair planner owned 31 codes in five private
-frozensets, production emitted 199, and nothing compared the two lists.  Only
-six of the planner's codes were ever emitted by a production module, and only
-two of those six were repairable -- so `has_repair_contract_evidence()` skipped
+frozensets, the runtime-normalized scan found 226 production codes, and nothing
+compared the two lists.  The original lowercase-only scan undercounted that
+surface by 27 codes -- so `has_repair_contract_evidence()` skipped
 almost every blocked target before a plan was ever built, and the block reached
 the operator as a terminal failure with no recovery path and no record that one
 could have existed.
@@ -13,9 +13,16 @@ The registry exists so that set can never drift unobserved again:
 * `repairable`   -- the exact-target repair planner owns a recovery for it.
 * `unsupported`  -- no automatic path; the operator gets a friendly action.
 * `fatal`        -- real data damage; automatic recovery would hide it.
+* `informational`-- a fact/wrapper that cannot itself terminate a target.
 * `unclassified` -- **not decided yet.**  Seeded from the codes that were
   invisible to the contract on 2026-08-03.  A debt marker, not an answer:
   `UNCLASSIFIED_CEILING` may only ever move down.
+
+The scan now follows conditional values, reason-parameter helper calls, and
+named failure-kind sets; that expanded the statically visible surface to 307.
+It is paired with a sanitized snapshot of 20 tokens observed in durable queue
+state, because source possibility and observed runtime state catch different
+omissions.
 
 `tests/test_repair_reason_registry.py` fails when a module emits a code that is
 absent here, when a `repairable` code is never emitted (dead vocabulary -- the
@@ -32,8 +39,15 @@ REPAIRABLE = "repairable"
 UNSUPPORTED = "unsupported"
 FATAL = "fatal"
 UNCLASSIFIED = "unclassified"
+INFORMATIONAL = "informational"
 
-DISPOSITIONS = frozenset({REPAIRABLE, UNSUPPORTED, FATAL, UNCLASSIFIED})
+DISPOSITIONS = frozenset({
+    REPAIRABLE,
+    UNSUPPORTED,
+    FATAL,
+    UNCLASSIFIED,
+    INFORMATIONAL,
+})
 
 
 class ReasonRow(NamedTuple):
@@ -47,6 +61,10 @@ class ReasonRow(NamedTuple):
 REASON_REGISTRY: dict[str, ReasonRow] = {
     "access_violation_exhausted": ReasonRow(
         UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_crash",
+    ),
+    "all_export_inspection_error": ReasonRow(
+        UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
+        "export_inspection",
     ),
     "actionable_role_has_no_current_atlas_normalized_variants": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
@@ -87,6 +105,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "atlas_manifest_current": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
     ),
+    "atlas_manifest_candidate_conflict": ReasonRow(
+        UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
+        "atlas_ownership",
+    ),
     "atlas_manifest_mirror_conflict_repairable": ReasonRow(
         REPAIRABLE, "atlas_manifest_resolver.py", "atlas_manifest",
     ),
@@ -95,6 +117,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "atlas_ownership_marker_invalid": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
+    ),
+    "atlas_ownership_provenance_mismatch": ReasonRow(
+        FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
+        "atlas_integrity",
     ),
     "authoritative_property_pair_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/spm_generator_reference_repair.py", "",
@@ -192,6 +218,15 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "canonical_bark_manifest_target_missing": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),
+    "canonical_bark_ambiguous": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_authoring",
+    ),
+    "canonical_bark_missing": ReasonRow(
+        UNSUPPORTED,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_authoring",
+    ),
     "canonical_bark_material_ambiguous": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),
@@ -200,6 +235,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "canonical_bark_production_ref_not_manifest_output": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
+    ),
+    "canonical_bark_normalization_required": ReasonRow(
+        REPAIRABLE, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_refresh",
     ),
     "canonical_material_mapping_incomplete": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_canonical_outputs.py", "",
@@ -237,6 +276,27 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "cluster_missing_normalized_export_pivot": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
     ),
+    "cluster_canonical_spm_missing": ReasonRow(
+        FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_identity",
+    ),
+    "cluster_export_artifact_mismatch": ReasonRow(
+        FATAL, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_integrity",
+    ),
+    "cluster_role_conflict": ReasonRow(
+        FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_integrity",
+    ),
+    "cluster_role_handoff_blocked": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
+    ),
+    "cluster_tga_basename_invalid": ReasonRow(
+        UNSUPPORTED,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_data",
+    ),
     "communication_error": ReasonRow(
         UNCLASSIFIED, "process_lifecycle.py", "",
     ),
@@ -254,6 +314,13 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "current_unused_group": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
+    ),
+    "current_preserved_unreferenced": ReasonRow(
+        INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py",
+        "current_authority_variant",
+    ),
+    "dependency_root_reason_missing": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
     ),
     "declared_generator_slot_not_declared_exactly_once": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
@@ -273,8 +340,18 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "explicit_target_relation_off": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
+    "exact_relation_repair_failed": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_execution",
+    ),
+    "exact_target_plan_invalid": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_plan",
+    ),
     "fresh_live_export_nonparticipation": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
+    ),
+    "fbx_role_material_mesh_partial": ReasonRow(
+        FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_integrity",
     ),
     "generator_connection_all_bindings_planned_inactive": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
@@ -292,7 +369,7 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
     "generator_cross_group_pair": ReasonRow(
-        UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
+        UNSUPPORTED, "sk_batch/atlas_consumer_integrity.py", "visible_generator_pair",
     ),
     "generator_guid_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
@@ -311,6 +388,13 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "initiating_job_context_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
+    ),
+    "inactive_material_provisional_source": ReasonRow(
+        INFORMATIONAL, "sk_batch/jobs/speedtree_material_preflight.py",
+        "nonparticipating_material",
+    ),
+    "instance_profile_invalid": ReasonRow(
+        FATAL, "speedtree_pipeline_contract.py", "pipeline_contract",
     ),
     "invalid_required_roles": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
@@ -375,11 +459,17 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "material_id_unavailable": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
     ),
+    "material_canonical_name_divergence": ReasonRow(
+        FATAL, "speedtree_pipeline_contract.py", "material_contract",
+    ),
     "material_identity_not_unique": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
     ),
     "material_is_expected_to_export": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
+    ),
+    "material_intent_parse_error": ReasonRow(
+        FATAL, "speedtree_pipeline_contract.py", "material_contract",
     ),
     "material_live_binding_evidence_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
@@ -426,6 +516,26 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "not_referenced_by_generator_material_property": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
     ),
+    "normalized_generator_delivery_incomplete": ReasonRow(
+        REPAIRABLE,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "generator_cluster",
+    ),
+    "normalized_generator_node_table_stale": ReasonRow(
+        REPAIRABLE,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "modeler_node_table",
+    ),
+    "normalized_variants_required": ReasonRow(
+        REPAIRABLE,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_refresh",
+    ),
+    "normalized_variants_stale": ReasonRow(
+        REPAIRABLE,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_refresh",
+    ),
     "operational_candidate": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
     ),
@@ -433,10 +543,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
     ),
     "operator_cancelled": ReasonRow(
-        UNCLASSIFIED, "exact_target_command.py", "",
+        INFORMATIONAL, "exact_target_command.py", "lifecycle_cancelled",
     ),
     "operator_release_requested": ReasonRow(
-        UNCLASSIFIED, "shared_job_queue.py", "",
+        INFORMATIONAL, "shared_job_queue.py", "lifecycle_cancelled",
     ),
     "output_filename": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
@@ -468,6 +578,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "physical_capture_manifest_missing": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
     ),
+    "pcg_cluster_handoff_not_ready": ReasonRow(
+        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff",
+    ),
     "pipeline_retry_result_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
     ),
@@ -480,6 +594,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "production_spm_outside_manifest_asset": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
     ),
+    "preflight_error": ReasonRow(
+        UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
+        "preflight_error",
+    ),
     "protected_manual": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
@@ -491,6 +609,17 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     ),
     "publication_canceled": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_board_snapshot.py", "",
+    ),
+    "receipt_not_requested": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
+    ),
+    "receipt_persistence_failed": ReasonRow(
+        UNSUPPORTED, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_persistence",
+    ),
+    "registered_reason_has_no_exact_action": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_plan",
     ),
     "recorded_source_conflict": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
@@ -547,7 +676,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
         UNCLASSIFIED, "pcg_st9_texture_batch/stale_node_table_recovery.py", "",
     ),
     "shared_dependency_failed": ReasonRow(
-        UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "dependency_wrapper",
+    ),
+    "shared_queue_lease_owner_lost": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "lifecycle_owner_lost",
     ),
     "signature": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
@@ -600,6 +732,13 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "speedtree_timeout": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_audit.py", "",
     ),
+    "spm_mesh_file_missing": ReasonRow(
+        FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
+        "asset_missing",
+    ),
+    "spm_visible_default_material_ambiguous": ReasonRow(
+        FATAL, "sk_batch/job_report_contract.py", "material_contract",
+    ),
     "status": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),
@@ -624,6 +763,10 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "timed_out": ReasonRow(
         UNCLASSIFIED, "spm_generator_sync/process_stream.py", "",
     ),
+    "texture_set_incomplete": ReasonRow(
+        REPAIRABLE, "sk_batch/jobs/speedtree_material_preflight.py",
+        "pcg_texture",
+    ),
     "timeout": ReasonRow(
         UNCLASSIFIED, "process_lifecycle.py", "",
     ),
@@ -642,44 +785,280 @@ REASON_REGISTRY: dict[str, ReasonRow] = {
     "written": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_board_snapshot.py", "",
     ),
+    # Expanded static-scan shapes and the sanitized observed-token snapshot
+    # from PR #148.  Durable statuses and retry-routing decisions are inputs,
+    # never blocking verdicts by themselves; exact evidence failures remain
+    # loud unsupported/fatal rows.
+    "all_recovery_target_material_scopes_match_live_export": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/stale_node_table_recovery.py",
+        "recovery_verified",
+    ),
+    "ambiguous_unsuffixed_export_hierarchy": ReasonRow(
+        UNSUPPORTED, "cluster_export_handoff_contract.py", "export_hierarchy",
+    ),
+    "atlas_manifest_authority_missing": ReasonRow(
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
+    ),
+    "atlas_manifest_resolution_conflict": ReasonRow(
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
+    ),
+    "atlas_marker_kind_mismatch": ReasonRow(
+        FATAL, "sk_batch/atlas_consumer_integrity.py", "atlas_integrity",
+    ),
+    "authoring_mesh_scope_overlaps_provider_roles": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "authoring_scope_not_exact_declared_scope": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "authoritative_recovery_target_scope_hash_mismatch": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "authoritative_recovery_target_scope_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "automatic_repair_failed": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "failure_wrapper",
+    ),
+    "automatic_repair_reaudit_failed": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "failure_wrapper",
+    ),
+    "blender_cluster_bake_output_missing": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py", "blender_cluster_bake",
+    ),
+    "blender_cluster_bake_uses_derived_cache": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py", "blender_cluster_bake",
+    ),
+    "blender_output_not_current": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "canonical_output": ReasonRow(
+        INFORMATIONAL, "speedtree_texture_contract.py", "current_texture_output",
+    ),
+    "canonical_output_missing": ReasonRow(
+        REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
+    ),
+    "canonical_output_uses_derived_cache": ReasonRow(
+        REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
+    ),
+    "coherent_operational_mirror": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "current_atlas_authority",
+    ),
+    "current_blender_success": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_excluded",
+    ),
+    "current_immutable_unreal_failure": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
+    ),
+    "current_source_newer_than_outputs": ReasonRow(
+        REPAIRABLE, "pcg_st9_texture_batch/pcg_texture_gui.pyw", "pcg_texture",
+    ),
+    "data_error": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+    ),
+    "diagnostic_only_legacy_shadow": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
+    ),
+    "diagnostic_only_scope_identity_shadow": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
+    ),
+    "exported_pending_unreal": ReasonRow(
+        INFORMATIONAL, "sk_batch/jobs/send2ue_push_job.py", "durable_status",
+    ),
+    "foreign_or_manual_userdata": ReasonRow(
+        INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",
+    ),
+    "imported_ok": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest.py", "durable_status",
+    ),
+    "internal_error": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+    ),
+    "interpreter_exit": ReasonRow(
+        UNSUPPORTED, "process_lifecycle.py", "process_lifecycle",
+    ),
+    "live_export_evidence_unavailable_stale_node_table": ReasonRow(
+        REPAIRABLE, "sk_batch/sk_batch_gui.pyw", "modeler_node_table",
+    ),
+    "lineage_unproven": ReasonRow(
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
+    ),
+    "manual_required": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
+    ),
+    "missing_source_collection": ReasonRow(
+        UNSUPPORTED, "cluster_export_handoff_contract.py", "export_hierarchy",
+    ),
+    "non_retryable_returncode": ReasonRow(
+        UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_process",
+    ),
+    "normalized_delivery_evidence_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "normalized_delivery_evidence_not_current": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "not_managed": ReasonRow(
+        INFORMATIONAL, "speedtree_texture_contract.py", "unmanaged_texture",
+    ),
+    "not_run": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
+    ),
+    "not_run_unreal": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "outputs_current": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_gui.pyw", "current_texture_output",
+    ),
+    "parent_not_retryable_unreal_failure": ReasonRow(
+        UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "unreal_retry_evidence",
+    ),
+    "preflight_skip": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "durable_status",
+    ),
+    "process": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "process_timeout": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "public_exact_target_request": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/exact_target_repair.py", "request_provenance",
+    ),
+    "push_timeout": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "push_phase_evidence_missing_full_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "ready": ReasonRow(
+        INFORMATIONAL, "sk_batch/retry_planning.py", "durable_status",
+    ),
+    "recovery_blocked": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "failure_wrapper",
+    ),
+    "recovery_contract_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "recovery_target_material_scope_incomplete": ReasonRow(
+        UNSUPPORTED, "pcg_st9_texture_batch/stale_node_table_recovery.py",
+        "modeler_recovery_scope",
+    ),
+    "required_live_scope_not_authoring_subset": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "required_live_scope_not_exact_delivery_scope": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "retry_evidence_ambiguous": ReasonRow(
+        UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "retry_evidence",
+    ),
+    "rpc_timeout": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "selected_authority": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "current_atlas_authority",
+    ),
+    "shutdown": ReasonRow(
+        INFORMATIONAL, "process_lifecycle.py", "lifecycle_cancelled",
+    ),
+    "stale_target_mesh_scope_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "structured_blender_failure": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "structured_send2ue_export_failure": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "target_audit_identity_missing_or_ambiguous": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_audit_sha256_missing_or_invalid": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_has_independent_blocker": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_missing_or_ambiguous": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_not_stale_only": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_scope_counts_inconsistent": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_scope_counts_invalid": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_scope_intent_echo_mismatch": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_scope_intent_sha256_invalid": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_scope_not_explicit": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_delivery_variant_policy_not_supported": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_has_no_stale_blocking_delivery": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_recovery_dependencies_missing": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_recovery_dependency_invalid": ReasonRow(
+        FATAL, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "target_recovery_scope_empty": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
+    ),
+    "texture_source_fallback_needs_pcg_generation": ReasonRow(
+        REPAIRABLE, "sk_batch/jobs/speedtree_material_preflight.py", "pcg_texture",
+    ),
+    "unreal_dependency_requires_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "unreal_parent_evidence_incomplete_full_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "unreal_parent_evidence_invalid_full_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "unreal_parent_validation_pending": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_validation_route",
+    ),
+    "unreal_unavailable": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "durable_status",
+    ),
+    "unreal_crash": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
+    ),
+    "userdata_missing": ReasonRow(
+        INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",
+    ),
+    "userdata_not_json": ReasonRow(
+        INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",
+    ),
+    "valid": ReasonRow(
+        INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "valid_marker",
+    ),
+    "wait_cancelled": ReasonRow(
+        INFORMATIONAL, "shared_queue_runtime.py", "lifecycle_cancelled",
+    ),
 }
 
 # Seeded on 2026-08-03.  Lower it in the same commit that classifies a code;
 # never raise it.  A new block ships with a disposition or it does not ship.
-UNCLASSIFIED_CEILING = 193
+UNCLASSIFIED_CEILING = 189
 
-# Codes the repair planner claims to handle that no production module emits.
-# Each was written against an error vocabulary the pipeline does not speak,
-# which is why the planner almost never fired.  Every entry is either a real
-# code whose emitter still has to be found, or dead vocabulary to delete.
-# Shrink only.
-UNEMITTED_PLANNER_CODES = frozenset({
-    "0xc0000005",
-    "all_export_material_missing",
-    "atlas_generator_connection_missing",
-    "atlas_strict_material_binding_conflict",
-    "blender_cluster_bake_map_role_mismatch",
-    "canonical_texture_output_stale",
-    "canonical_texture_output_unmapped",
-    "canonical_texture_set_incomplete",
-    "cluster_refresh_required",
-    "cluster_relation_stale",
-    "cluster_stale",
-    "cluster_tga_basename_invalid",
-    "generator_slot_pair_drift",
-    "managed_texture_set_incomplete",
-    "managed_texture_set_stale",
-    "material_export_missing",
-    "normalized_generator_delivery_incomplete",
-    "normalized_generator_node_table_stale",
-    "normalized_prototype_zero_match",
-    "normalized_variants_required",
-    "normalized_variants_stale",
-    "process_exporter_crash",
-    "source_fallback_needs_pcg_generation",
-    "texture_set_incomplete",
-    "texture_source_fallback_needs_pcg_generation",
-})
+# The planner now derives its vocabulary exclusively from emitted registry
+# rows.  Historical aliases with no production emitter were deleted rather
+# than preserved as unreachable repair promises.
+UNEMITTED_PLANNER_CODES = frozenset()
 
 
 def disposition_of(code: str) -> str:

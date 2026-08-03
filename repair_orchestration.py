@@ -15,24 +15,35 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from repair_reason_registry import (
+    FATAL,
+    INFORMATIONAL,
+    REASON_REGISTRY,
+    REPAIRABLE,
+    UNSUPPORTED,
+)
+
 
 REPAIR_PLAN_SCHEMA_VERSION = 1
 REPAIR_RECEIPT_SCHEMA_VERSION = 1
 
 PCG_TEXTURE_TOOL = "pcg_st9_texture_batch"
 GENERATOR_SYNC_TOOL = "spm_generator_sync"
+MODELER_RECOVERY_TOOL = "speedtree_modeler"
 
 STEP3_STANDARD = "step3-standard"
 ATLAS_MANIFEST_MIRROR_REPAIR = "atlas-manifest-mirror-repair"
 GENERATOR_SYNC = "generator-sync"
 CLUSTER_REFRESH = "cluster-refresh"
 GENERATOR_SYNC_AND_CLUSTER = "generator-sync-and-cluster"
+MODELER_NODE_TABLE_RECOVERY = "modeler-node-table-recovery"
 
 STATUS_PENDING = "automatic_repair_pending"
 STATUS_TEXTURE = "pcg_texture_repair_running"
 STATUS_ATLAS = "atlas_manifest_repair_running"
 STATUS_GENERATOR = "generator_sync_running"
 STATUS_CLUSTER = "cluster_refresh_running"
+STATUS_MODELER = "modeler_node_table_recovery_running"
 STATUS_REAUDIT = "fresh_reaudit_running"
 STATUS_PIPELINE = "blender_unreal_retry_running"
 STATUS_COMPLETED = "automatic_repair_completed"
@@ -45,6 +56,7 @@ STATUS_LABELS = {
     STATUS_ATLAS: "Atlas manifest 복구 중",
     STATUS_GENERATOR: "Generator Sync 중",
     STATUS_CLUSTER: "Cluster 갱신 중",
+    STATUS_MODELER: "SpeedTree Node table 복구 중",
     STATUS_REAUDIT: "재검증 중",
     STATUS_PIPELINE: "Blender-Unreal 재시도 중",
     STATUS_COMPLETED: "자동 복구 완료",
@@ -52,81 +64,74 @@ STATUS_LABELS = {
     STATUS_CANCELLED: "자동 복구 취소",
 }
 
-# Only published reason/issue codes may select a mutation path.  Equivalent
-# official spellings can be added here without changing callers or matching
-# human error text.
-TEXTURE_REASON_CODES = frozenset({
-    "canonical_texture_output_unmapped",
-    "managed_texture_set_incomplete",
-    "canonical_texture_set_incomplete",
-    "canonical_texture_output_stale",
-    "managed_texture_set_stale",
-    "source_fallback_needs_pcg_generation",
-    "texture_set_incomplete",
-    "texture_source_fallback_needs_pcg_generation",
-})
+# The registry is the only disposition source.  Action-specific sets are
+# derived from its rows so the planner cannot drift onto vocabulary no gate
+# emits (the original implementation had 25 such dead codes).
+def _registered_codes(*, disposition=None, note=None):
+    return frozenset(
+        code for code, row in REASON_REGISTRY.items()
+        if (disposition is None or row.disposition == disposition)
+        and (note is None or row.note == note)
+    )
 
-ATLAS_MANIFEST_REPAIR_CODES = frozenset({
-    "atlas_manifest_mirror_conflict_repairable",
-})
 
-UNSUPPORTED_ATLAS_MANIFEST_CODES = frozenset({
-    "atlas_manifest_ownership_conflict",
-})
+TEXTURE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="pcg_texture",
+)
+ATLAS_MANIFEST_REPAIR_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="atlas_manifest",
+)
+GENERATOR_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="generator",
+)
+GENERATOR_AND_CLUSTER_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="generator_cluster",
+)
+CLUSTER_STALE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="cluster_refresh",
+)
+MODELER_NODE_TABLE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="modeler_node_table",
+)
 
-GENERATOR_REASON_CODES = frozenset({
-    "generator_slot_pair_drift",
-    "atlas_generator_connection_missing",
-    "normalized_prototype_zero_match",
-})
+UNSUPPORTED_ATLAS_MANIFEST_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="atlas_ownership",
+)
+UNSUPPORTED_CLUSTER_DATA_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="cluster_data",
+)
+RECIPE_GATED_REASON_CODES = _registered_codes(note="recipe_gated")
+UNSUPPORTED_EXPORT_MATERIAL_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="export_material",
+)
+UNSUPPORTED_EXPORTER_CRASH_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="exporter_crash",
+)
+UNSUPPORTED_CLUSTER_HANDOFF_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="cluster_handoff",
+)
+UNSUPPORTED_PREFLIGHT_ERROR_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="preflight_error",
+)
+UNSUPPORTED_MODELER_SCOPE_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="modeler_recovery_scope",
+)
+FATAL_MODELER_SCOPE_CODES = _registered_codes(
+    disposition=FATAL, note="modeler_recovery_scope",
+)
+UNSUPPORTED_FAILURE_WRAPPER_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="failure_wrapper",
+)
+UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="visible_generator_pair",
+)
 
-GENERATOR_AND_CLUSTER_REASON_CODES = frozenset({
-    "generator_connection_contract_incomplete",
-    "normalized_generator_delivery_incomplete",
-})
-
-CLUSTER_STALE_REASON_CODES = frozenset({
-    "cluster_stale",
-    "cluster_relation_stale",
-    "cluster_refresh_required",
-    "normalized_generator_node_table_stale",
-    "normalized_variants_required",
-    "normalized_variants_stale",
-})
-
-UNSUPPORTED_CLUSTER_DATA_CODES = frozenset({
-    "cluster_tga_basename_invalid",
-})
-
-RECIPE_GATED_REASON_CODES = frozenset({
-    "asset_cluster_bake_texture_contract_invalid",
-    "blender_cluster_bake_map_role_mismatch",
-    "atlas_strict_material_binding_conflict",
-})
-
-UNSUPPORTED_EXPORT_MATERIAL_CODES = frozenset({
-    "asset_export_material_missing",
-    "material_export_missing",
-    "all_export_material_missing",
-})
-
-UNSUPPORTED_EXPORTER_CRASH_CODES = frozenset({
-    "process_exporter_crash",
-    "access_violation_exhausted",
-    "0xc0000005",
-})
-
-ALL_REPAIR_CONTRACT_CODES = frozenset().union(
-    TEXTURE_REASON_CODES,
-    ATLAS_MANIFEST_REPAIR_CODES,
-    UNSUPPORTED_ATLAS_MANIFEST_CODES,
-    GENERATOR_REASON_CODES,
-    GENERATOR_AND_CLUSTER_REASON_CODES,
-    CLUSTER_STALE_REASON_CODES,
-    UNSUPPORTED_CLUSTER_DATA_CODES,
-    RECIPE_GATED_REASON_CODES,
-    UNSUPPORTED_EXPORT_MATERIAL_CODES,
-    UNSUPPORTED_EXPORTER_CRASH_CODES,
+FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
+UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
+REPAIRABLE_REASON_CODES = _registered_codes(disposition=REPAIRABLE)
+ALL_REPAIR_CONTRACT_CODES = frozenset(
+    code for code, row in REASON_REGISTRY.items()
+    if row.disposition != INFORMATIONAL
 )
 
 REPAIR_UI_AUTOMATIC = "automatic_repair"
@@ -147,6 +152,10 @@ REASON_LABELS_KO = {
     "atlas_generator_connection_missing": "Atlas Generator 연결이 누락되었습니다",
     "normalized_prototype_zero_match": "정규화된 prototype 연결 대상을 찾지 못했습니다",
     "generator_connection_contract_incomplete": "Generator 연결 계약이 불완전합니다",
+    "generator_cross_group_pair": "표시되는 Generator의 Material/Mesh 소유 관계가 일치하지 않습니다",
+    "atlas_manifest_authority_missing": "현재 대상의 Atlas producer 영수증이 없습니다",
+    "atlas_manifest_resolution_conflict": "현재 Atlas producer 영수증들이 서로 충돌합니다",
+    "lineage_unproven": "일부 Atlas asset의 current producer 계보가 증명되지 않았습니다",
     "normalized_generator_delivery_incomplete": "정규화된 Generator 전달이 불완전합니다",
     "cluster_stale": "Cluster 결과가 오래되었습니다",
     "cluster_relation_stale": "Cluster 관계가 오래되었습니다",
@@ -165,6 +174,9 @@ REASON_LABELS_KO = {
     "access_violation_exhausted": "SpeedTree exporter access violation 재시도가 모두 실패했습니다",
     "0xc0000005": "SpeedTree exporter에서 access violation이 발생했습니다",
     "live_export_evidence_unavailable_stale_node_table": "오래된 Node table 때문에 현재 export 연결을 증명할 수 없습니다",
+    "pcg_cluster_handoff_not_ready": "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다",
+    "preflight_error": "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다",
+    "dependency_root_reason_missing": "의존 작업의 실제 실패 원인이 영수증에서 유실되었습니다",
 }
 
 REASON_KEYS = frozenset({
@@ -445,6 +457,70 @@ def _first_nested_mapping(
     return None
 
 
+def _validated_modeler_recovery_scope(
+    evidence: Mapping[str, Any],
+    canonical: Path,
+) -> dict[str, Any] | None:
+    scope = _first_nested_mapping(evidence, "stale_node_table_recovery")
+    if not isinstance(scope, Mapping):
+        return None
+    if (
+        scope.get("available") is not True
+        or scope.get("schema_version") != 2
+        or scope.get("mode") != "owned_semantic_uia_modeler_save_watch"
+        or scope.get("scope_policy")
+        != "explicit_sealed_delivery_scopes_v1"
+        or not scope.get("target_spm")
+        or _path_key(scope["target_spm"]) != _path_key(canonical)
+    ):
+        return None
+
+    def canonical_mesh_ids(key: str) -> list[int] | None:
+        values = scope.get(key)
+        if not isinstance(values, (list, tuple)):
+            return None
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return None
+        normalized = sorted(set(values))
+        return normalized if list(values) == normalized else None
+
+    authoring_mesh_ids = canonical_mesh_ids("authoring_mesh_ids")
+    required_live_mesh_ids = canonical_mesh_ids("required_live_mesh_ids")
+    if (
+        not authoring_mesh_ids
+        or not required_live_mesh_ids
+        or not set(required_live_mesh_ids).issubset(authoring_mesh_ids)
+    ):
+        return None
+    preimage = str(scope.get("target_preimage_raw_sha256") or "").casefold()
+    if len(preimage) != 64 or any(
+        character not in "0123456789abcdef" for character in preimage
+    ):
+        return None
+    scope_sha256 = str(scope.get("scope_sha256") or "").casefold()
+    sealed = {
+        name: value for name, value in scope.items()
+        if name != "scope_sha256"
+    }
+    expected_scope_sha256 = hashlib.sha256((json.dumps(
+        sealed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n").encode("utf-8")).hexdigest()
+    if (
+        len(scope_sha256) != 64
+        or scope_sha256 != expected_scope_sha256
+    ):
+        return None
+    return copy.deepcopy(dict(scope))
+
+
 def _reason_labels_ko(codes: set[str]) -> list[str]:
     return [
         REASON_LABELS_KO[code]
@@ -512,6 +588,39 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
         if expected:
             action += " 기준 basename: " + ", ".join(expected[:4])
         return decision(REPAIR_UI_BLOCKED, reason, action)
+    if codes & UNSUPPORTED_CLUSTER_HANDOFF_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다.",
+            "handoff 영수증의 상세 원인을 확인하고 누락된 Cluster 입력 또는 bark 정규화를 완료한 뒤 다시 검사하세요.",
+        )
+    if codes & UNSUPPORTED_PREFLIGHT_ERROR_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다.",
+            "사전 검사 보고서의 원본 오류를 확인한 뒤 검사를 다시 실행하세요. BAT가 원인을 추측해 성공 처리하지 않습니다.",
+        )
+    if (
+        codes & (UNSUPPORTED_MODELER_SCOPE_CODES | FATAL_MODELER_SCOPE_CODES)
+        and not codes & MODELER_NODE_TABLE_REASON_CODES
+    ):
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "SpeedTree Node table 복구에 필요한 exact 대상 범위 증거가 없거나 손상되었습니다.",
+            "fresh live audit으로 대상 SPM, provider, Mesh ID 범위를 다시 확정한 뒤 재시도하세요.",
+        )
+    if codes & UNSUPPORTED_FAILURE_WRAPPER_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "이전 자동 복구가 실패했지만 재시도할 구체 원인이 영수증에 남지 않았습니다.",
+            "fresh audit으로 실제 원인 코드를 다시 생성한 뒤 해당 exact 복구를 재시도하세요.",
+        )
+    if codes & UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "표시되는 Generator가 해당 Material이 소유하지 않는 Mesh를 참조합니다.",
+            "오류 행의 Generator, Material ID, Mesh ID를 확인해 visible 연결을 수정한 뒤 다시 검사하세요.",
+        )
 
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     if recipe_codes and _validated_recipe(evidence) is None:
@@ -521,12 +630,23 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
             "권위 있는 current material binding recipe가 없어 BAT가 연결을 추측하지 않습니다.",
         )
 
-    if "normalized_generator_node_table_stale" in codes:
+    if codes & MODELER_NODE_TABLE_REASON_CODES:
         recovery = _first_nested_mapping(
             evidence,
             "stale_node_table_recovery",
         )
-        if not recovery or recovery.get("available") is not True:
+        recovery_target = (
+            recovery.get("target_spm")
+            if isinstance(recovery, Mapping)
+            else None
+        )
+        if (
+            not recovery_target
+            or _validated_modeler_recovery_scope(
+                evidence, Path(recovery_target)
+            )
+            is None
+        ):
             return decision(
                 REPAIR_UI_BLOCKED,
                 "SpeedTree Generator Node table이 오래되었지만 자동 저장할 exact target 범위가 증명되지 않았습니다.",
@@ -571,8 +691,8 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
     return decision(
         REPAIR_UI_BLOCKED,
-        "자동 복구 가능한 구조화 원인을 확인하지 못했습니다.",
-        "현재 검사에서 정확한 원인과 대상 증거를 다시 생성해야 합니다.",
+        "이 차단 사유에는 등록된 자동 복구 동작이 없습니다.",
+        "표시된 원인 코드와 감사 증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요.",
     )
 
 
@@ -626,6 +746,16 @@ def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[
             "덮어쓸 수 없습니다. 충돌 영수증의 두 manifest를 확인하세요.",
         )
     if codes & UNSUPPORTED_CLUSTER_DATA_CODES:
+        decision = repair_ui_decision(evidence)
+        return decision["reason"], decision["action"]
+    if codes & (
+        UNSUPPORTED_CLUSTER_HANDOFF_CODES
+        | UNSUPPORTED_PREFLIGHT_ERROR_CODES
+        | UNSUPPORTED_MODELER_SCOPE_CODES
+        | FATAL_MODELER_SCOPE_CODES
+        | UNSUPPORTED_FAILURE_WRAPPER_CODES
+        | UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES
+    ):
         decision = repair_ui_decision(evidence)
         return decision["reason"], decision["action"]
     if "atlas_strict_material_binding_conflict" in codes:
@@ -721,6 +851,7 @@ def build_exact_target_repair_plan(
     generator = bool(codes & GENERATOR_REASON_CODES)
     generator_cluster = bool(codes & GENERATOR_AND_CLUSTER_REASON_CODES)
     cluster_stale = bool(codes & CLUSTER_STALE_REASON_CODES)
+    modeler_node_table = bool(codes & MODELER_NODE_TABLE_REASON_CODES)
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     recipe = _validated_recipe(evidence) if recipe_codes else None
 
@@ -741,12 +872,16 @@ def build_exact_target_repair_plan(
                 node_table_decision["action"],
             )
 
-    if codes & (
-        UNSUPPORTED_EXPORT_MATERIAL_CODES
-        | UNSUPPORTED_EXPORTER_CRASH_CODES
-        | UNSUPPORTED_ATLAS_MANIFEST_CODES
-        | UNSUPPORTED_CLUSTER_DATA_CODES
-    ):
+    # An explicit unsupported/fatal fact always wins over a repairable token
+    # found elsewhere in the same receipt.  Unclassified tokens do not mask a
+    # proven repair action, but if no action is proven they fall through to the
+    # visible unsupported plan below instead of disappearing at admission.
+    explicit_blockers = codes & (
+        UNSUPPORTED_REASON_CODES | FATAL_REASON_CODES
+    )
+    if recipe is not None:
+        explicit_blockers.difference_update(recipe_codes)
+    if explicit_blockers:
         reason, action = _unsupported_message(codes, evidence)
         return RepairPlan(
             REPAIR_PLAN_SCHEMA_VERSION, str(request_id), str(parent_retry_id),
@@ -793,6 +928,55 @@ def build_exact_target_repair_plan(
             continue
         if _path_key(resolved) != _path_key(canonical):
             exact_clusters.append(resolved)
+
+    if modeler_node_table:
+        recovery_scope = _validated_modeler_recovery_scope(
+            evidence, canonical
+        )
+        node_provider = None
+        provider_value = evidence.get("producer_spm")
+        try:
+            if provider_value:
+                node_provider = canonical_exact_spm(
+                    provider_value,
+                    inventory,
+                    require_exists=require_exists,
+                )
+        except (FileNotFoundError, ValueError):
+            node_provider = None
+        if node_provider is None:
+            unique_clusters = {
+                _path_key(candidate): candidate
+                for candidate in exact_clusters
+            }
+            if len(unique_clusters) == 1:
+                node_provider = next(iter(unique_clusters.values()))
+        if (
+            recovery_scope is None
+            or not node_provider
+            or _path_key(node_provider) == _path_key(canonical)
+        ):
+            return RepairPlan(
+                REPAIR_PLAN_SCHEMA_VERSION,
+                str(request_id),
+                str(parent_retry_id),
+                canonical,
+                evidence_sha256,
+                tuple(sorted(codes)),
+                (),
+                False,
+                STATUS_FINAL_FAILED,
+                "Node table 자동 복구의 exact target/provider 범위를 하나로 증명하지 못했습니다.",
+                "fresh live audit로 대상 SPM과 현재 Cluster provider를 다시 확정하세요.",
+            )
+        add(
+            "modeler_node_table_recovery",
+            MODELER_RECOVERY_TOOL,
+            MODELER_NODE_TABLE_RECOVERY,
+            [canonical],
+            producer_spm=node_provider,
+            recovery_scope=copy.deepcopy(recovery_scope),
+        )
 
     needs_cluster = generator_cluster or cluster_stale or recipe is not None
     cluster_targets = []
@@ -858,7 +1042,13 @@ def build_exact_target_repair_plan(
 
 
 def has_repair_contract_evidence(evidence: Mapping[str, Any]) -> bool:
-    """Return whether evidence contains a reason owned by BAT orchestration."""
+    """Return whether evidence contains a visible repair-policy reason.
+
+    Registered unsupported, fatal and still-unclassified codes deliberately
+    enter planning so they produce an explicit row.  Informational tokens do
+    not.  This replaces the old 31-code allow-list whose miss path silently
+    ``continue``-d and made most blocked targets disappear.
+    """
 
     return bool(set(evidence_reason_codes(evidence)) & ALL_REPAIR_CONTRACT_CODES)
 
@@ -870,6 +1060,7 @@ def stage_running_status(stage: Mapping[str, Any]) -> str:
         "generator_sync": STATUS_GENERATOR,
         "generator_sync_and_cluster": STATUS_GENERATOR,
         "cluster_refresh": STATUS_CLUSTER,
+        "modeler_node_table_recovery": STATUS_MODELER,
     }.get(str(stage.get("stage") or ""), STATUS_PENDING)
 
 
@@ -918,6 +1109,8 @@ def compact_success_message(attempted_stages: Sequence[Mapping[str, Any]]) -> st
         names.append("Atlas manifest")
     if stage_names & {"generator_sync", "generator_sync_and_cluster"}:
         names.append("Generator")
+    if "modeler_node_table_recovery" in stage_names:
+        names.append("SpeedTree Node table")
     if stage_names & {"cluster_refresh", "generator_sync_and_cluster"}:
         names.append("Cluster")
     names.extend(("Blender", "Unreal"))
