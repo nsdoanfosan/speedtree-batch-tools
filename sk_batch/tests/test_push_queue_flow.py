@@ -5357,6 +5357,10 @@ class PushQueueFlowTests(unittest.TestCase):
             "blend_status": "최신 ✓",
             "push_status_kind": "imported_ok",
             "push_status": "완료 (현재 최신)",
+            "push_paths": {
+                "manifest": "successful_parent.json",
+                "checkpoint": "successful_parent_checkpoint.json",
+            },
         }
         app._failed_retry_repair_state.return_value = {
             "current": False,
@@ -5398,6 +5402,29 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(title, "전체 실패 이력 재시도")
         self.assertIn("현재 목록 전체", body)
         self.assertNotIn("선택", body)
+
+    def test_failed_results_retry_imported_ok_parent_is_not_a_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "current_imported_ok.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {
+            "push_status_kind": "imported_ok",
+            # A completed run legitimately retains these receipt paths. Their
+            # presence must not turn success into an invalid failure parent.
+            "push_paths": {
+                "manifest": "successful_parent.json",
+                "checkpoint": "successful_parent_checkpoint.json",
+            },
+        }
+
+        with mock.patch.object(gui, "messagebox") as messages:
+            app.start_failed_results_retry()
+
+        self.assertEqual(jobs, [])
+        messages.showinfo.assert_called_once()
+        self.assertIn("current Blender success 제외", app.log.call_args.args[0])
+        app._validate_failed_retry_unreal_item_current.assert_not_called()
 
     def test_failed_results_retry_empty_inventory_does_not_request_selection(self):
         gui = load_gui_module()
