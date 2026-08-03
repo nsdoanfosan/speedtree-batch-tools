@@ -121,20 +121,14 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("서로 다른 원본", blocked["reason"])
         self.assertIn("임의로 덮어쓰지 않습니다", blocked["action"])
 
-    def test_unclassified_reason_has_explicit_korean_cause_and_action(self):
+    def test_registered_unsupported_reason_has_owner_cause_and_action(self):
         decision = repair_ui_decision({
             "reason_code": "managed_mesh_owner_ambiguous",
         })
 
         self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
-        self.assertEqual(
-            decision["reason"],
-            "이 차단 사유에는 등록된 자동 복구 동작이 없습니다.",
-        )
-        self.assertEqual(
-            decision["action"],
-            "표시된 원인 코드와 감사 증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요.",
-        )
+        self.assertIn("owner scope", decision["reason"])
+        self.assertIn("Material/Mesh/Generator ID", decision["action"])
         self.assertTrue(any("가" <= ch <= "힣" for ch in decision["reason"]))
         self.assertTrue(any("가" <= ch <= "힣" for ch in decision["action"]))
 
@@ -150,8 +144,8 @@ class RepairOrchestrationTests(unittest.TestCase):
         plan = self.plan(evidence)
 
         self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
-        self.assertIn("자동 저장할 exact target 범위", decision["reason"])
-        self.assertIn("복구 범위를 다시 확정", decision["action"])
+        self.assertIn("복구에 필요한 exact 대상 범위", decision["reason"])
+        self.assertIn("Mesh ID 범위", decision["action"])
         self.assertFalse(plan.supported)
         self.assertEqual(plan.initial_status, STATUS_FINAL_FAILED)
         self.assertEqual(plan.friendly_reason, decision["reason"])
@@ -357,6 +351,23 @@ class RepairOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
 
+    def test_nonblocking_attempt_wrapper_cannot_mask_repairable_root(self):
+        evidence = {
+            "reason_token": "generator_connection_contract_incomplete",
+            "repair_attempt": {
+                "status": "not_started",
+                "reason_token": "initiating_job_context_missing",
+            },
+        }
+
+        decision = repair_ui_decision(evidence)
+
+        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
+        self.assertIn(
+            "initiating_job_context_missing",
+            decision["reason_codes"],
+        )
+
     def test_mixed_reasons_are_ordered_and_deduplicated(self):
         plan = self.plan({
             "reason_codes": [
@@ -434,7 +445,6 @@ class RepairOrchestrationTests(unittest.TestCase):
     def test_cluster_bake_mismatch_requires_authoritative_recipe(self):
         blocked = self.plan({
             "classification": "asset_cluster_bake_texture_contract_invalid",
-            "issue": "blender_cluster_bake_map_role_mismatch",
             "material_ids": ["4", "7"],
             "roles": ["base_color", "normal"],
         })
@@ -444,7 +454,6 @@ class RepairOrchestrationTests(unittest.TestCase):
 
         repaired = self.plan({
             "classification": "asset_cluster_bake_texture_contract_invalid",
-            "issue": "blender_cluster_bake_map_role_mismatch",
             "cluster_material_binding_recipe": {
                 "status": "validated",
                 "authoritative": True,
@@ -454,19 +463,19 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertTrue(repaired.supported)
         self.assertEqual(repaired.stages[0]["repair_action"], CLUSTER_REFRESH)
 
-    def test_cross_folder_binding_is_unsupported_without_recipe(self):
+    def test_historical_alias_fails_closed_without_text_dispatch(self):
         plan = self.plan({
             "reason_code": "atlas_strict_material_binding_conflict",
-            "consumer_path": "X:/one/texture/T_Leaf.png",
-            "canonical_path": "X:/two/texture/T_Leaf.png",
+            "error": "texture_set_incomplete generator_connection_contract_incomplete",
         })
         self.assertFalse(plan.supported)
-        self.assertIn("다른 에셋 폴더", plan.friendly_reason)
+        self.assertEqual(plan.stages, ())
+        self.assertIn("등록되지 않은 차단 코드", plan.friendly_reason)
+        self.assertNotIn("PCG", plan.friendly_reason)
 
     def test_export_material_and_access_violation_are_friendly_unsupported(self):
         material = self.plan({
             "classification": "asset_export_material_missing",
-            "issue_codes": ["MATERIAL_EXPORT_MISSING"],
             "missing_export_materials": ["M_leaf", "M_branch"],
         })
         self.assertFalse(material.supported)
@@ -475,9 +484,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertNotIn("obsolete", material.remaining_action.casefold())
 
         crash = self.plan({
-            "classification": "process_exporter_crash",
             "result": "access_violation_exhausted",
-            "code": "0xC0000005",
             "attempt_count": 3,
         })
         self.assertFalse(crash.supported)

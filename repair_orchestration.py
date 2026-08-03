@@ -16,11 +16,20 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from repair_reason_registry import (
+    ATLAS_MIRROR_REPAIR_PLAN,
+    BLOCKING_DISPOSITIONS,
+    BLOCKING_REASON_CODES,
+    CURRENT_MATERIAL_BINDING_RECIPE,
+    DURABLE_FAILURE_REASON_CODES,
+    EXACT_CLUSTER_PROVIDER,
     FATAL,
-    INFORMATIONAL,
-    REASON_REGISTRY,
     REPAIRABLE,
+    SEALED_MODELER_RECOVERY_SCOPE,
     UNSUPPORTED,
+    normalize_reason_code,
+    present_evidence_failure,
+    present_reason,
+    reason_row,
 )
 
 
@@ -64,129 +73,12 @@ STATUS_LABELS = {
     STATUS_CANCELLED: "자동 복구 취소",
 }
 
-# The registry is the only disposition source.  Action-specific sets are
-# derived from its rows so the planner cannot drift onto vocabulary no gate
-# emits (the original implementation had 25 such dead codes).
-def _registered_codes(*, disposition=None, note=None):
-    return frozenset(
-        code for code, row in REASON_REGISTRY.items()
-        if (disposition is None or row.disposition == disposition)
-        and (note is None or row.note == note)
-    )
-
-
-TEXTURE_REASON_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="pcg_texture",
-)
-ATLAS_MANIFEST_REPAIR_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="atlas_manifest",
-)
-GENERATOR_REASON_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="generator",
-)
-GENERATOR_AND_CLUSTER_REASON_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="generator_cluster",
-)
-CLUSTER_STALE_REASON_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="cluster_refresh",
-)
-MODELER_NODE_TABLE_REASON_CODES = _registered_codes(
-    disposition=REPAIRABLE, note="modeler_node_table",
-)
-
-UNSUPPORTED_ATLAS_MANIFEST_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="atlas_ownership",
-)
-UNSUPPORTED_CLUSTER_DATA_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="cluster_data",
-)
-RECIPE_GATED_REASON_CODES = _registered_codes(note="recipe_gated")
-UNSUPPORTED_EXPORT_MATERIAL_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="export_material",
-)
-UNSUPPORTED_EXPORTER_CRASH_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="exporter_crash",
-)
-UNSUPPORTED_CLUSTER_HANDOFF_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="cluster_handoff",
-)
-UNSUPPORTED_PREFLIGHT_ERROR_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="preflight_error",
-)
-UNSUPPORTED_MODELER_SCOPE_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="modeler_recovery_scope",
-)
-FATAL_MODELER_SCOPE_CODES = _registered_codes(
-    disposition=FATAL, note="modeler_recovery_scope",
-)
-UNSUPPORTED_FAILURE_WRAPPER_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="failure_wrapper",
-)
-UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="visible_generator_pair",
-)
-UNSUPPORTED_DURABLE_FAILURE_CODES = _registered_codes(
-    disposition=UNSUPPORTED, note="durable_failure",
-)
-DURABLE_FAILURE_REASON_CODES = UNSUPPORTED_DURABLE_FAILURE_CODES
-
-FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
-UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
-REPAIRABLE_REASON_CODES = _registered_codes(disposition=REPAIRABLE)
-ALL_REPAIR_CONTRACT_CODES = frozenset(
-    code for code, row in REASON_REGISTRY.items()
-    if row.disposition != INFORMATIONAL
-)
+# Compatibility export for callers/tests that inspect the admitted vocabulary.
+# The value itself is owned and constructed by the registry module.
+ALL_REPAIR_CONTRACT_CODES = BLOCKING_REASON_CODES
 
 REPAIR_UI_AUTOMATIC = "automatic_repair"
 REPAIR_UI_BLOCKED = "final_blocked"
-
-REASON_LABELS_KO = {
-    "canonical_texture_output_unmapped": "canonical PCG 텍스처 연결이 누락되었습니다",
-    "managed_texture_set_incomplete": "관리 대상 PCG 텍스처 세트가 불완전합니다",
-    "canonical_texture_set_incomplete": "canonical PCG 텍스처 세트가 불완전합니다",
-    "canonical_texture_output_stale": "canonical PCG 텍스처 출력이 오래되었습니다",
-    "managed_texture_set_stale": "관리 대상 PCG 텍스처 세트가 오래되었습니다",
-    "source_fallback_needs_pcg_generation": "원본 fallback에 PCG 텍스처 생성이 필요합니다",
-    "texture_set_incomplete": "텍스처 세트가 불완전합니다",
-    "texture_source_fallback_needs_pcg_generation": "텍스처 원본 fallback에 PCG 생성이 필요합니다",
-    "atlas_manifest_mirror_conflict_repairable": "동일 원본의 낡은 Atlas manifest 미러가 충돌합니다",
-    "atlas_manifest_ownership_conflict": "서로 다른 Atlas 소유권 주장이 충돌합니다",
-    "generator_slot_pair_drift": "Generator 슬롯 쌍이 현재 계약과 다릅니다",
-    "atlas_generator_connection_missing": "Atlas Generator 연결이 누락되었습니다",
-    "normalized_prototype_zero_match": "정규화된 prototype 연결 대상을 찾지 못했습니다",
-    "generator_connection_contract_incomplete": "Generator 연결 계약이 불완전합니다",
-    "generator_cross_group_pair": "표시되는 Generator의 Material/Mesh 소유 관계가 일치하지 않습니다",
-    "atlas_manifest_authority_missing": "현재 대상의 Atlas producer 영수증이 없습니다",
-    "atlas_manifest_resolution_conflict": "현재 Atlas producer 영수증들이 서로 충돌합니다",
-    "lineage_unproven": "일부 Atlas asset의 current producer 계보가 증명되지 않았습니다",
-    "normalized_generator_delivery_incomplete": "정규화된 Generator 전달이 불완전합니다",
-    "cluster_stale": "Cluster 결과가 오래되었습니다",
-    "cluster_relation_stale": "Cluster 관계가 오래되었습니다",
-    "cluster_refresh_required": "Cluster 갱신이 필요합니다",
-    "normalized_generator_node_table_stale": "SpeedTree Generator Node table이 오래되었습니다",
-    "normalized_variants_required": "필수 정규화 Cluster variant가 아직 생성되지 않았습니다",
-    "normalized_variants_stale": "정규화 Cluster variant가 현재 원본보다 오래되었습니다",
-    "cluster_tga_basename_invalid": "Cluster TGA 참조가 canonical 파일 규칙과 다릅니다",
-    "asset_cluster_bake_texture_contract_invalid": "Cluster bake 텍스처 계약이 올바르지 않습니다",
-    "blender_cluster_bake_map_role_mismatch": "Blender Cluster bake map 역할이 서로 다릅니다",
-    "atlas_strict_material_binding_conflict": "Atlas material binding이 다른 canonical 텍스처를 가리킵니다",
-    "asset_export_material_missing": "SpeedTree 내보내기에 필요한 재질이 없습니다",
-    "material_export_missing": "SpeedTree 내보내기 재질이 누락되었습니다",
-    "all_export_material_missing": "SpeedTree 내보내기 재질이 모두 누락되었습니다",
-    "process_exporter_crash": "SpeedTree exporter가 비정상 종료되었습니다",
-    "access_violation_exhausted": "SpeedTree exporter access violation 재시도가 모두 실패했습니다",
-    "0xc0000005": "SpeedTree exporter에서 access violation이 발생했습니다",
-    "live_export_evidence_unavailable_stale_node_table": "오래된 Node table 때문에 현재 export 연결을 증명할 수 없습니다",
-    "pcg_cluster_handoff_not_ready": "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다",
-    "preflight_error": "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다",
-    "dependency_root_reason_missing": "의존 작업의 실제 실패 원인이 영수증에서 유실되었습니다",
-    "dependency_output_missing": "필수 producer 산출물이 없습니다",
-    "dependency_output_stale": "필수 producer 산출물이 현재 입력보다 오래되었습니다",
-    "data_error": "작업 데이터 처리에 실패했습니다",
-    "internal_error": "BAT 내부 실행 오류가 발생했습니다",
-    "unreal_unavailable": "Unreal 실행 상태가 현재 Push 방식과 맞지 않습니다",
-}
 
 REASON_KEYS = frozenset({
     "reason",
@@ -279,7 +171,7 @@ def evidence_reason_codes(evidence: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(token, Mapping):
                 continue
             normalized = _normal_token(token)
-            if normalized:
+            if normalize_reason_code(normalized):
                 result.add(normalized)
     return tuple(sorted(result))
 
@@ -530,289 +422,144 @@ def _validated_modeler_recovery_scope(
     return copy.deepcopy(dict(scope))
 
 
-def _reason_labels_ko(codes: set[str]) -> list[str]:
-    return [
-        REASON_LABELS_KO[code]
-        for code in sorted(codes)
-        if code in REASON_LABELS_KO
+_DISPOSITION_PRIORITY = {FATAL: 0, UNSUPPORTED: 1, REPAIRABLE: 2}
+_ACTION_PRIORITY = {
+    ATLAS_MANIFEST_MIRROR_REPAIR: 0,
+    STEP3_STANDARD: 1,
+    MODELER_NODE_TABLE_RECOVERY: 2,
+    GENERATOR_SYNC: 3,
+    GENERATOR_SYNC_AND_CLUSTER: 4,
+    CLUSTER_REFRESH: 5,
+}
+
+
+def _evidence_rows(evidence: Mapping[str, Any]):
+    return tuple(
+        (code, reason_row(code))
+        for code in evidence_reason_codes(evidence)
+    )
+
+
+def _active_policy_rows(rows):
+    active = [
+        (code, row) for code, row in rows
+        if row.disposition in BLOCKING_DISPOSITIONS
     ]
+    if any(not row.fallback_only for _code, row in active):
+        active = [
+            (code, row) for code, row in active
+            if not row.fallback_only
+        ]
+    return active
+
+
+def _primary_policy_row(rows):
+    active = _active_policy_rows(rows)
+    if not active:
+        return None
+    return min(
+        active,
+        key=lambda item: (
+            _DISPOSITION_PRIORITY[item[1].disposition],
+            _ACTION_PRIORITY.get(item[1].repair_action, 99),
+            item[0],
+        ),
+    )
+
+
+def _requirement_failure(rows, evidence, canonical=None, *, check_atlas=False):
+    repairable = [row for _code, row in rows if row.disposition == REPAIRABLE]
+    requirements = {
+        requirement
+        for row in repairable
+        for requirement in row.evidence_requirements
+    }
+    failing = None
+    if CURRENT_MATERIAL_BINDING_RECIPE in requirements:
+        if _validated_recipe(evidence) is None:
+            failing = next(
+                row for row in repairable
+                if CURRENT_MATERIAL_BINDING_RECIPE in row.evidence_requirements
+            )
+    if failing is None and SEALED_MODELER_RECOVERY_SCOPE in requirements:
+        recovery = _first_nested_mapping(evidence, "stale_node_table_recovery")
+        recovery_target = (
+            recovery.get("target_spm") if isinstance(recovery, Mapping) else None
+        )
+        expected = canonical or (Path(recovery_target) if recovery_target else None)
+        if expected is None or _validated_modeler_recovery_scope(
+            evidence, Path(expected)
+        ) is None:
+            failing = next(
+                row for row in repairable
+                if SEALED_MODELER_RECOVERY_SCOPE in row.evidence_requirements
+            )
+    if failing is None and check_atlas and ATLAS_MIRROR_REPAIR_PLAN in requirements:
+        valid_plan = False
+        for _trail, value in _walk(evidence):
+            if not isinstance(value, Mapping):
+                continue
+            if (
+                str(value.get("reason_code") or "").casefold()
+                != "atlas_manifest_mirror_conflict_repairable"
+                or value.get("status") != "repairable"
+            ):
+                continue
+            target = value.get("target_spm")
+            if canonical is None or (
+                target and _path_key(target) == _path_key(canonical)
+            ):
+                valid_plan = True
+                break
+        if not valid_plan:
+            failing = next(
+                row for row in repairable
+                if ATLAS_MIRROR_REPAIR_PLAN in row.evidence_requirements
+            )
+    if failing is None:
+        return None
+    return present_evidence_failure(failing, evidence)
 
 
 def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    """Return one Korean, single-meaning operator disposition.
+    """Render the disposition, cause and action owned by the registry row."""
 
-    Stable English reason tokens remain in ``reason_codes`` for receipts and
-    diagnostics.  The visible title/reason/action never asks an operator to
-    interpret one umbrella error as both repairable and terminal.
-    """
+    codes = tuple(evidence_reason_codes(evidence))
+    rows = _evidence_rows(evidence)
+    primary = _primary_policy_row(rows)
 
-    codes = set(evidence_reason_codes(evidence))
-    labels = _reason_labels_ko(codes)
-
-    def decision(status: str, reason: str, action: str) -> dict[str, Any]:
+    def decision(status, cause, action):
         return {
             "status": status,
-            "reason": str(reason),
+            "reason": str(cause),
             "action": str(action),
             "reason_codes": tuple(sorted(codes)),
         }
 
-    if codes & UNSUPPORTED_ATLAS_MANIFEST_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "서로 다른 원본·export 범위 또는 ownership claim이 같은 Atlas 대상을 소유한다고 기록되어 있습니다.",
-            "충돌한 manifest의 원본과 소유 범위를 확인해야 하며 BAT가 한쪽을 임의로 덮어쓰지 않습니다.",
+    if primary is None:
+        row = reason_row("registered_reason_has_no_exact_action")
+        cause, action = present_reason(
+            "registered_reason_has_no_exact_action", evidence
         )
-    if codes & UNSUPPORTED_EXPORT_MATERIAL_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            labels[0] if labels else "SpeedTree 내보내기 재질이 누락되었습니다.",
-            "SpeedTree Modeler에서 해당 Generator에 재질을 지정하고 FBX/STMAT를 다시 내보내야 합니다.",
-        )
-    if codes & UNSUPPORTED_EXPORTER_CRASH_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            labels[0] if labels else "SpeedTree exporter가 반복해서 비정상 종료되었습니다.",
-            "해당 SPM의 재질과 Generator 상태를 Modeler에서 확인한 뒤 수동 export를 시험해야 합니다.",
-        )
-    if codes & UNSUPPORTED_CLUSTER_DATA_CODES:
-        missing = _detail_values(evidence, {"missing"})
-        invalid = _detail_values(evidence, {"invalid"})
-        expected = _detail_values(evidence, {"expected_base"})
-        if missing:
-            reason = "Cluster가 참조하는 TGA 파일이 없습니다: " + ", ".join(
-                missing[:8]
-            )
-        elif invalid:
-            reason = (
-                "Cluster TGA 파일명이 canonical SPM basename과 일치하지 "
-                "않습니다: " + ", ".join(invalid[:8])
-            )
-        else:
-            reason = "Cluster TGA 참조가 canonical 파일 규칙과 다릅니다."
-        action = (
-            "표시된 TGA를 복원하거나 Cluster SPM basename에 맞게 다시 "
-            "생성한 뒤 live audit을 다시 실행해야 합니다."
-        )
-        if expected:
-            action += " 기준 basename: " + ", ".join(expected[:4])
-        return decision(REPAIR_UI_BLOCKED, reason, action)
-    if codes & UNSUPPORTED_CLUSTER_HANDOFF_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다.",
-            "handoff 영수증의 상세 원인을 확인하고 누락된 Cluster 입력 또는 bark 정규화를 완료한 뒤 다시 검사하세요.",
-        )
-    if codes & UNSUPPORTED_PREFLIGHT_ERROR_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다.",
-            "사전 검사 보고서의 원본 오류를 확인한 뒤 검사를 다시 실행하세요. BAT가 원인을 추측해 성공 처리하지 않습니다.",
-        )
-    if (
-        codes & (UNSUPPORTED_MODELER_SCOPE_CODES | FATAL_MODELER_SCOPE_CODES)
-        and not codes & MODELER_NODE_TABLE_REASON_CODES
-    ):
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "SpeedTree Node table 복구에 필요한 exact 대상 범위 증거가 없거나 손상되었습니다.",
-            "fresh live audit으로 대상 SPM, provider, Mesh ID 범위를 다시 확정한 뒤 재시도하세요.",
-        )
-    if codes & UNSUPPORTED_FAILURE_WRAPPER_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "이전 자동 복구가 실패했지만 재시도할 구체 원인이 영수증에 남지 않았습니다.",
-            "fresh audit으로 실제 원인 코드를 다시 생성한 뒤 해당 exact 복구를 재시도하세요.",
-        )
-    if codes & UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            "표시되는 Generator가 해당 Material이 소유하지 않는 Mesh를 참조합니다.",
-            "오류 행의 Generator, Material ID, Mesh ID를 확인해 visible 연결을 수정한 뒤 다시 검사하세요.",
-        )
-    dependency_output_codes = {
-        "dependency_output_missing",
-        "dependency_output_stale",
-    }
-    if codes and codes.issubset(dependency_output_codes):
-        return decision(
-            REPAIR_UI_BLOCKED,
-            labels[0] if labels else "필수 producer 산출물이 current가 아닙니다.",
-            "오류 행에 표시된 producer의 exact 산출물과 content key를 다시 생성한 뒤 해당 consumer만 재검사하세요.",
-        )
-    generic_terminal_codes = {
-        "data_error",
-        "internal_error",
-        "unreal_unavailable",
-    }
-    if codes and codes.issubset(generic_terminal_codes):
-        return decision(
-            REPAIR_UI_BLOCKED,
-            labels[0] if labels else "현재 작업이 구조화된 실패로 종료되었습니다.",
-            "같은 행의 상세 증거와 report 경로에서 실제 하위 원인을 확인한 뒤 해당 대상만 다시 실행하세요.",
-        )
-
-    recipe_codes = codes & RECIPE_GATED_REASON_CODES
-    if recipe_codes and _validated_recipe(evidence) is None:
-        return decision(
-            REPAIR_UI_BLOCKED,
-            labels[0] if labels else "Cluster material binding 계약이 올바르지 않습니다.",
-            "권위 있는 current material binding recipe가 없어 BAT가 연결을 추측하지 않습니다.",
-        )
-
-    if codes & MODELER_NODE_TABLE_REASON_CODES:
-        recovery = _first_nested_mapping(
-            evidence,
-            "stale_node_table_recovery",
-        )
-        recovery_target = (
-            recovery.get("target_spm")
-            if isinstance(recovery, Mapping)
-            else None
-        )
-        if (
-            not recovery_target
-            or _validated_modeler_recovery_scope(
-                evidence, Path(recovery_target)
-            )
-            is None
-        ):
-            return decision(
-                REPAIR_UI_BLOCKED,
-                "SpeedTree Generator Node table이 오래되었지만 자동 저장할 exact target 범위가 증명되지 않았습니다.",
-                "현재 live audit에서 대상 전체의 복구 범위를 다시 확정해야 합니다.",
-            )
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            "SpeedTree Generator Node table이 오래되었고 exact target 자동 복구 범위가 확인되었습니다.",
-            "BAT가 소유한 Modeler 세션에서 해당 SPM만 다시 저장하고 live audit을 재실행합니다.",
-        )
-
-    if codes & ATLAS_MANIFEST_REPAIR_CODES:
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            "동일 원본의 낡은 Atlas manifest 미러가 exact authority와 충돌합니다.",
-            "exact BAT가 낡은 미러만 갱신하고 Canonical PCG → Atlas 계약을 다시 검사합니다.",
-        )
-    if codes & TEXTURE_REASON_CODES:
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            labels[0] if labels else "canonical PCG 텍스처 복구가 필요합니다.",
-            "exact PCG BAT로 해당 대상의 텍스처만 복구한 뒤 material preflight를 다시 실행합니다.",
-        )
-    if codes & GENERATOR_AND_CLUSTER_REASON_CODES:
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            labels[0] if labels else "Generator 전달과 Cluster 관계 갱신이 필요합니다.",
-            "exact Generator Sync와 Cluster 갱신을 순서대로 실행한 뒤 live delivery를 다시 검사합니다.",
-        )
-    if codes & GENERATOR_REASON_CODES:
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            labels[0] if labels else "Generator Sync가 필요합니다.",
-            "exact Generator Sync를 실행하고 현재 연결을 다시 검사합니다.",
-        )
-    if codes & CLUSTER_STALE_REASON_CODES or recipe_codes:
-        return decision(
-            REPAIR_UI_AUTOMATIC,
-            labels[0] if labels else "Cluster 갱신이 필요합니다.",
-            "exact Cluster 관계를 갱신한 뒤 현재 결과를 다시 검사합니다.",
-        )
-
-    return decision(
-        REPAIR_UI_BLOCKED,
-        "이 차단 사유에는 등록된 자동 복구 동작이 없습니다.",
-        "표시된 원인 코드와 감사 증거를 확인해 원본 문제를 수정한 뒤 다시 검사하세요.",
-    )
-
-
-def _detail_values(evidence: Mapping[str, Any], keys: set[str]) -> list[str]:
-    values = []
-    seen = set()
-    for trail, value in _walk(evidence):
-        if not trail or trail[-1].casefold() not in keys:
-            continue
-        children = value if isinstance(value, (list, tuple, set)) else (value,)
-        for child in children:
-            if isinstance(child, (str, int, float)):
-                text = str(child).strip()
-                if text and text.casefold() not in seen:
-                    seen.add(text.casefold())
-                    values.append(text)
-    return values
+        return decision(REPAIR_UI_BLOCKED, cause, action)
+    code, row = primary
+    cause, action = present_reason(code, evidence)
+    if row.disposition != REPAIRABLE:
+        return decision(REPAIR_UI_BLOCKED, cause, action)
+    failed = _requirement_failure(rows, evidence)
+    if failed is not None:
+        return decision(REPAIR_UI_BLOCKED, *failed)
+    return decision(REPAIR_UI_AUTOMATIC, cause, action)
 
 
 def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[str, str]:
-    if codes & UNSUPPORTED_EXPORT_MATERIAL_CODES:
-        materials = _detail_values(
-            evidence,
-            {
-                "material",
-                "material_name",
-                "material_names",
-                "active_material_names",
-                "export_visible_materials",
-                "missing_export_materials",
-            },
-        )
-        suffix = f" 대상 재질: {', '.join(materials[:8])}." if materials else ""
-        return (
-            "SpeedTree 내보내기에 재질이 없습니다.",
-            "Modeler에서 표시된 재질을 Generator에 다시 지정/확인하고 "
-            "재질을 포함해 FBX/STMAT를 내보낸 뒤 다시 실행하세요." + suffix,
-        )
-    if codes & UNSUPPORTED_EXPORTER_CRASH_CODES:
-        attempts = _detail_values(evidence, {"attempt_count", "attempts"})
-        attempt_text = attempts[0] if attempts else "3"
-        return (
-            f"SpeedTree exporter가 access violation으로 {attempt_text}회 종료되었습니다.",
-            "Modeler에서 이 exact asset이 정상적으로 열리고 재질/Generator가 "
-            "유효한지 확인한 뒤 수동 export를 시험하세요.",
-        )
-    if codes & UNSUPPORTED_ATLAS_MANIFEST_CODES:
-        return (
-            "Atlas operational manifest ownership이 서로 다릅니다.",
-            "서로 다른 source/export scope 또는 ownership claim을 자동으로 "
-            "덮어쓸 수 없습니다. 충돌 영수증의 두 manifest를 확인하세요.",
-        )
-    if codes & UNSUPPORTED_CLUSTER_DATA_CODES:
-        decision = repair_ui_decision(evidence)
-        return decision["reason"], decision["action"]
-    if codes & (
-        UNSUPPORTED_CLUSTER_HANDOFF_CODES
-        | UNSUPPORTED_PREFLIGHT_ERROR_CODES
-        | UNSUPPORTED_MODELER_SCOPE_CODES
-        | FATAL_MODELER_SCOPE_CODES
-        | UNSUPPORTED_FAILURE_WRAPPER_CODES
-        | UNSUPPORTED_VISIBLE_GENERATOR_PAIR_CODES
-    ):
-        decision = repair_ui_decision(evidence)
-        return decision["reason"], decision["action"]
-    if "atlas_strict_material_binding_conflict" in codes:
-        return (
-            "실제 소비 texture가 다른 에셋 폴더의 canonical texture와 연결되어 있습니다.",
-            "공식 canonical binding provenance/recipe를 확정한 뒤 exact repair를 다시 실행하세요.",
-        )
-    if codes & {
-        "asset_cluster_bake_texture_contract_invalid",
-        "blender_cluster_bake_map_role_mismatch",
-    }:
-        material_ids = _detail_values(evidence, {"material_id", "material_ids"})
-        roles = _detail_values(evidence, {"role", "roles", "map_role", "map_roles"})
-        details = []
-        if material_ids:
-            details.append("material IDs " + ", ".join(material_ids[:8]))
-        if roles:
-            details.append("roles " + ", ".join(roles[:8]))
-        suffix = f" ({'; '.join(details)})" if details else ""
-        return (
-            "실제 소비 texture map과 finalized cluster bake map 역할이 다릅니다" + suffix + ".",
-            "공식 material binding recipe를 확정한 뒤 Cluster exact refresh를 다시 실행하세요.",
-        )
-    return (
-        "자동 BAT 복구 경로를 증명할 수 없습니다.",
-        "상세 reason code와 audit evidence를 확인한 뒤 원본 authoring 문제를 수정하세요.",
+    primary = _primary_policy_row(
+        tuple((code, reason_row(code)) for code in sorted(codes))
     )
+    if primary is None:
+        row = reason_row("registered_reason_has_no_exact_action")
+        return present_reason("registered_reason_has_no_exact_action", evidence)
+    return present_reason(primary[0], evidence)
 
 
 @dataclass(frozen=True)
@@ -852,6 +599,12 @@ def build_exact_target_repair_plan(
         require_exists=require_exists,
     )
     codes = set(evidence_reason_codes(evidence))
+    rows = tuple((code, reason_row(code)) for code in sorted(codes))
+    active_rows = tuple(_active_policy_rows(rows))
+    repairable_rows = tuple(
+        row for _code, row in active_rows if row.disposition == REPAIRABLE
+    )
+    repair_actions = {row.repair_action for row in repairable_rows}
     evidence_sha256 = _json_digest(evidence)
     stages: list[dict] = []
 
@@ -876,45 +629,30 @@ def build_exact_target_repair_plan(
             **extra,
         })
 
-    texture = bool(codes & TEXTURE_REASON_CODES)
-    atlas_manifest = bool(codes & ATLAS_MANIFEST_REPAIR_CODES)
-    generator = bool(codes & GENERATOR_REASON_CODES)
-    generator_cluster = bool(codes & GENERATOR_AND_CLUSTER_REASON_CODES)
-    cluster_stale = bool(codes & CLUSTER_STALE_REASON_CODES)
-    modeler_node_table = bool(codes & MODELER_NODE_TABLE_REASON_CODES)
-    recipe_codes = codes & RECIPE_GATED_REASON_CODES
-    recipe = _validated_recipe(evidence) if recipe_codes else None
-
-    if "normalized_generator_node_table_stale" in codes:
-        node_table_decision = repair_ui_decision(evidence)
-        if node_table_decision["status"] == REPAIR_UI_BLOCKED:
-            return RepairPlan(
-                REPAIR_PLAN_SCHEMA_VERSION,
-                str(request_id),
-                str(parent_retry_id),
-                canonical,
-                evidence_sha256,
-                tuple(sorted(codes)),
-                (),
-                False,
-                STATUS_FINAL_FAILED,
-                node_table_decision["reason"],
-                node_table_decision["action"],
-            )
-
-    # An explicit unsupported/fatal fact always wins over a repairable token
-    # found elsewhere in the same receipt.  Unclassified tokens do not mask a
-    # proven repair action, but if no action is proven they fall through to the
-    # visible unsupported plan below instead of disappearing at admission.
-    explicit_blockers = codes & (
-        UNSUPPORTED_REASON_CODES | FATAL_REASON_CODES
+    texture = STEP3_STANDARD in repair_actions
+    atlas_manifest = ATLAS_MANIFEST_MIRROR_REPAIR in repair_actions
+    generator = GENERATOR_SYNC in repair_actions
+    generator_cluster = GENERATOR_SYNC_AND_CLUSTER in repair_actions
+    cluster_stale = CLUSTER_REFRESH in repair_actions
+    modeler_node_table = MODELER_NODE_TABLE_RECOVERY in repair_actions
+    requirements = {
+        requirement
+        for row in repairable_rows
+        for requirement in row.evidence_requirements
+    }
+    recipe = (
+        _validated_recipe(evidence)
+        if CURRENT_MATERIAL_BINDING_RECIPE in requirements
+        else None
     )
-    if codes - UNSUPPORTED_DURABLE_FAILURE_CODES:
-        explicit_blockers.difference_update(
-            UNSUPPORTED_DURABLE_FAILURE_CODES
-        )
-    if recipe is not None:
-        explicit_blockers.difference_update(recipe_codes)
+
+    # The registry row is the only disposition authority.  Unknown runtime
+    # codes resolve to a synthetic unsupported row, so they cannot disappear
+    # even before the source-coverage CI catches the missing registration.
+    explicit_blockers = [
+        (code, row) for code, row in active_rows
+        if row.disposition in {UNSUPPORTED, FATAL}
+    ]
     if explicit_blockers:
         reason, action = _unsupported_message(codes, evidence)
         return RepairPlan(
@@ -922,8 +660,15 @@ def build_exact_target_repair_plan(
             canonical, evidence_sha256, tuple(sorted(codes)), (), False,
             STATUS_FINAL_FAILED, reason, action,
         )
-    if recipe_codes and recipe is None:
-        reason, action = _unsupported_message(codes, evidence)
+
+    failed_requirement = _requirement_failure(
+        rows,
+        evidence,
+        canonical,
+        check_atlas=True,
+    )
+    if failed_requirement is not None:
+        reason, action = failed_requirement
         return RepairPlan(
             REPAIR_PLAN_SCHEMA_VERSION, str(request_id), str(parent_retry_id),
             canonical, evidence_sha256, tuple(sorted(codes)), (), False,
@@ -947,7 +692,7 @@ def build_exact_target_repair_plan(
         )
 
     cluster_candidates = list(_cluster_paths_for_exact(evidence, canonical))
-    if recipe is not None:
+    if CURRENT_MATERIAL_BINDING_RECIPE in requirements and recipe is not None:
         cluster_candidates.extend(_candidate_paths(recipe, cluster_only=False))
     inventory = list(inventory_paths)
     exact_clusters = []
@@ -990,6 +735,11 @@ def build_exact_target_repair_plan(
             or not node_provider
             or _path_key(node_provider) == _path_key(canonical)
         ):
+            failing = next(
+                row for row in repairable_rows
+                if EXACT_CLUSTER_PROVIDER in row.evidence_requirements
+            )
+            reason, action = present_evidence_failure(failing, evidence)
             return RepairPlan(
                 REPAIR_PLAN_SCHEMA_VERSION,
                 str(request_id),
@@ -1000,8 +750,8 @@ def build_exact_target_repair_plan(
                 (),
                 False,
                 STATUS_FINAL_FAILED,
-                "Node table 자동 복구의 exact target/provider 범위를 하나로 증명하지 못했습니다.",
-                "fresh live audit로 대상 SPM과 현재 Cluster provider를 다시 확정하세요.",
+                reason,
+                action,
             )
         add(
             "modeler_node_table_recovery",
@@ -1012,22 +762,23 @@ def build_exact_target_repair_plan(
             recovery_scope=copy.deepcopy(recovery_scope),
         )
 
-    needs_cluster = generator_cluster or cluster_stale or recipe is not None
+    needs_cluster = generator_cluster or cluster_stale
     cluster_targets = []
     if needs_cluster:
         cluster_targets = exact_clusters or (
-            [canonical] if cluster_stale or recipe is not None else []
+            [canonical] if cluster_stale else []
         )
         if not cluster_targets:
-            reason = (
-                "Generator repair에는 canonical Cluster 관계가 필요하지만 "
-                "durable audit evidence에서 exact target을 증명하지 못했습니다."
+            primary = _primary_policy_row(rows)
+            row = primary[1] if primary is not None else reason_row(
+                "registered_reason_has_no_exact_action"
             )
+            reason, action = present_evidence_failure(row, evidence)
             return RepairPlan(
                 REPAIR_PLAN_SCHEMA_VERSION, str(request_id), str(parent_retry_id),
                 canonical, evidence_sha256, tuple(sorted(codes)), (), False,
                 STATUS_FINAL_FAILED, reason,
-                "fresh audit로 canonical Cluster identity/provenance를 다시 생성하세요.",
+                action,
             )
     if (generator or generator_cluster) and needs_cluster:
         add(
@@ -1078,13 +829,16 @@ def build_exact_target_repair_plan(
 def has_repair_contract_evidence(evidence: Mapping[str, Any]) -> bool:
     """Return whether evidence contains a visible repair-policy reason.
 
-    Registered unsupported, fatal and still-unclassified codes deliberately
+    Registered unsupported/fatal codes and unknown runtime tokens deliberately
     enter planning so they produce an explicit row.  Informational tokens do
-    not.  This replaces the old 31-code allow-list whose miss path silently
+    not.  This replaces the old allow-list whose miss path silently
     ``continue``-d and made most blocked targets disappear.
     """
 
-    return bool(set(evidence_reason_codes(evidence)) & ALL_REPAIR_CONTRACT_CODES)
+    return any(
+        reason_row(code).disposition in BLOCKING_DISPOSITIONS
+        for code in evidence_reason_codes(evidence)
+    )
 
 
 def stage_running_status(stage: Mapping[str, Any]) -> str:

@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 from repair_orchestration import REASON_KEYS
+from repair_reason_registry import REASON_CODE_TOKEN
 
 REPO_DIR = Path(__file__).resolve().parent
 
@@ -30,7 +31,7 @@ SKIP_PARTS = frozenset({
 
 # A reason code is an identifier-shaped token.  The same fields also carry
 # prose, paths and rendered messages, and none of those are contract tokens.
-CODE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{2,60}$")
+CODE_TOKEN = REASON_CODE_TOKEN
 
 # Local names that hold a list of reason codes before it is written into an
 # evidence field, so `issues.append("...")` is reached as well.
@@ -62,6 +63,8 @@ _REASON_ARGUMENT_NAMES = frozenset({
     "reason_token",
     "failure_kind",
     "terminal_reason",
+    "default_token",
+    "default_reason_token",
 })
 
 
@@ -122,6 +125,20 @@ def scan_module(path: Path) -> set[str]:
             reason_function_args.setdefault(definition.name, set()).update(
                 indexes
             )
+        defaults = definition.args.defaults
+        if defaults:
+            for argument, default in zip(positional[-len(defaults):], defaults):
+                if argument.arg.casefold() in _REASON_ARGUMENT_NAMES:
+                    found.update(_string_constants(default))
+        for argument, default in zip(
+            definition.args.kwonlyargs,
+            definition.args.kw_defaults,
+        ):
+            if (
+                default is not None
+                and argument.arg.casefold() in _REASON_ARGUMENT_NAMES
+            ):
+                found.update(_string_constants(default))
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values):
@@ -129,7 +146,11 @@ def scan_module(path: Path) -> set[str]:
                     found.update(_string_constants(value))
         elif isinstance(node, ast.Call):
             for keyword in node.keywords:
-                if _is_reason_key(keyword.arg):
+                if (
+                    _is_reason_key(keyword.arg)
+                    or str(keyword.arg or "").casefold()
+                    in _REASON_ARGUMENT_NAMES
+                ):
                     found.update(_string_constants(keyword.value))
             function = node.func
             if (

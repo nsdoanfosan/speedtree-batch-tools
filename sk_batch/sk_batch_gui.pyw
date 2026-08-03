@@ -5697,6 +5697,10 @@ class App:
             item = targets_by_id.get(iid)
             attempted = []
             if item is None:
+                missing_decision = repair_ui_decision({
+                    "reason_token": "repair_inventory_target_missing",
+                    "evidence": {"plan": copy.deepcopy(plan)},
+                })
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
@@ -5708,8 +5712,8 @@ class App:
                     iid,
                     STATUS_FINAL_FAILED,
                     plan=plan,
-                    friendly_reason="자동 복구 대상이 current inventory에서 사라졌습니다.",
-                    remaining_action="목록을 다시 검사한 뒤 재시도하세요.",
+                    friendly_reason=missing_decision["reason"],
+                    remaining_action=missing_decision["action"],
                 )
                 continue
 
@@ -5847,11 +5851,20 @@ class App:
             if failed is not None:
                 headline, raw_error = failed
                 reaudit_failed = headline == "fresh re-audit failed"
-                friendly = (
-                    "자동 복구 단계가 끝났지만 fresh re-audit를 통과하지 못했습니다."
+                failure_token = (
+                    "automatic_repair_reaudit_failed"
                     if reaudit_failed
-                    else "exact BAT 자동 복구가 완료되지 않았습니다."
+                    else "automatic_repair_failed"
                 )
+                failure_evidence = {
+                    "attempted_stages": copy.deepcopy(attempted),
+                    "raw_error": raw_error,
+                    "reason_codes": list(plan.get("reason_codes") or ()),
+                }
+                failure_decision = repair_ui_decision({
+                    "reason_token": failure_token,
+                    "evidence": failure_evidence,
+                })
                 self._set_failed_retry_automatic_status(
                     iid,
                     STATUS_FINAL_FAILED,
@@ -5861,25 +5874,15 @@ class App:
                         row.get("status") == "completed" for row in attempted
                     ),
                     error=raw_error,
-                    friendly_reason=friendly,
-                    remaining_action=(
-                        "receipt와 원래 reason code를 확인하고 해당 authoring 문제를 수정하세요."
-                    ),
+                    friendly_reason=failure_decision["reason"],
+                    remaining_action=failure_decision["action"],
                 )
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
                     "outcome": "failed",
-                    "reason_token": (
-                        "automatic_repair_reaudit_failed"
-                        if reaudit_failed
-                        else "automatic_repair_failed"
-                    ),
-                    "evidence": {
-                        "attempted_stages": copy.deepcopy(attempted),
-                        "raw_error": raw_error,
-                        "reason_codes": list(plan.get("reason_codes") or ()),
-                    },
+                    "reason_token": failure_token,
+                    "evidence": failure_evidence,
                 })
                 continue
             self._set_failed_retry_automatic_status(
@@ -6058,10 +6061,18 @@ class App:
                         }
                 else:
                     evidence = copy.deepcopy(pipeline_row.get("evidence") or {})
+                    retry_token = str(
+                        pipeline_row.get("reason_token")
+                        or "pipeline_retry_result_missing"
+                    )
+                    retry_decision = repair_ui_decision({
+                        "reason_token": retry_token,
+                        "evidence": evidence,
+                    })
                     raw_error = str(
                         evidence.get("message")
                         or evidence.get("raw_error")
-                        or pipeline_row.get("reason_token")
+                        or retry_token
                         or "pipeline retry failed"
                     )
                     self._set_failed_retry_automatic_status(
@@ -6071,13 +6082,8 @@ class App:
                         attempted_stages=attempted,
                         completed_stages=len(attempted),
                         error=raw_error,
-                        friendly_reason=(
-                            "BAT 복구와 fresh re-audit는 통과했지만 "
-                            "Blender/Unreal 재시도가 완료되지 않았습니다."
-                        ),
-                        remaining_action=(
-                            "상세 pipeline receipt를 확인한 뒤 남은 단계를 다시 실행하세요."
-                        ),
+                        friendly_reason=retry_decision["reason"],
+                        remaining_action=retry_decision["action"],
                     )
                 outcomes.append(pipeline_row or {
                     "target": iid,

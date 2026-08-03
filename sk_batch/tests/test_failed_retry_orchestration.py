@@ -611,7 +611,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         app._enqueue_batch_job.assert_called_once_with(job)
         tracker.complete_planning_commit.assert_called_once_with()
 
-    def test_unclassified_reason_is_visible_instead_of_silent_continue(self):
+    def test_unsupported_reason_is_visible_instead_of_silent_continue(self):
         gui = load_gui_module()
         app = self.app(gui)
         iid = str(self.first)
