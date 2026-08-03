@@ -50,8 +50,13 @@ _ISSUE_FUNCTION = re.compile(r"(issue|reason|block|exclusion)", re.IGNORECASE)
 
 def _string_constants(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        if CODE_TOKEN.match(node.value):
-            yield node.value
+        # Runtime extraction normalizes evidence tokens with ``casefold()``.
+        # The source scan must do the same or uppercase issue constants such
+        # as NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE disappear from the
+        # ledger even though the planner receives their lowercase form.
+        normalized = node.value.strip().casefold()
+        if CODE_TOKEN.match(normalized):
+            yield normalized
     elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         for element in node.elts:
             yield from _string_constants(element)

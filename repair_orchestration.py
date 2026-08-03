@@ -15,6 +15,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from repair_reason_registry import (
+    FATAL,
+    INFORMATIONAL,
+    REASON_REGISTRY,
+    REPAIRABLE,
+    UNSUPPORTED,
+)
+
 
 REPAIR_PLAN_SCHEMA_VERSION = 1
 REPAIR_RECEIPT_SCHEMA_VERSION = 1
@@ -52,81 +60,59 @@ STATUS_LABELS = {
     STATUS_CANCELLED: "자동 복구 취소",
 }
 
-# Only published reason/issue codes may select a mutation path.  Equivalent
-# official spellings can be added here without changing callers or matching
-# human error text.
-TEXTURE_REASON_CODES = frozenset({
-    "canonical_texture_output_unmapped",
-    "managed_texture_set_incomplete",
-    "canonical_texture_set_incomplete",
-    "canonical_texture_output_stale",
-    "managed_texture_set_stale",
-    "source_fallback_needs_pcg_generation",
-    "texture_set_incomplete",
-    "texture_source_fallback_needs_pcg_generation",
-})
+# The registry is the only disposition source.  Action-specific sets are
+# derived from its rows so the planner cannot drift onto vocabulary no gate
+# emits (the original implementation had 25 such dead codes).
+def _registered_codes(*, disposition=None, note=None):
+    return frozenset(
+        code for code, row in REASON_REGISTRY.items()
+        if (disposition is None or row.disposition == disposition)
+        and (note is None or row.note == note)
+    )
 
-ATLAS_MANIFEST_REPAIR_CODES = frozenset({
-    "atlas_manifest_mirror_conflict_repairable",
-})
 
-UNSUPPORTED_ATLAS_MANIFEST_CODES = frozenset({
-    "atlas_manifest_ownership_conflict",
-})
+TEXTURE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="pcg_texture",
+)
+ATLAS_MANIFEST_REPAIR_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="atlas_manifest",
+)
+GENERATOR_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="generator",
+)
+GENERATOR_AND_CLUSTER_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="generator_cluster",
+)
+CLUSTER_STALE_REASON_CODES = _registered_codes(
+    disposition=REPAIRABLE, note="cluster_refresh",
+)
 
-GENERATOR_REASON_CODES = frozenset({
-    "generator_slot_pair_drift",
-    "atlas_generator_connection_missing",
-    "normalized_prototype_zero_match",
-})
+UNSUPPORTED_ATLAS_MANIFEST_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="atlas_ownership",
+)
+UNSUPPORTED_CLUSTER_DATA_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="cluster_data",
+)
+RECIPE_GATED_REASON_CODES = _registered_codes(note="recipe_gated")
+UNSUPPORTED_EXPORT_MATERIAL_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="export_material",
+)
+UNSUPPORTED_EXPORTER_CRASH_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="exporter_crash",
+)
+UNSUPPORTED_CLUSTER_HANDOFF_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="cluster_handoff",
+)
+UNSUPPORTED_PREFLIGHT_ERROR_CODES = _registered_codes(
+    disposition=UNSUPPORTED, note="preflight_error",
+)
 
-GENERATOR_AND_CLUSTER_REASON_CODES = frozenset({
-    "generator_connection_contract_incomplete",
-    "normalized_generator_delivery_incomplete",
-})
-
-CLUSTER_STALE_REASON_CODES = frozenset({
-    "cluster_stale",
-    "cluster_relation_stale",
-    "cluster_refresh_required",
-    "normalized_generator_node_table_stale",
-    "normalized_variants_required",
-    "normalized_variants_stale",
-})
-
-UNSUPPORTED_CLUSTER_DATA_CODES = frozenset({
-    "cluster_tga_basename_invalid",
-})
-
-RECIPE_GATED_REASON_CODES = frozenset({
-    "asset_cluster_bake_texture_contract_invalid",
-    "blender_cluster_bake_map_role_mismatch",
-    "atlas_strict_material_binding_conflict",
-})
-
-UNSUPPORTED_EXPORT_MATERIAL_CODES = frozenset({
-    "asset_export_material_missing",
-    "material_export_missing",
-    "all_export_material_missing",
-})
-
-UNSUPPORTED_EXPORTER_CRASH_CODES = frozenset({
-    "process_exporter_crash",
-    "access_violation_exhausted",
-    "0xc0000005",
-})
-
-ALL_REPAIR_CONTRACT_CODES = frozenset().union(
-    TEXTURE_REASON_CODES,
-    ATLAS_MANIFEST_REPAIR_CODES,
-    UNSUPPORTED_ATLAS_MANIFEST_CODES,
-    GENERATOR_REASON_CODES,
-    GENERATOR_AND_CLUSTER_REASON_CODES,
-    CLUSTER_STALE_REASON_CODES,
-    UNSUPPORTED_CLUSTER_DATA_CODES,
-    RECIPE_GATED_REASON_CODES,
-    UNSUPPORTED_EXPORT_MATERIAL_CODES,
-    UNSUPPORTED_EXPORTER_CRASH_CODES,
+FATAL_REASON_CODES = _registered_codes(disposition=FATAL)
+UNSUPPORTED_REASON_CODES = _registered_codes(disposition=UNSUPPORTED)
+REPAIRABLE_REASON_CODES = _registered_codes(disposition=REPAIRABLE)
+ALL_REPAIR_CONTRACT_CODES = frozenset(
+    code for code, row in REASON_REGISTRY.items()
+    if row.disposition != INFORMATIONAL
 )
 
 REPAIR_UI_AUTOMATIC = "automatic_repair"
@@ -165,6 +151,9 @@ REASON_LABELS_KO = {
     "access_violation_exhausted": "SpeedTree exporter access violation 재시도가 모두 실패했습니다",
     "0xc0000005": "SpeedTree exporter에서 access violation이 발생했습니다",
     "live_export_evidence_unavailable_stale_node_table": "오래된 Node table 때문에 현재 export 연결을 증명할 수 없습니다",
+    "pcg_cluster_handoff_not_ready": "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다",
+    "preflight_error": "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다",
+    "dependency_root_reason_missing": "의존 작업의 실제 실패 원인이 영수증에서 유실되었습니다",
 }
 
 REASON_KEYS = frozenset({
@@ -512,6 +501,18 @@ def repair_ui_decision(evidence: Mapping[str, Any]) -> dict[str, Any]:
         if expected:
             action += " 기준 basename: " + ", ".join(expected[:4])
         return decision(REPAIR_UI_BLOCKED, reason, action)
+    if codes & UNSUPPORTED_CLUSTER_HANDOFF_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다.",
+            "handoff 영수증의 상세 원인을 확인하고 누락된 Cluster 입력 또는 bark 정규화를 완료한 뒤 다시 검사하세요.",
+        )
+    if codes & UNSUPPORTED_PREFLIGHT_ERROR_CODES:
+        return decision(
+            REPAIR_UI_BLOCKED,
+            "SpeedTree 재질 사전 검사 자체가 완료되지 않았습니다.",
+            "사전 검사 보고서의 원본 오류를 확인한 뒤 검사를 다시 실행하세요. BAT가 원인을 추측해 성공 처리하지 않습니다.",
+        )
 
     recipe_codes = codes & RECIPE_GATED_REASON_CODES
     if recipe_codes and _validated_recipe(evidence) is None:
@@ -628,6 +629,12 @@ def _unsupported_message(codes: set[str], evidence: Mapping[str, Any]) -> tuple[
     if codes & UNSUPPORTED_CLUSTER_DATA_CODES:
         decision = repair_ui_decision(evidence)
         return decision["reason"], decision["action"]
+    if codes & (
+        UNSUPPORTED_CLUSTER_HANDOFF_CODES
+        | UNSUPPORTED_PREFLIGHT_ERROR_CODES
+    ):
+        decision = repair_ui_decision(evidence)
+        return decision["reason"], decision["action"]
     if "atlas_strict_material_binding_conflict" in codes:
         return (
             "실제 소비 texture가 다른 에셋 폴더의 canonical texture와 연결되어 있습니다.",
@@ -741,12 +748,16 @@ def build_exact_target_repair_plan(
                 node_table_decision["action"],
             )
 
-    if codes & (
-        UNSUPPORTED_EXPORT_MATERIAL_CODES
-        | UNSUPPORTED_EXPORTER_CRASH_CODES
-        | UNSUPPORTED_ATLAS_MANIFEST_CODES
-        | UNSUPPORTED_CLUSTER_DATA_CODES
-    ):
+    # An explicit unsupported/fatal fact always wins over a repairable token
+    # found elsewhere in the same receipt.  Unclassified tokens do not mask a
+    # proven repair action, but if no action is proven they fall through to the
+    # visible unsupported plan below instead of disappearing at admission.
+    explicit_blockers = codes & (
+        UNSUPPORTED_REASON_CODES | FATAL_REASON_CODES
+    )
+    if recipe is not None:
+        explicit_blockers.difference_update(recipe_codes)
+    if explicit_blockers:
         reason, action = _unsupported_message(codes, evidence)
         return RepairPlan(
             REPAIR_PLAN_SCHEMA_VERSION, str(request_id), str(parent_retry_id),
@@ -858,7 +869,13 @@ def build_exact_target_repair_plan(
 
 
 def has_repair_contract_evidence(evidence: Mapping[str, Any]) -> bool:
-    """Return whether evidence contains a reason owned by BAT orchestration."""
+    """Return whether evidence contains a visible repair-policy reason.
+
+    Registered unsupported, fatal and still-unclassified codes deliberately
+    enter planning so they produce an explicit row.  Informational tokens do
+    not.  This replaces the old 31-code allow-list whose miss path silently
+    ``continue``-d and made most blocked targets disappear.
+    """
 
     return bool(set(evidence_reason_codes(evidence)) & ALL_REPAIR_CONTRACT_CODES)
 

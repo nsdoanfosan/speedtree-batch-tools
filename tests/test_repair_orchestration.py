@@ -48,8 +48,7 @@ class RepairOrchestrationTests(unittest.TestCase):
 
     def test_texture_reason_uses_standard_step3_without_force(self):
         plan = self.plan({
-            "reason_code": "canonical_texture_output_unmapped",
-            "audit": {"classification": "managed_texture_set_incomplete"},
+            "reason_code": "texture_set_incomplete",
         })
         self.assertTrue(plan.supported)
         self.assertEqual(plan.initial_status, STATUS_PENDING)
@@ -197,10 +196,10 @@ class RepairOrchestrationTests(unittest.TestCase):
     def test_mixed_reasons_are_ordered_and_deduplicated(self):
         plan = self.plan({
             "reason_codes": [
-                "managed_texture_set_incomplete",
-                "managed_texture_set_incomplete",
-                "generator_slot_pair_drift",
-                "cluster_stale",
+                "texture_set_incomplete",
+                "texture_set_incomplete",
+                "generator_connection_contract_incomplete",
+                "normalized_variants_stale",
             ],
             "producer_spm": str(self.cluster),
         })
@@ -322,7 +321,7 @@ class RepairOrchestrationTests(unittest.TestCase):
 
     def test_progress_and_final_failure_filter_hide_intermediate_repairs(self):
         plan = self.plan({
-            "reason_code": "canonical_texture_output_unmapped",
+            "reason_code": "texture_set_incomplete",
         })
         progress = repair_progress_payload(
             plan,

@@ -977,7 +977,13 @@ def _mesh_file_references_cached(
             }
             references.append(row)
             if not row["exists"]:
-                if row["referenced"]:
+                if row["referenced"] or usage == (
+                    "current_preserved_unreferenced"
+                ):
+                    # A coherent current variant is allowed to be unselected,
+                    # but its authority still declares the external Mesh.  A
+                    # missing file remains a real preflight failure rather
+                    # than being hidden by the non-stale classification.
                     missing.append(row)
                 elif usage in {"managed_orphan", "orphan"}:
                     orphan_missing.append(row)

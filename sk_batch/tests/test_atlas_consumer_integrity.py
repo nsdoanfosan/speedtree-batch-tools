@@ -27,6 +27,11 @@ SILKY_FIXTURE = (
     / "fixtures"
     / "issue57_silky_managed_orphans.json"
 )
+CURRENT_AUTHORITY_FIXTURE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "issue138_current_authority_variants.json"
+)
 
 
 def marker(kind, scope, group="leaf"):
@@ -461,7 +466,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 integrity["classification_counts"],
                 {
                     "current_default_cutout": 3,
-                    "current_unused_group": 6,
+                    "current_preserved_unreferenced": 6,
                 },
             )
             self.assertEqual(
@@ -471,8 +476,8 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 },
                 {
                     8: "current_default_cutout",
-                    9: "current_unused_group",
-                    10: "current_unused_group",
+                    9: "current_preserved_unreferenced",
+                    10: "current_preserved_unreferenced",
                 },
             )
             self.assertEqual(
@@ -480,9 +485,217 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                     row["usage"] for row in report["references"]
                     if row["mesh_id"] in {3, 4, 5, 6}
                 },
-                {"current_unused_group"},
+                {"current_preserved_unreferenced"},
             )
             self.assertEqual(integrity["repair_input"]["candidates"], [])
+
+    def test_sanitized_production_profiles_reach_material_preflight(self):
+        fixture = json.loads(
+            CURRENT_AUTHORITY_FIXTURE.read_text(encoding="utf-8")
+        )
+        for profile in fixture["profiles"]:
+            with self.subTest(profile=profile["name"]):
+                temporary_context = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary_context.cleanup)
+                temporary = temporary_context.name
+                root = Path(temporary)
+                spm = root / profile["target_name"]
+                model = ET.Element("SpeedTreeModel")
+                assets = ET.SubElement(model, "Assets")
+                receipt_groups = []
+                generator_index = 0
+
+                for group in profile["groups"]:
+                    mesh_ids = list(range(
+                        group["mesh_start"],
+                        group["mesh_start"] + group["mesh_count"],
+                    ))
+                    receipt_groups.append({
+                        "collection": group["group"],
+                        "material": group["material_name"],
+                        "material_id": group["material_id"],
+                        "mesh_ids": mesh_ids,
+                    })
+                    add_material(
+                        assets,
+                        group["material_id"],
+                        group["material_name"],
+                        mesh_ids,
+                        profile["current_scope"],
+                        group=group["group"],
+                    )
+                    for mesh_id in mesh_ids:
+                        add_external_mesh(
+                            assets,
+                            root,
+                            mesh_id,
+                            profile["current_scope"],
+                            group=group["group"],
+                        )
+                    for _ in range(group.get("default_cutout_slots", 0)):
+                        add_generator(
+                            model,
+                            group["material_id"],
+                            -10,
+                            generator_index,
+                        )
+                        generator_index += 1
+                    for mesh_id in group.get("generator_mesh_ids", []):
+                        add_generator(
+                            model,
+                            group["material_id"],
+                            mesh_id,
+                            generator_index,
+                        )
+                        generator_index += 1
+
+                for foreign in profile.get("foreign_groups", []):
+                    mesh_ids = list(range(
+                        foreign["mesh_start"],
+                        foreign["mesh_start"] + foreign["mesh_count"],
+                    ))
+                    add_material(
+                        assets,
+                        foreign["material_id"],
+                        foreign["material_name"],
+                        mesh_ids,
+                        foreign["scope"],
+                        group=foreign["group"],
+                    )
+                    for mesh_id in mesh_ids:
+                        add_external_mesh(
+                            assets,
+                            root,
+                            mesh_id,
+                            foreign["scope"],
+                            group=foreign["group"],
+                        )
+                    write_receipt(
+                        spm,
+                        ".atlas_leaf_speedtree_scopes",
+                        f"{foreign['scope']}__other.json",
+                        foreign["scope"],
+                        foreign["material_id"],
+                        foreign["material_name"],
+                        mesh_ids,
+                        blend="C:/sanitized/foreign.blend",
+                        collection=foreign["group"],
+                        declared_spm=root / "SK_other_target.spm",
+                    )
+
+                write_spm(spm, model)
+                first_group = receipt_groups[0]
+                write_receipt(
+                    spm,
+                    ".atlas_leaf_speedtree_targets",
+                    f"{spm.stem}.json",
+                    profile["current_scope"],
+                    first_group["material_id"],
+                    first_group["material"],
+                    first_group["mesh_ids"],
+                    blend="C:/sanitized/current.blend",
+                    collection="CurrentAtlasProducer",
+                    groups=receipt_groups,
+                )
+                before = spm.read_bytes()
+
+                report = inspect_spm_mesh_file_references(spm)
+
+                self.assertEqual(spm.read_bytes(), before)
+                self.assertEqual(report["status"], "ok")
+                self.assertEqual(
+                    report["checked_references"],
+                    profile["expected"]["checked_references"],
+                )
+                integrity = report["atlas_consumer_integrity"]
+                self.assertFalse(integrity["blocking"])
+                for key in (
+                    "active_managed_mesh_count",
+                    "managed_orphan_mesh_count",
+                    "managed_orphan_material_count",
+                    "classification_counts",
+                ):
+                    self.assertEqual(integrity[key], profile["expected"][key])
+                self.assertEqual(integrity["repair_input"]["candidates"], [])
+                issue_codes = {
+                    issue["code"]
+                    for issue in preflight.preflight_contract_issues({
+                        "spm": str(spm),
+                        "mesh_file_reference_contract": report,
+                    })
+                }
+                self.assertNotIn(
+                    "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
+                    issue_codes,
+                )
+                preflight_report = root / "preflight.json"
+                args = argparse.Namespace(
+                    spm=str(spm),
+                    speedtree_exe="SpeedTree.exe",
+                    fbx_ini="Options.ini",
+                    speedtree_cli="speedtree_cli.py",
+                    report=str(preflight_report),
+                    timeout=30,
+                )
+                with mock.patch.object(
+                    preflight,
+                    "parse_args",
+                    return_value=args,
+                ), mock.patch.object(
+                    preflight,
+                    "read_tree_instance_profile",
+                    return_value="sanitized-profile",
+                ), mock.patch.object(
+                    preflight,
+                    "load_speedtree_cli",
+                    return_value=object(),
+                ), mock.patch.object(
+                    preflight,
+                    "run_export",
+                    return_value={"status": "ok"},
+                ) as export, mock.patch.object(
+                    preflight,
+                    "inspect_speedtree_material_export",
+                    return_value={"status": "ok", "missing_materials": []},
+                ), mock.patch.object(
+                    preflight,
+                    "inspect_all_speedtree_material_export",
+                    return_value={"status": "ok", "missing_materials": []},
+                ), mock.patch.object(
+                    preflight,
+                    "inspect_speedtree_texture_sources",
+                    return_value={
+                        "status": "ok",
+                        "stmat": None,
+                        "missing_sources": [],
+                    },
+                ), mock.patch.object(
+                    preflight,
+                    "resolve_texture_bindings",
+                    return_value={},
+                ), mock.patch.object(
+                    preflight,
+                    "augment_texture_readiness_contract",
+                    return_value={"status": "ok", "missing": []},
+                ), mock.patch.object(
+                    preflight,
+                    "load_pcg_texture_config",
+                    return_value={},
+                ), mock.patch.object(
+                    preflight,
+                    "attach_pipeline_contract",
+                    return_value=None,
+                ):
+                    preflight.main()
+                export.assert_called_once()
+                emitted = json.loads(
+                    preflight_report.read_text(encoding="utf-8")
+                )
+                self.assertEqual(emitted["status"], "ok")
+                self.assertNotEqual(
+                    emitted.get("classification"),
+                    "atlas_managed_asset_integrity_stale",
+                )
 
     def test_foreign_scope_and_untagged_manual_assets_are_protected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -552,7 +765,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 {2: "protected_foreign", 3: "protected_manual"},
             )
 
-    def test_missing_file_status_remains_separate_from_integrity_status(self):
+    def test_missing_current_variant_still_blocks_as_missing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_missing_and_stale.spm"
@@ -575,12 +788,12 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
 
             report = inspect_spm_mesh_file_references(spm)
 
-            self.assertEqual(report["status"], "orphan_missing_mesh_assets")
-            self.assertEqual(report["missing"], [])
-            self.assertEqual(len(report["orphan_missing"]), 1)
-            self.assertTrue(report["atlas_consumer_integrity"]["blocking"])
+            self.assertEqual(report["status"], "missing_mesh_files")
+            self.assertEqual(len(report["missing"]), 1)
+            self.assertEqual(report["orphan_missing"], [])
+            self.assertFalse(report["atlas_consumer_integrity"]["blocking"])
 
-    def test_preflight_blocks_before_export_and_emits_repair_input(self):
+    def test_preflight_reaches_export_for_current_unreferenced_variant(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_integrity_preflight.spm"
@@ -622,27 +835,51 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 preflight,
                 "load_speedtree_cli",
                 return_value=object(),
-            ), mock.patch.object(preflight, "run_export") as export:
-                with self.assertRaises(SystemExit):
-                    preflight.main()
-
-            export.assert_not_called()
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["status"], "blocked")
-            self.assertEqual(
-                report["classification"],
-                "atlas_managed_asset_integrity_stale",
-            )
-            self.assertEqual(
-                len(report["atlas_consumer_repair_input"]["content_sha256"]),
-                64,
-            )
-            self.assertIn(
-                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
-                {
-                    issue["code"]
-                    for issue in report["speedtree_pipeline_contract"]["issues"]
+            ), mock.patch.object(
+                preflight,
+                "run_export",
+                return_value={"status": "ok"},
+            ) as export, mock.patch.object(
+                preflight,
+                "inspect_speedtree_material_export",
+                return_value={"status": "ok", "missing_materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_all_speedtree_material_export",
+                return_value={"status": "ok", "missing_materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_speedtree_texture_sources",
+                return_value={
+                    "status": "ok",
+                    "stmat": None,
+                    "missing_sources": [],
                 },
+            ), mock.patch.object(
+                preflight,
+                "resolve_texture_bindings",
+                return_value={},
+            ), mock.patch.object(
+                preflight,
+                "augment_texture_readiness_contract",
+                return_value={"status": "ok", "missing": []},
+            ), mock.patch.object(
+                preflight,
+                "load_pcg_texture_config",
+                return_value={},
+            ), mock.patch.object(
+                preflight,
+                "attach_pipeline_contract",
+                return_value=None,
+            ):
+                preflight.main()
+
+            export.assert_called_once()
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "ok")
+            self.assertNotEqual(
+                report.get("classification"),
+                "atlas_managed_asset_integrity_stale",
             )
 
     def test_manifest_receipt_change_invalidates_cached_integrity_audit(self):

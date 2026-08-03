@@ -1,6 +1,6 @@
 """The repair contract must cover every reason code the pipeline can emit.
 
-These four assertions are the whole point of the registry.  Each one failed
+These assertions are the whole point of the registry.  Each one failed
 silently before it existed, and each failure mode had already reached
 production: a blocked target with no recovery path, and no record that a
 recovery path was ever possible.
@@ -16,6 +16,7 @@ if str(REPO_DIR) not in sys.path:
 import repair_orchestration as orchestration  # noqa: E402
 from repair_reason_registry import (  # noqa: E402
     DISPOSITIONS,
+    INFORMATIONAL,
     REASON_REGISTRY,
     REPAIRABLE,
     UNCLASSIFIED,
@@ -36,7 +37,7 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         """A new block cannot ship without a disposition.
 
         This is the assertion that ends the discovery loop.  On 2026-08-03 the
-        planner owned 31 codes while production emitted 174, and the only way
+        planner owned 31 codes while production emitted 226, and the only way
         to learn that a block was unrepairable was to watch a batch stop.
         """
         unregistered = sorted(set(self.emitted) - set(REASON_REGISTRY))
@@ -115,6 +116,32 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             REPAIRABLE,
         )
 
+    def test_informational_codes_cannot_enter_repair_admission(self):
+        """A quiet fact/wrapper can never become a target verdict by itself."""
+        admitted = sorted(
+            code for code in codes_with(INFORMATIONAL)
+            if orchestration.has_repair_contract_evidence({
+                "reason_token": code,
+            })
+        )
+        self.assertEqual(
+            admitted,
+            [],
+            "informational-only evidence entered target repair/final planning",
+        )
+
+    def test_codes_emitted_by_terminal_fallbacks_are_not_informational(self):
+        terminal_fallbacks = {
+            "pcg_cluster_handoff_not_ready",
+            "preflight_error",
+            "dependency_root_reason_missing",
+        }
+        quiet = sorted(
+            code for code in terminal_fallbacks
+            if disposition_of(code) == INFORMATIONAL
+        )
+        self.assertEqual(quiet, [])
+
 
 class ReasonScanTests(unittest.TestCase):
     def test_scan_finds_codes_through_every_supported_shape(self):
@@ -124,6 +151,11 @@ class ReasonScanTests(unittest.TestCase):
         self.assertIn(
             "sk_batch/atlas_consumer_integrity.py",
             codes["managed_mesh_owner_ambiguous"],
+        )
+        self.assertIn("normalized_generator_delivery_incomplete", codes)
+        self.assertIn(
+            "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+            codes["normalized_generator_delivery_incomplete"],
         )
         self.assertTrue(module.is_file())
 
