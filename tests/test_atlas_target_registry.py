@@ -15,8 +15,10 @@ sys.path.insert(0, str(PCG_DIR))
 
 from atlas_target_registry import (  # noqa: E402
     TargetRegistryPublishError,
+    capture_target_registry_preimage,
     load_target_registry,
     registry_path_for_blend,
+    restore_target_registry_preimage,
     save_target_registry,
 )
 from mutation_plan_authority import path_state  # noqa: E402
@@ -110,6 +112,73 @@ class AtlasTargetRegistryTests(unittest.TestCase):
             self.assertEqual(
                 load_target_registry(blend)["target_spms"],
                 [str(second.absolute())],
+            )
+
+    def test_exact_preimage_rollback_restores_original_registry_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "M_leaf_elm_atlas_01.blend"
+            blend.touch()
+            first = root / "SK_Tree_elm_01.spm"
+            second = root / "SK_Tree_elm_02.spm"
+            save_target_registry(blend, [first])
+            registry_path = registry_path_for_blend(blend)
+            original_bytes = registry_path.read_bytes()
+            preimage = capture_target_registry_preimage(blend)
+            published = save_target_registry(
+                blend,
+                [second],
+                expected_registry_state=preimage["state"],
+            )
+
+            restored = restore_target_registry_preimage(
+                preimage,
+                expected_registry_state=published["registry_state"],
+            )
+
+            self.assertEqual(restored["status"], "restored")
+            self.assertEqual(registry_path.read_bytes(), original_bytes)
+            self.assertEqual(
+                load_target_registry(blend)["target_spms"],
+                [str(first.absolute())],
+            )
+
+    def test_exact_preimage_rollback_refuses_external_registry_edit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "M_leaf_elm_atlas_01.blend"
+            blend.touch()
+            first = root / "SK_Tree_elm_01.spm"
+            second = root / "SK_Tree_elm_02.spm"
+            external = root / "SK_Tree_elm_03.spm"
+            save_target_registry(blend, [first])
+            preimage = capture_target_registry_preimage(blend)
+            published = save_target_registry(
+                blend,
+                [second],
+                expected_registry_state=preimage["state"],
+            )
+            save_target_registry(
+                blend,
+                [external],
+                expected_registry_state=published["registry_state"],
+            )
+
+            with self.assertRaises(TargetRegistryPublishError) as raised:
+                restore_target_registry_preimage(
+                    preimage,
+                    expected_registry_state=published["registry_state"],
+                )
+
+            self.assertEqual(
+                raised.exception.connected_retry_contract[
+                    "operation_phase"
+                ],
+                "registry_compare_and_swap",
+            )
+            self.assertEqual(
+                load_target_registry(blend)["target_spms"],
+                [str(external.absolute())],
             )
 
     def test_exact_registry_replaces_inferred_one_target_statistics(self):

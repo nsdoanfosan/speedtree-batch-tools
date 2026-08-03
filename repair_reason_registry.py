@@ -94,12 +94,16 @@ class ReasonPolicy(NamedTuple):
 
 STEP3_STANDARD_ACTION = "step3-standard"
 ATLAS_MANIFEST_MIRROR_REPAIR_ACTION = "atlas-manifest-mirror-repair"
+ATLAS_PRODUCER_REFRESH_ACTION = "atlas-producer-refresh"
+ATLAS_SLOT_OWNERSHIP_RECONCILE_ACTION = "atlas-slot-ownership-reconcile"
 GENERATOR_SYNC_ACTION = "generator-sync"
 CLUSTER_REFRESH_ACTION = "cluster-refresh"
 GENERATOR_SYNC_AND_CLUSTER_ACTION = "generator-sync-and-cluster"
 MODELER_NODE_TABLE_RECOVERY_ACTION = "modeler-node-table-recovery"
 
 EXACT_INVENTORY_SPM = "exact_inventory_spm"
+EXACT_ATLAS_PRODUCER_RELATION = "exact_atlas_producer_relation"
+EXACT_LIVE_SPM_OWNERSHIP_PLAN = "exact_live_spm_ownership_plan"
 EXACT_CLUSTER_RELATION = "exact_cluster_relation"
 CURRENT_MATERIAL_BINDING_RECIPE = "current_material_binding_recipe"
 ATLAS_MIRROR_REPAIR_PLAN = "atlas_mirror_repair_plan"
@@ -175,17 +179,21 @@ POLICY_CONTRACTS = {
         evidence_failure_cause="Cluster 갱신의 exact relation target을 증명하지 못했습니다.",
         evidence_failure_action="fresh audit으로 canonical Cluster identity와 target relation을 다시 생성하세요.",
     ),
-    "cluster_refresh_atlas_authority": _automatic(
-        CLUSTER_REFRESH_ACTION,
-        (EXACT_INVENTORY_SPM, EXACT_CLUSTER_RELATION),
-        "현재 대상의 Atlas producer 영수증이 없습니다.",
-        "exact Cluster 관계를 갱신해 current producer 영수증을 다시 만든 뒤 검사합니다.",
+    "atlas_producer_refresh": _automatic(
+        ATLAS_PRODUCER_REFRESH_ACTION,
+        (EXACT_INVENTORY_SPM, EXACT_ATLAS_PRODUCER_RELATION),
+        "현재 대상의 Atlas producer 영수증이 canonical SPM을 가리키지 않습니다.",
+        "검증된 pair 영수증과 producer 관계로 Atlas registry 대상을 canonical SPM으로 갱신한 뒤 다시 검사합니다.",
+        evidence_failure_cause="canonical Atlas producer 관계를 안전하게 갱신할 exact 증명이 없습니다.",
+        evidence_failure_action="fresh audit에서 pair 영수증, target-local manifest, producer registry의 일치 관계를 다시 증명하세요.",
     ),
-    "cluster_refresh_atlas_conflict": _automatic(
-        CLUSTER_REFRESH_ACTION,
-        (EXACT_INVENTORY_SPM, EXACT_CLUSTER_RELATION),
-        "현재 Atlas producer 영수증들이 서로 충돌합니다.",
-        "exact Cluster 관계를 갱신해 target-local authority를 다시 확정한 뒤 검사합니다.",
+    "atlas_slot_ownership_reconcile": _automatic(
+        ATLAS_SLOT_OWNERSHIP_RECONCILE_ACTION,
+        (EXACT_INVENTORY_SPM, EXACT_LIVE_SPM_OWNERSHIP_PLAN),
+        "Atlas producer 영수증의 Generator slot ownership이 현재 live SPM과 충돌합니다.",
+        "봉인된 live SPM ownership 계획으로 각 slot의 현재 producer 영수증만 갱신한 뒤 다시 검사합니다.",
+        evidence_failure_cause="충돌을 임의 선택 없이 해결할 exact live SPM ownership 계획이 없습니다.",
+        evidence_failure_action="fresh live audit에서 Generator GUID, 전체 slot prefix, Material/Mesh pair별 소유 계획을 다시 생성하세요.",
     ),
     "cluster_refresh_lineage": _automatic(
         CLUSTER_REFRESH_ACTION,
@@ -477,7 +485,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         REPAIRABLE, "atlas_manifest_resolver.py", "atlas_manifest",
     ),
     "atlas_manifest_ownership_conflict": ReasonRow(
-        UNSUPPORTED, "atlas_manifest_resolver.py", "atlas_ownership",
+        REPAIRABLE, "atlas_manifest_resolver.py", "atlas_slot_ownership_reconcile",
     ),
     "atlas_ownership_marker_invalid": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
@@ -739,6 +747,12 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
     "generator_connection_not_requested": ReasonRow(
+        UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
+    ),
+    "current_generator_ownership_outside_sealed_authored_scope": ReasonRow(
+        UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
+    ),
+    "generator_current_ownership_relinquished": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
     "generator_cross_group_pair": ReasonRow(
@@ -1179,10 +1193,52 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "cluster_export_handoff_contract.py", "export_hierarchy",
     ),
     "atlas_manifest_authority_missing": ReasonRow(
-        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "atlas_producer_refresh",
     ),
     "atlas_manifest_resolution_conflict": ReasonRow(
-        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "cluster_refresh",
+        REPAIRABLE, "sk_batch/atlas_consumer_integrity.py", "atlas_slot_ownership_reconcile",
+    ),
+    "live_spm_exact_successor_binding": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "fleet_manifest_write_disagreement": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_fleet_ownership_already_current": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_fleet_ownership_reconciliation_required": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_ownership_already_current": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_ownership_reconciliation_required": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_same_provider_rebound": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "live_spm_slot_missing_or_unmanaged": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "managed_live_generator_guid_missing": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "managed_live_pair_has_no_unique_group": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "managed_live_pair_provider_ambiguous": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "managed_live_slot_identity_duplicated": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "managed_live_slot_prefix_missing": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
+    ),
+    "unplanned": ReasonRow(
+        UNCLASSIFIED, "atlas_slot_ownership.py", "",
     ),
     "atlas_marker_kind_mismatch": ReasonRow(
         FATAL, "sk_batch/atlas_consumer_integrity.py", "atlas_integrity",
@@ -1754,12 +1810,34 @@ _classify(
     "asset_cluster_bake_texture_contract_invalid",
 )
 _classify(
-    REPAIRABLE, "cluster_refresh_atlas_authority",
+    REPAIRABLE, "atlas_producer_refresh",
     "atlas_manifest_authority_missing",
 )
 _classify(
-    REPAIRABLE, "cluster_refresh_atlas_conflict",
+    REPAIRABLE, "atlas_slot_ownership_reconcile",
     "atlas_manifest_resolution_conflict",
+    "current_generator_ownership_outside_sealed_authored_scope",
+    "live_spm_ownership_reconciliation_required",
+)
+_classify(
+    INFORMATIONAL, "valid_marker",
+    "live_spm_exact_successor_binding",
+    "live_spm_fleet_ownership_already_current",
+    "live_spm_ownership_already_current",
+    "live_spm_same_provider_rebound",
+    "live_spm_slot_missing_or_unmanaged",
+    "generator_current_ownership_relinquished",
+    "unplanned",
+)
+_classify(
+    UNSUPPORTED, "atlas_ownership",
+    "managed_live_generator_guid_missing",
+    "fleet_manifest_write_disagreement",
+    "live_spm_fleet_ownership_reconciliation_required",
+    "managed_live_pair_has_no_unique_group",
+    "managed_live_pair_provider_ambiguous",
+    "managed_live_slot_identity_duplicated",
+    "managed_live_slot_prefix_missing",
 )
 _classify(REPAIRABLE, "cluster_refresh_lineage", "lineage_unproven")
 _classify(

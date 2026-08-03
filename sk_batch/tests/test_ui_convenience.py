@@ -773,7 +773,105 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             caught.exception.report["evidence"]["status"], "repairable"
         )
 
-    def test_canonical_atlas_real_ownership_conflict_is_korean_final_block(self):
+    def test_canonical_atlas_repairable_ownership_conflict_uses_exact_executor(self):
+        import atlas_slot_ownership as ownership
+
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        app.ui_queue = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        lease = mock.Mock(finished=False)
+        app._active_shared_queue_lease = lease
+        app.active_batch_job = {
+            "id": 8,
+            "shared_queue_job_id": "shared-job-8",
+        }
+        app._active_retry_metadata = {"progress_run_id": "retry-run-8"}
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm").absolute()
+        manifest = spm.parent / "ownership-scope.json"
+        payload = {}
+        ownership_plan = {
+            "contract": ownership.PLAN_CONTRACT,
+            "schema_version": ownership.PLAN_SCHEMA_VERSION,
+            "target_spm": str(spm),
+            "status": "repairable",
+            "reason_code": "live_spm_ownership_reconciliation_required",
+            "spm_sha256": "1" * 64,
+            "spm_text_sha256": "2" * 64,
+            "manifest_preconditions": [{
+                "path": str(manifest),
+                "sha256": "3" * 64,
+            }],
+            "provider_updates": [],
+            "takeovers": [],
+            "blocking": [],
+            "ignored_candidates": [],
+            "writes": [{
+                "path": str(manifest),
+                "before_sha256": "3" * 64,
+                "after_sha256": ownership._sha256_bytes(
+                    ownership._pretty_json_bytes(payload)
+                ),
+                "payload": payload,
+            }],
+        }
+        ownership_plan["plan_sha256"] = ownership._plan_hash(
+            ownership_plan
+        )
+        report = {
+            "reason_token": "atlas_manifest_ownership_conflict",
+            "evidence": {
+                "status": "unrepairable",
+                "reason": "different source identity",
+                "ownership_plan": ownership_plan,
+            },
+        }
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report=report,
+        )
+        canonical_refresh = {
+            "status": "updated",
+            "updated": ["ownership-scope.json"],
+        }
+        terminal = {
+            "status": "completed",
+            "terminal_status": "completed",
+            "result": {"apply_result": {"apply_status": "reconciled"}},
+        }
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=[failure, canonical_refresh],
+        ) as refresh, mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value=terminal,
+        ) as exact:
+            actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual, canonical_refresh)
+        self.assertEqual(refresh.call_count, 2)
+        request, executor = exact.call_args.args
+        self.assertEqual(request["tool"], gui.GENERATOR_SYNC_TOOL)
+        self.assertEqual(
+            request["repair_action"],
+            gui.ATLAS_SLOT_OWNERSHIP_RECONCILE,
+        )
+        self.assertEqual(
+            request["provenance"]["ownership_plan"]["plan_sha256"],
+            ownership_plan["plan_sha256"],
+        )
+        self.assertEqual(
+            executor.__name__,
+            "execute_exact_generator_request",
+        )
+        self.assertIs(exact.call_args.kwargs["inherited_lease"], lease)
+
+    def test_canonical_atlas_ownership_conflict_without_plan_is_final_block(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         app.log = mock.Mock()
@@ -799,9 +897,63 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("최종 차단", message)
-        self.assertIn("서로 다른 원본", message)
-        self.assertIn("임의로 덮어쓰지 않습니다", message)
+        self.assertIn("exact live SPM ownership 계획", message)
+        self.assertIn("fresh live audit", message)
         self.assertNotIn("ownership conflict", message)
+
+    def test_canonical_atlas_blocked_ownership_plan_never_dispatches(self):
+        import atlas_slot_ownership as ownership
+
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm").absolute()
+        ownership_plan = {
+            "contract": ownership.PLAN_CONTRACT,
+            "schema_version": ownership.PLAN_SCHEMA_VERSION,
+            "target_spm": str(spm),
+            "status": "blocked",
+            "reason_code": "managed_live_pair_provider_ambiguous",
+            "spm_sha256": "1" * 64,
+            "spm_text_sha256": "2" * 64,
+            "manifest_preconditions": [],
+            "provider_updates": [],
+            "takeovers": [],
+            "blocking": [{
+                "reason_code": "managed_live_pair_provider_ambiguous",
+                "reason": "two providers still match one live pair",
+            }],
+            "ignored_candidates": [],
+            "writes": [],
+        }
+        ownership_plan["plan_sha256"] = ownership._plan_hash(
+            ownership_plan
+        )
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report={
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {
+                    "status": "unrepairable",
+                    "ownership_plan": ownership_plan,
+                },
+            },
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ), mock.patch.object(gui, "run_exact_target_request") as exact:
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(caught.exception.kind, "data_error")
+        self.assertEqual(
+            caught.exception.report["repair_disposition"],
+            gui.REPAIR_UI_BLOCKED,
+        )
+        exact.assert_not_called()
 
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()
