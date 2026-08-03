@@ -17,18 +17,22 @@ if str(SK_BATCH) not in sys.path:
 
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
+    attachment_locked_safe_transform,
     build_blender_assembly_inputs,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
     content_build_decision,
+    derive_endpoint_uniform_similarity_transform,
     file_fingerprint,
     fit_trs_transform,
     fit_uniform_similarity_transform,
+    gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
+    _assembly_fit_summary,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
     _component_groups,
@@ -49,6 +53,7 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_unreal_bounds_contract,
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
+    validate_persisted_residual_gate,
 )
 
 
@@ -83,6 +88,51 @@ def seam_split_test_mesh(split_second_face=False):
                     x=uv_by_position[coordinates[vertex_index]][0],
                     y=uv_by_position[coordinates[vertex_index]][1],
                 )
+            ))
+        polygons.append(SimpleNamespace(
+            index=polygon_index,
+            vertices=face,
+            loop_indices=loop_indices,
+        ))
+    return SimpleNamespace(
+        vertices=vertices,
+        polygons=polygons,
+        loops=loops,
+        uv_layers=SimpleNamespace(active=SimpleNamespace(data=uv_data)),
+    )
+
+
+def stacked_uv_test_mesh(*, identical_faces=False, reverse_polygons=False):
+    coordinates = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (10.0, 0.0, 0.0),
+        (11.0, 0.0, 0.0),
+        (10.0, 1.0, 0.0),
+    ]
+    uv_faces = [
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+        (
+            ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+            if identical_faces
+            else ((0.0, 0.0), (2.0, 0.0), (0.0, 2.0))
+        ),
+    ]
+    face_rows = [((0, 1, 2), uv_faces[0]), ((3, 4, 5), uv_faces[1])]
+    if reverse_polygons:
+        face_rows.reverse()
+    vertices = [SimpleNamespace(co=value) for value in coordinates]
+    loops = []
+    uv_data = []
+    polygons = []
+    for polygon_index, (face, face_uv) in enumerate(face_rows):
+        loop_indices = []
+        for vertex_index, uv in zip(face, face_uv):
+            loop_indices.append(len(loops))
+            loops.append(SimpleNamespace(vertex_index=vertex_index))
+            uv_data.append(SimpleNamespace(
+                uv=SimpleNamespace(x=uv[0], y=uv[1])
             ))
         polygons.append(SimpleNamespace(
             index=polygon_index,
@@ -176,6 +226,50 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_duplicate_uv_uses_topology_not_first_vertex_iteration_order(self):
+        target = stacked_uv_test_mesh()
+        target_component = {"polygons": [1], "vertices": [3, 4, 5]}
+        target_obj = SimpleNamespace(data=target)
+        resolved = []
+        for reverse in (False, True):
+            source = stacked_uv_test_mesh(reverse_polygons=reverse)
+            source_obj = SimpleNamespace(data=source)
+            source_component = {
+                "polygons": [0, 1],
+                "vertices": [0, 1, 2, 3, 4, 5],
+            }
+            source_indices, target_indices, evidence = (
+                _ordered_cross_object_correspondence(
+                    source_obj,
+                    source_component,
+                    target_obj,
+                    target_component,
+                    include_evidence=True,
+                )
+            )
+            self.assertEqual(target_indices, [3, 5, 4])
+            self.assertEqual(source_indices, [3, 5, 4])
+            self.assertEqual(
+                evidence["policy"],
+                "all_candidates_topology_disambiguated_fail_closed_v1",
+            )
+            resolved.append(source_indices)
+        self.assertEqual(resolved[0], resolved[1])
+
+    def test_distinct_duplicate_uv_without_unique_evidence_fails_closed(self):
+        source = stacked_uv_test_mesh(identical_faces=True)
+        target = stacked_uv_test_mesh(identical_faces=True)
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "duplicate UV correspondence is ambiguous",
+        ):
+            _ordered_cross_object_correspondence(
+                SimpleNamespace(data=source),
+                {"polygons": [0, 1], "vertices": [0, 1, 2, 3, 4, 5]},
+                SimpleNamespace(data=target),
+                {"polygons": [1], "vertices": [3, 4, 5]},
+            )
 
     def test_unmatched_render_topology_is_preserved_instead_of_invented(self):
         source = seam_split_test_mesh(False)
@@ -2148,6 +2242,148 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             transform["affine_relative_rms"],
             transform["similarity_relative_rms"],
         )
+
+    def test_endpoint_frame_locks_authored_pivot_and_preserves_rigid_plan(self):
+        source = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [1.0, -0.5, 0.0],
+        ]
+        target = [
+            [5.0 - point[1] * 3.0, -2.0 + point[0] * 3.0, 7.0]
+            for point in source
+        ]
+        transform = derive_endpoint_uniform_similarity_transform(
+            source,
+            target,
+            source_attachment=[0.0, 0.0, 0.0],
+            target_attachment=[5.0, -2.0, 7.0],
+        )
+        self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
+        self.assertEqual(transform["scale"], [3.0, 3.0, 3.0])
+        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
+        self.assertLess(transform["endpoint_error"], 1.0e-12)
+        self.assertLess(transform["similarity_relative_rms"], 1.0e-12)
+        self.assertEqual(
+            transform["construction_mode"],
+            "authored_absolute_pivot_plus_surviving_root_tip_frame_v1",
+        )
+
+    def test_endpoint_frame_does_not_move_pivot_to_fit_nonrigid_curl(self):
+        source = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [1.0, -0.5, 0.0],
+        ]
+        target = [
+            [5.0, -2.0, 7.0],
+            [11.0, -2.0, 7.0],
+            [8.0, -0.5, 7.2],
+            [8.0, -3.5, 6.8],
+        ]
+        transform = derive_endpoint_uniform_similarity_transform(
+            source,
+            target,
+            source_attachment=[0.0, 0.0, 0.0],
+            target_attachment=[5.0, -2.0, 7.0],
+        )
+        self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
+        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
+        self.assertGreater(transform["similarity_relative_rms"], 0.0)
+
+    def test_safe_fallback_keeps_export_attached_with_uniform_scale(self):
+        transform = attachment_locked_safe_transform(
+            [1.0, 2.0, 3.0], "endpoint unavailable"
+        )
+        self.assertEqual(transform["translation"], [1.0, 2.0, 3.0])
+        self.assertEqual(transform["scale"], [1.0, 1.0, 1.0])
+        self.assertEqual(transform["rotation_xyzw"], [0.0, 0.0, 0.0, 1.0])
+        gate = gate_assembly_transform_residuals(
+            transform,
+            {"part_asset": "SK_part"},
+            block_geometry=False,
+        )
+        self.assertEqual(gate["status"], "warning")
+
+    def test_residual_ready_gate_checks_pivot_and_all_metrics(self):
+        transform = {
+            "attachment_pivot_error": 0.0,
+            "similarity_relative_rms": 0.009,
+            "trs_relative_rms": 0.009,
+            "affine_relative_rms": 0.001,
+            "placement_source": "test",
+        }
+        gate = gate_assembly_transform_residuals(
+            transform, {"full_asset": "SK_test", "part_asset": "SK_part"}
+        )
+        self.assertEqual(gate["status"], "pass")
+        self.assertEqual(gate["threshold"], 0.01)
+        self.assertEqual(
+            validate_persisted_residual_gate(transform)["status"], "pass"
+        )
+        exact_threshold = dict(transform)
+        exact_threshold.pop("residual_gate", None)
+        exact_threshold["similarity_relative_rms"] = 0.01
+        exact_threshold["trs_relative_rms"] = 0.01
+        self.assertEqual(
+            gate_assembly_transform_residuals(
+                exact_threshold,
+                {"full_asset": "SK_test", "part_asset": "SK_part"},
+            )["status"],
+            "pass",
+        )
+        summary = _assembly_fit_summary(
+            [{"transform": transform}], "uniform_similarity_3d"
+        )
+        self.assertEqual(summary["similarity_relative_rms_count"], 1)
+        self.assertEqual(summary["residual_ready_gate"]["status"], "pass")
+
+        authored_warning = dict(transform)
+        authored_warning.pop("residual_gate", None)
+        authored_warning["similarity_relative_rms"] = 0.05
+        authored_warning["trs_relative_rms"] = 0.05
+        warning_gate = gate_assembly_transform_residuals(
+            authored_warning,
+            {"full_asset": "SK_test", "part_asset": "SK_part"},
+            block_geometry=False,
+        )
+        self.assertEqual(warning_gate["status"], "warning")
+        self.assertEqual(
+            validate_persisted_residual_gate(authored_warning)["status"],
+            "warning",
+        )
+
+        for field, value, message in (
+            ("similarity_relative_rms", 0.010001, "blocked placement"),
+            ("attachment_pivot_error", 1.0001e-8, "blocked placement"),
+            ("trs_relative_rms", float("nan"), "non-finite evidence"),
+        ):
+            blocked = dict(transform)
+            blocked.pop("residual_gate", None)
+            blocked[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ClusterAssemblyBuildError, message
+            ):
+                gate_assembly_transform_residuals(
+                    blocked,
+                    {"full_asset": "SK_test", "part_asset": "SK_part"},
+                )
+
+    def test_persisted_residual_gate_detects_receipt_drift(self):
+        transform = {
+            "attachment_pivot_error": 0.0,
+            "similarity_relative_rms": 0.001,
+            "trs_relative_rms": 0.001,
+            "affine_relative_rms": 0.0001,
+        }
+        gate_assembly_transform_residuals(transform, {"part_asset": "SK_part"})
+        transform["residual_gate"]["metrics"]["trs_relative_rms"] = 0.0
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError, "evidence drifted"
+        ):
+            validate_persisted_residual_gate(transform)
 
     def test_trs_fit_recovers_translation_rotation_and_scale(self):
         source = [
