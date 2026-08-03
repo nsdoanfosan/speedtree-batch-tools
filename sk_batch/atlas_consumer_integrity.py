@@ -947,19 +947,15 @@ def audit_atlas_consumer_integrity(target_spm, root):
     # and bark); counting authorities for the whole target discarded the exact
     # claim already proved for each asset and falsely blocked those consumers.
     #
-    # The target must still contain a live current binding and have no integrity
-    # damage. Each preserved asset must carry a complete exact selected claim;
-    # a Mesh is preserved only when every owning Material has that same exact
+    # No live-use condition belongs here. `receipts["selected"]` is the current
+    # exact-target authority set; retired and shadowed records are already kept
+    # elsewhere. Requiring Generator use would confuse ownership with use and
+    # would keep a legitimately selected provider's unused variants blocked.
+    # Each preserved asset must carry a complete exact selected claim; a Mesh
+    # is preserved only when every owning Material has that same exact
     # authority. Lineage-unproven, scope-mismatched, mixed-owner, and damaged
     # assets remain ambiguous and blocking.
-    live_current_asset = any(
-        row.get("classification") in {
-            "current_reachable",
-            "current_default_cutout",
-        }
-        for row in managed_materials + managed_meshes
-    )
-    if live_current_asset and not integrity_issues:
+    if not integrity_issues:
         for material in managed_materials:
             if (
                 material.get("classification") == "ambiguous"

@@ -498,6 +498,36 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             )
             self.assertEqual(integrity["repair_input"]["candidates"], [])
 
+    def test_exact_selected_authority_does_not_require_live_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_selected_but_unused.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_leaf_unused", [1], "scope-current")
+            add_external_mesh(assets, root, 1, "scope-current")
+            write_spm(spm, model)
+            write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_selected_but_unused.json",
+                "scope-current",
+                10,
+                "M_leaf_unused",
+                [1],
+            )
+
+            report = inspect_spm_mesh_file_references(spm)
+
+            integrity = report["atlas_consumer_integrity"]
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertEqual(integrity["active_managed_mesh_count"], 0)
+            self.assertEqual(
+                integrity["classification_counts"],
+                {"current_preserved_unreferenced": 2},
+            )
+
     def test_sanitized_production_profiles_reach_material_preflight(self):
         fixture = json.loads(
             CURRENT_AUTHORITY_FIXTURE.read_text(encoding="utf-8")
