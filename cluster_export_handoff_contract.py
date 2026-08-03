@@ -214,7 +214,14 @@ def reconcile_transient_cluster_export_root(
 
     moved = sorted(connected, key=lambda obj: obj.name.casefold())
     for obj in moved:
-        if obj not in source_collection.objects:
+        source_objects = source_collection.objects
+        lookup = getattr(source_objects, "get", None)
+        already_linked = (
+            lookup(obj.name) is not None
+            if callable(lookup)
+            else obj in source_objects
+        )
+        if not already_linked:
             source_collection.objects.link(obj)
         export_collection.objects.unlink(obj)
     base_report.update(

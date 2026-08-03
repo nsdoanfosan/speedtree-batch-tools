@@ -27,6 +27,8 @@ BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    atlas_manifest_mirror_repair_plan,
     diagnose_manifest_generator_candidates,
     resolution_evidence,
     resolve_atlas_manifests,
@@ -8381,6 +8383,55 @@ def main():
             stage="asset_audit",
             error=type(exc).__name__,
         )
+        revision_finished = production_source_manifest(BATCH_TOOLS_DIR)
+        revision_state = production_source_revision_state(
+            expected_revision,
+            revision_started,
+            revision_finished,
+        )
+        failure = {
+            "reason_token": "asset_audit_failed",
+            "evidence": {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        }
+        if isinstance(exc, AtlasManifestResolutionError):
+            try:
+                mirror_plan = atlas_manifest_mirror_repair_plan(
+                    exc.resolution.get("target_spm")
+                    or (args.target or [""])[0],
+                    resolution=exc.resolution,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as plan_exc:
+                mirror_plan = {
+                    "status": "unrepairable",
+                    "reason_code": "atlas_manifest_ownership_conflict",
+                    "target_spm": str(
+                        exc.resolution.get("target_spm") or ""
+                    ),
+                    "reason": str(plan_exc),
+                    "resolution": resolution_evidence(exc.resolution),
+                }
+            failure = {
+                "reason_token": str(
+                    mirror_plan.get("reason_code")
+                    or "atlas_manifest_ownership_conflict"
+                ),
+                "evidence": mirror_plan,
+            }
+        report = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "failed",
+            "stage": "asset_audit",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "failure": failure,
+            "production_source_revision": revision_state,
+            "summary": {"total": 0, "by_status": {}},
+            "items": [],
+        }
+        write_report_outputs(report, args.json_path, args.csv_path)
         raise
     emit_progress_marker(
         CLUSTER_LIVE_AUDIT_REPORT_DONE_MARKER,

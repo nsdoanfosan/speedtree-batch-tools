@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -668,7 +669,76 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         refresh.assert_not_called()
         app.log.assert_not_called()
 
-    def test_canonical_atlas_conflict_preserves_repair_evidence(self):
+    def test_canonical_atlas_conflict_repairs_in_same_owned_lease(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        app.ui_queue = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        lease = mock.Mock(finished=False)
+        app._active_shared_queue_lease = lease
+        app.active_batch_job = {
+            "id": 7,
+            "shared_queue_job_id": "shared-job-7",
+        }
+        app._active_retry_metadata = {"progress_run_id": "retry-run-7"}
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        report = {
+            "reason_token": "atlas_manifest_mirror_conflict_repairable",
+            "evidence": {
+                "status": "repairable",
+                "authority": "authority.json",
+                "mirrors": ["stale.json"],
+            },
+        }
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report=report,
+        )
+
+        terminal = {
+            "status": "completed",
+            "terminal_status": "completed",
+            "result": {
+                "canonical_refresh": {
+                    "status": "updated",
+                    "updated": ["stale.json"],
+                },
+            },
+        }
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value=terminal,
+        ) as exact, mock.patch.object(
+            gui,
+            "atlas_manifest_mirror_repair_plan",
+            return_value={"status": "not_needed"},
+        ):
+            actual = app._refresh_canonical_atlas_manifests(spm)
+            repeated = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual["status"], "updated")
+        self.assertEqual(actual["updated"], ["stale.json"])
+        self.assertEqual(repeated, actual)
+        self.assertEqual(exact.call_count, 1)
+        kwargs = exact.call_args.kwargs
+        self.assertIs(kwargs["inherited_lease"], lease)
+        self.assertIs(kwargs["cancel_event"], app.stop_flag)
+        request = exact.call_args.args[0]
+        self.assertEqual(
+            request["repair_action"],
+            gui.ATLAS_MANIFEST_MIRROR_REPAIR,
+        )
+        self.assertEqual(request["target_spms"], [str(spm.absolute())])
+        self.assertIn("자동 복구 완료", app.log.call_args.args[0])
+
+    def test_canonical_atlas_conflict_without_lease_is_pending_with_evidence(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)
         app.log = mock.Mock()
@@ -694,6 +764,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             with self.assertRaises(gui.BatchItemError) as caught:
                 app._refresh_canonical_atlas_manifests(spm)
 
+        self.assertEqual(caught.exception.kind, "automatic_repair_pending")
         self.assertEqual(
             caught.exception.report["reason_token"],
             "atlas_manifest_mirror_conflict_repairable",
@@ -701,10 +772,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertEqual(
             caught.exception.report["evidence"]["status"], "repairable"
         )
-        self.assertIn("자동 복구 대상", str(caught.exception))
-        self.assertIn("원인:", str(caught.exception))
-        self.assertIn("조치:", str(caught.exception))
-        self.assertNotIn("preflight failed", str(caught.exception))
 
     def test_canonical_atlas_real_ownership_conflict_is_korean_final_block(self):
         gui = load_gui_module()

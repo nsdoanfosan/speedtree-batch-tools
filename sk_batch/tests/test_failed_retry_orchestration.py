@@ -221,6 +221,10 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             row["target"]: row for row in app._phase_result_summary["target_outcomes"]
         }
         self.assertEqual(outcomes[str(self.first)]["outcome"], "failed")
+        self.assertEqual(
+            outcomes[str(self.first)]["reason_token"],
+            "automatic_repair_failed",
+        )
         self.assertEqual(outcomes[str(self.second)]["outcome"], "blocked")
         self.assertEqual(
             outcomes[str(self.second)]["reason_token"],
