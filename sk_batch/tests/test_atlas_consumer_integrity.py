@@ -159,7 +159,7 @@ def write_receipt(
 
 
 class AtlasConsumerIntegrityTests(unittest.TestCase):
-    def test_silky_4_active_and_99_managed_orphans_is_not_healthy(self):
+    def test_silky_lineage_unproven_assets_stay_blocking(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = json.loads(SILKY_FIXTURE.read_text(encoding="utf-8"))
             root = Path(temporary)
@@ -278,6 +278,9 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 Counter({
                     "active": fixture["expected"]["active"],
                     "managed_orphan": fixture["expected"]["managed_orphan"],
+                    "current_preserved_unreferenced": fixture["expected"][
+                        "preserved_unreferenced"
+                    ],
                 }),
             )
             integrity = first["atlas_consumer_integrity"]
@@ -322,9 +325,15 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             }
             self.assertEqual(
                 {
+                    row["classification"] for row in authoritative.values()
+                },
+                {"current_preserved_unreferenced"},
+            )
+            self.assertEqual(
+                {
                     row["orphan_reason"] for row in authoritative.values()
                 },
-                {"authoritative_current_unreferenced"},
+                {"authoritative_current_variant_not_selected"},
             )
             self.assertFalse(any(
                 row["automatic_action_eligible"]
@@ -502,101 +511,63 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 spm = root / profile["target_name"]
                 model = ET.Element("SpeedTreeModel")
                 assets = ET.SubElement(model, "Assets")
-                receipt_groups = []
                 generator_index = 0
 
-                for group in profile["groups"]:
-                    mesh_ids = list(range(
-                        group["mesh_start"],
-                        group["mesh_start"] + group["mesh_count"],
-                    ))
-                    receipt_groups.append({
-                        "collection": group["group"],
-                        "material": group["material_name"],
-                        "material_id": group["material_id"],
-                        "mesh_ids": mesh_ids,
-                    })
-                    add_material(
-                        assets,
-                        group["material_id"],
-                        group["material_name"],
-                        mesh_ids,
-                        profile["current_scope"],
-                        group=group["group"],
-                    )
-                    for mesh_id in mesh_ids:
-                        add_external_mesh(
+                receipt_rows = []
+                for authority in profile["authorities"]:
+                    receipt_groups = []
+                    for group in authority["groups"]:
+                        mesh_ids = list(range(
+                            group["mesh_start"],
+                            group["mesh_start"] + group["mesh_count"],
+                        ))
+                        receipt_groups.append({
+                            "collection": group["group"],
+                            "material": group["material_name"],
+                            "material_id": group["material_id"],
+                            "mesh_ids": mesh_ids,
+                        })
+                        add_material(
                             assets,
-                            root,
-                            mesh_id,
-                            profile["current_scope"],
+                            group["material_id"],
+                            group["material_name"],
+                            mesh_ids,
+                            authority["scope"],
                             group=group["group"],
                         )
-                    for _ in range(group.get("default_cutout_slots", 0)):
-                        add_generator(
-                            model,
-                            group["material_id"],
-                            -10,
-                            generator_index,
-                        )
-                        generator_index += 1
-                    for mesh_id in group.get("generator_mesh_ids", []):
-                        add_generator(
-                            model,
-                            group["material_id"],
-                            mesh_id,
-                            generator_index,
-                        )
-                        generator_index += 1
+                        for mesh_id in mesh_ids:
+                            add_external_mesh(
+                                assets,
+                                root,
+                                mesh_id,
+                                authority["scope"],
+                                group=group["group"],
+                            )
+                        for mesh_id in group.get("generator_mesh_ids", []):
+                            add_generator(
+                                model,
+                                group["material_id"],
+                                mesh_id,
+                                generator_index,
+                            )
+                            generator_index += 1
+                    receipt_rows.append((authority, receipt_groups))
 
-                for foreign in profile.get("foreign_groups", []):
-                    mesh_ids = list(range(
-                        foreign["mesh_start"],
-                        foreign["mesh_start"] + foreign["mesh_count"],
-                    ))
-                    add_material(
-                        assets,
-                        foreign["material_id"],
-                        foreign["material_name"],
-                        mesh_ids,
-                        foreign["scope"],
-                        group=foreign["group"],
-                    )
-                    for mesh_id in mesh_ids:
-                        add_external_mesh(
-                            assets,
-                            root,
-                            mesh_id,
-                            foreign["scope"],
-                            group=foreign["group"],
-                        )
+                write_spm(spm, model)
+                for authority, receipt_groups in receipt_rows:
+                    first_group = receipt_groups[0]
                     write_receipt(
                         spm,
                         ".atlas_leaf_speedtree_scopes",
-                        f"{foreign['scope']}__other.json",
-                        foreign["scope"],
-                        foreign["material_id"],
-                        foreign["material_name"],
-                        mesh_ids,
-                        blend="C:/sanitized/foreign.blend",
-                        collection=foreign["group"],
-                        declared_spm=root / "SK_other_target.spm",
+                        f"{authority['scope']}__{spm.stem}.json",
+                        authority["scope"],
+                        first_group["material_id"],
+                        first_group["material"],
+                        first_group["mesh_ids"],
+                        blend=authority["blend_file"],
+                        collection=authority["source_collection"],
+                        groups=receipt_groups,
                     )
-
-                write_spm(spm, model)
-                first_group = receipt_groups[0]
-                write_receipt(
-                    spm,
-                    ".atlas_leaf_speedtree_targets",
-                    f"{spm.stem}.json",
-                    profile["current_scope"],
-                    first_group["material_id"],
-                    first_group["material"],
-                    first_group["mesh_ids"],
-                    blend="C:/sanitized/current.blend",
-                    collection="CurrentAtlasProducer",
-                    groups=receipt_groups,
-                )
                 before = spm.read_bytes()
 
                 report = inspect_spm_mesh_file_references(spm)
@@ -609,6 +580,10 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 )
                 integrity = report["atlas_consumer_integrity"]
                 self.assertFalse(integrity["blocking"])
+                self.assertEqual(
+                    len(integrity["selected_authorities"]),
+                    profile["expected"]["selected_authorities"],
+                )
                 for key in (
                     "active_managed_mesh_count",
                     "managed_orphan_mesh_count",
@@ -616,6 +591,26 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                     "classification_counts",
                 ):
                     self.assertEqual(integrity[key], profile["expected"][key])
+                self.assertEqual(
+                    sum(
+                        row["classification"]
+                        == "current_preserved_unreferenced"
+                        for row in integrity["managed_meshes"]
+                    ),
+                    profile["expected"][
+                        "preserved_unreferenced_mesh_count"
+                    ],
+                )
+                self.assertEqual(
+                    sum(
+                        row["classification"]
+                        == "current_preserved_unreferenced"
+                        for row in integrity["managed_materials"]
+                    ),
+                    profile["expected"][
+                        "preserved_unreferenced_material_count"
+                    ],
+                )
                 self.assertEqual(integrity["repair_input"]["candidates"], [])
                 issue_codes = {
                     issue["code"]

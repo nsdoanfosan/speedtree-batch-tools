@@ -514,6 +514,16 @@ def _asset_source_identity(receipt):
     return dict((receipt or {}).get("source_identity") or {})
 
 
+def _asset_authority_key(row):
+    """Return the exact selected authority that classified one asset."""
+    identity = row.get("source_identity") or {}
+    scope_id = str(row.get("scope_id") or "").strip().casefold()
+    producer = str(identity.get("producer_identity_sha256") or "").strip()
+    if not scope_id or not producer or identity.get("complete") is not True:
+        return None
+    return scope_id, producer
+
+
 def _selected_authorities(receipts):
     grouped = defaultdict(list)
     for receipt in receipts.get("selected") or []:
@@ -926,70 +936,70 @@ def audit_atlas_consumer_integrity(target_spm, root):
             "automatic_action_eligible": eligible,
         })
 
-    # Generator reachability is not an age signal.  One current Atlas producer
-    # may publish more Materials/Mesh variants than an exact SpeedTree target
-    # selects, both across whole groups and within one group.  Calling those
+    # Generator reachability is not an age signal. Current Atlas producers may
+    # publish more Materials/Mesh variants than an exact SpeedTree target
+    # selects, both across whole groups and within one group. Calling those
     # unselected variants "stale" blocked coherent targets such as blackgum
     # before Blender could start.
     #
-    # Preserve current unreferenced variants only when the stronger ownership
-    # facts are unambiguous: exactly one selected producer authority, at least
-    # one live asset from that authority, no integrity issue, and (for Meshes)
-    # all owning Materials belong to that same authority.  Missing/multiple
-    # authorities, lineage-unproven assets, mixed ownership, and broken live
-    # Generator pairs remain blocking.
-    selected_authorities = _selected_authorities(receipts)
-    if len(selected_authorities) == 1 and not integrity_issues:
-        authority = selected_authorities[0]
-        authority_scope = str(authority.get("scope_id") or "")
-        live_authority_asset = any(
-            row.get("scope_id") == authority_scope
-            and row.get("classification") in {
-                "current_reachable",
-                "current_default_cutout",
-            }
-            for row in managed_materials + managed_meshes
-        )
-        if authority_scope and live_authority_asset:
-            for material in managed_materials:
-                if (
-                    material.get("scope_id") == authority_scope
-                    and material.get("classification") == "ambiguous"
-                    and material.get("orphan_reason")
-                    == "authoritative_current_unreferenced"
-                    and not material.get("generator_references")
-                ):
-                    material["classification"] = (
-                        "current_preserved_unreferenced"
-                    )
-                    material["orphan_reason"] = (
-                        "authoritative_current_variant_not_selected"
-                    )
-            materials_by_id = {
-                row.get("material_id"): row for row in managed_materials
-            }
-            for row in managed_meshes:
-                owner_ids = list(row.get("owner_material_ids") or ())
-                owners = [materials_by_id.get(value) for value in owner_ids]
-                if (
-                    row.get("scope_id") == authority_scope
-                    and row.get("classification") == "ambiguous"
-                    and row.get("orphan_reason")
-                    == "authoritative_current_unreferenced"
-                    and not row.get("generator_references")
-                    and owner_ids
-                    and all(
-                        owner is not None
-                        and owner.get("scope_id") == authority_scope
-                        for owner in owners
-                    )
-                ):
-                    row["classification"] = (
-                        "current_preserved_unreferenced"
-                    )
-                    row["orphan_reason"] = (
-                        "authoritative_current_variant_not_selected"
-                    )
+    # Preserve current unreferenced variants per asset. A SpeedTree target can
+    # legitimately consume several disjoint Atlas producers (for example leaf
+    # and bark); counting authorities for the whole target discarded the exact
+    # claim already proved for each asset and falsely blocked those consumers.
+    #
+    # The target must still contain a live current binding and have no integrity
+    # damage. Each preserved asset must carry a complete exact selected claim;
+    # a Mesh is preserved only when every owning Material has that same exact
+    # authority. Lineage-unproven, scope-mismatched, mixed-owner, and damaged
+    # assets remain ambiguous and blocking.
+    live_current_asset = any(
+        row.get("classification") in {
+            "current_reachable",
+            "current_default_cutout",
+        }
+        for row in managed_materials + managed_meshes
+    )
+    if live_current_asset and not integrity_issues:
+        for material in managed_materials:
+            if (
+                material.get("classification") == "ambiguous"
+                and material.get("orphan_reason")
+                == "authoritative_current_unreferenced"
+                and not material.get("generator_references")
+                and _asset_authority_key(material) is not None
+            ):
+                material["classification"] = (
+                    "current_preserved_unreferenced"
+                )
+                material["orphan_reason"] = (
+                    "authoritative_current_variant_not_selected"
+                )
+        materials_by_id = {
+            row.get("material_id"): row for row in managed_materials
+        }
+        for row in managed_meshes:
+            authority_key = _asset_authority_key(row)
+            owner_ids = list(row.get("owner_material_ids") or ())
+            owners = [materials_by_id.get(value) for value in owner_ids]
+            if (
+                row.get("classification") == "ambiguous"
+                and row.get("orphan_reason")
+                == "authoritative_current_unreferenced"
+                and not row.get("generator_references")
+                and authority_key is not None
+                and owner_ids
+                and all(
+                    owner is not None
+                    and _asset_authority_key(owner) == authority_key
+                    for owner in owners
+                )
+            ):
+                row["classification"] = (
+                    "current_preserved_unreferenced"
+                )
+                row["orphan_reason"] = (
+                    "authoritative_current_variant_not_selected"
+                )
 
     managed_assets = managed_materials + managed_meshes
     classification_counts = dict(sorted(Counter(
