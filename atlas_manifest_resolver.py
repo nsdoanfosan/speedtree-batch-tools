@@ -349,9 +349,38 @@ def _target_scope_paths(scope_dir, target, pair_identity=None):
     return paths
 
 
+_ISOLATION_DIR_NAME = ".sk_batch_isolated_bark"
+
+
+def _manifest_owner_target(target):
+    """Production target that owns Atlas manifests for this queried SPM.
+
+    Bark isolation copies the SPM into ``<production dir>/.sk_batch_isolated_bark/
+    <hash>/<mirrored suffix>/``.  The mirrored copy never carries the
+    ``.atlas_leaf_speedtree_targets`` / ``.atlas_leaf_speedtree_scopes``
+    receipts or pair-normalization receipt.  The isolation root's parent owns
+    the production file with the same basename, so manifest identity and
+    relative paths must be resolved in that coordinate system.  Non-isolated
+    targets are unaffected.
+    """
+    parts = [part.casefold() for part in target.parts]
+    try:
+        index = parts.index(_ISOLATION_DIR_NAME)
+    except ValueError:
+        return target
+    production_dir = Path(*target.parts[:index])
+    production_target = production_dir / target.name
+    return production_target if production_dir.is_dir() else target
+
+
+def _manifest_search_dir(target):
+    return _manifest_owner_target(target).parent
+
+
 def _candidate_specs(target, pair_identity=None):
-    target_dir = target.parent / ".atlas_leaf_speedtree_targets"
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
+    search_dir = _manifest_search_dir(target)
+    target_dir = search_dir / ".atlas_leaf_speedtree_targets"
+    scope_dir = search_dir / ".atlas_leaf_speedtree_scopes"
     specs = []
     if target_dir.is_dir():
         specs.extend(
@@ -365,14 +394,15 @@ def _candidate_specs(target, pair_identity=None):
             (path, "exact_target_scope")
             for _key, path in sorted(exact.items())
         )
-    global_path = target.parent / "speedtree_import_manifest.json"
+    global_path = search_dir / "speedtree_import_manifest.json"
     if global_path.is_file():
         specs.append((global_path, "exact_global_target"))
     return specs
 
 
 def _diagnostic_specs(target, pair_identity=None):
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
+    search_dir = _manifest_search_dir(target)
+    scope_dir = search_dir / ".atlas_leaf_speedtree_scopes"
     exact_keys = set()
     if scope_dir.is_dir():
         exact_keys = set(
@@ -388,7 +418,7 @@ def _diagnostic_specs(target, pair_identity=None):
         )
     rows.extend(
         (path, "legacy_material_manifest")
-        for path in sorted(target.parent.glob("speedtree_import_manifest_M_*.json"))
+        for path in sorted(search_dir.glob("speedtree_import_manifest_M_*.json"))
         if path.is_file()
     )
     return rows
@@ -430,8 +460,10 @@ def resolve_atlas_manifests(
     with reasons, while diagnostic legacy records are always shadowed.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
-    target_key = normalized_manifest_path(target)
-    pair_identity = proven_cluster_pair_identity(target)
+    owner_target = _manifest_owner_target(target)
+    owner_parent = owner_target.parent
+    target_key = normalized_manifest_path(owner_target)
+    pair_identity = proven_cluster_pair_identity(owner_target)
     identity_keys = {target_key}
     legacy_identity_key = None
     if pair_identity:
@@ -460,31 +492,31 @@ def resolve_atlas_manifests(
             "receipt_path": str(pair_identity["receipt_path"]),
         }
 
-    target_dir = target.parent / ".atlas_leaf_speedtree_targets"
-    target_stems = _target_stems(target, pair_identity)
+    target_dir = owner_parent / ".atlas_leaf_speedtree_targets"
+    target_stems = _target_stems(owner_target, pair_identity)
     if not any((target_dir / f"{stem}.json").is_file() for stem in target_stems):
         resolution["missing"].append({
-            "path": str(target_dir / f"{target.stem}.json"),
+            "path": str(target_dir / f"{owner_target.stem}.json"),
             "reason": "candidate_file_missing",
         })
-    global_path = target.parent / "speedtree_import_manifest.json"
+    global_path = owner_parent / "speedtree_import_manifest.json"
     if not global_path.is_file():
         resolution["missing"].append({
             "path": str(global_path),
             "reason": "candidate_file_missing",
         })
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
+    scope_dir = owner_parent / ".atlas_leaf_speedtree_scopes"
     if not scope_dir.is_dir() or not _target_scope_paths(
-        scope_dir, target, pair_identity
+        scope_dir, owner_target, pair_identity
     ):
         resolution["missing"].append({
-            "path": str(scope_dir / f"*__{target.stem}.json"),
+            "path": str(scope_dir / f"*__{owner_target.stem}.json"),
             "reason": "target_scope_candidate_missing",
         })
 
     valid = []
     fatal = []
-    for path, kind in _candidate_specs(target, pair_identity):
+    for path, kind in _candidate_specs(owner_target, pair_identity):
         payload, read_error = _read_payload(path)
         base = {
             "path": str(path.resolve(strict=False)),
@@ -506,7 +538,7 @@ def resolve_atlas_manifests(
             continue
         declared_key = normalized_manifest_path(
             declared_spm,
-            relative_to=target.parent,
+            relative_to=owner_parent,
         )
         if declared_key not in identity_keys:
             resolution["rejected"].append({
@@ -551,7 +583,7 @@ def resolve_atlas_manifests(
         source_identity = _source_identity(
             payload,
             path,
-            target_parent=target.parent,
+            target_parent=owner_parent,
         )
         mismatch = _identity_mismatch(
             source_identity,
@@ -589,7 +621,7 @@ def resolve_atlas_manifests(
             "_identity_rank": identity_rank,
         })
 
-    for path, kind in _diagnostic_specs(target, pair_identity):
+    for path, kind in _diagnostic_specs(owner_target, pair_identity):
         payload, read_error = _read_payload(path)
         row = {
             "path": str(path.resolve(strict=False)),
@@ -606,7 +638,7 @@ def resolve_atlas_manifests(
             row["source_identity"] = _source_identity(
                 payload,
                 path,
-                target_parent=target.parent,
+                target_parent=owner_parent,
             )
             row["ownership_claims"] = sorted(
                 _candidate_claims(payload, row["source_identity"], kind)

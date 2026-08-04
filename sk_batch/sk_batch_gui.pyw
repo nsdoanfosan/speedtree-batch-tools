@@ -2470,11 +2470,20 @@ class App:
         Tooltip(lbl6, tip6); Tooltip(spin6, tip6)
 
         self.force_var = tk.BooleanVar(value=False)
-        chk = ttk.Checkbutton(opts, text="완료된 항목도 다시 실행", variable=self.force_var)
+        chk = ttk.Checkbutton(
+            opts,
+            text="최신 .blend/캐시가 있어도 강제로 다시 실행",
+            variable=self.force_var,
+        )
         chk.pack(side="left", padx=12)
         Tooltip(chk, ("② Blender Repair에서, 이미 SPM보다 최신인 .blend가 있는 항목은 기본적으로 "
                       "건너뜁니다. ① SPM 본 세팅도 동일 SPM/옵션 캐시를 기본 사용합니다. "
-                      "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다."))
+                      "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다.\n"
+                      "판정 기준은 '작업이 성공했는가'가 아니라 '.blend가 SPM보다 최신인가' "
+                      "입니다. 그래서 export가 게이트에 막혀 산출물이 안 나온 항목도 "
+                      "이전 .blend가 남아 있으면 기본적으로 건너뜁니다.\n"
+                      "↻ 재시도에서도 같은 옵션이 적용되어, 증거가 불완전해 fail-closed로 "
+                      "막히던 항목까지 전체 Blender→Send2UE→Unreal 재빌드로 보냅니다."))
 
         actions = ttk.Frame(self.root, padding=6)
         actions.pack(fill="x")
@@ -7051,12 +7060,22 @@ class App:
                 last_completed=iid,
             )
 
+        # The retry planner also runs in contexts that never built the options
+        # widgets, so read the force request defensively and default to the
+        # ordinary exclusion when it is unavailable.
+        force_var = getattr(self, "force_var", None)
+        try:
+            retry_force_rerun = bool(force_var.get()) if force_var else False
+        except Exception:
+            retry_force_rerun = False
+
         def classify(iid):
             return classify_failed_retry(
                 effective_entries.get(iid, {}),
                 repair_states[iid],
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
+                force_rerun=retry_force_rerun,
             )
 
         decisions = {}
@@ -7232,9 +7251,10 @@ class App:
             ):
                 continue
             prefix = (
-                "current Blender success 제외"
+                ".blend가 SPM보다 최신 · 제외 (강제 재실행 옵션으로 재빌드 가능)"
                 if decision.classification == CURRENT_BLENDER_EXCLUDED
-                else "재시도 증거 불완전 · fail closed"
+                else "재시도 증거 불완전 · fail closed "
+                "(강제 재실행 옵션으로 재빌드 가능)"
             )
             skipped.append(
                 f"{Path(iid).name}: {prefix} · "

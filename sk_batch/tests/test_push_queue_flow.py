@@ -5415,11 +5415,32 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(jobs, [])
         messages.showinfo.assert_called_once()
-        self.assertIn("current Blender success 제외", app.log.call_args.args[0])
+        self.assertIn(".blend가 SPM보다 최신 · 제외", app.log.call_args.args[0])
         title, body = messages.showinfo.call_args.args
         self.assertEqual(title, "전체 실패 이력 재시도")
         self.assertIn("현재 목록 전체", body)
         self.assertNotIn("선택", body)
+
+    def test_failed_results_retry_force_reruns_current_blender_success(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_var = mock.Mock()
+        app.force_var.get.return_value = True
+        iid = "current_blender.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {"push_status_kind": "imported_ok"}
+
+        with mock.patch.object(gui, "save_config"):
+            app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "pipeline")
+        self.assertTrue(jobs[0]["force_rerun"])
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]
+        self.assertEqual(
+            eligibility["items"][0]["reason_code"],
+            "current_blender_success_forced_rebuild",
+        )
 
     def test_failed_results_retry_imported_ok_parent_is_not_a_failure(self):
         gui = load_gui_module()
@@ -5441,7 +5462,7 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(jobs, [])
         messages.showinfo.assert_called_once()
-        self.assertIn("current Blender success 제외", app.log.call_args.args[0])
+        self.assertIn(".blend가 SPM보다 최신 · 제외", app.log.call_args.args[0])
         app._validate_failed_retry_unreal_item_current.assert_not_called()
 
     def test_failed_results_retry_empty_inventory_does_not_request_selection(self):

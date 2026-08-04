@@ -2119,9 +2119,6 @@ HIDDEN_ANCESTOR_CAUSAL_PATH_REASON = (
     "generator_causal_path_hidden_ancestor"
 )
 UNCONNECTED_CAUSAL_PATH_REASON = "generator_causal_path_unconnected"
-PAIR_DELIVERED_BY_SIBLING_REASON = (
-    "generator_material_mesh_pair_delivered_by_sibling"
-)
 
 
 def _inactive_causal_path_evidence(binding):
@@ -2433,7 +2430,8 @@ def _normalized_generator_delivery(
         "declared_binding_count": len(bindings),
         "active_required_binding_count": len(bindings),
         "planned_inactive_binding_count": 0,
-        "pair_covered_binding_count": 0,
+        "current_admission_relevant_binding_count": 0,
+        "current_admission_excluded_binding_count": 0,
         "current_required_target_mesh_ids": list(normalized_mesh_ids),
         "binding_outcomes": [],
         "missing_live_bindings": [],
@@ -2641,13 +2639,6 @@ def _normalized_generator_delivery(
         row for row in relevant_live_bindings
         if export_participates(row)
     ]
-    delivered_material_mesh_pairs = {
-        (
-            _positive_asset_id(row.get("material_id")),
-            _positive_asset_id(row.get("mesh_id")),
-        )
-        for row in export_participating_bindings
-    }
     evidence["live_generator_bindings"] = [
         dict(row) for row in export_participating_bindings
     ]
@@ -2747,12 +2738,30 @@ def _normalized_generator_delivery(
             row for row in bindings
             if tuple(slot_identity(row)) in required_slot_identities
         ]
+    admission_required_bindings = []
+    admission_excluded_bindings = []
+    for declared in required_bindings:
+        current_rows = live_by_slot.get(tuple(slot_identity(declared))) or []
+        if (
+            len(current_rows) == 1
+            and current_rows[0].get("export_admission_relevant") is False
+        ):
+            admission_excluded_bindings.append(declared)
+        else:
+            # Missing, ambiguous, and pre-admission-schema rows remain strict.
+            admission_required_bindings.append(declared)
     current_required_mesh_ids = sorted({
         _positive_asset_id(row.get("target_mesh_id"))
-        for row in required_bindings
+        for row in admission_required_bindings
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence["active_required_binding_count"] = len(required_bindings)
+    evidence["current_admission_relevant_binding_count"] = len(
+        admission_required_bindings
+    )
+    evidence["current_admission_excluded_binding_count"] = len(
+        admission_excluded_bindings
+    )
     evidence["planned_inactive_binding_count"] = len(planned_inactive_slots)
     evidence["current_required_target_mesh_ids"] = (
         current_required_mesh_ids
@@ -2780,6 +2789,8 @@ def _normalized_generator_delivery(
         if tuple(slot_identity(row)) in planned_inactive_slots
     ]
 
+    # Strict authored topology still validates every declared slot. Current
+    # export admission narrows only the mesh-set comparison above.
     for declared in bindings:
         errors = []
         outcome_reason = None
@@ -2828,11 +2839,11 @@ def _normalized_generator_delivery(
                         current.get("causal_path_reason")
                         or INACTIVE_CAUSAL_PATH_REASON
                     )
-                elif (
-                    current_material_id,
-                    current_mesh_id,
-                ) in delivered_material_mesh_pairs:
-                    outcome_reason = PAIR_DELIVERED_BY_SIBLING_REASON
+                elif current.get("export_admission_relevant") is False:
+                    outcome_reason = str(
+                        current.get("export_admission_reason")
+                        or "current_export_trustworthy_zero_geometry"
+                    )
                 elif _stale_node_table_evidence(current):
                     errors.append(
                         "generator_export_evidence_stale_node_table"
@@ -2849,10 +2860,14 @@ def _normalized_generator_delivery(
             "status": (
                 "continuity_only"
                 if continuity_only and not errors
-                else "pair_covered"
-                if outcome_reason == PAIR_DELIVERED_BY_SIBLING_REASON
                 else "planned_inactive"
-                if outcome_reason and not errors
+                if declared_slot in planned_inactive_slots and not errors
+                else "not_currently_admitted"
+                if (
+                    current is not None
+                    and current.get("export_admission_relevant") is False
+                    and not errors
+                )
                 else "completed" if not errors else "failed"
             ),
             "reason": outcome_reason,
@@ -2863,11 +2878,6 @@ def _normalized_generator_delivery(
         if "visible_generator_slot_missing" in errors:
             evidence["missing_live_bindings"].append(dict(declared))
         evidence["errors"].extend(errors)
-
-    evidence["pair_covered_binding_count"] = sum(
-        row.get("status") == "pair_covered"
-        for row in evidence["binding_outcomes"]
-    )
 
     # Preserve the old strict topology scope: only expected-material slots
     # that currently participate in export must be declared exactly once.

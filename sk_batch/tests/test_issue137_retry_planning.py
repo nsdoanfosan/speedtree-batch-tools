@@ -138,8 +138,25 @@ def test_sanitized_154_target_benchmark_preserves_classification_and_dedupes_io(
         label="regression",
     )
 
+    # The signature covers the operator-facing skip prose as well as the
+    # routing decision, so rewording a skip line moves the hash without any
+    # classification change. Pin the reason codes separately so a real routing
+    # regression is reported as itself instead of as an opaque hash mismatch.
+    signature = result["classification_signature"]
+    reason_codes = {}
+    for partition in signature["partitions"]:
+        for item in partition["eligibility"].get("items") or ():
+            reason_codes[item["reason_code"]] = (
+                reason_codes.get(item["reason_code"], 0) + 1
+            )
+    assert reason_codes == {
+        "blender_output_not_current": 24,
+        "current_immutable_unreal_failure": 10,
+        "structured_send2ue_export_failure": 10,
+    }
+    assert len(signature["skipped"]) == 110
     assert result["classification_signature_sha256"] == (
-        "87699b9d06e1f56749d9d819fe83dd0464e8449933fec1b136d580a983681a38"
+        "abfca4a07517e462c867d0a0f981469d18e2de2e098aa8093dd2b0a6074df822"
     )
     assert result["partition_counts"] == {
         "unreal_ingest": 10,

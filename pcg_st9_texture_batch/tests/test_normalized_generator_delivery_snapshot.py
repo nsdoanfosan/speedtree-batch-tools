@@ -1414,7 +1414,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                 "generator_causal_path_unconnected",
             )
 
-    def test_material_mesh_pair_delivered_by_sibling_covers_dead_rows(self):
+    def test_trustworthy_zero_slots_are_independently_excluded_from_admission(self):
         declared = []
         live = []
         for index, (guid, active) in enumerate((
@@ -1449,6 +1449,12 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
                     "node_table" if active else "node_table_stale"
                 ),
                 "node_table_stale": not active,
+                "export_admission_relevant": active,
+                "export_admission_reason": (
+                    "current_export_positive_geometry"
+                    if active
+                    else "current_export_trustworthy_zero_geometry"
+                ),
                 "causal_path_active": True if active else None,
                 "causal_path_reason": (
                     "generator_causal_path_active"
@@ -1486,15 +1492,21 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
         self.assertEqual(
             delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
         )
-        self.assertEqual(delivery["pair_covered_binding_count"], 2)
-        covered = [
-            row for row in delivery["binding_outcomes"]
-            if row["status"] == "pair_covered"
-        ]
-        self.assertEqual(len(covered), 2)
         self.assertEqual(
-            {row["reason"] for row in covered},
-            {"generator_material_mesh_pair_delivered_by_sibling"},
+            delivery["current_admission_relevant_binding_count"], 1
+        )
+        self.assertEqual(
+            delivery["current_admission_excluded_binding_count"], 2
+        )
+        self.assertEqual(delivery["current_required_target_mesh_ids"], [79])
+        excluded = [
+            row for row in delivery["binding_outcomes"]
+            if row["status"] == "not_currently_admitted"
+        ]
+        self.assertEqual(len(excluded), 2)
+        self.assertEqual(
+            {row["reason"] for row in excluded},
+            {"current_export_trustworthy_zero_geometry"},
         )
 
     def test_authored_zero_node_causes_are_planned_inactive(self):

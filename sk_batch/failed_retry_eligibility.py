@@ -118,6 +118,7 @@ def classify_failed_retry(
     *,
     unreal_parent_status=UNREAL_PARENT_ABSENT,
     unreal_parent_diagnostic="",
+    force_rerun=False,
 ):
     """Classify one inventory candidate from structured current evidence."""
 
@@ -172,6 +173,18 @@ def classify_failed_retry(
                 UNREAL_ONLY,
                 "current_immutable_unreal_failure",
                 "Immutable export/source evidence is current",
+                repair_kind,
+                parent,
+            )
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "parent_not_retryable_unreal_failure_forced_rebuild",
+                (
+                    "Unreal parent is current but status is not retryable "
+                    f"({push_kind or 'missing'}); an explicit force rerun "
+                    "authorizes the full Blender pipeline instead"
+                ),
                 repair_kind,
                 parent,
             )
@@ -231,6 +244,21 @@ def classify_failed_retry(
         )
 
     if repair_current:
+        # An explicit operator force request is an authorization to rebuild, not
+        # a claim that a failure exists. A current success stays ineligible for
+        # the ordinary failed-export route, but must not dead-end when the
+        # operator has already asked for a forced rerun.
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "current_blender_success_forced_rebuild",
+                (
+                    "Current Blender success is rebuilt because an explicit "
+                    "force rerun was requested"
+                ),
+                repair_kind,
+                parent,
+            )
         return _result(
             CURRENT_BLENDER_EXCLUDED,
             "current_blender_success",
@@ -239,6 +267,17 @@ def classify_failed_retry(
             parent,
         )
 
+    if force_rerun:
+        return _result(
+            BLENDER_REBUILD,
+            "retry_evidence_ambiguous_forced_rebuild",
+            (
+                "Retry evidence is incomplete but an explicit force rerun "
+                f"authorizes a full Blender rebuild · {repair_reason}"
+            ),
+            repair_kind,
+            parent,
+        )
     return _result(
         BLOCKED,
         "retry_evidence_ambiguous",

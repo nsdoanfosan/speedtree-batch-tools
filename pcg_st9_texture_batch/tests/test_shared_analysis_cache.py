@@ -163,7 +163,7 @@ class SharedAnalysisCacheTests(unittest.TestCase):
             stat = spm.stat()
             self.assertEqual(entry["size"], stat.st_size)
             self.assertEqual(entry["mtime_ns"], stat.st_mtime_ns)
-            self.assertEqual(entry["leaf_binding_schema"], 5)
+            self.assertEqual(entry["leaf_binding_schema"], 6)
 
 
 if __name__ == "__main__":

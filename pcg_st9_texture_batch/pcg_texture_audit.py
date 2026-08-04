@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -944,6 +945,89 @@ def _export_node_counts_from_text(text):
     return counts, total_nodes
 
 
+def _elementtree_export_node_counts_from_text(text):
+    """Independently count saved Node ownership from the same XML text."""
+    root = ET.fromstring(text)
+    counts = {}
+    total = 0
+
+    def local_name(element):
+        return str(element.tag).rsplit("}", 1)[-1].casefold()
+
+    def direct_child(element, name):
+        expected = name.casefold()
+        for child in element:
+            if local_name(child) == expected:
+                return child
+        return None
+
+    def truthy(element):
+        return bool(
+            element is not None
+            and str(element.text or "").strip().casefold()
+            in {"1", "true", "yes"}
+        )
+
+    for element in root.iter():
+        if local_name(element) != "node":
+            continue
+        total += 1
+        generator_guid = direct_child(element, "GeneratorGUID")
+        extra = direct_child(element, "Extra")
+        deleted = None
+        culled = None
+        if extra is not None:
+            for child in extra.iter():
+                name = local_name(child)
+                if name == "m_bdeleted" and deleted is None:
+                    deleted = child
+                elif name == "m_bculled" and culled is None:
+                    culled = child
+        key = _generator_guid_key(
+            generator_guid.text if generator_guid is not None else ""
+        )
+        if (
+            key
+            and not truthy(direct_child(element, "Hidden"))
+            and not truthy(deleted)
+            and not truthy(culled)
+        ):
+            counts[key] = counts.get(key, 0) + 1
+    return counts, total
+
+
+def _node_count_parser_parity_from_text(text, regex_counts, regex_total):
+    """Return fail-closed same-text parity evidence for zero-node admission."""
+    evidence = {
+        "contract": "speedtree_node_count_parser_parity_v1",
+        "regex_total_node_count": int(regex_total),
+        "regex_eligible_owner_count": len(regex_counts),
+        "regex_eligible_node_count": sum(regex_counts.values()),
+        "elementtree_total_node_count": None,
+        "elementtree_eligible_owner_count": None,
+        "elementtree_eligible_node_count": None,
+        "parity": False,
+        "error": None,
+    }
+    try:
+        elementtree_counts, elementtree_total = (
+            _elementtree_export_node_counts_from_text(text)
+        )
+    except (ET.ParseError, TypeError, ValueError) as exc:
+        evidence["error"] = type(exc).__name__
+        return evidence
+    evidence.update({
+        "elementtree_total_node_count": int(elementtree_total),
+        "elementtree_eligible_owner_count": len(elementtree_counts),
+        "elementtree_eligible_node_count": sum(elementtree_counts.values()),
+        "parity": bool(
+            regex_total == elementtree_total
+            and regex_counts == elementtree_counts
+        ),
+    })
+    return evidence
+
+
 def _generator_guid_keys_from_text(text):
     """GUID keys of every Generator in the document.
 
@@ -1111,8 +1195,10 @@ def _is_leaf_mesh_generator_type(value):
 
 
 def _leaf_generator_bindings_from_text(
-    text, export_node_counts=None, total_nodes=0
-):
+        text,
+        export_node_counts=None,
+        total_nodes=0,
+        node_count_parser_parity=None):
     """Return material/mesh slot pairs owned by semantic leaf generators.
 
     Texture filenames and material names are intentionally not part of this
@@ -1340,6 +1426,43 @@ def _leaf_generator_bindings_from_text(
         binding_node_table_stale = bool(
             causal_evidence.get("node_table_stale")
         )
+        parser_parity = bool(
+            isinstance(node_count_parser_parity, dict)
+            and node_count_parser_parity.get("parity") is True
+        )
+        causal_path_reason = str(
+            causal_evidence.get("causal_path_reason") or ""
+        )
+        exact_ancestor_chain = bool(
+            causal_path_reason
+            != "generator_causal_path_evidence_unavailable"
+            and not binding_node_table_stale
+        )
+        positive_ancestor_reached = any(
+            int(row.get("generated_node_count") or 0) > 0
+            for row in causal_evidence.get("causal_path") or ()
+            if isinstance(row, dict)
+        )
+        structurally_unconnected = bool(
+            causal_path_reason == "generator_causal_path_unconnected"
+            and not (causal_evidence.get("causal_path") or [])
+        )
+        trustworthy_zero_geometry = bool(
+            generated_node_count == 0
+            and int(total_nodes or 0) > 0
+            and parser_parity
+            and exact_ancestor_chain
+            and (positive_ancestor_reached or structurally_unconnected)
+        )
+        export_admission_relevant = bool(
+            export_participates or not trustworthy_zero_geometry
+        )
+        if export_participates:
+            export_admission_reason = "current_export_positive_geometry"
+        elif trustworthy_zero_geometry:
+            export_admission_reason = "current_export_trustworthy_zero_geometry"
+        else:
+            export_admission_reason = "current_export_evidence_fail_closed"
         # A zero count read out of a stale table proves nothing either way.
         # Keep failing closed, but say which of the two it is so an operator is
         # not sent to fix a Generator connection that is already correct.
@@ -1372,6 +1495,19 @@ def _leaf_generator_bindings_from_text(
                 "graph_visible": graph_visible,
                 "generated_node_count": generated_node_count,
                 "export_participates": export_participates,
+                "export_admission_relevant": export_admission_relevant,
+                "export_admission_reason": export_admission_reason,
+                "export_admission_evidence": {
+                    "generated_node_count": generated_node_count,
+                    "total_node_count": int(total_nodes or 0),
+                    "graph_visible": graph_visible,
+                    "node_table_stale": binding_node_table_stale,
+                    "node_count_parser_parity": parser_parity,
+                    "exact_ancestor_chain": exact_ancestor_chain,
+                    "positive_ancestor_reached": positive_ancestor_reached,
+                    "structurally_unconnected": structurally_unconnected,
+                    "trustworthy_zero_geometry": trustworthy_zero_geometry,
+                },
                 "export_evidence": export_evidence,
                 **causal_evidence,
             })
@@ -1381,10 +1517,16 @@ def _leaf_generator_bindings_from_text(
 def generator_delivery_snapshot_from_spm_text(text, path):
     """Build delivery evidence from one caller-owned immutable text snapshot."""
     export_node_counts, total_nodes = _export_node_counts_from_text(text)
+    node_count_parser_parity = _node_count_parser_parity_from_text(
+        text,
+        export_node_counts,
+        total_nodes,
+    )
     bindings = _leaf_generator_bindings_from_text(
         text,
         export_node_counts=export_node_counts,
         total_nodes=total_nodes,
+        node_count_parser_parity=node_count_parser_parity,
     )
     mesh_asset_ids = sorted({
         match.group(1).strip()
@@ -1541,7 +1683,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             == content_identity_sha256 \
             and disk_entry.get("content_identity_algorithm") \
             == SPM_CONTENT_IDENTITY_ALGORITHM \
-            and disk_entry.get("leaf_binding_schema") in (4, 5):
+            and disk_entry.get("leaf_binding_schema") == 6:
         _record_session_cache_metric("spm_persistent_hits", path=path)
         _PENDING_RAW_SPM_HANDOFF.set(None)
         analysis = {
@@ -1613,11 +1755,19 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
 
     referenced = _referenced_material_ids_from_text(text)
     export_node_counts, total_nodes = _export_node_counts_from_text(text)
+    node_count_parser_parity = _node_count_parser_parity_from_text(
+        text,
+        export_node_counts,
+        total_nodes,
+    )
     visible = _visible_material_ids_from_text(
         text, export_node_counts=export_node_counts, total_nodes=total_nodes
     )
     leaf_bindings = _leaf_generator_bindings_from_text(
-        text, export_node_counts=export_node_counts, total_nodes=total_nodes
+        text,
+        export_node_counts=export_node_counts,
+        total_nodes=total_nodes,
+        node_count_parser_parity=node_count_parser_parity,
     )
     mesh_assets = {
         match.group(1).strip()
@@ -1683,7 +1833,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             "visible_material_ids": sorted(visible),
             "leaf_generator_bindings": leaf_bindings,
             "mesh_asset_ids": sorted(mesh_assets),
-            "leaf_binding_schema": 5,
+            "leaf_binding_schema": 6,
             "texture_slot_schema": 1,
             "texture_slot_inspection": texture_slot_inspection,
             "generator_delivery_snapshot_schema": 1,

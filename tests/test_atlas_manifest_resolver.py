@@ -795,6 +795,44 @@ class ClusterPairLegacyNameIdentityTests(unittest.TestCase):
                 str(legacy),
             )
 
+    def test_isolated_bark_copy_uses_production_owner_and_legacy_stem(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+            isolated = (
+                cluster
+                / ".sk_batch_isolated_bark"
+                / "16fe43d9f75955c526e9009d"
+                / "tree_chestnut"
+                / "cluster"
+                / canonical.name
+            )
+            isolated.parent.mkdir(parents=True)
+            isolated.write_bytes(canonical.read_bytes())
+
+            resolution = resolve_atlas_manifests(isolated)
+
+            selected = {row["path"] for row in resolution["selected"]}
+            self.assertTrue(selected)
+            self.assertIn(str(paths["per_target_legacy"].resolve()), selected)
+            self.assertFalse(
+                any(
+                    ".sk_batch_isolated_bark" in row["path"]
+                    for row in resolution["missing"]
+                ),
+                "candidate diagnostics must also use the production owner",
+            )
+            self.assertTrue(all(
+                row["identity_match"] == "cluster_spm_pair_legacy_name"
+                for row in resolution["selected"]
+            ))
+            self.assertEqual(
+                resolution["cluster_pair_identity"]["counterpart_spm"],
+                str(legacy),
+            )
+
     def test_a_genuinely_different_spm_in_the_same_folder_stays_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             cluster, canonical, legacy, blend = self.build(temporary)
