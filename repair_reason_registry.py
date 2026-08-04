@@ -22,10 +22,12 @@ no runtime ``unclassified`` disposition: an unknown token resolves to one
 friendly, fail-closed unsupported row while the source scanner makes the same
 omission a CI failure.
 
-The scan now follows conditional values, reason-parameter helper calls, and
-named failure-kind sets; that expanded the statically visible surface to 307.
-It is paired with a sanitized snapshot of 20 tokens observed in durable queue
-state, because source possibility and observed runtime state catch different
+The scan now follows conditional values, reason-parameter helper calls, named
+failure-kind sets, and scope-local names assigned a literal -- the
+`reason = "..."` then `{"reason": reason}` shape that hid a whole family of
+gates.  That expanded the statically visible surface to 366.  It is paired
+with a sanitized snapshot of 20 tokens observed in durable queue state,
+because source possibility and observed runtime state catch different
 omissions.
 
 `tests/test_repair_reason_registry.py` fails when a module emits a code that is
@@ -345,6 +347,16 @@ POLICY_CONTRACTS = {
         "Atlas manifest의 명시적 schema version이 손상되었거나 지원 범위를 벗어났습니다.",
         "지원되는 producer로 manifest를 다시 생성하고 기존 unknown-schema 파일은 보존하여 검토하세요.",
     ),
+    # Losing the reason a repair was built for is a bookkeeping failure, not
+    # data damage.  `fatal` is reserved for damage automatic recovery would
+    # hide; spending it here sent nine targets to a state no automatic path
+    # may touch, for a defect in our own receipts (#167).  The single fresh
+    # re-audit that regenerates the reason runs first, so a row that still
+    # reaches an operator has already exhausted the automatic answer.
+    "dependency_provenance": _terminal(
+        "이전 자동 복구가 실패했고, fresh audit 1회로도 구체 원인을 다시 찾지 못했습니다.",
+        "해당 대상만 목록에서 다시 검사해 현재 blocker를 새로 생성한 뒤, 그 원인으로 재시도하세요.",
+    ),
     "generic_terminal": _terminal(
         "등록된 자동 BAT가 이 blocker를 안전하게 복구할 수 없습니다.",
         "registry owner가 표시한 audit evidence를 확인하고 원본 authoring 또는 실행 환경을 수정한 뒤 재검사하세요.",
@@ -412,7 +424,7 @@ POLICY_CONTRACTS = {
 # tables that can drift from the disposition.
 for _policy_name in (
     "asset_missing", "atlas_integrity", "cluster_identity",
-    "cluster_integrity", "dependency_provenance", "material_contract",
+    "cluster_integrity", "material_contract",
     "pipeline_contract", "blender_cluster_bake", "cluster_authoring",
     "export_hierarchy", "export_inspection", "exporter_process",
     "lifecycle_owner_lost", "process_lifecycle", "receipt_persistence",
@@ -433,7 +445,7 @@ for _policy_name in (
     "diagnostic_integrity_field", "material_export_scope_diagnostic",
     "relation_decision_diagnostic", "lifecycle_event",
     "cluster_handoff_diagnostic", "prepared_unused", "audit_detail",
-    "dependency_lifecycle",
+    "dependency_lifecycle", "generator_reference_mutation",
 ):
     POLICY_CONTRACTS.setdefault(_policy_name, _informational())
 
@@ -452,6 +464,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "all_consumers_planned_excluded": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
     ),
+    "ambiguous_complete_sets": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
     "assembly_source_fbx_pending_export": ReasonRow(
         UNCLASSIFIED, "sk_batch/cluster_assembly_handoff_contract.py", "",
     ),
@@ -461,11 +477,19 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "asset_cluster_bake_texture_contract_invalid": ReasonRow(
         UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py", "recipe_gated",
     ),
+    "asset_dependency_error": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw",
+        "cluster_source_missing",
+    ),
     "asset_export_material_missing": ReasonRow(
         UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py", "export_material",
     ),
     "asset_external_mesh_path_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
+    ),
+    "asset_registration_only": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
     ),
     "asset_texture_source_path_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_leaf_handoff_contract.py", "",
@@ -509,14 +533,54 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
         "atlas_integrity",
     ),
+    "authoritative_managed_mesh_sentinel": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_managed_ordinal_mismatch": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_managed_to_source_restore": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_material_mesh_mismatch": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_missing_mesh_reference": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
     "authoritative_property_pair_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/spm_generator_reference_repair.py", "",
+    ),
+    "authoritative_source_mesh_sentinel_restore": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_source_missing_mesh_restore": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_source_ordinal_restore": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
+    ),
+    "authoritative_source_to_managed": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
+        "generator_reference_mutation",
     ),
     "automatic_repair_cancelled": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
     ),
     "automatic_retry_cancelled": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
+    ),
+    "basename_or_suffix_mismatch": ReasonRow(
+        UNSUPPORTED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_data",
     ),
     "before_marker_restore": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_problem_node_marker.py", "",
@@ -598,6 +662,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "cancelled": ReasonRow(
         UNCLASSIFIED, "spm_generator_sync/process_stream.py", "",
+    ),
+    "candidate": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "retry_route_status",
     ),
     "candidate_file_missing": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
@@ -681,8 +749,12 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "cluster_integrity",
     ),
     "cluster_role_handoff_blocked": ReasonRow(
-        UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
-        "cluster_handoff",
+        INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
+    "cluster_source_build_contract_invalid": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
     ),
     "cluster_tga_basename_invalid": ReasonRow(
         UNSUPPORTED,
@@ -712,7 +784,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "current_authority_variant",
     ),
     "dependency_root_reason_missing": ReasonRow(
-        FATAL, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
     ),
     "dependency_output_missing": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_artifact",
@@ -775,6 +847,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "generator_guid_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
+    "generator_material_scope_ambiguous": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
+    "generator_material_scope_empty": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
     "generator_material_scope_unreadable": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
     ),
@@ -783,6 +863,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "hash_validated_cluster_assembly_source": ReasonRow(
         UNCLASSIFIED, "sk_batch/cluster_assembly_handoff_contract.py", "",
+    ),
+    "incomplete_texture_set": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
     ),
     "initiating_job_cancelled": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
@@ -887,8 +971,16 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "material_texture_origin_invalid": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
     ),
+    "merged_source_missing": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
+    ),
     "missing_export_collection": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
+    ),
+    "missing_or_incomplete_report": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
     ),
     "missing_pipeline_report": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/bwr_headless_job.py", "",
@@ -982,6 +1074,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "physical_capture_manifest_missing": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
     ),
+    "path_alias_missing": ReasonRow(
+        UNSUPPORTED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_data",
+    ),
     "pcg_cluster_handoff_not_ready": ReasonRow(
         UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff",
@@ -1008,6 +1104,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
         "preflight_error",
     ),
+    "production_texture_not_canonical_output": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_scope_integrity",
+    ),
+    "production_texture_uses_derived_cache": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_scope_integrity",
+    ),
     "protected_manual": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
@@ -1020,7 +1124,15 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "publication_canceled": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_board_snapshot.py", "",
     ),
+    "receipt_not_applicable": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
+    ),
     "receipt_not_requested": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
+    ),
+    "receipt_persisted": ReasonRow(
         INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
         "receipt_status",
     ),
@@ -1030,6 +1142,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "registered_reason_has_no_exact_action": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_plan",
+    ),
+    "receipt_unchanged": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "receipt_status",
     ),
     "recorded_source_conflict": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
@@ -1063,6 +1179,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "required_cluster_repaired_resume": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
+    ),
+    "resumable_cancelled": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "lifecycle_cancelled",
     ),
     "resumed_pipeline_result_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
@@ -1111,6 +1231,18 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "source_fbx_missing": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
+    ),
+    "source_handoff_blocked": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
+    ),
+    "source_identity_stale": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
+    ),
+    "source_semantic_unavailable": ReasonRow(
+        UNSUPPORTED, "cluster_normalization_sync.py",
+        "cluster_source_integrity",
     ),
     "source_spm_missing": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
@@ -1172,6 +1304,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "timed_out": ReasonRow(
         UNCLASSIFIED, "spm_generator_sync/process_stream.py", "",
+    ),
+    "texture_ref_not_found": ReasonRow(
+        UNSUPPORTED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_data",
     ),
     "texture_set_incomplete": ReasonRow(
         REPAIRABLE, "sk_batch/jobs/speedtree_material_preflight.py",
@@ -1251,6 +1387,22 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "canonical_output_missing": ReasonRow(
         REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
     ),
+    "canonical_output_must_be_manifest_relative": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
+    "canonical_output_outside_texture_root": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_scope_integrity",
+    ),
+    "canonical_output_role_mismatch": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
+    "canonical_output_role_undeclared": ReasonRow(
+        UNSUPPORTED, "speedtree_texture_contract.py",
+        "texture_authoring",
+    ),
     "canonical_output_uses_derived_cache": ReasonRow(
         REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
     ),
@@ -1300,8 +1452,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "superseded_legacy_name_record": ReasonRow(
         INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
     ),
+    # send2ue_push_job.py writes this as a report stage/status, which is not a
+    # reason field.  The token only becomes a reason code where the GUI turns
+    # it into `reason_token`, so that module owns the registry row.
     "exported_pending_unreal": ReasonRow(
-        INFORMATIONAL, "sk_batch/jobs/send2ue_push_job.py", "durable_status",
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "durable_status",
     ),
     "foreign_or_manual_userdata": ReasonRow(
         INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",
@@ -1368,6 +1523,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "process": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
+    "process_cache_io_error": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw",
+        "worker_runtime",
+    ),
+    "process_resolution_error": ReasonRow(
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw",
+        "worker_runtime",
     ),
     "process_timeout": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",

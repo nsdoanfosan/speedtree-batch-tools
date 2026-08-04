@@ -1110,9 +1110,9 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             evidence = "asset_registration_only"
         elif delivery_mode == "connection_incomplete":
             row["decision"] = "blocked"
-            row["reconciliation"] = "generator_connection_incomplete"
+            row["reconciliation"] = "generator_connection_contract_incomplete"
             decision = "blocked"
-            evidence = "generator_connection_incomplete"
+            evidence = "generator_connection_contract_incomplete"
         elif decision == "normalize_part" and not _normalized_variants_ready(
             row.get("normalized_variants"),
             spm_path=spm_path,

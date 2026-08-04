@@ -1400,7 +1400,10 @@ class PushQueueFlowTests(unittest.TestCase):
             weed_outcome["reason_token"],
             fixture["expected_result"]["blocked_reason_token"],
         )
-        self.assertIn(
+        # 자동 복구 대상 is a promise that a repair is coming, so it may not
+        # sit on a row that is not being repaired (#160).  The exclusion is
+        # still visible, still target-local, and still names the same reason.
+        self.assertNotIn(
             "자동 복구 대상",
             app.state[str(weed)]["blend_status"],
         )
@@ -2572,12 +2575,15 @@ class PushQueueFlowTests(unittest.TestCase):
             for node in app_class.body
             if isinstance(node, ast.FunctionDef) and node.name == "_job_blender"
         )
+        # The single entry point is the recovery wrapper: the direct run
+        # admits a registered target block to repair before it terminates
+        # (#160).  It still has to be one call, still after the mesh gate.
         refresh_calls = [
             node
             for node in ast.walk(job)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_refresh_stale_cluster_receipt"
+            and node.func.attr == "_cluster_receipt_with_recovery"
         ]
         mesh_calls = [
             node
