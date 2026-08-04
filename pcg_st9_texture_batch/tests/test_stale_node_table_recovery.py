@@ -891,7 +891,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
         )
         self.assertFalse(snapshot["delivery"]["node_table"]["stale"])
 
-    def test_original_stale_blackgum_failure_shape_is_deterministic(self):
+    def test_disconnected_orphans_do_not_hide_unconnected_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             spm, _executable, _root = self.make_files(folder)
@@ -908,8 +908,9 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 self.assertTrue(snapshot["regex_elementtree_parity"])
                 self.assertEqual(
                     snapshot["normalization"]["delivery_reason"],
-                    "live_export_evidence_unavailable_stale_node_table",
+                    "generator_connection_all_bindings_planned_inactive",
                 )
+                self.assertEqual(snapshot["normalization"]["errors"], [])
                 self.assertFalse(snapshot["normalization"]["complete"])
             self.assertEqual(first["raw_sha256"], second["raw_sha256"])
             self.assertEqual(
@@ -2302,7 +2303,7 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             caught.exception.evidence["last_reason_tokens"],
         )
 
-    def test_same_mesh_one_live_three_dead_siblings_remain_fail_closed(self):
+    def test_same_mesh_one_live_three_dead_siblings_satisfy_pair_delivery(self):
         baseline = spm_text(stale=True)
         after = spm_text(stale=False, volatile="two")
         for mesh_id in (131, 132, 133):
@@ -2322,15 +2323,14 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             spm, executable, root = self.make_files(folder)
             write_spm(spm, baseline)
 
-            with self.assertRaises(StaleNodeTableRecoveryTimeout) as caught:
-                self.recover_with_save(
-                    spm,
-                    executable,
-                    root,
-                    after_text=after,
-                    timeout=3,
-                    expected_mesh_ids=(130,),
-                )
+            result = self.recover_with_save(
+                spm,
+                executable,
+                root,
+                after_text=after,
+                timeout=3,
+                expected_mesh_ids=(130,),
+            )
             receipt = json.loads(
                 next(root.glob("*.receipt.json")).read_text(encoding="utf-8")
             )
@@ -2343,14 +2343,12 @@ class PreimageAndReceiptTests(RecoveryTestCase):
             receipt["required_target_bindings"]["binding_count"],
             4,
         )
-        self.assertIn(
-            "target_binding_has_no_eligible_nodes",
-            caught.exception.evidence["last_reason_tokens"],
+        self.assertEqual(result["status"], "repaired_reaudit_valid")
+        self.assertEqual(
+            result["reaudit"]["target_delivery"]["errors"],
+            [],
         )
-        self.assertIn(
-            "target_binding_not_export_participating",
-            caught.exception.evidence["last_reason_tokens"],
-        )
+        self.assertTrue(result["reaudit"]["normalization"]["complete"])
 
     def test_corrupt_backup_or_receipt_blocks_before_launch(self):
         for corrupt in ("backup", "receipt"):

@@ -2449,17 +2449,33 @@ def validate_repaired_snapshot(
         errors.append("required_target_binding_missing")
     if live != required_live:
         errors.append("live_target_mesh_set_incomplete")
+    rows_by_material_mesh_pair = {}
     for row in target_rows:
-        if row.get("graph_visible") is not True:
-            errors.append("target_binding_not_graph_visible")
-        if int(row.get("generated_node_count") or 0) <= 0:
-            errors.append("target_binding_has_no_eligible_nodes")
-        if row.get("export_participates") is not True:
+        pair = (
+            _mesh_id(row.get("material_id")),
+            _mesh_id(row.get("mesh_id")),
+        )
+        rows_by_material_mesh_pair.setdefault(pair, []).append(row)
+    for pair_rows in rows_by_material_mesh_pair.values():
+        participating = [
+            row for row in pair_rows
+            if row.get("export_participates") is True
+        ]
+        # Required-live delivery is a Material/Mesh-pair property.  Once one
+        # sibling delivers the pair, zero-node siblings cannot make the FBX or
+        # its normalized material incomplete.
+        rows_to_validate = participating or pair_rows
+        if not participating:
             errors.append("target_binding_not_export_participating")
-        if row.get("export_evidence") != "node_table":
-            errors.append("target_binding_evidence_not_current_node_table")
-        if row.get("node_table_stale") is not False:
-            errors.append("target_binding_reports_stale_node_table")
+        for row in rows_to_validate:
+            if row.get("graph_visible") is not True:
+                errors.append("target_binding_not_graph_visible")
+            if int(row.get("generated_node_count") or 0) <= 0:
+                errors.append("target_binding_has_no_eligible_nodes")
+            if row.get("export_evidence") != "node_table":
+                errors.append("target_binding_evidence_not_current_node_table")
+            if row.get("node_table_stale") is not False:
+                errors.append("target_binding_reports_stale_node_table")
     return {
         "contract": RECOVERY_CONTRACT,
         "valid": not errors,

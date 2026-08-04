@@ -827,6 +827,30 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "cluster_integrity",
     ),
+    "generator_causal_path_active": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
+    "generator_causal_path_evidence_unavailable": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
+    "generator_causal_path_hidden_ancestor": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
+    "generator_causal_path_inactive_ancestor": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
+    "generator_causal_path_inactive_unused_base": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
+    "generator_causal_path_unconnected": ReasonRow(
+        INFORMATIONAL, "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "audit_detail",
+    ),
     "generator_connection_all_bindings_planned_inactive": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
@@ -847,6 +871,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "generator_guid_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
+    ),
+    "generator_material_mesh_pair_delivered_by_sibling": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "audit_detail",
     ),
     "generator_material_scope_ambiguous": ReasonRow(
         UNSUPPORTED, "speedtree_texture_contract.py",
