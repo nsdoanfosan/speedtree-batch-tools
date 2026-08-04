@@ -1265,6 +1265,13 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "diagnostic_only_scope_identity_shadow": ReasonRow(
         INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
     ),
+    # A Cluster output's legacy unprefixed name is normalization input only.
+    # A record written against it that disagrees with a canonical-named one is
+    # a rename artifact, so it is shadowed rather than allowed to fail the
+    # target closed -- a fact about one record, never a target's verdict.
+    "superseded_legacy_name_record": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
+    ),
     "exported_pending_unreal": ReasonRow(
         INFORMATIONAL, "sk_batch/jobs/send2ue_push_job.py", "durable_status",
     ),

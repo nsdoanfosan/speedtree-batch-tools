@@ -13,6 +13,14 @@ providers.  Any two operational records that overlap and disagree on source
 identity, material ownership, material-group content, or a Generator binding
 fail closed.  Precedence never turns a disagreement into a last-writer win.
 
+A Cluster output carries two names for one file: the canonical ``SK_<name>``
+production output and the legacy unprefixed ``<name>`` normalization input.
+An Atlas export aimed at the legacy name therefore writes records that name
+the target's own mirror.  Those records are accepted for the canonical target
+only when ``cluster_spm_pair_contract`` has a **complete** normalization
+receipt proving both names hold identical content -- name shape alone proves
+nothing, and a record naming an unrelated SPM still fails closed.
+
 Historical ``speedtree_import_manifest_M_*.json`` files and non-target-
 suffixed scope identity files are evidence only.  They are never returned as
 operational payloads.
@@ -25,6 +33,11 @@ import os
 import tempfile
 from pathlib import Path
 
+from cluster_spm_pair_contract import (
+    ClusterSpmPairError,
+    resolve_cluster_spm_pair,
+)
+
 
 RESOLUTION_SCHEMA_VERSION = 1
 SUPPORTED_ATLAS_SCHEMA_VERSIONS = {1}
@@ -34,6 +47,12 @@ KIND_PRECEDENCE = {
     "exact_target_scope": 1,
     "exact_global_target": 2,
 }
+
+# Within one Cluster pair the canonical ``SK_`` output is the production
+# identity and the unprefixed name is normalization input only, so a record
+# written against the legacy name is ordered after every canonical-named one.
+CANONICAL_IDENTITY_RANK = 0
+LEGACY_IDENTITY_RANK = 1
 
 _DERIVED_TEXTURE_FIELDS = {
     "blender_cluster_bake_texture",
@@ -231,7 +250,7 @@ def _public_record(record, *, include_payload=True):
 
 def resolution_evidence(resolution):
     """Return JSON-safe path/reason evidence without embedding payload copies."""
-    return {
+    evidence = {
         "schema_version": resolution["schema_version"],
         "contract": resolution["contract"],
         "target_spm": resolution["target_spm"],
@@ -253,9 +272,83 @@ def resolution_evidence(resolution):
         ],
         "missing": list(resolution["missing"]),
     }
+    if resolution.get("cluster_pair_identity"):
+        evidence["cluster_pair_identity"] = copy.deepcopy(
+            resolution["cluster_pair_identity"]
+        )
+    return evidence
 
 
-def _candidate_specs(target):
+CLUSTER_PAIR_RECEIPT_KIND = "cluster_spm_output_name_normalization"
+
+
+def proven_cluster_pair_identity(target_spm):
+    """Return the receipt-proven other name of one Cluster SPM, or ``None``.
+
+    ``SK_<name>.spm`` and ``<name>.spm`` are two names for one Cluster output,
+    but the naming convention alone is not evidence.  The normalization
+    receipt is: it records both paths, one ``pair_id``, and the invariants
+    proving the canonical copy is byte-identical and authoritative.  Only a
+    complete receipt makes an Atlas record written against one name readable
+    as a record for the other.
+    """
+
+    target = Path(target_spm).expanduser().resolve(strict=False)
+    try:
+        pair = resolve_cluster_spm_pair(target)
+    except ClusterSpmPairError:
+        return None
+    canonical = Path(pair["canonical_spm"])
+    mirror = Path(pair["mirror_spm"])
+    counterpart = mirror if pair["input_role"] == "canonical" else canonical
+    if normalized_manifest_path(counterpart) == normalized_manifest_path(target):
+        return None
+    payload, read_error = _read_payload(pair["receipt_path"])
+    if read_error or not isinstance(payload, dict):
+        return None
+    invariants = payload.get("invariants") or {}
+    paths = payload.get("paths") or {}
+    proven = (
+        payload.get("receipt_kind") == CLUSTER_PAIR_RECEIPT_KIND
+        and payload.get("status") == "complete"
+        and payload.get("pair_id") == pair["pair_id"]
+        and invariants.get("after_content_equal") is True
+        and invariants.get("canonical_output_authoritative") is True
+        and normalized_manifest_path(paths.get("canonical_output") or "")
+        == normalized_manifest_path(canonical)
+        and normalized_manifest_path(paths.get("legacy_unprefixed_input") or "")
+        == normalized_manifest_path(mirror)
+    )
+    if not proven:
+        return None
+    return {
+        "pair_id": pair["pair_id"],
+        "input_role": pair["input_role"],
+        "counterpart_spm": counterpart,
+        "receipt_path": Path(pair["receipt_path"]),
+    }
+
+
+def _target_stems(target, pair_identity=None):
+    """Return every SPM stem that names this exact target."""
+    stems = [target.stem]
+    if pair_identity:
+        counterpart_stem = Path(pair_identity["counterpart_spm"]).stem
+        if counterpart_stem.casefold() != target.stem.casefold():
+            stems.append(counterpart_stem)
+    return stems
+
+
+def _target_scope_paths(scope_dir, target, pair_identity=None):
+    paths = {}
+    for stem in _target_stems(target, pair_identity):
+        for path in scope_dir.glob(f"*__{stem}.json"):
+            if path.is_file():
+                paths[normalized_manifest_path(path)] = path
+    return paths
+
+
+def _candidate_specs(target, pair_identity=None):
     target_dir = target.parent / ".atlas_leaf_speedtree_targets"
     scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
     specs = []
@@ -266,11 +359,7 @@ def _candidate_specs(target):
             if path.is_file()
         )
     if scope_dir.is_dir():
-        exact = {
-            normalized_manifest_path(path): path
-            for path in scope_dir.glob(f"*__{target.stem}.json")
-            if path.is_file()
-        }
+        exact = _target_scope_paths(scope_dir, target, pair_identity)
         specs.extend(
             (path, "exact_target_scope")
             for _key, path in sorted(exact.items())
@@ -281,15 +370,13 @@ def _candidate_specs(target):
     return specs
 
 
-def _diagnostic_specs(target):
+def _diagnostic_specs(target, pair_identity=None):
     scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
     exact_keys = set()
     if scope_dir.is_dir():
-        exact_keys = {
-            normalized_manifest_path(path)
-            for path in scope_dir.glob(f"*__{target.stem}.json")
-            if path.is_file()
-        }
+        exact_keys = set(
+            _target_scope_paths(scope_dir, target, pair_identity)
+        )
     rows = []
     if scope_dir.is_dir():
         rows.extend(
@@ -343,6 +430,18 @@ def resolve_atlas_manifests(
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
     target_key = normalized_manifest_path(target)
+    pair_identity = proven_cluster_pair_identity(target)
+    identity_keys = {target_key}
+    legacy_identity_key = None
+    if pair_identity:
+        counterpart_key = normalized_manifest_path(
+            pair_identity["counterpart_spm"]
+        )
+        identity_keys.add(counterpart_key)
+        legacy_identity_key = (
+            counterpart_key if pair_identity["input_role"] == "canonical"
+            else target_key
+        )
     resolution = {
         "schema_version": RESOLUTION_SCHEMA_VERSION,
         "contract": "atlas_speedtree_manifest_resolution_v1",
@@ -353,19 +452,30 @@ def resolve_atlas_manifests(
         "conflicting": [],
         "missing": [],
     }
+    if pair_identity:
+        resolution["cluster_pair_identity"] = {
+            "pair_id": pair_identity["pair_id"],
+            "counterpart_spm": str(pair_identity["counterpart_spm"]),
+            "receipt_path": str(pair_identity["receipt_path"]),
+        }
 
-    expected_paths = (
-        target.parent / ".atlas_leaf_speedtree_targets" / f"{target.stem}.json",
-        target.parent / "speedtree_import_manifest.json",
-    )
-    for path in expected_paths:
-        if not path.is_file():
-            resolution["missing"].append({
-                "path": str(path),
-                "reason": "candidate_file_missing",
-            })
+    target_dir = target.parent / ".atlas_leaf_speedtree_targets"
+    target_stems = _target_stems(target, pair_identity)
+    if not any((target_dir / f"{stem}.json").is_file() for stem in target_stems):
+        resolution["missing"].append({
+            "path": str(target_dir / f"{target.stem}.json"),
+            "reason": "candidate_file_missing",
+        })
+    global_path = target.parent / "speedtree_import_manifest.json"
+    if not global_path.is_file():
+        resolution["missing"].append({
+            "path": str(global_path),
+            "reason": "candidate_file_missing",
+        })
     scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-    if not scope_dir.is_dir() or not any(scope_dir.glob(f"*__{target.stem}.json")):
+    if not scope_dir.is_dir() or not _target_scope_paths(
+        scope_dir, target, pair_identity
+    ):
         resolution["missing"].append({
             "path": str(scope_dir / f"*__{target.stem}.json"),
             "reason": "target_scope_candidate_missing",
@@ -373,7 +483,7 @@ def resolve_atlas_manifests(
 
     valid = []
     fatal = []
-    for path, kind in _candidate_specs(target):
+    for path, kind in _candidate_specs(target, pair_identity):
         payload, read_error = _read_payload(path)
         base = {
             "path": str(path.resolve(strict=False)),
@@ -397,13 +507,29 @@ def resolve_atlas_manifests(
             declared_spm,
             relative_to=target.parent,
         )
-        if declared_key != target_key:
+        if declared_key not in identity_keys:
             resolution["rejected"].append({
                 **base,
                 "reason": "different_target_spm",
                 "declared_spm": declared_spm,
             })
             continue
+        identity_rank = CANONICAL_IDENTITY_RANK
+        if declared_key == legacy_identity_key:
+            # The record names this exact output under its legacy unprefixed
+            # name.  The normalization receipt already proved both names hold
+            # the same bytes, so this is the target's own record -- but the
+            # canonical name is the production identity, so a legacy-named
+            # record never outranks one written against the canonical name.
+            identity_rank = LEGACY_IDENTITY_RANK
+            base = {
+                **base,
+                "declared_spm": declared_spm,
+                "identity_match": "cluster_spm_pair_legacy_name",
+                "cluster_pair_receipt": str(
+                    (pair_identity or {}).get("receipt_path", "")
+                ),
+            }
         lifecycle = payload.get("atlas_scope_lifecycle") or {}
         if lifecycle.get("state") == "retired":
             resolution["shadowed"].append({
@@ -459,9 +585,10 @@ def resolve_atlas_manifests(
             "ownership_claims": sorted(claims),
             "payload": payload,
             "_claims": claims,
+            "_identity_rank": identity_rank,
         })
 
-    for path, kind in _diagnostic_specs(target):
+    for path, kind in _diagnostic_specs(target, pair_identity):
         payload, read_error = _read_payload(path)
         row = {
             "path": str(path.resolve(strict=False)),
@@ -497,7 +624,11 @@ def resolve_atlas_manifests(
     selected = []
     for candidate in sorted(
         valid,
-        key=lambda row: (row["precedence"], row["path"].casefold()),
+        key=lambda row: (
+            row["_identity_rank"],
+            row["precedence"],
+            row["path"].casefold(),
+        ),
     ):
         claims = candidate["_claims"]
         overlaps = [
@@ -509,6 +640,27 @@ def resolve_atlas_manifests(
             if claims[key] != winner["_claims"][key]
         ]
         if disagreements:
+            # A record written against the legacy unprefixed name loses to one
+            # written against the canonical output name: the pair contract
+            # makes the canonical name the production identity, so the legacy
+            # record is a superseded rename artifact, not a live disagreement.
+            superseded_by = next(
+                (
+                    winner for _key, winner in disagreements
+                    if winner["_identity_rank"] < candidate["_identity_rank"]
+                ),
+                None,
+            )
+            if superseded_by is not None:
+                resolution["shadowed"].append({
+                    "path": candidate["path"],
+                    "kind": candidate["kind"],
+                    "precedence": candidate["precedence"],
+                    "reason": "superseded_legacy_name_record",
+                    "declared_spm": candidate.get("declared_spm", ""),
+                    "superseded_by": superseded_by["path"],
+                })
+                continue
             for key, winner in disagreements:
                 resolution["conflicting"].append({
                     "path": candidate["path"],

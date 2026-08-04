@@ -626,5 +626,369 @@ class AtlasManifestResolverTests(unittest.TestCase):
             )
 
 
+class ClusterPairLegacyNameIdentityTests(unittest.TestCase):
+    """A Cluster output's Atlas records may name its legacy unprefixed file.
+
+    ``SK_<name>.spm`` and ``<name>.spm`` are one Cluster output under two
+    names.  An Atlas export aimed at the legacy name used to leave the
+    canonical target with zero operational records -- on 2026-08-04 that was
+    18 of 242 production rows, each reported as "Atlas producer 영수증이
+    없습니다" with no recovery.  The normalization receipt is what makes the
+    two names one identity, so it is required, and the canonical name still
+    outranks the legacy one.
+    """
+
+    FIXTURE = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "issue165_cluster_pair_legacy_name_records.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    def build(self, temporary, *, receipt="complete"):
+        fixture = self.FIXTURE
+        cluster = Path(temporary) / fixture["asset_folder"] / "cluster"
+        cluster.mkdir(parents=True)
+        canonical = cluster / fixture["canonical_spm"]
+        legacy = cluster / fixture["legacy_spm"]
+        canonical.write_bytes(b"cluster-spm")
+        legacy.write_bytes(b"cluster-spm")
+        blend = Path(temporary) / "atlas" / "M_sanitized.blend"
+        blend.parent.mkdir(parents=True, exist_ok=True)
+        blend.write_bytes(b"blend")
+
+        if receipt != "absent":
+            reports = cluster / "reports"
+            reports.mkdir(exist_ok=True)
+            body = {
+                "receipt_kind": "cluster_spm_output_name_normalization",
+                "schema_version": 2,
+                "status": "complete",
+                "pair_id": self.pair_id(canonical, legacy),
+                "invariants": {
+                    "after_content_equal": True,
+                    "canonical_output_authoritative": True,
+                    "source_unchanged_during_copy": True,
+                },
+                "paths": {
+                    "canonical_output": str(canonical),
+                    "legacy_unprefixed_input": str(legacy),
+                },
+            }
+            if receipt == "incomplete":
+                body["status"] = "in_progress"
+            elif receipt == "unproven":
+                body["invariants"]["after_content_equal"] = False
+            elif receipt == "foreign_pair":
+                body["pair_id"] = "0" * 64
+            (reports / f"{canonical.stem}_cluster_spm_pair.json").write_text(
+                json.dumps(body, sort_keys=True), encoding="utf-8"
+            )
+        return cluster, canonical, legacy, blend
+
+    @staticmethod
+    def pair_id(canonical, legacy):
+        import hashlib
+
+        keys = sorted(
+            os.path.normcase(os.path.abspath(str(path))).casefold()
+            for path in (canonical, legacy)
+        )
+        return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
+
+    def payload(self, spm, blend, material, scope_id):
+        return {
+            "atlas_manifest_schema_version": 1,
+            "spm": str(spm),
+            "blend_file": str(blend),
+            "source_collection": material["material"],
+            "export_scope_id": scope_id,
+            "material_groups": [{
+                "material": material["material"],
+                "material_id": material["material_id"],
+                "mesh_ids": list(material["mesh_ids"]),
+            }],
+        }
+
+    def write(self, cluster, relative, payload):
+        path = cluster / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        return path
+
+    def write_production_shape(self, cluster, canonical, legacy, blend):
+        """Reproduce the folder that blocked the real Cluster push."""
+        fixture = self.FIXTURE
+        cluster_record = self.payload(
+            legacy, blend, fixture["cluster_material"], fixture["cluster_scope_id"]
+        )
+        leaf_record = self.payload(
+            legacy, blend, fixture["leaf_material"], fixture["leaf_scope_id"]
+        )
+        foreign_record = self.payload(
+            cluster / fixture["foreign_spm"],
+            blend,
+            fixture["leaf_material"],
+            fixture["leaf_scope_id"],
+        )
+        paths = {
+            "per_target_legacy": self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{legacy.stem}.json",
+                leaf_record,
+            ),
+            "per_target_foreign": self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets")
+                / f"{Path(fixture['foreign_spm']).stem}.json",
+                foreign_record,
+            ),
+            "cluster_scope_legacy": self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_scopes")
+                / f"{fixture['cluster_scope_id']}__{legacy.stem}.json",
+                cluster_record,
+            ),
+            "leaf_scope_legacy": self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_scopes")
+                / f"{fixture['leaf_scope_id']}__{legacy.stem}.json",
+                leaf_record,
+            ),
+            # Last-writer-wins identity shadow, diagnostic only.
+            "scope_shadow": self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_scopes")
+                / f"{fixture['leaf_scope_id']}.json",
+                foreign_record,
+            ),
+        }
+        return paths
+
+    def test_legacy_named_records_resolve_for_the_canonical_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+
+            resolution = resolve_atlas_manifests(canonical)
+
+            self.assertEqual(
+                {row["path"] for row in resolution["selected"]},
+                {
+                    str(paths["per_target_legacy"].resolve()),
+                    str(paths["cluster_scope_legacy"].resolve()),
+                    str(paths["leaf_scope_legacy"].resolve()),
+                },
+                "the canonical target's own records, written under its legacy "
+                "name, must be operational",
+            )
+            self.assertTrue(all(
+                row["identity_match"] == "cluster_spm_pair_legacy_name"
+                for row in resolution["selected"]
+            ))
+            self.assertEqual(
+                resolution["cluster_pair_identity"]["counterpart_spm"],
+                str(legacy),
+            )
+
+    def test_a_genuinely_different_spm_in_the_same_folder_stays_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+
+            resolution = resolve_atlas_manifests(canonical)
+
+            rejected = {
+                row["path"]: row["reason"] for row in resolution["rejected"]
+            }
+            self.assertEqual(
+                rejected.get(str(paths["per_target_foreign"].resolve())),
+                "different_target_spm",
+                "a sibling provider SPM is not this target under another name",
+            )
+
+    def test_the_identity_shadow_is_never_operational(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+
+            resolution = resolve_atlas_manifests(canonical)
+
+            self.assertNotIn(
+                str(paths["scope_shadow"].resolve()),
+                {row["path"] for row in resolution["selected"]},
+            )
+            self.assertIn(
+                str(paths["scope_shadow"].resolve()),
+                {row["path"] for row in resolution["shadowed"]},
+            )
+
+    def test_a_legacy_scope_record_satisfies_the_target_scope_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            self.write_production_shape(cluster, canonical, legacy, blend)
+
+            resolution = resolve_atlas_manifests(canonical)
+
+            self.assertNotIn(
+                "target_scope_candidate_missing",
+                {row["reason"] for row in resolution["missing"]},
+            )
+
+    def test_without_a_pair_receipt_the_legacy_name_proves_nothing(self):
+        for receipt in ("absent", "incomplete", "unproven", "foreign_pair"):
+            with self.subTest(receipt=receipt):
+                with tempfile.TemporaryDirectory() as temporary:
+                    cluster, canonical, legacy, blend = self.build(
+                        temporary, receipt=receipt
+                    )
+                    self.write_production_shape(
+                        cluster, canonical, legacy, blend
+                    )
+
+                    resolution = resolve_atlas_manifests(canonical)
+
+                    self.assertEqual(
+                        resolution["selected"],
+                        [],
+                        "name shape alone must never adopt another file's "
+                        "Atlas records",
+                    )
+                    self.assertNotIn("cluster_pair_identity", resolution)
+
+    def test_a_canonical_named_record_supersedes_a_disagreeing_legacy_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            fixture = self.FIXTURE
+            current = self.payload(
+                canonical,
+                blend,
+                fixture["cluster_material"],
+                fixture["cluster_scope_id"],
+            )
+            stale = self.payload(
+                legacy,
+                blend,
+                {**fixture["cluster_material"], "mesh_ids": [99]},
+                fixture["cluster_scope_id"],
+            )
+            current_path = self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{canonical.stem}.json",
+                current,
+            )
+            stale_path = self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{legacy.stem}.json",
+                stale,
+            )
+
+            resolution = resolve_atlas_manifests(canonical)
+
+            self.assertEqual(
+                [row["path"] for row in resolution["selected"]],
+                [str(current_path.resolve())],
+            )
+            superseded = {
+                row["path"]: row["reason"] for row in resolution["shadowed"]
+            }
+            self.assertEqual(
+                superseded.get(str(stale_path.resolve())),
+                "superseded_legacy_name_record",
+                "a rename artifact must not veto the production identity",
+            )
+            self.assertEqual(resolution["conflicting"], [])
+
+    def test_two_canonical_named_records_that_disagree_still_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            fixture = self.FIXTURE
+            first = self.payload(
+                canonical,
+                blend,
+                fixture["cluster_material"],
+                fixture["cluster_scope_id"],
+            )
+            second = self.payload(
+                canonical,
+                blend,
+                {**fixture["cluster_material"], "mesh_ids": [99]},
+                fixture["cluster_scope_id"],
+            )
+            self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{canonical.stem}.json",
+                first,
+            )
+            self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_scopes")
+                / f"{fixture['cluster_scope_id']}__{canonical.stem}.json",
+                second,
+            )
+
+            with self.assertRaises(AtlasManifestResolutionError) as caught:
+                resolve_atlas_manifests(canonical)
+
+            self.assertEqual(
+                {
+                    row["reason"]
+                    for row in caught.exception.resolution["conflicting"]
+                },
+                {"operational_candidate_disagreement"},
+            )
+
+    def test_the_legacy_member_resolves_the_same_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            fixture = self.FIXTURE
+            current_path = self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{canonical.stem}.json",
+                self.payload(
+                    canonical,
+                    blend,
+                    fixture["cluster_material"],
+                    fixture["cluster_scope_id"],
+                ),
+            )
+
+            resolution = resolve_atlas_manifests(legacy)
+
+            self.assertEqual(
+                [row["path"] for row in resolution["selected"]],
+                [str(current_path.resolve())],
+                "querying the legacy member must see the canonical record",
+            )
+
+    def test_resolution_stays_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+            before = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in paths.values()
+            }
+
+            resolve_atlas_manifests(canonical)
+
+            self.assertEqual(
+                {
+                    path: (path.read_bytes(), path.stat().st_mtime_ns)
+                    for path in paths.values()
+                },
+                before,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
