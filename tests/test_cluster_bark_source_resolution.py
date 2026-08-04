@@ -10,6 +10,7 @@ import pytest
 
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
+    canonical_bark_record_plan,
     _copy_canonical_textures,
     _copy_source_external_meshes,
     _normalization_identity,
@@ -1073,3 +1074,91 @@ def test_isolated_bark_source_rebases_external_texture_dependencies():
             root / leaf_outputs["color"]
         ).read_bytes()
         assert workspace / "Texture" / "chestnut" / "leaf_color.tif" == external_texture
+
+
+class TestCanonicalBarkRecordPlan:
+    """A lost manifest entry is bookkeeping, not missing texture work.
+
+    On 2026-08-04 every canonical bark row blocked in production -- 24 rows
+    across 8 assets -- had its complete six-role T_* set already on disk.  The
+    gate still told the operator to generate those outputs in PCG ST9 Texture,
+    which is work that does not exist.  The plan below is built only from what
+    the row itself proves: its SPM, its material, and the refs that material
+    actually points at.
+    """
+
+    def row(self, root, base="T_bark_test_01", roles=None):
+        texture = root / "texture"
+        texture.mkdir(parents=True, exist_ok=True)
+        roles = roles or list(REQUIRED_TEXTURE_ROLES)
+        refs = []
+        for role in roles:
+            path = texture / f"{base}_{role}.tga"
+            path.write_bytes(b"tga")
+            refs.append(f"texture\\{base}_{role}.tga")
+        return {
+            "spm": str(root / "cluster" / "SK_leaf_test_01.spm"),
+            "material_id": "6",
+            "material_name": "M_bark_test_01",
+            "refs": refs,
+        }
+
+    def test_a_complete_on_disk_set_is_a_recordable_entry(self, tmp_path):
+        row = self.row(tmp_path / "tree_test")
+
+        plan = canonical_bark_record_plan(row)
+
+        assert plan is not None
+        assert plan["texture_base"] == "T_bark_test_01"
+        assert Path(plan["asset_root"]).name == "tree_test"
+        assert plan["material_targets"] == [{
+            "spm": row["spm"],
+            "material_id": "6",
+            "material_name": "M_bark_test_01",
+        }]
+        assert len(plan["output_files"]) == len(REQUIRED_TEXTURE_ROLES)
+
+    def test_an_absent_role_file_is_not_recordable(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        (root / "texture" / "T_bark_test_01_normal.tga").unlink()
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_an_empty_role_file_is_not_recordable(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        (root / "texture" / "T_bark_test_01_normal.tga").write_bytes(b"")
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_an_incomplete_role_set_is_not_recordable(self, tmp_path):
+        row = self.row(tmp_path / "tree_test", roles=["color", "normal"])
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_two_texture_bases_are_never_guessed_apart(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        row["refs"][0] = "texture\\T_bark_other_01_color.tga"
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_a_non_canonical_base_is_refused(self, tmp_path):
+        row = self.row(tmp_path / "tree_test", base="bark_test_01")
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_a_row_without_refs_proves_nothing(self, tmp_path):
+        row = self.row(tmp_path / "tree_test")
+        row["refs"] = []
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_the_asset_root_is_the_cluster_parent(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+
+        plan = canonical_bark_record_plan(row)
+
+        assert Path(plan["asset_root"]) == root.resolve()

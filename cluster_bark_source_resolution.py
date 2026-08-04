@@ -505,6 +505,85 @@ def _blender_cluster_bake_overrides(contract, source_spm):
     return overrides
 
 
+def _canonical_bark_asset_root(spm):
+    root = Path(spm).expanduser().resolve(strict=False).parent
+    return root.parent if root.name.casefold() == "cluster" else root
+
+
+def canonical_bark_record_plan(row):
+    """Return the manifest entry a canonical bark row already proves, or None.
+
+    The row carries the SPM, the material, and the texture refs that material
+    actually points at.  When those refs name one ``T_*`` base whose complete
+    role set is on disk, the manifest entry is fully determined by evidence --
+    nothing is inferred from a naming convention -- and the only thing missing
+    is the bookkeeping.  Telling the operator to *generate* outputs that are
+    already there sends them to do work that does not exist.
+    """
+
+    from pcg_st9_texture_batch.pcg_canonical_outputs import REQUIRED_ROLES
+
+    spm = str(row.get("spm") or "")
+    refs = list(row.get("refs") or [])
+    if not spm or not refs:
+        return None
+    asset_root = _canonical_bark_asset_root(spm)
+    bases = {Path(ref).stem.rsplit("_", 1)[0] for ref in refs}
+    if len(bases) != 1:
+        return None
+    texture_base = next(iter(bases))
+    if not texture_base.casefold().startswith("t_"):
+        return None
+    files = []
+    for ref in refs:
+        path = Path(ref)
+        if not path.is_absolute():
+            path = asset_root / path
+        path = path.resolve(strict=False)
+        if not path.is_file() or path.stat().st_size <= 0:
+            return None
+        files.append(path)
+    roles = {path.stem.rsplit("_", 1)[-1].casefold() for path in files}
+    if not {role.casefold() for role in REQUIRED_ROLES} <= roles:
+        return None
+    return {
+        "asset_root": str(asset_root),
+        "texture_base": texture_base,
+        "material_targets": [{
+            "spm": spm,
+            "material_id": row.get("material_id"),
+            "material_name": row.get("material_name"),
+        }],
+        "output_files": [str(path) for path in files],
+    }
+
+
+def _record_canonical_bark_output(row):
+    """Upsert the proven manifest entry and return the reloaded manifest."""
+
+    plan = canonical_bark_record_plan(row)
+    if plan is None:
+        return None, None
+    from pcg_st9_texture_batch.pcg_canonical_outputs import (
+        CanonicalOutputManifestError,
+        record_canonical_output,
+    )
+
+    try:
+        record_canonical_output(
+            {
+                "folder": plan["asset_root"],
+                "texture_base": plan["texture_base"],
+                "material_targets": plan["material_targets"],
+            },
+            plan["output_files"],
+            producer_source=str(row.get("producer_source") or ""),
+        )
+    except (CanonicalOutputManifestError, OSError, ValueError) as exc:
+        return None, {**plan, "error": str(exc)[:320]}
+    return load_canonical_output_manifest(row["spm"]), plan
+
+
 def _canonical_bark_output(contract, source_spm, manifest):
     bark = ((contract.get("handoff") or {}).get("canonical_bark") or {})
     resolved = []
@@ -516,6 +595,19 @@ def _canonical_bark_output(contract, source_spm, manifest):
             row.get("material_name"),
         )
         if output is None:
+            # The outputs may already exist with only the manifest entry
+            # lost.  Re-record what the row proves, then ask again; a genuine
+            # missing render still fails, under its own reason.
+            recorded, attempt = _record_canonical_bark_output(row)
+            if recorded is not None:
+                manifest = recorded
+                output = resolve_manifest_material_output(
+                    manifest,
+                    row.get("spm"),
+                    row.get("material_id"),
+                    row.get("material_name"),
+                )
+        if output is None:
             raise ClusterBarkSourceResolutionError(
                 _canonical_texture_error_message(
                     source_spm,
@@ -524,7 +616,11 @@ def _canonical_bark_output(contract, source_spm, manifest):
                         "material_id": row.get("material_id"),
                         "role": "*",
                         "expected_output": manifest.get("manifest"),
-                        "reason": "canonical_bark_manifest_target_missing",
+                        "reason": (
+                            "canonical_bark_manifest_record_failed"
+                            if attempt
+                            else "canonical_bark_manifest_target_missing"
+                        ),
                     }],
                 )
             )

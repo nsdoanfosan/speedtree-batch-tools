@@ -605,6 +605,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "canonical_bark_manifest_target_missing": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),
+    # Distinguishes "the bookkeeping re-record was attempted and failed" from
+    # "the outputs were never rendered".  Only the second is operator work.
+    "canonical_bark_manifest_record_failed": ReasonRow(
+        UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
+    ),
     "canonical_bark_ambiguous": ReasonRow(
         UNSUPPORTED, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_authoring",
@@ -1552,6 +1557,7 @@ _classify(UNSUPPORTED, "cluster_source_missing", "blender_source_missing")
 _classify(
     INFORMATIONAL, "diagnostic_integrity_field",
     "canonical_bark_manifest_target_missing",
+    "canonical_bark_manifest_record_failed",
     "canonical_bark_material_ambiguous", "canonical_bark_material_id_missing",
     "canonical_bark_production_ref_not_manifest_output", "copied_artifacts",
     "isolated_spm_sha256", "kind", "output_filename",
