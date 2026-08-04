@@ -872,11 +872,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "generator_guid_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
-    "generator_material_mesh_pair_delivered_by_sibling": ReasonRow(
-        INFORMATIONAL,
-        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "audit_detail",
-    ),
     "generator_material_scope_ambiguous": ReasonRow(
         UNSUPPORTED, "speedtree_texture_contract.py",
         "texture_authoring",
@@ -1449,6 +1444,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "current_blender_success": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_excluded",
     ),
+    "current_blender_success_forced_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
+    ),
     "current_immutable_unreal_failure": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
     ),
@@ -1549,6 +1547,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "parent_not_retryable_unreal_failure": ReasonRow(
         UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "unreal_retry_evidence",
     ),
+    "parent_not_retryable_unreal_failure_forced_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
+    ),
     "preflight_skip": ReasonRow(
         INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "durable_status",
     ),
@@ -1596,6 +1597,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "retry_evidence_ambiguous": ReasonRow(
         UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "retry_evidence",
+    ),
+    "retry_evidence_ambiguous_forced_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
     ),
     "rpc_timeout": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",

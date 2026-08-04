@@ -335,7 +335,7 @@ def _projection_from_shared_analysis(requirement, identity_row):
     if mode == _SOURCE_MODE:
         return projection
     if (
-        entry.get("leaf_binding_schema") not in (4, 5)
+        entry.get("leaf_binding_schema") != 6
         or not isinstance(entry.get("referenced_material_ids"), list)
         or not isinstance(entry.get("visible_material_ids"), list)
         or not isinstance(entry.get("leaf_generator_bindings"), list)

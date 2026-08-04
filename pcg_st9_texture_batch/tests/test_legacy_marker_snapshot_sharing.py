@@ -338,7 +338,7 @@ class SchemaFourCompatibilityTests(SharedSnapshotTestCase):
             self.assertTrue(audit._PERSISTENT_SPM_ANALYSIS_DIRTY)
             # The stat-only row is upgraded while the same decoded handoff
             # supplies legacy-marker provenance.
-            self.assertEqual(entry["leaf_binding_schema"], 5)
+            self.assertEqual(entry["leaf_binding_schema"], 6)
             self.assertEqual(
                 entry["content_identity_algorithm"],
                 audit.SPM_CONTENT_IDENTITY_ALGORITHM,
@@ -466,7 +466,7 @@ class HandoffLifecycleTests(SharedSnapshotTestCase):
 
 
 class WarmCachePerformanceTests(SharedSnapshotTestCase):
-    def test_schema_five_warm_cache_has_zero_reads_and_faster_mean(self):
+    def test_schema_six_warm_cache_has_zero_reads_and_faster_mean(self):
         with tempfile.TemporaryDirectory() as temp:
             spm = Path(temp) / "SK_tree_warm_gate.spm"
             write_spm(spm, padding_size=8 * 1024 * 1024)
@@ -478,7 +478,7 @@ class WarmCachePerformanceTests(SharedSnapshotTestCase):
 
             path_key, _, _ = audit._file_cache_key(spm)
             entry = audit._PERSISTENT_SPM_ANALYSIS[path_key]
-            self.assertEqual(entry["leaf_binding_schema"], 5)
+            self.assertEqual(entry["leaf_binding_schema"], 6)
             self.assertEqual(entry["legacy_marker_schema"], 1)
 
             self.reset_in_process_caches()

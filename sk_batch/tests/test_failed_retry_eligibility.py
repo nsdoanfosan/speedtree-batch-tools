@@ -7,6 +7,7 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 
 from failed_retry_eligibility import (  # noqa: E402
     BLENDER_REBUILD,
+    BLOCKED,
     CURRENT_BLENDER_EXCLUDED,
     UNREAL_ONLY,
     UNREAL_PARENT_CURRENT,
@@ -20,6 +21,13 @@ CURRENT_REPAIR = {
     "push_ready": True,
     "kind": "ready",
     "reason": "current content-addressed Repair output",
+}
+
+AMBIGUOUS_REPAIR = {
+    "current": False,
+    "push_ready": False,
+    "kind": "inspection_incomplete",
+    "reason": "Blender Repair evidence is incomplete",
 }
 
 
@@ -50,6 +58,60 @@ def test_current_content_excludes_even_when_saved_label_claims_stale():
 
     assert decision.classification == CURRENT_BLENDER_EXCLUDED
     assert decision.reason_code == "current_blender_success"
+
+
+def test_explicit_force_rerun_rebuilds_current_blender_success():
+    decision = classify_failed_retry(
+        {"push_status_kind": "imported_ok"},
+        CURRENT_REPAIR,
+        force_rerun=True,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "current_blender_success_forced_rebuild"
+
+
+def test_non_retryable_unreal_parent_blocks_without_an_explicit_force():
+    decision = classify_failed_retry(
+        {"push_status_kind": "imported_ok"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_CURRENT,
+    )
+
+    assert decision.classification == BLOCKED
+    assert decision.reason_code == "parent_not_retryable_unreal_failure"
+
+
+def test_explicit_force_rerun_rebuilds_a_non_retryable_unreal_parent():
+    decision = classify_failed_retry(
+        {"push_status_kind": "imported_ok"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_CURRENT,
+        force_rerun=True,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == (
+        "parent_not_retryable_unreal_failure_forced_rebuild"
+    )
+
+
+def test_ambiguous_retry_evidence_blocks_without_an_explicit_force():
+    decision = classify_failed_retry({}, AMBIGUOUS_REPAIR)
+
+    assert decision.classification == BLOCKED
+    assert decision.reason_code == "retry_evidence_ambiguous"
+
+
+def test_explicit_force_rerun_rebuilds_ambiguous_retry_evidence():
+    decision = classify_failed_retry(
+        {},
+        AMBIGUOUS_REPAIR,
+        force_rerun=True,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "retry_evidence_ambiguous_forced_rebuild"
 
 
 def test_current_immutable_unreal_failure_stays_unreal_only():
