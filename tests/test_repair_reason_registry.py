@@ -31,7 +31,11 @@ from repair_reason_registry import (  # noqa: E402
     disposition_of,
     reason_row,
 )
-from repair_reason_scan import emitted_reason_codes, scan_module  # noqa: E402
+from repair_reason_scan import (  # noqa: E402
+    emitted_reason_codes,
+    production_sources,
+    scan_module,
+)
 
 
 OBSERVED_TOKEN_FIXTURE = (
@@ -53,7 +57,21 @@ OBSERVED_INTEGRITY_FIXTURE = (
 class ReasonRegistryCoverageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        sources = tuple(production_sources(REPO_DIR))
+        if len(sources) < 100:
+            raise AssertionError(
+                "repair reason coverage scanned only "
+                f"{len(sources)} production sources under {REPO_DIR}; "
+                "expected at least 100. Check production_sources() path "
+                "filtering before changing the reason registry."
+            )
         cls.emitted = emitted_reason_codes(REPO_DIR)
+        if "managed_mesh_owner_ambiguous" not in cls.emitted:
+            raise AssertionError(
+                "repair reason coverage is missing the known production "
+                "sentinel managed_mesh_owner_ambiguous; the source scan is "
+                "empty, partial, or filtering the wrong checkout scope."
+            )
         queue_payload = json.loads(
             OBSERVED_TOKEN_FIXTURE.read_text(encoding="utf-8")
         )
@@ -156,6 +174,40 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         self.assertEqual(
             disposition_of("generator_connection_contract_incomplete"),
             REPAIRABLE,
+        )
+
+    def test_role_handoff_wrapper_defers_to_inner_repairable_reason(self):
+        evidence = {
+            "issues": [{
+                "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
+                "reason": "normalized_variants_required",
+            }],
+        }
+        decision = orchestration.repair_ui_decision(evidence)
+        self.assertEqual(decision["status"], orchestration.REPAIR_UI_AUTOMATIC)
+        self.assertEqual(
+            decision["reason_codes"],
+            ("cluster_role_handoff_blocked", "normalized_variants_required"),
+        )
+        self.assertEqual(
+            disposition_of("cluster_role_handoff_blocked"),
+            INFORMATIONAL,
+        )
+
+    def test_declared_owner_is_one_of_each_static_codes_emitters(self):
+        mismatches = []
+        for code, emitters in self.emitted.items():
+            row = REASON_REGISTRY.get(code)
+            if row is None:
+                continue
+            owner = row.owner
+            if owner not in emitters:
+                mismatches.append((code, owner, tuple(emitters)))
+        self.assertEqual(
+            mismatches,
+            [],
+            "registry owner must be one of the modules that statically emits "
+            "the code; update the owner or canonicalize the emitter token",
         )
 
     def test_every_blocking_row_has_one_complete_domain_contract(self):
@@ -320,6 +372,60 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
 
 
 class ReasonScanTests(unittest.TestCase):
+    def test_production_source_skips_are_scoped_to_checkout_relative_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = (
+                Path(temporary)
+                / "work"
+                / ".claude"
+                / "tests"
+                / "speedtree-batch-tools"
+            )
+            production = checkout / "package" / "module.py"
+            repository_test = checkout / "tests" / "test_module.py"
+            vendored = checkout / "work" / "vendor.py"
+            for path in (production, repository_test, vendored):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("VALUE = 1\n", encoding="utf-8")
+
+            found = {
+                path.relative_to(checkout).as_posix()
+                for path in production_sources(checkout)
+            }
+
+        self.assertEqual(found, {"package/module.py"})
+
+    def test_scan_resolves_reason_values_through_scope_local_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            module = Path(temporary) / "local_reason.py"
+            module.write_text(
+                "def first(flag):\n"
+                "    evidence = 'first_local_reason'\n"
+                "    if flag:\n"
+                "        evidence = 'second_local_reason'\n"
+                "    return {'reason': evidence}\n"
+                "\n"
+                "def unrelated():\n"
+                "    evidence = 'must_not_leak_between_scopes'\n"
+                "    return {'message': evidence}\n",
+                encoding="utf-8",
+            )
+            found = scan_module(module)
+        self.assertEqual(
+            found,
+            {"first_local_reason", "second_local_reason"},
+        )
+
+    def test_role_handoff_emits_the_canonical_generator_connection_reason(self):
+        module = (
+            REPO_DIR
+            / "sk_batch"
+            / "cluster_assembly_handoff_contract.py"
+        )
+        codes = scan_module(module)
+        self.assertIn("generator_connection_contract_incomplete", codes)
+        self.assertNotIn("generator_connection_incomplete", codes)
+
     def test_scan_finds_codes_through_every_supported_shape(self):
         module = REPO_DIR / "sk_batch" / "atlas_consumer_integrity.py"
         codes = emitted_reason_codes(REPO_DIR)
