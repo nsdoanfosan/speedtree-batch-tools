@@ -1,0 +1,52 @@
+{
+  "kind": "issue165_cluster_pair_legacy_name_atlas_records",
+  "source": "sanitized structure of D:\\...\\bush_Silky_Dogwood\\cluster on 2026-08-04; folder/material names anonymised, counts and record shapes preserved",
+  "production_measurement": {
+    "batch_state_rows": 242,
+    "targets_resolving_before": 115,
+    "targets_resolving_after": 133,
+    "recovered_targets": 18,
+    "ownership_conflicts_before": 2,
+    "ownership_conflicts_after": 2,
+    "recovered_names": [
+      "SK_cluster_Silky_Dogwood_01.spm",
+      "SK_cluster_Lauraceae_01.spm",
+      "SK_cluster_Lauraceae_02.spm",
+      "SK_cluster_tree_NothofagusSolandri_07.spm",
+      "SK_cluster_tree_NothofagusSolandri_side_01.spm",
+      "SK_leaf_birch_paper_01.spm",
+      "SK_leaf_birch_paper_side_01.spm",
+      "SK_leaf_chestnut_01.spm",
+      "SK_leaf_chestnut_side_01.spm",
+      "SK_cluster_densiflora_02.spm",
+      "SK_cluster_scotspine_01.spm",
+      "SK_cluster_scotspine_02.spm",
+      "SK_cluster_hog_peanut_01.spm",
+      "SK_cluster_ladyfern_01.spm",
+      "SK_cluster_meadow_01.spm",
+      "SK_cluster_reed_01.spm",
+      "SK_cluster_sorrel_01.spm",
+      "SK_cluster_velvet_grass_01.spm"
+    ],
+    "still_blocked_without_a_pair_receipt": [
+      "SK_leaf_weeping_willow_01.spm",
+      "SK_leaf_weeping_willow_02.spm"
+    ]
+  },
+  "asset_folder": "bush_sanitized",
+  "canonical_spm": "SK_cluster_sanitized_01.spm",
+  "legacy_spm": "cluster_sanitized_01.spm",
+  "foreign_spm": "leaf_sanitized_01.spm",
+  "cluster_scope_id": "3dadb0deef164e1d8bd79a12c690f423",
+  "leaf_scope_id": "b6466b300681495884043ff28119ae3c",
+  "cluster_material": {
+    "material": "M_cluster_sanitized_atlas_01",
+    "material_id": 5,
+    "mesh_ids": [11]
+  },
+  "leaf_material": {
+    "material": "M_leaf_sanitized_atlas_01",
+    "material_id": 9,
+    "mesh_ids": [21]
+  }
+}
