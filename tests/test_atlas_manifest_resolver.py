@@ -8,6 +8,7 @@ from pathlib import Path
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
     atlas_manifest_mirror_repair_plan,
+    canonical_name_publication_plan,
     diagnose_manifest_generator_candidates,
     repair_atlas_manifest_mirrors,
     resolution_evidence,
@@ -987,6 +988,218 @@ class ClusterPairLegacyNameIdentityTests(unittest.TestCase):
                     for path in paths.values()
                 },
                 before,
+            )
+
+
+class CanonicalNamePublicationTests(ClusterPairLegacyNameIdentityTests):
+    """Reading the legacy-named records is not enough to finish the rename.
+
+    Every reader that is not this resolver -- the Blender push gate first --
+    looks a manifest up by the canonical file's own stem, misses, and falls
+    back to the unsuffixed identity shadow, which is diagnostic-only and
+    last-writer-wins.  That is what reported `fbx_spm_identity_mismatch` and
+    killed the Cluster push before Unreal was ever contacted.
+    """
+
+    def scope_name(self, scope_id, stem):
+        return f"{scope_id}__{stem}.json"
+
+    def test_plan_names_every_missing_canonical_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            self.write_production_shape(cluster, canonical, legacy, blend)
+
+            plan = atlas_manifest_mirror_repair_plan(canonical)
+
+            self.assertEqual(plan["status"], "repairable")
+            self.assertEqual(
+                plan["reason_code"], "atlas_manifest_canonical_name_missing"
+            )
+            self.assertEqual(
+                {Path(row["destination"]).name for row in plan["publications"]},
+                {
+                    f"{canonical.stem}.json",
+                    self.scope_name(
+                        self.FIXTURE["cluster_scope_id"], canonical.stem
+                    ),
+                    self.scope_name(
+                        self.FIXTURE["leaf_scope_id"], canonical.stem
+                    ),
+                },
+            )
+
+    def test_repair_publishes_the_records_verbatim_except_the_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            paths = self.write_production_shape(
+                cluster, canonical, legacy, blend
+            )
+
+            result = repair_atlas_manifest_mirrors(canonical)
+
+            self.assertEqual(result["status"], "repaired")
+            published = {
+                Path(value).name: json.loads(
+                    Path(value).read_text(encoding="utf-8")
+                )
+                for value in result["published"]
+            }
+            source = json.loads(
+                paths["cluster_scope_legacy"].read_text(encoding="utf-8")
+            )
+            copied = published[
+                self.scope_name(
+                    self.FIXTURE["cluster_scope_id"], canonical.stem
+                )
+            ]
+            self.assertEqual(copied["spm"], str(canonical))
+            self.assertEqual(
+                {k: v for k, v in copied.items() if k != "spm"},
+                {k: v for k, v in source.items() if k != "spm"},
+                "publication is a rename completion, not an authoring edit",
+            )
+
+    def test_the_push_gate_lookup_resolves_after_the_repair(self):
+        """The addon reads `{scope}__{fbx stem}.json` and checks the SPM name."""
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            self.write_production_shape(cluster, canonical, legacy, blend)
+            consumer = (
+                cluster
+                / ".atlas_leaf_speedtree_scopes"
+                / self.scope_name(
+                    self.FIXTURE["leaf_scope_id"], canonical.stem
+                )
+            )
+            self.assertFalse(consumer.is_file())
+
+            repair_atlas_manifest_mirrors(canonical)
+
+            self.assertTrue(consumer.is_file())
+            payload = json.loads(consumer.read_text(encoding="utf-8"))
+            self.assertEqual(
+                Path(payload["spm"]).name,
+                f"{canonical.stem}.spm",
+                "the identity check that reported fbx_spm_identity_mismatch",
+            )
+            self.assertEqual(
+                payload["export_scope_id"], self.FIXTURE["leaf_scope_id"]
+            )
+
+    def test_the_repair_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            self.write_production_shape(cluster, canonical, legacy, blend)
+
+            first = repair_atlas_manifest_mirrors(canonical)
+            snapshot = {
+                Path(value): Path(value).read_bytes()
+                for value in first["published"]
+            }
+
+            self.assertEqual(
+                atlas_manifest_mirror_repair_plan(canonical)["status"],
+                "not_needed",
+            )
+            second = repair_atlas_manifest_mirrors(canonical)
+            self.assertEqual(second["status"], "not_needed")
+            self.assertEqual(
+                {path: path.read_bytes() for path in snapshot},
+                snapshot,
+            )
+
+    def test_the_legacy_name_is_never_a_publication_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            fixture = self.FIXTURE
+            self.write(
+                cluster,
+                Path(".atlas_leaf_speedtree_targets") / f"{canonical.stem}.json",
+                self.payload(
+                    canonical,
+                    blend,
+                    fixture["cluster_material"],
+                    fixture["cluster_scope_id"],
+                ),
+            )
+
+            self.assertEqual(canonical_name_publication_plan(legacy), [])
+            self.assertFalse(
+                (
+                    cluster
+                    / ".atlas_leaf_speedtree_targets"
+                    / f"{legacy.stem}.json"
+                ).exists()
+            )
+
+    def test_the_rolling_global_record_is_never_claimed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            fixture = self.FIXTURE
+            self.write(
+                cluster,
+                Path("speedtree_import_manifest.json"),
+                self.payload(
+                    legacy,
+                    blend,
+                    fixture["cluster_material"],
+                    fixture["cluster_scope_id"],
+                ),
+            )
+
+            destinations = {
+                Path(row["destination"]).name
+                for row in canonical_name_publication_plan(canonical)
+            }
+
+            self.assertNotIn("speedtree_import_manifest.json", destinations)
+
+    def test_without_a_pair_receipt_nothing_is_published(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(
+                temporary, receipt="absent"
+            )
+            self.write_production_shape(cluster, canonical, legacy, blend)
+
+            self.assertEqual(canonical_name_publication_plan(canonical), [])
+            self.assertEqual(
+                atlas_manifest_mirror_repair_plan(canonical)["status"],
+                "not_needed",
+            )
+
+    def test_a_failed_write_leaves_the_folder_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster, canonical, legacy, blend = self.build(temporary)
+            self.write_production_shape(cluster, canonical, legacy, blend)
+            before = {
+                path: path.read_bytes()
+                for path in sorted(cluster.rglob("*.json"))
+            }
+            calls = []
+            import atlas_manifest_resolver as module
+
+            original = module._atomic_manifest_write
+
+            def fail_on_second(path, payload):
+                calls.append(path)
+                if len(calls) == 2:
+                    raise OSError("disk full")
+                original(path, payload)
+
+            module._atomic_manifest_write = fail_on_second
+            try:
+                with self.assertRaises(OSError):
+                    repair_atlas_manifest_mirrors(canonical)
+            finally:
+                module._atomic_manifest_write = original
+
+            self.assertEqual(
+                {
+                    path: path.read_bytes()
+                    for path in sorted(cluster.rglob("*.json"))
+                },
+                before,
+                "a partial publication must not survive",
             )
 
 

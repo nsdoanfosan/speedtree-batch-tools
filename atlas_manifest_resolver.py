@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -708,6 +709,82 @@ _MIRROR_OWNERSHIP_FIELDS = (
 )
 
 
+def _scope_file_stem(scope_id):
+    """Return the scope filename component every reader derives the same way."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scope_id or "")).strip("._")
+    return safe or "AtlasLeaf"
+
+
+def canonical_name_publication_plan(target_spm, resolution=None):
+    """Return the canonical-name records a legacy-named export never wrote.
+
+    The resolver reads a Cluster output's legacy-named records, but every
+    downstream reader that is not the resolver -- the Blender push gate above
+    all -- looks the manifest up by the canonical file's own stem.  With only
+    legacy-named records on disk that lookup misses and falls back to the
+    unsuffixed identity shadow, which is diagnostic-only and last-writer-wins.
+
+    So the canonical name has to exist on disk as well.  This is a rename
+    completion, not an authoring decision: the payload is copied verbatim from
+    the record the resolver already selected, with only ``spm`` rebound.
+    """
+
+    target = Path(target_spm).expanduser().resolve(strict=False)
+    if resolution is None:
+        try:
+            resolution = resolve_atlas_manifests(target)
+        except AtlasManifestResolutionError:
+            return []
+    pair = resolution.get("cluster_pair_identity")
+    if not pair:
+        return []
+    canonical = Path(resolution["target_spm"])
+    # The pair contract forbids publishing to the legacy name, so only a
+    # canonical target may gain records; a legacy-named query never writes.
+    if not canonical.name.casefold().startswith("sk_"):
+        return []
+    publications = []
+    for row in resolution.get("selected") or ():
+        if row.get("identity_match") != "cluster_spm_pair_legacy_name":
+            continue
+        kind = row.get("kind")
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            payload, read_error = _read_payload(row.get("path"))
+            if read_error or payload is None:
+                continue
+        if kind == "exact_per_target":
+            destination = (
+                canonical.parent
+                / ".atlas_leaf_speedtree_targets"
+                / f"{canonical.stem}.json"
+            )
+        elif kind == "exact_target_scope":
+            scope_id = str(payload.get("export_scope_id") or "").strip()
+            if not scope_id:
+                continue
+            destination = (
+                canonical.parent
+                / ".atlas_leaf_speedtree_scopes"
+                / f"{_scope_file_stem(scope_id)}__{canonical.stem}.json"
+            )
+        else:
+            # The rolling global record is shared by every target in the
+            # folder; completing one rename must not claim it.
+            continue
+        if destination.is_file():
+            continue
+        published = copy.deepcopy(payload)
+        published["spm"] = str(canonical)
+        publications.append({
+            "kind": kind,
+            "source": str(Path(row["path"]).resolve(strict=False)),
+            "destination": str(destination),
+            "payload": published,
+        })
+    return publications
+
+
 def atlas_manifest_mirror_repair_plan(target_spm, resolution=None):
     """Classify whether one conflict is a stale mirror, without mutating it.
 
@@ -716,15 +793,37 @@ def atlas_manifest_mirror_repair_plan(target_spm, resolution=None):
     its source identity and complete ownership-claim key set must match the
     authority.  A different source/scope or extra claim is authoring ambiguity,
     not a stale mirror.
+
+    A resolvable target can still be incomplete: when its records exist only
+    under the legacy unprefixed name, the canonical-name copies every other
+    reader looks for are missing, and that is repairable too.
     """
 
     target = Path(target_spm).expanduser().resolve(strict=False)
     if resolution is None:
         try:
-            resolve_atlas_manifests(target)
+            current = resolve_atlas_manifests(target)
         except AtlasManifestResolutionError as exc:
             resolution = exc.resolution
         else:
+            publications = canonical_name_publication_plan(target, current)
+            if publications:
+                return {
+                    "schema_version": 1,
+                    "status": "repairable",
+                    "reason_code": "atlas_manifest_canonical_name_missing",
+                    "target_spm": str(target),
+                    "authority": None,
+                    "mirrors": [],
+                    "publications": [
+                        {
+                            key: value for key, value in row.items()
+                            if key != "payload"
+                        }
+                        for row in publications
+                    ],
+                    "resolution": resolution_evidence(current),
+                }
             return {
                 "schema_version": 1,
                 "status": "not_needed",
@@ -841,6 +940,40 @@ def _atomic_manifest_write(path, payload):
     _atomic_manifest_write_bytes(path, encoded)
 
 
+def _publish_canonical_name_records(target, plan):
+    """Write the canonical-name copies, or leave the folder untouched."""
+
+    publications = canonical_name_publication_plan(target)
+    if not publications:
+        # Another process completed the rename between plan and repair.
+        return {**plan, "status": "not_needed", "published": []}
+    committed = []
+    try:
+        for row in publications:
+            destination = Path(row["destination"])
+            if destination.exists():
+                raise OSError(
+                    f"canonical Atlas record already exists: {destination}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_manifest_write(destination, row["payload"])
+            committed.append(destination)
+        verified = resolve_atlas_manifests(target)
+    except Exception:
+        for path in reversed(committed):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+    return {
+        **plan,
+        "status": "repaired",
+        "published": [str(path) for path in committed],
+        "verified_resolution": resolution_evidence(verified),
+    }
+
+
 def repair_atlas_manifest_mirrors(target_spm):
     """Repair only a freshly proven exact-authority/lower-mirror conflict."""
 
@@ -848,6 +981,8 @@ def repair_atlas_manifest_mirrors(target_spm):
     plan = atlas_manifest_mirror_repair_plan(target)
     if plan.get("status") == "not_needed":
         return plan
+    if plan.get("reason_code") == "atlas_manifest_canonical_name_missing":
+        return _publish_canonical_name_records(target, plan)
     if plan.get("status") != "repairable":
         raise AtlasManifestResolutionError(
             str(plan.get("reason") or "Atlas manifest conflict is not repairable"),
