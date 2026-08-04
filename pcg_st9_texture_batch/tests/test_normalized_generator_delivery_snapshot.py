@@ -1405,8 +1405,202 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             self.assertEqual(live_binding["generated_node_count"], 0)
             self.assertEqual(
                 live_binding["export_evidence"],
-                "node_table_stale",
+                "node_table",
             )
+            self.assertFalse(live_binding["node_table_stale"])
+            self.assertTrue(live_binding["node_table_document_stale"])
+            self.assertEqual(
+                live_binding["causal_path_reason"],
+                "generator_causal_path_unconnected",
+            )
+
+    def test_material_mesh_pair_delivered_by_sibling_covers_dead_rows(self):
+        declared = []
+        live = []
+        for index, (guid, active) in enumerate((
+            ("frond-57", True),
+            ("frond-47", False),
+            ("frond-48", False),
+        )):
+            slot_prefix = f"Material:Frond:{index}"
+            declared.append({
+                "state": "already_connected",
+                "generator_index": index,
+                "generator_name": f"Frond {guid[-2:]}",
+                "generator_guid": guid,
+                "generator_type": "Frond",
+                "slot_prefix": slot_prefix,
+                "target_material_id": 2,
+                "target_mesh_id": 79,
+            })
+            live.append({
+                "generator_index": index,
+                "generator_name": f"Frond {guid[-2:]}",
+                "generator_guid": guid,
+                "generator_type": "Frond",
+                "slot_prefix": slot_prefix,
+                "material_id": "2",
+                "mesh_id": "79",
+                "visible": active,
+                "graph_visible": True,
+                "generated_node_count": 69 if active else 0,
+                "export_participates": active,
+                "export_evidence": (
+                    "node_table" if active else "node_table_stale"
+                ),
+                "node_table_stale": not active,
+                "causal_path_active": True if active else None,
+                "causal_path_reason": (
+                    "generator_causal_path_active"
+                    if active
+                    else "generator_causal_path_evidence_unavailable"
+                ),
+                "causal_path": [],
+                "inactive_ancestor": None,
+                "inactive_base": None,
+            })
+
+        class SharedPairAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, live, [79], total_node_count=69)
+
+        delivery = _normalized_generator_delivery(
+            SharedPairAudit,
+            "SK_tree_black_locast_04.spm",
+            {
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "generator_variant_policy": (
+                        "ensure_all_material_cutouts"
+                    ),
+                    "bindings": declared,
+                },
+            },
+            {"material_id": 2},
+            [{"target_mesh_id": 79}],
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"], DELIVERY_MODE_RENDER_CONNECTED
+        )
+        self.assertEqual(delivery["pair_covered_binding_count"], 2)
+        covered = [
+            row for row in delivery["binding_outcomes"]
+            if row["status"] == "pair_covered"
+        ]
+        self.assertEqual(len(covered), 2)
+        self.assertEqual(
+            {row["reason"] for row in covered},
+            {"generator_material_mesh_pair_delivered_by_sibling"},
+        )
+
+    def test_authored_zero_node_causes_are_planned_inactive(self):
+        causes = (
+            (
+                "dead-branch",
+                "generator_causal_path_inactive_ancestor",
+                True,
+                {
+                    "generator_type": "Branch",
+                    "generated_node_count": 0,
+                    "own_hidden": False,
+                },
+                ["branch"],
+            ),
+            (
+                "hidden-parent",
+                "generator_causal_path_hidden_ancestor",
+                False,
+                {
+                    "generator_type": "Branch",
+                    "generated_node_count": 12,
+                    "own_hidden": True,
+                },
+                ["branch"],
+            ),
+            (
+                "unconnected",
+                "generator_causal_path_unconnected",
+                True,
+                None,
+                [],
+            ),
+        )
+        declared = []
+        live = []
+        mesh_ids = []
+        for index, (guid, reason, graph_visible, ancestor, path) in enumerate(
+            causes
+        ):
+            mesh_id = 200 + index
+            mesh_ids.append(mesh_id)
+            slot_prefix = f"Leaves:Type:{index}"
+            declared.append({
+                "state": "already_connected",
+                "generator_index": index,
+                "generator_name": guid,
+                "generator_guid": guid,
+                "generator_type": "Leaf Mesh",
+                "slot_prefix": slot_prefix,
+                "target_material_id": 4,
+                "target_mesh_id": mesh_id,
+            })
+            live.append({
+                "generator_index": index,
+                "generator_name": guid,
+                "generator_guid": guid,
+                "generator_type": "Leaf Mesh",
+                "slot_prefix": slot_prefix,
+                "material_id": "4",
+                "mesh_id": str(mesh_id),
+                "visible": False,
+                "graph_visible": graph_visible,
+                "generated_node_count": 0,
+                "export_participates": False,
+                "export_evidence": "node_table",
+                "node_table_stale": False,
+                "causal_path_active": False,
+                "causal_path_reason": reason,
+                "causal_path": path,
+                "inactive_ancestor": ancestor,
+                "inactive_base": None,
+            })
+
+        class AuthoredInactiveAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, live, mesh_ids, total_node_count=12)
+
+        delivery = _normalized_generator_delivery(
+            AuthoredInactiveAudit,
+            "SK_tree_black_locast_04.spm",
+            {
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "generator_variant_policy": (
+                        "ensure_all_material_cutouts"
+                    ),
+                    "bindings": declared,
+                },
+            },
+            {"material_id": 4},
+            [{"target_mesh_id": mesh_id} for mesh_id in mesh_ids],
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(delivery["planned_inactive_binding_count"], 3)
+        self.assertEqual(
+            {row["reason"] for row in delivery["binding_outcomes"]},
+            {row[1] for row in causes},
+        )
+        self.assertTrue(all(
+            row["status"] == "planned_inactive"
+            for row in delivery["binding_outcomes"]
+        ))
 
 if __name__ == "__main__":
     unittest.main()

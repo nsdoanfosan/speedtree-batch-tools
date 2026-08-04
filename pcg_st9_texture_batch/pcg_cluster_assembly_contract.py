@@ -2112,28 +2112,50 @@ def _stale_node_table_evidence(binding):
 INACTIVE_CAUSAL_PATH_REASON = (
     "generator_causal_path_inactive_unused_base"
 )
+INACTIVE_ANCESTOR_CAUSAL_PATH_REASON = (
+    "generator_causal_path_inactive_ancestor"
+)
+HIDDEN_ANCESTOR_CAUSAL_PATH_REASON = (
+    "generator_causal_path_hidden_ancestor"
+)
+UNCONNECTED_CAUSAL_PATH_REASON = "generator_causal_path_unconnected"
+PAIR_DELIVERED_BY_SIBLING_REASON = (
+    "generator_material_mesh_pair_delivered_by_sibling"
+)
 
 
 def _inactive_causal_path_evidence(binding):
-    """True only for a coherent live path below an unused SpeedTree Base."""
+    """True for a coherent authored explanation of zero live geometry."""
     if not isinstance(binding, dict):
         return False
-    return (
+    reason = str(binding.get("causal_path_reason") or "")
+    if not (
         binding.get("causal_path_active") is False
-        and str(binding.get("causal_path_reason") or "")
-        == INACTIVE_CAUSAL_PATH_REASON
         and binding.get("node_table_stale") is False
-        and binding.get("graph_visible") is True
         and not int(binding.get("generated_node_count") or 0)
-        and isinstance(binding.get("inactive_base"), dict)
-        and str(
-            (binding.get("inactive_base") or {}).get("generator_type") or ""
-        ).strip().casefold() == "base"
-        and not int(
-            (binding.get("inactive_base") or {}).get(
-                "generated_node_count"
-            ) or 0
+    ):
+        return False
+    if reason == UNCONNECTED_CAUSAL_PATH_REASON:
+        return (
+            binding.get("graph_visible") is True
+            and not (binding.get("causal_path") or [])
         )
+    ancestor = binding.get("inactive_ancestor")
+    if not isinstance(ancestor, dict):
+        # Existing snapshots used only the Base-specific compatibility field.
+        ancestor = binding.get("inactive_base")
+    if not isinstance(ancestor, dict):
+        return False
+    if reason == HIDDEN_ANCESTOR_CAUSAL_PATH_REASON:
+        return ancestor.get("own_hidden") is True
+    if reason == INACTIVE_ANCESTOR_CAUSAL_PATH_REASON:
+        return not int(ancestor.get("generated_node_count") or 0)
+    return bool(
+        reason == INACTIVE_CAUSAL_PATH_REASON
+        and binding.get("graph_visible") is True
+        and str(ancestor.get("generator_type") or "").strip().casefold()
+        == "base"
+        and not int(ancestor.get("generated_node_count") or 0)
     )
 
 
@@ -2411,6 +2433,7 @@ def _normalized_generator_delivery(
         "declared_binding_count": len(bindings),
         "active_required_binding_count": len(bindings),
         "planned_inactive_binding_count": 0,
+        "pair_covered_binding_count": 0,
         "current_required_target_mesh_ids": list(normalized_mesh_ids),
         "binding_outcomes": [],
         "missing_live_bindings": [],
@@ -2618,6 +2641,13 @@ def _normalized_generator_delivery(
         row for row in relevant_live_bindings
         if export_participates(row)
     ]
+    delivered_material_mesh_pairs = {
+        (
+            _positive_asset_id(row.get("material_id")),
+            _positive_asset_id(row.get("mesh_id")),
+        )
+        for row in export_participating_bindings
+    }
     evidence["live_generator_bindings"] = [
         dict(row) for row in export_participating_bindings
     ]
@@ -2794,7 +2824,15 @@ def _normalized_generator_delivery(
                 if continuity_only:
                     outcome_reason = "relationship_continuity_only"
                 elif declared_slot in planned_inactive_slots:
-                    outcome_reason = INACTIVE_CAUSAL_PATH_REASON
+                    outcome_reason = str(
+                        current.get("causal_path_reason")
+                        or INACTIVE_CAUSAL_PATH_REASON
+                    )
+                elif (
+                    current_material_id,
+                    current_mesh_id,
+                ) in delivered_material_mesh_pairs:
+                    outcome_reason = PAIR_DELIVERED_BY_SIBLING_REASON
                 elif _stale_node_table_evidence(current):
                     errors.append(
                         "generator_export_evidence_stale_node_table"
@@ -2811,6 +2849,8 @@ def _normalized_generator_delivery(
             "status": (
                 "continuity_only"
                 if continuity_only and not errors
+                else "pair_covered"
+                if outcome_reason == PAIR_DELIVERED_BY_SIBLING_REASON
                 else "planned_inactive"
                 if outcome_reason and not errors
                 else "completed" if not errors else "failed"
@@ -2823,6 +2863,11 @@ def _normalized_generator_delivery(
         if "visible_generator_slot_missing" in errors:
             evidence["missing_live_bindings"].append(dict(declared))
         evidence["errors"].extend(errors)
+
+    evidence["pair_covered_binding_count"] = sum(
+        row.get("status") == "pair_covered"
+        for row in evidence["binding_outcomes"]
+    )
 
     # Preserve the old strict topology scope: only expected-material slots
     # that currently participate in export must be declared exactly once.

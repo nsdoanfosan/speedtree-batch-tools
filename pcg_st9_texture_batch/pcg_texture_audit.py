@@ -1145,6 +1145,7 @@ def _leaf_generator_bindings_from_text(
                 "generator_index": generator_index,
                 "generator_name": generator_name,
                 "generator_type": generator_type,
+                "own_hidden": own_hidden,
                 "generated_node_count": int(
                     (export_node_counts or {}).get(guid_key, 0)
                 ),
@@ -1198,61 +1199,130 @@ def _leaf_generator_bindings_from_text(
     node_table = _node_table_state(
         export_node_counts, total_nodes, hidden_by_guid
     )
+    orphan_generator_guids = set(
+        node_table.get("orphan_generator_guids") or ()
+    )
 
     def causal_path_evidence(generator):
-        """Describe whether an upstream Base is used by the live model.
+        """Describe whether the authored path can produce live geometry.
 
         A graph-visible leaf with zero Nodes is not necessarily defective.
-        SpeedTree can retain a complete Base/Branch/Leaf authoring path that
-        the current model does not reference.  A coherent saved Node table
-        proves that state when the upstream Base and its descendants all own
-        zero Nodes.  Stale or absent Node evidence never earns this exclusion.
+        SpeedTree can retain an inactive ancestor path, a hidden ancestor, or
+        an unconnected leaf.  A stale Node owner only invalidates evidence for
+        descendants whose ancestry actually reaches that orphan GUID; an
+        unrelated orphan elsewhere in the document cannot affect this path.
         """
-        unavailable = {
-            "causal_path_active": None,
-            "causal_path_reason": "generator_causal_path_evidence_unavailable",
-            "causal_path": [],
-            "inactive_base": None,
-        }
+        def result(
+            active,
+            reason,
+            *,
+            path=(),
+            inactive_ancestor=None,
+            inactive_base=None,
+            orphan_ancestor_guids=(),
+        ):
+            return {
+                "causal_path_active": active,
+                "causal_path_reason": reason,
+                "causal_path": [dict(row) for row in path],
+                "inactive_ancestor": (
+                    dict(inactive_ancestor)
+                    if inactive_ancestor is not None
+                    else None
+                ),
+                # Compatibility field retained for existing consumers.
+                "inactive_base": (
+                    dict(inactive_base)
+                    if inactive_base is not None
+                    else None
+                ),
+                "orphan_ancestor_guids": sorted(orphan_ancestor_guids),
+                "node_table_stale": bool(orphan_ancestor_guids),
+                "node_table_document_stale": bool(node_table["stale"]),
+            }
+
         guid_key = generator.get("guid_key")
-        if not guid_key or not total_nodes or node_table["stale"]:
-            return unavailable
+        if not guid_key or not total_nodes:
+            return result(
+                None,
+                "generator_causal_path_evidence_unavailable",
+            )
+
+        ancestor_key = parent.get(guid_key, "")
+        if not ancestor_key:
+            return result(
+                False,
+                "generator_causal_path_unconnected",
+            )
 
         path = []
+        inactive_ancestor = None
         inactive_base = None
-        ancestor_key = parent.get(guid_key, "")
+        hidden_ancestor = None
         seen = set()
         while ancestor_key and ancestor_key not in seen:
             seen.add(ancestor_key)
+            if ancestor_key in orphan_generator_guids:
+                return result(
+                    None,
+                    "generator_causal_path_evidence_unavailable",
+                    path=path,
+                    orphan_ancestor_guids=(ancestor_key,),
+                )
             ancestor = generator_state_by_guid.get(ancestor_key)
             if ancestor is None:
-                break
+                return result(
+                    None,
+                    "generator_causal_path_evidence_unavailable",
+                    path=path,
+                )
             row = dict(ancestor)
             path.append(row)
-            if (
-                _normalized_generator_type(row.get("generator_type"))
-                == "base"
-                and int(row.get("generated_node_count") or 0) == 0
-            ):
-                inactive_base = dict(row)
-                break
+            if row.get("own_hidden") is True and hidden_ancestor is None:
+                hidden_ancestor = dict(row)
+            if int(row.get("generated_node_count") or 0) == 0:
+                if (
+                    _normalized_generator_type(row.get("generator_type"))
+                    == "base"
+                ):
+                    inactive_base = dict(row)
+                elif inactive_ancestor is None:
+                    inactive_ancestor = dict(row)
             ancestor_key = parent.get(ancestor_key, "")
 
+        if ancestor_key in seen:
+            return result(
+                None,
+                "generator_causal_path_evidence_unavailable",
+                path=path,
+            )
+        if hidden_ancestor is not None:
+            return result(
+                False,
+                "generator_causal_path_hidden_ancestor",
+                path=path,
+                inactive_ancestor=hidden_ancestor,
+            )
         if inactive_base is not None:
-            return {
-                "causal_path_active": False,
-                "causal_path_reason": (
-                    "generator_causal_path_inactive_unused_base"
-                ),
-                "causal_path": path,
-                "inactive_base": inactive_base,
-            }
-        return {
-            "causal_path_active": True,
-            "causal_path_reason": "generator_causal_path_active",
-            "causal_path": path,
-            "inactive_base": None,
-        }
+            return result(
+                False,
+                "generator_causal_path_inactive_unused_base",
+                path=path,
+                inactive_ancestor=inactive_base,
+                inactive_base=inactive_base,
+            )
+        if inactive_ancestor is not None:
+            return result(
+                False,
+                "generator_causal_path_inactive_ancestor",
+                path=path,
+                inactive_ancestor=inactive_ancestor,
+            )
+        return result(
+            True,
+            "generator_causal_path_active",
+            path=path,
+        )
 
     bindings = []
     for generator in generators:
@@ -1266,15 +1336,18 @@ def _leaf_generator_bindings_from_text(
             or generated_node_count > 0
         )
         export_participates = bool(graph_visible and counted_by_node_table)
+        causal_evidence = causal_path_evidence(generator)
+        binding_node_table_stale = bool(
+            causal_evidence.get("node_table_stale")
+        )
         # A zero count read out of a stale table proves nothing either way.
         # Keep failing closed, but say which of the two it is so an operator is
         # not sent to fix a Generator connection that is already correct.
         export_evidence = (
             "node_table"
-            if counted_by_node_table or not node_table["stale"]
+            if counted_by_node_table or not binding_node_table_stale
             else "node_table_stale"
         )
-        causal_evidence = causal_path_evidence(generator)
         by_name = {name.lower(): (name, value)
                    for name, value in generator["properties"]}
         for property_name, material_id in generator["properties"]:
@@ -1300,7 +1373,6 @@ def _leaf_generator_bindings_from_text(
                 "generated_node_count": generated_node_count,
                 "export_participates": export_participates,
                 "export_evidence": export_evidence,
-                "node_table_stale": bool(node_table["stale"]),
                 **causal_evidence,
             })
     return bindings
