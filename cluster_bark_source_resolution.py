@@ -41,7 +41,6 @@ from sk_batch.spm_leaf_handoff_contract import (
 )
 from speedtree_texture_contract import (
     CanonicalTextureContractError,
-    PCG_ST9_REMEDIATION,
     build_spm_canonical_texture_plan,
     inspect_spm_texture_slots,
     load_canonical_output_manifest,
@@ -327,9 +326,7 @@ def _source_tree_texture_inventory(source_spm):
                 continue
             seen.add(key)
             if not path.is_file():
-                raise ClusterBarkSourceResolutionError(
-                    f"Cluster source Tree texture is missing: {path}"
-                )
+                continue
             rows.append({
                 "source": str(path),
                 "relative": relative.as_posix(),
@@ -390,10 +387,7 @@ def _source_external_texture_inventory(source_spm):
             except ValueError:
                 pass
             if not path.is_file():
-                raise ClusterBarkSourceResolutionError(
-                    "Cluster source external texture is missing: "
-                    + str(path)
-                )
+                continue
             key = _path_key(path)
             if key in seen:
                 continue
@@ -419,8 +413,8 @@ def _canonical_texture_error_message(spm, issues):
         )
     suffix = " | " + " | ".join(details) if details else ""
     return (
-        f"{Path(spm).name}: production texture handoff is blocked."
-        f"{suffix}. {PCG_ST9_REMEDIATION}"
+        f"{Path(spm).name}: isolated material handoff could not be prepared."
+        f"{suffix}"
     )
 
 
@@ -505,29 +499,117 @@ def _blender_cluster_bake_overrides(contract, source_spm):
     return overrides
 
 
+def _canonical_bark_asset_root(spm):
+    root = Path(spm).expanduser().resolve(strict=False).parent
+    return root.parent if root.name.casefold() == "cluster" else root
+
+
+def canonical_bark_record_plan(row):
+    """Return the manifest entry a canonical bark row already proves, or None.
+
+    The row carries the SPM, the material, and the texture refs that material
+    actually points at.  When those refs name one ``T_*`` base whose complete
+    role set is on disk, the manifest entry is fully determined by evidence --
+    nothing is inferred from a naming convention -- and the only thing missing
+    is the bookkeeping.  Telling the operator to *generate* outputs that are
+    already there sends them to do work that does not exist.
+    """
+
+    from pcg_st9_texture_batch.pcg_canonical_outputs import REQUIRED_ROLES
+
+    spm = str(row.get("spm") or "")
+    refs = list(row.get("refs") or [])
+    if not spm or not refs:
+        return None
+    asset_root = _canonical_bark_asset_root(spm)
+    bases = {Path(ref).stem.rsplit("_", 1)[0] for ref in refs}
+    if len(bases) != 1:
+        return None
+    texture_base = next(iter(bases))
+    if not texture_base.casefold().startswith("t_"):
+        return None
+    files = []
+    for ref in refs:
+        path = Path(ref)
+        if not path.is_absolute():
+            path = asset_root / path
+        path = path.resolve(strict=False)
+        if not path.is_file() or path.stat().st_size <= 0:
+            return None
+        files.append(path)
+    roles = {path.stem.rsplit("_", 1)[-1].casefold() for path in files}
+    if not {role.casefold() for role in REQUIRED_ROLES} <= roles:
+        return None
+    return {
+        "asset_root": str(asset_root),
+        "texture_base": texture_base,
+        "material_targets": [{
+            "spm": spm,
+            "material_id": row.get("material_id"),
+            "material_name": row.get("material_name"),
+        }],
+        "output_files": [str(path) for path in files],
+    }
+
+
+def _record_canonical_bark_output(row):
+    """Upsert the proven manifest entry and return the reloaded manifest."""
+
+    plan = canonical_bark_record_plan(row)
+    if plan is None:
+        return None, None
+    from pcg_st9_texture_batch.pcg_canonical_outputs import (
+        CanonicalOutputManifestError,
+        record_canonical_output,
+    )
+
+    try:
+        record_canonical_output(
+            {
+                "folder": plan["asset_root"],
+                "texture_base": plan["texture_base"],
+                "material_targets": plan["material_targets"],
+            },
+            plan["output_files"],
+            producer_source=str(row.get("producer_source") or ""),
+        )
+    except (CanonicalOutputManifestError, OSError, ValueError) as exc:
+        return None, {**plan, "error": str(exc)[:320]}
+    try:
+        return load_canonical_output_manifest(row["spm"]), plan
+    except (CanonicalTextureContractError, OSError, ValueError) as exc:
+        return None, {**plan, "error": str(exc)[:320]}
+
+
 def _canonical_bark_output(contract, source_spm, manifest):
     bark = ((contract.get("handoff") or {}).get("canonical_bark") or {})
+    quarantine_all = bool(bark.get("texture_candidates_ambiguous"))
     resolved = []
     for row in bark.get("canonical_sources") or []:
-        output = resolve_manifest_material_output(
-            manifest,
-            row.get("spm"),
-            row.get("material_id"),
-            row.get("material_name"),
-        )
-        if output is None:
-            raise ClusterBarkSourceResolutionError(
-                _canonical_texture_error_message(
-                    source_spm,
-                    [{
-                        "material": row.get("material_name"),
-                        "material_id": row.get("material_id"),
-                        "role": "*",
-                        "expected_output": manifest.get("manifest"),
-                        "reason": "canonical_bark_manifest_target_missing",
-                    }],
-                )
+        output = (
+            resolve_manifest_material_output(
+                manifest,
+                row.get("spm"),
+                row.get("material_id"),
+                row.get("material_name"),
             )
+            if manifest.get("outputs")
+            else None
+        )
+        record_attempt = None
+        if output is None:
+            # The outputs may already exist with only the manifest entry
+            # lost. Re-record a complete proven set opportunistically. Partial
+            # or absent textures are ordinary runtime states, not a gate.
+            recorded, record_attempt = _record_canonical_bark_output(row)
+            if recorded is not None:
+                manifest = recorded
+                output = resolve_manifest_material_output(
+                    manifest,
+                    row.get("spm"),
+                    row.get("material_id"),
+                    row.get("material_name"),
+                )
         materials = [
             material
             for material in inspect_spm_texture_slots(row.get("spm"))[
@@ -538,66 +620,140 @@ def _canonical_bark_output(contract, source_spm, manifest):
                 == str(row.get("material_id") or "")
             )
         ]
-        issues = []
         if len(materials) != 1:
-            issues.append({
-                "material": row.get("material_name"),
-                "material_id": row.get("material_id"),
-                "role": "*",
-                "expected_output": manifest.get("manifest"),
-                "reason": "canonical_bark_material_ambiguous",
-            })
-        else:
-            for slot in materials[0]["slots"]:
-                expected = str(
-                    (output.get("files") or {}).get(slot["role"]) or ""
-                )
-                if (
-                    not slot["role"]
-                    or not expected
-                    or _path_key(slot["resolved_ref"]) != _path_key(expected)
-                ):
-                    issues.append({
-                        "material": row.get("material_name"),
-                        "material_id": row.get("material_id"),
-                        "role": slot["role"] or "unknown",
-                        "expected_output": expected or manifest.get("manifest"),
-                        "reason": (
-                            "canonical_bark_production_ref_not_manifest_output"
-                        ),
-                    })
-        if issues:
             raise ClusterBarkSourceResolutionError(
-                _canonical_texture_error_message(source_spm, issues)
+                f"{Path(source_spm).name}: canonical bark material is "
+                f"ambiguous for ID {row.get('material_id') or '?'}"
             )
-        resolved.append(output)
-    signatures = {
-        (
-            output["texture_base"].casefold(),
-            tuple(
-                (role, _path_key(path))
-                for role, path in sorted(output["files"].items())
-            ),
-        )
-        for output in resolved
-    }
-    if len(signatures) != 1:
-        raise ClusterBarkSourceResolutionError(
-            f"{Path(source_spm).name}: canonical bark manifest outputs "
-            "are missing or disagree at the same authority level. "
-            + PCG_ST9_REMEDIATION
-        )
-    return resolved[0]
+        material = materials[0]
+        candidates = {}
+        omissions = []
+        manifest_files = dict((output or {}).get("files") or {})
+        if quarantine_all:
+            manifest_files = {}
+        for slot in material["slots"]:
+            role = str(slot.get("role") or "").casefold()
+            if not role:
+                omissions.append({
+                    "map": slot.get("map"),
+                    "authored_ref": slot.get("authored_ref"),
+                    "reason": "role_unknown",
+                })
+                continue
+            live = Path(str(slot.get("resolved_ref") or ""))
+            declared = str(manifest_files.get(role) or "")
+            if quarantine_all:
+                omissions.append({
+                    "role": role,
+                    "authored_ref": slot.get("authored_ref"),
+                    "reason": "same_authority_candidates_disagree",
+                })
+                continue
+            if (
+                declared
+                and live.is_file()
+                and _path_key(live) != _path_key(declared)
+            ):
+                omissions.append({
+                    "role": role,
+                    "authored_ref": slot.get("authored_ref"),
+                    "reason": "declared_and_live_candidates_disagree",
+                })
+                continue
+            candidate = declared or (str(live) if live.is_file() else "")
+            if not candidate or not Path(candidate).is_file():
+                omissions.append({
+                    "role": role,
+                    "authored_ref": slot.get("authored_ref"),
+                    "reason": "candidate_unavailable",
+                })
+                continue
+            candidates.setdefault(role, set()).add(str(Path(candidate).resolve()))
+        files = {}
+        for role, paths in candidates.items():
+            if len({_path_key(path) for path in paths}) == 1:
+                files[role] = next(iter(paths))
+            else:
+                omissions.append({
+                    "role": role,
+                    "reason": "candidate_ambiguous",
+                })
+        bases = {
+            Path(path).stem.rsplit("_", 1)[0]
+            for path in files.values()
+            if Path(path).stem.casefold().startswith("t_")
+        }
+        if len({base.casefold() for base in bases}) > 1:
+            omissions.extend(
+                {"role": role, "reason": "texture_base_ambiguous"}
+                for role in sorted(files)
+            )
+            files = {}
+            bases = set()
+        resolved.append({
+            "texture_base": next(iter(bases), ""),
+            "required_roles": sorted(files),
+            "files": files,
+            "material_targets": [{
+                "spm": str(row.get("spm") or ""),
+                "material_id": str(row.get("material_id") or ""),
+                "material_name": str(row.get("material_name") or ""),
+            }],
+            "producer": dict((output or {}).get("producer") or {}),
+            "origin_kind": "pcg_sbs",
+            "omitted": omissions,
+            "record_attempt": record_attempt or {},
+        })
+
+    if not resolved:
+        return {
+            "texture_base": "",
+            "required_roles": [],
+            "files": {},
+            "origin_kind": "pcg_sbs",
+            "omitted": [{"reason": "canonical_source_unavailable"}],
+        }
+
+    consensus = {}
+    for role in sorted({role for item in resolved for role in item["files"]}):
+        rows = [item["files"].get(role) for item in resolved]
+        if not all(rows):
+            continue
+        try:
+            hashes = {_sha256_file(path) for path in rows}
+        except OSError:
+            continue
+        if len(hashes) == 1:
+            consensus[role] = rows[0]
+    first = copy.deepcopy(resolved[0])
+    first["files"] = consensus
+    first["required_roles"] = sorted(consensus)
+    first["texture_availability"] = (
+        "complete" if consensus and all(
+            len(item["files"]) == len(consensus) for item in resolved
+        ) else
+        "partial" if consensus else
+        "textureless"
+    )
+    first["candidate_count"] = len(resolved)
+    return first
 
 
 def _production_texture_handoff_plan(contract, source_spm, required_rows):
-    """Build one origin-aware, no-fallback texture plan for an isolated copy."""
+    """Build a texture-candidate plan that never gates cluster isolation."""
+    manifest_error = ""
     try:
         manifest = load_canonical_output_manifest(source_spm)
     except CanonicalTextureContractError as exc:
-        raise ClusterBarkSourceResolutionError(
-            _canonical_texture_error_message(source_spm, exc.issues)
-        ) from exc
+        manifest_error = str(exc)
+        manifest = {
+            "manifest": "",
+            "asset_root": str(Path(source_spm).resolve().parent.parent),
+            "texture_root": str(
+                Path(source_spm).resolve().parent.parent / "texture"
+            ),
+            "outputs": [],
+        }
     overrides = _blender_cluster_bake_overrides(contract, source_spm)
     bark_output = _canonical_bark_output(contract, source_spm, manifest)
     for row in required_rows:
@@ -610,7 +766,7 @@ def _production_texture_handoff_plan(contract, source_spm, required_rows):
                         "material": row.get("material_name"),
                         "material_id": "",
                         "role": "*",
-                        "expected_output": manifest["manifest"],
+                        "expected_output": manifest.get("manifest"),
                         "reason": "canonical_bark_material_id_missing",
                     }],
                 )
@@ -619,18 +775,44 @@ def _production_texture_handoff_plan(contract, source_spm, required_rows):
             **copy.deepcopy(bark_output),
             "origin_kind": "pcg_sbs",
         }
+    if not manifest.get("manifest"):
+        # Avoid asking the strict manifest loader about unrelated generator
+        # materials when there is no usable manifest. Runtime rebasing will
+        # preserve only safe candidates and blank the rest.
+        inspection = inspect_spm_texture_slots(source_spm)
+        for material in inspection.get("materials") or []:
+            material_id = str(material.get("material_id") or "").strip()
+            if (
+                material.get("slots")
+                and material_id
+                and material_id not in overrides
+            ):
+                overrides[material_id] = {
+                    "texture_base": "",
+                    "required_roles": [],
+                    "files": {},
+                    "origin_kind": "pcg_sbs",
+                    "omitted": [{"reason": "manifest_unavailable"}],
+                }
     plan = build_spm_canonical_texture_plan(
         source_spm,
-        manifest["manifest"],
+        manifest.get("manifest") or None,
         overrides,
     )
-    if plan.get("status") not in {"ok", "not_applicable"}:
+    if (plan.get("generator_material_scope") or {}).get("status") not in {
+        "ok",
+        None,
+    }:
         raise ClusterBarkSourceResolutionError(
             _canonical_texture_error_message(
                 source_spm, plan.get("issues") or []
             )
         )
     plan["material_output_overrides"] = overrides
+    plan["texture_admission_mode"] = "runtime_tolerant"
+    plan["texture_manifest_available"] = bool(manifest.get("manifest"))
+    if manifest_error:
+        plan["texture_manifest_telemetry"] = manifest_error[:640]
     return plan
 
 
@@ -642,6 +824,7 @@ def _normalization_identity(contract, source_spm, required_rows):
             "Cluster bark normalization has no canonical Tree bark source"
         )
     textures = []
+    texture_omissions = []
     for row in canonical_sources:
         canonical_spm = Path(str(row.get("spm") or ""))
         if not canonical_spm.is_file():
@@ -651,12 +834,22 @@ def _normalization_identity(contract, source_spm, required_rows):
         for value in row.get("refs") or []:
             path = _resolve_ref(canonical_spm, value)
             if not path.is_file():
-                raise ClusterBarkSourceResolutionError(
-                    f"canonical bark texture is missing: {path}"
-                )
+                texture_omissions.append({
+                    "name": path.name.casefold(),
+                    "reason": "missing",
+                })
+                continue
+            try:
+                texture_hash = _sha256_file(path)
+            except OSError:
+                texture_omissions.append({
+                    "name": path.name.casefold(),
+                    "reason": "unreadable",
+                })
+                continue
             textures.append({
                 "name": path.name.casefold(),
-                "sha256": _sha256_file(path),
+                "sha256": texture_hash,
             })
     texture_handoff = _production_texture_handoff_plan(
         contract,
@@ -674,6 +867,10 @@ def _normalization_identity(contract, source_spm, required_rows):
         "canonical_textures": sorted(
             textures,
             key=lambda row: (row["name"], row["sha256"]),
+        ),
+        "canonical_texture_omissions": sorted(
+            texture_omissions,
+            key=lambda row: (row["name"], row["reason"]),
         ),
         "required_materials": sorted(
             [
@@ -700,6 +897,20 @@ def _normalization_identity(contract, source_spm, required_rows):
     return signature, identity
 
 
+def _structural_normalization_signature(identity):
+    """Compare owner authority without turning texture drift into a gate."""
+    structural = copy.deepcopy(identity)
+    for field in (
+        "canonical_textures",
+        "canonical_texture_omissions",
+        "production_texture_handoff",
+    ):
+        structural.pop(field, None)
+    return hashlib.sha256(
+        _canonical_json(structural).encode("utf-8")
+    ).hexdigest()
+
+
 def _copy_canonical_textures(contract, isolated_tree_root):
     bark = ((contract.get("handoff") or {}).get("canonical_bark") or {})
     copied = []
@@ -709,7 +920,12 @@ def _copy_canonical_textures(contract, isolated_tree_root):
         tree_root = canonical_spm.parent
         for value in row.get("refs") or []:
             source = _resolve_ref(canonical_spm, value)
-            source_hash = _sha256_file(source)
+            if not source.is_file():
+                continue
+            try:
+                source_hash = _sha256_file(source)
+            except OSError:
+                continue
             try:
                 relative = source.resolve().relative_to(tree_root)
                 destination = Path(isolated_tree_root) / relative
@@ -728,14 +944,16 @@ def _copy_canonical_textures(contract, isolated_tree_root):
             if key in seen:
                 continue
             seen.add(key)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            isolated_hash = _sha256_file(destination)
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                isolated_hash = _sha256_file(destination)
+            except OSError:
+                destination.unlink(missing_ok=True)
+                continue
             if isolated_hash != source_hash:
-                raise ClusterBarkSourceResolutionError(
-                    "isolated canonical bark texture hash mismatch: "
-                    + str(destination)
-                )
+                destination.unlink(missing_ok=True)
+                continue
             copied.append({
                 "source": str(source),
                 "isolated": str(destination),
@@ -749,14 +967,18 @@ def _copy_source_tree_textures(identity, isolated_tree_root):
     for row in identity.get("source_tree_textures") or []:
         source = Path(row["source"])
         destination = Path(isolated_tree_root) / Path(row["relative"])
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        actual_hash = _sha256_file(destination)
+        if not source.is_file():
+            continue
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            actual_hash = _sha256_file(destination)
+        except OSError:
+            destination.unlink(missing_ok=True)
+            continue
         if actual_hash != row["sha256"]:
-            raise ClusterBarkSourceResolutionError(
-                "isolated source texture hash mismatch: "
-                + str(destination)
-            )
+            destination.unlink(missing_ok=True)
+            continue
         copied.append({
             "source": str(source),
             "isolated": str(destination),
@@ -827,20 +1049,24 @@ def _copy_source_external_textures(
     staged_source = Path(staged_source)
     for row in identity.get("source_external_textures") or []:
         source = Path(row["source"])
+        if not source.is_file():
+            continue
         destination = (
             Path(isolated_tree_root)
             / "_external_textures"
             / str(row["sha256"])[:16]
             / source.name
         )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        actual_hash = _sha256_file(destination)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            actual_hash = _sha256_file(destination)
+        except OSError:
+            destination.unlink(missing_ok=True)
+            continue
         if actual_hash != row["sha256"]:
-            raise ClusterBarkSourceResolutionError(
-                "isolated source external texture hash mismatch: "
-                + str(destination)
-            )
+            destination.unlink(missing_ok=True)
+            continue
         spm_ref = os.path.relpath(destination, staged_source.parent).replace(
             "\\", "/"
         )
@@ -997,20 +1223,57 @@ def _rebase_external_texture_refs(
         os.replace(temporary, isolated_spm)
     finally:
         temporary.unlink(missing_ok=True)
+    omitted = []
+    stale_refs = set()
     for row in rewritten:
         destination = _resolve_ref(isolated_spm, row["spm_ref"])
-        if (
-            not destination.is_file()
-            or _sha256_file(destination) != row["sha256"]
-        ):
-            raise ClusterBarkSourceResolutionError(
-                "rebased isolated external texture is missing or stale: "
-                + str(destination)
+        try:
+            current = (
+                destination.is_file()
+                and _sha256_file(destination) == row["sha256"]
             )
+        except OSError:
+            current = False
+        if not current:
+            stale_refs.add(str(row["spm_ref"]).replace("\\", "/").casefold())
+            omitted.append({
+                "authored_ref": row["spm_ref"],
+                "reason": "copied_candidate_unavailable",
+            })
+    if stale_refs:
+        current_bytes = isolated_spm.read_bytes()
+        current_compressed = current_bytes.startswith(b"\x1f\x8b")
+        current_text = (
+            gzip.decompress(current_bytes).decode("utf-8")
+            if current_compressed
+            else current_bytes.decode("utf-8")
+        )
+
+        def clear_stale(match):
+            authored = " ".join(match.group(2).split()).replace(
+                "\\", "/"
+            ).casefold()
+            if authored not in stale_refs:
+                return match.group(0)
+            return match.group(1) + match.group(3)
+
+        current_text = _TEX_FILENAME_RE.sub(clear_stale, current_text)
+        payload = current_text.encode("utf-8")
+        if current_compressed:
+            payload = gzip.compress(payload)
+        temporary = isolated_spm.with_name(
+            isolated_spm.name + ".external-textures-quarantine.tmp"
+        )
+        try:
+            temporary.write_bytes(payload)
+            os.replace(temporary, isolated_spm)
+        finally:
+            temporary.unlink(missing_ok=True)
     return {
-        "status": "rebased",
+        "status": "partial" if omitted else "rebased",
         "rewritten_reference_count": len(rewritten),
         "textures": copied_external_textures,
+        "omitted": omitted,
     }
 
 
@@ -1259,6 +1522,7 @@ def prepare_isolated_bark_source(
                     staged_source,
                     source,
                     identity["production_texture_handoff"],
+                    texture_policy="runtime_tolerant",
                 )
             )
         except CanonicalTextureContractError as exc:
@@ -1276,7 +1540,7 @@ def prepare_isolated_bark_source(
             temporary_texture = Path(row["isolated"])
             try:
                 temporary_texture.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
         final_staged_hash = _sha256_file(staged_source)
         for output in normalization.get("outputs") or []:
@@ -1298,12 +1562,19 @@ def prepare_isolated_bark_source(
                     if str(row.get("material_id") or "")
                     == str(output.get("material_id") or "")
                 ]
-                output["canonical_textures"] = [
-                    {
+                safe_rebound = []
+                for row in rebound:
+                    try:
+                        texture_hash = _sha256_file(
+                            row["expected_output"]
+                        )
+                    except OSError:
+                        continue
+                    safe_rebound.append({
                         "map": row["map"],
                         "source": row["expected_output"],
                         "isolated": row["expected_output"],
-                        "sha256": _sha256_file(row["expected_output"]),
+                        "sha256": texture_hash,
                         "spm_ref": row["after"],
                         "export_enabled": True,
                         "origin_kind": next(
@@ -1317,9 +1588,8 @@ def prepare_isolated_bark_source(
                             ),
                             "pcg_sbs",
                         ),
-                    }
-                    for row in rebound
-                ]
+                    })
+                output["canonical_textures"] = safe_rebound
                 output["production_texture_handoff"] = copy.deepcopy(
                     production_texture_rebase
                 )
@@ -1510,10 +1780,13 @@ def resolve_cluster_bark_source_spm(
         )
         row["signature"] = signature
         row["identity"] = identity
-    signatures = {row["signature"] for row in selected}
-    if len(signatures) != 1:
+    structural_signatures = {
+        _structural_normalization_signature(row["identity"])
+        for row in selected
+    }
+    if len(structural_signatures) != 1:
         raise ClusterBarkSourceResolutionError(
-            "Cluster owner canonical bark texture sets disagree at the "
+            "Cluster owner canonical bark material contracts disagree at the "
             f"same authority level {best_authority}: "
             + "; ".join(
                 (
@@ -1526,7 +1799,16 @@ def resolve_cluster_bark_source_spm(
                 for row in selected
             )
         )
-    contract = selected[0]["contract"]
+    texture_signatures = {row["signature"] for row in selected}
+    contract = copy.deepcopy(selected[0]["contract"])
+    if len(texture_signatures) != 1:
+        bark = (
+            (contract.setdefault("handoff", {}))
+            .setdefault("canonical_bark", {})
+        )
+        bark["texture_candidates_ambiguous"] = True
+        for source_row in bark.get("canonical_sources") or []:
+            source_row["refs"] = []
     required_rows = selected[0]["required_rows"]
     prepared = prepare_isolated_bark_source(
         source,

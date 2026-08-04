@@ -377,6 +377,37 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 )
             )
 
+    def test_partial_texture_binding_keeps_pipeline_outcome_ok(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_partial.spm")
+            stmat = write_stmat(spm, ["M_stem_Mat"], texture_base="T_Stem_01")
+            for role in ("extra", "height", "opacity", "subsurface"):
+                (root / "texture" / f"T_Stem_01_{role}.tga").unlink()
+
+            readiness = resolve_texture_bindings(stmat)
+            envelope = build_preflight_envelope(
+                spm,
+                outcome="ok",
+                texture_readiness=readiness,
+            )
+
+            self.assertEqual(readiness["status"], "partial")
+            self.assertEqual(envelope["outcome"], "ok")
+            self.assertEqual(
+                envelope["texture_admission"],
+                {
+                    "mode": "runtime_tolerant",
+                    "affects_outcome": False,
+                    "state": "partial",
+                },
+            )
+            intent = envelope["material_intents"][0]
+            self.assertEqual(intent["texture_source_mode"], "managed_texture_set")
+            self.assertEqual(
+                set(intent["texture_binding"]["files"]), {"color", "normal"}
+            )
+
     def test_tree_profile_is_applied_once_to_every_stmat_material(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

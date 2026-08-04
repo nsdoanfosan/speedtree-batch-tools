@@ -3409,6 +3409,18 @@ class PushQueueFlowTests(unittest.TestCase):
         push_source = (
             SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
         ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "PCG ST9 Texture Batch 산출물 누락; Unreal Push 중단",
+            push_source,
+        )
+        self.assertNotIn(
+            'texture_normalization.get("missing")\n                or export_collection_issues',
+            push_source,
+        )
+        self.assertNotIn(
+            'texture_normalization.get("missing")\n            or empty_material_slots',
+            bwr_source,
+        )
         self.assertIn("resolve_cluster_spm_pair(spm_path)", push_source)
         self.assertIn(
             'parser.add_argument("--dependency-orchestrated", action="store_true")',

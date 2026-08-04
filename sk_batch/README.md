@@ -177,10 +177,10 @@ Cluster Assembly 영수증이 현재 산출물 해시보다 오래된 경우에�
 한 번 자동 재실행하고, 새 영수증이 실제 현재 해시로 검증된 뒤에만 Blender를
 시작한다. 오래된 영수증을 무시하거나 완화해서 통과시키지는 않는다.
 
-**③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
-새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,
-blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비 안 된 항목은
-이유를 표에 남기고 건너뛰고, 준비된 것만 헤드리스 send2ue로 push한다
+**③ Unreal Push** — 시작 전에 구조 준비 검사를 수행한다:
+새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질 정체성, blend 존재+최신,
+wind JSON 존재, 언리얼 에디터 실행 여부를 확인한다. 텍스처는 입장 조건이 아니다.
+확정된 파일만 전달하고 부분·누락·불일치 후보는 비운 채 헤드리스 send2ue로 push한다
 (임포트 시 머티리얼 파이프라인이 wind JSON 연결까지 자동 수행 + 디스크 저장).
 headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
 안전하게 순차 실행한다. Blender 오브젝트 이름에 충돌 방지 숫자가 붙더라도 wind
@@ -282,6 +282,6 @@ phase 상태를 다시 해석하지 않는다.
 - `Cluster\branch_elm_01.spm` 같은 무접두사 레거시 입력은 한 번
   `SK_branch_elm_01.spm`으로 정규화한다. 이후 SPM/FBX/STMAT/JSON/Blend는 모두
   `SK_branch_elm_01` stem을 사용한다.
-- 원본에 선언된 텍스처 경로 또는 실제 FBX material slot이 완전하지 않아도, 검증된 raw Cluster 보존 계약이면 ② Blender 생성은 완료할 수 있다. 이때 보고서는 `handoff_preflight.status=source_review`, `source_review_required=true`, `unreal_push_ready=false`를 기록한다.
-- GUI 행은 이 상태를 `Blend 완료 · 원본 검토 필요 · Unreal Push 차단`으로 표시한다. Blend 열기와 경로 복사는 허용하지만 ③ Unreal Push 준비 목록에서는 제외한다.
-- `source_review`는 최신 receipt가 없거나 Blender Repair가 실패했다는 뜻이 아니다. 현재 원본의 결손을 그대로 보존했다는 뜻이며, 원본 SPM/TGA를 자동 수정하거나 이름을 바꾸지 않는다.
+- 원본에 선언된 텍스처 경로가 부분적이거나 전혀 없어도 ② Blender 생성과 ③ Unreal Push를 계속한다. 보고서의 texture availability는 진단 정보이며 `unreal_push_ready`를 바꾸지 않는다.
+- 안전하게 확인된 역할만 연결한다. 누락 후보는 비워 두고, 모호하거나 작업 범위를 벗어난 후보는 선택하지 않는다. 이 상태는 `source_review`나 자동 PCG 복구를 만들지 않는다.
+- 실제 FBX material slot 부재, 재질 ID/슬롯 모호성, 메시·버텍스 payload 오류 같은 비텍스처 구조 문제만 `source_review` 또는 `blocked`가 될 수 있다.

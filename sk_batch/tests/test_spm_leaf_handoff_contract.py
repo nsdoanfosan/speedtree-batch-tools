@@ -461,7 +461,7 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             self.assertEqual(contract["expected_visible_material_names"], ["M_leaf_real_01"])
             self.assertEqual(exported["status"], "missing_materials")
 
-    def test_stmat_declared_texture_sources_are_checked_before_blender(self):
+    def test_missing_declared_texture_source_is_nonblocking_availability(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_tree_texture_source.spm"
@@ -474,20 +474,18 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             os.utime(stmat, ns=(now + 1, now + 1))
 
             missing = inspect_speedtree_texture_sources(spm)
-            self.assertEqual(missing["status"], "missing_sources")
-            self.assertEqual(
-                missing["classification"],
-                "asset_texture_source_path_missing",
-            )
+            self.assertEqual(missing["status"], "ok")
+            self.assertEqual(missing["availability_status"], "textureless")
+            self.assertFalse(missing["affects_pipeline_outcome"])
             self.assertEqual(missing["missing_sources"][0]["map"], "Color")
-            self.assertIn("Relink", missing["remediation"])
 
             texture.parent.mkdir()
             texture.write_bytes(b"pixels")
             ready = inspect_speedtree_texture_sources(spm)
             self.assertEqual(ready["status"], "ok")
+            self.assertEqual(ready["availability_status"], "complete")
 
-    def test_textureless_stmat_material_remains_blocking(self):
+    def test_textureless_stmat_material_is_a_normal_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_reed_textureless_01.spm"
@@ -500,11 +498,9 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
 
             contract = inspect_speedtree_texture_sources(spm)
 
-            self.assertEqual(contract["status"], "missing_sources")
-            self.assertEqual(
-                contract["classification"],
-                "asset_texture_source_undeclared",
-            )
+            self.assertEqual(contract["status"], "ok")
+            self.assertEqual(contract["availability_status"], "textureless")
+            self.assertFalse(contract["affects_pipeline_outcome"])
             self.assertEqual(contract["source_count"], 0)
             self.assertEqual(
                 contract["missing_sources"][0]["material"],

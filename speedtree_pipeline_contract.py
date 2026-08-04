@@ -910,11 +910,11 @@ def _binding_summary(binding):
 
 def _texture_source_mode(binding):
     status = str((binding or {}).get("status") or "")
-    if status == "ok":
+    if status in {"ok", "partial"}:
         return "managed_texture_set"
     if status == "not_managed":
         return "preserve_declared_sources"
-    return "unresolved"
+    return "leave_unassigned"
 
 
 def build_stmat_material_intents(
@@ -1032,6 +1032,11 @@ def build_preflight_envelope(
         "instance_profile": normalized_profile,
         "tree_user_data": profile,
         "material_intents": material_intents,
+        "texture_admission": {
+            "mode": "runtime_tolerant",
+            "affects_outcome": False,
+            "state": str((texture_readiness or {}).get("status") or "unassigned"),
+        },
         "dynamic_wind": {
             "path": canonical_path(dynamic_wind_path(spm)),
             "rules": api.dynamic_wind_rules(),

@@ -684,7 +684,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                 "push_status_kind": "data_error",
                 "push_status_error": {
                     "kind": "data_error",
-                    "reason_code": "texture_set_incomplete",
+                    "reason_code": "generator_connection_contract_incomplete",
                     "message": "sanitized cluster failure",
                 },
             },
@@ -702,7 +702,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                 cluster_iid,
                 "data_error",
                 "sanitized cluster failure",
-                {"reason_code": "texture_set_incomplete"},
+                {"reason_code": "generator_connection_contract_incomplete"},
             )
         )
         consumer_details = {
@@ -735,7 +735,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         def evidence(iid, _repair_state=None, **_kwargs):
             if iid == cluster_iid:
                 return {
-                    "reason_code": "texture_set_incomplete",
+                    "reason_code": "generator_connection_contract_incomplete",
                     "canonical_spm": iid,
                 }
             return {
@@ -823,7 +823,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             "reason": "repair evidence",
         })
         app._failed_retry_durable_evidence = mock.Mock(return_value={
-            "reason_code": "texture_set_incomplete",
+            "reason_code": "generator_connection_contract_incomplete",
             "canonical_spm": str(missing),
         })
 
@@ -843,7 +843,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(entry["push_status_kind"], "automatic_repair_failed")
         self.assertIn(
-            "texture_set_incomplete",
+            "generator_connection_contract_incomplete",
             entry["push_status_error"]["reason_codes"],
         )
 
