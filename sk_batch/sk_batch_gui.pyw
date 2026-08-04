@@ -92,6 +92,14 @@ from repair_orchestration import (
     repair_ui_decision,
     stage_running_status,
 )
+from repair_failure_provenance import (
+    REPAIR_FAILURE_KEY,
+    build_repair_failure,
+    mark_fresh_reaudit_attempted,
+    needs_fresh_reaudit,
+    repair_failure_record,
+    root_reason_codes as repair_root_reason_codes,
+)
 from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
@@ -1114,6 +1122,31 @@ def cluster_contract_dependency_for_spm(contract, spm):
             if value and normalized_folder_key(value) == wanted:
                 return dependency
     return None
+
+
+def cluster_live_audit_target_block(contract, target_spm):
+    """Find the one provider whose live delivery explicitly blocks a target.
+
+    The normalization gate is handed its provider; the live-audit gate audits
+    an owner SPM and has to discover it.  Target-local isolation is unchanged:
+    only a provider that names this target in `delivery_blocked_targets`
+    qualifies, so a shared provider issue still fails closed (#16).
+    """
+    for dependency in (contract or {}).get("dependencies") or ():
+        if not isinstance(dependency, dict):
+            continue
+        for field in ("spm", "source_spm", "authoring_spm", "output_spm"):
+            producer = dependency.get(field)
+            if not producer:
+                continue
+            block = cluster_target_delivery_block(
+                contract,
+                target_spm,
+                producer,
+            )
+            if block:
+                return Path(str(producer)), block
+    return None, None
 
 
 def cluster_contract_issues(contract):
@@ -5402,6 +5435,65 @@ class App:
             ),
         }
 
+    def _recover_missing_root_reason(self, iid, evidence):
+        """Regenerate a lost root reason with exactly one fresh audit.
+
+        A row that carries only repair wrappers -- `automatic_repair_failed`
+        and friends -- records that a repair failed without recording what it
+        was for.  The operator action printed on such a row already says to
+        run a fresh audit and retry the real reason, so run it rather than
+        print it (#167).
+
+        The budget is one, durable, and spent *before* the audit runs: the
+        state this recovers from is exactly the state a crash leaves behind,
+        so an in-memory counter would reset into a loop.
+        """
+        if not needs_fresh_reaudit(evidence):
+            return evidence
+
+        # The evidence above decides whether a recovery is warranted; the
+        # state row holds the budget.  Keeping them separate matters because
+        # the wrapper can land on any status column, while the budget must be
+        # one per target no matter which column recorded the failure.
+        with self.state_lock:
+            entry = self.state.setdefault(str(iid), {})
+            record = repair_failure_record(entry)
+            if record.get("fresh_reaudit_attempted"):
+                return evidence
+            entry[REPAIR_FAILURE_KEY] = mark_fresh_reaudit_attempted(
+                {REPAIR_FAILURE_KEY: record} if record else {},
+                request_id=str(iid),
+            )[REPAIR_FAILURE_KEY]
+            save_state(self.state)
+
+        self.log(
+            "[복구 provenance] 원인 코드가 남지 않은 실패 행을 fresh audit으로 "
+            f"1회 재생성합니다 · {Path(iid).name}"
+        )
+        try:
+            fresh_state = self._failed_retry_repair_state(iid)
+        except Exception as exc:  # noqa: BLE001 - audit must not raise here
+            fresh_state = {
+                "current": False,
+                "push_ready": False,
+                "kind": "inspection_incomplete",
+                "reason": compact_error_message(exc, 240),
+            }
+
+        recovered = copy.deepcopy(evidence)
+        recovered["fresh_reaudit"] = {
+            "policy": "single_shot_root_reason_recovery_v1",
+            "repair_state": copy.deepcopy(fresh_state),
+        }
+        recovered[REPAIR_FAILURE_KEY] = mark_fresh_reaudit_attempted(
+            {REPAIR_FAILURE_KEY: evidence.get(REPAIR_FAILURE_KEY)}
+            if isinstance(evidence, dict)
+            else {},
+            request_id=str(iid),
+        )[REPAIR_FAILURE_KEY]
+        recovered["current_repair_state"] = copy.deepcopy(fresh_state)
+        return recovered
+
     def _set_failed_retry_automatic_status(
         self,
         iid,
@@ -6655,6 +6747,8 @@ class App:
                     entry_override=effective_entries[iid],
                     failure_record_verdicts=failure_record_verdicts[iid],
                 )
+            with planning_context.span("root_reason_recovery"):
+                evidence = self._recover_missing_root_reason(iid, evidence)
             planning_context.counters["durable_evidence_rows"] += 1
             planning_context.publish(
                 "durable_evidence",
@@ -8204,8 +8298,21 @@ class App:
             reason_token,
             evidence,
         )
-        automatic = decision["status"] == REPAIR_UI_AUTOMATIC
-        status_prefix = "자동 복구 대상" if automatic else "최종 차단"
+        # 자동 복구 대상 is a promise, so it may only appear before a repair
+        # runs.  By the time an exclusion is recorded the attempt has already
+        # been made, declined, or ruled out, and the row must say which (#160).
+        attempt = evidence.get("repair_attempt")
+        attempt_status = str(
+            (attempt or {}).get("status") or ""
+        ) if isinstance(attempt, dict) else ""
+        if attempt_status in {"failed", "repaired_but_reaudit_blocked"}:
+            status_prefix = "자동 복구 실패"
+        elif attempt_status:
+            status_prefix = "최종 차단"
+        elif decision["status"] == REPAIR_UI_AUTOMATIC:
+            status_prefix = "복구 계획됨"
+        else:
+            status_prefix = "최종 차단"
         self._record_phase_status(
             iid,
             "blend_status",
@@ -10909,6 +11016,14 @@ class App:
                 report=copy.deepcopy(failure_report),
             )
         key = os.path.normcase(os.path.abspath(str(spm))).casefold()
+        # Known before any stage runs, and the only thing on this path that
+        # says what the repair was for.  The failure branch below has to carry
+        # it onto the durable row; the cached path never reaches the block
+        # that used to compute it.
+        root_reason_codes = sorted(set(
+            evidence_reason_codes(failure_report)
+            or ["atlas_manifest_mirror_conflict_repairable"]
+        ))
         with _INLINE_ATLAS_REPAIR_LOCK:
             memo = self.__dict__.setdefault("_inline_atlas_repair_results", {})
             cached = memo.get(key)
@@ -10950,10 +11065,7 @@ class App:
                     or active_job.get("shared_queue_job_id")
                     or f"sk-batch-{active_job.get('id') or 'direct'}"
                 )
-                reason_codes = sorted(set(
-                    evidence_reason_codes(failure_report)
-                    or ["atlas_manifest_mirror_conflict_repairable"]
-                ))
+                reason_codes = list(root_reason_codes)
                 request = build_exact_target_request(
                     tool=PCG_TEXTURE_TOOL,
                     repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
@@ -11017,6 +11129,16 @@ class App:
                     kind="automatic_repair_failed",
                     report={
                         "repair_disposition": REPAIR_UI_BLOCKED,
+                        "reason_codes": list(root_reason_codes),
+                        REPAIR_FAILURE_KEY: build_repair_failure(
+                            request_id=str(terminal.get("request_id") or ""),
+                            root_reason_codes=root_reason_codes,
+                            planned_actions=[ATLAS_MANIFEST_MIRROR_REPAIR],
+                            failed_stage="atlas_manifest_repair",
+                            failure_code="automatic_repair_failed",
+                            failure_report=str(terminal.get("receipt") or ""),
+                            error=compact_error_message(raw_error, 320),
+                        ),
                         "original_failure": copy.deepcopy(failure_report),
                         "exact_repair_receipt": copy.deepcopy(terminal),
                     },
@@ -11973,6 +12095,32 @@ class App:
                             report={
                                 "stage": "cluster_assembly_live_audit",
                                 "repair_disposition": REPAIR_UI_BLOCKED,
+                                "reason_codes": list(
+                                    repair_root_reason_codes(
+                                        repair_request.report
+                                    )
+                                ),
+                                REPAIR_FAILURE_KEY: build_repair_failure(
+                                    root_reason_codes=(
+                                        repair_root_reason_codes(
+                                            repair_request.report
+                                        )
+                                    ),
+                                    planned_actions=[
+                                        ATLAS_MANIFEST_MIRROR_REPAIR
+                                    ],
+                                    failed_stage="atlas_manifest_repair",
+                                    failure_code=(
+                                        "automatic_repair_reaudit_failed"
+                                    ),
+                                    failure_report=str(
+                                        repeated.report_file or ""
+                                    ),
+                                    error=(
+                                        "same Atlas manifest conflict after "
+                                        "the exact mirror repair"
+                                    ),
+                                ),
                                 "first_failure": copy.deepcopy(
                                     repair_request.report
                                 ),
@@ -12350,6 +12498,9 @@ class App:
                         if decision["status"] == REPAIR_UI_AUTOMATIC
                         else "최종 차단"
                     )
+                    audit_root_codes = repair_root_reason_codes(
+                        failure_report
+                    )
                     raise BatchItemError(
                         f"{status_prefix}: Cluster Assembly live audit · "
                         f"원인: {decision['reason']} · 조치: {decision['action']}",
@@ -12363,6 +12514,13 @@ class App:
                             "repair_disposition": decision["status"],
                             "reason_ko": decision["reason"],
                             "action_ko": decision["action"],
+                            "reason_codes": list(audit_root_codes),
+                            REPAIR_FAILURE_KEY: build_repair_failure(
+                                root_reason_codes=audit_root_codes,
+                                failed_stage="cluster_assembly_live_audit",
+                                failure_code=failure_token,
+                                failure_report=str(audit_report or ""),
+                            ),
                             **failure_report,
                         },
                         log_file=log_file,
@@ -12481,13 +12639,63 @@ class App:
 
         if actual_failure:
             decision = repair_ui_decision({"issues": live_issues})
-            status_prefix = (
-                "자동 복구 대상"
-                if decision["status"] == REPAIR_UI_AUTOMATIC
-                else "최종 차단"
+            # This gate used to print 자동 복구 대상 and then terminate the
+            # target without ever consulting the planner (#160).  A block the
+            # registry can act on now leaves through the same typed exclusion
+            # the repair path admits; everything else stays terminal.
+            selected = raw_audit.get("selected_contract")
+            if not isinstance(selected, dict):
+                try:
+                    from cluster_assembly_handoff_contract import (
+                        select_cluster_contract,
+                    )
+                    selected = select_cluster_contract(payload, spm)
+                except (ImportError, ValueError):
+                    selected = None
+            audit_producer, audit_block = cluster_live_audit_target_block(
+                selected if isinstance(selected, dict) else {},
+                spm,
             )
+            if (
+                audit_block
+                and audit_producer is not None
+                and has_repair_contract_evidence({"issues": live_issues})
+            ):
+                evidence = {
+                    "audit_report": str(audit_report),
+                    "target_spm": audit_block["target_spm"],
+                    "target_name": audit_block["target_name"],
+                    "delivery_mode": audit_block["delivery_mode"],
+                    "delivery_errors": audit_block["delivery_errors"],
+                    "delivery_remedy": audit_block["delivery_remedy"],
+                    "stale_node_table_target_mesh_ids": audit_block[
+                        "stale_node_table_target_mesh_ids"
+                    ],
+                    "live_node_table": audit_block["live_node_table"],
+                    "issue_codes": sorted({
+                        str(issue.get("code") or "")
+                        for issue in live_issues
+                        if isinstance(issue, dict) and issue.get("code")
+                    }),
+                    "issues": copy.deepcopy(live_issues),
+                    "gate": "cluster_assembly_live_audit",
+                }
+                raise TargetPlannedExclusionError(
+                    "현재 Cluster Assembly 전달이 차단됨: "
+                    + target_planned_exclusion_summary(
+                        spm,
+                        audit_block["reason_token"],
+                        evidence,
+                    ),
+                    reason_token=audit_block["reason_token"],
+                    target_spm=spm,
+                    producer_spm=audit_producer,
+                    evidence=evidence,
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
             raise BatchItemError(
-                f"{status_prefix}: {spm.name} Cluster Assembly 데이터 검사 · "
+                f"최종 차단: {spm.name} Cluster Assembly 데이터 검사 · "
                 f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
                 report={
@@ -12719,14 +12927,20 @@ class App:
                 for issue in blocking
                 if isinstance(issue, dict)
             }
+            # Admission is the registry's call, not a per-gate allowlist.
+            # The old `blocking_codes <= {two codes}` guard meant every new
+            # repairable reason -- canonical_bark_normalization_required,
+            # normalized_variants_required, normalized_variants_stale --
+            # printed 자동 복구 대상 and then terminated the target, because
+            # nobody remembered to widen this set (#160).
+            # `not global_issues` stays: target-local isolation (#16).
+            # Disposition authority stays with build_exact_target_repair_plan(),
+            # which returns unsupported for anything it cannot act on, and the
+            # exclusion then propagates as a visible planned exclusion.
             if (
                 target_block
                 and not global_issues
-                and blocking_codes
-                <= {
-                    "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
-                    "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
-                }
+                and has_repair_contract_evidence({"issues": blocking})
             ):
                 reason_token = target_block["reason_token"]
                 evidence = {
@@ -12769,13 +12983,11 @@ class App:
             summary = cluster_issue_summary(blocking)
             stage = "출력" if require_normalized else "입력"
             decision = repair_ui_decision({"issues": blocking})
-            status_prefix = (
-                "자동 복구 대상"
-                if decision["status"] == REPAIR_UI_AUTOMATIC
-                else "최종 차단"
-            )
+            # Reaching here means no repair will run for this row, so it may
+            # not claim one is coming.  A row cannot be labelled 자동 복구 대상
+            # and be terminal at the same time (#160).
             raise BatchItemError(
-                f"{status_prefix}: {target.name} Cluster 정규화 {stage} 검사 · "
+                f"최종 차단: {target.name} Cluster 정규화 {stage} 검사 · "
                 f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
                 report={
@@ -12855,6 +13067,7 @@ class App:
         producer_spm,
         *,
         require_normalized,
+        reaudit=None,
     ):
         """Run a relation gate's registered repair under its current lease.
 
@@ -12984,6 +13197,11 @@ class App:
                 "reason_codes": list(plan.get("reason_codes") or ()),
                 "reason_ko": repair_plan.friendly_reason,
                 "action_ko": repair_plan.remaining_action,
+                REPAIR_FAILURE_KEY: build_repair_failure(
+                    request_id=request_id,
+                    plan_metadata=plan,
+                    failure_code="registered_reason_has_no_exact_action",
+                ),
             })
             return None
 
@@ -13021,14 +13239,22 @@ class App:
                 },
             )
 
+        def observe_fresh():
+            # The live-audit gate re-resolves a receipt, not a normalization
+            # observation.  Both admit repair through this one executor, so
+            # the caller supplies the shape its own gate returns (#160).
+            if reaudit is not None:
+                return reaudit()
+            return self._cluster_normalization_stage_observation(
+                target,
+                f"{stamp}_registered_repair_reaudit",
+                producer,
+                require_normalized=require_normalized,
+            )
+
         def fresh_reaudit(attempted_stages):
             try:
-                return self._cluster_normalization_stage_observation(
-                    target,
-                    f"{stamp}_registered_repair_reaudit",
-                    producer,
-                    require_normalized=require_normalized,
-                )
+                return observe_fresh()
             except TargetPlannedExclusionError as fresh_exclusion:
                 fresh_attempt = {
                     "status": "repaired_but_reaudit_blocked",
@@ -13172,17 +13398,28 @@ class App:
                             kind="owner_lost",
                             report=owner_lost,
                         )
+                    raw_error = compact_error_message(
+                        terminal.get("error")
+                        or (terminal.get("result") or {}).get("reason")
+                        or "exact BAT repair failed",
+                        320,
+                    )
                     failed = {
                         "status": "failed",
                         "reason_token": "exact_relation_repair_failed",
                         "request_id": request_id,
                         "reason_codes": list(plan.get("reason_codes") or ()),
                         "attempted_stages": copy.deepcopy(attempted),
-                        "error": compact_error_message(
-                            terminal.get("error")
-                            or (terminal.get("result") or {}).get("reason")
-                            or "exact BAT repair failed",
-                            320,
+                        "error": raw_error,
+                        # Survives the process; the memo above does not (#167).
+                        REPAIR_FAILURE_KEY: build_repair_failure(
+                            request_id=request_id,
+                            plan_metadata=plan,
+                            attempted_stages=attempted,
+                            failed_stage=stage["stage"],
+                            failure_code="exact_relation_repair_failed",
+                            failure_report=str(receipt),
+                            error=raw_error,
                         ),
                     }
                     memo[request_id] = copy.deepcopy(failed)
@@ -13203,6 +13440,49 @@ class App:
             if modeler_live_resolution is not None:
                 return modeler_live_resolution
             return fresh_reaudit(attempted)
+
+    def _cluster_receipt_with_recovery(self, spm, stamp):
+        """Resolve one owner receipt, repairing a registered target block.
+
+        The direct Cluster Assembly run reached the live-audit gate with no
+        repair frame at all: the row said 자동 복구 대상 and the target died
+        (#160).  It now uses the same admission, executor and lease the
+        normalization gate uses, and re-resolves the receipt afterwards.
+        """
+        try:
+            return self._refresh_stale_cluster_receipt(spm, stamp)
+        except TargetPlannedExclusionError as exc:
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Cluster Assembly 검사가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(spm),
+                    },
+                )
+            recovered = self._attempt_registered_relation_repair(
+                exc,
+                stamp,
+                exc.producer_spm,
+                require_normalized=True,
+                reaudit=lambda: self._refresh_stale_cluster_receipt(
+                    spm,
+                    f"{stamp}_after_registered_repair",
+                ),
+            )
+            if recovered is not None:
+                return recovered
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Cluster Assembly 자동 복구가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(spm),
+                    },
+                )
+            raise
 
     def _cluster_normalization_stage_with_recovery(
         self,
@@ -13668,7 +13948,7 @@ class App:
             nonlocal cluster_receipt_resolution, cluster_receipt_resolved
             if not cluster_receipt_resolved:
                 cluster_receipt_resolution = (
-                    self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
+                    self._cluster_receipt_with_recovery(speedtree_spm, stamp)
                 )
                 cluster_receipt_resolved = True
             return cluster_receipt_resolution
