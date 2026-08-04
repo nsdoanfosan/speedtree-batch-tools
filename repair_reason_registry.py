@@ -153,6 +153,22 @@ POLICY_CONTRACTS = {
         evidence_failure_cause="Atlas mirror 복구 가능성을 증명하는 exact authority 계획이 없습니다.",
         evidence_failure_action="fresh Atlas manifest resolution으로 authority와 stale mirror 범위를 다시 확정하세요.",
     ),
+    "atlas_manifest_canonical_name": _automatic(
+        ATLAS_MANIFEST_MIRROR_REPAIR_ACTION,
+        (EXACT_INVENTORY_SPM, ATLAS_MIRROR_REPAIR_PLAN),
+        "Atlas 영수증이 Cluster 출력의 legacy 이름으로만 존재해, "
+        "canonical 이름으로 찾는 Push 검사가 이를 보지 못합니다.",
+        "exact BAT가 선택된 영수증을 canonical 이름으로 그대로 복제한 뒤 "
+        "Atlas 계약을 다시 검사합니다.",
+        evidence_failure_cause=(
+            "canonical 이름 복제의 근거가 되는 Cluster pair 정규화 영수증을 "
+            "증명하지 못했습니다."
+        ),
+        evidence_failure_action=(
+            "cluster_spm_pair 영수증을 다시 생성해 canonical/legacy 동일성을 "
+            "증명한 뒤 다시 검사하세요."
+        ),
+    ),
     "generator": _automatic(
         GENERATOR_SYNC_ACTION,
         (EXACT_INVENTORY_SPM,),
@@ -475,6 +491,13 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "atlas_manifest_mirror_conflict_repairable": ReasonRow(
         REPAIRABLE, "atlas_manifest_resolver.py", "atlas_manifest",
+    ),
+    # The records resolve, but only under the Cluster output's legacy name.
+    # Every reader that looks a manifest up by the canonical file's own stem
+    # -- the Blender push gate first -- still misses, so completing the rename
+    # is exactly the same bounded mirror write.
+    "atlas_manifest_canonical_name_missing": ReasonRow(
+        REPAIRABLE, "atlas_manifest_resolver.py", "atlas_manifest_canonical_name",
     ),
     "atlas_manifest_ownership_conflict": ReasonRow(
         UNSUPPORTED, "atlas_manifest_resolver.py", "atlas_ownership",
