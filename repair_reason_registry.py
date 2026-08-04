@@ -347,6 +347,16 @@ POLICY_CONTRACTS = {
         "Atlas manifest의 명시적 schema version이 손상되었거나 지원 범위를 벗어났습니다.",
         "지원되는 producer로 manifest를 다시 생성하고 기존 unknown-schema 파일은 보존하여 검토하세요.",
     ),
+    # Losing the reason a repair was built for is a bookkeeping failure, not
+    # data damage.  `fatal` is reserved for damage automatic recovery would
+    # hide; spending it here sent nine targets to a state no automatic path
+    # may touch, for a defect in our own receipts (#167).  The single fresh
+    # re-audit that regenerates the reason runs first, so a row that still
+    # reaches an operator has already exhausted the automatic answer.
+    "dependency_provenance": _terminal(
+        "이전 자동 복구가 실패했고, fresh audit 1회로도 구체 원인을 다시 찾지 못했습니다.",
+        "해당 대상만 목록에서 다시 검사해 현재 blocker를 새로 생성한 뒤, 그 원인으로 재시도하세요.",
+    ),
     "generic_terminal": _terminal(
         "등록된 자동 BAT가 이 blocker를 안전하게 복구할 수 없습니다.",
         "registry owner가 표시한 audit evidence를 확인하고 원본 authoring 또는 실행 환경을 수정한 뒤 재검사하세요.",
@@ -414,7 +424,7 @@ POLICY_CONTRACTS = {
 # tables that can drift from the disposition.
 for _policy_name in (
     "asset_missing", "atlas_integrity", "cluster_identity",
-    "cluster_integrity", "dependency_provenance", "material_contract",
+    "cluster_integrity", "material_contract",
     "pipeline_contract", "blender_cluster_bake", "cluster_authoring",
     "export_hierarchy", "export_inspection", "exporter_process",
     "lifecycle_owner_lost", "process_lifecycle", "receipt_persistence",
@@ -769,7 +779,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "current_authority_variant",
     ),
     "dependency_root_reason_missing": ReasonRow(
-        FATAL, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
+        UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
     ),
     "dependency_output_missing": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_artifact",
