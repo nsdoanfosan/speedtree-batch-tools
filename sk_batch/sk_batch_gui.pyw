@@ -1017,17 +1017,6 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         outcome="ok",
         texture_readiness=texture_readiness,
     )
-    unresolved_materials = [
-        str(intent.get("material_name") or "<unnamed>")
-        for intent in migrated_envelope.get("material_intents") or []
-        if str(intent.get("texture_source_mode") or "") == "unresolved"
-    ]
-    if unresolved_materials:
-        raise ValueError(
-            "legacy Repair report cannot prove material texture bindings; "
-            "run Blender Repair again: "
-            + ", ".join(unresolved_materials)
-        )
     migrated["speedtree_pipeline_contract"] = migrated_envelope
     migrated["speedtree_pipeline_contract_required"] = True
     migrated["report_contract_migration"] = {
@@ -10725,63 +10714,6 @@ class App:
                 )
             return False, f"텍스처 정규화 보고서 오류: {exc}"
         normalization = report.get("texture_normalization") or {}
-        missing = list(normalization.get("missing", []))
-        def recorded_file_missing(value):
-            try:
-                candidate = Path(value) if value else None
-                return not candidate or not candidate.is_file() or candidate.stat().st_size <= 0
-            except OSError:
-                return True
-
-        # A report can outlive one of its local T_ files. Re-check recorded
-        # paths cheaply so deletion/OneDrive placeholders cannot pass on a
-        # stale "ok" label. Preserved Cluster rows carry their own source-file
-        # map and are validated the same way.
-        for material in normalization.get("materials", []):
-            material_status = str(material.get("status") or "")
-            if material_status not in {
-                "ok",
-                "preserved_cluster",
-                "needs_pcg_generation",
-            }:
-                continue
-            files = (
-                material.get("files")
-                or material.get("preserved_files")
-                or material.get("source_maps")
-                or material.get("source_paths")
-                or {}
-            )
-            missing_roles = [
-                role for role, value in files.items()
-                if recorded_file_missing(value)
-            ]
-            if material_status == "needs_pcg_generation" and not files:
-                missing_roles = list(material.get("source_roles") or ["source"])
-            if missing_roles:
-                missing.append(
-                    {
-                        "material": material.get("material", "?"),
-                        "expected_texture_base": (
-                            material.get("texture_base")
-                            or material.get("expected_texture_base")
-                            or "보존 Cluster"
-                        ),
-                        "missing_roles": missing_roles,
-                    }
-                )
-        if missing:
-            details = []
-            for item in missing:
-                roles = ",".join(item.get("missing_roles", [])) or "대응 세트"
-                details.append(
-                    f"{item.get('material', '?')}→"
-                    f"{item.get('expected_texture_base', 'T_?')}[{roles}]"
-                )
-            return False, (
-                "텍스처 준비 안 됨: " + " | ".join(details)
-                + " → PCG ③ 또는 ② Repair 확인"
-            )
         normalization_status = str(normalization.get("status") or "")
         fallback_rows = [
             material
@@ -10799,42 +10731,45 @@ class App:
                 for material in fallback_rows
             )
         )
-        if (
-            normalization_status not in {"ok", "preserved_cluster"}
-            and not source_fallback_ready
-        ):
-            return False, "텍스처 정규화 미완료 → ② 필요"
         handoff = report.get("handoff_preflight")
         if not isinstance(handoff, dict):
             return False, "② 사전검사 정보 없음 → ② Blender Repair 다시 실행"
-        if handoff.get("status") != "ok":
-            slots = handoff.get("empty_material_slots") or []
-            outputs = handoff.get("missing_outputs") or []
-            materials = (
-                handoff.get("missing_materials")
-                or (handoff.get("material_export") or {}).get("missing_materials")
-                or []
-            )
-            vertex_contract = handoff.get("vertex_color_contract") or {}
-            payload_contract = handoff.get("vertex_payload_contract") or {}
-            reasons = []
-            if slots:
-                reasons.append(
-                    "머티리얼 빈 슬롯 "
-                    + ", ".join(
-                        f"{item.get('object', '?')}[{item.get('slot', '?')}]"
-                        for item in slots
-                    )
+        slots = handoff.get("empty_material_slots") or []
+        outputs = handoff.get("missing_outputs") or []
+        materials = (
+            handoff.get("missing_materials")
+            or (handoff.get("material_export") or {}).get("missing_materials")
+            or []
+        )
+        collections = handoff.get("export_collection_issues") or []
+        vertex_contract = handoff.get("vertex_color_contract") or {}
+        payload_contract = handoff.get("vertex_payload_contract") or {}
+        leaf_contract = handoff.get("leaf_reference_contract") or {}
+        reasons = []
+        if slots:
+            reasons.append(
+                "머티리얼 빈 슬롯 "
+                + ", ".join(
+                    f"{item.get('object', '?')}[{item.get('slot', '?')}]"
+                    for item in slots
                 )
-            if outputs:
-                reasons.append("핸드오프 파일 누락 " + ", ".join(map(str, outputs)))
-            if materials:
-                reasons.append("SpeedTree export 재질 누락 " + ", ".join(materials))
-            if vertex_contract.get("status") == "blocked":
-                reasons.append("버텍스 컬러 검사 실패")
-            if payload_contract.get("status") == "blocked":
-                reasons.append("AO/Nanite UV payload 검사 실패")
-            return False, "② 사전검사 차단: " + (" | ".join(reasons) or "보고서 확인")
+            )
+        if outputs:
+            reasons.append("핸드오프 파일 누락 " + ", ".join(map(str, outputs)))
+        if materials:
+            reasons.append("SpeedTree export 재질 누락 " + ", ".join(materials))
+        if collections:
+            reasons.append("Export collection 오류 " + ", ".join(map(str, collections)))
+        if vertex_contract.get("status") == "blocked":
+            reasons.append("버텍스 컬러 검사 실패")
+        if payload_contract.get("status") == "blocked":
+            reasons.append("AO/Nanite UV payload 검사 실패")
+        if leaf_contract.get("status") in {"blocked", "replacement_needed"}:
+            reasons.append("SPM leaf 참조 실패")
+        if reasons:
+            return False, "② 사전검사 차단: " + " | ".join(reasons)
+        if handoff.get("status") not in {"ok", "source_review", "blocked"}:
+            return False, "② 사전검사 미완료 → Blender Repair 다시 실행"
         preserved_count = sum(
             1 for item in normalization.get("materials", [])
             if item.get("status") == "preserved_cluster"
@@ -10847,7 +10782,7 @@ class App:
                 "canonical T_* 미생성 "
                 f"{len(fallback_rows)}세트"
             )
-        return True, "텍스처 정규화 완료"
+        return True, "머티리얼 준비 완료 · 텍스처 선택 연결"
 
     @staticmethod
     def _blend_status_from_repair_state(state):

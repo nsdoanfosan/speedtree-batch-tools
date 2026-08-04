@@ -446,16 +446,74 @@ class BarkNormalizationTests(unittest.TestCase):
                 self.root / "different-root",
             )
 
-    def test_rejects_canonical_texture_copy_with_different_bytes(self):
+    def test_omits_canonical_texture_copy_with_different_bytes(self):
         (self.copy_root / "texture" / "T_bark_elm_01_color.tga").write_bytes(
             b"not-canonical")
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "texture hash mismatch"):
-            build_isolated_bark_normalization_plan(
-                self.contract,
-                {str(self.cluster): str(self.cluster_copy)},
-                self.isolation,
-            )
+        plan = build_isolated_bark_normalization_plan(
+            self.contract,
+            {str(self.cluster): str(self.cluster_copy)},
+            self.isolation,
+        )
+        report = apply_isolated_bark_normalization(plan)
+
+        self.assertEqual(plan["patches"][0]["texture_availability"], "partial")
+        self.assertEqual(
+            plan["patches"][0]["omitted_textures"][0]["reason"],
+            "content_mismatch",
+        )
+        refs = extract_material_image_refs(self.cluster_copy)[0]["refs"]
+        self.assertEqual(
+            {Path(value).name for value in refs},
+            {"T_bark_elm_01_normal.tga"},
+        )
+        self.assertEqual(report["status"], "normalized")
+
+    def test_textureless_canonical_material_still_normalizes(self):
+        for name in (
+            "T_bark_elm_01_color.tga",
+            "T_bark_elm_01_normal.tga",
+        ):
+            (self.original / "texture" / name).unlink()
+            (self.copy_root / "texture" / name).unlink()
+
+        plan = build_isolated_bark_normalization_plan(
+            self.contract,
+            {str(self.cluster): str(self.cluster_copy)},
+            self.isolation,
+        )
+        report = apply_isolated_bark_normalization(plan)
+
+        self.assertEqual(
+            plan["patches"][0]["texture_availability"],
+            "textureless",
+        )
+        self.assertEqual(
+            extract_material_image_refs(self.cluster_copy)[0]["refs"],
+            [],
+        )
+        self.assertEqual(report["status"], "normalized")
+
+    def test_canonical_material_without_map_blocks_still_normalizes(self):
+        write_spm(
+            self.canonical,
+            "M_Bark_elm_01",
+            (),
+        )
+
+        plan = build_isolated_bark_normalization_plan(
+            self.contract,
+            {str(self.cluster): str(self.cluster_copy)},
+            self.isolation,
+        )
+        report = apply_isolated_bark_normalization(plan)
+
+        row = extract_material_image_refs(self.cluster_copy)[0]
+        self.assertEqual(row["material_name"], "M_bark_elm_01")
+        self.assertEqual(row["refs"], [])
+        self.assertEqual(
+            report["outputs"][0]["texture_availability"],
+            "textureless",
+        )
 
     def test_plan_does_not_write(self):
         before = sha256(self.cluster_copy)
@@ -526,6 +584,32 @@ class BarkNormalizationTests(unittest.TestCase):
         self.assertEqual(
             result["status"], "ready_for_downstream_blender_mapping"
         )
+
+    def test_export_bundle_allows_a_textureless_material(self):
+        _plan, report = self.normalize()
+        report["outputs"][0]["canonical_textures"] = []
+        export = self.root / "export"
+        export.mkdir()
+        fbx = export / "branch_elm_01.fbx"
+        stmat = export / "branch_elm_01.stmat"
+        xml = export / "branch_elm_01.xml"
+        write_ascii_fbx(fbx)
+        write_export_xml(stmat, maps=())
+        write_export_xml(xml, maps=())
+
+        result = validate_canonical_bark_export_bundle(
+            fbx,
+            stmat,
+            xml,
+            report,
+        )
+
+        self.assertEqual(
+            result["status"],
+            "ready_for_downstream_blender_mapping",
+        )
+        self.assertEqual(result["texture_availability"], "textureless")
+        self.assertFalse(result["texture_set_propagated"])
 
     def test_export_bundle_accepts_willow_branch_alias_receipts(self):
         for stem in (
@@ -603,7 +687,7 @@ class BarkNormalizationTests(unittest.TestCase):
                 BarkNormalizationError, "undeclared canonical bark alias"):
             validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
 
-    def test_export_bundle_rejects_source_role_outside_receipt(self):
+    def test_export_bundle_omits_source_role_outside_receipt(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -618,11 +702,14 @@ class BarkNormalizationTests(unittest.TestCase):
             )
             metadata.write_text(payload, encoding="utf-8")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "outside the normalization receipt"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(
+            result["status"], "ready_for_downstream_blender_mapping"
+        )
 
-    def test_export_bundle_rejects_wrong_receipt_role(self):
+    def test_export_bundle_omits_wrong_receipt_role(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -636,11 +723,12 @@ class BarkNormalizationTests(unittest.TestCase):
             )
             metadata.write_text(payload, encoding="utf-8")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "does not match its receipt path"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
-    def test_export_bundle_rejects_stmat_xml_source_role_drift(self):
+    def test_export_bundle_omits_stmat_xml_source_role_drift(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -651,11 +739,12 @@ class BarkNormalizationTests(unittest.TestCase):
         payload = xml.read_text(encoding="utf-8").replace(height, "")
         xml.write_text(payload, encoding="utf-8")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "STMat/XML.*does not match"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
-    def test_export_bundle_rejects_wrong_receipt_path(self):
+    def test_export_bundle_omits_wrong_receipt_path(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -672,11 +761,12 @@ class BarkNormalizationTests(unittest.TestCase):
             )
             metadata.write_text(payload, encoding="utf-8")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "does not match its receipt path"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
-    def test_export_bundle_rejects_changed_receipt_texture_content(self):
+    def test_export_bundle_omits_changed_receipt_texture_content(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -685,11 +775,12 @@ class BarkNormalizationTests(unittest.TestCase):
         )
         textures["color"].write_bytes(b"changed-after-receipt")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "texture hash changed"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
-    def test_export_bundle_rejects_wrong_receipt_hash(self):
+    def test_export_bundle_omits_wrong_receipt_hash(self):
         fbx, stmat, xml, report, _textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -698,11 +789,12 @@ class BarkNormalizationTests(unittest.TestCase):
         )
         report["outputs"][0]["canonical_textures"][0]["sha256"] = "0" * 64
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "texture hash changed"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
-    def test_export_bundle_rejects_wrong_texture_family(self):
+    def test_export_bundle_omits_wrong_texture_family(self):
         fbx, stmat, xml, report, textures = (
             self.preserved_alias_export_bundle(
                 "weeping_willow",
@@ -720,9 +812,10 @@ class BarkNormalizationTests(unittest.TestCase):
             )
             metadata.write_text(payload, encoding="utf-8")
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "does not match its receipt path"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "partial")
 
     def test_export_bundle_fails_closed_on_unbound_material(self):
         _plan, report = self.normalize()
@@ -768,7 +861,7 @@ class BarkNormalizationTests(unittest.TestCase):
                 BarkNormalizationError, "not connected to a mesh"):
             validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
 
-    def test_export_bundle_fails_closed_on_stale_stmat_texture(self):
+    def test_export_bundle_omits_stale_stmat_texture(self):
         _plan, report = self.normalize()
         export = self.root / "export"
         export.mkdir()
@@ -779,9 +872,10 @@ class BarkNormalizationTests(unittest.TestCase):
         write_export_xml(stmat, textures=("Nothofagus_bark.tga",))
         write_export_xml(xml)
 
-        with self.assertRaisesRegex(
-                BarkNormalizationError, "does not match its receipt path"):
-            validate_canonical_bark_export_bundle(fbx, stmat, xml, report)
+        result = validate_canonical_bark_export_bundle(
+            fbx, stmat, xml, report
+        )
+        self.assertEqual(result["texture_availability"], "textureless")
 
     @unittest.skipUnless(
         REAL_CANONICAL_SPM.is_file()

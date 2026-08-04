@@ -446,6 +446,7 @@ for _policy_name in (
     "relation_decision_diagnostic", "lifecycle_event",
     "cluster_handoff_diagnostic", "prepared_unused", "audit_detail",
     "dependency_lifecycle", "generator_reference_mutation",
+    "texture_availability",
 ):
     POLICY_CONTRACTS.setdefault(_policy_name, _informational())
 
@@ -1306,12 +1307,13 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNCLASSIFIED, "spm_generator_sync/process_stream.py", "",
     ),
     "texture_ref_not_found": ReasonRow(
-        UNSUPPORTED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "cluster_data",
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "texture_availability",
     ),
     "texture_set_incomplete": ReasonRow(
-        REPAIRABLE, "sk_batch/jobs/speedtree_material_preflight.py",
-        "pcg_texture",
+        INFORMATIONAL, "sk_batch/jobs/speedtree_material_preflight.py",
+        "texture_availability",
     ),
     "timeout": ReasonRow(
         UNCLASSIFIED, "process_lifecycle.py", "",
@@ -1373,10 +1375,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "failure_wrapper",
     ),
     "blender_cluster_bake_output_missing": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py", "blender_cluster_bake",
+        INFORMATIONAL, "speedtree_texture_contract.py", "texture_availability",
     ),
     "blender_cluster_bake_uses_derived_cache": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py", "blender_cluster_bake",
+        INFORMATIONAL, "speedtree_texture_contract.py", "texture_availability",
     ),
     "blender_output_not_current": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
@@ -1385,26 +1387,26 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "speedtree_texture_contract.py", "current_texture_output",
     ),
     "canonical_output_missing": ReasonRow(
-        REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
+        INFORMATIONAL, "speedtree_texture_contract.py", "texture_availability",
     ),
     "canonical_output_must_be_manifest_relative": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py",
-        "texture_authoring",
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
     ),
     "canonical_output_outside_texture_root": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py",
-        "texture_scope_integrity",
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
     ),
     "canonical_output_role_mismatch": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py",
-        "texture_authoring",
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
     ),
     "canonical_output_role_undeclared": ReasonRow(
-        UNSUPPORTED, "speedtree_texture_contract.py",
-        "texture_authoring",
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
     ),
     "canonical_output_uses_derived_cache": ReasonRow(
-        REPAIRABLE, "speedtree_texture_contract.py", "pcg_texture",
+        INFORMATIONAL, "speedtree_texture_contract.py", "texture_availability",
     ),
     "coherent_operational_mirror": ReasonRow(
         INFORMATIONAL, "atlas_manifest_resolver.py", "current_atlas_authority",
@@ -1630,7 +1632,104 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
     ),
     "texture_source_fallback_needs_pcg_generation": ReasonRow(
-        REPAIRABLE, "sk_batch/jobs/speedtree_material_preflight.py", "pcg_texture",
+        INFORMATIONAL, "sk_batch/jobs/speedtree_material_preflight.py",
+        "texture_availability",
+    ),
+    "candidate_ambiguous": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "candidate_unavailable": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "canonical_material_has_no_maps": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "canonical_source_unavailable": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "content_mismatch": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "copied_candidate_unavailable": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "declared_and_live_candidates_disagree": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "destination_outside_isolation": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "destination_unavailable": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "isolated_copy_missing": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "manifest_unavailable": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "missing": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "partial": ReasonRow(
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
+    ),
+    "role_unknown": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "same_authority_candidates_disagree": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "source_missing": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "texture_base_ambiguous": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "texture_unreadable": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
+    ),
+    "textureless": ReasonRow(
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
+    ),
+    "unassigned": ReasonRow(
+        INFORMATIONAL, "speedtree_texture_contract.py",
+        "texture_availability",
+    ),
+    "unreadable": ReasonRow(
+        INFORMATIONAL, "cluster_bark_source_resolution.py",
+        "texture_availability",
+    ),
+    "write_verification_mismatch": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_bark_normalization.py",
+        "texture_availability",
     ),
     "unreal_dependency_requires_rebuild": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
@@ -1882,12 +1981,10 @@ _classify(
     "recovery_target_material_scope_missing",
     "sealed_policy_has_no_required_live_targets",
 )
-_classify(
-    REPAIRABLE, "pcg_texture", "output_set_incomplete",
-)
+_classify(INFORMATIONAL, "texture_availability", "output_set_incomplete")
 _classify(UNSUPPORTED, "output_identity", "output_identity_missing")
 _classify(
-    UNSUPPORTED, "manual_asset_reference",
+    INFORMATIONAL, "texture_availability",
     "asset_texture_source_path_missing", "asset_texture_source_undeclared",
 )
 _classify(
@@ -1919,26 +2016,18 @@ _classify(
 # safely regenerate outputs from the inventory target.  Unknown roles remain
 # manual authoring; malformed/scope-invalid manifests fail as data integrity.
 _classify(
-    REPAIRABLE, "pcg_texture",
+    INFORMATIONAL, "texture_availability",
     "canonical_output_has_no_material_targets", "canonical_output_manifest_empty",
     "canonical_output_manifest_missing", "material_canonical_output_unmapped",
-    "material_canonical_role_unmapped",
-)
-_classify(
-    UNSUPPORTED, "texture_authoring",
-    "isolated_texture_role_unmapped", "speedtree_texture_role_unknown",
-)
-_classify(
-    FATAL, "manifest_corruption",
-    "canonical_output_manifest_invalid_json",
-    "canonical_output_manifest_schema_mismatch", "generator_material_scope_unreadable",
-    "invalid_required_roles", "invalid_texture_base",
-    "isolated_texture_rebase_verification_failed",
-)
-_classify(
-    FATAL, "texture_scope_integrity",
+    "material_canonical_role_unmapped", "isolated_texture_role_unmapped",
+    "speedtree_texture_role_unknown", "canonical_output_manifest_invalid_json",
+    "canonical_output_manifest_schema_mismatch", "invalid_required_roles",
+    "invalid_texture_base", "isolated_texture_rebase_verification_failed",
     "manifest_outside_texture_root", "material_texture_origin_invalid",
     "production_spm_is_derived_cache", "production_spm_outside_manifest_asset",
+)
+_classify(
+    FATAL, "manifest_corruption", "generator_material_scope_unreadable"
 )
 _classify(
     INFORMATIONAL, "nonparticipating_material",

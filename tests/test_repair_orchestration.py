@@ -68,16 +68,12 @@ class RepairOrchestrationTests(unittest.TestCase):
         ) + "\n").encode("utf-8")).hexdigest()
         return scope
 
-    def test_texture_reason_uses_standard_step3_without_force(self):
+    def test_texture_availability_reason_does_not_schedule_repair(self):
         plan = self.plan({
             "reason_code": "texture_set_incomplete",
         })
-        self.assertTrue(plan.supported)
-        self.assertEqual(plan.initial_status, STATUS_PENDING)
-        self.assertEqual(len(plan.stages), 1)
-        self.assertEqual(plan.stages[0]["repair_action"], STEP3_STANDARD)
-        self.assertFalse(plan.stages[0]["force_rerender"])
-        self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
 
     def test_repairable_atlas_mirror_conflict_routes_exact_bat(self):
         plan = self.plan({
@@ -335,7 +331,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertFalse(plan.supported)
         self.assertEqual(plan.friendly_reason, decision["reason"])
 
-    def test_deadleaves_missing_t_roles_use_exact_pcg_action(self):
+    def test_deadleaves_missing_t_roles_do_not_schedule_repair(self):
         plan = self.plan({
             "status": "blocked",
             "issues": [{
@@ -344,12 +340,8 @@ class RepairOrchestrationTests(unittest.TestCase):
                 "expected_texture_base": "T_Leaf_deadleaves_01",
             }],
         })
-        self.assertTrue(plan.supported)
-        self.assertEqual(
-            [stage["repair_action"] for stage in plan.stages],
-            [STEP3_STANDARD],
-        )
-        self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
 
     def test_nonblocking_attempt_wrapper_cannot_mask_repairable_root(self):
         evidence = {
@@ -380,7 +372,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         })
         self.assertEqual(
             [stage["repair_action"] for stage in plan.stages],
-            [STEP3_STANDARD, GENERATOR_SYNC_AND_CLUSTER],
+            [GENERATOR_SYNC_AND_CLUSTER],
         )
         self.assertEqual(
             plan.stages[-1]["target_spms"],
@@ -490,7 +482,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertFalse(crash.supported)
         self.assertIn("3회", crash.friendly_reason)
 
-    def test_progress_and_final_failure_filter_hide_intermediate_repairs(self):
+    def test_texture_telemetry_adds_no_repair_progress_stage(self):
         plan = self.plan({
             "reason_code": "texture_set_incomplete",
         })
@@ -499,7 +491,7 @@ class RepairOrchestrationTests(unittest.TestCase):
             status=STATUS_PENDING,
             completed_stages=0,
         )
-        self.assertEqual(progress["remaining_stages"], 1)
+        self.assertEqual(progress["remaining_stages"], 0)
         rows = [
             {"status": STATUS_PENDING, "target": "pending"},
             {"status": STATUS_COMPLETED, "target": "done"},
@@ -511,7 +503,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(
             compact_success_message(plan.stages),
-            "자동 복구: PCG 텍스처 → Blender → Unreal, 통과",
+            "자동 복구: Blender → Unreal, 통과",
         )
 
     def test_only_current_request_receipt_is_terminal_authority(self):

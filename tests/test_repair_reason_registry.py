@@ -233,19 +233,43 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         self.assertEqual(invalid, [])
 
     def test_representative_domain_dispositions_are_explicit(self):
-        repairable = reason_row("output_set_incomplete")
+        texture_availability = reason_row("output_set_incomplete")
         unsupported = reason_row("managed_mesh_owner_ambiguous")
         fatal = reason_row("duplicate_material_id")
 
-        self.assertEqual(repairable.disposition, REPAIRABLE)
-        self.assertEqual(repairable.repair_action, "step3-standard")
-        self.assertIn("exact_inventory_spm", repairable.evidence_requirements)
+        self.assertEqual(texture_availability.disposition, INFORMATIONAL)
+        self.assertEqual(texture_availability.repair_action, "")
+        self.assertEqual(texture_availability.evidence_requirements, ())
         self.assertEqual(unsupported.disposition, UNSUPPORTED)
         self.assertEqual(unsupported.owner, "sk_batch/atlas_consumer_integrity.py")
         self.assertTrue(unsupported.operator_action)
         self.assertEqual(fatal.disposition, FATAL)
         self.assertEqual(fatal.owner, "sk_batch/atlas_consumer_integrity.py")
         self.assertTrue(fatal.operator_action)
+
+    def test_texture_omission_reasons_are_informational(self):
+        reasons = {
+            "canonical_material_has_no_maps",
+            "copied_candidate_unavailable",
+            "same_authority_candidates_disagree",
+            "unreadable",
+            "write_verification_mismatch",
+        }
+
+        self.assertTrue(all(
+            reason_row(code).disposition == INFORMATIONAL
+            for code in reasons
+        ))
+        self.assertTrue(all(
+            reason_row(code).policy == "texture_availability"
+            for code in reasons
+        ))
+        self.assertTrue(all(
+            not orchestration.has_repair_contract_evidence({
+                "reason_token": code,
+            })
+            for code in reasons
+        ))
 
     def test_historical_planner_only_aliases_are_not_contract_rows(self):
         aliases = {
@@ -313,7 +337,7 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             all(disposition_of(token) == UNSUPPORTED for token in terminal)
         )
 
-    def test_generic_terminal_failure_is_visible_but_does_not_mask_repair(self):
+    def test_generic_terminal_failure_is_not_masked_by_texture_telemetry(self):
         generic = {"reason_token": "data_error"}
         self.assertTrue(orchestration.has_repair_contract_evidence(generic))
         decision = orchestration.repair_ui_decision(generic)
@@ -334,8 +358,8 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             request_id="request",
             require_exists=False,
         )
-        self.assertTrue(plan.supported)
-        self.assertEqual(plan.stages[0]["stage"], "pcg_texture")
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
 
     def test_sanitized_observed_tokens_are_registered_and_decided(self):
         payload = json.loads(

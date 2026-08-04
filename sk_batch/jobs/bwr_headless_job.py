@@ -885,12 +885,6 @@ def main():
                 "status": texture_normalization.get("texture_contract_status", ""),
                 "path": texture_normalization.get("texture_contract_path", ""),
             }
-            for missing in texture_normalization.get("missing", []):
-                roles = ", ".join(missing.get("missing_roles", [])) or "대응 세트"
-                report.setdefault("warnings", []).append(
-                    f"{missing.get('material', '?')}: "
-                    f"{missing.get('expected_texture_base', 'T_?')} ({roles}) 누락"
-                )
             merged_name = str((pipeline_data.get("paths") or {}).get("merged_name") or "")
             merged_object = bpy.data.objects.get(merged_name)
             removed_empty_slots = remove_unused_empty_material_slots(merged_object)
@@ -960,8 +954,7 @@ def main():
             report.setdefault("warnings", []).append(f"expected output missing: {path}")
 
         reviewable_source_issues = bool(
-            texture_normalization.get("missing")
-            or empty_material_slots
+            empty_material_slots
             or material_export_blocked
         )
         structural_handoff_blocked = bool(
@@ -1148,8 +1141,6 @@ def main():
                     "Send2UE Export 구조 오류: "
                     + ", ".join(blocking_export_collection_issues)
                 )
-            if texture_normalization.get("missing"):
-                reasons.append(f"텍스처 세트 {len(texture_normalization['missing'])}개 미준비")
             if empty_material_slots:
                 details = ", ".join(
                     f"{item['object']} slot {item['slot']}"

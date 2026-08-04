@@ -1212,71 +1212,10 @@ def preflight_contract_issues(report):
             )
         )
 
-    textures = report.get("texture_source_contract") or {}
-    if textures.get("status") not in {None, "", "ok"}:
-        code = {
-            "missing_stmat": "STMAT_MISSING",
-            "invalid_stmat": "STMAT_INVALID",
-            "stale": "STMAT_STALE",
-            "missing_sources": "TEXTURE_SOURCE_MISSING",
-        }.get(str(textures.get("status")), "TEXTURE_SOURCE_INVALID")
-        issues.append(
-            _issue(
-                code,
-                "texture_source",
-                textures.get("stmat"),
-                textures.get("error") or textures.get("status"),
-                details={"missing_sources": textures.get("missing_sources") or []},
-            )
-        )
-
-    readiness = report.get("texture_readiness_contract") or {}
-    for warning in readiness.get("warnings") or []:
-        issues.append(
-            _issue(
-                warning.get("issue_code")
-                or "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
-                "material",
-                warning.get("material"),
-                warning.get("warning")
-                or "Original source texture is provisional",
-                severity="warning",
-                details={
-                    "material_index": warning.get("material_index"),
-                    "source_roles": warning.get("source_roles") or [],
-                    "source_paths": warning.get("source_paths") or {},
-                    "expected_texture_base": warning.get(
-                        "expected_texture_base"
-                    )
-                    or "",
-                    "expected_t_paths": warning.get("expected_t_paths")
-                    or {},
-                    "remediation": warning.get("remediation") or "",
-                    "source_rejections": warning.get("source_rejections")
-                    or [],
-                    "export_scope": warning.get("export_scope") or {},
-                },
-            )
-        )
-    for missing in readiness.get("missing") or []:
-        issues.append(
-            _issue(
-                "TEXTURE_SET_INCOMPLETE",
-                "material",
-                missing.get("material"),
-                missing.get("reason") or "managed texture set is incomplete",
-                details={
-                    "material_index": missing.get("material_index"),
-                    "missing_roles": missing.get("missing_roles") or [],
-                    "expected_texture_base": missing.get("expected_texture_base")
-                    or missing.get("texture_base")
-                    or "",
-                    "source_rejections": missing.get("source_rejections")
-                    or [],
-                    "export_scope": missing.get("export_scope") or {},
-                },
-            )
-        )
+    # Texture readiness is intentionally absent from the admission issue list.
+    # The detailed source/binding diagnostics stay in the report, but an empty,
+    # partial, stale, or ambiguous texture set is a normal handoff state. Unreal
+    # may bind a proven candidate later or leave the parameter unassigned.
     if report.get("status") == "failed" and not issues:
         issues.append(
             _issue(
@@ -1438,21 +1377,38 @@ def main():
                 speedtree_spm, leaf_contract
             )
             all_material = inspect_all_speedtree_material_export(speedtree_spm)
-            textures = inspect_speedtree_texture_sources(speedtree_spm)
-            texture_readiness = augment_texture_readiness_contract(
-                resolve_texture_bindings(textures.get("stmat")),
-                textures.get("stmat"),
-                canonical_spm,
-                source_texture_roots=(
-                    load_pcg_texture_config().get(
-                        "source_texture_roots"
-                    )
-                    or []
-                ),
-                leaf_contract=leaf_contract,
-                all_material_contract=all_material,
-                export_evidence_spm=speedtree_spm,
-            )
+            try:
+                textures = inspect_speedtree_texture_sources(speedtree_spm)
+                texture_readiness = augment_texture_readiness_contract(
+                    resolve_texture_bindings(textures.get("stmat")),
+                    textures.get("stmat"),
+                    canonical_spm,
+                    source_texture_roots=(
+                        load_pcg_texture_config().get(
+                            "source_texture_roots"
+                        )
+                        or []
+                    ),
+                    leaf_contract=leaf_contract,
+                    all_material_contract=all_material,
+                    export_evidence_spm=speedtree_spm,
+                )
+            except Exception as exc:
+                textures = {
+                    "status": "unassigned",
+                    "stmat": str(contract_stmat_path(speedtree_spm)),
+                    "missing_sources": [],
+                    "diagnostic": f"{type(exc).__name__}: {exc}",
+                }
+                texture_readiness = {
+                    "status": "unassigned",
+                    "stmat": textures["stmat"],
+                    "bindings": [],
+                    "missing": [],
+                    "texture_admission_mode": "runtime_tolerant",
+                    "affects_pipeline_outcome": False,
+                    "diagnostic": textures["diagnostic"],
+                }
             report["material_export_contract"] = material
             report["all_export_material_contract"] = all_material
             report["texture_source_contract"] = textures
@@ -1467,6 +1423,19 @@ def main():
             ))
             missing_sources = list(textures.get("missing_sources") or [])
             missing_sets = list(texture_readiness.get("missing") or [])
+            report["texture_diagnostics"] = {
+                "admission_mode": "runtime_tolerant",
+                "affects_pipeline_outcome": False,
+                "source_status": textures.get("status"),
+                "binding_status": texture_readiness.get("status"),
+                "missing_sources": missing_sources,
+                "unassigned_or_partial": missing_sets,
+                "diagnostic": (
+                    texture_readiness.get("diagnostic")
+                    or textures.get("diagnostic")
+                    or ""
+                ),
+            }
             if textures.get("classification"):
                 report["classification"] = textures["classification"]
                 report["failure_reason"] = textures.get(
@@ -1476,13 +1445,6 @@ def main():
             if (
                 material.get("status") in {"ok", "not_applicable"}
                 and all_material.get("status") in {"ok", "not_applicable"}
-                and textures.get("status") == "ok"
-                and texture_readiness.get("status") in {
-                    "ok",
-                    "not_applicable",
-                    "source_fallback_needs_pcg_generation",
-                    "nonblocking_diagnostics",
-                }
             ):
                 report["status"] = "ok"
             elif missing:
@@ -1534,34 +1496,12 @@ def main():
                     )
             else:
                 report["status"] = "blocked"
-                if missing_sets:
-                    details = ", ".join(
-                        f"{item.get('material', '?')}:"
-                        f"{','.join(item.get('missing_roles') or []) or item.get('reason', '?')}"
-                        for item in missing_sets[:8]
-                    )
-                    report["error"] = (
-                        "SpeedTree managed texture set is incomplete: "
-                        + details
-                    )
-                elif missing_sources:
-                    details = ", ".join(
-                        f"{item.get('material', '?')}:{item.get('map', '?')}"
-                        " -> "
-                        + (
-                            str(item.get("resolved") or "<Source 미지정>")
-                        )
-                        for item in missing_sources[:8]
-                    )
-                    report["error"] = (
-                        "에셋 텍스처 Source 계약 오류 — "
-                        + details
-                    )
-                else:
-                    report["error"] = (
-                        "SpeedTree 텍스처 사전검사 실패 — "
-                        + str(textures.get("status") or "unknown")
-                    )
+                report["error"] = (
+                    "SpeedTree material export preflight failed — material="
+                    + str(material.get("status") or "unknown")
+                    + ", all_material="
+                    + str(all_material.get("status") or "unknown")
+                )
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER,
                 spm=canonical_spm.name,

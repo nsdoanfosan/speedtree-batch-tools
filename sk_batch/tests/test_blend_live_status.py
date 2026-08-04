@@ -631,7 +631,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             self.assertEqual(report.read_bytes(), before)
 
-    def test_legacy_material_report_with_unresolved_bindings_never_migrates(
+    def test_legacy_material_report_with_unresolved_textures_migrates(
         self,
     ):
         gui = load_gui_module()
@@ -653,8 +653,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(json.dumps(payload), encoding="utf-8")
             self.set_time(blend, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
-            before = report.read_bytes()
-
             with mock.patch.object(
                 gui,
                 "build_preflight_envelope",
@@ -664,13 +662,18 @@ class BlendLiveStatusTests(unittest.TestCase):
                         "texture_source_mode": "unresolved",
                     }],
                 },
-            ), self.assertRaisesRegex(
-                ValueError,
-                "cannot prove material texture bindings",
             ):
-                gui.load_current_repair_pipeline_report(spm)
+                migrated = gui.load_current_repair_pipeline_report(spm)
 
-            self.assertEqual(report.read_bytes(), before)
+            self.assertEqual(
+                migrated["speedtree_pipeline_contract"]["material_intents"][0]
+                ["texture_source_mode"],
+                "unresolved",
+            )
+            self.assertEqual(
+                migrated["report_contract_migration"]["kind"],
+                "legacy_content_identity_upgrade",
+            )
 
     def test_cluster_contract_uses_canonical_sk_output_and_stmat(self):
         gui = load_gui_module()
@@ -709,7 +712,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(gui.speedtree_output_spm_for(canonical), canonical)
             self.assertEqual(
                 app._texture_normalization_ready(canonical),
-                (True, "텍스처 정규화 완료"),
+                (True, "머티리얼 준비 완료 · 텍스처 선택 연결"),
             )
 
     def test_content_receipt_keeps_touch_only_spm_current(self):
@@ -1661,7 +1664,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("재질이 SpeedTree FBX에서 빠짐", status)
             self.assertIn("M_leaf_atlas_01", status)
 
-    def test_texture_preflight_rechecks_recorded_files_and_handoff_slots(self):
+    def test_texture_preflight_ignores_files_but_keeps_structural_slot_gate(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1707,8 +1710,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             texture.unlink()
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._texture_normalization_ready(spm)
-            self.assertFalse(ready)
-            self.assertIn("텍스처 준비 안 됨", reason)
+            self.assertTrue(ready, reason)
+            self.assertIn("텍스처 선택 연결", reason)
 
     def test_legacy_material_failure_is_not_waived_by_a_different_live_check(self):
         gui = load_gui_module()
@@ -1893,11 +1896,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._handoff_ready(spm)
 
-            self.assertFalse(ready)
-            self.assertIn("텍스처 준비 안 됨", reason)
-            self.assertIn("M_leaf_silky_dogwood_atlas_01_green", reason)
+            self.assertTrue(ready, reason)
 
-    def test_unrecognized_needs_pcg_status_does_not_bypass_handoff(self):
+    def test_unrecognized_texture_status_does_not_gate_handoff(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1935,8 +1936,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._texture_normalization_ready(spm)
 
-            self.assertFalse(ready)
-            self.assertIn("텍스처 정규화 미완료", reason)
+            self.assertTrue(ready, reason)
+            self.assertIn("텍스처 선택 연결", reason)
 
     def test_live_signature_tracks_reported_texture_deletion(self):
         gui = load_gui_module()

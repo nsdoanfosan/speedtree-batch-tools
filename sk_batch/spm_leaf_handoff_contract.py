@@ -1233,7 +1233,7 @@ def inspect_all_speedtree_material_export(spm_path):
 
 
 def inspect_speedtree_texture_sources(spm_path):
-    """Validate every texture Source declared by the current SpeedTree STMAT."""
+    """Describe usable texture Sources without deciding pipeline admission."""
     spm = Path(spm_path)
     stmat = speedtree_stmat_path(spm)
     result = {
@@ -1242,6 +1242,8 @@ def inspect_speedtree_texture_sources(spm_path):
         "stmat": str(stmat),
         "source_count": 0,
         "missing_sources": [],
+        "availability_status": "unavailable",
+        "affects_pipeline_outcome": False,
     }
     try:
         path_text, size, mtime_ns = _file_key(stmat)
@@ -1260,19 +1262,8 @@ def inspect_speedtree_texture_sources(spm_path):
             result["error"] = names_error
             return result
         if names:
-            result["status"] = "missing_sources"
-            result["classification"] = "asset_texture_source_undeclared"
-            result["error"] = (
-                "Exported STMAT materials declare no texture Source entries"
-            )
-            result["failure_reason"] = (
-                "The source SPM exported one or more materials, but those "
-                "materials do not declare any texture Source path"
-            )
-            result["remediation"] = (
-                "Assign the intended texture maps to the material in "
-                "SpeedTree Modeler, then save and export the SPM again"
-            )
+            result["status"] = "ok"
+            result["availability_status"] = "textureless"
             result["missing_sources"] = [
                 {
                     "material": name,
@@ -1298,25 +1289,20 @@ def inspect_speedtree_texture_sources(spm_path):
             missing.append({**row, "resolved": str(resolved)})
     result["missing_sources"] = missing
     if missing:
-        result["status"] = "missing_sources"
-        result["classification"] = "asset_texture_source_path_missing"
-        result["error"] = (
-            f"{len(missing)} texture Source path(s) declared by the "
-            "exported STMAT do not resolve to a non-empty file"
-        )
-        result["failure_reason"] = (
-            "The source SPM material stores stale or missing texture file "
-            "paths; Blender Repair cannot prove the intended texture content"
-        )
-        result["remediation"] = (
-            "Relink the listed Source paths in SpeedTree Modeler to the "
-            "intended files, then save and export the SPM again"
+        result["status"] = "ok"
+        result["availability_status"] = (
+            "partial" if len(missing) < len(rows) else "textureless"
         )
     else:
-        try:
-            result["status"] = (
-                "stale" if stmat.stat().st_mtime_ns < spm.stat().st_mtime_ns else "ok"
-            )
-        except OSError:
-            result["status"] = "ok"
+        result["status"] = "ok"
+        result["availability_status"] = "complete" if rows else "textureless"
+    try:
+        result["source_snapshot"] = (
+            "stale" if stmat.stat().st_mtime_ns < spm.stat().st_mtime_ns else "current"
+        )
+    except OSError as exc:
+        result["source_snapshot"] = "unknown"
+        result["texture_diagnostics"] = [
+            {"kind": "metadata_io", "message": str(exc)}
+        ]
     return result

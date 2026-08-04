@@ -706,8 +706,7 @@ def main():
         report["export_collection_issues"] = export_collection_issues
         report["handoff_preflight"] = {
             "status": "blocked" if (
-                texture_normalization.get("missing")
-                or export_collection_issues
+                export_collection_issues
                 or empty_material_slots
                 or blocked_vertex_payloads
                 or blocked_vertex_colors
@@ -731,19 +730,6 @@ def main():
             or any(item.get("changed") for item in vertex_payload_contracts)
         )
         report["blend_resaved"] = False
-        missing_textures = texture_normalization.get("missing", [])
-        if missing_textures:
-            details = []
-            for item in missing_textures:
-                roles = ", ".join(item.get("missing_roles", [])) or "대응 세트"
-                details.append(
-                    f"{item.get('material', '?')} -> "
-                    f"{item.get('expected_texture_base', 'T_?')} ({roles})"
-                )
-            raise RuntimeError(
-                "PCG ST9 Texture Batch 산출물 누락; Unreal Push 중단: "
-                + " | ".join(details)
-            )
         if export_collection_issues:
             raise RuntimeError(
                 "Send2UE Export collection contract failed: "
