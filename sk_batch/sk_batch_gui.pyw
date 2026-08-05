@@ -238,6 +238,7 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
 )
 from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
 from repair_runtime_contract import (
+    LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_RUNTIME_RECEIPT_VERSION,
     addon_dir_from_config,
@@ -245,6 +246,7 @@ from repair_runtime_contract import (
     repair_runtime_code_paths,
     repair_runtime_code_state,
     repair_runtime_output_contract,
+    repair_pipeline_output_contract,
     repair_runtime_receipt_needs_migration,
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
@@ -10450,10 +10452,12 @@ class App:
         return proc.returncode, log_file
 
     @staticmethod
-    def _repair_contract_current(spm):
+    def _repair_contract_current(spm, pipeline_out=None):
         """Prove the saved blend/report came from the current SPM content."""
         try:
             report = load_current_repair_pipeline_report(spm)
+            if isinstance(pipeline_out, dict):
+                pipeline_out["payload"] = report
             if (report.get("handoff_preflight") or {}).get("status") not in {
                 "ok", "source_review",
             }:
@@ -10734,11 +10738,12 @@ class App:
                 getattr(self, "cfg", {}) or {},
                 addon_dir=addon_dir,
                 code_state=state,
+                blend=blend_path_for(spm),
             )
         except OSError as exc:
             self.log(f"  [② 경고] Repair 런타임 기록 실패: {spm.name}: {exc}")
 
-    def _repair_runtime_fresh(self, spm):
+    def _repair_runtime_fresh(self, spm, content_contract_out=None):
         """Gate only on an explicit saved-output contract revision.
 
         Producer source hashes are retained in the receipt for diagnostics,
@@ -10764,7 +10769,60 @@ class App:
                 candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 candidate = None
+        # This loader owns the narrow structural-semantic migration for
+        # texture-path-only SPM rewrites. Run it before exact v2 pipeline proof
+        # so a supported migration can refresh the report identity first.
+        pipeline_probe = {}
+        content_contract_current = self._repair_contract_current(
+            spm,
+            pipeline_out=pipeline_probe,
+        )
+        if isinstance(content_contract_out, dict):
+            content_contract_out["current"] = content_contract_current
+        pipeline_payload = pipeline_probe.get("payload")
+        if not isinstance(pipeline_payload, dict):
+            try:
+                pipeline_payload = _read_repair_pipeline_json(report_path)
+            except (OSError, ValueError):
+                pipeline_payload = None
+        pipeline_contract = repair_pipeline_output_contract(
+            pipeline_payload,
+            spm=spm,
+            blend=blend,
+            source_identity_already_validated=content_contract_current,
+        )
         saved_contract = repair_runtime_output_contract(candidate)
+        pipeline_proved_upgrade = False
+        if pipeline_contract != REPAIR_OUTPUT_CONTRACT_VERSION:
+            return False, (
+                "Blender Repair report does not prove the current "
+                "Default/empty-material cleanup output contract; rerun "
+                "Blender Repair"
+            )
+        if saved_contract not in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+            REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            return False, (
+                "Blender Repair saved-output contract changed; rerun "
+                "Blender Repair "
+                f"({saved_contract} -> "
+                f"{REPAIR_OUTPUT_CONTRACT_VERSION})"
+            )
+        if saved_contract in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            if not content_contract_current:
+                return False, (
+                    "Blender Repair cleanup evidence does not match the "
+                    "current source/output contract; rerun Blender Repair"
+                )
+            saved_contract = pipeline_contract
+            pipeline_proved_upgrade = True
+        if saved_contract is None:
+            saved_contract = pipeline_contract
         if (
             saved_contract is not None
             and saved_contract != REPAIR_OUTPUT_CONTRACT_VERSION
@@ -10783,7 +10841,10 @@ class App:
         # stale, and an old receipt can never bless stale artifacts.
         if (
             repair_runtime_receipt_needs_migration(candidate)
-            and self._repair_contract_current(spm)
+            and (
+                pipeline_proved_upgrade
+                or content_contract_current
+            )
         ):
             planning = self._failed_retry_planning_context()
             if planning is not None:
@@ -10843,7 +10904,11 @@ class App:
                 "kind": "missing_blend",
                 "reason": "생성 필요 — blend 없음 → ② Blender Repair",
             }
-        runtime_fresh, runtime_reason = self._repair_runtime_fresh(spm)
+        content_contract_probe = {}
+        runtime_fresh, runtime_reason = self._repair_runtime_fresh(
+            spm,
+            content_contract_out=content_contract_probe,
+        )
         if not runtime_fresh:
             return {
                 "current": False,
@@ -10851,7 +10916,9 @@ class App:
                 "kind": "output_contract",
                 "reason": runtime_reason,
             }
-        receipt_current = self._repair_contract_current(spm)
+        receipt_current = content_contract_probe.get("current")
+        if not isinstance(receipt_current, bool):
+            receipt_current = self._repair_contract_current(spm)
         assembly_state = None
         assembly_dependency_contract = {}
 

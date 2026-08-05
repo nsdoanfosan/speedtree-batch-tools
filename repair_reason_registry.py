@@ -1339,9 +1339,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
         "asset_missing",
     ),
-    "spm_visible_default_material_ambiguous": ReasonRow(
-        FATAL, "sk_batch/job_report_contract.py", "material_contract",
-    ),
     "status": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),

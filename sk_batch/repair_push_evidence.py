@@ -12,13 +12,14 @@ import copy
 import hashlib
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
 
 EVIDENCE_BUNDLE_KIND = "sk_batch_repair_push_evidence"
 EVIDENCE_BUNDLE_VERSION = 2
 EXPORT_POSTCONDITION_KIND = "sk_batch_export_object_postcondition"
-EXPORT_POSTCONDITION_VERSION = 1
+EXPORT_POSTCONDITION_VERSION = 2
 STALE_EXECUTION_FREEZE = "STALE_EXECUTION_FREEZE"
 
 
@@ -282,10 +283,23 @@ def export_object_postcondition(blender_data):
                         "slot": index,
                     })
             polygons = list(getattr(data, "polygons", ()) or ())
+            material_index_counts = Counter(
+                int(getattr(polygon, "material_index", 0))
+                for polygon in polygons
+            )
             row["mesh"] = {
                 "vertex_count": len(getattr(data, "vertices", ()) or ()),
                 "edge_count": len(getattr(data, "edges", ()) or ()),
                 "polygon_count": len(polygons),
+                "material_index_counts": [
+                    {
+                        "material_index": material_index,
+                        "polygon_count": polygon_count,
+                    }
+                    for material_index, polygon_count in sorted(
+                        material_index_counts.items()
+                    )
+                ],
                 "polygon_layout_sha256": _sequence_digest(
                     {
                         "vertices": [
@@ -350,6 +364,52 @@ def validate_export_object_postcondition(expected, blender_data):
         raise RepairPushEvidenceError(
             "Repair Export postcondition is incomplete or invalid"
         )
+    for row in expected.get("objects") or []:
+        mesh = row.get("mesh") if isinstance(row, dict) else None
+        if not isinstance(mesh, dict):
+            continue
+        polygon_count = mesh.get("polygon_count")
+        materials = mesh.get("materials")
+        index_counts = mesh.get("material_index_counts")
+        if (
+            isinstance(polygon_count, bool)
+            or not isinstance(polygon_count, int)
+            or polygon_count < 0
+            or not isinstance(materials, list)
+            or not isinstance(index_counts, list)
+            or any(not isinstance(material, dict) for material in materials)
+        ):
+            raise RepairPushEvidenceError(
+                "Repair Export mesh material evidence is invalid"
+            )
+        counted_polygons = 0
+        seen_indices = set()
+        for count_row in index_counts:
+            if not isinstance(count_row, dict):
+                raise RepairPushEvidenceError(
+                    "Repair Export mesh material assignment is invalid"
+                )
+            material_index = count_row.get("material_index")
+            assigned_count = count_row.get("polygon_count")
+            if (
+                isinstance(material_index, bool)
+                or not isinstance(material_index, int)
+                or material_index in seen_indices
+                or material_index < 0
+                or material_index >= len(materials)
+                or isinstance(assigned_count, bool)
+                or not isinstance(assigned_count, int)
+                or assigned_count < 1
+            ):
+                raise RepairPushEvidenceError(
+                    "Repair Export mesh material assignment is invalid"
+                )
+            seen_indices.add(material_index)
+            counted_polygons += assigned_count
+        if counted_polygons != polygon_count:
+            raise RepairPushEvidenceError(
+                "Repair Export mesh material assignments do not cover faces"
+            )
     actual = export_object_postcondition(blender_data)
     if actual != expected:
         raise RepairPushEvidenceError(

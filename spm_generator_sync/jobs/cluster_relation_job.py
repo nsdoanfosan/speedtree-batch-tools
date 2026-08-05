@@ -94,12 +94,42 @@ def finalize_cluster_source_pipeline(recipe):
         / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
     )
     payload = json.loads(report_path.read_text(encoding="utf-8"))
+    blend_stat = blend.stat()
+    normalization_receipt = json.loads(
+        Path(recipe["receipt_path"]).read_text(encoding="utf-8")
+    )
+    recorded_blend_digest = str(
+        normalization_receipt.get("output_blend_sha256") or ""
+    ).casefold()
+    recorded_blend = normalization_receipt.get("blend")
+    if (
+        not recorded_blend
+        or key(recorded_blend) != key(blend)
+        or normalization_receipt.get("output_blend_size")
+        != blend_stat.st_size
+        or normalization_receipt.get("output_blend_mtime_ns")
+        != blend_stat.st_mtime_ns
+        or len(recorded_blend_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in recorded_blend_digest
+        )
+    ):
+        recorded_blend_digest = sha256_file(blend)
+    source_blend_identity = {
+        "path": str(blend.resolve()),
+        "exists": True,
+        "size": blend_stat.st_size,
+        "mtime_ns": blend_stat.st_mtime_ns,
+        "sha256": recorded_blend_digest,
+    }
     try:
         finalized, changed = finalize_cluster_pipeline_payload(
             payload,
             export_issues=issues,
             expected_source_object=recipe.get("source_object"),
             export_postcondition=export_object_postcondition(bpy.data),
+            source_blend_identity=source_blend_identity,
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -334,6 +364,8 @@ def normalize_cluster_blend(recipe):
         check_existing=False,
     )
     blend_path = Path(bpy.data.filepath).expanduser().absolute()
+    blend_stat = blend_path.stat()
+    blend_digest = sha256_file(blend_path)
     receipt_path = Path(recipe["receipt_path"]).expanduser().absolute()
     capture_manifest = (
         Path(recipe["capture_output_dir"])
@@ -344,7 +376,9 @@ def normalize_cluster_blend(recipe):
         "version": 3,
         "status": "ready",
         "blend": str(blend_path),
-        "output_blend_sha256": sha256_file(blend_path),
+        "output_blend_sha256": blend_digest,
+        "output_blend_size": blend_stat.st_size,
+        "output_blend_mtime_ns": blend_stat.st_mtime_ns,
         "canonical_spm": recipe["canonical_spm"],
         "source_spm_semantic_projection_version": recipe[
             "source_spm_semantic_projection_version"

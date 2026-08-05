@@ -57,5 +57,6 @@ def test_legacy_default_bark_error_does_not_create_asset_authority():
     mark_job_failed(report, error, "traceback")
 
     assert report["status"] == "failed"
+    assert report["error"] == str(error)
     assert "failure_classification" not in report
     assert "asset_issue" not in report
