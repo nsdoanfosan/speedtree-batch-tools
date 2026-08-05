@@ -54,6 +54,7 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     texture_base_for_material,
 )
 from atlas_manifest_resolver import (  # noqa: E402
+    resolution_evidence,
     resolve_atlas_manifests,
     resolve_manifest_material_ownership,
 )
@@ -542,7 +543,11 @@ def augment_texture_readiness_contract(
             _material_contract_key(material.get("material_name")),
             [],
         ).append(material)
-    atlas_resolution = resolve_atlas_manifests(production_spm)
+    atlas_manifest_diagnostic = None
+    atlas_resolution = resolve_atlas_manifests(
+        production_spm,
+        diagnostic_only=True,
+    )
     atlas_ownership = resolve_manifest_material_ownership(
         atlas_resolution,
         [
@@ -552,6 +557,15 @@ def augment_texture_readiness_contract(
         ],
         target_spm=production_spm,
     )
+    if atlas_resolution.get("mutation_authorized") is False:
+        # Multiple Providers may legitimately claim the same live Material or
+        # Mesh. The disagreement prevents provenance-based mutation, but it is
+        # not a texture/export failure and must not stop preflight.
+        atlas_manifest_diagnostic = {
+            "status": "provider_claim_disagreement",
+            "resolution": resolution_evidence(atlas_resolution),
+            "mutation_authorized": False,
+        }
     atlas_ownership_by_key = {}
     for proof in atlas_ownership.get("materials") or []:
         atlas_ownership_by_key.setdefault(
@@ -569,6 +583,8 @@ def augment_texture_readiness_contract(
     )
     warnings = list(readiness.get("warnings") or [])
     missing = list(readiness.get("missing") or [])
+    if atlas_manifest_diagnostic is not None:
+        readiness["atlas_manifest_diagnostic"] = atlas_manifest_diagnostic
     live_evidence = _capture_live_material_export_evidence(
         export_evidence_spm
     )
@@ -951,17 +967,46 @@ def _atlas_integrity_failure_message(integrity):
     """Return one Korean cause/action with the exact offending identities."""
     integrity = integrity or {}
     issues = list(integrity.get("integrity_issues") or ())
-    codes = {str(row.get("code") or "") for row in issues}
-    if "atlas_manifest_authority_missing" in codes:
+    duplicate_materials = [
+        row for row in issues if row.get("code") == "duplicate_material_id"
+    ]
+    duplicate_meshes = [
+        row for row in issues if row.get("code") == "duplicate_mesh_id"
+    ]
+    if duplicate_materials or duplicate_meshes:
+        identities = []
+        if duplicate_materials:
+            identities.append(
+                "Material ID "
+                + ", ".join(str(row.get("asset_id")) for row in duplicate_materials)
+            )
+        if duplicate_meshes:
+            identities.append(
+                "Mesh ID "
+                + ", ".join(str(row.get("asset_id")) for row in duplicate_meshes)
+            )
         return (
-            "현재 대상의 Atlas producer 영수증이 없습니다.",
-            "BAT가 exact Cluster 갱신으로 producer 영수증을 다시 만든 뒤 fresh audit을 실행합니다.",
+            "표시되는 Generator가 중복 ID를 참조합니다: " + " / ".join(identities),
+            "표시되는 exact Generator가 하나의 Material/Mesh ID만 참조하도록 중복 항목을 정리하세요.",
         )
-    if "atlas_manifest_resolution_conflict" in codes:
+
+    incomplete_slots = [
+        row
+        for row in issues
+        if row.get("code") == "generator_slot_pair_incomplete"
+        and row.get("hidden") is not True
+    ]
+    if incomplete_slots:
+        slots = ", ".join(
+            f"{row.get('generator_name') or '이름 없음'}"
+            f"(Material {row.get('material_id')}, Mesh {row.get('mesh_id')})"
+            for row in incomplete_slots[:8]
+        )
         return (
-            "현재 Atlas producer 영수증들이 서로 충돌합니다.",
-            "BAT가 exact Cluster 갱신으로 current 영수증을 다시 게시한 뒤 fresh audit을 실행합니다.",
+            "표시되는 Generator의 Material/Mesh slot이 불완전합니다: " + slots,
+            "해당 exact Generator에 유효한 Material과 Mesh를 각각 하나씩 지정하세요.",
         )
+
     visible_pairs = [
         row for row in issues
         if row.get("code") == "generator_cross_group_pair"
@@ -978,39 +1023,14 @@ def _atlas_integrity_failure_message(integrity):
             + pairs,
             "표시된 Generator, Material ID, Mesh ID의 visible 연결을 수정한 뒤 다시 검사하세요.",
         )
-
-    lineage_mesh_ids = [
-        row.get("mesh_id")
-        for row in integrity.get("managed_meshes") or ()
-        if row.get("orphan_reason") == "lineage_unproven"
-    ]
-    lineage_material_ids = [
-        row.get("material_id")
-        for row in integrity.get("managed_materials") or ()
-        if row.get("orphan_reason") == "lineage_unproven"
-    ]
-    if lineage_mesh_ids or lineage_material_ids:
-        identities = []
-        if lineage_material_ids:
-            identities.append(
-                "Material ID " + ", ".join(
-                    str(value) for value in lineage_material_ids[:8]
-                )
-            )
-        if lineage_mesh_ids:
-            identities.append(
-                "Mesh ID " + ", ".join(
-                    str(value) for value in lineage_mesh_ids[:12]
-                )
-            )
-        return (
-            "current Atlas producer 계보가 증명되지 않은 asset이 남았습니다: "
-            + " · ".join(identities),
-            "BAT가 exact Cluster 갱신을 먼저 실행합니다. fresh audit 뒤에도 남으면 표시된 ID의 Atlas 원본 연결을 수정하세요.",
-        )
+    exact_rows = ", ".join(
+        f"{row.get('code')}"
+        f"({row.get('asset_kind') or 'slot'} {row.get('asset_id')})"
+        for row in issues[:8]
+    )
     return (
-        "Atlas 관리 asset의 current 소유 증거가 불완전합니다.",
-        "상세 integrity issue와 Material/Mesh ID를 확인한 뒤 다시 검사하세요.",
+        "표시되는 live Material/Mesh 구조에 문제가 있습니다: " + exact_rows,
+        "표시된 exact ID와 Generator slot을 수정한 뒤 다시 검사하세요.",
     )
 
 
@@ -1035,39 +1055,10 @@ def preflight_contract_issues(report):
                 or leaf_status,
             )
         )
-    ownership = leaf.get("managed_ownership_provenance") or {}
-    if ownership.get("status") == "marker_only":
-        issues.append(
-            _issue(
-                "ATLAS_OWNERSHIP_PROVENANCE_MISMATCH",
-                "atlas_builder",
-                report.get("spm"),
-                ownership.get("reason")
-                or "Atlas builder ownership provenance is marker-only",
-                severity="warning",
-                details={
-                    "material_names": ownership.get("material_names") or [],
-                    "validation": "shadow_only_no_mutation_change",
-                },
-            )
-        )
-    elif ownership.get("status") == "manifest_conflict":
-        issues.append(
-            _issue(
-                "ATLAS_MANIFEST_CANDIDATE_CONFLICT",
-                "atlas_manifest",
-                report.get("spm"),
-                ownership.get("reason")
-                or "Atlas manifest candidates conflict",
-                details={
-                    "material_names": ownership.get("material_names") or [],
-                    "atlas_manifest_resolution": ownership.get(
-                        "atlas_manifest_resolution"
-                    )
-                    or {},
-                },
-            )
-        )
+    # Atlas ownership/provenance is authority for an optional cleanup, not for
+    # exporting the live SpeedTree graph. Marker-only ownership, missing or
+    # stale lineage, and simultaneous Provider claims remain in the internal
+    # audit but deliberately emit no user-facing preflight issue.
 
     mesh_files = report.get("mesh_file_reference_contract") or {}
     if mesh_files.get("missing"):
@@ -1087,7 +1078,10 @@ def preflight_contract_issues(report):
             )
         )
     atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
-    if atlas_integrity.get("blocking"):
+    if atlas_integrity.get(
+        "export_blocking",
+        atlas_integrity.get("blocking"),
+    ):
         integrity_message, integrity_action = (
             _atlas_integrity_failure_message(atlas_integrity)
         )
@@ -1341,7 +1335,10 @@ def main():
                 spm=canonical_spm.name,
                 status="blocked",
             )
-        elif atlas_integrity.get("blocking"):
+        elif atlas_integrity.get(
+            "export_blocking",
+            atlas_integrity.get("blocking"),
+        ):
             integrity_message, integrity_action = (
                 _atlas_integrity_failure_message(atlas_integrity)
             )

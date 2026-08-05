@@ -16,7 +16,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from atlas_manifest_resolver import (
-    AtlasManifestResolutionError,
     resolve_atlas_manifests,
     selected_manifest_payload,
 )
@@ -565,13 +564,16 @@ def _material_id_by_exact_name(root, material_name):
 
 def _atlas_target_relation_manifest(target_spm):
     target = Path(target_spm).expanduser().absolute()
-    try:
-        resolution = resolve_atlas_manifests(
-            target,
-            require_generator_complete=True,
-        )
-    except AtlasManifestResolutionError as exc:
-        raise ClusterNormalizationSyncError(str(exc)) from exc
+    # This metadata is used only to prove optional GUID/slot repairs.  A
+    # Provider disagreement must disable the disputed metadata-guided repair,
+    # not abort the otherwise exact normalization operation.
+    resolution = resolve_atlas_manifests(
+        target,
+        require_generator_complete=True,
+        diagnostic_only=True,
+    )
+    if resolution.get("mutation_authorized") is False:
+        return {}
     return selected_manifest_payload(resolution)
 
 
@@ -591,16 +593,27 @@ def _source_binding_repairs(target_spm, material_record):
     material_id = material_record["material_id"]
     material_mesh_ids = set(material_record.get("mesh_ids") or [])
     atlas_manifest = _atlas_target_relation_manifest(target)
-    atlas_bindings = {
-        (
+    atlas_bindings = {}
+    ambiguous_binding_keys = set()
+    for item in (
+        atlas_manifest.get("generator_connection") or {}
+    ).get("bindings") or []:
+        if not isinstance(item, dict):
+            continue
+        key = (
             generator_guid_key(item.get("generator_guid")),
             str(item.get("slot_prefix") or "").strip(),
-        ): item
-        for item in (
-            atlas_manifest.get("generator_connection") or {}
-        ).get("bindings") or []
-        if isinstance(item, dict)
-    }
+        )
+        if not all(key) or key in ambiguous_binding_keys:
+            continue
+        previous = atlas_bindings.get(key)
+        if previous is not None and previous != item:
+            # Conflicting metadata cannot authorize a binding rewrite.  Drop
+            # only this key; the live SPM and other exact repairs remain valid.
+            atlas_bindings.pop(key, None)
+            ambiguous_binding_keys.add(key)
+            continue
+        atlas_bindings[key] = item
     live_pairs = [
         pair
         for pair in _generator_property_pairs(root)

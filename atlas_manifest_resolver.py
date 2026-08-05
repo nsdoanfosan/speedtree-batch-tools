@@ -238,6 +238,143 @@ def _candidate_claims(payload, source_identity, kind):
     return claims
 
 
+def _diagnostic_disjoint_candidate(candidate, winners, disagreement_keys):
+    """Keep only claim groups unique to a later Provider for read-only audit.
+
+    A single operational record may disagree with an earlier Provider for role
+    A while uniquely supplying role B. Strict mutation selection still rejects
+    that record as a whole. Live audit must not erase role B, so this projection
+    carries only groups/bindings whose complete claim-key set is disjoint from
+    every existing winner and from the disagreement set.
+    """
+
+    claims = candidate["_claims"]
+    allowed_keys = set(claims) - set(winners)
+    if not allowed_keys:
+        return None
+    disagreement_keys = set(disagreement_keys)
+    payload = copy.deepcopy(candidate["payload"])
+
+    def group_keys(group):
+        keys = set()
+        name = str(group.get("material") or "").strip().casefold()
+        material_id = str(group.get("material_id") or "").strip()
+        if name:
+            keys.add(f"material_name:{name}")
+        if material_id:
+            keys.add(f"material_id:{material_id}")
+        return keys
+
+    kept_group_count = 0
+    for field in ("speedtree_material_groups", "material_groups"):
+        raw_groups = payload.get(field)
+        if not isinstance(raw_groups, list):
+            continue
+        kept = []
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            keys = group_keys(group)
+            if keys and keys.issubset(allowed_keys) and not keys & disagreement_keys:
+                kept.append(group)
+        payload[field] = kept
+        kept_group_count += len(kept)
+
+    # The Atlas writer also publishes single-group convenience fields at the
+    # manifest root.  They are derived authority, not independent claims.  A
+    # diagnostic projection must rebuild them from the groups that survived;
+    # otherwise a removed Provider role can re-enter through material_id,
+    # mesh_ids, an adoption snapshot, or a physical-capture receipt.
+    projected_groups = _material_groups(payload)
+    projected_names = [
+        str(group.get("material") or "").strip()
+        for group in projected_groups
+        if str(group.get("material") or "").strip()
+    ]
+    projected_ids = [
+        group.get("material_id")
+        for group in projected_groups
+        if str(group.get("material_id") or "").strip()
+    ]
+    projected_mesh_ids = sorted({
+        mesh_id
+        for group in projected_groups
+        for mesh_id in (group.get("mesh_ids") or [])
+    }, key=lambda value: str(value))
+    projected_name = projected_names[0] if len(projected_names) == 1 else None
+    projected_id = projected_ids[0] if len(projected_ids) == 1 else None
+    for field in ("material", "material_name"):
+        if field in payload:
+            payload[field] = projected_name
+    if "material_id" in payload:
+        payload["material_id"] = projected_id
+    if "mesh_ids" in payload:
+        payload["mesh_ids"] = projected_mesh_ids
+
+    adoption = payload.get("source_material_adoption")
+    if isinstance(adoption, dict):
+        adoption_name = str(adoption.get("material_name") or "").casefold()
+        adoption_id = str(adoption.get("material_id") or "").strip()
+        if (
+            projected_name is None
+            or adoption_name != projected_name.casefold()
+            or (
+                adoption_id
+                and projected_id is not None
+                and adoption_id != str(projected_id)
+            )
+        ):
+            payload["source_material_adoption"] = None
+    # These receipts seal the original full Provider output.  Once claims are
+    # projected they cannot be treated as a seal for the reduced payload.
+    for field in (
+        "normalized_prototype_receipt",
+        "physical_capture_contract",
+        "physical_capture_receipt",
+        "unit_probe_contract",
+    ):
+        payload.pop(field, None)
+
+    connection = payload.get("generator_connection")
+    kept_binding_count = 0
+    if isinstance(connection, dict):
+        kept_bindings = []
+        for binding in connection.get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            slot = str(binding.get("slot_prefix") or "").strip().casefold()
+            guid = str(binding.get("generator_guid") or "").strip().casefold()
+            index = str(binding.get("generator_index") or "").strip()
+            name = str(binding.get("generator_name") or "").strip().casefold()
+            owner = guid or (f"index:{index}" if index else "") or (
+                f"name:{name}" if name else ""
+            )
+            key = f"generator:{owner}:{slot}" if owner and slot else ""
+            if key and key in allowed_keys and key not in disagreement_keys:
+                kept_bindings.append(binding)
+        connection["bindings"] = kept_bindings
+        kept_binding_count = len(kept_bindings)
+
+    allowed_claims = {
+        key: value for key, value in claims.items() if key in allowed_keys
+    }
+    if not allowed_claims or not (
+        kept_group_count
+        or kept_binding_count
+        or any(key.startswith("record:") for key in allowed_claims)
+    ):
+        return None
+    projected = copy.deepcopy(candidate)
+    projected.update({
+        "reason": "diagnostic_disjoint_provider_claims",
+        "payload": payload,
+        "ownership_claims": sorted(allowed_claims),
+        "diagnostic_excluded_claims": sorted(set(claims) - set(allowed_claims)),
+        "_claims": allowed_claims,
+    })
+    return projected
+
+
 def _public_record(record, *, include_payload=True):
     public = {
         key: value
@@ -277,6 +414,13 @@ def resolution_evidence(resolution):
         evidence["cluster_pair_identity"] = copy.deepcopy(
             resolution["cluster_pair_identity"]
         )
+    for field in (
+        "diagnostic_only",
+        "mutation_authorized",
+        "diagnostic_status",
+    ):
+        if field in resolution:
+            evidence[field] = copy.deepcopy(resolution[field])
     return evidence
 
 
@@ -452,12 +596,17 @@ def resolve_atlas_manifests(
     expected_source_collection=None,
     expected_export_scope_id=None,
     require_generator_complete=False,
+    diagnostic_only=False,
 ):
     """Resolve exact Atlas records for one SPM and return auditable evidence.
 
-    The function is read-only.  Invalid JSON and explicit unsupported schemas
-    are fail-closed.  Foreign-target and caller-filtered records are rejected
-    with reasons, while diagnostic legacy records are always shadowed.
+    The function is read-only.  Its default remains strict for mutation writers:
+    invalid JSON, unsupported schemas, and contradictory operational mirrors
+    fail closed.  A read-only live audit may opt into ``diagnostic_only``.  In
+    that mode the same records remain visible as diagnostics, but deterministic
+    valid winners are returned so metadata cannot erase the live Assembly graph.
+    Foreign-target and caller-filtered records are rejected with reasons, while
+    diagnostic legacy records are always shadowed.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
     owner_target = _manifest_owner_target(target)
@@ -645,7 +794,7 @@ def resolve_atlas_manifests(
             )
         resolution["shadowed"].append(row)
 
-    if fatal:
+    if fatal and not diagnostic_only:
         evidence = resolution_evidence(resolution)
         raise AtlasManifestResolutionError(
             "Atlas manifest resolution failed for "
@@ -705,6 +854,16 @@ def resolve_atlas_manifests(
                     "conflicts_with_kind": winner["kind"],
                     "conflicts_with_precedence": winner["precedence"],
                 })
+            if diagnostic_only:
+                projected = _diagnostic_disjoint_candidate(
+                    candidate,
+                    winners,
+                    {key for key, _winner in disagreements},
+                )
+                if projected is not None:
+                    selected.append(projected)
+                    for key in projected["_claims"]:
+                        winners.setdefault(key, projected)
             continue
 
         candidate["reason"] = (
@@ -718,6 +877,13 @@ def resolve_atlas_manifests(
         resolution["selected"] = [
             _public_record(row) for row in selected
         ]
+        if diagnostic_only:
+            resolution.update({
+                "diagnostic_only": True,
+                "mutation_authorized": False,
+                "diagnostic_status": "atlas_manifest_metadata_disagreement",
+            })
+            return resolution
         evidence = resolution_evidence(resolution)
         first = resolution["conflicting"][0]
         raise AtlasManifestResolutionError(

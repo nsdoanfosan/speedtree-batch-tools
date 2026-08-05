@@ -19,7 +19,10 @@ def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
     exact-target adapter before import is both isolated and deterministic.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
-    resolution = resolve_atlas_manifests(target)
+    # BWR consumes paths read-only. Provider overlap or stale metadata cannot
+    # veto the normal SpeedTree export; the diagnostic resolver preserves only
+    # deterministic/disjoint selected claims and keeps mutation unauthorized.
+    resolution = resolve_atlas_manifests(target, diagnostic_only=True)
     resolver_selected_paths = []
     selected_paths = []
     seen = set()
@@ -33,7 +36,12 @@ def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
             # record.  Exact per-target/global records remain authoritative to
             # the strict preflight envelope, but must not be reinterpreted by
             # the add-on's older scope-only overlay reader.
-            if row.get("kind") == "exact_target_scope":
+            if (
+                resolution.get("mutation_authorized") is not False
+                and row.get("kind") == "exact_target_scope"
+                and row.get("reason")
+                != "diagnostic_disjoint_provider_claims"
+            ):
                 selected_paths.append(path)
 
     original = getattr(bwr_core, "_speedtree_manifest_paths", None)
@@ -58,5 +66,10 @@ def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
     ]
     evidence["selected_manifest_paths"] = [
         str(path) for path in selected_paths
+    ]
+    evidence["projected_manifest_paths_withheld"] = [
+        str(Path(row.get("path") or "").resolve(strict=False))
+        for row in resolution.get("selected") or []
+        if row.get("reason") == "diagnostic_disjoint_provider_claims"
     ]
     return evidence

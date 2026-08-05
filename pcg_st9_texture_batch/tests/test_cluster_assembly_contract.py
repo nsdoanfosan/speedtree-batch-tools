@@ -3295,10 +3295,10 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "normalized_variants": normalized,
                 }],
             )
-            self.assertEqual(bark["status"], "replacement_required")
+            self.assertEqual(bark["status"], "preserved_live_variants")
             self.assertEqual(
                 bark["cluster_bark_sources"][0]["replacement"],
-                "required",
+                "not_required",
             )
             self.assertIsNone(
                 bark["cluster_bark_sources"][0][
@@ -3674,7 +3674,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(contract["canonical_material"], bark_name)
             self.assertEqual(len(contract["canonical_sources"]), 1)
 
-    def test_multiple_provider_signatures_cannot_supply_missing_owner_bark(
+    def test_multiple_provider_signatures_are_preserved_live_variants(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3715,10 +3715,18 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
+            self.assertEqual(
+                {
+                    row["replacement"]
+                    for row in contract["cluster_bark_sources"]
+                },
+                {"not_required"},
+            )
 
     def test_same_signature_bark_labels_alias_expected_provider_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3797,7 +3805,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 {"not_required"},
             )
 
-    def test_same_signature_without_expected_identity_stays_blocked(self):
+    def test_same_signature_without_expected_identity_is_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "weed_black_locast"
             target = folder / "SK_tree_black_locast_01.spm"
@@ -3828,10 +3836,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 1)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 1)
 
     def test_same_basenames_in_different_folders_are_not_bark_aliases(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3882,12 +3891,13 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
 
-    def test_direct_owner_bark_requires_same_named_provider_texture_replacement(
+    def test_direct_owner_bark_preserves_distinct_provider_texture_variant(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3923,9 +3933,24 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [{"source_spm": provider, "spm": provider}],
             )
 
-            self.assertEqual(contract["status"], "replacement_required")
+            self.assertEqual(
+                contract["status"], "preserved_live_variants"
+            )
             self.assertEqual(
                 contract["cluster_bark_sources"][0]["replacement"],
+                "not_required",
+            )
+
+            requested = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+                mutation_requested=True,
+            )
+            self.assertEqual(requested["status"], "replacement_required")
+            self.assertEqual(
+                requested["cluster_bark_sources"][0]["replacement"],
                 "required",
             )
 
@@ -3977,10 +4002,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
 
     def test_barkless_owner_and_provider_do_not_invent_canonical_bark(self):
         with tempfile.TemporaryDirectory() as temporary:

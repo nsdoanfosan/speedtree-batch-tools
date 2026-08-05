@@ -2,7 +2,8 @@
 
 Run:
   blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
-      --wind TREE|BUSH|GRASS|NONE --report result.json
+      --wind TREE|BUSH|GRASS|NONE --material-contract preflight.json
+      --report result.json
 
 Runs with --factory-startup and enables only the junction-installed
 speedtree_bone_weight_repair add-on for this process.  This avoids loading every
@@ -54,6 +55,11 @@ from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
+from repair_runtime_contract import (
+    REPAIR_OUTPUT_CONTRACT_VERSION,
+    RepairPipelineEvidenceError,
+    validate_unassigned_geometry_cleanup_evidence,
+)
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -91,7 +97,7 @@ def parse_args():
     parser.add_argument("--speedtree-spm", default="")
     parser.add_argument("--blend", required=True)
     parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
-    parser.add_argument("--material-contract", default="")
+    parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument("--manual-bones-locked", action="store_true")
@@ -759,6 +765,27 @@ def main():
                 canonical_spm.stem,
             )
         result = bwr_core.run_import_and_repair(repair_settings)
+        try:
+            unassigned_geometry_cleanup = (
+                validate_unassigned_geometry_cleanup_evidence(
+                    result,
+                    expected_spm=canonical_spm,
+                    expected_fbx=fbx_export["path"],
+                    require_recheck=True,
+                )
+            )
+        except RepairPipelineEvidenceError as exc:
+            raise RuntimeError(
+                "Blender Repair output contract requires pre-repair "
+                "Default/empty-material geometry cleanup evidence: "
+                f"{exc}"
+            ) from exc
+        report["repair_output_contract_version"] = (
+            REPAIR_OUTPUT_CONTRACT_VERSION
+        )
+        report["unassigned_geometry_cleanup"] = (
+            unassigned_geometry_cleanup
+        )
         report["speedtree_export"] = speedtree_export
         transient_export_reconciliation = None
         if cluster_export_snapshot is not None:

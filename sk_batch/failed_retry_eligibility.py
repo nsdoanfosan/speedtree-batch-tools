@@ -32,6 +32,26 @@ UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
     "unreal_crash",
     "not_run",
 })
+# Durable push states that are stamped *before* Unreal ingest is confirmed.
+# `ready` lands when Blender Repair finishes and the row is handed to the push
+# phase; `exported_pending_unreal` lands when Send2UE export finishes and the
+# Unreal result has not been observed. Neither is a failure and neither is a
+# finished pipeline -- if the push phase stops in between, the row keeps a
+# current .blend and never reaches Unreal on its own.
+PUSH_INCOMPLETE_KINDS = frozenset({
+    "exported_pending_unreal",
+    "ready",
+})
+# These are orchestration-history wrappers, not current asset verdicts.  They
+# may explain why an earlier automatic route stopped, but only a fresh content
+# audit may decide whether the asset can Push.
+AUTOMATION_WRAPPER_RETRY_KINDS = frozenset({
+    "automatic_repair",
+    "automatic_repair_failed",
+    "automatic_repair_reaudit_failed",
+    "planned_excluded",
+    "preflight_skip",
+})
 BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
     "data_error",
     "internal_error",
@@ -158,6 +178,35 @@ def classify_failed_retry(
             parent,
         )
 
+    # These are unfinished Push states, regardless of whether an older parent
+    # manifest is still current.  Parent evidence may safely authorize an
+    # Unreal-only retry after a recorded Unreal failure; it must not convert a
+    # run that never reached Unreal into a terminal success/exclusion.
+    if push_kind in PUSH_INCOMPLETE_KINDS:
+        return _result(
+            BLENDER_REBUILD,
+            "push_never_reached_unreal",
+            (
+                "Blender output is current but the push phase never produced a "
+                f"terminal Unreal result ({push_kind}); regenerate it through "
+                "the full Blender pipeline"
+            ),
+            repair_kind,
+            parent,
+        )
+    if push_kind in AUTOMATION_WRAPPER_RETRY_KINDS:
+        return _result(
+            BLENDER_REBUILD,
+            "automation_wrapper_fresh_pipeline",
+            (
+                "Saved automation status is historical orchestration evidence, "
+                f"not current asset authority ({push_kind}); run the fresh full "
+                "pipeline and let its exact content audit decide"
+            ),
+            repair_kind,
+            parent,
+        )
+
     if parent == UNREAL_PARENT_DEPENDENCY_REBUILD:
         return _result(
             BLENDER_REBUILD,
@@ -168,23 +217,23 @@ def classify_failed_retry(
             parent,
         )
     if parent == UNREAL_PARENT_CURRENT:
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "current_unreal_parent_forced_rebuild",
+                (
+                    "An explicit checked rerun authorizes the full Blender "
+                    "pipeline even when a current immutable Unreal parent "
+                    f"exists ({push_kind or 'missing'})"
+                ),
+                repair_kind,
+                parent,
+            )
         if push_kind in UNREAL_RECOVERY_FAILURE_KINDS:
             return _result(
                 UNREAL_ONLY,
                 "current_immutable_unreal_failure",
                 "Immutable export/source evidence is current",
-                repair_kind,
-                parent,
-            )
-        if force_rerun:
-            return _result(
-                BLENDER_REBUILD,
-                "parent_not_retryable_unreal_failure_forced_rebuild",
-                (
-                    "Unreal parent is current but status is not retryable "
-                    f"({push_kind or 'missing'}); an explicit force rerun "
-                    "authorizes the full Blender pipeline instead"
-                ),
                 repair_kind,
                 parent,
             )
@@ -288,6 +337,7 @@ def classify_failed_retry(
 
 
 __all__ = (
+    "AUTOMATION_WRAPPER_RETRY_KINDS",
     "BLENDER_EXPORT_RETRY_FAILURE_KINDS",
     "BLENDER_REBUILD",
     "BLOCKED",

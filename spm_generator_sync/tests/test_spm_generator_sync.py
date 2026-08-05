@@ -2288,6 +2288,100 @@ class GeneratorSyncTests(unittest.TestCase):
                 ["external_edit.spm"],
             )
 
+    def test_provider_disagreement_does_not_abort_generator_document_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_01.spm"
+            target.write_bytes(b"spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(target),
+                "blend_file": str(root / "provider_a.blend"),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [{
+                        "generator_guid": "guid-leaf-2",
+                        "slot_prefix": "Leaf Mesh 1",
+                        "created_slot": True,
+                        "material_id": 7,
+                    }],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{target.stem}.json").write_text(
+                json.dumps(authority), encoding="utf-8"
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["blend_file"] = str(root / "provider_b.blend")
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing), encoding="utf-8"
+            )
+
+            selected = sync._atlas_target_relation_manifest(target)
+
+            self.assertFalse(selected["_atlas_relation_mutation_authorized"])
+            self.assertEqual(
+                selected["generator_connection"]["bindings"],
+                [],
+            )
+            self.assertEqual(
+                len(selected["_atlas_relation_protection_bindings"]),
+                1,
+            )
+            document = sync.SPMDocument(
+                target,
+                make_target(),
+                compressed=False,
+                full=True,
+            )
+            key = ("guid-leaf-2", "Leaf Mesh 1")
+            self.assertNotIn(key, document.atlas_relation_bindings)
+            self.assertIn(key, document.atlas_relation_protection_bindings)
+
+    def test_conflicting_metadata_binding_is_ignored_not_a_sync_gate(self):
+        first = {
+            "generator_guid": "guid-leaf-2",
+            "slot_prefix": "Leaf Mesh 1",
+            "created_slot": True,
+            "material_id": 7,
+        }
+        competing = dict(first, material_id=8)
+        manifest = {
+            "generator_connection": {
+                "complete": True,
+                "bindings": [first, competing],
+            },
+        }
+        with mock.patch.object(
+            sync,
+            "_atlas_target_relation_manifest",
+            return_value=manifest,
+        ):
+            document = sync.SPMDocument(
+                Path("SK_tree_01.spm"),
+                make_target(),
+                compressed=False,
+                full=True,
+            )
+
+        key = ("guid-leaf-2", "Leaf Mesh 1")
+        self.assertNotIn(key, document.atlas_relation_bindings)
+        self.assertIn(
+            key,
+            document.atlas_relation_ambiguous_binding_keys,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

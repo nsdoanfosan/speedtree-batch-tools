@@ -236,6 +236,17 @@ class RepairPushEvidenceTests(unittest.TestCase):
         ):
             validate_export_object_postcondition(expected, actual)
 
+    def test_export_postcondition_rejects_invalid_face_material_assignment(self):
+        scene = FakeBlenderData([FakeObject("SK_Tree")])
+        scene.collections["Export"].all_objects[0].data.polygons[0].material_index = 1
+        expected = export_object_postcondition(scene)
+
+        with self.assertRaisesRegex(
+            RepairPushEvidenceError,
+            "material assignment is invalid",
+        ):
+            validate_export_object_postcondition(expected, scene)
+
 
 if __name__ == "__main__":
     unittest.main()

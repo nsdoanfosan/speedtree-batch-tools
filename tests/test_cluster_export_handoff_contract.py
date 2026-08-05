@@ -354,6 +354,34 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(finalized, payload)
 
+    def test_normalizer_rebinds_final_pipeline_to_saved_blend(self):
+        payload = {
+            "handoff_preflight": {
+                "status": "ok",
+                "unreal_push_ready": True,
+            },
+            "source_blend_identity": {"sha256": "before"},
+        }
+        identity = {
+            "path": "C:/fixture/SK_branch_elm_01.blend",
+            "exists": True,
+            "size": 123,
+            "mtime_ns": 456,
+            "sha256": "a" * 64,
+        }
+
+        finalized, changed = finalize_cluster_pipeline_payload(
+            payload,
+            export_issues=[],
+            source_blend_identity=identity,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(finalized["source_blend_identity"], identity)
+        self.assertEqual(
+            payload["source_blend_identity"], {"sha256": "before"}
+        )
+
     def test_atomic_report_write_replaces_complete_json(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "report.json"

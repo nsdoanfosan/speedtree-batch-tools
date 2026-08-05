@@ -575,6 +575,55 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
             self.assertTrue(rollback.is_file())
             self.assertGreater(len(rollback.read_bytes()), 0)
 
+    def test_explorer_copy_siblings_are_reportable_but_not_live(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = (
+                write_spm(root / "SK_copy_habitat_01.spm"),
+                write_spm(root / "SK_authored - copy habitat.spm"),
+            )
+            inventory_copies = (
+                write_spm(root / "SK_tree_02 - \uBCF5\uC0AC\uBCF8.spm"),
+                write_spm(root / "SK_tree_02 - Copy.spm"),
+                write_spm(root / "SK_tree_02 - copy (2).spm"),
+            )
+
+            for spm in authored:
+                with self.subTest(authored=spm.name):
+                    self.assertTrue(is_live_spm(spm))
+            for spm in inventory_copies:
+                with self.subTest(inventory_copy=spm.name):
+                    self.assertFalse(is_live_spm(spm))
+                    self.assertTrue(spm.is_file())
+            self.assertFalse(
+                is_live_spm(
+                    root / "SK_missing - Copy.spm",
+                    require_file=False,
+                )
+            )
+            self.assertTrue(
+                is_live_spm(root / "SK_missing_authored.spm", require_file=False)
+            )
+
+            canonical = root / "SK_tree_02.spm"
+            with mock.patch.object(
+                pipeline_contract,
+                "_canonical_path",
+                return_value=canonical,
+            ):
+                self.assertFalse(
+                    is_live_spm(
+                        root / "SK_tree_02 - Copy.spm",
+                        require_file=False,
+                    )
+                )
+                self.assertFalse(
+                    is_live_spm(
+                        root / "_spm_backups" / "SK_tree_02.spm",
+                        require_file=False,
+                    )
+                )
+
     def test_pcg_production_group_uses_numeric_suffix_not_token_allowlist(self):
         self.assertEqual(
             derived_material_base(

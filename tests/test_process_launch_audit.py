@@ -30,6 +30,13 @@ MANUAL_HANDOFF_CALLS = {
         "external_handoff_startfile",
     ),
 }
+BAT_LAUNCHERS = {
+    "SpeedTree_Artifact_Maintenance.bat",
+    "SpeedTree_Batch_Tools.bat",
+    "pcg_st9_texture_batch/PCG_ST9_Texture_Batch.bat",
+    "sk_batch/SK_Batch.bat",
+    "spm_generator_sync/SPM_Generator_Sync.bat",
+}
 
 
 def _production_sources():
@@ -101,7 +108,10 @@ class ProcessLaunchAuditTests(unittest.TestCase):
         launchers = sorted(REPO_DIR.glob("*.bat")) + sorted(
             REPO_DIR.glob("*/*.bat")
         )
-        self.assertEqual(len(launchers), 4)
+        self.assertEqual(
+            {path.relative_to(REPO_DIR).as_posix() for path in launchers},
+            BAT_LAUNCHERS,
+        )
         for launcher in launchers:
             text = launcher.read_text(encoding="utf-8", errors="replace")
             with self.subTest(launcher=launcher.name):

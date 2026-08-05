@@ -914,7 +914,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             xml_declaration=True,
         )
 
-    def test_marker_only_atlas_ownership_emits_the_shadow_issue(self):
+    def test_marker_only_atlas_ownership_is_silent_mutation_diagnostic(self):
         issues = preflight.preflight_contract_issues({
             "spm": "SK_atlas.spm",
             "leaf_reference_contract": {
@@ -927,16 +927,72 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             },
         })
 
-        self.assertIn(
-            {
-                "code": "ATLAS_OWNERSHIP_PROVENANCE_MISMATCH",
-                "severity": "warning",
-            },
-            [
-                {"code": issue["code"], "severity": issue["severity"]}
-                for issue in issues
-            ],
-        )
+        self.assertEqual(issues, [])
+
+    def test_provider_claim_disagreement_does_not_abort_texture_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_overlapping_providers.spm"
+            spm.write_bytes(b"fixture-spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(spm),
+                "blend_file": str(root / "provider_a.blend"),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_leaf_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{spm.stem}.json").write_text(
+                json.dumps(authority),
+                encoding="utf-8",
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["blend_file"] = str(root / "provider_b.blend")
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                preflight,
+                "read_stmat_material_sources",
+                return_value={"materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value={"materials": []},
+            ), mock.patch.object(
+                preflight,
+                "extract_material_image_refs",
+                return_value=[],
+            ):
+                readiness = preflight.augment_texture_readiness_contract(
+                    {"bindings": [], "warnings": [], "missing": []},
+                    root / "SK_overlapping_providers.stmat",
+                    spm,
+                )
+
+            diagnostic = readiness["atlas_manifest_diagnostic"]
+            self.assertEqual(
+                diagnostic["status"],
+                "provider_claim_disagreement",
+            )
+            self.assertFalse(diagnostic["mutation_authorized"])
+            self.assertTrue(diagnostic["resolution"]["conflicting"])
+            self.assertEqual(readiness["warnings"], [])
+            self.assertEqual(readiness["missing"], [])
 
     def run_preflight(self, spm, report_path):
         args = argparse.Namespace(
@@ -1180,7 +1236,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 },
             )
 
-    def test_unbound_managed_mesh_blocks_when_material_keeps_others(
+    def test_unbound_marker_only_missing_mesh_is_not_export_authority(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1206,8 +1262,8 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             exited, export_mock = self.run_preflight(spm, report_path)
 
-            self.assertTrue(exited)
-            export_mock.assert_not_called()
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
             contract = json.loads(
                 report_path.read_text(encoding="utf-8")
             )["mesh_file_reference_contract"]
@@ -1220,8 +1276,11 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 contract["orphan_missing"][0]["usage"],
                 "managed_orphan",
             )
-            self.assertTrue(
+            self.assertFalse(
                 contract["atlas_consumer_integrity"]["blocking"]
+            )
+            self.assertTrue(
+                contract["atlas_consumer_integrity"]["mutation_blocking"]
             )
 
     def test_final_managed_material_mesh_stays_a_blocking_reference(self):

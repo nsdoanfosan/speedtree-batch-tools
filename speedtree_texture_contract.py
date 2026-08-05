@@ -1395,16 +1395,26 @@ def resolve_manifest_material_output(
     production_spm,
     material_id="",
     material_name="",
+    *,
+    equivalent_spms=(),
 ):
-    """Resolve one manifest output, preferring exact material ID."""
-    spm_key = _path_key(production_spm)
+    """Resolve one manifest output, preferring exact material ID.
+
+    ``equivalent_spms`` is deliberately proof-fed by the caller.  Naming
+    similarity alone never expands a target; a receipt-validated Cluster
+    canonical/legacy pair may supply the only additional identity.
+    """
+    spm_keys = {_path_key(production_spm)}
+    spm_keys.update(
+        _path_key(value) for value in equivalent_spms if str(value).strip()
+    )
     material_id = str(material_id or "").strip()
     material_name_key = str(material_name or "").strip().casefold()
     id_matches = []
     name_matches = []
     for output in manifest.get("outputs") or []:
         for target in output.get("material_targets") or []:
-            if _path_key(target.get("spm") or "") != spm_key:
+            if _path_key(target.get("spm") or "") not in spm_keys:
                 continue
             target_id = str(target.get("material_id") or "").strip()
             target_name = str(target.get("material_name") or "").strip()

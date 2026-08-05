@@ -888,6 +888,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             }]
             handoff_contract["canonical_bark"] = {
                 "status": "replacement_required",
+                "mutation_requested": True,
                 "canonical_material": "M_bark_elm_01",
                 "cluster_bark_sources": [{
                     "cluster_spm": str(provider),
@@ -931,7 +932,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "M_bark_elm_01",
             )
 
-    def test_ambiguous_canonical_bark_preserves_provider_texture_conflicts(self):
+    def test_legacy_ambiguous_bark_audit_does_not_block_live_variants(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_tree_black_locast_01.spm"
@@ -992,20 +993,19 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             handoff = build_assembly_handoff(receipt, spm, inventory)
 
-            issue = next(
-                row
+            self.assertNotEqual(handoff["status"], "blocked", handoff)
+            self.assertFalse(any(
+                row.get("code") == "CANONICAL_BARK_AMBIGUOUS"
                 for row in handoff["issues"]
-                if row["code"] == "CANONICAL_BARK_AMBIGUOUS"
-            )
+            ))
             self.assertEqual(
-                issue["reason"],
-                "blocked_canonical_ambiguous",
+                handoff["canonical_bark_delivery"],
+                {
+                    "status": "blocked_canonical_ambiguous",
+                    "mutation_requested": False,
+                    "normalization_gate_applied": False,
+                },
             )
-            self.assertEqual(
-                issue["canonical_material"],
-                "M_bark_black_locast_01",
-            )
-            self.assertEqual(issue["canonical_conflicts"], conflicts)
 
     def test_exact_isolated_bark_capture_satisfies_stale_receipt_request(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1048,6 +1048,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             }]
             handoff_contract["canonical_bark"] = {
                 "status": "replacement_required",
+                "mutation_requested": True,
                 "canonical_material": "M_bark_elm_01",
                 "cluster_bark_sources": [{
                     "cluster_spm": str(provider),

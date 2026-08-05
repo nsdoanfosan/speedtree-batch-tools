@@ -50,6 +50,7 @@ from generator_delivery_scope import (
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+    generator_guid_key,
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     spm_file_structural_semantic_fingerprint,
@@ -774,7 +775,9 @@ def _material_rows(audit, spm):
     return rows
 
 
-def _canonical_bark_contract(audit, folder, target_spms, dependencies):
+def _canonical_bark_contract(
+        audit, folder, target_spms, dependencies,
+        mutation_requested=False):
     expected = f"bark_{_asset_species(folder)}_01"
     species = _asset_species(folder)
     # Older authored trees can retain the owner-folder token in the rendered
@@ -892,28 +895,25 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                 ),
             })
     canonical_conflicts = []
-    if not canonical and sources:
-        provider_groups = {}
-        for row in sources:
-            authority = normalize_export_name(row.get("material_name"))
-            authored_refs = [
-                str(value).strip()
-                for value in row.get("texture_refs") or []
-                if str(value).strip()
-            ]
-            # Provider-label aliasing is safe only for the exact same physical
-            # texture sequence.  Basenames alone are insufficient because two
-            # libraries can contain different files with the same names.
-            texture_signature = tuple(
-                _normalized_identity_path(
-                    _resolve_ref(Path(row["cluster_spm"]), value)
-                )
-                for value in authored_refs
+    provider_groups = {}
+    for row in sources:
+        authority = normalize_export_name(row.get("material_name"))
+        authored_refs = [
+            str(value).strip()
+            for value in row.get("texture_refs") or []
+            if str(value).strip()
+        ]
+        texture_signature = tuple(
+            _normalized_identity_path(
+                _resolve_ref(Path(row["cluster_spm"]), value)
             )
-            provider_groups.setdefault(
-                (authority, texture_signature),
-                [],
-            ).append(row)
+            for value in authored_refs
+        )
+        provider_groups.setdefault(
+            (authority, texture_signature),
+            [],
+        ).append(row)
+    if not canonical and sources:
         live_signatures = {
             signature
             for _authority, signature in provider_groups
@@ -963,7 +963,7 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                     != provider_identity
                 ):
                     row["canonical_alias_of"] = provider_identity
-        else:
+        elif mutation_requested:
             canonical_conflicts = [
                 {
                     "material_identity": identity,
@@ -979,8 +979,51 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                 for (identity, texture_signature), rows
                 in sorted(provider_groups.items())
             ]
+    live_variants = [
+        {
+            "material_identity": identity,
+            "texture_basenames": [
+                Path(value).name.casefold()
+                for value in (rows[0].get("texture_refs") or [])
+            ],
+            "texture_identities": list(texture_signature),
+            "providers": sorted({
+                row["cluster_spm"] for row in rows
+            }),
+        }
+        for (identity, texture_signature), rows
+        in sorted(provider_groups.items())
+    ]
+    live_texture_signatures = {
+        signature for _identity, signature in provider_groups
+    }
+
+    # This builder is a read-only delivery audit.  Different live bark slots,
+    # labels, and texture sets are valid SpeedTree authoring and are preserved
+    # unless an exact merge/replacement mutation was explicitly requested.
+    # A historical canonical convention is evidence, not authority to rewrite
+    # or strand the current render geometry.
+    live_variant_mismatch = any(
+        row.get("replacement") == "required" for row in sources
+    )
+    if not mutation_requested:
+        for row in sources:
+            if row.get("replacement") == "required":
+                row["replacement"] = "not_required"
+                row["normalization_evidence"] = None
+        canonical_conflicts = []
+
     if not canonical and not sources:
         status = "not_applicable"
+    elif (
+        not mutation_requested
+        and (
+            not canonical
+            or live_variant_mismatch
+            or len(live_texture_signatures) > 1
+        )
+    ):
+        status = "preserved_live_variants"
     elif canonical_conflicts:
         status = "blocked_canonical_ambiguous"
     elif not canonical:
@@ -994,11 +1037,14 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
         "canonical_material": (
             display_export_name(canonical[0]["material_name"])
             if canonical
-            else f"M_{expected}" if sources else None
+            else display_export_name(sources[0]["material_name"])
+            if sources else None
         ),
         "canonical_sources": canonical,
         "canonical_conflicts": canonical_conflicts,
+        "live_variants": live_variants,
         "cluster_bark_sources": sources,
+        "mutation_requested": bool(mutation_requested),
         "mutation_applied": False,
     }
 
@@ -2091,11 +2137,91 @@ def _positive_asset_id(value):
 
 
 def _delivery_binding_slot_identity(binding):
-    """Use authored Generator identity, never XML array position."""
-    # Legacy audit snapshots can omit Generator type/name while retaining the
-    # semantic slot prefix.  Preserve that established matching behavior here;
-    # explicit authored scope validation uses the strict shared default.
-    return canonical_slot_identity(binding, strict=False)
+    """Return the compatibility identity for historical live audit rows.
+
+    New sealed delivery receipts hash exact opaque GUID and slot-prefix text.
+    Older live snapshots predate that contract and may use the alternate
+    Modeler GUID spelling or case variants, so this read-only join retains the
+    established semantic comparison without changing sealed receipt hashes.
+    """
+    if isinstance(binding, dict):
+        prefix = str(
+            binding.get("slot_prefix")
+            or str(binding.get("material_property") or "").rsplit(":", 1)[0]
+        ).strip().casefold()
+        guid = generator_guid_key(binding.get("generator_guid"))
+        generator_type = str(
+            binding.get("generator_type") or ""
+        ).strip().casefold()
+        generator_name = str(
+            binding.get("generator_name") or ""
+        ).strip().casefold()
+    elif isinstance(binding, (list, tuple)):
+        parts = tuple(str(part or "").strip() for part in binding)
+        kind = parts[0].casefold() if parts else ""
+        if kind == "guid" and len(parts) == 3:
+            guid = generator_guid_key(parts[1])
+            prefix = parts[2].casefold()
+            generator_type = ""
+            generator_name = ""
+        elif kind == "named" and len(parts) == 4:
+            guid = ""
+            generator_type = parts[1].casefold()
+            generator_name = parts[2].casefold()
+            prefix = parts[3].casefold()
+        else:
+            raise GeneratorDeliveryScopeError(
+                "Generator delivery slot identity is incomplete"
+            )
+    else:
+        raise GeneratorDeliveryScopeError(
+            "Generator delivery slot identity must be an object or list"
+        )
+    if guid and prefix:
+        return ("guid", guid, prefix)
+    identity = (
+        "named",
+        generator_type,
+        generator_name,
+        prefix,
+    )
+    if not prefix:
+        raise GeneratorDeliveryScopeError(
+            "Generator delivery slot identity has no semantic prefix"
+        )
+    return identity
+
+
+def _historical_semantic_delivery_connection(connection):
+    """Project a pre-exact receipt onto its historical semantic identities.
+
+    #163 producer receipts now seal opaque GUID/prefix text.  Older receipts
+    were legitimately sealed with the case-folded Modeler join used by this
+    consumer at the time.  Replaying that projection is compatibility
+    validation of the existing hashes, not a rewrite or a weaker new seal.
+    """
+
+    projected = copy.deepcopy(connection)
+    field = "authored_bindings" if "authored_bindings" in projected else "bindings"
+    rows = projected.get(field)
+    if not isinstance(rows, list) or not rows:
+        raise GeneratorDeliveryScopeError(
+            "historical delivery bindings are missing"
+        )
+    projected[field] = [
+        {
+            "slot_identity": list(_delivery_binding_slot_identity(row)),
+            "target_material_id": row.get("target_material_id"),
+            "target_mesh_id": row.get("target_mesh_id"),
+        }
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    if len(projected[field]) != len(rows):
+        raise GeneratorDeliveryScopeError(
+            "historical delivery bindings contain a non-object row"
+        )
+    return projected
 
 
 def _stale_node_table_evidence(binding):
@@ -2398,12 +2524,15 @@ def _normalized_generator_delivery(
         ),
         "generator_variant_policy": variant_policy or None,
         "delivery_scope_mode": "legacy_strict",
+        "delivery_scope_identity_mode": None,
         "delivery_scope_intent_sha256": None,
         "delivery_scope_required_live_slot_count": len(bindings),
         "delivery_scope_continuity_only_slot_count": 0,
         # Populated only from a fully validated explicit delivery intent.
         # Recovery callers must not reconstruct intent from live observations.
         "recovery_target_scope": None,
+        "mutation_authorized": True,
+        "metadata_diagnostics": [],
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
@@ -2569,10 +2698,11 @@ def _normalized_generator_delivery(
     )
     slot_identity = _delivery_binding_slot_identity
     explicit_scope = connection.get("delivery_scope") is not None
+    invalid_scope_diagnostic = False
     scope_contract = None
     if explicit_scope:
+        provider_blend = str(payload.get("blend_file") or "").strip()
         try:
-            provider_blend = str(payload.get("blend_file") or "").strip()
             if not provider_blend:
                 raise GeneratorDeliveryScopeError(
                     "explicit delivery scope manifest has no provider blend"
@@ -2584,23 +2714,52 @@ def _normalized_generator_delivery(
                 provider_blend=provider_blend,
                 target_spm_postwrite_sha256=snapshot_sha256,
             )
-        except GeneratorDeliveryScopeError as exc:
-            evidence["delivery_scope_mode"] = "explicit_invalid"
-            evidence["errors"].append(
-                "generator_delivery_scope_invalid:" + str(exc)
-            )
-            return _finalize_normalized_generator_delivery(evidence)
+            evidence["delivery_scope_identity_mode"] = "exact_opaque_v1"
+        except GeneratorDeliveryScopeError as exact_error:
+            try:
+                if not provider_blend:
+                    raise exact_error
+                scope_contract = validate_resolved_delivery_scope(
+                    _historical_semantic_delivery_connection(connection),
+                    target_spm=production_spm,
+                    material_id=expected_material_id,
+                    provider_blend=provider_blend,
+                    target_spm_postwrite_sha256=snapshot_sha256,
+                )
+                evidence["delivery_scope_identity_mode"] = (
+                    "historical_semantic_compatibility"
+                )
+            except GeneratorDeliveryScopeError as compatibility_error:
+                invalid_scope_diagnostic = True
+                explicit_scope = False
+                scope_contract = None
+                evidence["delivery_scope_mode"] = (
+                    "explicit_invalid_diagnostic"
+                )
+                evidence["mutation_authorized"] = False
+                evidence["metadata_diagnostics"].append({
+                    "code": "generator_delivery_scope_invalid",
+                    "exact_validation_error": str(exact_error),
+                    "historical_validation_error": str(
+                        compatibility_error
+                    ),
+                    "asset_failure": False,
+                })
         evidence["delivery_scope_mode"] = "explicit_sealed_v1"
-        evidence["delivery_scope_intent_sha256"] = scope_contract[
-            "intent_sha256"
-        ]
+        if scope_contract is None:
+            evidence["delivery_scope_mode"] = "explicit_invalid_diagnostic"
+        else:
+            evidence["delivery_scope_intent_sha256"] = scope_contract[
+                "intent_sha256"
+            ]
+    if scope_contract is not None:
         evidence["delivery_scope_required_live_slot_count"] = len(
             scope_contract["required_live_slot_identities"]
         )
         evidence["delivery_scope_continuity_only_slot_count"] = len(
             scope_contract["continuity_only_slot_identities"]
         )
-        required_slot_identities = scope_contract[
+        exact_required_slot_identities = scope_contract[
             "required_live_slot_identities"
         ]
         recovery_target_scope = {
@@ -2615,7 +2774,8 @@ def _normalized_generator_delivery(
             "required_live_mesh_ids": sorted({
                 row["target_mesh_id"]
                 for row in scope_contract["authored_slots"]
-                if tuple(row["slot_identity"]) in required_slot_identities
+                if tuple(row["slot_identity"])
+                in exact_required_slot_identities
             }),
         }
         recovery_target_scope["scope_sha256"] = canonical_sha256(
@@ -2650,12 +2810,50 @@ def _normalized_generator_delivery(
     evidence[
         "live_export_participating_target_mesh_ids"
     ] = live_mesh_ids
-    if normalized_mesh_ids != declared_mesh_ids:
+    if invalid_scope_diagnostic:
+        # The contradictory metadata cannot define legacy authority.  Rebuild
+        # the inspection rows from this SHA-bound live document and use them
+        # only for content admission.  No recovery/mutation scope is emitted.
+        live_fallback_bindings = []
+        for row in live_bindings:
+            material_id = _positive_asset_id(row.get("material_id"))
+            mesh_id = _positive_asset_id(row.get("mesh_id"))
+            incomplete_visible_pair = bool(
+                export_participates(row)
+                and (material_id is None or mesh_id is None)
+            )
+            if not (
+                material_id == expected_material_id
+                or mesh_id in set(normalized_mesh_ids)
+                or incomplete_visible_pair
+            ):
+                continue
+            projected = dict(row)
+            projected["target_material_id"] = material_id
+            projected["target_mesh_id"] = mesh_id
+            live_fallback_bindings.append(projected)
+        bindings = live_fallback_bindings
+        declared_mesh_ids = sorted({
+            _positive_asset_id(row.get("target_mesh_id"))
+            for row in bindings
+            if _positive_asset_id(row.get("target_mesh_id")) is not None
+        })
+        evidence["generator_bindings"] = [dict(row) for row in bindings]
+        evidence["declared_target_mesh_ids"] = declared_mesh_ids
+        evidence["declared_binding_count"] = len(bindings)
+        evidence["delivery_scope_required_live_slot_count"] = len(bindings)
+    if (
+        not invalid_scope_diagnostic
+        and normalized_mesh_ids != declared_mesh_ids
+    ):
         evidence["errors"].append(
             "normalized_and_declared_target_mesh_sets_differ"
         )
+    asset_required_mesh_ids = (
+        declared_mesh_ids if invalid_scope_diagnostic else normalized_mesh_ids
+    )
     missing_assets = sorted(
-        set(normalized_mesh_ids).difference(live_asset_mesh_ids)
+        set(asset_required_mesh_ids).difference(live_asset_mesh_ids)
     )
     if missing_assets:
         evidence["errors"].append("target_mesh_asset_missing")
@@ -2717,12 +2915,14 @@ def _normalized_generator_delivery(
             planned_inactive_slots.add(declared_slot)
 
     if explicit_scope:
-        required_slot_identities = scope_contract[
-            "required_live_slot_identities"
-        ]
-        continuity_only_slot_identities = scope_contract[
-            "continuity_only_slot_identities"
-        ]
+        required_slot_identities = {
+            tuple(_delivery_binding_slot_identity(row))
+            for row in scope_contract["required_live_slot_identities"]
+        }
+        continuity_only_slot_identities = {
+            tuple(_delivery_binding_slot_identity(row))
+            for row in scope_contract["continuity_only_slot_identities"]
+        }
         required_bindings = [
             row for row in bindings
             if tuple(slot_identity(row)) in required_slot_identities
@@ -2913,11 +3113,32 @@ def _normalized_generator_delivery(
             for row in evidence["binding_outcomes"]
         )
     )
-    if all_bindings_planned_inactive:
+    all_required_bindings_not_currently_admitted = bool(
+        required_bindings
+        and not evidence["errors"]
+        and not admission_required_bindings
+        and len(admission_excluded_bindings) == len(required_bindings)
+        and evidence["current_admission_relevant_binding_count"] == 0
+        and evidence["current_admission_excluded_binding_count"]
+        == len(required_bindings)
+    )
+    if invalid_scope_diagnostic and not bindings and not evidence["errors"]:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "invalid_scope_metadata_live_content_unbound"
+        )
+    elif all_bindings_planned_inactive:
         evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
         evidence["delivery_decision"] = "pass_through"
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
+        )
+    elif all_required_bindings_not_currently_admitted:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "current_export_trustworthy_zero_geometry"
         )
     elif (
         explicit_scope
@@ -3021,6 +3242,7 @@ def _atlas_normalized_variants(
     target_spms,
     audit=None,
     physical_receipt_cache=None,
+    atlas_resolution_reader=None,
 ):
     """Read one current role contract from stable Atlas target/scope receipts."""
     allowed_spms = {
@@ -3028,10 +3250,11 @@ def _atlas_normalized_variants(
     }
     if not allowed_spms:
         return None
+    resolution_reader = atlas_resolution_reader or resolve_atlas_manifests
     atlas_resolutions = []
     for target in target_spms or []:
         try:
-            atlas_resolutions.append(resolve_atlas_manifests(target))
+            atlas_resolutions.append(resolution_reader(target))
         except AtlasManifestResolutionError as exc:
             raise ClusterAssemblyReceiptError(str(exc)) from exc
     candidates = []
@@ -3988,7 +4211,7 @@ def _validate_normalized_source_dependency(normalized_variants, output_spm):
 
 def build_cluster_assembly_contract(
         folder, target_spms, clusters, cluster_usage=None,
-        assembly_source_spms=None):
+        assembly_source_spms=None, atlas_resolution_reader=None):
     """Build hierarchy and downstream handoff from actual SPM dependencies."""
     try:
         from . import pcg_texture_audit as audit
@@ -4120,6 +4343,7 @@ def build_cluster_assembly_contract(
                 full_target_spms,
                 audit=audit,
                 physical_receipt_cache=physical_receipt_cache,
+                atlas_resolution_reader=atlas_resolution_reader,
             )
             try:
                 _validate_normalized_source_dependency(
@@ -4415,7 +4639,10 @@ def build_cluster_assembly_contract(
                 f"M_bark_{_asset_species(folder)}_01"
             ),
             "canonical_sources": [],
+            "canonical_conflicts": [],
+            "live_variants": [],
             "cluster_bark_sources": [],
+            "mutation_requested": False,
             "mutation_applied": False,
         }
     decisions = {

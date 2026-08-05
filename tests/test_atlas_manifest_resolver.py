@@ -435,6 +435,130 @@ class AtlasManifestResolverTests(unittest.TestCase):
                         str(authority.resolve()),
                     )
 
+    def test_read_only_diagnostic_mode_keeps_deterministic_live_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, target, _blend, payload = self.fixture(temporary)
+            authority = self.write_candidate(
+                root,
+                target,
+                "exact_per_target",
+                payload,
+            )
+            conflicting = copy.deepcopy(payload)
+            conflicting["material_groups"][0]["mesh_ids"] = [99]
+            conflict = self.write_candidate(
+                root,
+                target,
+                "exact_global_target",
+                conflicting,
+            )
+
+            resolution = resolve_atlas_manifests(
+                target,
+                diagnostic_only=True,
+            )
+
+            self.assertEqual(
+                [row["path"] for row in resolution["selected"]],
+                [str(authority.resolve())],
+            )
+            self.assertEqual(
+                resolution["selected"][0]["payload"]["material_groups"][0][
+                    "mesh_ids"
+                ],
+                [20],
+            )
+            self.assertEqual(
+                resolution["conflicting"][0]["path"],
+                str(conflict.resolve()),
+            )
+            self.assertTrue(resolution["diagnostic_only"])
+            self.assertFalse(resolution["mutation_authorized"])
+            self.assertEqual(
+                resolution_evidence(resolution)["diagnostic_status"],
+                "atlas_manifest_metadata_disagreement",
+            )
+
+    def test_diagnostic_mode_keeps_disjoint_role_from_conflicting_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, target, _blend, payload = self.fixture(temporary)
+            authority = self.write_candidate(
+                root,
+                target,
+                "exact_per_target",
+                payload,
+            )
+            mixed = copy.deepcopy(payload)
+            mixed["material_groups"][0]["mesh_ids"] = [99]
+            mixed["material_groups"].append({
+                "material": "M_branch_unique",
+                "material_id": 8,
+                "mesh_ids": [30],
+            })
+            mixed.update({
+                "material_name": "M_leaf_test",
+                "material_id": 7,
+                "mesh_ids": [99],
+                "source_material_adoption": {
+                    "material_name": "M_leaf_test",
+                    "material_id": 7,
+                    "final_material_mesh_ids": [99],
+                },
+                "normalized_prototype_receipt": {
+                    "physical_capture_contract": {"contract_sha256": "stale"},
+                },
+                "unit_probe_contract": {"contract_sha256": "stale"},
+            })
+            mixed["generator_connection"] = {"complete": True, "bindings": []}
+            provider = self.write_candidate(
+                root,
+                target,
+                "exact_target_scope",
+                mixed,
+                name=f"mixed__{target.stem}.json",
+            )
+
+            resolution = resolve_atlas_manifests(
+                target,
+                diagnostic_only=True,
+            )
+
+            self.assertEqual(
+                [row["path"] for row in resolution["selected"]],
+                [str(authority.resolve()), str(provider.resolve())],
+            )
+            projected = resolution["selected"][1]
+            self.assertEqual(
+                projected["payload"]["material_groups"],
+                [{
+                    "material": "M_branch_unique",
+                    "material_id": 8,
+                    "mesh_ids": [30],
+                }],
+            )
+            self.assertEqual(
+                projected["ownership_claims"],
+                ["material_id:8", "material_name:m_branch_unique"],
+            )
+            self.assertIn(
+                "material_id:7",
+                projected["diagnostic_excluded_claims"],
+            )
+            self.assertEqual(
+                projected["payload"]["material_name"],
+                "M_branch_unique",
+            )
+            self.assertEqual(projected["payload"]["material_id"], 8)
+            self.assertEqual(projected["payload"]["mesh_ids"], [30])
+            self.assertIsNone(
+                projected["payload"]["source_material_adoption"]
+            )
+            self.assertNotIn(
+                "normalized_prototype_receipt",
+                projected["payload"],
+            )
+            self.assertNotIn("unit_probe_contract", projected["payload"])
+
     def test_unsupported_operational_schema_is_a_conflict(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, target, _blend, payload = self.fixture(temporary)

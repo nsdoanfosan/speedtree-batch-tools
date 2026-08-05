@@ -49,6 +49,7 @@ sys.path.insert(0, str(TOOL_DIR))
 from process_lifecycle import owned_run
 
 from code_compile_gate import (
+    CODE_REVISION_RESTART_ROUTE,
     CompileGateError,
     production_source_manifest,
     run_gate as run_code_compile_gate,
@@ -83,6 +84,7 @@ from repair_orchestration import (
     STATUS_PENDING,
     STATUS_PIPELINE,
     STATUS_REAUDIT,
+    STEP3_STANDARD,
     build_exact_target_repair_plan,
     compact_success_message,
     evidence_reason_codes,
@@ -236,6 +238,7 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
 )
 from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
 from repair_runtime_contract import (
+    LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_RUNTIME_RECEIPT_VERSION,
     addon_dir_from_config,
@@ -243,6 +246,7 @@ from repair_runtime_contract import (
     repair_runtime_code_paths,
     repair_runtime_code_state,
     repair_runtime_output_contract,
+    repair_pipeline_output_contract,
     repair_runtime_receipt_needs_migration,
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
@@ -281,9 +285,6 @@ _REGISTERED_RELATION_REPAIR_LOCK = threading.RLock()
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
-# Temporary production drain mode: select only owner rows that already have
-# cluster/*.spm providers but do not yet have a local Assembly output.
-TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS = True
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
@@ -1673,10 +1674,20 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
     try:
         registry = load_target_registry(blend)
     except TargetRegistryError as exc:
+        diagnostic_targets = [
+            str(Path(value).expanduser().absolute())
+            for value in target_spms
+        ]
         return {
-            "current": False,
+            # An unreadable registry cannot select a writer.  It removes
+            # mutation authority, but it is not evidence that the current
+            # live target is unsafe to export.
+            "current": True,
             "reason": f"target_registry_invalid: {exc}",
             "targets": [],
+            "actionable_targets": [],
+            "metadata_diagnostic_targets": diagnostic_targets,
+            "mutation_authorized": False,
         }
     registered = {
         normalized_path_key(value)
@@ -1697,8 +1708,21 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
         row for row in rows
         if row.get("status") != "synced"
     ]
+    diagnostic_stale = []
+    actionable_stale = []
+    for row in stale:
+        resolution = row.get("atlas_manifest_resolution") or {}
+        # Every refresh reason on this row was derived from the selected
+        # manifest payload.  When resolver ownership is diagnostic-only, no
+        # such reason may pick that Provider for a mutation -- including
+        # physical-capture/source-FBX drift.  Independent live content audit,
+        # not disputed metadata, decides whether export can continue.
+        if resolution.get("mutation_authorized") is False:
+            diagnostic_stale.append(row)
+        else:
+            actionable_stale.append(row)
     return {
-        "current": not stale,
+        "current": not actionable_stale,
         "reason": "; ".join(
             f"{Path(row['target_spm']).name}:{row.get('status')}"
             + (
@@ -1706,9 +1730,16 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
                 if row.get("refresh_reasons")
                 else ""
             )
-            for row in stale
+            for row in actionable_stale
         ),
         "targets": rows,
+        "actionable_targets": [
+            row["target_spm"] for row in actionable_stale
+        ],
+        "metadata_diagnostic_targets": [
+            row["target_spm"] for row in diagnostic_stale
+        ],
+        "mutation_authorized": not diagnostic_stale,
     }
 
 
@@ -2185,6 +2216,44 @@ class BatchItemError(RuntimeError):
         self.report = report or {}
         self.log_file = log_file
         self.report_file = report_file
+
+
+class CodeRevisionRestartRequired(RuntimeError):
+    """Job-level control flow when loaded code no longer matches disk."""
+
+    route = CODE_REVISION_RESTART_ROUTE
+
+    def __init__(
+        self,
+        compile_error,
+        *,
+        context,
+        report=None,
+        log_file=None,
+        report_file=None,
+    ):
+        details = copy.deepcopy(
+            getattr(compile_error, "details", {}) or {}
+        )
+        details.update({
+            "route": CODE_REVISION_RESTART_ROUTE,
+            "status": CODE_REVISION_RESTART_ROUTE,
+            "context": str(context),
+        })
+        message = (
+            f"{context}: {compile_error}\n\n"
+            "SK Batch를 안전하게 종료한 뒤 다시 시작하고 같은 작업을 "
+            "실행하세요. 이 상태는 자산 실패가 아닙니다."
+        )
+        details["message"] = message
+        super().__init__(message)
+        self.details = details
+        self.report = copy.deepcopy(report or {})
+        self.log_file = log_file
+        self.report_file = report_file
+
+    def as_dict(self):
+        return copy.deepcopy(self.details)
 
 
 class InlineAtlasRepairRequested(BatchItemError):
@@ -3560,8 +3629,6 @@ class App:
                 ),
             )
             self.row_copy_paths[iid] = [spm]
-        if TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS:
-            self._set_temporary_cluster_without_assembly_push_rows()
         self.checked_rows.sync_after_reload()
         save_state(self.state)
         cache_count = sum(
@@ -4364,6 +4431,11 @@ class App:
 
     def _start_next_batch_job(self):
         self._ensure_batch_queue_state()
+        if isinstance(
+            getattr(self, "_code_revision_restart_required", None),
+            dict,
+        ):
+            return
         if self.active_batch_job is not None or not self.pending_batch_jobs:
             return
         job = self.pending_batch_jobs.popleft()
@@ -4403,6 +4475,75 @@ class App:
         )
         self.worker.start()
 
+    def _production_source_revision_precheck(self):
+        latched = getattr(
+            self,
+            "_code_revision_restart_required",
+            None,
+        )
+        if isinstance(latched, dict):
+            return copy.deepcopy(latched)
+        try:
+            current = production_source_manifest(REPO_DIR)
+            validate_production_source_manifest(
+                _PROCESS_PRODUCTION_SOURCE_MANIFEST,
+                current,
+                label="Preflight production source",
+            )
+        except CompileGateError as exc:
+            return CodeRevisionRestartRequired(
+                exc,
+                context="Code revision preflight requires an app restart",
+            )
+        return None
+
+    def _present_code_revision_restart_required(self, requirement):
+        details = (
+            requirement.as_dict()
+            if isinstance(requirement, CodeRevisionRestartRequired)
+            else copy.deepcopy(requirement or {})
+        )
+        details.update({
+            "route": CODE_REVISION_RESTART_ROUTE,
+            "status": CODE_REVISION_RESTART_ROUTE,
+        })
+        message = str(
+            details.get("message")
+            or "Code revision changed. Restart SK Batch before retrying."
+        )
+        details["message"] = message
+        signature = (
+            str(details.get("expected_revision") or ""),
+            str(details.get("actual_revision") or ""),
+        )
+        if not any(signature):
+            signature = (
+                hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "",
+            )
+        self._code_revision_restart_required = copy.deepcopy(details)
+        progress_var = getattr(self, "progress_var", None)
+        if callable(getattr(progress_var, "set", None)):
+            progress_var.set(
+                "code_revision_restart_required · SK Batch 재시작 필요"
+            )
+        if signature != getattr(
+            self,
+            "_last_code_revision_restart_notice_signature",
+            None,
+        ):
+            self._last_code_revision_restart_notice_signature = signature
+            if callable(getattr(self, "log", None)):
+                self.log(
+                    "[code_revision_restart_required]\n" + message
+                )
+            messagebox.showwarning(
+                "SK Batch 재시작 필요",
+                message,
+                parent=getattr(self, "root", None),
+            )
+        return details
+
     def _freeze_batch_production_source_manifest(self):
         gate_result = run_code_compile_gate(
             REPO_DIR,
@@ -4416,10 +4557,11 @@ class App:
                 label="Batch-start production source",
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Production sources changed after the GUI process loaded; "
-                "restart SK Batch before running another batch: " + str(exc),
-                kind="internal_error",
+            raise CodeRevisionRestartRequired(
+                exc,
+                context=(
+                    "Production sources changed after the GUI process loaded"
+                ),
             ) from exc
         self._active_production_source_manifest = manifest
         self.log(
@@ -4449,10 +4591,11 @@ class App:
                 label="Parent production source",
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Production source revision changed during the active batch: "
-                + str(exc),
-                kind="internal_error",
+            raise CodeRevisionRestartRequired(
+                exc,
+                context=(
+                    "Production source revision changed during the active batch"
+                ),
             ) from exc
         return expected
 
@@ -4470,10 +4613,11 @@ class App:
                 expected_manifest,
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Cluster Assembly live audit worker revision mismatch: "
-                + str(exc),
-                kind="internal_error",
+            raise CodeRevisionRestartRequired(
+                exc,
+                context=(
+                    "Cluster Assembly live audit worker revision mismatch"
+                ),
                 report=payload if isinstance(payload, dict) else None,
                 log_file=log_file,
                 report_file=report_file,
@@ -4497,6 +4641,7 @@ class App:
             "shared_failures": [],
         }
         lease = None
+        revision_restart = None
         tracker = self._retry_tracker_for_job(job)
         retry_partition = str(
             (job.get("retry_metadata") or {}).get("partition") or ""
@@ -4634,6 +4779,18 @@ class App:
                     getattr(self, "_phase_abort_reason", None)
                     or "작업이 완료되지 않음"
                 )
+        except CodeRevisionRestartRequired as exc:
+            revision_restart = exc.as_dict()
+            error = str(exc)
+            status = CODE_REVISION_RESTART_ROUTE
+            summary["job_route"] = CODE_REVISION_RESTART_ROUTE
+            summary[CODE_REVISION_RESTART_ROUTE] = copy.deepcopy(
+                revision_restart
+            )
+            self.log(
+                f"[대기열 #{job['id']}] "
+                f"{CODE_REVISION_RESTART_ROUTE}\n{error}"
+            )
         except WaitCancelled:
             error = "공용 대기열 대기 중 취소됨"
             status = "stopped"
@@ -4660,34 +4817,76 @@ class App:
                             **summary,
                         },
                     }
-                    if status == "stopped":
+                    if status in {
+                        "stopped",
+                        CODE_REVISION_RESTART_ROUTE,
+                    }:
                         finish_options["terminal_status"] = "cancelled"
                     lease.finish(**finish_options)
                 except Exception as queue_exc:
-                    error = compact_error_message(queue_exc)
-                    status = "failed"
-                    if tracker is not None and retry_partition:
-                        reconciled = tracker.reconcile_queue(
-                            getattr(self, "shared_queue_runtime", None).queue
+                    queue_error = compact_error_message(queue_exc)
+                    summary.setdefault("job_diagnostics", []).append({
+                        "stage": "shared_queue_finalization",
+                        "error": queue_error,
+                        "asset_failure": False,
+                        "owner_lost": bool(
+                            getattr(lease, "heartbeat_error", None)
+                        ),
+                    })
+                    if status == CODE_REVISION_RESTART_ROUTE:
+                        # The revision fence is higher-priority job control
+                        # flow. Failure to publish the queue receipt is useful
+                        # owner/queue evidence, but cannot manufacture an
+                        # asset failure or erase the required restart route.
+                        summary["queue_finalization_error"] = queue_error
+                        error = (
+                            f"{error}\nShared queue finalization diagnostic: "
+                            f"{queue_error}"
                         )
-                        if not reconciled and lease.heartbeat_error is not None:
-                            tracker.mark_partition_terminal(
-                                retry_partition,
-                                RETRY_STAGE_OWNER_LOST,
-                                "shared queue lease lost before receipt finalization",
+                    else:
+                        error = queue_error
+                        status = "failed"
+                        if tracker is not None and retry_partition:
+                            reconciled = tracker.reconcile_queue(
+                                getattr(
+                                    self,
+                                    "shared_queue_runtime",
+                                    None,
+                                ).queue
                             )
+                            if (
+                                not reconciled
+                                and lease.heartbeat_error is not None
+                            ):
+                                tracker.mark_partition_terminal(
+                                    retry_partition,
+                                    RETRY_STAGE_OWNER_LOST,
+                                    "shared queue lease lost before receipt finalization",
+                                )
                     self.log(
                         f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
-                        f"{job['label']}: {error}"
+                        f"{job['label']}: {queue_error}"
                     )
             if tracker is not None:
-                self._finalize_retry_progress_for_job(
-                    job,
-                    tracker,
-                    status,
-                    summary,
-                    error,
-                )
+                if status == CODE_REVISION_RESTART_ROUTE:
+                    if retry_partition:
+                        tracker.mark_partition_terminal(
+                            retry_partition,
+                            RETRY_STAGE_CANCELLED,
+                            CODE_REVISION_RESTART_ROUTE,
+                            outcome=RETRY_STAGE_CANCELLED,
+                        )
+                    tracker.finalize(
+                        reason=CODE_REVISION_RESTART_ROUTE
+                    )
+                else:
+                    self._finalize_retry_progress_for_job(
+                        job,
+                        tracker,
+                        status,
+                        summary,
+                        error,
+                    )
             self.__dict__.pop("_active_shared_queue_lease", None)
             self.ui_queue.put((
                 "batch_job_done",
@@ -4842,6 +5041,7 @@ class App:
                 }
             )
         outcome_text = {
+            CODE_REVISION_RESTART_ROUTE: "code revision changed; restart app",
             "completed": "완료",
             "partial": "실패/준비 제외 기록 후 다음 작업 계속",
             "failed": "실패 기록 후 다음 작업 계속",
@@ -4872,13 +5072,64 @@ class App:
             "_inline_atlas_repair_results",
         ):
             self.__dict__.pop(key, None)
+        if status == CODE_REVISION_RESTART_ROUTE:
+            pending_jobs = list(self.pending_batch_jobs)
+            shared_runtime = getattr(self, "shared_queue_runtime", None)
+            if shared_runtime is not None:
+                for pending_job in pending_jobs:
+                    shared_job_id = pending_job.get("shared_queue_job_id")
+                    if not shared_job_id:
+                        continue
+                    try:
+                        shared_runtime.cancel(
+                            shared_job_id,
+                            reason=CODE_REVISION_RESTART_ROUTE,
+                        )
+                        tracker = self._retry_tracker_for_job(pending_job)
+                        partition = str(
+                            (
+                                pending_job.get("retry_metadata") or {}
+                            ).get("partition")
+                            or ""
+                        )
+                        if tracker is not None and partition:
+                            tracker.mark_partition_terminal(
+                                partition,
+                                RETRY_STAGE_CANCELLED,
+                                (
+                                    "code revision changed before shared "
+                                    "queue claim; restart required"
+                                ),
+                            )
+                    except Exception as exc:
+                        self.log(
+                            "[code_revision_restart_required] shared queue "
+                            f"cancellation diagnostic: {shared_job_id} - "
+                            f"{compact_error_message(exc, 200)}"
+                        )
+            dropped_jobs = len(pending_jobs)
+            self.pending_batch_jobs.clear()
+            requirement = copy.deepcopy(
+                payload.get(CODE_REVISION_RESTART_ROUTE) or {}
+            )
+            requirement.setdefault("message", str(error or ""))
+            self._present_code_revision_restart_required(requirement)
+            if dropped_jobs:
+                self.log(
+                    "[code_revision_restart_required] queued jobs held for "
+                    f"safe restart: {dropped_jobs}"
+                )
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
         self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
-        if status == "stopped":
+        if status == CODE_REVISION_RESTART_ROUTE:
+            self.progress_var.set(
+                "code_revision_restart_required; restart SK Batch"
+            )
+        elif status == "stopped":
             self.progress_var.set(
                 "대기열 중지됨 · cancelled "
                 f"{int(payload.get('cancelled_count', 0) or 0)}"
@@ -5503,8 +5754,9 @@ class App:
         error="",
         friendly_reason="",
         remaining_action="",
+        preserve_phase_status=False,
     ):
-        """Persist one non-failure transition or one terminal final failure."""
+        """Persist automation progress without erasing a newer phase verdict."""
 
         iid = str(iid)
         label = AUTOMATIC_REPAIR_STATUS_LABELS.get(status, str(status))
@@ -5530,7 +5782,8 @@ class App:
                 display += f" · 조치: {remaining_action}"
         elif status == STATUS_COMPLETED:
             display = compact_success_message(attempted_stages)
-        self.ui_queue.put(("cell", (iid, "push_status", display)))
+        if not preserve_phase_status:
+            self.ui_queue.put(("cell", (iid, "push_status", display)))
         with self.state_lock:
             entry = self.state.setdefault(iid, {})
             automation = entry.setdefault("failed_retry_automation", {})
@@ -5543,24 +5796,27 @@ class App:
                 }
             automation.update(progress)
             automation["plan"] = plan_payload
-            entry["push_status"] = display
-            entry["push_status_kind"] = (
-                "automatic_repair_failed"
-                if status == STATUS_FINAL_FAILED
-                else "automatic_repair"
-            )
-            if status == STATUS_FINAL_FAILED:
-                entry["push_status_error"] = {
-                    "time": datetime.now().isoformat(timespec="seconds"),
-                    "kind": "automatic_repair_failed",
-                    "message": friendly_reason or "자동 복구 후 재검증 실패",
-                    "attempted_stages": copy.deepcopy(list(attempted_stages)),
-                    "remaining_action": str(remaining_action or ""),
-                    "reason_codes": list(plan_payload.get("reason_codes") or ()),
-                    "raw_error": str(error or ""),
-                }
-            else:
-                entry.pop("push_status_error", None)
+            if not preserve_phase_status:
+                entry["push_status"] = display
+                entry["push_status_kind"] = (
+                    "automatic_repair_failed"
+                    if status == STATUS_FINAL_FAILED
+                    else "automatic_repair"
+                )
+                if status == STATUS_FINAL_FAILED:
+                    entry["push_status_error"] = {
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "automatic_repair_failed",
+                        "message": friendly_reason or "자동 복구 후 재검증 실패",
+                        "attempted_stages": copy.deepcopy(list(attempted_stages)),
+                        "remaining_action": str(remaining_action or ""),
+                        "reason_codes": list(
+                            plan_payload.get("reason_codes") or ()
+                        ),
+                        "raw_error": str(error or ""),
+                    }
+                else:
+                    entry.pop("push_status_error", None)
             save_state(self.state)
         return progress
 
@@ -5779,7 +6035,7 @@ class App:
         global_completed = 0
         outcomes = []
         pipeline_targets = []
-        successful_repair_ids = set()
+        pipeline_reaudit_ids = set()
         cancelled_repair_ids = set()
 
         for plan in plans:
@@ -5809,7 +6065,8 @@ class App:
 
             cancelled = False
             failed = None
-            for stage_index, stage in enumerate(plan.get("stages") or (), 1):
+            exact_stages = list(plan.get("stages") or ())
+            for stage_index, stage in enumerate(exact_stages, 1):
                 if self.stop_flag.is_set():
                     cancelled = True
                     break
@@ -5861,15 +6118,46 @@ class App:
                         f"남음 {max(0, total_stage_count - global_completed)}",
                     ))
 
-                terminal = self._execute_exact_repair_stage(
-                    plan,
-                    stage,
-                    lease,
-                    stage_index=stage_index,
-                    receipt=receipt,
-                    provenance_source="sk_batch.failed_retry",
-                    on_progress=on_exact_progress,
-                )
+                try:
+                    terminal = self._execute_exact_repair_stage(
+                        plan,
+                        stage,
+                        lease,
+                        stage_index=stage_index,
+                        receipt=receipt,
+                        provenance_source="sk_batch.failed_retry",
+                        on_progress=on_exact_progress,
+                    )
+                except CodeRevisionRestartRequired:
+                    raise
+                except WaitCancelled as exc:
+                    attempted.append({
+                        "stage": stage["stage"],
+                        "tool": stage["tool"],
+                        "repair_action": stage["repair_action"],
+                        "targets": list(stage["target_spms"]),
+                        "receipt": str(receipt),
+                        "status": "cancelled",
+                        "error": compact_error_message(exc, 400),
+                    })
+                    cancelled = True
+                    break
+                except Exception as exc:
+                    raw_error = compact_error_message(exc, 400)
+                    attempted.append({
+                        "stage": stage["stage"],
+                        "tool": stage["tool"],
+                        "repair_action": stage["repair_action"],
+                        "targets": list(stage["target_spms"]),
+                        "receipt": str(receipt),
+                        "status": "orchestration_diagnostic",
+                        "error": raw_error,
+                    })
+                    failed = (
+                        "BAT exact repair orchestration failed",
+                        raw_error,
+                    )
+                    break
                 attempted_row = {
                     "stage": stage["stage"],
                     "tool": stage["tool"],
@@ -5895,6 +6183,25 @@ class App:
                     )
                     break
                 global_completed += 1
+                if stage_index < len(exact_stages):
+                    # One exact repair plan is one bounded transaction.  An
+                    # early stage may intentionally prepare inputs that only a
+                    # later registered Generator/Cluster stage makes current.
+                    # Auditing the whole asset at that intermediate boundary
+                    # would create a new checkpoint and strand the remaining
+                    # known repair action.
+                    attempted_row["fresh_reaudit"] = {
+                        "status": "deferred_until_remaining_exact_stages",
+                        "remaining_stage_count": (
+                            len(exact_stages) - stage_index
+                        ),
+                    }
+                    self.ui_queue.put((
+                        "progress",
+                        f"{Path(iid).name}: exact repair stage "
+                        f"{stage_index}/{len(exact_stages)} complete",
+                    ))
+                    continue
                 self._set_failed_retry_automatic_status(
                     iid,
                     STATUS_REAUDIT,
@@ -5912,6 +6219,8 @@ class App:
                     attempted_row["fresh_reaudit"] = (
                         self._fresh_reaudit_after_exact_repair(item, stage)
                     )
+                except CodeRevisionRestartRequired:
+                    raise
                 except Exception as exc:
                     failed = (
                         "fresh re-audit failed",
@@ -5951,29 +6260,32 @@ class App:
                     "raw_error": raw_error,
                     "reason_codes": list(plan.get("reason_codes") or ()),
                 }
-                failure_decision = repair_ui_decision({
-                    "reason_token": failure_token,
-                    "evidence": failure_evidence,
-                })
+                # A BAT process/result failure is orchestration evidence, not
+                # an asset verdict. Preserve it on the immutable retry item
+                # and return to the ordinary full pipeline. Its fresh content
+                # preflight is the only authority that may block this target.
                 self._set_failed_retry_automatic_status(
                     iid,
-                    STATUS_FINAL_FAILED,
+                    STATUS_PIPELINE,
                     plan=plan,
                     attempted_stages=attempted,
                     completed_stages=sum(
                         row.get("status") == "completed" for row in attempted
                     ),
-                    error=raw_error,
-                    friendly_reason=failure_decision["reason"],
-                    remaining_action=failure_decision["action"],
                 )
-                outcomes.append({
-                    "target": iid,
-                    "target_name": Path(iid).name,
-                    "outcome": "failed",
+                item["_failed_retry_attempted_stages"] = attempted
+                item["_failed_retry_stage_diagnostic"] = {
                     "reason_token": failure_token,
+                    "headline": headline,
                     "evidence": failure_evidence,
-                })
+                }
+                pipeline_targets.append(item)
+                pipeline_reaudit_ids.add(iid)
+                self.log(
+                    "[automatic repair diagnostic] BAT result does not gate "
+                    f"export; fresh full pipeline retained: {Path(iid).name} "
+                    f"({failure_token}: {raw_error})"
+                )
                 continue
             self._set_failed_retry_automatic_status(
                 iid,
@@ -5984,7 +6296,7 @@ class App:
             )
             item["_failed_retry_attempted_stages"] = attempted
             pipeline_targets.append(item)
-            successful_repair_ids.add(iid)
+            pipeline_reaudit_ids.add(iid)
 
         pipeline_target_ids = {
             str(item["spm"]) for item in pipeline_targets
@@ -5999,7 +6311,7 @@ class App:
             missing_roots = [
                 root
                 for root in required_roots
-                if root not in successful_repair_ids
+                if root not in pipeline_reaudit_ids
             ]
             if item is not None and required_roots and not missing_roots:
                 if resume_iid not in pipeline_target_ids:
@@ -6096,8 +6408,16 @@ class App:
             for item in pipeline_targets:
                 iid = str(item["spm"])
                 attempted = item.pop("_failed_retry_attempted_stages", [])
+                stage_diagnostic = item.pop(
+                    "_failed_retry_stage_diagnostic",
+                    None,
+                )
                 resumed_by = item.pop("_failed_retry_resumed_by", [])
-                pipeline_row = pipeline_by_id.get(iid, {})
+                pipeline_row = copy.deepcopy(pipeline_by_id.get(iid, {}))
+                if stage_diagnostic and pipeline_row:
+                    pipeline_row.setdefault("evidence", {})[
+                        "automatic_repair_attempt"
+                    ] = copy.deepcopy(stage_diagnostic)
                 plan = plans_by_id.get(iid)
                 pipeline_outcome = str(pipeline_row.get("outcome") or "")
                 if plan is None:
@@ -6116,12 +6436,23 @@ class App:
                         plan=plan,
                         attempted_stages=attempted,
                         completed_stages=len(attempted),
+                        preserve_phase_status=True,
                     )
                     if not fresh_repair_receipt_authoritative(
                         final_receipt, plan
                     ):
-                        raise RuntimeError(
-                            "fresh automatic repair receipt identity mismatch"
+                        pipeline_row.setdefault("evidence", {})[
+                            "automatic_repair_receipt_diagnostic"
+                        ] = {
+                            "status": "identity_mismatch",
+                            "asset_failure": False,
+                            "fresh_pipeline_outcome": "completed",
+                            "receipt": copy.deepcopy(final_receipt),
+                        }
+                        self.log(
+                            "[automatic repair route] completed fresh pipeline "
+                            "owns the target verdict despite receipt bookkeeping "
+                            f"mismatch: {Path(iid).name}"
                         )
                 elif pipeline_outcome == "pending_unreal":
                     self._set_failed_retry_automatic_status(
@@ -6130,6 +6461,7 @@ class App:
                         plan=plan,
                         attempted_stages=attempted,
                         completed_stages=len(attempted),
+                        preserve_phase_status=True,
                     )
                 elif pipeline_outcome == "cancelled" or (
                     not pipeline_outcome and self.stop_flag.is_set()
@@ -6140,6 +6472,7 @@ class App:
                         plan=plan,
                         attempted_stages=attempted,
                         completed_stages=len(attempted),
+                        preserve_phase_status=True,
                     )
                     if not pipeline_row:
                         pipeline_row = {
@@ -6150,30 +6483,17 @@ class App:
                             "evidence": {},
                         }
                 else:
-                    evidence = copy.deepcopy(pipeline_row.get("evidence") or {})
                     retry_token = str(
                         pipeline_row.get("reason_token")
                         or "pipeline_retry_result_missing"
                     )
-                    retry_decision = repair_ui_decision({
-                        "reason_token": retry_token,
-                        "evidence": evidence,
-                    })
-                    raw_error = str(
-                        evidence.get("message")
-                        or evidence.get("raw_error")
-                        or retry_token
-                        or "pipeline retry failed"
-                    )
-                    self._set_failed_retry_automatic_status(
-                        iid,
-                        STATUS_FINAL_FAILED,
-                        plan=plan,
-                        attempted_stages=attempted,
-                        completed_stages=len(attempted),
-                        error=raw_error,
-                        friendly_reason=retry_decision["reason"],
-                        remaining_action=retry_decision["action"],
+                    # `_run_full_pipeline` already persisted the exact current
+                    # content result. Do not overwrite it with the historical
+                    # automation wrapper that preceded this audit.
+                    self.log(
+                        "[automatic repair route] fresh pipeline result owns "
+                        f"the target verdict: {Path(iid).name} "
+                        f"({retry_token})"
                     )
                 outcomes.append(pipeline_row or {
                     "target": iid,
@@ -6186,6 +6506,7 @@ class App:
             for item in pipeline_targets:
                 iid = str(item["spm"])
                 attempted = item.pop("_failed_retry_attempted_stages", [])
+                item.pop("_failed_retry_stage_diagnostic", None)
                 item.pop("_failed_retry_resumed_by", None)
                 plan = plans_by_id.get(iid)
                 if plan is not None:
@@ -6347,12 +6668,30 @@ class App:
                 empty_message,
             )
             return
+        revision_restart = self._production_source_revision_precheck()
+        if revision_restart is not None:
+            return self._present_code_revision_restart_required(
+                revision_restart
+            )
+        # Capture the operator's rerun authority on the Tk owner thread.  The
+        # planner runs in a worker and must never read a live Tk variable.  An
+        # exact checked retry is itself an explicit rerun request; it does not
+        # require a second force checkbox and a historical success receipt
+        # cannot veto it (#175/#178).
+        force_var = getattr(self, "force_var", None)
+        try:
+            force_checked = bool(force_var.get()) if force_var else False
+        except Exception:
+            force_checked = False
+        retry_force_rerun = bool(scope == "checked" or force_checked)
         retry_request = {
             "scope": str(scope),
             "dialog_title": str(dialog_title),
             "empty_message": str(empty_message),
+            "force_rerun": retry_force_rerun,
         }
         cfg = dict(self._collect_cfg())
+        cfg["_retry_force_rerun"] = retry_force_rerun
         inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
             candidate_iids
         )
@@ -6792,6 +7131,20 @@ class App:
                 )
             except (FileNotFoundError, TypeError, ValueError) as exc:
                 raw_error = compact_error_message(exc, 240)
+                if Path(iid).is_file():
+                    # A repair-plan/provenance wrapper is not export
+                    # authority.  Keep the exact diagnostic, then let the
+                    # phase classifier run a fresh full pipeline; concrete
+                    # current content failures will be reported by that
+                    # pipeline instead of by a zero-stage automation record.
+                    planning_context.counters[
+                        "repair_plan_diagnostics_routed_to_pipeline"
+                    ] += 1
+                    deferred_logs.append(
+                        "[retry routing] repair plan unavailable; fresh full "
+                        f"pipeline retained for {Path(iid).name}: {raw_error}"
+                    )
+                    continue
                 plan = RepairPlan(
                     REPAIR_PLAN_SCHEMA_VERSION,
                     request_id,
@@ -6833,6 +7186,17 @@ class App:
                     plan=plan,
                 )
             else:
+                if Path(iid).is_file():
+                    planning_context.counters[
+                        "unsupported_repair_routed_to_pipeline"
+                    ] += 1
+                    deferred_logs.append(
+                        "[retry routing] metadata/repair plan is not an "
+                        "export gate; fresh full pipeline retained for "
+                        f"{Path(iid).name}: "
+                        f"reason_codes={','.join(plan.reason_codes)}"
+                    )
+                    continue
                 unsupported_plans[iid] = plan
                 defer_status(
                     iid,
@@ -7060,14 +7424,9 @@ class App:
                 last_completed=iid,
             )
 
-        # The retry planner also runs in contexts that never built the options
-        # widgets, so read the force request defensively and default to the
-        # ordinary exclusion when it is unavailable.
-        force_var = getattr(self, "force_var", None)
-        try:
-            retry_force_rerun = bool(force_var.get()) if force_var else False
-        except Exception:
-            retry_force_rerun = False
+        # This immutable value was captured on the Tk owner thread before the
+        # async planner started and is part of the plan-cache signature.
+        retry_force_rerun = bool(cfg.get("_retry_force_rerun"))
 
         def classify(iid):
             return classify_failed_retry(
@@ -7302,6 +7661,18 @@ class App:
                         )
                     else:
                         decision = decisions[iid]
+                        if (
+                            decision.classification
+                            == CURRENT_BLENDER_EXCLUDED
+                        ):
+                            tracker.transition(
+                                iid,
+                                RETRY_STAGE_COMPLETE,
+                                diagnostic=decision.diagnostic,
+                                terminal_reason=decision.reason_code,
+                                outcome=RETRY_STAGE_COMPLETE,
+                            )
+                            continue
                         tracker.transition(
                             iid,
                             RETRY_STAGE_BLOCKED,
@@ -7572,6 +7943,19 @@ class App:
                     )
                 else:
                     decision = decisions[iid]
+                    if (
+                        decision.classification
+                        == CURRENT_BLENDER_EXCLUDED
+                        and iid not in missing_ids
+                    ):
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_COMPLETE,
+                            diagnostic=decision.diagnostic,
+                            terminal_reason=decision.reason_code,
+                            outcome=RETRY_STAGE_COMPLETE,
+                        )
+                        continue
                     tracker.transition(
                         iid,
                         RETRY_STAGE_BLOCKED,
@@ -7624,6 +8008,20 @@ class App:
             workers.difference_update(finished_workers)
             workers.discard(current)
         tracker = plan.get("tracker")
+        revision_restart = self._production_source_revision_precheck()
+        if revision_restart is not None:
+            if tracker is not None:
+                tracker.finish_planning(
+                    RETRY_STAGE_CANCELLED,
+                    CODE_REVISION_RESTART_ROUTE,
+                )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return self._present_code_revision_restart_required(
+                revision_restart
+            )
         error = plan.get("error")
         if self.stop_flag.is_set() and tracker is not None:
             tracker.finish_planning(
@@ -7698,6 +8096,8 @@ class App:
         for message in plan.get("deferred_logs") or ():
             self.log(message)
         cfg = dict(plan.get("cfg") or {})
+        persisted_cfg = dict(cfg)
+        persisted_cfg.pop("_retry_force_rerun", None)
         artifact = plan.get("_planning_cache_artifact")
         planning_session_id = plan.get("_planning_session_id")
         if (
@@ -7724,7 +8124,7 @@ class App:
                     side_effects_committed=True,
                 )
         try:
-            save_config(cfg)
+            save_config(persisted_cfg)
         except Exception as exc:
             error = compact_error_message(exc)
             if tracker is not None:
@@ -7764,6 +8164,9 @@ class App:
             return None
         enqueued = []
         for job in jobs:
+            job_cfg = dict(job.get("cfg") or {})
+            job_cfg.pop("_retry_force_rerun", None)
+            job["cfg"] = job_cfg
             if self.stop_flag.is_set():
                 if tracker is not None:
                     partition = (job.get("retry_metadata") or {}).get(
@@ -7801,6 +8204,11 @@ class App:
         if not target_iids:
             messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
             return
+        revision_restart = self._production_source_revision_precheck()
+        if revision_restart is not None:
+            return self._present_code_revision_restart_required(
+                revision_restart
+            )
         cfg = dict(self._collect_cfg())
         save_config(cfg)
         inventory, targets = self._snapshot_batch_request(target_iids)
@@ -9567,6 +9975,8 @@ class App:
                     progress=True,
                     heartbeat=True,
                 )
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 full_reason = str(exc)
                 reason = compact_error_message(full_reason)
@@ -10042,10 +10452,12 @@ class App:
         return proc.returncode, log_file
 
     @staticmethod
-    def _repair_contract_current(spm):
+    def _repair_contract_current(spm, pipeline_out=None):
         """Prove the saved blend/report came from the current SPM content."""
         try:
             report = load_current_repair_pipeline_report(spm)
+            if isinstance(pipeline_out, dict):
+                pipeline_out["payload"] = report
             if (report.get("handoff_preflight") or {}).get("status") not in {
                 "ok", "source_review",
             }:
@@ -10326,11 +10738,12 @@ class App:
                 getattr(self, "cfg", {}) or {},
                 addon_dir=addon_dir,
                 code_state=state,
+                blend=blend_path_for(spm),
             )
         except OSError as exc:
             self.log(f"  [② 경고] Repair 런타임 기록 실패: {spm.name}: {exc}")
 
-    def _repair_runtime_fresh(self, spm):
+    def _repair_runtime_fresh(self, spm, content_contract_out=None):
         """Gate only on an explicit saved-output contract revision.
 
         Producer source hashes are retained in the receipt for diagnostics,
@@ -10356,7 +10769,60 @@ class App:
                 candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 candidate = None
+        # This loader owns the narrow structural-semantic migration for
+        # texture-path-only SPM rewrites. Run it before exact v2 pipeline proof
+        # so a supported migration can refresh the report identity first.
+        pipeline_probe = {}
+        content_contract_current = self._repair_contract_current(
+            spm,
+            pipeline_out=pipeline_probe,
+        )
+        if isinstance(content_contract_out, dict):
+            content_contract_out["current"] = content_contract_current
+        pipeline_payload = pipeline_probe.get("payload")
+        if not isinstance(pipeline_payload, dict):
+            try:
+                pipeline_payload = _read_repair_pipeline_json(report_path)
+            except (OSError, ValueError):
+                pipeline_payload = None
+        pipeline_contract = repair_pipeline_output_contract(
+            pipeline_payload,
+            spm=spm,
+            blend=blend,
+            source_identity_already_validated=content_contract_current,
+        )
         saved_contract = repair_runtime_output_contract(candidate)
+        pipeline_proved_upgrade = False
+        if pipeline_contract != REPAIR_OUTPUT_CONTRACT_VERSION:
+            return False, (
+                "Blender Repair report does not prove the current "
+                "Default/empty-material cleanup output contract; rerun "
+                "Blender Repair"
+            )
+        if saved_contract not in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+            REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            return False, (
+                "Blender Repair saved-output contract changed; rerun "
+                "Blender Repair "
+                f"({saved_contract} -> "
+                f"{REPAIR_OUTPUT_CONTRACT_VERSION})"
+            )
+        if saved_contract in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            if not content_contract_current:
+                return False, (
+                    "Blender Repair cleanup evidence does not match the "
+                    "current source/output contract; rerun Blender Repair"
+                )
+            saved_contract = pipeline_contract
+            pipeline_proved_upgrade = True
+        if saved_contract is None:
+            saved_contract = pipeline_contract
         if (
             saved_contract is not None
             and saved_contract != REPAIR_OUTPUT_CONTRACT_VERSION
@@ -10375,7 +10841,10 @@ class App:
         # stale, and an old receipt can never bless stale artifacts.
         if (
             repair_runtime_receipt_needs_migration(candidate)
-            and self._repair_contract_current(spm)
+            and (
+                pipeline_proved_upgrade
+                or content_contract_current
+            )
         ):
             planning = self._failed_retry_planning_context()
             if planning is not None:
@@ -10435,7 +10904,11 @@ class App:
                 "kind": "missing_blend",
                 "reason": "생성 필요 — blend 없음 → ② Blender Repair",
             }
-        runtime_fresh, runtime_reason = self._repair_runtime_fresh(spm)
+        content_contract_probe = {}
+        runtime_fresh, runtime_reason = self._repair_runtime_fresh(
+            spm,
+            content_contract_out=content_contract_probe,
+        )
         if not runtime_fresh:
             return {
                 "current": False,
@@ -10443,7 +10916,9 @@ class App:
                 "kind": "output_contract",
                 "reason": runtime_reason,
             }
-        receipt_current = self._repair_contract_current(spm)
+        receipt_current = content_contract_probe.get("current")
+        if not isinstance(receipt_current, bool):
+            receipt_current = self._repair_contract_current(spm)
         assembly_state = None
         assembly_dependency_contract = {}
 
@@ -10955,8 +11430,13 @@ class App:
             )
         return Path(result.get("canonical_spm") or spm)
 
-    def _run_inline_atlas_manifest_repair(self, spm, failure_report):
-        """Run one exact mirror repair under the already-owned batch lease."""
+    def _run_inline_atlas_manifest_repair(
+        self,
+        spm,
+        failure_report,
+        repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
+    ):
+        """Run one exact PCG/Atlas repair under the owned batch lease."""
 
         from pcg_st9_texture_batch.exact_target_repair import (
             execute_step3_standard,
@@ -10970,7 +11450,11 @@ class App:
                 kind="automatic_repair_pending",
                 report=copy.deepcopy(failure_report),
             )
-        key = os.path.normcase(os.path.abspath(str(spm))).casefold()
+        key = (
+            str(repair_action).casefold()
+            + "\0"
+            + os.path.normcase(os.path.abspath(str(spm))).casefold()
+        )
         # Known before any stage runs, and the only thing on this path that
         # says what the repair was for.  The failure branch below has to carry
         # it onto the durable row; the cached path never reaches the block
@@ -10990,7 +11474,7 @@ class App:
                 )
                 if cached_status != "completed":
                     terminal = copy.deepcopy(cached)
-                else:
+                elif repair_action == ATLAS_MANIFEST_MIRROR_REPAIR:
                     current_plan = atlas_manifest_mirror_repair_plan(spm)
                     if current_plan.get("status") == "not_needed":
                         terminal = copy.deepcopy(cached)
@@ -11000,6 +11484,8 @@ class App:
                         # successful receipt, decides whether another exact repair
                         # is required.
                         cached = None
+                else:
+                    terminal = copy.deepcopy(cached)
             if cached is None:
                 active_job = getattr(self, "active_batch_job", None) or {}
                 retry_metadata = copy.deepcopy(
@@ -11023,9 +11509,13 @@ class App:
                 reason_codes = list(root_reason_codes)
                 request = build_exact_target_request(
                     tool=PCG_TEXTURE_TOOL,
-                    repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
+                    repair_action=repair_action,
                     target_spms=[spm],
-                    repair_stage="atlas_manifest_repair",
+                    repair_stage=(
+                        "atlas_manifest_repair"
+                        if repair_action == ATLAS_MANIFEST_MIRROR_REPAIR
+                        else "pcg_texture"
+                    ),
                     provenance={
                         "reason_codes": reason_codes,
                         "source": "sk_batch.inline_atlas_preflight",
@@ -11078,27 +11568,55 @@ class App:
                     or (terminal.get("result") or {}).get("reason")
                     or "exact BAT Atlas manifest 복구 실패"
                 )
-                raise BatchItemError(
-                    "Atlas manifest 자동 복구 실패: "
-                    + compact_error_message(raw_error, 320),
-                    kind="automatic_repair_failed",
-                    report={
-                        "repair_disposition": REPAIR_UI_BLOCKED,
+                diagnostic = {
+                    "status": "diagnostic_only",
+                    "mutation_authorized": False,
+                    "reason_codes": list(root_reason_codes),
+                    "repair_attempt": {
+                        "status": "failed",
+                        "error": compact_error_message(raw_error, 320),
+                        "receipt": copy.deepcopy(terminal),
+                    },
+                    "original_failure": copy.deepcopy(failure_report),
+                }
+                # This refresh writes metadata. Its process result is not
+                # authority over a valid live SpeedTree graph. The caller
+                # still performs a fresh audit and only concrete content from
+                # that audit may stop export.
+                self.log(
+                    "[Atlas metadata diagnostic] exact refresh did not "
+                    "complete; export remains admitted to fresh content "
+                    f"audit: {spm.name} "
+                    f"({diagnostic['repair_attempt']['error']})"
+                )
+                return diagnostic
+            result = copy.deepcopy(terminal.get("result") or {})
+            if repair_action == STEP3_STANDARD:
+                try:
+                    return refresh_atlas_manifests_for_spm(
+                        spm,
+                        require_complete=True,
+                    )
+                except CanonicalOutputManifestError as exc:
+                    diagnostic = {
+                        "status": "diagnostic_only",
+                        "mutation_authorized": False,
                         "reason_codes": list(root_reason_codes),
-                        REPAIR_FAILURE_KEY: build_repair_failure(
-                            request_id=str(terminal.get("request_id") or ""),
-                            root_reason_codes=root_reason_codes,
-                            planned_actions=[ATLAS_MANIFEST_MIRROR_REPAIR],
-                            failed_stage="atlas_manifest_repair",
-                            failure_code="automatic_repair_failed",
-                            failure_report=str(terminal.get("receipt") or ""),
-                            error=compact_error_message(raw_error, 320),
+                        "repair_attempt": {
+                            "status": "completed_but_reaudit_unresolved",
+                            "receipt": copy.deepcopy(terminal),
+                        },
+                        "fresh_reaudit": copy.deepcopy(
+                            getattr(exc, "report", {}) or {}
                         ),
                         "original_failure": copy.deepcopy(failure_report),
-                        "exact_repair_receipt": copy.deepcopy(terminal),
-                    },
-                )
-            result = copy.deepcopy(terminal.get("result") or {})
+                    }
+                    self.log(
+                        "[Canonical mapping diagnostic] exact PCG refresh "
+                        "completed but metadata mapping remains unresolved; "
+                        f"fresh live audit continues: {spm.name}"
+                    )
+                    return diagnostic
             self.log(
                 "[자동 복구 완료] Canonical PCG → Atlas manifest · "
                 f"{spm.name}"
@@ -11127,7 +11645,14 @@ class App:
             failure_report = copy.deepcopy(getattr(exc, "report", {}) or {})
             decision = repair_ui_decision(failure_report)
             automatic = decision["status"] == REPAIR_UI_AUTOMATIC
-            if automatic:
+            failure_stage = str(failure_report.get("stage") or "")
+            atlas_metadata_only = failure_stage == "atlas_manifest_resolution"
+            canonical_mapping_repair = (
+                failure_stage == "canonical_material_mapping"
+            )
+            if automatic and (
+                atlas_metadata_only or canonical_mapping_repair
+            ):
                 return self._run_inline_atlas_manifest_repair(
                     spm,
                     {
@@ -11140,7 +11665,33 @@ class App:
                         "action_ko": decision["action"],
                         **failure_report,
                     },
+                    repair_action=(
+                        STEP3_STANDARD
+                        if canonical_mapping_repair
+                        else ATLAS_MANIFEST_MIRROR_REPAIR
+                    ),
                 )
+            if atlas_metadata_only:
+                # Canonical publication is a metadata mutation. Multiple or
+                # disagreeing Providers do not invalidate current SpeedTree
+                # content, so skip only this write and continue into the fresh
+                # material/Cluster audit. Concrete canonical texture failures
+                # use another stage and remain actionable errors below.
+                diagnostic = {
+                    "status": "diagnostic_only",
+                    "mutation_authorized": False,
+                    "target_spm": str(spm),
+                    "canonical_manifest": None,
+                    "updated": [],
+                    "current": [],
+                    "pending": [],
+                    "atlas_manifest_diagnostic": failure_report,
+                }
+                self.log(
+                    "[Atlas metadata diagnostic] canonical publication "
+                    f"skipped; live audit continues: {spm.name}"
+                )
+                return diagnostic
             raise BatchItemError(
                 "최종 차단: Canonical PCG → Atlas 사전 검사 · "
                 f"원인: {decision['reason']} · 조치: {decision['action']}",
@@ -11297,9 +11848,40 @@ class App:
         state = cluster_relation_refresh_state(spm, targets)
         if state["current"]:
             return {
-                "status": "ok",
+                "status": (
+                    "pass_through"
+                    if state.get("metadata_diagnostic_targets")
+                    else "ok"
+                ),
                 "no_change": True,
                 "targets": state["targets"],
+                "reason": (
+                    "provider_metadata_diagnostic_only"
+                    if state.get("metadata_diagnostic_targets")
+                    else "already_current"
+                ),
+                "metadata_diagnostic_targets": list(
+                    state.get("metadata_diagnostic_targets") or ()
+                ),
+            }
+        actionable_targets = state.get("actionable_targets")
+        if actionable_targets is None:
+            # Compatibility for older cached/test projections.  Current
+            # production states always publish the exact mutation subset.
+            actionable_targets = targets
+        actionable_targets = [
+            Path(value).expanduser().absolute()
+            for value in actionable_targets
+        ]
+        if not actionable_targets:
+            return {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "provider_metadata_diagnostic_only",
+                "targets": state.get("targets") or [],
+                "metadata_diagnostic_targets": list(
+                    state.get("metadata_diagnostic_targets") or ()
+                ),
             }
         self.log(
             f"Cluster Normalizer/Atlas 자동 재생성: {Path(spm).name}"
@@ -11309,7 +11891,7 @@ class App:
             with cluster_relation_owner_lock(spm):
                 result = run_cluster_relation_transaction(
                     blend_path_for(spm),
-                    targets,
+                    actionable_targets,
                     enabled=True,
                     blender_exe=Path(self.cfg["blender_exe"]),
                     unit_probe_path=Path(self.cfg["cluster_unit_probe"]),
@@ -11322,18 +11904,39 @@ class App:
                     ),
                 )
         except Exception as exc:
-            raise BatchItemError(
-                "Cluster Normalizer/Atlas 자동 재생성 실패: " + str(exc),
-                kind="data_error",
-            ) from exc
+            diagnostic = {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "cluster_refresh_orchestration_diagnostic",
+                "targets": state["targets"],
+                "attempted": True,
+                "error": compact_error_message(exc),
+                "asset_failure": False,
+            }
+            self.log(
+                "Cluster Normalizer/Atlas 자동 재생성은 진단으로만 남기고 "
+                f"fresh pipeline을 계속합니다: {Path(spm).name} · "
+                f"{diagnostic['error']}"
+            )
+            return diagnostic
         verified = cluster_relation_refresh_state(spm, targets)
         if not verified["current"]:
-            raise BatchItemError(
-                "Cluster Normalizer/Atlas 재생성 후 실제 출력 검증 실패: "
-                + verified["reason"],
-                kind="data_error",
-                report=result,
+            diagnostic = {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "cluster_refresh_reaudit_diagnostic",
+                "targets": verified["targets"],
+                "attempted": True,
+                "result": result,
+                "fresh_audit": verified,
+                "asset_failure": False,
+            }
+            self.log(
+                "Cluster Normalizer/Atlas fresh audit는 현재 live content "
+                f"pipeline으로 이관합니다: {Path(spm).name} · "
+                f"{verified['reason']}"
             )
+            return diagnostic
         self.log(f"Cluster Normalizer/Atlas 갱신 완료: {Path(spm).name}")
         return result
 
@@ -11757,7 +12360,7 @@ class App:
 
         for candidate in owner.rglob("*.spm"):
             if (
-                candidate.is_file()
+                is_live_spm(candidate)
                 and not is_temporary_contract_path(candidate)
             ):
                 paths.add(candidate.resolve())
@@ -12037,55 +12640,16 @@ class App:
                         repair_request.target_spm,
                         repair_request.report,
                     )
-                    try:
-                        raw_audit = self._refresh_stale_cluster_receipt_uncached(
-                            spm,
-                            f"{audit_stamp}_atlas_repaired",
-                            _raw_only=True,
-                        )
-                    except InlineAtlasRepairRequested as repeated:
-                        raise BatchItemError(
-                            "Atlas manifest 자동 복구 후 재검사에도 같은 충돌이 남았습니다.",
-                            kind="automatic_repair_failed",
-                            report={
-                                "stage": "cluster_assembly_live_audit",
-                                "repair_disposition": REPAIR_UI_BLOCKED,
-                                "reason_codes": list(
-                                    repair_root_reason_codes(
-                                        repair_request.report
-                                    )
-                                ),
-                                REPAIR_FAILURE_KEY: build_repair_failure(
-                                    root_reason_codes=(
-                                        repair_root_reason_codes(
-                                            repair_request.report
-                                        )
-                                    ),
-                                    planned_actions=[
-                                        ATLAS_MANIFEST_MIRROR_REPAIR
-                                    ],
-                                    failed_stage="atlas_manifest_repair",
-                                    failure_code=(
-                                        "automatic_repair_reaudit_failed"
-                                    ),
-                                    failure_report=str(
-                                        repeated.report_file or ""
-                                    ),
-                                    error=(
-                                        "same Atlas manifest conflict after "
-                                        "the exact mirror repair"
-                                    ),
-                                ),
-                                "first_failure": copy.deepcopy(
-                                    repair_request.report
-                                ),
-                                "repeated_failure": copy.deepcopy(
-                                    repeated.report
-                                ),
-                            },
-                            log_file=repeated.log_file,
-                            report_file=repeated.report_file,
-                        ) from repeated
+                    # The read-only audit consumes Atlas disagreement as
+                    # diagnostics while retaining the identity-bound Assembly
+                    # graph.  Even if the optional exact metadata refresh did
+                    # not change anything, this second run returns real live
+                    # contract evidence rather than a synthetic pass-through.
+                    raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                        spm,
+                        f"{audit_stamp}_atlas_repaired",
+                        _raw_only=True,
+                    )
                 post_discovery_records = []
                 post_discovery_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
@@ -12448,35 +13012,17 @@ class App:
                             log_file=log_file,
                             report_file=audit_report,
                         )
-                    status_prefix = (
-                        "자동 복구 실패"
-                        if decision["status"] == REPAIR_UI_AUTOMATIC
-                        else "최종 차단"
-                    )
-                    audit_root_codes = repair_root_reason_codes(
-                        failure_report
-                    )
                     raise BatchItemError(
-                        f"{status_prefix}: Cluster Assembly live audit · "
-                        f"원인: {decision['reason']} · 조치: {decision['action']}",
-                        kind=(
-                            "automatic_repair_failed"
-                            if decision["status"] == REPAIR_UI_AUTOMATIC
-                            else "data_error"
-                        ),
+                        "Cluster Assembly child returned a strict Atlas "
+                        "metadata failure instead of a diagnostic live "
+                        f"contract: {spm.name}",
+                        kind="internal_error",
                         report={
                             "stage": "cluster_assembly_live_audit",
-                            "repair_disposition": decision["status"],
-                            "reason_ko": decision["reason"],
-                            "action_ko": decision["action"],
-                            "reason_codes": list(audit_root_codes),
-                            REPAIR_FAILURE_KEY: build_repair_failure(
-                                root_reason_codes=audit_root_codes,
-                                failed_stage="cluster_assembly_live_audit",
-                                failure_code=failure_token,
-                                failure_report=str(audit_report or ""),
+                            "asset_failure": False,
+                            "unexpected_strict_atlas_failure": copy.deepcopy(
+                                failure_report
                             ),
-                            **failure_report,
                         },
                         log_file=log_file,
                         report_file=audit_report,
@@ -14284,12 +14830,18 @@ class App:
                 "--cluster-source-build-only",
             )
         parallel = self.cfg.get("blender_parallel_jobs", 2) > 1
-        code, log_file = self._run_limited(
-            cmd,
-            f"{spm.stem}_bwr_{stamp}.log",
-            self.cfg.get("blender_job_timeout", 3600),
-            affinity=not parallel,
-        )
+        self._assert_active_production_source_manifest()
+        try:
+            code, log_file = self._run_limited(
+                cmd,
+                f"{spm.stem}_bwr_{stamp}.log",
+                self.cfg.get("blender_job_timeout", 3600),
+                affinity=not parallel,
+            )
+        finally:
+            # A code change while Blender is running is a restart route, never
+            # evidence that this asset failed its repair contract.
+            self._assert_active_production_source_manifest()
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             if cluster_source:
@@ -15141,16 +15693,22 @@ class App:
         disk_export_timeout = max(1, int(
             self.cfg.get("push_job_timeout", 1800)
         ))
-        code, log_file = self._run_limited(
-            cmd,
-            export_log_name,
-            None,
-            affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
-            inactivity_timeout=disk_export_timeout,
-            inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                stage_timeout, disk_export_timeout
-            ),
-        )
+        self._assert_active_production_source_manifest()
+        try:
+            code, log_file = self._run_limited(
+                cmd,
+                export_log_name,
+                None,
+                affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+                inactivity_timeout=disk_export_timeout,
+                inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                    stage_timeout, disk_export_timeout
+                ),
+            )
+        finally:
+            # Send2UE output produced across two code revisions is discarded by
+            # the parent restart fence and must not create an asset failure.
+            self._assert_active_production_source_manifest()
         result = load_job_report(export_report)
         if code != 0 or result.get("status") != "exported_pending_unreal":
             reason = summarize_job_failure(result, log_file)
@@ -15486,6 +16044,8 @@ class App:
                         f"{prepared_selected}/{total}",
                     )
                 )
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 reason = compact_error_message(exc)
                 for queue_id in request_selected:
@@ -15633,6 +16193,8 @@ class App:
             self.ui_queue.put(("cell", (iid, "push_status", "Send2UE export 중...")))
             try:
                 return index, self._export_manifest_item(iid, spm, batch_stamp)
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 reason = compact_error_message(exc)
                 kind = getattr(exc, "kind", "data_error")

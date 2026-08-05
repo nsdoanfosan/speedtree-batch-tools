@@ -469,7 +469,10 @@ def _atlas_transaction_artifact_recipe(
     }
     for target in targets:
         match = _matching_scope_manifest(blend, target)
-        if match is None:
+        if (
+            match is None
+            or match.get("mutation_authorized") is False
+        ):
             continue
         payload = match["payload"]
         adoption = payload.get("source_material_adoption") or {}
@@ -1199,13 +1202,28 @@ def _refresh_reason_summary(reasons):
 
 
 def _matching_scope_manifest(blend, target_spm):
-    """Return the resolver-selected Atlas manifest for this blend/target."""
+    """Return read-only Atlas evidence for this blend/target.
+
+    Provider metadata disagreement can revoke authority to rewrite a manifest,
+    but it cannot veto inspection of an already-live Cluster relationship.  A
+    projected diagnostic selection also prevents a disagreement in an
+    unrelated Provider claim from hiding this exact target's disjoint claims.
+    """
     blend = Path(blend).expanduser().absolute()
     target = Path(target_spm).expanduser().absolute()
     try:
+        # Resolve ownership before applying the caller's Provider filter.  The
+        # filter is useful for selecting the exact live payload to inspect, but
+        # it must not hide another claimant and thereby recreate write
+        # authority for the preferred Provider.
+        ownership_resolution = resolve_atlas_manifests(
+            target,
+            diagnostic_only=True,
+        )
         resolution = resolve_atlas_manifests(
             target,
             expected_blend=blend,
+            diagnostic_only=True,
         )
     except AtlasManifestResolutionError as exc:
         raise ClusterBlendSyncError(str(exc)) from exc
@@ -1216,7 +1234,12 @@ def _matching_scope_manifest(blend, target_spm):
     return {
         "path": match["path"],
         "payload": match["payload"],
-        "resolution": resolution_evidence(resolution),
+        "resolution": resolution_evidence(ownership_resolution),
+        "selection_resolution": resolution_evidence(resolution),
+        "mutation_authorized": bool(
+            ownership_resolution.get("mutation_authorized", True)
+            and resolution.get("mutation_authorized", True)
+        ),
     }
 
 

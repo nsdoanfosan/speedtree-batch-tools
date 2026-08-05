@@ -889,6 +889,9 @@ def main():
                 sidecar_descriptor_builder=(
                     shared_contract_api().build_sidecar_descriptor
                 ),
+                authoritative_pipeline_contract=material_payload.get(
+                    "speedtree_pipeline_contract"
+                ),
             )
         )
         mesh_path = primary_mesh_asset_path(

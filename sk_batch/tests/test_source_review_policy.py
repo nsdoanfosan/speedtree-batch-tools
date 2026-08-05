@@ -62,6 +62,33 @@ def call_lines(tree, function_name):
 
 
 class SourceReviewPolicyTests(unittest.TestCase):
+    def test_material_contract_is_required_before_blender_mutation(self):
+        material_arguments = [
+            node
+            for node in ast.walk(job_tree())
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "--material-contract"
+            )
+        ]
+        self.assertEqual(len(material_arguments), 1)
+        required = next(
+            (
+                keyword.value.value
+                for keyword in material_arguments[0].keywords
+                if (
+                    keyword.arg == "required"
+                    and isinstance(keyword.value, ast.Constant)
+                )
+            ),
+            None,
+        )
+        self.assertIs(required, True)
+
     def test_only_reachable_policies_are_declared(self):
         policies = assigned_string_values(job_tree(), "source_review_policy")
         self.assertEqual(policies, {"strict"})
