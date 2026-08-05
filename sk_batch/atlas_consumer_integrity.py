@@ -6,6 +6,7 @@ separate reviewed recovery workflow.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -13,9 +14,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from atlas_manifest_resolver import (
-    AtlasManifestResolutionError,
     resolve_atlas_manifests,
     resolution_evidence,
+)
+from pcg_st9_texture_batch.pcg_texture_audit import leaf_generator_bindings
+from speedtree_pipeline_contract import (
+    generator_guid_key as canonical_generator_guid_key,
 )
 
 
@@ -196,6 +200,55 @@ def _generator_reachability(root):
     }
 
 
+def _apply_export_admission(target, reachability):
+    """Join shared Node/ancestor evidence to exact Generator slots."""
+    try:
+        bindings = leaf_generator_bindings(target, visible_only=False)
+    except (OSError, RuntimeError, ValueError, EOFError, UnicodeError):
+        bindings = []
+    by_key = defaultdict(list)
+    for binding in bindings:
+        key = (
+            canonical_generator_guid_key(
+                str(binding.get("generator_guid") or "")
+            ),
+            str(binding.get("slot_prefix") or "").strip().casefold(),
+        )
+        if key[0] and key[1]:
+            by_key[key].append(binding)
+    for slot in reachability.get("slots") or []:
+        key = (
+            canonical_generator_guid_key(slot.get("generator_guid") or ""),
+            str(slot.get("slot_prefix") or "").strip().casefold(),
+        )
+        matches = by_key.get(key, []) if key[0] and key[1] else []
+        if slot.get("hidden") is True:
+            relevant = False
+            reason = "generator_locally_hidden"
+            evidence = {"local_hidden": True}
+        elif len(matches) == 1:
+            binding = matches[0]
+            relevant = binding.get("export_admission_relevant") is not False
+            reason = str(
+                binding.get("export_admission_reason")
+                or "current_export_evidence_fail_closed"
+            )
+            evidence = copy.deepcopy(
+                binding.get("export_admission_evidence") or {}
+            )
+        else:
+            relevant = True
+            reason = "current_export_evidence_fail_closed"
+            evidence = {
+                "join_status": "missing" if not matches else "ambiguous",
+                "matching_binding_count": len(matches),
+            }
+        slot["export_admission_relevant"] = bool(relevant)
+        slot["export_admission_reason"] = reason
+        slot["export_admission_evidence"] = evidence
+    return reachability
+
+
 def _manifest_spm_path(value, target):
     candidate = Path(str(value or "")).expanduser()
     if candidate.is_absolute():
@@ -330,18 +383,20 @@ def _shadow_receipts(target, evidence):
 def resolve_canonical_atlas_producer_receipts(target_spm):
     """Adapt the issue #58 canonical resolver into ownership records."""
     target = Path(target_spm).expanduser().absolute()
+    # Ownership receipts are read-only evidence.  Overlapping Provider claims
+    # may revoke cleanup/mutation authority, but must not erase deterministic
+    # or disjoint live claims from the export audit.
+    resolution = resolve_atlas_manifests(target, diagnostic_only=True)
+    evidence = resolution_evidence(resolution)
+    selected_rows = resolution.get("selected") or []
+    status = (
+        "diagnostic_only"
+        if resolution.get("mutation_authorized") is False
+        else "resolved"
+        if selected_rows
+        else "missing"
+    )
     error = ""
-    try:
-        resolution = resolve_atlas_manifests(target)
-        evidence = resolution_evidence(resolution)
-        selected_rows = resolution.get("selected") or []
-        status = "resolved" if selected_rows else "missing"
-    except AtlasManifestResolutionError as exc:
-        resolution = None
-        evidence = dict(exc.resolution or {})
-        selected_rows = []
-        status = "conflict"
-        error = str(exc)
 
     selected = [
         _receipt_record(
@@ -562,8 +617,30 @@ def audit_atlas_consumer_integrity(target_spm, root):
     """Inventory and classify Atlas-managed assets without mutating inputs."""
     target = Path(target_spm).expanduser().absolute()
     receipts = resolve_canonical_atlas_producer_receipts(target)
-    reachability = _generator_reachability(root)
+    reachability = _apply_export_admission(
+        target,
+        _generator_reachability(root),
+    )
+    visible_slots = [
+        dict(slot)
+        for slot in reachability["slots"]
+        if slot.get("export_admission_relevant") is True
+    ]
+    visible_material_slots = defaultdict(list)
+    visible_mesh_slots = defaultdict(list)
+    for slot in visible_slots:
+        material_id = slot.get("material_id")
+        mesh_id = slot.get("mesh_id")
+        if material_id is not None and material_id > 0:
+            visible_material_slots[material_id].append(slot)
+        if mesh_id is not None and mesh_id > 0:
+            visible_mesh_slots[mesh_id].append(slot)
+    # Only concrete live-content defects belong in ``integrity_issues``.  Atlas
+    # markers and producer receipts are mutation authority, not export
+    # authority: missing/stale/conflicting provenance must never turn a valid
+    # SpeedTree Material/Mesh binding into an export failure.
     integrity_issues = []
+    mutation_diagnostics = []
     invalid_material_ids = set()
     invalid_mesh_ids = set()
 
@@ -580,6 +657,23 @@ def audit_atlas_consumer_integrity(target_spm, root):
             invalid_material_ids.add(asset_id)
         if asset_kind == "mesh" and asset_id is not None:
             invalid_mesh_ids.add(asset_id)
+
+    def add_mutation_issue(
+        code,
+        reason,
+        *,
+        asset_kind=None,
+        asset_id=None,
+        **details,
+    ):
+        diagnostic = {
+            "code": code,
+            "reason": reason,
+            "asset_kind": asset_kind,
+            "asset_id": asset_id,
+        }
+        diagnostic.update(details)
+        mutation_diagnostics.append(diagnostic)
 
     material_rows_by_id = defaultdict(list)
     material_nodes = []
@@ -603,7 +697,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
         material_rows_by_id[material_id].append(row)
         material_nodes.append(row)
         if marker_info["claimed"] and not marker_info["valid"]:
-            add_asset_issue(
+            add_mutation_issue(
                 "atlas_ownership_marker_invalid",
                 "Atlas Material ownership marker has the wrong or missing kind",
                 asset_kind="material",
@@ -612,13 +706,28 @@ def audit_atlas_consumer_integrity(target_spm, root):
 
     for material_id, rows in sorted(material_rows_by_id.items()):
         if len(rows) > 1:
-            add_asset_issue(
-                "duplicate_material_id",
-                "SPM contains more than one Material with the same ID",
-                asset_kind="material",
-                asset_id=material_id,
-                duplicate_count=len(rows),
-            )
+            details = {
+                "duplicate_count": len(rows),
+                "visible_generator_slots": copy.deepcopy(
+                    visible_material_slots.get(material_id, [])
+                ),
+            }
+            if visible_material_slots.get(material_id):
+                add_asset_issue(
+                    "duplicate_material_id",
+                    "A visible Generator references a duplicate Material ID",
+                    asset_kind="material",
+                    asset_id=material_id,
+                    **details,
+                )
+            else:
+                add_mutation_issue(
+                    "duplicate_material_id",
+                    "Duplicate Material ID is not used by a visible Generator",
+                    asset_kind="material",
+                    asset_id=material_id,
+                    **details,
+                )
 
     materials = {
         material_id: rows[0]
@@ -697,14 +806,14 @@ def audit_atlas_consumer_integrity(target_spm, root):
         mesh_rows_by_id[mesh_id].append(row)
 
         if raw["direct_marker_claimed"] and not raw["direct_marker_valid"]:
-            add_asset_issue(
+            add_mutation_issue(
                 "atlas_ownership_marker_invalid",
                 "Atlas Mesh ownership marker has the wrong or missing kind",
                 asset_kind="mesh",
                 asset_id=mesh_id,
             )
         if managed and len(inherited_scopes) > 1:
-            add_asset_issue(
+            add_mutation_issue(
                 "managed_mesh_owner_ambiguous",
                 "Builder-managed Mesh is owned by Materials from multiple scopes",
                 asset_kind="mesh",
@@ -720,7 +829,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
                 for value in inherited_scopes
             )
         ):
-            add_asset_issue(
+            add_mutation_issue(
                 "managed_mesh_scope_mismatch",
                 "Mesh marker scope disagrees with its managed Material owner",
                 asset_kind="mesh",
@@ -731,13 +840,28 @@ def audit_atlas_consumer_integrity(target_spm, root):
 
     for mesh_id, rows in sorted(mesh_rows_by_id.items()):
         if len(rows) > 1:
-            add_asset_issue(
-                "duplicate_mesh_id",
-                "SPM contains more than one Mesh with the same ID",
-                asset_kind="mesh",
-                asset_id=mesh_id,
-                duplicate_count=len(rows),
-            )
+            details = {
+                "duplicate_count": len(rows),
+                "visible_generator_slots": copy.deepcopy(
+                    visible_mesh_slots.get(mesh_id, [])
+                ),
+            }
+            if visible_mesh_slots.get(mesh_id):
+                add_asset_issue(
+                    "duplicate_mesh_id",
+                    "A visible Generator references a duplicate Mesh ID",
+                    asset_kind="mesh",
+                    asset_id=mesh_id,
+                    **details,
+                )
+            else:
+                add_mutation_issue(
+                    "duplicate_mesh_id",
+                    "Duplicate Mesh ID is not used by a visible Generator",
+                    asset_kind="mesh",
+                    asset_id=mesh_id,
+                    **details,
+                )
 
     meshes = {
         mesh_id: rows[0]
@@ -784,8 +908,8 @@ def audit_atlas_consumer_integrity(target_spm, root):
         if mesh_id is not None and mesh_id > 0:
             generator_mesh_references[mesh_id].append(public_slot)
 
-        def add_generator_issue(code, reason):
-            integrity_issues.append({
+        def add_generator_issue(code, reason, *, export_blocking=True):
+            issue = {
                 "code": code,
                 "reason": reason,
                 "generator_index": slot["generator_index"],
@@ -795,16 +919,33 @@ def audit_atlas_consumer_integrity(target_spm, root):
                 "material_id": material_id,
                 "mesh_id": mesh_id,
                 "hidden": slot["hidden"],
-            })
-            if material_id is not None and material_id > 0:
-                invalid_material_ids.add(material_id)
-            if mesh_id is not None and mesh_id > 0:
-                invalid_mesh_ids.add(mesh_id)
+                "export_admission_relevant": slot[
+                    "export_admission_relevant"
+                ],
+                "export_admission_reason": slot[
+                    "export_admission_reason"
+                ],
+                "export_admission_evidence": copy.deepcopy(
+                    slot["export_admission_evidence"]
+                ),
+            }
+            if (
+                export_blocking
+                and slot["export_admission_relevant"] is True
+            ):
+                integrity_issues.append(issue)
+                if material_id is not None and material_id > 0:
+                    invalid_material_ids.add(material_id)
+                if mesh_id is not None and mesh_id > 0:
+                    invalid_mesh_ids.add(mesh_id)
+            else:
+                mutation_diagnostics.append(issue)
 
         if not slot["generator_guid"]:
             add_generator_issue(
                 "generator_guid_missing",
                 "Managed Material/Mesh slot has no stable Generator GUID provenance",
+                export_blocking=False,
             )
         if (
             slot["material_property_count"] != 1
@@ -816,51 +957,74 @@ def audit_atlas_consumer_integrity(target_spm, root):
             )
         if mesh_id is None or mesh_id <= 0:
             continue
-        pair_reasons = []
+        content_pair_reasons = []
+        ownership_claim_reasons = []
         if material is None or mesh_id not in material.get("mesh_ids", []):
-            pair_reasons.append("SPM Material does not own the referenced Mesh")
+            content_pair_reasons.append(
+                "SPM Material does not own the referenced Mesh"
+            )
         if material and mesh and (
             material.get("scope_id")
             and mesh.get("scope_id")
             and material["scope_id"] != mesh["scope_id"]
         ):
-            pair_reasons.append("Material and Mesh ownership scopes differ")
+            ownership_claim_reasons.append(
+                "Material and Mesh ownership scopes differ"
+            )
         if (
             material_id in selected_material_ids
             and mesh_id in selected_mesh_ids
             and (material_id, mesh_id) not in current_material_mesh_pairs
         ):
-            pair_reasons.append(
+            ownership_claim_reasons.append(
                 "Selected manifests assign Material and Mesh to different groups"
             )
-        if pair_reasons:
-            if slot["hidden"]:
+        if ownership_claim_reasons:
+            add_generator_issue(
+                "generator_ownership_claim_disagreement",
+                "; ".join(ownership_claim_reasons),
+                export_blocking=False,
+            )
+        if content_pair_reasons:
+            if slot["export_admission_relevant"] is not True:
                 suppressed_generator_pairs.append({
                     "code": "generator_cross_group_pair",
-                    "reason": "; ".join(pair_reasons),
-                    "suppression_reason": "hidden_generator_not_exported",
+                    "reason": "; ".join(content_pair_reasons),
+                    "suppression_reason": slot[
+                        "export_admission_reason"
+                    ],
                     "generator_index": slot["generator_index"],
                     "generator_guid": slot["generator_guid"],
                     "generator_name": slot["generator_name"],
                     "slot_prefix": slot["slot_prefix"],
                     "material_id": material_id,
                     "mesh_id": mesh_id,
-                    "hidden": True,
+                    "hidden": slot["hidden"],
+                    "export_admission_relevant": False,
+                    "export_admission_evidence": copy.deepcopy(
+                        slot["export_admission_evidence"]
+                    ),
                 })
             else:
                 add_generator_issue(
                     "generator_cross_group_pair",
-                    "; ".join(pair_reasons),
+                    "; ".join(content_pair_reasons),
                 )
 
     managed_candidate_count = sum(row["managed"] for row in material_nodes) + sum(
         row["managed"] for rows in mesh_rows_by_id.values() for row in rows
     )
     if managed_candidate_count and receipts["status"] != "resolved":
-        integrity_issues.append({
+        resolution_conflict = bool(
+            (receipts.get("resolution_evidence") or {}).get("conflicting")
+        )
+        mutation_diagnostics.append({
             "code": (
                 "atlas_manifest_resolution_conflict"
-                if receipts["status"] == "conflict"
+                if (
+                    receipts["status"] == "conflict"
+                    or resolution_conflict
+                )
                 else "atlas_manifest_authority_missing"
             ),
             "reason": receipts.get("error") or (
@@ -968,8 +1132,8 @@ def audit_atlas_consumer_integrity(target_spm, root):
     # would keep a legitimately selected provider's unused variants blocked.
     # Each preserved asset must carry a complete exact selected claim; a Mesh
     # is preserved only when every owning Material has that same exact
-    # authority. Lineage-unproven, scope-mismatched, mixed-owner, and damaged
-    # assets remain ambiguous and blocking.
+    # authority. Lineage-unproven and scope-mismatched assets remain ambiguous
+    # mutation diagnostics, while only damaged live content blocks export.
     if not integrity_issues:
         for material in managed_materials:
             if (
@@ -1023,13 +1187,38 @@ def audit_atlas_consumer_integrity(target_spm, root):
     # present; that avoids turning unrelated historical material markers into
     # destructive cleanup evidence.
     integrity_applicable = bool(managed_meshes)
-    blocking_assets = [
+    mutation_review_assets = [
         row for row in managed_assets
         if row["classification"] in {
             "superseded_with_proven_successor",
             "ambiguous",
         }
     ] if integrity_applicable else []
+    # A destructive cleanup candidate needs both exact successor provenance
+    # and zero Generator references.  Ambiguous lineage remains visible in the
+    # audit, but is intentionally absent from the executable repair input.
+    mutation_candidates = [
+        row for row in mutation_review_assets
+        if row.get("automatic_action_eligible") is True
+        and not row.get("generator_references")
+    ]
+    mutation_candidate_keys = {
+        (row.get("asset_kind"), row.get("material_id") or row.get("mesh_id"))
+        for row in mutation_candidates
+    }
+    protected_mutation_assets = [
+        row for row in mutation_review_assets
+        if (
+            row.get("asset_kind"),
+            row.get("material_id") or row.get("mesh_id"),
+        ) not in mutation_candidate_keys
+    ]
+    export_blocking = bool(integrity_issues)
+    mutation_blocking = bool(
+        integrity_issues
+        or mutation_diagnostics
+        or protected_mutation_assets
+    )
 
     generation_rows = defaultdict(list)
     for row in managed_assets:
@@ -1099,15 +1288,18 @@ def audit_atlas_consumer_integrity(target_spm, root):
                 key: value for key, value in row.items()
                 if key not in {"managed"}
             }
-            for row in blocking_assets
+            for row in mutation_candidates
         ],
         "integrity_issues": integrity_issues,
+        "mutation_diagnostics": mutation_diagnostics,
+        "mutation_blocking": mutation_blocking,
+        "protected_candidate_count": len(protected_mutation_assets),
         "suppressed_generator_pairs": suppressed_generator_pairs,
         "review_policy": (
-            "No mutation is authorized by this evidence. Only an explicit "
-            "retired scope with a same-producer successor is marked eligible; "
-            "authoritative-current, foreign/manual, and lineage-unproven "
-            "assets must be preserved."
+            "Only an explicit retired scope with a same-producer successor "
+            "and no Generator references is an automatic mutation candidate. "
+            "Provider disagreement, marker-only ownership, foreign/manual, "
+            "and lineage-unproven assets are diagnostics and must be preserved."
         ),
     }
     repair_input = {
@@ -1117,8 +1309,12 @@ def audit_atlas_consumer_integrity(target_spm, root):
     return {
         "kind": INTEGRITY_CONTRACT_KIND,
         "schema_version": INTEGRITY_SCHEMA_VERSION,
-        "status": "blocked" if blocking_assets or integrity_issues else "ok",
-        "blocking": bool(blocking_assets or integrity_issues),
+        "status": "blocked" if export_blocking else "ok",
+        # ``blocking`` remains the compatibility alias consumed by the SPM
+        # mesh-reference contract.  It is export admission only.
+        "blocking": export_blocking,
+        "export_blocking": export_blocking,
+        "mutation_blocking": mutation_blocking,
         "applicable": integrity_applicable,
         "spm": str(target),
         "receipt_resolution": receipts["status"],
@@ -1165,6 +1361,7 @@ def audit_atlas_consumer_integrity(target_spm, root):
         "generations": generations,
         "generator_slots": reachability["slots"],
         "integrity_issues": integrity_issues,
+        "mutation_diagnostics": mutation_diagnostics,
         "suppressed_generator_pairs": suppressed_generator_pairs,
         "repair_input": repair_input,
     }

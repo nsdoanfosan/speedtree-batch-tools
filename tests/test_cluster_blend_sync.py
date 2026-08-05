@@ -2090,6 +2090,50 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 changed["targets"][0]["refresh_reasons"],
             )
 
+    def test_provider_disagreement_cannot_block_cluster_relation_inspection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "SK_cluster.blend"
+            blend.write_bytes(b"blend")
+            target = root / "SK_tree_01.spm"
+            target.write_bytes(b"spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(target),
+                "blend_file": str(blend),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{target.stem}.json").write_text(
+                json.dumps(authority), encoding="utf-8"
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing), encoding="utf-8"
+            )
+
+            match = cluster_sync._matching_scope_manifest(blend, target)
+
+            self.assertIsNotNone(match)
+            self.assertFalse(
+                match["resolution"]["mutation_authorized"]
+            )
+            self.assertTrue(match["resolution"]["conflicting"])
+
 
 if __name__ == "__main__":
     unittest.main()

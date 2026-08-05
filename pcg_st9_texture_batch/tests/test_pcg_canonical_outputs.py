@@ -1,4 +1,6 @@
 import json
+import hashlib
+import os
 import sys
 import tempfile
 import threading
@@ -31,6 +33,35 @@ from spm_texture_normalize import cleanup_preserved_cluster_outputs
 
 
 class CanonicalOutputManifestTests(unittest.TestCase):
+    @staticmethod
+    def _write_cluster_pair_receipt(canonical, legacy):
+        keys = sorted(
+            os.path.normcase(os.path.abspath(str(path))).casefold()
+            for path in (canonical, legacy)
+        )
+        pair_id = hashlib.sha256(
+            "\n".join(keys).encode("utf-8")
+        ).hexdigest()
+        reports = canonical.parent / "reports"
+        reports.mkdir(exist_ok=True)
+        receipt = reports / f"{canonical.stem}_cluster_spm_pair.json"
+        receipt.write_text(json.dumps({
+            "receipt_kind": "cluster_spm_output_name_normalization",
+            "schema_version": 2,
+            "status": "complete",
+            "pair_id": pair_id,
+            "invariants": {
+                "after_content_equal": True,
+                "canonical_output_authoritative": True,
+                "source_unchanged_during_copy": True,
+            },
+            "paths": {
+                "canonical_output": str(canonical),
+                "legacy_unprefixed_input": str(legacy),
+            },
+        }), encoding="utf-8")
+        return receipt
+
     def test_exact_bat_dispatches_atlas_mirror_repair_then_canonical_refresh(self):
         class Lease:
             @staticmethod
@@ -95,6 +126,31 @@ class CanonicalOutputManifestTests(unittest.TestCase):
                         (asset / f"SK_tree_test_{index}.spm").resolve()
                         for index in range(3)
                     ] + [(asset / "stable-receipt.spm").resolve()],
+                    key=lambda path: str(path).casefold(),
+                ),
+            )
+
+    def test_target_receipt_does_not_promote_copy_or_backup_siblings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_test"
+            asset.mkdir()
+            live = asset / "SK_tree_test_1.spm"
+            live.write_bytes(b"spm")
+            manual_copy = asset / "SK_tree_test_1 - Copy.spm"
+            manual_copy.write_bytes(b"spm")
+            rollback = asset / "SK_tree_test_1.apply_rollback_backup.spm"
+            rollback.write_bytes(b"spm")
+            receipts = asset / ".atlas_leaf_speedtree_targets"
+            receipts.mkdir()
+            (receipts / "stable-receipt.json").write_text(
+                json.dumps({"spm": str(live)}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _atlas_manifest_targets(asset),
+                sorted(
+                    [live.resolve(), (asset / "stable-receipt.spm").resolve()],
                     key=lambda path: str(path).casefold(),
                 ),
             )
@@ -324,6 +380,125 @@ class CanonicalOutputManifestTests(unittest.TestCase):
             )
             self.assertEqual(second["status"], "current")
             self.assertEqual(second["updated"], [])
+
+    def test_receipt_proven_cluster_pair_resolves_canonical_material_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "bush_silky_dogwood"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_cluster_silky_dogwood_01.spm"
+            legacy = cluster / "cluster_silky_dogwood_01.spm"
+            canonical.write_bytes(b"same-cluster")
+            legacy.write_bytes(b"same-cluster")
+            receipt = self._write_cluster_pair_receipt(canonical, legacy)
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / f"scope__{canonical.stem}.json"
+            scope.write_text(json.dumps({
+                "spm": str(canonical),
+                "texture_contract_status":
+                    "source_fallback_needs_pcg_generation",
+                "material_groups": [{
+                    "material": "M_cluster_silky_dogwood_atlas_01",
+                    "material_id": 5,
+                }],
+            }), encoding="utf-8")
+            manifest = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_cluster_silky_dogwood_atlas_01",
+                    "material_targets": [{
+                        "spm": str(legacy),
+                        "material_id": "5",
+                        "material_name":
+                            "M_cluster_silky_dogwood_atlas_01",
+                    }],
+                },
+                self._outputs(
+                    asset, "T_cluster_silky_dogwood_atlas_01"
+                ),
+                producer_source="silky.sbs#atlas",
+            )
+
+            result = refresh_atlas_manifests_for_spm(
+                canonical,
+                manifest,
+                require_complete=True,
+            )
+
+            self.assertIn(result["status"], {"updated", "current"})
+            self.assertEqual(
+                result["cluster_pair_identity"]["counterpart_spm"],
+                str(legacy),
+            )
+            self.assertEqual(
+                result["cluster_pair_identity"]["receipt_path"],
+                str(receipt),
+            )
+            promoted = json.loads(scope.read_text(encoding="utf-8"))
+            self.assertEqual(
+                promoted["texture_contract_status"],
+                "canonical_pcg_output",
+            )
+            self.assertEqual(
+                promoted["canonical_texture_outputs"][0]["material_id"],
+                "5",
+            )
+
+    def test_similar_cluster_name_without_pair_receipt_is_not_equivalent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "bush_silky_dogwood"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_cluster_silky_dogwood_01.spm"
+            legacy = cluster / "cluster_silky_dogwood_01.spm"
+            canonical.write_bytes(b"same-cluster")
+            legacy.write_bytes(b"same-cluster")
+            scope_dir = cluster / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scope = scope_dir / f"scope__{canonical.stem}.json"
+            scope.write_text(json.dumps({
+                "spm": str(canonical),
+                "material_groups": [{
+                    "material": "M_cluster_silky_dogwood_atlas_01",
+                    "material_id": 5,
+                }],
+            }), encoding="utf-8")
+            manifest = record_canonical_output(
+                {
+                    "folder": str(asset),
+                    "texture_base": "T_cluster_silky_dogwood_atlas_01",
+                    "material_targets": [{
+                        "spm": str(legacy),
+                        "material_id": "5",
+                        "material_name":
+                            "M_cluster_silky_dogwood_atlas_01",
+                    }],
+                },
+                self._outputs(
+                    asset, "T_cluster_silky_dogwood_atlas_01"
+                ),
+                producer_source="silky.sbs#atlas",
+            )
+
+            with self.assertRaises(CanonicalOutputManifestError) as caught:
+                refresh_atlas_manifests_for_spm(
+                    canonical,
+                    manifest,
+                    require_complete=True,
+                )
+
+            self.assertEqual(
+                caught.exception.report["reason_token"],
+                "canonical_material_mapping_incomplete",
+            )
+            self.assertIsNone(
+                caught.exception.report["cluster_pair_identity"]
+            )
+            self.assertNotIn(
+                "canonical_texture_outputs",
+                json.loads(scope.read_text(encoding="utf-8")),
+            )
 
     def test_canonical_promotion_updates_selected_records_not_legacy_shadows(self):
         with tempfile.TemporaryDirectory() as temporary:

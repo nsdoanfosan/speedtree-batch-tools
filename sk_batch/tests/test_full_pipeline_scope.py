@@ -71,6 +71,8 @@ class FullPipelineScopeTests(unittest.TestCase):
             gui, "calibration_settings_signature", return_value="current"
         ), mock.patch.object(
             gui, "legacy_calibration_settings_signature", return_value="legacy"
+        ), mock.patch.object(
+            app, "_production_source_revision_precheck", return_value=None
         ), mock.patch.object(gui, "save_config"), mock.patch.object(
             gui.threading, "Thread", return_value=worker
         ) as thread, mock.patch.object(gui.messagebox, "showinfo") as showinfo:

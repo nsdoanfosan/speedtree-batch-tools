@@ -3059,15 +3059,25 @@ def _atlas_manifest_resolution(spm):
     """Resolve and report-cache the exact operational Atlas candidate set."""
     target = Path(spm).expanduser().resolve(strict=False)
     report_cache = _REPORT_SCAN_CACHE.get()
+    diagnostic_only = bool(
+        report_cache is not None
+        and not report_cache.get("mutation_authority")
+    )
     cache = report_cache.setdefault("atlas_manifest_resolutions", {}) \
         if report_cache is not None else None
-    cache_key = os.path.normcase(str(target)).casefold()
+    cache_key = (
+        f"{'diagnostic' if diagnostic_only else 'strict'}:"
+        f"{os.path.normcase(str(target)).casefold()}"
+    )
     resolution = cache.get(cache_key) if cache is not None else None
     if resolution is None:
         _record_session_cache_metric(
             "atlas_manifest_resolution_calls", path=target
         )
-        resolution = resolve_atlas_manifests(target)
+        resolution = resolve_atlas_manifests(
+            target,
+            diagnostic_only=diagnostic_only,
+        )
         if cache is not None:
             cache[cache_key] = resolution
     return resolution
@@ -6430,8 +6440,15 @@ def _atlas_manifest_targets(asset_root):
         path = Path(path).expanduser()
         if not path.is_absolute():
             path = asset_root / path
+        # Check the discovery spelling before resolving aliases. A manual
+        # `` - Copy`` symlink or a backup-directory junction must not lose its
+        # inventory classification merely because its target is live.
+        if not is_live_spm(path, require_file=False):
+            return
         path = path.resolve(strict=False)
         if path.suffix.casefold() != ".spm":
+            return
+        if not is_live_spm(path, require_file=False):
             return
         targets.setdefault(os.path.normcase(str(path)).casefold(), path)
 
@@ -6478,7 +6495,10 @@ def _atlas_provisional_source_declarations_cached(asset_root_text):
     manifests = []
     seen_manifests = set()
     for target in _atlas_manifest_targets(asset_root):
-        resolution = _atlas_manifest_resolution(target)
+        # This is a read-only provenance lookup. Metadata disagreement may
+        # disable mutation authority, but it must not prevent a material
+        # preflight or erase disjoint live Provider declarations.
+        resolution = resolve_atlas_manifests(target, diagnostic_only=True)
         for selected in resolution["selected"]:
             key = os.path.normcase(selected["path"]).casefold()
             if key in seen_manifests:
@@ -7231,6 +7251,10 @@ def audit_folder(
         clusters,
         cluster_usage=assembly_cluster_usage,
         assembly_source_spms=assembly_source_spms,
+        # Reuse this report's strict-vs-diagnostic resolver and cache.  A
+        # read-only live audit keeps deterministic current Atlas authorities;
+        # mutation-authority reports remain strict.
+        atlas_resolution_reader=_atlas_manifest_resolution,
     )
     cluster_sources = cluster_connection_rows(
         folder,

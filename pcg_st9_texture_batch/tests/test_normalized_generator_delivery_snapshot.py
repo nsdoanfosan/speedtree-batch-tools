@@ -26,6 +26,7 @@ from generator_delivery_scope import (  # noqa: E402
     RESOLVED_KIND,
     RUNTIME_INACTIVE_POLICY,
     SCOPE_KIND,
+    canonical_slot_identity,
     canonical_sha256,
 )
 
@@ -268,7 +269,7 @@ def explicit_delivery_payload(spm, required_indices, generator_guid=None):
     bindings = payload["generator_connection"]["bindings"]
     authored = [
         {
-            "slot_identity": list(_delivery_binding_slot_identity(row)),
+            "slot_identity": list(canonical_slot_identity(row)),
             "target_material_id": row["target_material_id"],
             "target_mesh_id": row["target_mesh_id"],
         }
@@ -1115,7 +1116,7 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             for row in delivery["binding_outcomes"]
         ))
 
-    def test_tampered_explicit_scope_fails_closed_without_legacy_downgrade(self):
+    def test_tampered_scope_is_diagnostic_when_current_live_pairs_are_exact(self):
         rows = [
             snapshot_binding(slot_prefix, mesh_id)
             for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
@@ -1139,14 +1140,20 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             delivery_variants(),
         )
 
-        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
-        self.assertTrue(any(
-            error.startswith("generator_delivery_scope_invalid:")
-            for error in delivery["errors"]
-        ))
-        self.assertFalse(delivery["generator_connection_complete"])
+        self.assertEqual(
+            delivery["delivery_scope_mode"],
+            "explicit_invalid_diagnostic",
+        )
+        self.assertEqual(delivery["errors"], [])
+        self.assertTrue(delivery["generator_connection_complete"])
+        self.assertFalse(delivery["mutation_authorized"])
+        self.assertIsNone(delivery["recovery_target_scope"])
+        self.assertEqual(
+            delivery["metadata_diagnostics"][0]["code"],
+            "generator_delivery_scope_invalid",
+        )
 
-    def test_foreign_provider_scope_fails_closed(self):
+    def test_foreign_provider_scope_cannot_mutate_but_live_pairs_proceed(self):
         rows = [
             snapshot_binding(slot_prefix, mesh_id)
             for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
@@ -1170,13 +1177,21 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             delivery_variants(),
         )
 
-        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
-        self.assertTrue(any(
-            "another provider blend" in error
-            for error in delivery["errors"]
-        ))
+        self.assertEqual(
+            delivery["delivery_scope_mode"],
+            "explicit_invalid_diagnostic",
+        )
+        self.assertEqual(delivery["errors"], [])
+        self.assertTrue(delivery["generator_connection_complete"])
+        self.assertFalse(delivery["mutation_authorized"])
+        self.assertIn(
+            "another provider blend",
+            delivery["metadata_diagnostics"][0][
+                "exact_validation_error"
+            ],
+        )
 
-    def test_resolved_bindings_must_equal_sealed_authored_slots(self):
+    def test_stale_declared_binding_does_not_override_exact_live_pair(self):
         rows = [
             snapshot_binding(slot_prefix, mesh_id)
             for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
@@ -1200,11 +1215,48 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             delivery_variants(),
         )
 
-        self.assertEqual(delivery["delivery_scope_mode"], "explicit_invalid")
-        self.assertTrue(any(
-            "differ from sealed authored slots" in error
-            for error in delivery["errors"]
-        ))
+        self.assertEqual(
+            delivery["delivery_scope_mode"],
+            "explicit_invalid_diagnostic",
+        )
+        self.assertEqual(delivery["errors"], [])
+        self.assertTrue(delivery["generator_connection_complete"])
+        self.assertEqual(
+            delivery["declared_target_mesh_ids"],
+            list(TARGET_MESH_IDS),
+        )
+        self.assertFalse(delivery["mutation_authorized"])
+
+    def test_invalid_scope_still_blocks_a_current_missing_live_mesh(self):
+        rows = [
+            snapshot_binding(slot_prefix, mesh_id)
+            for slot_prefix, mesh_id in zip(SLOT_PREFIXES, TARGET_MESH_IDS)
+        ]
+
+        class MissingMeshAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(spm, rows, TARGET_MESH_IDS[:-1])
+
+        target = "SK_tree_sanitized_01.spm"
+        payload = explicit_delivery_payload(target, {0, 1, 2, 3})
+        payload["generator_connection"]["delivery_scope"]["intent"][
+            "required_live_slot_identities"
+        ].pop()
+        delivery = _normalized_generator_delivery(
+            MissingMeshAudit,
+            target,
+            payload,
+            {"material_id": 4},
+            delivery_variants(),
+        )
+
+        self.assertEqual(
+            delivery["delivery_scope_mode"],
+            "explicit_invalid_diagnostic",
+        )
+        self.assertIn("target_mesh_asset_missing", delivery["errors"])
+        self.assertFalse(delivery["generator_connection_complete"])
 
     def test_explicit_required_slot_cannot_be_shrunk_by_unused_base_evidence(self):
         inactive_base = {

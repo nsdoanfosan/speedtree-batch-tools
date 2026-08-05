@@ -16,6 +16,7 @@ from pathlib import Path
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
     atlas_manifest_mirror_repair_plan,
+    proven_cluster_pair_identity,
     resolution_evidence,
     resolve_atlas_manifests,
 )
@@ -190,6 +191,7 @@ def _promote_atlas_manifest_payload(
     path,
     target_spm,
     canonical_manifest,
+    equivalent_target_spms=(),
 ):
     """Return a canonical Atlas payload only when every group resolves."""
     from speedtree_texture_contract import resolve_manifest_material_output
@@ -219,6 +221,7 @@ def _promote_atlas_manifest_payload(
             target_spm,
             material_id,
             material_name,
+            equivalent_spms=equivalent_target_spms,
         )
         if output is None:
             unresolved.append({
@@ -313,6 +316,19 @@ def refresh_atlas_manifests_for_spm(
     )
 
     target = Path(target_spm).expanduser().resolve(strict=False)
+    pair_identity = proven_cluster_pair_identity(target)
+    equivalent_target_spms = (
+        [pair_identity["counterpart_spm"]] if pair_identity else []
+    )
+    pair_evidence = (
+        {
+            "pair_id": pair_identity["pair_id"],
+            "input_role": pair_identity["input_role"],
+            "counterpart_spm": str(pair_identity["counterpart_spm"]),
+            "receipt_path": str(pair_identity["receipt_path"]),
+        }
+        if pair_identity else None
+    )
     if manifest_path is None:
         canonical_candidates = canonical_output_manifest_candidates(target)
         manifest_path = next(
@@ -366,6 +382,7 @@ def refresh_atlas_manifests_for_spm(
             path,
             target,
             canonical,
+            equivalent_target_spms,
         )
         if issue == "different_target" or issue == "no_material_groups":
             continue
@@ -388,7 +405,16 @@ def refresh_atlas_manifests_for_spm(
         )
         raise CanonicalOutputManifestError(
             "Canonical PCG outputs cannot fully regenerate the Atlas "
-            f"material contract for {target.name}: {details}"
+            f"material contract for {target.name}: {details}",
+            report={
+                "schema_version": 1,
+                "stage": "canonical_material_mapping",
+                "reason_token": "canonical_material_mapping_incomplete",
+                "target_spm": str(target),
+                "canonical_manifest": str(manifest_path),
+                "pending": pending,
+                "cluster_pair_identity": pair_evidence,
+            },
         )
     if pending:
         planned = []
@@ -424,6 +450,7 @@ def refresh_atlas_manifests_for_spm(
         "updated": updated,
         "current": current,
         "pending": pending,
+        "cluster_pair_identity": pair_evidence,
         "atlas_manifest_resolution": resolution_evidence(atlas_resolution),
     }
 

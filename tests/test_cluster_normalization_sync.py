@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cluster_normalization_sync as normalization_sync
 from cluster_atlas_source_index import (
     COLLECTION_CONTENT_KEY_ALGORITHM,
     COLLECTION_PROJECTION_VERSION,
@@ -1289,6 +1290,47 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 "Rebuild the Cluster source blend first",
                 str(caught.exception),
             )
+
+    def test_provider_disagreement_disables_only_optional_binding_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_01.spm"
+            target.write_bytes(b"spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(target),
+                "blend_file": str(root / "provider_a.blend"),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{target.stem}.json").write_text(
+                json.dumps(authority), encoding="utf-8"
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["blend_file"] = str(root / "provider_b.blend")
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing), encoding="utf-8"
+            )
+
+            selected = normalization_sync._atlas_target_relation_manifest(
+                target
+            )
+
+            self.assertEqual(selected, {})
 
 
 if __name__ == "__main__":

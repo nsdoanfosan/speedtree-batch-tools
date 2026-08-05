@@ -101,6 +101,54 @@ def test_export_pending_unreal_is_not_a_current_success():
     assert decision.reason_code == "push_never_reached_unreal"
 
 
+def test_ready_with_current_parent_still_reenters_full_push():
+    decision = classify_failed_retry(
+        {
+            "push_status": "ready",
+            "push_status_kind": "ready",
+            "push_paths": {
+                "manifest": "older_parent.json",
+                "checkpoint": "older_parent_checkpoint.json",
+            },
+        },
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_CURRENT,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "push_never_reached_unreal"
+
+
+def test_automation_wrapper_status_requires_fresh_pipeline():
+    for kind in (
+        "automatic_repair",
+        "automatic_repair_failed",
+        "automatic_repair_reaudit_failed",
+        "planned_excluded",
+        "preflight_skip",
+    ):
+        decision = classify_failed_retry(
+            {"push_status_kind": kind},
+            AMBIGUOUS_REPAIR,
+            unreal_parent_status=UNREAL_PARENT_CURRENT,
+        )
+
+        assert decision.classification == BLENDER_REBUILD
+        assert decision.reason_code == "automation_wrapper_fresh_pipeline"
+
+
+def test_interrupted_automatic_repair_with_current_output_resumes_full_pipeline():
+    for parent in ("absent", UNREAL_PARENT_CURRENT):
+        decision = classify_failed_retry(
+            {"push_status_kind": "automatic_repair"},
+            CURRENT_REPAIR,
+            unreal_parent_status=parent,
+        )
+
+        assert decision.classification == BLENDER_REBUILD
+        assert decision.reason_code == "automation_wrapper_fresh_pipeline"
+
+
 def test_imported_ok_is_still_excluded_as_a_current_success():
     """The fix must not turn a genuinely completed push into a retry."""
     decision = classify_failed_retry(
@@ -133,7 +181,7 @@ def test_explicit_force_rerun_rebuilds_a_non_retryable_unreal_parent():
 
     assert decision.classification == BLENDER_REBUILD
     assert decision.reason_code == (
-        "parent_not_retryable_unreal_failure_forced_rebuild"
+        "current_unreal_parent_forced_rebuild"
     )
 
 
@@ -164,6 +212,18 @@ def test_current_immutable_unreal_failure_stays_unreal_only():
 
     assert decision.classification == UNREAL_ONLY
     assert decision.reason_code == "current_immutable_unreal_failure"
+
+
+def test_explicit_force_rerun_rebuilds_current_retryable_unreal_failure():
+    decision = classify_failed_retry(
+        {"push_status_kind": "data_error"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_CURRENT,
+        force_rerun=True,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "current_unreal_parent_forced_rebuild"
 
 
 def test_incomplete_unreal_parent_uses_safe_full_rebuild_fallback():

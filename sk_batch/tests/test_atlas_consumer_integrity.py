@@ -19,6 +19,7 @@ for import_path in (SK_BATCH_DIR, JOBS_DIR):
 
 from spm_leaf_handoff_contract import inspect_spm_mesh_file_references  # noqa: E402
 import speedtree_material_preflight as preflight  # noqa: E402
+import atlas_consumer_integrity as atlas_integrity  # noqa: E402
 
 
 ATLAS_MARKER = "Atlas Leaf Mesh Builder"
@@ -115,6 +116,7 @@ def add_generator(
         prop = ET.SubElement(properties, "Property")
         ET.SubElement(prop, "Name").text = f"Leaves:Type:{index}:{suffix}"
         ET.SubElement(prop, "Value").text = str(value)
+    return generator
 
 
 def write_spm(path, model):
@@ -159,7 +161,7 @@ def write_receipt(
 
 
 class AtlasConsumerIntegrityTests(unittest.TestCase):
-    def test_silky_lineage_unproven_assets_stay_blocking(self):
+    def test_silky_lineage_unproven_assets_are_silent_export_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = json.loads(SILKY_FIXTURE.read_text(encoding="utf-8"))
             root = Path(temporary)
@@ -270,7 +272,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertEqual(spm.read_bytes(), before)
-            self.assertEqual(first["status"], "managed_asset_integrity_error")
+            self.assertEqual(first["status"], "ok")
             self.assertEqual(first["missing"], [])
             self.assertEqual(first["orphan_missing"], [])
             self.assertEqual(
@@ -284,7 +286,9 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 }),
             )
             integrity = first["atlas_consumer_integrity"]
-            self.assertTrue(integrity["blocking"])
+            self.assertFalse(integrity["blocking"])
+            self.assertFalse(integrity["export_blocking"])
+            self.assertTrue(integrity["mutation_blocking"])
             self.assertEqual(
                 integrity["active_managed_mesh_count"],
                 fixture["expected"]["active"],
@@ -354,23 +358,92 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             repair = integrity["repair_input"]
             self.assertEqual(len(repair["content_sha256"]), 64)
             self.assertEqual(repair, second["atlas_consumer_integrity"]["repair_input"])
-            self.assertFalse(any(
-                candidate["automatic_action_eligible"]
-                for candidate in repair["candidates"]
-            ))
+            self.assertEqual(repair["candidates"], [])
             issues = preflight.preflight_contract_issues({
                 "spm": str(spm),
                 "mesh_file_reference_contract": first,
             })
-            atlas_issue = next(
-                issue for issue in issues
-                if issue["code"] == "ATLAS_MANAGED_ASSET_INTEGRITY_STALE"
+            self.assertEqual(issues, [])
+
+    def test_dandelion_legacy_ids_do_not_block_current_provider_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_weed_flower_Dandelion_01.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+
+            legacy_mesh_ids = list(range(45, 57))
+            add_material(
+                assets,
+                6,
+                "M_leaf_dandelion_legacy",
+                legacy_mesh_ids,
+                "",
             )
-            self.assertIn("producer 계보가 증명되지 않은", atlas_issue["message"])
-            self.assertIn("Mesh ID 7", atlas_issue["message"])
-            self.assertIn(
-                "exact Cluster 갱신을 먼저 실행",
-                atlas_issue["details"]["operator_action_ko"],
+            for mesh_id in legacy_mesh_ids:
+                add_external_mesh(assets, root, mesh_id, None)
+            add_generator(model, 6, 45)
+
+            current_mesh_ids = list(range(68, 71))
+            add_material(
+                assets,
+                7,
+                "M_leaf_dandelion_atlas_01",
+                current_mesh_ids,
+                "scope-current",
+            )
+            for mesh_id in current_mesh_ids:
+                add_external_mesh(
+                    assets,
+                    root,
+                    mesh_id,
+                    "scope-current",
+                )
+            write_spm(spm, model)
+            write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                f"{spm.stem}.json",
+                "scope-current",
+                7,
+                "M_leaf_dandelion_atlas_01",
+                current_mesh_ids,
+            )
+
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
+
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["export_blocking"])
+            self.assertTrue(integrity["mutation_blocking"])
+            legacy_material = next(
+                row for row in integrity["managed_materials"]
+                if row["material_id"] == 6
+            )
+            legacy_mesh = next(
+                row for row in integrity["managed_meshes"]
+                if row["mesh_id"] == 45
+            )
+            self.assertEqual(
+                {
+                    legacy_material["orphan_reason"],
+                    legacy_mesh["orphan_reason"],
+                },
+                {"lineage_unproven"},
+            )
+            self.assertEqual(integrity["repair_input"]["candidates"], [])
+            self.assertEqual(
+                preflight.preflight_contract_issues({
+                    "spm": str(spm),
+                    "leaf_reference_contract": {
+                        "status": "managed_connected",
+                        "managed_ownership_provenance": {
+                            "status": "marker_only",
+                        },
+                    },
+                    "mesh_file_reference_contract": report,
+                }),
+                [],
             )
 
     def test_current_default_cutout_generation_is_not_orphaned(self):
@@ -936,7 +1009,13 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             )
             resolved = inspect_spm_mesh_file_references(spm)
 
-            self.assertEqual(unresolved["status"], "managed_asset_integrity_error")
+            self.assertEqual(unresolved["status"], "ok")
+            self.assertFalse(
+                unresolved["atlas_consumer_integrity"]["export_blocking"]
+            )
+            self.assertTrue(
+                unresolved["atlas_consumer_integrity"]["mutation_blocking"]
+            )
             self.assertEqual(
                 unresolved["atlas_consumer_integrity"]["receipt_resolution"],
                 "missing",
@@ -947,7 +1026,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 "resolved",
             )
 
-    def test_duplicate_operational_ownership_conflict_fails_closed(self):
+    def test_overlapping_provider_claims_are_silent_export_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_conflicting_authority.spm"
@@ -979,20 +1058,39 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             )
             before = spm.read_bytes()
 
-            integrity = inspect_spm_mesh_file_references(spm)[
-                "atlas_consumer_integrity"
-            ]
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
 
             self.assertEqual(spm.read_bytes(), before)
-            self.assertTrue(integrity["blocking"])
-            self.assertEqual(integrity["receipt_resolution"], "conflict")
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertFalse(integrity["export_blocking"])
+            self.assertTrue(integrity["mutation_blocking"])
+            self.assertEqual(
+                integrity["receipt_resolution"], "diagnostic_only"
+            )
             self.assertIn(
                 "atlas_manifest_resolution_conflict",
-                {row["code"] for row in integrity["integrity_issues"]},
+                {row["code"] for row in integrity["mutation_diagnostics"]},
             )
+            self.assertEqual(integrity["integrity_issues"], [])
             self.assertEqual(
                 {row["classification"] for row in integrity["managed_meshes"]},
-                {"ambiguous"},
+                {"current_reachable"},
+            )
+            self.assertEqual(
+                preflight.preflight_contract_issues({
+                    "spm": str(spm),
+                    "leaf_reference_contract": {
+                        "status": "managed_connected",
+                        "managed_ownership_provenance": {
+                            "status": "manifest_conflict",
+                            "reason": "two Providers claim the same pair",
+                        },
+                    },
+                    "mesh_file_reference_contract": report,
+                }),
+                [],
             )
 
     def test_hidden_generator_superseded_mesh_reference_is_explicit(self):
@@ -1048,7 +1146,9 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 ["leaf-guid-1"],
             )
             self.assertTrue(old_mesh["generator_references"][0]["hidden"])
-            self.assertTrue(integrity["blocking"])
+            self.assertFalse(integrity["blocking"])
+            self.assertTrue(integrity["mutation_blocking"])
+            self.assertEqual(integrity["repair_input"]["candidates"], [])
 
     def test_cross_group_material_mesh_pair_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1103,6 +1203,224 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
             self.assertIn("Material 10, Mesh 2", message)
             self.assertIn("visible 연결을 수정", action)
 
+    def test_unreferenced_duplicate_ids_are_diagnostics_not_export_gates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_unreferenced_duplicates.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_legacy_a", [1], "scope-legacy")
+            add_material(assets, 10, "M_legacy_b", [1], "scope-legacy")
+            add_external_mesh(assets, root, 1, "scope-legacy")
+            add_external_mesh(assets, root, 1, "scope-legacy")
+            add_material(assets, 20, "M_live", [2], "scope-live")
+            add_external_mesh(assets, root, 2, "scope-live")
+            add_generator(model, 20, 2)
+            write_spm(spm, model)
+
+            integrity = inspect_spm_mesh_file_references(spm)[
+                "atlas_consumer_integrity"
+            ]
+
+            self.assertFalse(integrity["blocking"])
+            self.assertEqual(integrity["integrity_issues"], [])
+            self.assertTrue({
+                "duplicate_material_id",
+                "duplicate_mesh_id",
+            }.issubset({
+                row["code"] for row in integrity["mutation_diagnostics"]
+            }))
+
+    def test_visible_duplicate_ids_block_with_exact_ids_not_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_visible_duplicates.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_live_a", [1], "scope-live")
+            add_material(assets, 10, "M_live_b", [1], "scope-live")
+            add_external_mesh(assets, root, 1, "scope-live")
+            add_external_mesh(assets, root, 1, "scope-live")
+            add_generator(model, 10, 1)
+            write_spm(spm, model)
+
+            integrity = inspect_spm_mesh_file_references(spm)[
+                "atlas_consumer_integrity"
+            ]
+
+            self.assertTrue(integrity["blocking"])
+            self.assertEqual(
+                {row["code"] for row in integrity["integrity_issues"]},
+                {"duplicate_material_id", "duplicate_mesh_id"},
+            )
+            message, action = preflight._atlas_integrity_failure_message(
+                integrity
+            )
+            self.assertIn("Material ID 10", message)
+            self.assertIn("Mesh ID 1", message)
+            self.assertNotIn("계보", message + action)
+            self.assertNotIn("갱신", message + action)
+
+    def test_trustworthy_zero_geometry_slots_do_not_recreate_export_gates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_zero_geometry_diagnostics.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(assets, 10, "M_leaf_a", [1], "scope-current")
+            add_external_mesh(assets, root, 1, "scope-current")
+            add_material(assets, 20, "M_leaf_b", [2], "scope-current")
+            add_external_mesh(assets, root, 2, "scope-current")
+
+            add_generator(model, 10, 2, index=0)
+            incomplete = add_generator(model, 10, 1, index=1)
+            properties = incomplete.find("Properties")
+            duplicate = ET.SubElement(properties, "Property")
+            ET.SubElement(duplicate, "Name").text = "Leaves:Type:1:Material"
+            ET.SubElement(duplicate, "Value").text = "10"
+
+            add_material(assets, 30, "M_legacy_a", [3], "scope-legacy")
+            add_material(assets, 30, "M_legacy_b", [3], "scope-legacy")
+            add_external_mesh(assets, root, 3, "scope-legacy")
+            add_external_mesh(assets, root, 3, "scope-legacy")
+            add_generator(model, 30, 3, index=2)
+            write_spm(spm, model)
+
+            bindings = [
+                {
+                    "generator_guid": f"leaf-guid-{index}",
+                    "slot_prefix": f"Leaves:Type:{index}",
+                    "export_admission_relevant": False,
+                    "export_admission_reason":
+                        "current_export_trustworthy_zero_geometry",
+                    "export_admission_evidence": {
+                        "generated_node_count": 0,
+                        "total_node_count": 69,
+                        "graph_visible": True,
+                        "node_count_parser_parity": True,
+                        "exact_ancestor_chain": True,
+                        "trustworthy_zero_geometry": True,
+                    },
+                }
+                for index in range(3)
+            ]
+            with mock.patch.object(
+                atlas_integrity,
+                "leaf_generator_bindings",
+                return_value=bindings,
+            ):
+                report = inspect_spm_mesh_file_references(spm)
+
+            integrity = report["atlas_consumer_integrity"]
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["export_blocking"])
+            self.assertEqual(integrity["integrity_issues"], [])
+            diagnostics = {
+                row["code"] for row in integrity["mutation_diagnostics"]
+            }
+            self.assertTrue({
+                "duplicate_material_id",
+                "duplicate_mesh_id",
+                "generator_slot_pair_incomplete",
+            }.issubset(diagnostics))
+            self.assertEqual(
+                integrity["suppressed_generator_pairs"][0][
+                    "suppression_reason"
+                ],
+                "current_export_trustworthy_zero_geometry",
+            )
+            self.assertFalse(
+                integrity["suppressed_generator_pairs"][0][
+                    "export_admission_relevant"
+                ]
+            )
+            self.assertEqual(
+                preflight.preflight_contract_issues({
+                    "spm": str(spm),
+                    "mesh_file_reference_contract": report,
+                }),
+                [],
+            )
+
+    def test_scope_and_manifest_group_claims_do_not_block_valid_live_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_claim_disagreement.spm"
+            model = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(model, "Assets")
+            add_material(
+                assets,
+                10,
+                "M_leaf_a",
+                [1, 2],
+                "scope-current",
+            )
+            add_material(
+                assets,
+                20,
+                "M_leaf_b",
+                [2],
+                "scope-current",
+            )
+            add_external_mesh(assets, root, 1, "scope-current")
+            add_external_mesh(assets, root, 2, "scope-other")
+            add_generator(model, 10, 2)
+            write_spm(spm, model)
+            write_receipt(
+                spm,
+                ".atlas_leaf_speedtree_targets",
+                "SK_claim_disagreement.json",
+                "scope-current",
+                10,
+                "M_leaf_a",
+                [1],
+                groups=[
+                    {
+                        "collection": "AtlasLeavesA",
+                        "material": "M_leaf_a",
+                        "material_id": 10,
+                        "mesh_ids": [1],
+                    },
+                    {
+                        "collection": "AtlasLeavesB",
+                        "material": "M_leaf_b",
+                        "material_id": 20,
+                        "mesh_ids": [2],
+                    },
+                ],
+            )
+
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
+
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["export_blocking"])
+            self.assertEqual(integrity["integrity_issues"], [])
+            self.assertTrue(integrity["mutation_blocking"])
+            diagnostics = {
+                row["code"]: row
+                for row in integrity["mutation_diagnostics"]
+            }
+            self.assertIn("managed_mesh_scope_mismatch", diagnostics)
+            claim = diagnostics[
+                "generator_ownership_claim_disagreement"
+            ]
+            self.assertIn(
+                "Material and Mesh ownership scopes differ",
+                claim["reason"],
+            )
+            self.assertIn(
+                "Selected manifests assign Material and Mesh to different groups",
+                claim["reason"],
+            )
+            self.assertEqual(
+                preflight.preflight_contract_issues({
+                    "spm": str(spm),
+                    "mesh_file_reference_contract": report,
+                }),
+                [],
+            )
+
     def test_hidden_cross_group_pair_does_not_block_export(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1152,8 +1470,8 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 integrity["suppressed_generator_pairs"],
                 [{
                     "code": "generator_cross_group_pair",
-                    "reason": "SPM Material does not own the referenced Mesh; Selected manifests assign Material and Mesh to different groups",
-                    "suppression_reason": "hidden_generator_not_exported",
+                    "reason": "SPM Material does not own the referenced Mesh",
+                    "suppression_reason": "generator_locally_hidden",
                     "generator_index": 1,
                     "generator_guid": "leaf-guid-1",
                     "generator_name": "Leaf 1",
@@ -1161,14 +1479,25 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                     "material_id": 10,
                     "mesh_id": 2,
                     "hidden": True,
+                    "export_admission_relevant": False,
+                    "export_admission_evidence": {
+                        "local_hidden": True,
+                    },
                 }],
             )
             self.assertEqual(
                 integrity["repair_input"]["suppressed_generator_pairs"],
                 integrity["suppressed_generator_pairs"],
             )
+            self.assertIn(
+                "generator_ownership_claim_disagreement",
+                {
+                    row["code"]
+                    for row in integrity["mutation_diagnostics"]
+                },
+            )
 
-    def test_managed_generator_reference_without_guid_fails_closed(self):
+    def test_managed_generator_reference_without_guid_is_mutation_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_missing_guid.spm"
@@ -1188,14 +1517,19 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 [1],
             )
 
-            integrity = inspect_spm_mesh_file_references(spm)[
-                "atlas_consumer_integrity"
-            ]
+            report = inspect_spm_mesh_file_references(spm)
+            integrity = report["atlas_consumer_integrity"]
 
-            self.assertTrue(integrity["blocking"])
-            self.assertIn(
+            self.assertEqual(report["status"], "ok")
+            self.assertFalse(integrity["blocking"])
+            self.assertTrue(integrity["mutation_blocking"])
+            self.assertNotIn(
                 "generator_guid_missing",
                 {row["code"] for row in integrity["integrity_issues"]},
+            )
+            self.assertIn(
+                "generator_guid_missing",
+                {row["code"] for row in integrity["mutation_diagnostics"]},
             )
 
 

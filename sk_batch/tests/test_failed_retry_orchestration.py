@@ -146,6 +146,116 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertEqual(automation["status"], "automatic_repair_completed")
         self.assertEqual(app._phase_result_summary["completed_count"], 1)
 
+    def test_multi_stage_plan_runs_every_exact_action_before_broad_reaudit(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        plan = self.plan(self.first, "two-stage")
+        plan["stages"].append({
+            "stage": "generator_sync_and_cluster",
+            "tool": "spm_generator_sync",
+            "repair_action": "generator-sync-and-cluster",
+            "target_spms": [str(self.first)],
+        })
+
+        def complete_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._execute_exact_repair_stage = mock.Mock(return_value={
+            "status": "completed",
+            "terminal_status": "completed",
+            "result": {},
+        })
+        app._fresh_reaudit_after_exact_repair = mock.Mock(return_value={
+            "status": "current",
+        })
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [plan],
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(app._execute_exact_repair_stage.call_count, 2)
+        app._fresh_reaudit_after_exact_repair.assert_called_once_with(
+            job["targets"][0],
+            plan["stages"][1],
+        )
+        attempted = app.state[str(self.first)]["failed_retry_automation"][
+            "attempted_stages"
+        ]
+        self.assertEqual(
+            attempted[0]["fresh_reaudit"],
+            {
+                "status": "deferred_until_remaining_exact_stages",
+                "remaining_stage_count": 1,
+            },
+        )
+        self.assertEqual(
+            attempted[1]["fresh_reaudit"],
+            {"status": "current"},
+        )
+
+    def test_completed_pipeline_wins_over_repair_receipt_bookkeeping_mismatch(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        target = {"spm": self.first}
+
+        def completed_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=completed_pipeline)
+        job = {
+            "targets": [target],
+            "repair_plans": [self.plan(self.first, "receipt-mismatch")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ), mock.patch.object(
+            gui,
+            "fresh_repair_receipt_authoritative",
+            return_value=False,
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        outcome = app._phase_result_summary["target_outcomes"][0]
+        self.assertEqual(outcome["outcome"], "completed")
+        diagnostic = outcome["evidence"][
+            "automatic_repair_receipt_diagnostic"
+        ]
+        self.assertFalse(diagnostic["asset_failure"])
+        self.assertEqual(
+            diagnostic["fresh_pipeline_outcome"],
+            "completed",
+        )
+
     def test_repaired_cluster_resumes_blocked_consumer_in_same_pipeline(self):
         gui = load_gui_module()
         app = self.app(gui)
@@ -197,10 +307,35 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
-    def test_failed_cluster_repair_finally_blocks_consumer_without_pipeline(self):
+    def test_failed_cluster_repair_returns_to_fresh_pipeline_for_both_targets(self):
         gui = load_gui_module()
         app = self.app(gui)
-        app._run_full_pipeline = mock.Mock()
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            for item in targets:
+                app.state.setdefault(str(item["spm"]), {}).update({
+                    "push_status": "완료 (headless)",
+                    "push_status_kind": "imported_ok",
+                })
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": "completed",
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
         job = {
             "targets": [{"spm": self.first}, {"spm": self.second}],
             "repair_plans": [self.plan(self.first, "cluster-failed")],
@@ -216,20 +351,137 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         ):
             ok = app._run_failed_retry_repair_job(job, Lease())
 
-        self.assertFalse(ok)
-        app._run_full_pipeline.assert_not_called()
+        self.assertTrue(ok)
+        app._run_full_pipeline.assert_called_once()
+        self.assertEqual(
+            captured_targets,
+            [str(self.first), str(self.second)],
+        )
         outcomes = {
             row["target"]: row for row in app._phase_result_summary["target_outcomes"]
         }
-        self.assertEqual(outcomes[str(self.first)]["outcome"], "failed")
+        self.assertEqual(outcomes[str(self.first)]["outcome"], "completed")
         self.assertEqual(
-            outcomes[str(self.first)]["reason_token"],
+            outcomes[str(self.first)]["evidence"][
+                "automatic_repair_attempt"
+            ]["reason_token"],
             "automatic_repair_failed",
         )
-        self.assertEqual(outcomes[str(self.second)]["outcome"], "blocked")
+        self.assertEqual(outcomes[str(self.second)]["outcome"], "completed")
+        self.assertEqual(
+            app.state[str(self.first)].get("push_status_kind"),
+            "imported_ok",
+        )
+
+    def test_exact_repair_wrapper_exception_still_runs_fresh_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            app.state.setdefault(str(self.first), {}).update({
+                "push_status": "완료 (headless)",
+                "push_status_kind": "imported_ok",
+            })
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": "completed",
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        app._execute_exact_repair_stage = mock.Mock(
+            side_effect=RuntimeError("sanitized request construction bug")
+        )
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [self.plan(self.first, "wrapper-exception")],
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(captured_targets, [str(self.first)])
+        app._run_full_pipeline.assert_called_once()
+        outcome = app._phase_result_summary["target_outcomes"][0]
+        self.assertEqual(outcome["outcome"], "completed")
+        self.assertEqual(
+            outcome["evidence"]["automatic_repair_attempt"]["reason_token"],
+            "automatic_repair_failed",
+        )
+        self.assertEqual(
+            app.state[str(self.first)]["push_status_kind"],
+            "imported_ok",
+        )
+
+    def test_fresh_pipeline_content_failure_keeps_its_exact_reason(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+
+        def content_blocked(_targets, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(self.first),
+                        "target_name": self.first.name,
+                        "outcome": "failed",
+                        "reason_token": "asset_external_mesh_path_missing",
+                        "evidence": {"missing": ["meshes/missing.fbx"]},
+                    },
+                    {
+                        "target": str(self.second),
+                        "target_name": self.second.name,
+                        "outcome": "blocked",
+                        "reason_token": "dependency_blocked",
+                        "evidence": {"blocked_by": [str(self.first)]},
+                    },
+                ],
+                "completed_count": 0,
+                "blocked_count": 1,
+                "failed_count": 1,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=content_blocked)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-failed-content")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "failed", "error": "worker transport"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        outcomes = {
+            row["target"]: row
+            for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(
+            outcomes[str(self.first)]["reason_token"],
+            "asset_external_mesh_path_missing",
+        )
         self.assertEqual(
             outcomes[str(self.second)]["reason_token"],
-            "required_cluster_repair_failed",
+            "dependency_blocked",
+        )
+        self.assertNotEqual(
+            app.state[str(self.first)].get("push_status_kind"),
+            "automatic_repair_failed",
         )
 
     def test_cancelled_cluster_repair_cancels_consumer_resumably(self):
@@ -380,10 +632,33 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertIn("Generator Sync 중", status_cells)
         self.assertIn("Cluster 갱신 중", status_cells)
 
-    def test_partial_stage_failure_does_not_enter_pipeline_or_hide_final_failure(self):
+    def test_multiple_stage_failures_return_to_fresh_pipeline(self):
         gui = load_gui_module()
         app = self.app(gui)
-        app._run_full_pipeline = mock.Mock()
+
+        def complete_pipeline(targets, **_kwargs):
+            for item in targets:
+                app.state.setdefault(str(item["spm"]), {}).update({
+                    "push_status": "완료 (headless)",
+                    "push_status_kind": "imported_ok",
+                })
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": "completed",
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
         job = {
             "targets": [{"spm": self.first}, {"spm": self.second}],
             "repair_plans": [
@@ -400,13 +675,16 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         ):
             ok = app._run_failed_retry_repair_job(job, Lease())
 
-        self.assertFalse(ok)
-        app._run_full_pipeline.assert_not_called()
-        self.assertEqual(app._phase_result_summary["failed_count"], 2)
+        self.assertTrue(ok)
+        app._run_full_pipeline.assert_called_once()
+        self.assertEqual(app._phase_result_summary["completed_count"], 2)
         for path in (self.first, self.second):
             automation = app.state[str(path)]["failed_retry_automation"]
-            self.assertEqual(automation["status"], "final_failed")
-            self.assertIn("reason_codes", app.state[str(path)]["push_status_error"])
+            self.assertEqual(automation["status"], gui.STATUS_COMPLETED)
+            self.assertEqual(
+                app.state[str(path)].get("push_status_kind"),
+                "imported_ok",
+            )
 
     def test_cancel_is_resumable_and_not_promoted_to_final_failed(self):
         gui = load_gui_module()
@@ -473,10 +751,13 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
     def test_downstream_pending_unreal_is_waiting_not_final_failure(self):
         gui = load_gui_module()
         app = self.app(gui)
-        app._run_full_pipeline = mock.Mock(side_effect=lambda *_args, **_kwargs: setattr(
-            app,
-            "_phase_result_summary",
-            {
+
+        def pending_pipeline(*_args, **_kwargs):
+            app.state.setdefault(str(self.first), {}).update({
+                "push_status": "Unreal import pending",
+                "push_status_kind": "exported_pending_unreal",
+            })
+            app._phase_result_summary = {
                 "target_outcomes": [{
                     "target": str(self.first),
                     "target_name": self.first.name,
@@ -488,8 +769,9 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
                 "pending_count": 1,
                 "blocked_count": 0,
                 "failed_count": 0,
-            },
-        ))
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=pending_pipeline)
         job = {
             "targets": [{"spm": self.first}],
             "repair_plans": [self.plan(self.first, "downstream-wait")],
@@ -508,6 +790,10 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         self.assertTrue(ok)
         automation = app.state[str(self.first)]["failed_retry_automation"]
         self.assertEqual(automation["status"], "blender_unreal_retry_running")
+        self.assertEqual(
+            app.state[str(self.first)]["push_status_kind"],
+            "exported_pending_unreal",
+        )
         self.assertEqual(app._phase_result_summary["pending_count"], 1)
         self.assertEqual(app._phase_result_summary["failed_count"], 0)
 
@@ -611,7 +897,7 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
         app._enqueue_batch_job.assert_called_once_with(job)
         tracker.complete_planning_commit.assert_called_once_with()
 
-    def test_unsupported_reason_is_visible_instead_of_silent_continue(self):
+    def test_unsupported_metadata_repair_keeps_fresh_pipeline_route(self):
         gui = load_gui_module()
         app = self.app(gui)
         iid = str(self.first)
@@ -627,19 +913,15 @@ class FailedRetryOrchestrationTests(unittest.TestCase):
             inventory_snapshot=inventory,
         )
 
-        self.assertEqual(built["jobs"], [])
+        self.assertEqual(len(built["jobs"]), 1)
+        self.assertEqual(built["jobs"][0]["mode"], "pipeline")
+        self.assertTrue(built["jobs"][0]["force_rerun"])
+        self.assertEqual(built["skipped"], [])
+        self.assertEqual(built["deferred_status_updates"], [])
         self.assertTrue(any(
             "managed_mesh_owner_ambiguous" in row
-            for row in built["skipped"]
+            for row in built["deferred_logs"]
         ))
-        self.assertEqual(
-            built["deferred_status_updates"][0]["status"],
-            gui.STATUS_FINAL_FAILED,
-        )
-        self.assertIn(
-            "managed_mesh_owner_ambiguous",
-            built["deferred_status_updates"][0]["kwargs"]["plan"].reason_codes,
-        )
 
     def test_atlas_receipt_and_lineage_blocks_enter_exact_cluster_refresh(self):
         gui = load_gui_module()

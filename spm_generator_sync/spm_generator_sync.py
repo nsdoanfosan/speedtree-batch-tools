@@ -50,7 +50,6 @@ if str(REPO_DIR) not in sys.path:
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from speedtree_legacy_cluster_contract import FOREGROUND_TAGS
 from atlas_manifest_resolver import (
-    AtlasManifestResolutionError,
     resolve_atlas_manifests,
     selected_manifest_payload,
 )
@@ -724,18 +723,36 @@ def _path_identity(path: Path | str) -> str:
 
 
 def _atlas_target_relation_manifest(spm_path: Path) -> dict:
-    """Load the shared-resolver authority for one exact Atlas target."""
-    try:
-        resolution = resolve_atlas_manifests(
-            spm_path,
-            require_generator_complete=True,
+    """Load non-blocking Atlas evidence for one exact Generator target."""
+    # Generator Sync can use an unambiguous binding as protection metadata,
+    # but Provider disagreement is not permission to reject or rewrite the
+    # live Generator graph.  Diagnostic mode projects only disjoint claims.
+    resolution = resolve_atlas_manifests(
+        spm_path,
+        require_generator_complete=True,
+        diagnostic_only=True,
+    )
+    selected = resolution.get("selected") or []
+    if not selected:
+        return {}
+    payload = copy.deepcopy(selected_manifest_payload(resolution))
+    protection_bindings = []
+    for record in selected:
+        connection = (record.get("payload") or {}).get(
+            "generator_connection"
+        ) or {}
+        protection_bindings.extend(
+            copy.deepcopy(connection.get("bindings") or [])
         )
-    except AtlasManifestResolutionError as exc:
-        raise SyncError(
-            "Atlas manifest resolution failed for the exact target SPM: "
-            f"{exc}"
-        ) from exc
-    return selected_manifest_payload(resolution)
+    mutation_authorized = resolution.get("mutation_authorized") is not False
+    payload["_atlas_relation_mutation_authorized"] = mutation_authorized
+    payload["_atlas_relation_protection_bindings"] = protection_bindings
+    connection = copy.deepcopy(payload.get("generator_connection") or {})
+    connection["bindings"] = (
+        copy.deepcopy(protection_bindings) if mutation_authorized else []
+    )
+    payload["generator_connection"] = connection
+    return payload
 
 
 def _material_cutout_ids(material: ET.Element | None) -> list[str]:
@@ -784,9 +801,20 @@ class SPMDocument:
             _atlas_target_relation_manifest(self.path) if full else {}
         )
         self.atlas_relation_bindings: dict[tuple[str, str], dict] = {}
-        for binding in (
-            self.atlas_relation_manifest.get("generator_connection") or {}
-        ).get("bindings") or []:
+        self.atlas_relation_protection_bindings: dict[
+            tuple[str, str], dict
+        ] = {}
+        self.atlas_relation_ambiguous_binding_keys: set[
+            tuple[str, str]
+        ] = set()
+        protection_rows = self.atlas_relation_manifest.get(
+            "_atlas_relation_protection_bindings"
+        )
+        if protection_rows is None:
+            protection_rows = (
+                self.atlas_relation_manifest.get("generator_connection") or {}
+            ).get("bindings") or []
+        for binding in protection_rows:
             if not isinstance(binding, dict):
                 continue
             key = (
@@ -795,13 +823,36 @@ class SPMDocument:
             )
             if not all(key):
                 continue
-            previous = self.atlas_relation_bindings.get(key)
+            if key in self.atlas_relation_ambiguous_binding_keys:
+                continue
+            previous = self.atlas_relation_protection_bindings.get(key)
             if previous is not None and previous != binding:
-                raise SyncError(
-                    "Atlas target manifest에 충돌하는 Generator binding이 "
-                    f"있습니다: {self.path.name} · {key[0]} · {key[1]}"
+                # The disputed Provider metadata cannot authorize clone/slot
+                # mutation.  Ignore only that binding and continue syncing the
+                # live Generator content that does not depend on it.
+                self.atlas_relation_protection_bindings.pop(key, None)
+                self.atlas_relation_ambiguous_binding_keys.add(key)
+                continue
+            self.atlas_relation_protection_bindings[key] = binding
+        if self.atlas_relation_manifest.get(
+            "_atlas_relation_mutation_authorized", True
+        ):
+            positive_rows = (
+                self.atlas_relation_manifest.get("generator_connection") or {}
+            ).get("bindings") or []
+            for binding in positive_rows:
+                if not isinstance(binding, dict):
+                    continue
+                key = (
+                    str(binding.get("generator_guid") or "").strip(),
+                    str(binding.get("slot_prefix") or "").strip(),
                 )
-            self.atlas_relation_bindings[key] = binding
+                if (
+                    all(key)
+                    and key not in self.atlas_relation_ambiguous_binding_keys
+                    and key in self.atlas_relation_protection_bindings
+                ):
+                    self.atlas_relation_bindings[key] = binding
         if full:
             self._index_assets(text)
         try:
@@ -1597,7 +1648,7 @@ def strip_atlas_created_variant_slots_from_clone(
     bindings = [
         binding
         for (binding_guid, _slot), binding
-        in source_document.atlas_relation_bindings.items()
+        in source_document.atlas_relation_protection_bindings.items()
         if binding_guid == guid and binding.get("created_slot")
     ]
     properties = clone.find("Properties")

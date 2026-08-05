@@ -1148,10 +1148,20 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
 
     pcg_handoff = contract.get("handoff") or {}
     pcg_handoff_status = str(pcg_handoff.get("status") or "")
+    bark = pcg_handoff.get("canonical_bark") or {}
+    bark_mutation_requested = bool(bark.get("mutation_requested"))
+    legacy_bark_audit_status = str(bark.get("status") or "") in {
+        "blocked_canonical_ambiguous",
+        "blocked_canonical_missing",
+        "replacement_required",
+    }
     canonical_bark_captures = []
     if pcg_handoff_status in {"blocked", "needs_bark_normalization"}:
         detailed = []
-        if pcg_handoff_status == "needs_bark_normalization":
+        if (
+            pcg_handoff_status == "needs_bark_normalization"
+            and bark_mutation_requested
+        ):
             dependency_roles = {}
             for dependency in (
                 pcg_handoff.get("cluster_dependencies")
@@ -1170,7 +1180,6 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                         dependency_roles[
                             os.path.normcase(os.path.abspath(str(value)))
                         ] = role
-            bark = pcg_handoff.get("canonical_bark") or {}
             for source in bark.get("cluster_bark_sources") or []:
                 if source.get("replacement") != "required":
                     continue
@@ -1208,9 +1217,18 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 )
                 if isinstance(row, dict)
             ]
-            bark = pcg_handoff.get("canonical_bark") or {}
+            if not bark_mutation_requested:
+                detailed = [
+                    row for row in detailed
+                    if str(row.get("code") or "") not in {
+                        "CANONICAL_BARK_AMBIGUOUS",
+                        "CANONICAL_BARK_MISSING",
+                        "CANONICAL_BARK_NORMALIZATION_REQUIRED",
+                    }
+                ]
             if (
                 not detailed
+                and bark_mutation_requested
                 and bark.get("status") == "blocked_canonical_ambiguous"
             ):
                 detailed.append({
@@ -1223,9 +1241,16 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                         bark.get("canonical_conflicts") or []
                     ),
                 })
-        if pcg_handoff_status == "needs_bark_normalization":
+        if (
+            pcg_handoff_status == "needs_bark_normalization"
+            and bark_mutation_requested
+        ):
             issues.extend(detailed)
-        else:
+        elif pcg_handoff_status == "blocked" and detailed:
+            issues.extend(detailed)
+        elif not (
+            legacy_bark_audit_status and not bark_mutation_requested
+        ):
             issues.extend(
                 detailed
                 or [{
@@ -1250,6 +1275,16 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
         "actual_fbx": inventory.get("source_fbx") or {},
         "artifact_validation": artifacts,
         "pcg_handoff_status": pcg_handoff_status,
+        "canonical_bark_delivery": {
+            "status": bark.get("status"),
+            "mutation_requested": bark_mutation_requested,
+            "normalization_gate_applied": bool(
+                bark_mutation_requested
+                and pcg_handoff_status in {
+                    "blocked", "needs_bark_normalization"
+                }
+            ),
+        },
         "canonical_bark_captures": canonical_bark_captures,
         "roles": roles,
         "full_skeletal_mesh": {

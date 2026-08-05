@@ -455,6 +455,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "access_violation_exhausted": ReasonRow(
         UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_crash",
     ),
+    "already_current": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "relation_decision_diagnostic",
+    ),
     "all_export_inspection_error": ReasonRow(
         UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
         "export_inspection",
@@ -511,8 +515,8 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
     ),
     "atlas_manifest_candidate_conflict": ReasonRow(
-        UNSUPPORTED, "sk_batch/jobs/speedtree_material_preflight.py",
-        "atlas_ownership",
+        INFORMATIONAL, "sk_batch/spm_leaf_handoff_contract.py",
+        "atlas_candidate_diagnostic",
     ),
     "atlas_manifest_mirror_conflict_repairable": ReasonRow(
         REPAIRABLE, "atlas_manifest_resolver.py", "atlas_manifest",
@@ -531,8 +535,8 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
     "atlas_ownership_provenance_mismatch": ReasonRow(
-        FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
-        "atlas_integrity",
+        INFORMATIONAL, "sk_batch/spm_leaf_handoff_contract.py",
+        "diagnostic_integrity_field",
     ),
     "authoritative_managed_mesh_sentinel": ReasonRow(
         INFORMATIONAL, "pcg_st9_texture_batch/spm_generator_reference_repair.py",
@@ -702,7 +706,8 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "cluster_refresh",
     ),
     "canonical_material_mapping_incomplete": ReasonRow(
-        UNCLASSIFIED, "pcg_st9_texture_batch/pcg_canonical_outputs.py", "",
+        REPAIRABLE, "pcg_st9_texture_batch/pcg_canonical_outputs.py",
+        "pcg_texture",
     ),
     "canonical_output_has_no_material_targets": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
@@ -753,6 +758,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff_diagnostic",
     ),
+    "cluster_refresh_orchestration_diagnostic": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "relation_decision_diagnostic",
+    ),
+    "cluster_refresh_reaudit_diagnostic": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "relation_decision_diagnostic",
+    ),
     "cluster_source_build_contract_invalid": ReasonRow(
         UNSUPPORTED, "cluster_normalization_sync.py",
         "cluster_source_integrity",
@@ -801,6 +814,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "different_target_spm": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
+    ),
+    "diagnostic_disjoint_provider_claims": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py",
+        "atlas_candidate_diagnostic",
     ),
     "duplicate_material_id": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
@@ -866,6 +883,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "generator_connection_not_requested": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
     ),
+    "generator_delivery_scope_invalid": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "diagnostic_integrity_field",
+    ),
     "generator_cross_group_pair": ReasonRow(
         UNSUPPORTED, "sk_batch/atlas_consumer_integrity.py", "visible_generator_pair",
     ),
@@ -882,6 +904,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "generator_material_scope_unreadable": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
+    ),
+    "generator_ownership_claim_disagreement": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/atlas_consumer_integrity.py",
+        "atlas_candidate_diagnostic",
     ),
     "generator_slot_pair_incomplete": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
@@ -908,6 +935,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "invalid_required_roles": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
+    ),
+    "invalid_scope_metadata_live_content_unbound": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "diagnostic_integrity_field",
     ),
     "invalid_texture_base": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
@@ -1142,6 +1174,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "provider_identity": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
+    ),
+    "provider_metadata_diagnostic_only": ReasonRow(
+        INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
+        "relation_decision_diagnostic",
     ),
     "provisional_source_blocked": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
@@ -1407,6 +1443,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "blender_output_not_current": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
     ),
+    "automation_wrapper_fresh_pipeline": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "blender_rebuild_route",
+    ),
     "canonical_output": ReasonRow(
         INFORMATIONAL, "speedtree_texture_contract.py", "current_texture_output",
     ),
@@ -1445,6 +1486,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_excluded",
     ),
     "current_blender_success_forced_rebuild": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
+    ),
+    "current_unreal_parent_forced_rebuild": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "retry_route_status",
     ),
     "current_immutable_unreal_failure": ReasonRow(
@@ -2024,7 +2068,7 @@ _classify(
     "asset_texture_source_path_missing", "asset_texture_source_undeclared",
 )
 _classify(
-    UNSUPPORTED, "canonical_material_mapping", "canonical_material_mapping_incomplete",
+    REPAIRABLE, "pcg_texture", "canonical_material_mapping_incomplete",
 )
 _classify(
     UNSUPPORTED, "generator_authority", "authoritative_property_pair_missing",

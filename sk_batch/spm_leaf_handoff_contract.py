@@ -37,7 +37,6 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     visible_material_ids,
 )
 from atlas_manifest_resolver import (  # noqa: E402
-    AtlasManifestResolutionError,
     resolution_evidence,
     resolve_atlas_manifests,
     resolve_manifest_material_ownership,
@@ -711,20 +710,13 @@ def inspect_spm_leaf_contract(spm_path):
     managed_materials = contract.pop("_managed_materials", [])
     if not managed_materials:
         return contract
-    try:
-        resolution = resolve_atlas_manifests(path)
-        proof = resolve_manifest_material_ownership(
-            resolution,
-            managed_materials,
-            target_spm=path,
-        )
-        proof["atlas_manifest_resolution"] = resolution_evidence(resolution)
-    except AtlasManifestResolutionError as exc:
-        proof = {
-            "status": "manifest_conflict",
-            "reason": str(exc),
-            "atlas_manifest_resolution": copy.deepcopy(exc.resolution),
-        }
+    resolution = resolve_atlas_manifests(path, diagnostic_only=True)
+    proof = resolve_manifest_material_ownership(
+        resolution,
+        managed_materials,
+        target_spm=path,
+    )
+    proof["atlas_manifest_resolution"] = resolution_evidence(resolution)
     contract["managed_ownership_provenance"] = (
         _managed_ownership_provenance(managed_materials, proof)
     )

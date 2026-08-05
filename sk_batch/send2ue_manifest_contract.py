@@ -23,6 +23,13 @@ from pathlib import Path
 
 MESH_ASSET_TYPES = {"SkeletalMesh", "StaticMesh"}
 MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
+SIDECAR_DESCRIPTOR_REQUIRED_FIELDS = (
+    "kind",
+    "version",
+    "fingerprint",
+    "asset_kind",
+    "mesh_name",
+)
 
 
 def is_actionable_cluster_assembly_manifest(manifest):
@@ -192,6 +199,8 @@ def _normalize_command_groups(
     target_asset_path,
     source_sidecar,
     normalized_sidecar,
+    source_sidecar_sha256="",
+    normalized_sidecar_sha256="",
 ):
     for group_key in ("pre_import_commands", "post_import_commands"):
         groups = manifest_asset.get(group_key)
@@ -209,6 +218,11 @@ def _normalize_command_groups(
                     source_sidecar,
                     normalized_sidecar,
                 )
+                if source_sidecar_sha256 and normalized_sidecar_sha256:
+                    value = value.replace(
+                        str(source_sidecar_sha256),
+                        str(normalized_sidecar_sha256),
+                    )
                 value = value.replace(
                     str(source_asset_path),
                     str(target_asset_path),
@@ -237,6 +251,41 @@ def _normalized_sidecar_path(export_root, source_path, asset_path):
     ).hexdigest()
     asset_name = asset_path.rsplit("/", 1)[-1]
     return Path(export_root) / "handoff" / f"{asset_name}_{digest}.json"
+
+
+def _sidecar_descriptor_is_complete(descriptor):
+    if not isinstance(descriptor, dict):
+        return False
+    for field in SIDECAR_DESCRIPTOR_REQUIRED_FIELDS:
+        if not str(descriptor.get(field) or "").strip():
+            return False
+    return True
+
+
+def _source_bound_fallback_descriptor(pipeline_contract):
+    """Return the wrapper descriptor only when it owns the wrapper source."""
+
+    pipeline_contract = (
+        pipeline_contract if isinstance(pipeline_contract, dict) else {}
+    )
+    descriptor = pipeline_contract.get("speedtree_handoff_contract")
+    if not _sidecar_descriptor_is_complete(descriptor):
+        raise RuntimeError(
+            "Send2UE strict material wrapper has no complete authoritative "
+            "SpeedTree handoff descriptor"
+        )
+    pipeline_source = pipeline_contract.get("source")
+    descriptor_source = descriptor.get("source")
+    if (
+        not isinstance(pipeline_source, dict)
+        or not pipeline_source
+        or descriptor_source != pipeline_source
+    ):
+        raise RuntimeError(
+            "Send2UE authoritative SpeedTree handoff descriptor is not bound "
+            "to the current strict material source"
+        )
+    return descriptor
 
 
 def _normalize_exported_mesh_file(asset_data, export_root, authored_name):
@@ -287,15 +336,24 @@ def normalize_manifest_handoff_sidecars(
     export_root,
     *,
     sidecar_descriptor_builder,
+    authoritative_pipeline_contract=None,
 ):
     """Align each manifest destination with its authored Export Empty identity.
 
     The child mesh object may retain ``_Mesh``.  Public Unreal asset paths and
     the cache-local FBX filename are taken from the sidecar ``mesh_name`` so
     Unreal creates the authored Export Empty identity.  A sidecar copy is
-    created only when its own descriptor is missing or incomplete; source
-    sidecars remain untouched.
+    created when its descriptor is missing, incomplete, stale, or bound to a
+    different source; source sidecars remain untouched.  Descriptor data is
+    recovered from the already-validated strict material wrapper, never from
+    an unrelated asset.
     """
+
+    authoritative_descriptor = None
+    if authoritative_pipeline_contract is not None:
+        authoritative_descriptor = _source_bound_fallback_descriptor(
+            authoritative_pipeline_contract
+        )
 
     results = []
     claimed_asset_paths = {}
@@ -331,14 +389,54 @@ def normalize_manifest_handoff_sidecars(
             if isinstance(descriptor, dict)
             else ""
         )
-        if saved_name and descriptor_name and (
-            saved_name.casefold() != descriptor_name.casefold()
+        descriptor_complete = _sidecar_descriptor_is_complete(descriptor)
+        if (
+            authoritative_descriptor is None
+            and saved_name
+            and descriptor_complete
+            and descriptor_name
+            and saved_name.casefold() != descriptor_name.casefold()
         ):
             raise RuntimeError(
                 "Send2UE material sidecar identity is inconsistent: "
                 f"{saved_name!r} != {descriptor_name!r} ({source_path})"
             )
-        authored_name = saved_name or descriptor_name or expected_name
+        fallback_descriptor = authoritative_descriptor
+        fallback_name = (
+            str((fallback_descriptor or {}).get("mesh_name") or "").strip()
+        )
+        authored_name = (
+            saved_name
+            or (descriptor_name if descriptor_complete else "")
+            or fallback_name
+            or expected_name
+        )
+        expected_descriptor = None
+        descriptor_authoritative = descriptor_complete
+        if authoritative_descriptor is not None:
+            expected_descriptor = sidecar_descriptor_builder(
+                authored_name,
+                source=authoritative_descriptor.get("source"),
+            )
+            descriptor_authoritative = (
+                descriptor_complete
+                and descriptor == expected_descriptor
+            )
+        if not descriptor_authoritative and fallback_descriptor is None:
+            raise RuntimeError(
+                "Send2UE material sidecar descriptor is not authoritative and "
+                "no source-bound strict wrapper is available"
+            )
+        if (
+            not descriptor_authoritative
+            and fallback_descriptor is not None
+            and fallback_name.casefold() != authored_name.casefold()
+        ):
+            raise RuntimeError(
+                "Send2UE authoritative SpeedTree handoff descriptor belongs "
+                "to a different canonical unit: "
+                f"{fallback_name!r} != {authored_name!r} ({source_path})"
+            )
         destination_folder = asset_path.rsplit("/", 1)[0]
         target_asset_path = destination_folder + "/" + authored_name
         target_key = target_asset_path.casefold()
@@ -354,23 +452,26 @@ def normalize_manifest_handoff_sidecars(
 
         needs_identity_normalization = (
             not saved_name
-            or (
-                isinstance(descriptor, dict)
-                and not descriptor_name
-            )
+            or not descriptor_authoritative
         )
 
         normalized_path = source_path
         if needs_identity_normalization:
             normalized_data = copy.deepcopy(source_data)
             normalized_data["mesh_name"] = authored_name
-            if isinstance(descriptor, dict):
-                normalized_data["speedtree_handoff_contract"] = (
-                    sidecar_descriptor_builder(
-                        authored_name,
-                        source=descriptor.get("source"),
-                    )
+            descriptor_source = (
+                fallback_descriptor.get("source")
+                if not descriptor_authoritative
+                and fallback_descriptor is not None
+                else descriptor.get("source")
+            )
+            normalized_data["speedtree_handoff_contract"] = copy.deepcopy(
+                expected_descriptor
+                if expected_descriptor is not None
+                else sidecar_descriptor_builder(
+                    authored_name, source=descriptor_source
                 )
+            )
             normalized_path = _normalized_sidecar_path(
                 export_root,
                 source_path,
@@ -390,6 +491,12 @@ def normalize_manifest_handoff_sidecars(
             )
             os.replace(temporary, normalized_path)
 
+        source_sidecar_sha256 = str(
+            asset_data.get("_material_pipeline_json_sha256") or ""
+        ).strip()
+        normalized_sidecar_sha256 = hashlib.sha256(
+            normalized_path.read_bytes()
+        ).hexdigest()
         asset_data["asset_path"] = target_asset_path
         exported_mesh = _normalize_exported_mesh_file(
             asset_data,
@@ -399,12 +506,18 @@ def normalize_manifest_handoff_sidecars(
         asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(
             normalized_path.resolve()
         ).replace("\\", "/")
+        if needs_identity_normalization or source_sidecar_sha256:
+            asset_data["_material_pipeline_json_sha256"] = (
+                normalized_sidecar_sha256
+            )
         _normalize_command_groups(
             manifest_asset,
             source_asset_path=asset_path,
             target_asset_path=target_asset_path,
             source_sidecar=source_path,
             normalized_sidecar=normalized_path,
+            source_sidecar_sha256=source_sidecar_sha256,
+            normalized_sidecar_sha256=normalized_sidecar_sha256,
         )
         results.append(
             {

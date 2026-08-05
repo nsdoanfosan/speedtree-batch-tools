@@ -5043,6 +5043,341 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         app._snapshot_batch_request.assert_called_once_with([checked])
 
+    def test_checked_retry_force_rebuilds_current_success_without_checkbox(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        checked = "checked_current_success.spm"
+        jobs = self.configure_failed_retry_start(app, [checked])
+        app.force_var = mock.Mock()
+        app.force_var.get.return_value = False
+        app.state[checked] = {
+            "blend_status": "current",
+            "push_status": "completed previously",
+            "push_status_kind": "imported_ok",
+        }
+
+        with mock.patch.object(gui, "save_config") as save_config:
+            app.start_checked_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(jobs[0]["force_rerun"])
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["eligibility"]["items"][0][
+                "reason_code"
+            ],
+            "current_blender_success_forced_rebuild",
+        )
+        app.force_var.get.assert_called_once_with()
+        self.assertNotIn("_retry_force_rerun", save_config.call_args.args[0])
+        self.assertNotIn("_retry_force_rerun", jobs[0]["cfg"])
+
+    def test_revision_mismatch_prechecks_before_retry_tracker_and_dedupes(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        checked = "revision_changed.spm"
+        self.configure_failed_retry_start(app, [checked])
+        app._async_retry_planning_enabled = True
+        app._new_retry_progress = mock.Mock()
+        app._record_phase_status = mock.Mock()
+        app.force_var = mock.Mock()
+        original_state = copy.deepcopy(app.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sources = [root / f"changed_{index}.py" for index in range(6)]
+            for index, path in enumerate(sources):
+                path.write_text(f"value = {index}\n", encoding="utf-8")
+            expected = gui.production_source_manifest(root)
+            for index, path in enumerate(sources):
+                path.write_text(
+                    f"value = {index + 100}\n",
+                    encoding="utf-8",
+                )
+            actual = gui.production_source_manifest(root)
+
+            with mock.patch.object(
+                gui,
+                "_PROCESS_PRODUCTION_SOURCE_MANIFEST",
+                expected,
+            ), mock.patch.object(
+                gui,
+                "production_source_manifest",
+                return_value=actual,
+            ) as manifest, mock.patch.object(
+                gui.messagebox,
+                "showwarning",
+            ) as warning:
+                first = app.start_checked_failed_results_retry()
+                second = app.start_checked_failed_results_retry()
+
+        self.assertEqual(
+            first["route"],
+            "code_revision_restart_required",
+        )
+        self.assertEqual(second, first)
+        self.assertEqual(first["expected_revision"], expected.content_hash)
+        self.assertEqual(first["actual_revision"], actual.content_hash)
+        self.assertEqual(len(first["changed_paths"]), 6)
+        manifest.assert_called_once_with(gui.REPO_DIR)
+        warning.assert_called_once()
+        warning_text = warning.call_args.args[1]
+        for path in sources:
+            self.assertIn(path.name, warning_text)
+        self.assertIn(expected.content_hash, warning_text)
+        self.assertIn(actual.content_hash, warning_text)
+        app._new_retry_progress.assert_not_called()
+        app._collect_cfg.assert_not_called()
+        app._snapshot_batch_request.assert_not_called()
+        app._enqueue_batch_job.assert_not_called()
+        app._record_phase_status.assert_not_called()
+        app.force_var.get.assert_not_called()
+        self.assertEqual(app.state, original_state)
+
+    def test_retry_click_has_one_revision_precheck_before_receipt_creation(self):
+        module = ast.parse(
+            (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(encoding="utf-8")
+        )
+        app_class = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "App"
+        )
+        method = next(
+            node
+            for node in app_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_start_failed_results_retry"
+        )
+
+        def calls(name):
+            return [
+                node
+                for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            ]
+
+        prechecks = calls("_production_source_revision_precheck")
+        self.assertEqual(len(prechecks), 1)
+        self.assertLess(prechecks[0].lineno, calls("_collect_cfg")[0].lineno)
+        self.assertLess(
+            prechecks[0].lineno,
+            calls("_new_retry_progress")[0].lineno,
+        )
+
+    def test_revision_restart_escapes_item_worker_without_asset_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("worker_revision_changed.spm")
+        details = {
+            "route": "code_revision_restart_required",
+            "expected_revision": "a" * 64,
+            "actual_revision": "b" * 64,
+            "changed_paths": [{
+                "path": "sk_batch/worker.py",
+                "status": "modified",
+                "expected": {"sha256": "a" * 64},
+                "actual": {"sha256": "b" * 64},
+            }],
+        }
+        restart = gui.CodeRevisionRestartRequired(
+            gui.CompileGateError("intentional mismatch", details=details),
+            context="worker revision test",
+        )
+        app.cfg = {"check_parallel_jobs": 1}
+        app._job_check = mock.Mock(side_effect=restart)
+        app._record_phase_status = mock.Mock()
+        app._retry_transition = mock.Mock()
+        original_state = copy.deepcopy(app.state)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui,
+            "LOG_DIR",
+            Path(temporary) / "logs",
+        ), self.assertRaises(gui.CodeRevisionRestartRequired):
+            app._run_batch(
+                "check",
+                [{"spm": target}],
+                emit_done=False,
+            )
+
+        app._record_phase_status.assert_not_called()
+        self.assertEqual(app._phase_failed_items, set())
+        self.assertEqual(app.state, original_state)
+
+    def test_revision_restart_is_structured_job_route_not_asset_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("top_level_revision_changed.spm")
+        details = {
+            "route": "code_revision_restart_required",
+            "expected_revision": "c" * 64,
+            "actual_revision": "d" * 64,
+            "changed_paths": [{
+                "path": "sk_batch/job.py",
+                "status": "modified",
+                "expected": {"sha256": "c" * 64},
+                "actual": {"sha256": "d" * 64},
+            }],
+        }
+        restart = gui.CodeRevisionRestartRequired(
+            gui.CompileGateError("intentional mismatch", details=details),
+            context="top-level revision test",
+        )
+        app._freeze_batch_production_source_manifest = mock.Mock(
+            side_effect=restart
+        )
+        app._run_full_pipeline = mock.Mock()
+        app._record_phase_status = mock.Mock()
+        app._set_push_state = mock.Mock()
+        app._set_failed_retry_automatic_status = mock.Mock()
+        job = {
+            "id": 178,
+            "label": "revision fence test",
+            "mode": "pipeline",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": [{"spm": target}],
+            "retry_metadata": {},
+        }
+
+        app._run_queued_batch_job(job)
+
+        done = next(
+            payload
+            for event, payload in iter(app.ui_queue.get_nowait, None)
+            if event == "batch_job_done"
+        )
+        self.assertEqual(
+            done["status"],
+            "code_revision_restart_required",
+        )
+        self.assertEqual(done["failed_count"], 0)
+        self.assertEqual(done["target_outcomes"], [])
+        self.assertEqual(
+            done["code_revision_restart_required"]["expected_revision"],
+            "c" * 64,
+        )
+        app._run_full_pipeline.assert_not_called()
+        app._record_phase_status.assert_not_called()
+        app._set_push_state.assert_not_called()
+        app._set_failed_retry_automatic_status.assert_not_called()
+        self.assertNotIn(str(target), app.state)
+
+    def test_revision_restart_survives_queue_receipt_finalization_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        target = Path("revision_changed_before_queue_finish.spm")
+        details = {
+            "route": "code_revision_restart_required",
+            "expected_revision": "e" * 64,
+            "actual_revision": "f" * 64,
+            "changed_paths": [],
+        }
+        restart = gui.CodeRevisionRestartRequired(
+            gui.CompileGateError("intentional mismatch", details=details),
+            context="queue finalization revision test",
+        )
+        app._freeze_batch_production_source_manifest = mock.Mock(
+            side_effect=restart
+        )
+        lease = mock.Mock()
+        lease.finished = False
+        lease.heartbeat_error = RuntimeError("lease owner unavailable")
+        lease.finish.side_effect = RuntimeError("queue receipt write failed")
+        app.shared_queue_runtime = mock.Mock()
+        app.shared_queue_runtime.wait_for_turn.return_value = lease
+        app._run_full_pipeline = mock.Mock()
+        app._record_phase_status = mock.Mock()
+        job = {
+            "id": 179,
+            "label": "revision fence queue finalization test",
+            "mode": "pipeline",
+            "terminal_phase": "push",
+            "selected_scope": True,
+            "targets": [{"spm": target}],
+            "shared_queue_job_id": "shared-revision-179",
+            "retry_metadata": {},
+        }
+
+        app._run_queued_batch_job(job)
+
+        done = next(
+            payload
+            for event, payload in iter(app.ui_queue.get_nowait, None)
+            if event == "batch_job_done"
+        )
+        self.assertEqual(
+            done["status"],
+            "code_revision_restart_required",
+        )
+        self.assertEqual(done["failed_count"], 0)
+        self.assertEqual(done["target_outcomes"], [])
+        self.assertEqual(done["shared_failures"], [])
+        self.assertEqual(
+            done["queue_finalization_error"],
+            "queue receipt write failed",
+        )
+        self.assertTrue(done["job_diagnostics"][0]["owner_lost"])
+        self.assertFalse(done["job_diagnostics"][0]["asset_failure"])
+        self.assertEqual(
+            lease.finish.call_args.kwargs["terminal_status"],
+            "cancelled",
+        )
+        app._run_full_pipeline.assert_not_called()
+        app._record_phase_status.assert_not_called()
+        self.assertNotIn(str(target), app.state)
+
+    def test_revision_restart_cancels_pending_shared_queue_tickets(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        tracker = mock.Mock()
+        pending_job = {
+            "id": 180,
+            "label": "pending rebuild",
+            "shared_queue_job_id": "shared-revision-180",
+            "retry_metadata": {"partition": "blender_rebuild"},
+            "_retry_progress_tracker": tracker,
+        }
+        app.active_batch_job = {
+            "id": 179,
+            "label": "active revision fence",
+            "retry_metadata": {},
+        }
+        app.pending_batch_jobs = deque([pending_job])
+        app.batch_job_failures = []
+        app.worker = mock.Mock()
+        app.shared_queue_runtime = mock.Mock()
+        app._present_code_revision_restart_required = mock.Mock()
+        app._reset_cluster_receipt_refresh_memo = mock.Mock()
+        app._set_batch_queue_controls = mock.Mock()
+        app.progress_var = mock.Mock()
+        app._start_next_batch_job = mock.Mock()
+
+        app._finish_batch_job({
+            "id": 179,
+            "status": gui.CODE_REVISION_RESTART_ROUTE,
+            "error": "intentional source revision change",
+            gui.CODE_REVISION_RESTART_ROUTE: {
+                "expected_revision": "a" * 64,
+                "actual_revision": "b" * 64,
+                "changed_paths": [],
+            },
+        })
+
+        app.shared_queue_runtime.cancel.assert_called_once_with(
+            "shared-revision-180",
+            reason=gui.CODE_REVISION_RESTART_ROUTE,
+        )
+        tracker.mark_partition_terminal.assert_called_once_with(
+            "blender_rebuild",
+            gui.RETRY_STAGE_CANCELLED,
+            "code revision changed before shared queue claim; restart required",
+        )
+        self.assertEqual(list(app.pending_batch_jobs), [])
+        app._start_next_batch_job.assert_not_called()
+
     def test_checked_failed_retry_with_no_checks_does_not_plan(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -5078,6 +5413,16 @@ class PushQueueFlowTests(unittest.TestCase):
         ui_thread_ident = threading.get_ident()
         app._ui_thread_ident = ui_thread_ident
         events = []
+        force_reads = []
+
+        class ThreadCheckedForceVar:
+            def get(self):
+                if threading.get_ident() != ui_thread_ident:
+                    raise AssertionError("worker touched the force Tk variable")
+                force_reads.append(threading.get_ident())
+                return False
+
+        app.force_var = ThreadCheckedForceVar()
 
         class ThreadCheckedVar:
             value = ""
@@ -5174,6 +5519,7 @@ class PushQueueFlowTests(unittest.TestCase):
             all(ident != ui_thread_ident for ident in repair_threads)
         )
         self.assertEqual(len(enqueued), 1)
+        self.assertEqual(force_reads, [ui_thread_ident])
         self.assertEqual(
             [str(item["spm"]) for item in enqueued[0]["targets"]],
             candidate_ids,
@@ -5420,6 +5766,34 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(title, "전체 실패 이력 재시도")
         self.assertIn("현재 목록 전체", body)
         self.assertNotIn("선택", body)
+
+    def test_current_success_exclusion_completes_retry_receipt(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "current_blender_receipt.spm"
+        self.configure_failed_retry_start(app, [iid])
+        app.state[iid] = {"push_status_kind": "imported_ok"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = gui.RetryProgressReceipt.create(
+                [iid],
+                receipt_dir=Path(temp_dir),
+            )
+            built = app._build_failed_retry_plan(
+                [iid],
+                {"push_transport": "rpc"},
+                tracker=tracker,
+                inventory_snapshot=dict(app.items),
+            )
+            receipt = tracker.snapshot(evaluate=False)
+
+        self.assertEqual(built["jobs"], [])
+        self.assertEqual(receipt["terminal_outcome"], "complete")
+        self.assertEqual(receipt["targets"][0]["stage"], "complete")
+        self.assertEqual(
+            receipt["targets"][0]["terminal_reason"],
+            "current_blender_success",
+        )
 
     def test_failed_results_retry_force_reruns_current_blender_success(self):
         gui = load_gui_module()

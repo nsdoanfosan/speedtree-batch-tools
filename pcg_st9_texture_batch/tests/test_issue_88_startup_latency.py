@@ -2263,7 +2263,8 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             # Negative control for the exact PR #61 integration regression:
             # a manifest-free folder used to send every sibling SPM through
             # resolve_atlas_manifests().  The fixture is deliberately tiny,
-            # but preserves that per-SPM/per-scope cardinality mismatch.  The
+            # but preserves the per-SPM amplification while the report-local
+            # resolver cache correctly collapses duplicate scope visits.  The
             # unmodified 597-SPM fixture below has no Atlas carrier and records
             # zero resolver calls, so this injection is the load-bearing proof
             # that the manifest rule catches more than the trivial 0 <= 55.
@@ -2299,7 +2300,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 4,
             )
             self.assertEqual(
-                metrics.get("atlas_manifest_resolution_calls"), 8
+                metrics.get("atlas_manifest_resolution_calls"), 4
             )
             self.assertEqual(guard["status"], "failed")
             self.assertEqual(
@@ -2308,7 +2309,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 StartupAmplificationError,
-                r"atlas_manifest_resolution_calls=8 > 2",
+                r"atlas_manifest_resolution_calls=4 > 2",
             ):
                 require_startup_total_invocation_guard(
                     metrics,

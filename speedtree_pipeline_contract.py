@@ -51,6 +51,10 @@ BACKUP_FILENAME_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+MANUAL_COPY_FILENAME_RE = re.compile(
+    r"\s+-\s+(?:\uBCF5\uC0AC\uBCF8|copy)(?:\s*\(\d+\))?\.spm$",
+    re.IGNORECASE,
+)
 # A SpeedTree 16-byte Generator GUID appears in two observed serialization
 # spellings.  The shorter Modeler dialect omits a final ``A`` data character --
 # the all-zero tail of a 128-bit value -- while retaining the ``==`` padding.
@@ -89,6 +93,15 @@ def _canonical_path(value):
     try:
         return path.resolve(strict=False)
     except (OSError, RuntimeError):
+        return path.absolute()
+
+
+def _lexical_path(value):
+    """Return an absolute spelling without following aliases or junctions."""
+    path = Path(str(value or "")).expanduser()
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError):
         return path.absolute()
 
 
@@ -136,17 +149,28 @@ def is_live_spm(path, require_file=True):
     Tool-owned backup, rollback, recovery, preflight, and verification files
     remain directly addressable by their recovery code, but they must never be
     rediscovered as board rows, queue targets, registry owners, Push
-    dependencies, or Cluster consumers.  Patterns stay deliberately explicit:
-    an ordinary authored asset is not excluded merely because its name contains
-    a word such as ``backup``.
+    dependencies, or Cluster consumers.  Explorer-style `` - Copy`` and its
+    Korean-localized duplicate suffix are also inventory artifacts: their
+    provenance is ambiguous, so they remain reportable and directly
+    addressable but cannot silently become a second production target.
+    Patterns stay deliberately explicit: an ordinary authored asset is not
+    excluded merely because its name contains a word such as ``backup`` or
+    ``copy``.
     """
+    lexical = _lexical_path(path)
     candidate = _canonical_path(path)
-    if candidate.suffix.casefold() != ".spm":
-        return False
-    if BACKUP_FILENAME_RE.search(candidate.name):
-        return False
-    if any(part.casefold() in BACKUP_DIRECTORY_NAMES for part in candidate.parts):
-        return False
+    for inspected in (lexical, candidate):
+        if inspected.suffix.casefold() != ".spm":
+            return False
+        if BACKUP_FILENAME_RE.search(inspected.name):
+            return False
+        if MANUAL_COPY_FILENAME_RE.search(inspected.name):
+            return False
+        if any(
+            part.casefold() in BACKUP_DIRECTORY_NAMES
+            for part in inspected.parts
+        ):
+            return False
     return candidate.is_file() if require_file else True
 
 
@@ -1165,6 +1189,7 @@ def validate_preflight_report(report_path, spm_path, require_ok=True):
 
 __all__ = [
     "BACKUP_DIRECTORY_NAMES",
+    "MANUAL_COPY_FILENAME_RE",
     "PREFLIGHT_CONTRACT_KIND",
     "PREFLIGHT_SCHEMA_VERSION",
     "SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION",
