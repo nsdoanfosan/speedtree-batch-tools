@@ -787,6 +787,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "current_atlas_material_mesh_connected": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
     ),
+    "current_export_trustworthy_zero_geometry": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "audit_detail",
+    ),
     "current_material_mesh_connection_incomplete": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
     ),
