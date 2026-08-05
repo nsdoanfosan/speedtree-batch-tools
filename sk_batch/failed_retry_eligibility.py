@@ -32,6 +32,16 @@ UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
     "unreal_crash",
     "not_run",
 })
+# Durable push states that are stamped *before* Unreal ingest is confirmed.
+# `ready` lands when Blender Repair finishes and the row is handed to the push
+# phase; `exported_pending_unreal` lands when Send2UE export finishes and the
+# Unreal result has not been observed. Neither is a failure and neither is a
+# finished pipeline -- if the push phase stops in between, the row keeps a
+# current .blend and never reaches Unreal on its own.
+PUSH_INCOMPLETE_KINDS = frozenset({
+    "exported_pending_unreal",
+    "ready",
+})
 BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
     "data_error",
     "internal_error",
@@ -238,6 +248,23 @@ def classify_failed_retry(
                 "Push failure has no export report or complete Unreal "
                 "manifest/checkpoint evidence; regenerate it through the "
                 "full Blender pipeline"
+            ),
+            repair_kind,
+            parent,
+        )
+
+    # A current Blender output is not a finished pipeline. These states record
+    # that the push phase stopped before Unreal confirmed anything, so treating
+    # them as a current success strands a target that never reached Unreal and
+    # leaves the operator no route back (#175).
+    if push_kind in PUSH_INCOMPLETE_KINDS:
+        return _result(
+            BLENDER_REBUILD,
+            "push_never_reached_unreal",
+            (
+                "Blender output is current but the push phase never produced a "
+                f"terminal Unreal result ({push_kind}); regenerate it through "
+                "the full Blender pipeline"
             ),
             repair_kind,
             parent,

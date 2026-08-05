@@ -284,6 +284,24 @@ STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 # Temporary production drain mode: select only owner rows that already have
 # cluster/*.spm providers but do not yet have a local Assembly output.
 TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS = True
+# Temporary retry drain mode: select only rows whose saved push evidence the
+# ordinary failed-retry route cannot admit, so one forced rerun drains exactly
+# those instead of rebuilding everything that already imported (#175). Takes
+# precedence over the cluster drain mode above while it is on.
+TEMP_SELECT_RETRY_BLOCKED_ROWS = True
+# push_status_kind values that are in neither BLENDER_EXPORT_RETRY_FAILURE_KINDS
+# nor UNREAL_RECOVERY_FAILURE_KINDS and carry no evidence of what to repair, so
+# classify_failed_retry keeps failing closed on them. Only an explicit force
+# rerun can drain these.
+#
+# `ready` / `exported_pending_unreal` are deliberately NOT here: those are now
+# routed by PUSH_INCOMPLETE_KINDS on the ordinary retry path and need no force.
+RETRY_BLOCKED_PUSH_STATUS_KINDS = frozenset({
+    "automatic_repair_failed",
+    "automatic_repair_reaudit_failed",
+    "planned_excluded",
+    "preflight_skip",
+})
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
@@ -3560,7 +3578,9 @@ class App:
                 ),
             )
             self.row_copy_paths[iid] = [spm]
-        if TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS:
+        if TEMP_SELECT_RETRY_BLOCKED_ROWS:
+            self._set_temporary_retry_blocked_rows()
+        elif TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS:
             self._set_temporary_cluster_without_assembly_push_rows()
         self.checked_rows.sync_after_reload()
         save_state(self.state)
@@ -3914,6 +3934,36 @@ class App:
             f"{checked_count}개만 Unreal Push 대상으로 체크"
         )
         return checked_count
+
+    def _set_temporary_retry_blocked_rows(self):
+        """Check only rows the ordinary failed-retry route cannot admit.
+
+        ``automatic_repair_failed`` and friends are in neither retry-eligible
+        kind set, so the planner classifies them fail-closed and skips them no
+        matter how often the button is pressed. Selecting exactly those rows
+        lets one forced rerun drain them.
+        """
+        blocked = set()
+        with self.state_lock:
+            for iid in self.items:
+                entry = self.state.get(str(iid))
+                if not isinstance(entry, dict):
+                    continue
+                kind = str(entry.get("push_status_kind") or "")
+                if kind in RETRY_BLOCKED_PUSH_STATUS_KINDS:
+                    blocked.add(iid)
+        for iid, item in self.items.items():
+            item["checked"] = iid in blocked
+            if callable(getattr(self.tree, "item", None)):
+                self._redraw_checked_row(iid, item)
+        self.checked_rows.armed = False
+        self.log(
+            "[임시 선택] 일반 재시도가 받아주지 못하는 행 "
+            f"{len(blocked)}개만 체크 (총 {len(self.items)}개) · "
+            "'최신 .blend/캐시가 있어도 강제로 다시 실행'을 켜고 "
+            "↻ 체크 항목 실패 재시도를 누르세요"
+        )
+        return len(blocked)
 
     def _set_recent_modified(self, hours=24, now_ns=None):
         """Check only rows whose authoritative SPM changed within ``hours``."""

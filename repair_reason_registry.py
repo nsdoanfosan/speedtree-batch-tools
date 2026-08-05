@@ -1573,6 +1573,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "push_timeout": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
     ),
+    "push_never_reached_unreal": ReasonRow(
+        INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
+    ),
     "push_phase_evidence_missing_full_rebuild": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "blender_rebuild_route",
     ),

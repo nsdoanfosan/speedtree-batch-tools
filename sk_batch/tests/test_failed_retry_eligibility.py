@@ -71,6 +71,47 @@ def test_explicit_force_rerun_rebuilds_current_blender_success():
     assert decision.reason_code == "current_blender_success_forced_rebuild"
 
 
+def test_blender_ready_but_never_pushed_is_not_a_current_success():
+    """`ready` means Blender finished, not that Unreal ingested anything."""
+    decision = classify_failed_retry(
+        {"push_status": "준비됨 ✓", "push_status_kind": "ready"},
+        CURRENT_REPAIR,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "push_never_reached_unreal"
+
+
+def test_export_pending_unreal_is_not_a_current_success():
+    decision = classify_failed_retry(
+        {
+            "push_status": "export 완료 · Unreal 대기",
+            "push_status_kind": "exported_pending_unreal",
+            # A half-done push legitimately retains its export receipts; their
+            # presence must not read as a completed run.
+            "push_paths": {
+                "manifest": "pending_parent.json",
+                "export_report": "pending_export.json",
+            },
+        },
+        CURRENT_REPAIR,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "push_never_reached_unreal"
+
+
+def test_imported_ok_is_still_excluded_as_a_current_success():
+    """The fix must not turn a genuinely completed push into a retry."""
+    decision = classify_failed_retry(
+        {"push_status": "완료 (headless)", "push_status_kind": "imported_ok"},
+        CURRENT_REPAIR,
+    )
+
+    assert decision.classification == CURRENT_BLENDER_EXCLUDED
+    assert decision.reason_code == "current_blender_success"
+
+
 def test_non_retryable_unreal_parent_blocks_without_an_explicit_force():
     decision = classify_failed_retry(
         {"push_status_kind": "imported_ok"},
