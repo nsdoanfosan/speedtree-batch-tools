@@ -1561,6 +1561,77 @@ class NormalizedGeneratorDeliverySnapshotTests(unittest.TestCase):
             {"current_export_trustworthy_zero_geometry"},
         )
 
+    def test_all_trustworthy_zero_slots_pass_through_without_live_delivery(self):
+        declared = declared_bindings()[:1]
+        live = [snapshot_binding(
+            SLOT_PREFIXES[0],
+            TARGET_MESH_IDS[0],
+            generated_node_count=0,
+        )]
+        live[0].update({
+            "export_admission_relevant": False,
+            "export_admission_reason": (
+                "current_export_trustworthy_zero_geometry"
+            ),
+            "node_table_stale": True,
+        })
+
+        class TrustworthyZeroAudit:
+            @staticmethod
+            def live_generator_delivery_snapshot(spm):
+                return fake_snapshot(
+                    spm,
+                    live,
+                    [TARGET_MESH_IDS[0]],
+                    total_node_count=1,
+                )
+
+        delivery = _normalized_generator_delivery(
+            TrustworthyZeroAudit,
+            "SK_tree_black_locast_04.spm",
+            {
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "generator_variant_policy": (
+                        "ensure_all_material_cutouts"
+                    ),
+                    "bindings": declared,
+                },
+            },
+            {"material_id": 4},
+            [{"target_mesh_id": TARGET_MESH_IDS[0]}],
+        )
+
+        self.assertEqual(delivery["errors"], [])
+        self.assertEqual(
+            delivery["delivery_mode"],
+            DELIVERY_MODE_ASSET_REGISTRATION_ONLY,
+        )
+        self.assertEqual(delivery["delivery_decision"], "pass_through")
+        self.assertEqual(
+            delivery["delivery_reason"],
+            "current_export_trustworthy_zero_geometry",
+        )
+        self.assertFalse(delivery["generator_connection_complete"])
+        self.assertFalse(delivery["live_generator_delivery_complete"])
+        self.assertEqual(
+            delivery["live_export_participating_target_mesh_ids"],
+            [],
+        )
+        self.assertEqual(
+            delivery["current_admission_relevant_binding_count"],
+            0,
+        )
+        self.assertEqual(
+            delivery["current_admission_excluded_binding_count"],
+            1,
+        )
+        self.assertEqual(
+            [row["status"] for row in delivery["binding_outcomes"]],
+            ["not_currently_admitted"],
+        )
+
     def test_authored_zero_node_causes_are_planned_inactive(self):
         causes = (
             (

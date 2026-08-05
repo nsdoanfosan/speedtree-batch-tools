@@ -3113,6 +3113,15 @@ def _normalized_generator_delivery(
             for row in evidence["binding_outcomes"]
         )
     )
+    all_required_bindings_not_currently_admitted = bool(
+        required_bindings
+        and not evidence["errors"]
+        and not admission_required_bindings
+        and len(admission_excluded_bindings) == len(required_bindings)
+        and evidence["current_admission_relevant_binding_count"] == 0
+        and evidence["current_admission_excluded_binding_count"]
+        == len(required_bindings)
+    )
     if invalid_scope_diagnostic and not bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
         evidence["delivery_decision"] = "pass_through"
@@ -3124,6 +3133,12 @@ def _normalized_generator_delivery(
         evidence["delivery_decision"] = "pass_through"
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
+        )
+    elif all_required_bindings_not_currently_admitted:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "current_export_trustworthy_zero_geometry"
         )
     elif (
         explicit_scope
