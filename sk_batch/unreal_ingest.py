@@ -1313,6 +1313,42 @@ def _unique_transaction_asset_path(asset_path, label, token):
     return candidate
 
 
+def _finish_pending_asset_compilation_for_publish():
+    """Finish transient editor compilation before one exact move retry."""
+    commands = []
+    try:
+        system_library = getattr(unreal, "SystemLibrary", None)
+        execute = getattr(system_library, "execute_console_command", None)
+        get_subsystem = getattr(unreal, "get_editor_subsystem", None)
+        subsystem_type = getattr(unreal, "UnrealEditorSubsystem", None)
+        if callable(execute) and callable(get_subsystem) and subsystem_type:
+            subsystem = get_subsystem(subsystem_type)
+            world = subsystem.get_editor_world() if subsystem else None
+            for command in (
+                "Editor.AsyncSkinnedAssetCompilationFinishAll",
+                "Editor.AsyncAssetCompilationFinishAll",
+            ):
+                execute(world, command)
+                commands.append(command)
+    except Exception as exc:
+        commands.append(f"compile-finish unavailable: {exc}")
+
+    collector = getattr(
+        getattr(unreal, "SystemLibrary", None),
+        "collect_garbage",
+        None,
+    )
+    if not callable(collector):
+        collector = getattr(unreal, "collect_garbage", None)
+    if callable(collector):
+        try:
+            collector()
+            commands.append("collect_garbage")
+        except Exception as exc:
+            commands.append(f"collect-garbage unavailable: {exc}")
+    return commands
+
+
 def _move_asset_for_publish(journal, source_path, target_path, role):
     source_path = str(source_path).split(".", 1)[0]
     target_path = str(target_path).split(".", 1)[0]
@@ -1341,21 +1377,35 @@ def _move_asset_for_publish(journal, source_path, target_path, role):
         "referencers_before": _asset_referencers(source_path),
         "moved": False,
         "source_redirector_cleared": False,
+        "rename_api_returns": [],
+        "exact_retry_repair": [],
     }
     journal.append(record)
-    renamed = bool(
-        unreal.EditorAssetLibrary.rename_asset(
-            source_path,
-            target_path,
+    moved = False
+    for attempt in range(2):
+        renamed = bool(
+            unreal.EditorAssetLibrary.rename_asset(
+                source_path,
+                target_path,
+            )
         )
-    )
-    actual_path = _asset_package_path(asset)
-    moved = (
-        actual_path.casefold() == target_path.casefold()
-        and unreal.EditorAssetLibrary.does_asset_exist(target_path)
-    )
+        record["rename_api_returns"].append(renamed)
+        actual_path = _asset_package_path(asset)
+        moved = (
+            actual_path.casefold() == target_path.casefold()
+            and unreal.EditorAssetLibrary.does_asset_exist(target_path)
+        )
+        if moved:
+            break
+        if attempt == 0:
+            record["exact_retry_repair"] = (
+                _finish_pending_asset_compilation_for_publish()
+            )
     record["moved"] = moved
-    if not renamed or not moved:
+    record["rename_api_disagreed_with_live_move"] = bool(
+        moved and not any(record["rename_api_returns"])
+    )
+    if not moved:
         raise RuntimeError(
             f"{role} move failed: {source_path} -> {target_path}"
         )
