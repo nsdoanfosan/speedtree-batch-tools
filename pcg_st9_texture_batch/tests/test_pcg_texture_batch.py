@@ -595,6 +595,26 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertEqual(item["status"], "ready")
         self.assertEqual(item["actions"], [])
 
+    def test_current_pass_through_handoff_ignores_connection_metadata_cleanup(self):
+        item = {
+            "sk_spms": [r"D:\Trees\dogwood\SK_bush_dogwood_01.spm"],
+            "chosen_spm": r"D:\Trees\dogwood\SK_bush_dogwood_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [{
+                "connection_update_needed": True,
+                "missing_export_maps": [],
+            }],
+            "cluster_assembly": {"handoff": {"status": "pass_through"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [r"D:\Trees\dogwood\dogwood.sbs"],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
     def test_relative_image_resolve_cache_is_shared_by_spms_in_one_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

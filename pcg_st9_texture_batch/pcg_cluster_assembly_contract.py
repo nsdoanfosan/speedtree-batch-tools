@@ -609,6 +609,21 @@ def classify_fbx_role(
     }
 
 
+def _current_live_pair_covered(targets):
+    """Return true when every live target already carries the exact role pair."""
+    if not targets:
+        return False
+    for target in targets:
+        gate = target.get("fbx_material_mesh_pair") or {}
+        if (
+            gate.get("status") != "complete_pair"
+            or int(gate.get("complete_pair_count") or 0) < 1
+            or gate.get("error")
+        ):
+            return False
+    return True
+
+
 def _asset_species(folder):
     value = Path(folder).name
     value = re.sub(
@@ -4425,6 +4440,16 @@ def build_cluster_assembly_contract(
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
         )
+        current_live_pair_covered = bool(
+            normalized_variants_missing
+            and _current_live_pair_covered(targets)
+        )
+        if current_live_pair_covered:
+            # Current export evidence already supplies the exact material/mesh
+            # pair. Missing historical normalization metadata cannot block it.
+            decision = "pass_through"
+            normalized_variants_required = False
+            normalized_variants_missing = False
         normalized_delivery_mode = str(
             (normalized_variants or {}).get("delivery_mode") or ""
         )
@@ -4575,6 +4600,7 @@ def build_cluster_assembly_contract(
             "normalized_variants_stale": normalized_variants_stale,
             "normalized_variants_required": normalized_variants_required,
             "normalized_variants_missing": normalized_variants_missing,
+            "current_live_pair_covered": current_live_pair_covered,
             "normalized_delivery_mode": normalized_delivery_mode or None,
             "normalized_delivery_blocked": normalized_delivery_blocked,
             "target_relation": copy.deepcopy(pair_row["target_relation"]),
