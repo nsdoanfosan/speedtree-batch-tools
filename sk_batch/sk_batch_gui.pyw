@@ -106,6 +106,11 @@ from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
 )
+from material_preflight_cache import (
+    load_material_preflight_cache,
+    material_preflight_runtime_signature,
+    store_material_preflight_cache,
+)
 from retry_progress import (
     BLENDER as RETRY_STAGE_BLENDER,
     BLOCKED as RETRY_STAGE_BLOCKED,
@@ -11636,6 +11641,110 @@ class App:
             )
         return result
 
+    def _material_preflight_cache_context(self, fbx_ini, speedtree_cli):
+        cached = self.__dict__.get("_material_preflight_cache_context_value")
+        if isinstance(cached, dict):
+            return cached
+        semantic_files = (
+            Path(fbx_ini),
+            Path(speedtree_cli),
+            TOOL_DIR / "jobs" / "speedtree_material_preflight.py",
+            REPO_DIR / "speedtree_pipeline_contract.py",
+            TOOL_DIR / "spm_leaf_handoff_contract.py",
+            TOOL_DIR / "atlas_consumer_integrity.py",
+            TOOL_DIR / "cluster_assembly_handoff_contract.py",
+            REPO_DIR
+            / "pcg_st9_texture_batch"
+            / "pcg_cluster_assembly_contract.py",
+        )
+        cache_dir = Path(
+            self.cfg.get("material_preflight_cache_dir")
+            or (TOOL_DIR / "cache" / "material_preflight")
+        ).expanduser()
+        try:
+            runtime_signature = material_preflight_runtime_signature(
+                semantic_files=semantic_files,
+                speedtree_exe=self.cfg["speedtree_exe"],
+            )
+        except OSError:
+            # Missing test/development inputs disable this optimization.  The
+            # existing child process remains the authority for its own error.
+            runtime_signature = None
+        context = {
+            "cache_dir": cache_dir,
+            "runtime_signature": runtime_signature,
+        }
+        self._material_preflight_cache_context_value = context
+        return context
+
+    def _material_preflight_seed_candidates(self, spm):
+        index = self.__dict__.get("_material_preflight_seed_index")
+        if not isinstance(index, dict):
+            index = {}
+            try:
+                paths = LOG_DIR.glob("*_material_preflight_*.json")
+                for path in paths:
+                    stem = path.name.split("_material_preflight_", 1)[0]
+                    index.setdefault(stem.casefold(), []).append(path)
+            except OSError:
+                index = {}
+            def candidate_mtime(path):
+                try:
+                    return path.stat().st_mtime_ns
+                except OSError:
+                    return -1
+            for candidates in index.values():
+                candidates.sort(
+                    key=candidate_mtime,
+                    reverse=True,
+                )
+            self._material_preflight_seed_index = index
+        return index.get(Path(spm).stem.casefold(), ())
+
+    def _load_or_seed_material_preflight_cache(
+        self,
+        cache_context,
+        spm,
+        speedtree_spm,
+    ):
+        cached = load_material_preflight_cache(
+            cache_context["cache_dir"],
+            spm,
+            speedtree_spm,
+            runtime_signature=cache_context["runtime_signature"],
+        )
+        if cached is not None:
+            return cached
+        # Adopt an existing successful report once.  Current source/STMAT/FBX
+        # content validation is identical to an ordinary durable cache load;
+        # foreign, stale, failed or corrupt historical reports are silent
+        # misses and never become asset failures.
+        for candidate in self._material_preflight_seed_candidates(spm):
+            report = load_job_report(candidate)
+            try:
+                store_material_preflight_cache(
+                    cache_context["cache_dir"],
+                    spm,
+                    speedtree_spm,
+                    report,
+                    runtime_signature=cache_context["runtime_signature"],
+                )
+            except (OSError, TypeError, ValueError, RuntimeError):
+                continue
+            cached = load_material_preflight_cache(
+                cache_context["cache_dir"],
+                spm,
+                speedtree_spm,
+                runtime_signature=cache_context["runtime_signature"],
+            )
+            if cached is not None:
+                self.log(
+                    "기존 재질 사전검사 성공 보고서를 재사용 영수증으로 등록: "
+                    f"{Path(spm).name}"
+                )
+                return cached
+        return None
+
     def _execute_material_preflight(
         self,
         spm,
@@ -11658,10 +11767,36 @@ class App:
                 f"SpeedTree export helper 없음: {speedtree_cli}",
                 kind="data_error",
             )
+        cache_context = self._material_preflight_cache_context(
+            fbx_ini,
+            speedtree_cli,
+        )
         material_report = LOG_DIR / (
             f"{spm.stem}_material_preflight_{stamp}.json"
         )
         material_log_name = f"{spm.stem}_material_preflight_{stamp}.log"
+        if (
+            not getattr(self, "force_rerun", False)
+            and cache_context["runtime_signature"]
+        ):
+            cached = self._load_or_seed_material_preflight_cache(
+                cache_context,
+                spm,
+                speedtree_spm,
+            )
+            if cached is not None:
+                self.log(
+                    "재질 사전검사 건너뜀 (동일 입력 성공 영수증): "
+                    f"{spm.name}"
+                )
+                return {
+                    "code": 0,
+                    "report": cached["report_path"],
+                    "run_report": material_report,
+                    "log": cached["receipt_path"],
+                    "result": cached["report"],
+                    "cache_hit": True,
+                }
         export_timeout = max(1, int(
             self.cfg.get("speedtree_material_preflight_timeout", 900)
         ))
@@ -11744,11 +11879,34 @@ class App:
             ),
         )
         material_result = load_job_report(material_report)
+        if (
+            material_code == 0
+            and material_result.get("status") == "ok"
+            and cache_context["runtime_signature"]
+        ):
+            try:
+                store_material_preflight_cache(
+                    cache_context["cache_dir"],
+                    spm,
+                    speedtree_spm,
+                    material_result,
+                    runtime_signature=cache_context["runtime_signature"],
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                # Cache publication is an optimization.  The authoritative
+                # just-completed report still proceeds to Blender Repair.
+                self.log(
+                    "  [캐시 기록 경고] 재질 사전검사 결과는 유효하지만 "
+                    f"재사용 영수증을 기록하지 못함: {spm.name} · "
+                    f"{compact_error_message(exc)}"
+                )
         return {
             "code": material_code,
             "report": material_report,
+            "run_report": material_report,
             "log": material_log,
             "result": material_result,
+            "cache_hit": False,
         }
 
     def _refresh_cluster_source_relations(self, spm, item):
@@ -14349,14 +14507,12 @@ class App:
 
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
-        self._refresh_canonical_atlas_manifests(spm)
-        if cluster_source and not self.force_rerun:
+        if not self.force_rerun:
             # The shared Repair decision already validates the exact SPM,
-            # blend, BWR report, material/wind output and Cluster dependency
-            # artifacts.  Re-running every consumer audit and relation Sync
-            # before consulting that result made a current provider rewrite
-            # its own capture files and invalidate the Push contract.  A force
-            # rebuild deliberately bypasses this fast path.
+            # blend, BWR report, material/wind output and exact dependency
+            # artifacts.  Consult it before Atlas refresh, consumer audits or
+            # material preflight for both owner Trees and Cluster providers.
+            # Explicit force rebuild deliberately bypasses this fast path.
             repair_state = self._repair_output_state(spm)
             if self._publish_current_repair_skip(
                 iid,
@@ -14364,6 +14520,7 @@ class App:
                 repair_state,
             ):
                 return
+        self._refresh_canonical_atlas_manifests(spm)
         producer_spm = speedtree_output_spm_for(spm)
         speedtree_spm = producer_spm
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -14525,10 +14682,6 @@ class App:
                 cluster_receipt_resolved = True
             return cluster_receipt_resolution
 
-        if not cluster_source:
-            # A current blend is not enough for an owner Tree.  Resolve the
-            # live Cluster relationship before authorizing an early Repair skip.
-            resolve_cluster_receipt_once()
         if not self.force_rerun:
             live_contract = cluster_receipt_resolution_uses_live_audit(
                 cluster_receipt_resolution
@@ -14721,9 +14874,10 @@ class App:
                 log_file=material_log,
                 report_file=material_report,
             )
-        # Cluster sources resolve here; owner Trees reuse the result that
-        # was already required for the Repair-current decision.  The local
-        # resolver guarantees one runtime live-audit resolution per item.
+        # Resolve the hash-current persisted Cluster receipt only after the
+        # material contract is available.  A durable preflight cache hit keeps
+        # its old run-specific live marker disabled, so this is a cheap receipt
+        # lookup unless exact recovery is genuinely required.
         cluster_receipt_resolution = resolve_cluster_receipt_once()
         if cluster_receipt_resolution_uses_live_audit(
             cluster_receipt_resolution
@@ -14757,6 +14911,11 @@ class App:
                         "",
                     ),
                 }
+                if artifact.get("cache_hit"):
+                    # Never mutate the durable cache report with run-specific
+                    # live evidence.  Materialize a report only for the rare
+                    # exact-recovery run that actually needs new embedding.
+                    material_report = artifact["run_report"]
                 atomic_write_json(material_report, material_result)
             except (OSError, TypeError, ValueError) as exc:
                 raise BatchItemError(

@@ -895,7 +895,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._run_limited.assert_not_called()
             app._record_live_blend_status.assert_called_once()
 
-    def test_live_pass_through_invalidates_saved_ready_assembly_skip(self):
+    def test_current_owner_receipt_skips_redundant_live_pass_through_audit(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -903,66 +903,33 @@ class BlendLiveStatusTests(unittest.TestCase):
             owner.mkdir()
             spm = owner / "SK_Tree_relation_off_01.spm"
             write_empty_spm(spm)
-            report = owner / "reports" / (
-                "SK_Tree_relation_off_01_"
-                "speedtree_repair_pipeline_report_codex.json"
-            )
-            report.parent.mkdir()
-            report.write_text(
-                json.dumps({
-                    "cluster_assembly_manifest": {
-                        "status": "ready",
-                    },
-                }),
-                encoding="utf-8",
-            )
-            live_report = Path(temporary) / "live_audit.json"
-            live_report.write_text(
-                json.dumps({
-                    "items": [{
-                        "cluster_assembly": {
-                            "tree_source_identities": [{
-                                "target_spm": {"path": str(spm)},
-                            }],
-                            "handoff": {
-                                "status": "pass_through",
-                                "cluster_dependencies": [],
-                                "roles": [],
-                            },
-                        },
-                    }],
-                }),
-                encoding="utf-8",
-            )
             app.force_rerun = False
             app.log = mock.Mock()
-            app._leaf_reference_ready = mock.Mock(
-                return_value=(True, "ok")
+            app._refresh_stale_cluster_receipt = mock.Mock(
+                side_effect=AssertionError(
+                    "current receipt must not trigger a new live audit"
+                )
             )
-            app._refresh_stale_cluster_receipt = mock.Mock(return_value={
-                "policy": "live_audit_authoritative",
-                "live_audit_report": str(live_report),
-            })
             app._repair_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
                 "reason": "ready",
             })
+            app._publish_current_repair_skip = mock.Mock(return_value=True)
 
-            with mock.patch.object(
-                gui,
-                "blender_open_file_window_titles",
-                side_effect=RuntimeError("rerun reached"),
-            ), self.assertRaisesRegex(RuntimeError, "rerun reached"):
-                app._job_blender(
-                    str(spm),
-                    spm,
-                    {
-                        "manual_bones_locked": False,
-                        "wind_override": "auto",
-                    },
-                )
+            app._job_blender(
+                str(spm),
+                spm,
+                {
+                    "manual_bones_locked": False,
+                    "wind_override": "auto",
+                },
+            )
+
+            app._repair_output_state.assert_called_once_with(spm)
+            app._publish_current_repair_skip.assert_called_once()
+            app._refresh_stale_cluster_receipt.assert_not_called()
 
     def test_repair_code_newer_than_saved_outputs_does_not_force_rerun(self):
         gui = load_gui_module()
@@ -6226,6 +6193,58 @@ class BlendLiveStatusTests(unittest.TestCase):
                 push_dependency_contract={"status": "current"},
                 evidence_bundle=None,
             )
+
+    def test_current_owner_bwr_skips_atlas_refresh_and_material_preflight(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_chestnut"
+            owner.mkdir(parents=True)
+            spm = owner / "SK_tree_chestnut_01.spm"
+            blend = spm.with_suffix(".blend")
+            for path in (spm, blend):
+                path.touch()
+            app.force_rerun = False
+            app._repair_output_state = mock.Mock(return_value={
+                "current": True,
+                "push_ready": True,
+                "kind": "ready",
+                "reason": "준비됨 ✓",
+                "push_dependency_contract": {"status": "current"},
+            })
+            app._record_live_blend_status = mock.Mock()
+            app._publish_repair_stage_contract = mock.Mock()
+            app._refresh_canonical_atlas_manifests = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not refresh Atlas manifests"
+                )
+            )
+            app._cluster_receipt_with_recovery = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not rerun Cluster live audit"
+                )
+            )
+            app._execute_material_preflight = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not rerun material preflight"
+                )
+            )
+            app._run_limited = mock.Mock(
+                side_effect=AssertionError("BWR must not run")
+            )
+            item = {
+                "spm": spm,
+                "wind_override": "auto",
+                "referenced_by_spms": (),
+            }
+
+            app._job_blender(str(spm), spm, item)
+
+            app._repair_output_state.assert_called_once_with(spm)
+            app._refresh_canonical_atlas_manifests.assert_not_called()
+            app._cluster_receipt_with_recovery.assert_not_called()
+            app._execute_material_preflight.assert_not_called()
+            app._run_limited.assert_not_called()
 
     def test_provider_metadata_disagreement_is_not_relation_refresh_gate(self):
         gui = load_gui_module()
