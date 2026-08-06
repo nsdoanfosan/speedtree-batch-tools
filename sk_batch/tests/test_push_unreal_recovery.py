@@ -184,6 +184,108 @@ class PushUnrealRecoveryTests(unittest.TestCase):
                     selected=True,
                 )
 
+    def test_exporter_code_change_reuses_verified_immutable_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend = root / "source.blend"
+            exporter = root / "send2ue_material_pipeline.py"
+            runtime = root / "unreal_ingest.py"
+            repair_report = root / "repair_report.json"
+            exported = root / "mesh.fbx"
+            handoff = root / "material.json"
+            for path, content in (
+                (blend, b"blend-v1"),
+                (exporter, b"exporter-v1"),
+                (runtime, b"runtime-v1"),
+                (repair_report, b"repair-v1"),
+                (exported, b"fbx-v1"),
+                (handoff, b"json-v1"),
+            ):
+                path.write_bytes(content)
+            parent_snapshot = self.snapshot(
+                blend, [exporter, runtime, repair_report]
+            )
+            parent_item = self.parent_item(blend, exported, handoff, runtime)
+
+            exporter.write_bytes(b"exporter-v2-after-complete-export")
+            current_snapshot = self.snapshot(
+                blend, [exporter, runtime, repair_report]
+            )
+            result = recover_manifest_item(
+                parent_item,
+                parent_manifest_path=root / "parent.json",
+                parent_report_path=root / "parent_report.json",
+                parent_source_record={
+                    "fingerprint": "parent-source",
+                    "snapshot": parent_snapshot,
+                },
+                current_source_record={
+                    "fingerprint": "current-source",
+                    "snapshot": current_snapshot,
+                },
+                current_source_fingerprint="current-source",
+                runtime_code_paths=[runtime],
+                rebindable_code_paths=[runtime, exporter],
+                report_path=root / "retry.json",
+                selected=True,
+            )
+
+            self.assertEqual(
+                result["recovery"]["rebound_source_code_paths"],
+                [str(exporter.resolve())],
+            )
+            self.assertEqual(
+                result["exported_files"], parent_item["exported_files"]
+            )
+
+    def test_source_data_change_still_requires_full_push(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blend = root / "source.blend"
+            exporter = root / "send2ue_material_pipeline.py"
+            runtime = root / "unreal_ingest.py"
+            repair_report = root / "repair_report.json"
+            exported = root / "mesh.fbx"
+            handoff = root / "material.json"
+            for path in (
+                blend,
+                exporter,
+                runtime,
+                repair_report,
+                exported,
+                handoff,
+            ):
+                path.write_bytes(path.name.encode("utf-8"))
+            parent_snapshot = self.snapshot(
+                blend, [exporter, runtime, repair_report]
+            )
+            parent_item = self.parent_item(blend, exported, handoff, runtime)
+            repair_report.write_bytes(b"changed per-asset repair data")
+
+            with self.assertRaisesRegex(
+                PushUnrealRecoveryError, "export-time dependency changed"
+            ):
+                recover_manifest_item(
+                    parent_item,
+                    parent_manifest_path=root / "parent.json",
+                    parent_report_path="",
+                    parent_source_record={
+                        "fingerprint": "parent-source",
+                        "snapshot": parent_snapshot,
+                    },
+                    current_source_record={
+                        "fingerprint": "current-source",
+                        "snapshot": self.snapshot(
+                            blend, [exporter, runtime, repair_report]
+                        ),
+                    },
+                    current_source_fingerprint="current-source",
+                    runtime_code_paths=[runtime],
+                    rebindable_code_paths=[runtime, exporter],
+                    report_path=root / "retry.json",
+                    selected=True,
+                )
+
     def test_artifact_content_change_is_rejected_even_when_stat_is_restored(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

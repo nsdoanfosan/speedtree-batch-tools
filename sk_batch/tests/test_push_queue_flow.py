@@ -5009,6 +5009,20 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         app._failed_retry_state_entry.assert_not_called()
 
+    def test_unreal_only_recovery_rebinds_completed_export_code(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        exporter = Path("send2ue_material_pipeline.py")
+        runtime = Path("unreal_ingest.py")
+        app._push_dependency_paths = mock.Mock(
+            return_value=[exporter, runtime, exporter]
+        )
+
+        self.assertEqual(
+            app._push_rebindable_unreal_code_paths(),
+            [exporter, runtime],
+        )
+
     def configure_failed_retry_start(
         self,
         app,

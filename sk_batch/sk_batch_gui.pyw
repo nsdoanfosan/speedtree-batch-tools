@@ -15571,16 +15571,17 @@ class App:
         ]
 
     def _push_rebindable_unreal_code_paths(self):
-        """Runtime code whose derived bindings can be rebuilt without Blender."""
-        paths = self._push_unreal_code_paths()
-        # Dynamic-wind policy resolves Blender object facts while exporting;
-        # changing it requires a full Push.  The remaining modules consume the
-        # frozen artifact/sidecar contract or are regenerated below.
-        return [
-            path
-            for path in paths
-            if Path(path).name != "dynamic_wind_handoff_policy.py"
-        ]
+        """Code drift allowed after the immutable export is proven current.
+
+        Every path returned by ``_push_dependency_paths`` is executable code,
+        not per-asset source data.  Once the parent FBX/JSON/handoff artifacts
+        pass their exact content-identity checks, later exporter-code changes
+        cannot retroactively change them.  Recovery records that drift and
+        rebinds the existing artifacts to the current Unreal runtime.  The
+        blend and per-asset Repair report remain outside this set, so an actual
+        source-data change still requires a full Push.
+        """
+        return list(dict.fromkeys(self._push_dependency_paths()))
 
     def _push_source_dependency_paths(self, spm=None):
         """Return code plus the per-asset Repair/Assembly contract."""
