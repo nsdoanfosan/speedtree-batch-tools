@@ -6598,14 +6598,10 @@ class App:
             raise PushUnrealRecoveryError(
                 "parent manifest item has no Blender source path"
             )
-        current_fingerprint = self._source_push_fingerprint(
-            Path(blend_value), queue_id
-        )
-        current_record = copy.deepcopy(
-            self._failed_retry_state_entry(queue_id).get(
-                "push_source_fingerprint_cache"
-            )
-            or {}
+        current_fingerprint, current_record = self._source_push_fingerprint(
+            Path(blend_value),
+            queue_id,
+            return_record=True,
         )
         validate_unreal_only_recovery_evidence(
             parent_item,
@@ -15713,7 +15709,13 @@ class App:
             return "완료 (현재 최신)"
         return "export 완료 · Unreal 대기"
 
-    def _source_push_fingerprint(self, blend, iid=None):
+    def _source_push_fingerprint(
+        self,
+        blend,
+        iid=None,
+        *,
+        return_record=False,
+    ):
         """Hash a large source blend once, then reuse its stable stat cache."""
         planning = self._failed_retry_planning_context()
         if iid:
@@ -15748,6 +15750,13 @@ class App:
             ] += 1
         if cache_hit and planning is None:
             self.log(f"[source hash cache] {Path(blend).name}: 재사용")
+        if return_record:
+            # Retry planning owns an immutable state snapshot, so a cache
+            # miss cannot publish the newly computed record back through
+            # ``planning.entry``.  Return the fingerprint and its exact
+            # record as one value pair; reading the old snapshot record here
+            # falsely routes a current Unreal-only retry through Blender.
+            return fingerprint, copy.deepcopy(record)
         return fingerprint
 
     def _cached_manifest_item(self, iid, source_fingerprint):
