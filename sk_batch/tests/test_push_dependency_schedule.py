@@ -499,3 +499,108 @@ def test_pass_through_stage_contract_is_root_bound_and_skips_disk(tmp_path):
     assert ordered == [item]
     assert dependencies[str(roots[1])] == ()
     load_manifest.assert_called_once_with(roots[1])
+
+
+def test_partition_keeps_independent_and_metadata_only_roots_runnable(tmp_path):
+    owner = tmp_path / "Tree_partition"
+    owner.mkdir()
+    stale_root = owner / "SK_Tree_partition_stale.spm"
+    ready_root = owner / "SK_Tree_partition_ready.spm"
+    stale_root.write_bytes(b"stale")
+    ready_root.write_bytes(b"ready")
+    items = {
+        str(path): {"spm": path, "checked": True}
+        for path in (stale_root, ready_root)
+    }
+
+    def dependencies(root, **_kwargs):
+        if Path(root) == stale_root:
+            raise schedule.PushDependencyError("stale receipt metadata")
+        return []
+
+    with mock.patch.object(
+        schedule,
+        "cluster_dependency_spms",
+        side_effect=dependencies,
+    ):
+        ordered, dependency_map, auto_added, issues = (
+            schedule.partition_push_targets(list(items.values()), items)
+        )
+
+    assert [item["spm"] for item in ordered] == [stale_root, ready_root]
+    assert dependency_map == {str(stale_root): (), str(ready_root): ()}
+    assert auto_added == set()
+    assert set(issues) == {str(stale_root)}
+    assert issues[str(stale_root)].concrete_missing is False
+
+
+def test_partition_excludes_only_root_with_proven_missing_dependency(tmp_path):
+    owner = tmp_path / "Tree_partition_missing"
+    owner.mkdir()
+    blocked_root = owner / "SK_Tree_partition_blocked.spm"
+    ready_root = owner / "SK_Tree_partition_ready.spm"
+    missing_dependency = owner / "Cluster" / "SK_missing.spm"
+    blocked_root.write_bytes(b"blocked")
+    ready_root.write_bytes(b"ready")
+    items = {
+        str(path): {"spm": path, "checked": True}
+        for path in (blocked_root, ready_root)
+    }
+
+    def dependencies(root, **_kwargs):
+        if Path(root) == blocked_root:
+            raise schedule.PushDependencyError(
+                "Cluster dependency SPM is missing: "
+                + str(missing_dependency),
+                concrete_missing=True,
+                dependency_path=missing_dependency,
+            )
+        return []
+
+    with mock.patch.object(
+        schedule,
+        "cluster_dependency_spms",
+        side_effect=dependencies,
+    ):
+        ordered, dependency_map, auto_added, issues = (
+            schedule.partition_push_targets(list(items.values()), items)
+        )
+
+    assert [item["spm"] for item in ordered] == [ready_root]
+    assert dependency_map == {str(blocked_root): (), str(ready_root): ()}
+    assert auto_added == set()
+    assert set(issues) == {str(blocked_root)}
+    issue = issues[str(blocked_root)]
+    assert issue.concrete_missing is True
+    assert issue.dependency_path == str(missing_dependency)
+
+
+def test_partition_discards_partial_dependencies_after_root_issue(tmp_path):
+    owner = tmp_path / "Tree_partial"
+    cluster_dir = owner / "Cluster"
+    cluster_dir.mkdir(parents=True)
+    root = owner / "SK_Tree_partial.spm"
+    scanned_dependency = cluster_dir / "SK_scanned.spm"
+    unscanned_dependency = cluster_dir / "SK_unscanned.spm"
+    for path in (root, scanned_dependency, unscanned_dependency):
+        path.write_bytes(path.name.encode("utf-8"))
+    root_item = {"spm": root, "checked": True}
+    scanned_item = {"spm": scanned_dependency, "checked": False}
+    inventory = {
+        str(root): root_item,
+        str(scanned_dependency): scanned_item,
+    }
+
+    with mock.patch.object(
+        schedule,
+        "cluster_dependency_spms",
+        return_value=[scanned_dependency, unscanned_dependency],
+    ):
+        ordered, dependency_map, auto_added, issues = (
+            schedule.partition_push_targets([root_item], inventory)
+        )
+
+    assert ordered == [root_item]
+    assert dependency_map == {str(root): ()}
+    assert auto_added == set()
+    assert set(issues) == {str(root)}
