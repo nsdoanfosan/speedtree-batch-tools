@@ -6663,14 +6663,17 @@ class App:
         except Exception:
             force_checked = False
         retry_force_rerun = bool(scope == "checked" or force_checked)
+        retry_force_full_rebuild = bool(force_checked)
         retry_request = {
             "scope": str(scope),
             "dialog_title": str(dialog_title),
             "empty_message": str(empty_message),
             "force_rerun": retry_force_rerun,
+            "force_full_rebuild": retry_force_full_rebuild,
         }
         cfg = dict(self._collect_cfg())
         cfg["_retry_force_rerun"] = retry_force_rerun
+        cfg["_retry_force_full_rebuild"] = retry_force_full_rebuild
         inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
             candidate_iids
         )
@@ -7406,6 +7409,9 @@ class App:
         # This immutable value was captured on the Tk owner thread before the
         # async planner started and is part of the plan-cache signature.
         retry_force_rerun = bool(cfg.get("_retry_force_rerun"))
+        retry_force_full_rebuild = bool(
+            cfg.get("_retry_force_full_rebuild")
+        )
 
         def classify(iid):
             return classify_failed_retry(
@@ -7414,6 +7420,7 @@ class App:
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
                 force_rerun=retry_force_rerun,
+                force_full_rebuild=retry_force_full_rebuild,
             )
 
         decisions = {}
@@ -8064,6 +8071,7 @@ class App:
         cfg = dict(plan.get("cfg") or {})
         persisted_cfg = dict(cfg)
         persisted_cfg.pop("_retry_force_rerun", None)
+        persisted_cfg.pop("_retry_force_full_rebuild", None)
         artifact = plan.get("_planning_cache_artifact")
         planning_session_id = plan.get("_planning_session_id")
         if (
@@ -8132,6 +8140,7 @@ class App:
         for job in jobs:
             job_cfg = dict(job.get("cfg") or {})
             job_cfg.pop("_retry_force_rerun", None)
+            job_cfg.pop("_retry_force_full_rebuild", None)
             job["cfg"] = job_cfg
             if self.stop_flag.is_set():
                 if tracker is not None:

@@ -139,6 +139,7 @@ def classify_failed_retry(
     unreal_parent_status=UNREAL_PARENT_ABSENT,
     unreal_parent_diagnostic="",
     force_rerun=False,
+    force_full_rebuild=False,
 ):
     """Classify one inventory candidate from structured current evidence."""
 
@@ -217,12 +218,12 @@ def classify_failed_retry(
             parent,
         )
     if parent == UNREAL_PARENT_CURRENT:
-        if force_rerun:
+        if force_full_rebuild:
             return _result(
                 BLENDER_REBUILD,
                 "current_unreal_parent_forced_rebuild",
                 (
-                    "An explicit checked rerun authorizes the full Blender "
+                    "An explicit force-full-rebuild request authorizes the Blender "
                     "pipeline even when a current immutable Unreal parent "
                     f"exists ({push_kind or 'missing'})"
                 ),
@@ -234,6 +235,18 @@ def classify_failed_retry(
                 UNREAL_ONLY,
                 "current_immutable_unreal_failure",
                 "Immutable export/source evidence is current",
+                repair_kind,
+                parent,
+            )
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "current_unreal_parent_forced_rebuild",
+                (
+                    "The selected current result has no retryable Unreal "
+                    "failure, so its explicit rerun uses the full Blender "
+                    f"pipeline ({push_kind or 'missing'})"
+                ),
                 repair_kind,
                 parent,
             )
