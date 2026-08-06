@@ -4965,6 +4965,50 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(item["queue_id"], "tree")
 
+    def test_retry_planning_validates_the_record_computed_with_fingerprint(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        queue_id = "tree.spm"
+        parent_item = {
+            "schema_version": 1,
+            "queue_id": queue_id,
+            "source_fingerprint": "parent-source",
+            "blend": "tree.blend",
+        }
+        computed_record = {
+            "version": gui.PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint": "current-source",
+            "snapshot": {"blend": "current"},
+        }
+        app._source_push_fingerprint = mock.Mock(
+            return_value=("current-source", computed_record)
+        )
+        app._failed_retry_state_entry = mock.Mock(
+            return_value={
+                "push_source_fingerprint_cache": {
+                    "fingerprint": "stale-source",
+                    "snapshot": {"blend": "stale"},
+                }
+            }
+        )
+        app._push_rebindable_unreal_code_paths = mock.Mock(return_value=[])
+
+        with mock.patch.object(
+            gui, "validate_unreal_only_recovery_evidence"
+        ) as validate:
+            returned = app._validate_failed_retry_unreal_item_current(
+                queue_id,
+                parent_item,
+                {"fingerprint": "parent-source", "snapshot": {}},
+            )
+
+        self.assertEqual(returned, computed_record)
+        self.assertEqual(
+            validate.call_args.kwargs["current_source_record"],
+            computed_record,
+        )
+        app._failed_retry_state_entry.assert_not_called()
+
     def configure_failed_retry_start(
         self,
         app,
