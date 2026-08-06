@@ -198,7 +198,7 @@ from speedtree_texture_contract import (
 from push_dependency_schedule import (
     PushDependencyError,
     exact_dependency_contract_from_validated_manifest,
-    expand_push_targets,
+    partition_push_targets,
 )
 from failed_retry_eligibility import (
     BLENDER_EXPORT_RETRY_FAILURE_KINDS,
@@ -9432,38 +9432,99 @@ class App:
         if phase == "spm":
             targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
-            try:
-                stage_dependency_contracts = {}
-                repair_contracts = getattr(
-                    self,
-                    "_active_repair_stage_contracts",
-                    None,
+            requested_ids = {
+                str(item["spm"]) for item in requested_targets
+            }
+            targets, preflight_abort = self._push_preflight(
+                requested_targets
+            )
+            ready_requested_ids = {
+                str(item["spm"]) for item in targets
+            }
+            preflight_skipped = requested_ids - ready_requested_ids
+            self._phase_failed_items.update(preflight_skipped)
+            if preflight_abort:
+                self._phase_failed_items.update(requested_ids)
+                self._phase_abort_reason = preflight_abort
+                if emit_done:
+                    self.ui_queue.put(
+                        (
+                            "progress",
+                            f"Unreal Push 중단 — {preflight_abort}",
+                        )
+                    )
+                    self.ui_queue.put(("done", None))
+                return False
+            if not targets:
+                excluded = len(preflight_skipped)
+                reason = (
+                    f"준비 검사 통과 항목 없음 · {excluded}개 제외"
+                    if excluded
+                    else "준비 검사 통과 항목 없음"
                 )
-                if isinstance(repair_contracts, dict):
-                    with self.state_lock:
-                        for root, repair_contract in repair_contracts.items():
-                            if not isinstance(repair_contract, dict):
-                                continue
+                self.log(
+                    f"Unreal Push 실행 항목 없음 — {reason}. "
+                    "각 대상의 현재 준비 결과만 유지합니다."
+                )
+                if emit_done:
+                    self.ui_queue.put(("progress", reason))
+                    self.ui_queue.put(("done", None))
+                return True
+
+            stage_dependency_contracts = {}
+            ready_requested_contract_keys = {
+                _normalized_path(
+                    speedtree_output_spm_for(item["spm"])
+                )
+                for item in targets
+            }
+            repair_contracts = getattr(
+                self,
+                "_active_repair_stage_contracts",
+                None,
+            )
+            if isinstance(repair_contracts, dict):
+                with self.state_lock:
+                    for root, repair_contract in repair_contracts.items():
+                        if (
+                            _normalized_path(root)
+                            not in ready_requested_contract_keys
+                            or not isinstance(repair_contract, dict)
+                        ):
+                            continue
+                        try:
                             if repair_contract.get("ready") is True:
                                 self._validate_repair_stage_contract(
                                     None,
                                     repair_contract,
                                 )
-                            dependency_contract = repair_contract.get(
-                                "push_dependency_contract"
+                        except RepairPushEvidenceError as exc:
+                            self.log(
+                                "Push dependency same-run evidence ignored; "
+                                f"current output audit remains authoritative: "
+                                f"{Path(root).name}: {exc}"
                             )
-                            if isinstance(dependency_contract, dict):
-                                stage_dependency_contracts[root] = (
-                                    copy.deepcopy(dependency_contract)
-                                )
+                            continue
+                        dependency_contract = repair_contract.get(
+                            "push_dependency_contract"
+                        )
+                        if isinstance(dependency_contract, dict):
+                            stage_dependency_contracts[root] = (
+                                copy.deepcopy(dependency_contract)
+                            )
+
+            inventory = self._batch_job_inventory() or {
+                str(item["spm"]): item for item in targets
+            }
+            try:
                 (
                     targets,
                     self._active_push_dependency_map,
                     self._active_push_auto_added_ids,
-                ) = expand_push_targets(
+                    dependency_issues,
+                ) = partition_push_targets(
                     targets,
-                    self._batch_job_inventory()
-                    or {str(item["spm"]): item for item in targets},
+                    inventory,
                     stage_dependency_contracts=(
                         stage_dependency_contracts or None
                     ),
@@ -9475,29 +9536,224 @@ class App:
                 TypeError,
                 ValueError,
             ) as exc:
-                reason = compact_error_message(exc)
-                requested_ids = {
-                    str(item["spm"]) for item in requested_targets
+                # Dependency discovery is orchestration metadata.  A current,
+                # preflight-ready export remains runnable when that metadata
+                # cannot be read; the Push job itself still validates its
+                # exact live files item by item.
+                dependency_issues = {}
+                self._active_push_dependency_map = {
+                    str(item["spm"]): () for item in targets
                 }
-                self._phase_failed_items.update(requested_ids)
-                self._phase_abort_reason = reason
-                for item in requested_targets:
+                self._active_push_auto_added_ids = set()
+                self.log(
+                    "Push dependency metadata unavailable; continuing exact "
+                    "preflight-ready targets without inferred dependencies: "
+                    + compact_error_message(exc)
+                )
+
+            dependency_blocked_roots = set()
+            metadata_issue_count = 0
+            metadata_issue_details = []
+            for root, issue in dependency_issues.items():
+                if not issue.concrete_missing:
+                    metadata_issue_count += 1
+                    metadata_issue_details.append(
+                        f"{Path(root).name}: {issue}"
+                    )
+                    continue
+                dependency_blocked_roots.add(str(root))
+                preflight_skipped.add(str(root))
+                dependency_path = str(issue.dependency_path or "")
+                evidence = {
+                    "scope": "exact_root",
+                    "scheduling_error": str(issue),
+                    "dependency_path": dependency_path,
+                }
+                self._record_phase_status(
+                    str(root),
+                    "push_status",
+                    "건너뜀: 필요한 Cluster SPM 파일 없음",
+                    "dependency_blocked",
+                    str(issue),
+                    details={
+                        "reason_token": "dependency_output_missing",
+                        "blocked_by": (
+                            [dependency_path] if dependency_path else []
+                        ),
+                        "evidence": evidence,
+                    },
+                    persist=False,
+                )
+            if metadata_issue_count:
+                self.log(
+                    "Push dependency metadata nonblocking: "
+                    f"{metadata_issue_count}개 current-ready target 계속"
+                    + (
+                        " — " + " | ".join(metadata_issue_details[:3])
+                        if metadata_issue_details
+                        else ""
+                    )
+                    + (
+                        f" | 외 {metadata_issue_count - 3}개"
+                        if metadata_issue_count > 3
+                        else ""
+                    )
+                )
+
+            actual_auto_added_ids = (
+                self._active_push_auto_added_ids - requested_ids
+            )
+            auto_items = [
+                item
+                for item in targets
+                if (
+                    str(item["spm"])
+                    in actual_auto_added_ids
+                )
+            ]
+            ready_auto_ids = set()
+            if auto_items:
+                ready_auto, auto_abort = self._push_preflight(auto_items)
+                if auto_abort:
+                    self._phase_failed_items.update(requested_ids)
+                    self._phase_abort_reason = auto_abort
+                    if emit_done:
+                        self.ui_queue.put(
+                            (
+                                "progress",
+                                f"Unreal Push 중단 — {auto_abort}",
+                            )
+                        )
+                        self.ui_queue.put(("done", None))
+                    return False
+                ready_auto_ids = {
+                    str(item["spm"]) for item in ready_auto
+                }
+
+            reusable_current_dependencies = set()
+            reusable_waiting_dependencies = set()
+            unavailable_dependencies = {}
+            for dependency in (
+                actual_auto_added_ids - ready_auto_ids
+            ):
+                verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase="push",
+                )
+                status = str(verdict.get("status") or "")
+                if status == "current":
+                    if getattr(self, "force_rerun", False):
+                        ready_auto_ids.add(dependency)
+                    else:
+                        reusable_current_dependencies.add(dependency)
+                    continue
+                if status == "waiting":
+                    reusable_waiting_dependencies.add(dependency)
+                    continue
+                unavailable_dependencies[dependency] = verdict
+
+            dependency_reuse = self.__dict__.setdefault(
+                "_pipeline_dependency_reuse_evidence",
+                {},
+            )
+            for root, dependencies in list(
+                self._active_push_dependency_map.items()
+            ):
+                if root in dependency_blocked_roots:
+                    continue
+                unavailable = [
+                    dependency
+                    for dependency in dependencies
+                    if dependency in unavailable_dependencies
+                ]
+                if unavailable:
+                    dependency_blocked_roots.add(root)
+                    preflight_skipped.add(root)
+                    artifact_rows = {
+                        dependency: copy.deepcopy(
+                            unavailable_dependencies[dependency]
+                        )
+                        for dependency in unavailable
+                    }
+                    reason_token = (
+                        "dependency_output_missing"
+                        if any(
+                            row.get("status") == "missing"
+                            for row in artifact_rows.values()
+                        )
+                        else "dependency_output_stale"
+                    )
+                    reason = (
+                        "필요한 Cluster Push 산출물이 현재 없거나 낡음: "
+                        + ", ".join(
+                            Path(value).name for value in unavailable
+                        )
+                    )
                     self._record_phase_status(
-                        str(item["spm"]),
+                        root,
                         "push_status",
-                        self._failure_status_text(reason, "data_error"),
-                        "data_error",
+                        f"건너뜀: {reason}",
+                        "dependency_blocked",
                         reason,
+                        details={
+                            "reason_token": reason_token,
+                            "blocked_by": unavailable,
+                            "dependency_artifacts": artifact_rows,
+                            "evidence": {
+                                "scope": "exact_root",
+                                "dependency_artifacts": artifact_rows,
+                            },
+                        },
                         persist=False,
                     )
-                self.log(f"Unreal Push dependency scheduling failed — {reason}")
-                if emit_done:
-                    self.ui_queue.put(
-                        ("progress", f"Unreal Push 중단 — {reason}")
+                    continue
+                reused = {
+                    dependency: copy.deepcopy(
+                        self._dependency_artifact_verdict(
+                            dependency,
+                            phase="push",
+                        )
                     )
-                    self.ui_queue.put(("done", None))
-                return False
-            requested_targets = list(targets)
+                    for dependency in dependencies
+                    if dependency in (
+                        reusable_current_dependencies
+                        | reusable_waiting_dependencies
+                    )
+                }
+                if reused:
+                    dependency_reuse[root] = reused
+
+            filtered_dependency_map = {}
+            for root, dependencies in self._active_push_dependency_map.items():
+                if root in dependency_blocked_roots:
+                    continue
+                filtered_dependency_map[root] = tuple(
+                    dependency
+                    for dependency in dependencies
+                    if dependency not in reusable_current_dependencies
+                )
+            self._active_push_dependency_map = filtered_dependency_map
+            required_dependency_ids = {
+                dependency
+                for dependencies in filtered_dependency_map.values()
+                for dependency in dependencies
+            }
+            targets = [
+                item
+                for item in targets
+                if (
+                    str(item["spm"]) not in dependency_blocked_roots
+                    and (
+                        str(item["spm"]) in ready_requested_ids
+                        or str(item["spm"]) in required_dependency_ids
+                    )
+                )
+            ]
+            self._active_push_auto_added_ids = (
+                required_dependency_ids - requested_ids
+            )
+            self._phase_failed_items.update(preflight_skipped)
+
             if self._active_push_auto_added_ids:
                 names = sorted(
                     Path(iid).name
@@ -9507,30 +9763,20 @@ class App:
                     "Tree Push dependency: Cluster "
                     f"{len(names)}개 자동 포함 — {', '.join(names)}"
                 )
-            requested_ids = {str(item["spm"]) for item in requested_targets}
-            targets, preflight_abort = self._push_preflight(targets)
-            ready_ids = {str(item["spm"]) for item in targets}
-            preflight_skipped = requested_ids - ready_ids
-            self._phase_failed_items.update(preflight_skipped)
-            if preflight_abort:
-                self._phase_failed_items.update(requested_ids)
-                self._phase_abort_reason = preflight_abort
-                if emit_done:
-                    self.ui_queue.put(("progress", f"Unreal Push 중단 — {preflight_abort}"))
-                    self.ui_queue.put(("done", None))
-                return False
             if not targets:
                 excluded = len(preflight_skipped)
                 reason = (
                     f"준비 검사 통과 항목 없음 · {excluded}개 제외"
                     if excluded else "준비 검사 통과 항목 없음"
                 )
-                self._phase_abort_reason = reason
-                self.log(f"Unreal Push 중단 — {reason}. 표의 준비 검사 결과를 확인하세요.")
+                self.log(
+                    f"Unreal Push 실행 항목 없음 — {reason}. "
+                    "각 대상의 현재 결과만 유지합니다."
+                )
                 if emit_done:
-                    self.ui_queue.put(("progress", f"Unreal Push 중단 — {reason}"))
+                    self.ui_queue.put(("progress", reason))
                     self.ui_queue.put(("done", None))
-                return False
+                return True
         titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Repair", "push": "Unreal Push"}
         column_by_phase = {"check": "spm_status", "spm": "spm_status",
                            "blender": "blend_status", "push": "push_status"}

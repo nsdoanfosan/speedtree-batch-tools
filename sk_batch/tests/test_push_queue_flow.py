@@ -3424,9 +3424,9 @@ class PushQueueFlowTests(unittest.TestCase):
 
         with mock.patch.object(
             gui,
-            "expand_push_targets",
-            return_value=([target], {str(root): ()}, set()),
-        ) as expand, mock.patch.object(
+            "partition_push_targets",
+            return_value=([target], {str(root): ()}, set(), {}),
+        ) as partition, mock.patch.object(
             app, "_push_preflight", return_value=([target], None)
         ), mock.patch.object(
             app, "_job_push"
@@ -3434,12 +3434,158 @@ class PushQueueFlowTests(unittest.TestCase):
             result = app._run_batch("push", [target], emit_done=False)
 
         self.assertTrue(result)
-        forwarded = expand.call_args.kwargs["stage_dependency_contracts"]
+        forwarded = partition.call_args.kwargs["stage_dependency_contracts"]
         self.assertEqual(len(forwarded), 1)
         self.assertEqual(
             next(iter(forwarded.values())),
             dependency_contract,
         )
+
+    def test_push_dependency_metadata_issue_keeps_ready_roots_runnable(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        stale_root = Path("Tree_oak") / "SK_Tree_oak_stale.spm"
+        independent_root = Path("Tree_maple") / "SK_Tree_maple.spm"
+        targets = [
+            {"spm": stale_root, "checked": True},
+            {"spm": independent_root, "checked": True},
+        ]
+        app.items = {str(item["spm"]): item for item in targets}
+        attempted = []
+        call_order = []
+
+        def preflight(items):
+            call_order.append("preflight")
+            return list(items), None
+
+        def partition(*_args, **_kwargs):
+            call_order.append("partition")
+            return (
+                targets,
+                {str(stale_root): (), str(independent_root): ()},
+                set(),
+                {
+                    str(stale_root): gui.PushDependencyError(
+                        "stale Assembly receipt metadata"
+                    )
+                },
+            )
+
+        with mock.patch.object(
+            gui,
+            "partition_push_targets",
+            side_effect=partition,
+        ), mock.patch.object(
+            app,
+            "_push_preflight",
+            side_effect=preflight,
+        ), mock.patch.object(
+            app,
+            "_job_push",
+            side_effect=lambda _iid, spm: attempted.append(spm),
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch("push", targets, emit_done=False)
+
+        self.assertTrue(result)
+        self.assertEqual(call_order, ["preflight", "partition"])
+        self.assertEqual(attempted, [stale_root, independent_root])
+        self.assertEqual(app._phase_failed_items, set())
+        self.assertNotIn(str(stale_root), app.state)
+
+    def test_push_missing_exact_dependency_blocks_only_its_root(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        blocked_root = Path("Tree_oak") / "SK_Tree_oak.spm"
+        independent_root = Path("Tree_maple") / "SK_Tree_maple.spm"
+        missing = Path("Tree_oak") / "Cluster" / "SK_missing.spm"
+        blocked_item = {"spm": blocked_root, "checked": True}
+        independent_item = {"spm": independent_root, "checked": True}
+        selected = [blocked_item, independent_item]
+        app.items = {str(item["spm"]): item for item in selected}
+        attempted = []
+
+        with mock.patch.object(
+            gui,
+            "partition_push_targets",
+            return_value=(
+                [independent_item],
+                {str(blocked_root): (), str(independent_root): ()},
+                set(),
+                {
+                    str(blocked_root): gui.PushDependencyError(
+                        "Cluster dependency SPM is missing: " + str(missing),
+                        concrete_missing=True,
+                        dependency_path=missing,
+                    )
+                },
+            ),
+        ), mock.patch.object(
+            app,
+            "_push_preflight",
+            return_value=(selected, None),
+        ), mock.patch.object(
+            app,
+            "_job_push",
+            side_effect=lambda _iid, spm: attempted.append(spm),
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch("push", selected, emit_done=False)
+
+        self.assertTrue(result)
+        self.assertEqual(attempted, [independent_root])
+        self.assertEqual(app._phase_failed_items, {str(blocked_root)})
+        self.assertEqual(
+            app.state[str(blocked_root)]["push_status_kind"],
+            "dependency_blocked",
+        )
+        self.assertNotIn(str(independent_root), app.state)
+
+    def test_push_reuses_current_auto_dependency_before_scheduling_root(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        dependency = Path("Tree_oak") / "Cluster" / "SK_cluster_oak.spm"
+        root = Path("Tree_oak") / "SK_Tree_oak.spm"
+        dependency_item = {"spm": dependency, "checked": False}
+        root_item = {"spm": root, "checked": True}
+        app.items = {
+            str(dependency): dependency_item,
+            str(root): root_item,
+        }
+        attempted = []
+
+        with mock.patch.object(
+            gui,
+            "partition_push_targets",
+            return_value=(
+                [dependency_item, root_item],
+                {str(root): (str(dependency),)},
+                {str(dependency)},
+                {},
+            ),
+        ), mock.patch.object(
+            app,
+            "_push_preflight",
+            side_effect=[([root_item], None), ([], None)],
+        ) as preflight, mock.patch.object(
+            app,
+            "_dependency_artifact_verdict",
+            return_value={
+                "status": "current",
+                "phase": "push",
+                "reason": "current Unreal import receipt",
+            },
+        ), mock.patch.object(
+            app,
+            "_job_push",
+            side_effect=lambda _iid, spm: attempted.append(spm),
+        ), mock.patch.object(gui, "save_state"):
+            result = app._run_batch("push", [root_item], emit_done=False)
+
+        self.assertTrue(result)
+        self.assertEqual(preflight.call_count, 2)
+        self.assertEqual(attempted, [root])
+        self.assertEqual(app._active_push_dependency_map, {str(root): ()})
+        reused = app._pipeline_dependency_reuse_evidence[str(root)]
+        self.assertEqual(reused[str(dependency)]["status"], "current")
 
     def test_rpc_push_continues_roots_when_auto_cluster_failed(self):
         gui = load_gui_module()
@@ -3465,7 +3611,7 @@ class PushQueueFlowTests(unittest.TestCase):
 
         with mock.patch.object(
             gui,
-            "expand_push_targets",
+            "partition_push_targets",
             return_value=(
                 expanded,
                 {
@@ -3473,6 +3619,7 @@ class PushQueueFlowTests(unittest.TestCase):
                     str(independent_root): (),
                 },
                 {str(cluster)},
+                {},
             ),
         ), mock.patch.object(
             app, "_push_preflight", return_value=(expanded, None)
@@ -3516,11 +3663,12 @@ class PushQueueFlowTests(unittest.TestCase):
 
         with mock.patch.object(
             gui,
-            "expand_push_targets",
+            "partition_push_targets",
             return_value=(
                 expanded,
                 {str(root): (str(cluster),)},
                 {str(cluster)},
+                {},
             ),
         ), mock.patch.object(
             app, "_push_preflight", return_value=(expanded, None)
@@ -3658,6 +3806,7 @@ class PushQueueFlowTests(unittest.TestCase):
                     str(unrelated_tree): (),
                 },
                 {str(failed_cluster)},
+                {},
             )
 
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
@@ -3677,9 +3826,9 @@ class PushQueueFlowTests(unittest.TestCase):
             ),
         ), mock.patch.object(
             gui,
-            "expand_push_targets",
+            "partition_push_targets",
             side_effect=expand_for_push,
-        ) as expand_push, mock.patch.object(
+        ) as partition_push, mock.patch.object(
             app,
             "_push_preflight",
             side_effect=record_preflight,
@@ -3714,12 +3863,12 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(blocked_contracts_at_push_expand), 1)
         self.assertIsNone(blocked_contracts_at_push_expand[0])
         self.assertEqual(
-            [item["spm"] for item in expand_push.call_args.args[0]],
+            [item["spm"] for item in partition_push.call_args.args[0]],
             [failed_cluster, blocked_tree, unrelated_tree],
         )
         self.assertEqual(
             app._active_push_auto_added_ids,
-            {str(failed_cluster)},
+            set(),
         )
         self.assertEqual(
             app.state[str(failed_cluster)]["spm_status_kind"],
@@ -3958,7 +4107,7 @@ class PushQueueFlowTests(unittest.TestCase):
             app.state["SK_first.spm"]["push_status_kind"], "unreal_unavailable"
         )
 
-    def test_all_preflight_excluded_is_an_explicit_push_failure(self):
+    def test_all_preflight_excluded_remains_item_local_without_fleet_abort(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         targets = self.targets("SK_missing_texture.spm", "SK_stale_blend.spm")
@@ -3968,16 +4117,15 @@ class PushQueueFlowTests(unittest.TestCase):
         ):
             result = app._run_batch("push", targets, emit_done=True)
 
-        self.assertFalse(result)
+        self.assertTrue(result)
         self.assertEqual(app._phase_failed_items, {
             "SK_missing_texture.spm", "SK_stale_blend.spm",
         })
-        self.assertIn("2개 제외", app._phase_abort_reason)
+        self.assertIsNone(app._phase_abort_reason)
         progress = [
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
         ][-1]
-        self.assertIn("Unreal Push 중단", progress)
         self.assertIn("2개 제외", progress)
 
     def test_headless_preflight_allows_unreal_to_be_off(self):
