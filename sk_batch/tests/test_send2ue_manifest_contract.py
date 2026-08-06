@@ -403,37 +403,63 @@ class Send2ueManifestContractTests(unittest.TestCase):
                 )
                 self.assertTrue(result[0]["identity_changed"])
 
-    def test_missing_descriptor_rejects_different_wrapper_unit(self):
+    def test_missing_descriptor_reissues_each_live_wrapper_unit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            mesh_name = "SK_weed_deadbranches_a_01"
-            source = root / f"{mesh_name}.json"
-            source.write_text(
-                json.dumps({"mesh_name": mesh_name, "materials": []}),
-                encoding="utf-8",
-            )
-            source_before = source.read_bytes()
+            wrapper_name = "SK_cluster_blackgum_01"
             wrapper_source = {"spm": {"sha256": "strict-source"}}
             authoritative_pipeline = {
                 "source": wrapper_source,
                 "speedtree_handoff_contract": descriptor(
-                    "SK_unrelated_01",
+                    wrapper_name,
                     source=wrapper_source,
                 ),
             }
-
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "different canonical unit",
-            ):
-                normalize_manifest_handoff_sidecars(
-                    [self._asset(f"/Game/Tree/{mesh_name}_Mesh", source)],
-                    root / "export",
-                    sidecar_descriptor_builder=descriptor,
-                    authoritative_pipeline_contract=authoritative_pipeline,
+            assets = []
+            source_bytes = {}
+            for ordinal in range(1, 4):
+                mesh_name = f"{wrapper_name}_{ordinal:02d}"
+                source = root / f"{mesh_name}.json"
+                source.write_text(
+                    json.dumps({
+                        "mesh_name": mesh_name,
+                        "materials": [],
+                    }),
+                    encoding="utf-8",
+                )
+                source_bytes[source] = source.read_bytes()
+                assets.append(
+                    self._asset(f"/Game/Tree/{mesh_name}_Mesh", source)
                 )
 
-            self.assertEqual(source.read_bytes(), source_before)
+            result = normalize_manifest_handoff_sidecars(
+                assets,
+                root / "export",
+                sidecar_descriptor_builder=descriptor,
+                authoritative_pipeline_contract=authoritative_pipeline,
+            )
+
+            self.assertEqual(len(result), 3)
+            for ordinal, asset in enumerate(assets, start=1):
+                mesh_name = f"{wrapper_name}_{ordinal:02d}"
+                source = root / f"{mesh_name}.json"
+                self.assertEqual(source.read_bytes(), source_bytes[source])
+                normalized_path = Path(
+                    asset["asset_data"]["_material_pipeline_json_path"]
+                )
+                normalized = json.loads(
+                    normalized_path.read_text(encoding="utf-8")
+                )
+                self.assertNotEqual(normalized_path, source)
+                self.assertEqual(normalized["mesh_name"], mesh_name)
+                self.assertEqual(
+                    normalized["speedtree_handoff_contract"],
+                    descriptor(mesh_name, source=wrapper_source),
+                )
+                self.assertEqual(
+                    asset["asset_data"]["asset_path"],
+                    f"/Game/Tree/{mesh_name}",
+                )
 
     def test_missing_descriptor_rejects_wrapper_source_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
