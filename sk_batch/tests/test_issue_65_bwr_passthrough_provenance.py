@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import queue
 import sys
 import threading
@@ -20,6 +21,7 @@ from cluster_assembly_builder import (  # noqa: E402
 from cluster_assembly_handoff_contract import (  # noqa: E402
     select_cluster_contract,
 )
+from artifact_content_key import sampled_file_content_snapshot  # noqa: E402
 
 
 FIXTURE_PATH = (
@@ -65,6 +67,21 @@ def replace_fingerprint(value, artifact_path, fingerprint):
     elif isinstance(value, list):
         for child in value:
             replace_fingerprint(child, artifact_path, fingerprint)
+
+
+def replace_artifact_record(value, artifact_path, record):
+    if isinstance(value, dict):
+        if str(value.get("path") or "").casefold() == str(
+            artifact_path
+        ).casefold():
+            value.clear()
+            value.update(copy.deepcopy(record))
+            return
+        for child in value.values():
+            replace_artifact_record(child, artifact_path, record)
+    elif isinstance(value, list):
+        for child in value:
+            replace_artifact_record(child, artifact_path, record)
 
 
 def make_scenario(tmp_path):
@@ -133,6 +150,52 @@ def make_scenario(tmp_path):
         "report": report,
         "manifest": manifest,
     }
+
+
+def use_sampled_dependency_fingerprint(scenario):
+    dependency = scenario["dependency_spm"]
+    sampled = sampled_file_content_snapshot(dependency)
+    record = {
+        "path": str(dependency.resolve()),
+        "exists": True,
+        "size": sampled["size"],
+        "mtime_ns": sampled["mtime_ns"],
+        "sha256": None,
+        "fingerprint": sampled["fingerprint"],
+        "fingerprint_algorithm": sampled["fingerprint_algorithm"],
+    }
+    replace_artifact_record(scenario["payload"], dependency, record)
+    scenario["receipt"].write_text(
+        json.dumps(scenario["payload"], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    target_contract = select_cluster_contract(
+        scenario["payload"], scenario["target_spm"]
+    )
+    manifest = build_blender_assembly_inputs(
+        target_contract["handoff"],
+        None,
+        None,
+        scenario["target_spm"].parent / "assembly",
+        "",
+        scenario["target_spm"].parent / "wind.json",
+        pass_through_receipt_path=scenario["receipt"],
+        pass_through_target_contract=target_contract,
+        pass_through_target_spm=scenario["target_spm"],
+    )
+    scenario["manifest"] = manifest
+    scenario["report"].write_text(
+        json.dumps({
+            "cluster_assembly_receipt_resolution": {
+                "policy": "embedded_live_audit_authoritative",
+                "requested_spm": str(scenario["target_spm"]),
+                "selected_receipt": str(scenario["receipt"]),
+            },
+            "cluster_assembly_manifest": manifest,
+        }),
+        encoding="utf-8",
+    )
+    return scenario
 
 
 def make_app(gui):
@@ -242,6 +305,44 @@ def test_changed_pass_through_artifact_stays_blocked_with_exact_path(
     )
     assert str(scenario["dependency_spm"]) in reason
     assert len(reason) > 100
+
+
+def test_sampled_pass_through_artifact_mtime_only_rewrite_stays_current(
+    tmp_path,
+):
+    gui = load_gui_module()
+    app = make_app(gui)
+    scenario = use_sampled_dependency_fingerprint(make_scenario(tmp_path))
+    artifact = scenario["dependency_spm"]
+    stat = artifact.stat()
+    os.utime(
+        artifact,
+        ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+    )
+
+    ready, reason = app._cluster_assembly_inputs_current(
+        scenario["target_spm"]
+    )
+
+    assert ready, reason
+    assert reason == ""
+
+
+def test_sampled_pass_through_artifact_same_size_content_change_stays_blocked(
+    tmp_path,
+):
+    gui = load_gui_module()
+    app = make_app(gui)
+    scenario = use_sampled_dependency_fingerprint(make_scenario(tmp_path))
+    scenario["dependency_spm"].write_bytes(b"new")
+
+    ready, reason = app._cluster_assembly_inputs_current(
+        scenario["target_spm"]
+    )
+
+    assert not ready
+    assert ".fingerprint" in reason
+    assert str(scenario["dependency_spm"]) in reason
 
 
 def test_operator_state_keeps_full_mismatch_before_display_truncation(

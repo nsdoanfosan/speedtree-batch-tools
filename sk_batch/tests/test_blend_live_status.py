@@ -6150,7 +6150,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 [],
             )
 
-    def test_current_cluster_bwr_refreshes_only_stale_relation(self):
+    def test_current_cluster_bwr_skips_relation_rediscovery(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6162,56 +6162,35 @@ class BlendLiveStatusTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             for path in (spm, target, blend):
                 path.touch()
-            from atlas_target_registry import save_target_registry
-
-            save_target_registry(blend, [target])
-            blender = Path(temporary) / "blender.exe"
-            unit_probe = Path(temporary) / "unit.json"
-            blender.touch()
-            unit_probe.touch()
             app.force_rerun = False
-            app.cfg = {
-                "blender_exe": str(blender),
-                "cluster_unit_probe": str(unit_probe),
-                "cluster_capture_resolution": 1024,
-                "blender_job_timeout": 30,
-            }
-            app._leaf_reference_ready = mock.Mock(
-                return_value=(True, "ok")
-            )
             app._repair_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
-                "kind": "current",
-                "reason": "",
+                "kind": "ready",
+                "reason": "준비됨 ✓",
+                "push_dependency_contract": {"status": "current"},
             })
             app._record_live_blend_status = mock.Mock()
+            app._publish_repair_stage_contract = mock.Mock()
+            app._refresh_canonical_atlas_manifests = mock.Mock()
+            app._cluster_relation_input_plan = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rediscover consumers"
+                )
+            )
+            app._refresh_cluster_source_relations = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rewrite relations"
+                )
+            )
+            app._cluster_normalization_stage_with_recovery = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rerun normalization audits"
+                )
+            )
             app._run_limited = mock.Mock(
                 side_effect=AssertionError("BWR must not run")
             )
-            app._cluster_normalization_stage_observation = mock.Mock(
-                return_value={
-                    "status": "current",
-                    "live_audit_report": str(
-                        Path(temporary) / "normalization.json"
-                    ),
-                    "selected_contract": {
-                        "dependencies": [{"spm": str(spm)}],
-                        "handoff": {"errors": []},
-                    },
-                }
-            )
-            states = [
-                {
-                    "current": False,
-                    "reason": (
-                        "SK_Tree_elm_01.spm:refresh_required"
-                        "(target_scope_changed)"
-                    ),
-                    "targets": [],
-                },
-                {"current": True, "reason": "", "targets": []},
-            ]
             item = {
                 "spm": spm,
                 "wind_override": "auto",
@@ -6221,18 +6200,32 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(
                 gui,
                 "cluster_relation_refresh_state",
-                side_effect=states,
+                side_effect=AssertionError(
+                    "current Cluster BWR must not inspect relation metadata"
+                ),
             ) as refresh_state, mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
-                return_value={"status": "ok"},
+                side_effect=AssertionError(
+                    "current Cluster BWR must not run relation transaction"
+                ),
             ) as relation:
                 app._job_blender(str(spm), spm, item)
 
-            self.assertEqual(refresh_state.call_count, 2)
-            relation.assert_called_once()
-            self.assertEqual(relation.call_args.args[1], [target.absolute()])
-            self.assertEqual(app._repair_output_state.call_count, 2)
+            refresh_state.assert_not_called()
+            relation.assert_not_called()
+            app._cluster_relation_input_plan.assert_not_called()
+            app._refresh_cluster_source_relations.assert_not_called()
+            app._cluster_normalization_stage_with_recovery.assert_not_called()
+            app._repair_output_state.assert_called_once_with(spm)
             app._run_limited.assert_not_called()
+            app._publish_repair_stage_contract.assert_called_once_with(
+                spm,
+                ready=True,
+                reason="준비됨 ✓",
+                kind="ready",
+                push_dependency_contract={"status": "current"},
+                evidence_bundle=None,
+            )
 
     def test_provider_metadata_disagreement_is_not_relation_refresh_gate(self):
         gui = load_gui_module()

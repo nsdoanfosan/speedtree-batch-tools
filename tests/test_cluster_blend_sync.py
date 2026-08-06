@@ -729,6 +729,65 @@ class ClusterBlendSyncTests(unittest.TestCase):
 
             self.assertEqual(registry_path.read_bytes(), registry_before)
 
+    def test_current_normalization_sync_rolls_back_capture_side_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = root / "Tree_elm"
+            cluster = owner / "Cluster"
+            reports = cluster / "reports"
+            cluster.mkdir(parents=True)
+            reports.mkdir()
+            blend = cluster / "SK_branch_elm_01.blend"
+            target = owner / "SK_Tree_elm_01.spm"
+            receipt = reports / (
+                "SK_branch_elm_01_cluster_normalization_sync_receipt.json"
+            )
+            color = cluster / "branch_elm_01.tga"
+            capture_manifest = (
+                cluster / "branch_elm_01_auto_capture_manifest.json"
+            )
+            blend.write_bytes(b"blend")
+            target.write_bytes(b"target")
+            color.write_bytes(b"old-color")
+            capture_manifest.write_bytes(b"old-manifest")
+            receipt.write_bytes(b"old-receipt")
+            original_stats = {
+                path: path.stat().st_mtime_ns
+                for path in (color, capture_manifest, receipt)
+            }
+            recipe = {
+                "blend": str(blend),
+                "normalization_required": False,
+                "first_target_spm": str(target),
+                "target_spms": [str(target)],
+                "capture_output_dir": str(cluster),
+                "capture_prefix": "branch_elm_01",
+                "receipt_path": str(receipt),
+                "material_name": "M_branch_elm_01",
+            }
+
+            snapshots = cluster_sync._snapshot_normalization_artifacts(
+                recipe,
+                root / "snapshots",
+            )
+            color.write_bytes(b"new-color")
+            capture_manifest.write_bytes(b"new-manifest")
+            receipt.write_bytes(b"new-receipt")
+
+            restored, failed = cluster_sync._restore_normalization_artifacts(
+                snapshots
+            )
+
+            self.assertFalse(failed)
+            self.assertEqual(color.read_bytes(), b"old-color")
+            self.assertEqual(
+                capture_manifest.read_bytes(), b"old-manifest"
+            )
+            self.assertEqual(receipt.read_bytes(), b"old-receipt")
+            for path, expected_mtime in original_stats.items():
+                self.assertEqual(path.stat().st_mtime_ns, expected_mtime)
+                self.assertIn(str(path), restored)
+
     def test_failed_apply_persists_pre_rollback_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
