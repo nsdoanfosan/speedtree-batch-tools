@@ -4453,6 +4453,7 @@ class App:
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
         self.stop_flag.clear()
+        self._mark_previous_cancellations_pending(job)
         with self._recovery_commit_lock:
             self._recovery_resume_commit = None
         self.batch_progress.configure(value=0)
@@ -4469,6 +4470,50 @@ class App:
             daemon=True,
         )
         self.worker.start()
+
+    def _mark_previous_cancellations_pending(self, job):
+        """Do not present a previous stop as the state of a new active job."""
+
+        state = getattr(self, "state", None)
+        state_lock = getattr(self, "state_lock", None)
+        ui_queue = getattr(self, "ui_queue", None)
+        if not isinstance(state, dict) or state_lock is None:
+            return
+
+        if str(job.get("mode") or "") == "pipeline":
+            columns = {
+                "spm": ("spm_status",),
+                "blender": ("spm_status", "blend_status"),
+                "push": STATUS_COLUMNS,
+            }.get(str(job.get("terminal_phase") or "push"), STATUS_COLUMNS)
+        else:
+            columns = {
+                "check": ("spm_status",),
+                "spm": ("spm_status",),
+                "blender": ("blend_status",),
+                "push": ("push_status",),
+            }.get(str(job.get("phase") or ""), STATUS_COLUMNS)
+
+        changed = []
+        with state_lock:
+            for item in job.get("targets") or ():
+                iid = str(item.get("spm") or "")
+                entry = state.get(iid)
+                if not iid or not isinstance(entry, dict):
+                    continue
+                for column in columns:
+                    kind = str(entry.get(f"{column}_kind") or "").casefold()
+                    if kind not in {"cancelled", "stopped"}:
+                        continue
+                    entry[column] = "재실행 대기"
+                    entry[f"{column}_kind"] = "rerun_pending"
+                    changed.append((iid, column))
+            if changed:
+                save_state(state)
+
+        if ui_queue is not None:
+            for iid, column in changed:
+                ui_queue.put(("cell", (iid, column, "재실행 대기")))
 
     def _production_source_revision_precheck(self):
         try:
@@ -8588,6 +8633,8 @@ class App:
         """Map one durable status kind to its authoritative result class."""
         normalized = str(kind or "").strip().casefold()
         diagnostic = str(message or "").strip().casefold()
+        if normalized == "rerun_pending":
+            return None
         if "사용자 중지" in diagnostic or "operator cancel" in diagnostic:
             return "cancelled"
         if normalized in {"completed", "imported_ok", "ready"}:
