@@ -7353,7 +7353,13 @@ def derive_status_actions(item):
         actions.append("Blender 잎 매쉬 Generator 연결 필요")
     if any(c["missing_export_maps"] for c in local_entries):
         actions.append("Substance에서 출력 텍스처 저장 필요")
-    if any(c.get("connection_update_needed") for c in item["cluster_items"]):
+    current_handoff_status = (
+        ((item.get("cluster_assembly") or {}).get("handoff") or {}).get("status")
+    )
+    if (
+        any(c.get("connection_update_needed") for c in item["cluster_items"])
+        and current_handoff_status not in {"ready", "pass_through"}
+    ):
         actions.append("SpeedTree 연결 텍스처 정리 필요")
     cluster_assembly = item.get("cluster_assembly") or {}
     bark_status = (cluster_assembly.get("canonical_bark") or {}).get("status")

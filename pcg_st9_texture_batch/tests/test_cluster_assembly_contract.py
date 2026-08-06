@@ -36,6 +36,7 @@ from pcg_cluster_assembly_contract import (
     _atlas_normalized_variants,
     _canonical_bark_contract,
     _canonical_cluster_texture_refs,
+    _current_live_pair_covered,
     _normalized_generator_delivery,
     _tga_basename_validation,
     _validate_normalized_source_dependency,
@@ -371,6 +372,20 @@ def write_ascii_fbx(path, material_names, mesh_names, pairs):
 
 
 class FbxRoleContractTests(unittest.TestCase):
+    def test_current_complete_pairs_cover_missing_historical_variants(self):
+        targets = [{
+            "fbx_material_mesh_pair": {
+                "status": "complete_pair",
+                "decision": "normalize_part",
+                "complete_pair_count": 1,
+                "error": None,
+            },
+        }]
+
+        self.assertTrue(_current_live_pair_covered(targets))
+        targets[0]["fbx_material_mesh_pair"]["status"] = "material_without_mesh"
+        self.assertFalse(_current_live_pair_covered(targets))
+
     def test_complete_absent_and_partial_roles_are_independent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fbx = Path(temp_dir) / "tree.fbx"
@@ -1146,9 +1161,15 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 set(dependencies),
                 {"SK_branch_elm_01", "SK_leaf_elm_01", "SK_leaf_elm_side_01"},
             )
-            self.assertEqual(dependencies["SK_branch_elm_01"]["decision"], "blocked")
-            self.assertTrue(
+            self.assertEqual(
+                dependencies["SK_branch_elm_01"]["decision"],
+                "pass_through",
+            )
+            self.assertFalse(
                 dependencies["SK_branch_elm_01"]["normalized_variants_missing"]
+            )
+            self.assertTrue(
+                dependencies["SK_branch_elm_01"]["current_live_pair_covered"]
             )
             self.assertEqual(dependencies["SK_leaf_elm_01"]["decision"], "blocked")
             self.assertEqual(
