@@ -954,6 +954,85 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
 
             self.assertFalse(current["normalization_required"])
 
+    def test_changed_source_fbx_rebuilds_stale_physical_receipt_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            source_fbx = blend.parent / "fbx" / f"{blend.stem}.fbx"
+            source_fbx.parent.mkdir()
+            source_fbx.write_bytes(b"bwr-export-before-cleanup")
+            first = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            capture_manifest = write_capture_manifest(first)
+            receipt = Path(first["receipt_path"])
+
+            def write_current_receipt(recipe):
+                receipt.write_text(
+                    json.dumps({
+                        "kind": "speedtree_cluster_sync_normalization",
+                        "status": "ready",
+                        "normalization_contract_sha256": recipe[
+                            "normalization_contract_sha256"
+                        ],
+                        "source_spm_sha256": recipe["source_spm_sha256"],
+                        "source_spm_semantic_projection_version": recipe[
+                            "source_spm_semantic_projection_version"
+                        ],
+                        "source_spm_semantic_fingerprint": recipe[
+                            "source_spm_semantic_fingerprint"
+                        ],
+                        "unit_probe_sha256": recipe["unit_probe_sha256"],
+                        "capture_manifest": str(capture_manifest.absolute()),
+                        "capture_manifest_sha256": sha256(capture_manifest),
+                        "build": {
+                            "source_3d_contract": {
+                                "source_fbx": recipe[
+                                    "source_fbx_identity"
+                                ]["path"],
+                                "source_fbx_sha256": recipe[
+                                    "source_fbx_identity"
+                                ]["sha256"],
+                            },
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+                seal_receipt_source_identity(blend, receipt, recipe)
+
+            write_current_receipt(first)
+            unchanged = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertFalse(unchanged["normalization_required"])
+
+            source_fbx.write_bytes(b"bwr-export-after-zero-face-cleanup")
+            changed = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertTrue(changed["normalization_required"])
+            self.assertNotEqual(
+                changed["normalization_contract_sha256"],
+                first["normalization_contract_sha256"],
+            )
+
+            write_current_receipt(changed)
+            rebuilt = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertFalse(rebuilt["normalization_required"])
+
     def test_saved_atlas_collection_change_refreshes_without_normalizer_rebuild(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)

@@ -450,6 +450,38 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 self.assertEqual(app._blend_status_text(spm), "최신 ✓")
 
+    def test_current_live_repair_status_clears_saved_blend_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = str(Path("SK_branch_elm_01.spm").absolute())
+        app.state[iid] = {
+            "blend_status": "old failure",
+            "blend_status_kind": "data_error",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "stale preflight failure",
+            },
+            "blend_status_result": {"outcome": "failed"},
+        }
+        repair_state = {
+            "current": True,
+            "push_ready": True,
+            "kind": "ready",
+            "reason": "current live Repair output",
+            "texture_reason": "",
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            app._record_live_blend_status(
+                iid,
+                Path(iid),
+                repair_state=repair_state,
+            )
+
+        self.assertEqual(app.state[iid]["blend_status_kind"], "ok")
+        self.assertNotIn("blend_status_error", app.state[iid])
+        self.assertNotIn("blend_status_result", app.state[iid])
+
     def test_legacy_report_without_pipeline_contract_requires_repair(self):
         gui = load_gui_module()
         app = self.make_app(gui)
