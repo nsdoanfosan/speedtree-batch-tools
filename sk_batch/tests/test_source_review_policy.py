@@ -148,6 +148,9 @@ class SourceReviewPolicyTests(unittest.TestCase):
         material_validation_lines = call_lines(
             tree, "validate_preflight_report"
         )
+        exact_export_refresh_lines = call_lines(
+            tree, "refresh_preflight_report_after_exact_export"
+        )
         assembly_inspection_lines = call_lines(
             tree, "inspect_cluster_assembly_fbx"
         )
@@ -155,7 +158,12 @@ class SourceReviewPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(export_lines), 2)
         self.assertEqual(len(material_validation_lines), 2)
+        self.assertEqual(len(exact_export_refresh_lines), 1)
         self.assertLess(material_validation_lines[0], export_lines[0])
+        self.assertGreater(exact_export_refresh_lines[0], max(export_lines))
+        self.assertLess(
+            exact_export_refresh_lines[0], material_validation_lines[1]
+        )
         self.assertGreater(material_validation_lines[1], max(export_lines))
         self.assertEqual(len(assembly_inspection_lines), 1)
         self.assertGreater(assembly_inspection_lines[0], max(export_lines))

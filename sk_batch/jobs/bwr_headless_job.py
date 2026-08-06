@@ -40,7 +40,11 @@ from spm_leaf_handoff_contract import (
     inspect_spm_leaf_contract,
     leaf_contract_user_message,
 )
-from speedtree_pipeline_contract import source_identity, validate_preflight_report
+from speedtree_pipeline_contract import (
+    refresh_preflight_report_after_exact_export,
+    source_identity,
+    validate_preflight_report,
+)
 from bwr_atlas_manifest_bridge import install_bwr_atlas_manifest_resolver
 from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
@@ -696,21 +700,37 @@ def main():
                     "the authoritative SpeedTree export"
                 )
 
-        # SpeedTree FBX export also promotes its generated STMAT sidecar, while
-        # the paired XML export replaces the XML in the same bundle.  Recheck
-        # every source contract only after all CLI exports have completed.
-        # Deferring the actual FBX import to this point also prevents a ready
-        # pre-export inventory (and its cached hashes) from being reused after
-        # the exporter replaces those files.
+        # SpeedTree FBX export promotes a newly generated STMAT sidecar.  The
+        # initial validation above proved the exact SPM/report pair before any
+        # mutation; now bind a derived runtime contract to the exact producer
+        # output instead of treating that expected replacement as an asset
+        # failure.  The original preflight receipt remains immutable.
         if args.material_contract:
-            material_preflight = validate_preflight_report(
-                args.material_contract,
+            live_stmat_path = Path(fbx_export["path"]).with_suffix(".stmat")
+            material_preflight = refresh_preflight_report_after_exact_export(
+                material_preflight,
+                speedtree_spm,
+                live_stmat_path,
+            )
+            live_material_contract_path = Path(args.report).with_name(
+                Path(args.report).stem + "_live_material_contract.json"
+            )
+            write_report(live_material_contract_path, material_preflight)
+            validate_preflight_report(
+                live_material_contract_path,
                 speedtree_spm,
                 require_ok=True,
             )
+            settings.texture_contract_path = str(live_material_contract_path)
             report["speedtree_pipeline_contract"] = material_preflight[
                 "speedtree_pipeline_contract"
             ]
+            report["exact_target_export_contract_refresh"] = (
+                material_preflight["exact_target_export_contract_refresh"]
+            )
+            report["live_material_contract"] = source_identity(
+                live_material_contract_path
+            )
             report["speedtree_pipeline_contract_revalidated_after_export"] = True
 
         if (
