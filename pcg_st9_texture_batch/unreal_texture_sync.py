@@ -1,6 +1,6 @@
-"""Synchronize canonical SpeedTree TGA outputs into Unreal without P4 churn.
+"""Synchronize canonical SpeedTree texture outputs into Unreal without P4 churn.
 
-The source TGA MD5 is compared with Unreal's saved ``AssetImportData.FileMD5``.
+The source file MD5 is compared with Unreal's saved ``AssetImportData.FileMD5``.
 An identical texture is never checked out, reimported, or saved.  New assets are
 explicitly marked for add, while only checkouts owned by the current run are
 eligible for ``revert unchanged`` cleanup.
@@ -296,7 +296,7 @@ def validate_unreal_texture_name(asset_name):
 
 def _asset_path_for_source(path, destination="/Game/Textures"):
     path = Path(path)
-    if path.suffix.lower() != ".tga" or not path.stem.lower().startswith("t_"):
+    if not path.stem.lower().startswith("t_"):
         return None
     if texture_role(path) is None:
         return None
@@ -361,7 +361,7 @@ def _emit_progress(progress, phase, current, total, message):
 
 
 def canonical_texture_entries(files, destination="/Game/Textures", progress=None):
-    """Return de-duplicated canonical T_ TGA entries with content hashes."""
+    """Return de-duplicated canonical T_ texture entries with content hashes."""
     destination = "/" + str(destination or "/Game/Textures").strip("/")
     entries = []
     candidates = []
@@ -374,7 +374,7 @@ def canonical_texture_entries(files, destination="/Game/Textures", progress=None
         if key in seen:
             continue
         seen.add(key)
-        if path.suffix.lower() != ".tga" or not path.stem.lower().startswith("t_"):
+        if not path.stem.lower().startswith("t_"):
             continue
         if role is None or not path.is_file() or path.stat().st_size <= 0:
             continue

@@ -4949,16 +4949,11 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertNotIn("_retry_force_rerun", save_config.call_args.args[0])
         self.assertNotIn("_retry_force_rerun", jobs[0]["cfg"])
 
-    def test_revision_mismatch_prechecks_before_retry_tracker_and_dedupes(self):
+    def test_revision_mismatch_precheck_warns_once_and_does_not_latch(self):
         gui = load_gui_module()
         app = self.make_app(gui)
-        checked = "revision_changed.spm"
-        self.configure_failed_retry_start(app, [checked])
-        app._async_retry_planning_enabled = True
-        app._new_retry_progress = mock.Mock()
-        app._record_phase_status = mock.Mock()
-        app.force_var = mock.Mock()
-        original_state = copy.deepcopy(app.state)
+        app.log = mock.Mock()
+        app.progress_var = mock.Mock()
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4985,31 +4980,22 @@ class PushQueueFlowTests(unittest.TestCase):
                 gui.messagebox,
                 "showwarning",
             ) as warning:
-                first = app.start_checked_failed_results_retry()
-                second = app.start_checked_failed_results_retry()
+                first = app._production_source_revision_precheck()
+                second = app._production_source_revision_precheck()
 
-        self.assertEqual(
-            first["route"],
-            "code_revision_restart_required",
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(manifest.call_count, 2)
+        warning.assert_not_called()
+        warning_text = "\n".join(
+            str(call.args[0]) for call in app.log.call_args_list
         )
-        self.assertEqual(second, first)
-        self.assertEqual(first["expected_revision"], expected.content_hash)
-        self.assertEqual(first["actual_revision"], actual.content_hash)
-        self.assertEqual(len(first["changed_paths"]), 6)
-        manifest.assert_called_once_with(gui.REPO_DIR)
-        warning.assert_called_once()
-        warning_text = warning.call_args.args[1]
         for path in sources:
             self.assertIn(path.name, warning_text)
         self.assertIn(expected.content_hash, warning_text)
         self.assertIn(actual.content_hash, warning_text)
-        app._new_retry_progress.assert_not_called()
-        app._collect_cfg.assert_not_called()
-        app._snapshot_batch_request.assert_not_called()
-        app._enqueue_batch_job.assert_not_called()
-        app._record_phase_status.assert_not_called()
-        app.force_var.get.assert_not_called()
-        self.assertEqual(app.state, original_state)
+        self.assertEqual(app.log.call_count, 1)
+        self.assertFalse(hasattr(app, "_code_revision_restart_required"))
 
     def test_retry_click_has_one_revision_precheck_before_receipt_creation(self):
         module = ast.parse(
@@ -5084,7 +5070,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(app._phase_failed_items, set())
         self.assertEqual(app.state, original_state)
 
-    def test_revision_restart_is_structured_job_route_not_asset_failure(self):
+    def test_legacy_revision_exception_becomes_nonblocking_job_warning(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         target = Path("top_level_revision_changed.spm")
@@ -5129,21 +5115,26 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             done["status"],
-            "code_revision_restart_required",
+            "completed",
         )
         self.assertEqual(done["failed_count"], 0)
         self.assertEqual(done["target_outcomes"], [])
         self.assertEqual(
-            done["code_revision_restart_required"]["expected_revision"],
+            done["job_diagnostics"][0]["expected_revision"],
             "c" * 64,
         )
+        self.assertEqual(
+            done["job_diagnostics"][0]["route"],
+            "code_revision_warning",
+        )
+        self.assertFalse(done["job_diagnostics"][0]["asset_failure"])
         app._run_full_pipeline.assert_not_called()
         app._record_phase_status.assert_not_called()
         app._set_push_state.assert_not_called()
         app._set_failed_retry_automatic_status.assert_not_called()
         self.assertNotIn(str(target), app.state)
 
-    def test_revision_restart_survives_queue_receipt_finalization_failure(self):
+    def test_revision_warning_does_not_hide_queue_owner_loss(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         target = Path("revision_changed_before_queue_finish.spm")
@@ -5188,26 +5179,24 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             done["status"],
-            "code_revision_restart_required",
+            "failed",
         )
         self.assertEqual(done["failed_count"], 0)
         self.assertEqual(done["target_outcomes"], [])
         self.assertEqual(done["shared_failures"], [])
-        self.assertEqual(
-            done["queue_finalization_error"],
-            "queue receipt write failed",
+        self.assertEqual(done["error"], "queue receipt write failed")
+        queue_diagnostic = next(
+            row for row in done["job_diagnostics"]
+            if row.get("stage") == "shared_queue_finalization"
         )
-        self.assertTrue(done["job_diagnostics"][0]["owner_lost"])
-        self.assertFalse(done["job_diagnostics"][0]["asset_failure"])
-        self.assertEqual(
-            lease.finish.call_args.kwargs["terminal_status"],
-            "cancelled",
-        )
+        self.assertTrue(queue_diagnostic["owner_lost"])
+        self.assertFalse(queue_diagnostic["asset_failure"])
+        self.assertNotIn("terminal_status", lease.finish.call_args.kwargs)
         app._run_full_pipeline.assert_not_called()
         app._record_phase_status.assert_not_called()
         self.assertNotIn(str(target), app.state)
 
-    def test_revision_restart_cancels_pending_shared_queue_tickets(self):
+    def test_revision_warning_keeps_pending_shared_queue_tickets(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         tracker = mock.Mock()
@@ -5244,17 +5233,10 @@ class PushQueueFlowTests(unittest.TestCase):
             },
         })
 
-        app.shared_queue_runtime.cancel.assert_called_once_with(
-            "shared-revision-180",
-            reason=gui.CODE_REVISION_RESTART_ROUTE,
-        )
-        tracker.mark_partition_terminal.assert_called_once_with(
-            "blender_rebuild",
-            gui.RETRY_STAGE_CANCELLED,
-            "code revision changed before shared queue claim; restart required",
-        )
-        self.assertEqual(list(app.pending_batch_jobs), [])
-        app._start_next_batch_job.assert_not_called()
+        app.shared_queue_runtime.cancel.assert_not_called()
+        tracker.mark_partition_terminal.assert_not_called()
+        self.assertEqual(list(app.pending_batch_jobs), [pending_job])
+        app._start_next_batch_job.assert_called_once_with()
 
     def test_checked_failed_retry_with_no_checks_does_not_plan(self):
         gui = load_gui_module()

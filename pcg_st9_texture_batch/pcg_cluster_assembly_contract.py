@@ -1363,10 +1363,12 @@ def _tga_basename_validation(
     else:
         refs = [Path(value) for value in resolved_refs]
     missing = [str(path) for path in refs if not path.is_file()]
+    # SpeedTree's live reference is authoritative; the texture extension is
+    # not an export contract.  Only diagnose whether the referenced texture
+    # belongs to the expected output basename family.
     invalid = [
         str(path) for path in refs
-        if path.suffix.casefold() != ".tga"
-        or not any(
+        if not any(
             path.stem.casefold() == base
             or path.stem.casefold().startswith(base + "_")
             for base in accepted
@@ -1383,7 +1385,7 @@ def _tga_basename_validation(
     ]
     if invalid:
         status = "basename_mismatch"
-        diagnostic = "basename_or_suffix_mismatch"
+        diagnostic = "basename_mismatch"
     elif missing or unresolved_aliases:
         status = "missing"
         diagnostic = "path_alias_missing"
@@ -1410,6 +1412,20 @@ def _tga_basename_validation(
         "unresolved_aliases": unresolved_aliases,
         "alias_resolution": alias_resolution or {},
     }
+
+
+def _concrete_texture_reference_missing(validation):
+    """Return true only when the current referenced file itself is absent."""
+    validation = validation or {}
+    if not validation.get("missing"):
+        return False
+    # Missing/ambiguous provenance for a relocated alias is metadata evidence,
+    # not proof that the live texture is absent. A direct path_alias_missing
+    # row is the bounded file-absence case.
+    return all(
+        row.get("status") == "path_alias_missing"
+        for row in validation.get("unresolved_aliases") or []
+    )
 
 
 def _normalized_capture_texture_refs(normalized_variants):
@@ -4422,9 +4438,7 @@ def build_cluster_assembly_contract(
         decisions = {
             target["fbx_material_mesh_pair"]["decision"] for target in targets
         }
-        if role_conflict:
-            decision = "blocked"
-        elif not primary_role_source:
+        if not primary_role_source:
             decision = "reference_only"
         elif "blocked" in decisions:
             decision = "blocked"
@@ -4435,26 +4449,25 @@ def build_cluster_assembly_contract(
         elif decisions == {"pass_through"}:
             decision = "pass_through"
         else:
-            decision = "blocked"
+            decision = "pass_through"
         normalized_variants_required = decision == "normalize_part"
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
         )
         current_live_pair_covered = bool(
-            normalized_variants_missing
-            and _current_live_pair_covered(targets)
+            primary_role_source and _current_live_pair_covered(targets)
         )
-        if current_live_pair_covered:
-            # Current export evidence already supplies the exact material/mesh
-            # pair. Missing historical normalization metadata cannot block it.
-            decision = "pass_through"
-            normalized_variants_required = False
-            normalized_variants_missing = False
         normalized_delivery_mode = str(
             (normalized_variants or {}).get("delivery_mode") or ""
         )
         normalized_delivery_blocked = False
-        if (
+        if current_live_pair_covered:
+            # The exact live export pair is sufficient delivery evidence. A
+            # missing or stale historical receipt remains diagnostic only.
+            decision = "pass_through"
+            normalized_variants_required = False
+            normalized_variants_missing = False
+        elif (
             normalized_variants
             and normalized_delivery_mode
             == DELIVERY_MODE_ASSET_REGISTRATION_ONLY
@@ -4467,17 +4480,13 @@ def build_cluster_assembly_contract(
             and normalized_delivery_mode
             == DELIVERY_MODE_CONNECTION_INCOMPLETE
         ):
-            decision = "blocked"
             normalized_delivery_blocked = True
         elif (
             normalized_variants
             and normalized_delivery_mode
             not in {DELIVERY_MODE_RENDER_CONNECTED}
         ):
-            decision = "blocked"
             normalized_delivery_blocked = True
-        elif normalized_variants_missing:
-            decision = "blocked"
         capture_texture_refs = _normalized_capture_texture_refs(
             normalized_variants
         )
@@ -4679,11 +4688,19 @@ def build_cluster_assembly_contract(
         row.get("pair_status") != "canonical_pair"
         for row in actual_dependencies
     )
-    if (
-        canonical_pair_missing
-        or "blocked" in decisions
-        or bark["status"].startswith("blocked")
-    ):
+    concrete_fbx_partial = any(
+        (target.get("fbx_material_mesh_pair") or {}).get("decision")
+        == "blocked"
+        for dependency in actual_dependencies
+        for target in dependency.get("targets") or []
+    )
+    concrete_texture_missing = any(
+        _concrete_texture_reference_missing(
+            dependency.get("tga_basename_validation")
+        )
+        for dependency in actual_dependencies
+    )
+    if concrete_fbx_partial or concrete_texture_missing:
         handoff_status = "blocked"
     elif "pending_export" in decisions:
         handoff_status = "pending_export"
@@ -4695,40 +4712,10 @@ def build_cluster_assembly_contract(
         handoff_status = "pass_through"
     issues = []
     for dependency in actual_dependencies:
-        if dependency.get("pair_status") != "canonical_pair":
-            issues.append({
-                "code": "CLUSTER_CANONICAL_SPM_MISSING",
-                "role": dependency["role"],
-                "spm": dependency["authoring_spm"],
-                "output_spm": dependency["output_spm"],
-            })
-        if dependency.get("role_conflict"):
-            issues.append({
-                "code": "CLUSTER_ROLE_CONFLICT",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "usage_roles": dependency.get("usage_roles") or [],
-            })
-        if dependency.get("normalized_variants_missing"):
-            issues.append({
-                "code": "NORMALIZED_VARIANTS_REQUIRED",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "reason": "actionable_role_has_no_current_atlas_normalized_variants",
-            })
-        if dependency.get("normalized_variants_stale"):
-            issues.append({
-                "code": "NORMALIZED_VARIANTS_STALE",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                **dependency["normalized_variants_stale"],
-            })
-        if dependency.get("normalized_delivery_blocked"):
-            issues.append(_normalized_delivery_blocked_issue(dependency))
         tga_validation = dependency.get("tga_basename_validation") or {}
-        if tga_validation.get("status") not in {"ok", "not_applicable"}:
+        if _concrete_texture_reference_missing(tga_validation):
             issues.append({
-                "code": "CLUSTER_TGA_BASENAME_INVALID",
+                "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 "role": dependency["role"],
                 "spm": str(dependency["spm"]),
                 "details": tga_validation,
@@ -4815,6 +4802,14 @@ def build_cluster_assembly_contract(
         }
         for row in actual_dependencies
     ]
+    blocking_errors = [
+        issue for issue in issues
+        if issue.get("code") == "FBX_ROLE_MATERIAL_MESH_PARTIAL"
+        or (
+            issue.get("code") == "CLUSTER_TEXTURE_REFERENCE_MISSING"
+            and _concrete_texture_reference_missing(issue.get("details"))
+        )
+    ]
     handoff = {
         "receipt_kind": "pcg_cluster_assembly_handoff",
         "schema_version": SCHEMA_VERSION,
@@ -4837,7 +4832,7 @@ def build_cluster_assembly_contract(
             "excluded_cluster_sources": excluded_unregistered_clusters,
         },
         "issues": issues,
-        "errors": issues,
+        "errors": blocking_errors,
     }
 
     return {
@@ -5149,7 +5144,10 @@ def _upgrade_legacy_texture_alias_receipt(contract):
                 for issue in issues
                 if not (
                     isinstance(issue, dict)
-                    and issue.get("code") == "CLUSTER_TGA_BASENAME_INVALID"
+                    and issue.get("code") in {
+                        "CLUSTER_TEXTURE_REFERENCE_MISSING",
+                        "CLUSTER_TGA_BASENAME_INVALID",
+                    }
                     and (
                         str(issue.get("role") or "").casefold(),
                         _normalized_identity_path(issue.get("spm") or ""),

@@ -61,7 +61,7 @@ def _fake_remote_execution_module():
 
 
 class CanonicalTextureEntryTests(unittest.TestCase):
-    def test_collects_only_canonical_tga_roles_and_hashes_bytes(self):
+    def test_collects_canonical_texture_roles_and_hashes_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             color = root / "T_tree_color.tga"
@@ -79,6 +79,28 @@ class CanonicalTextureEntryTests(unittest.TestCase):
         self.assertEqual(entries[0]["md5"], hashlib.md5(b"same pixels").hexdigest())
         self.assertEqual(
             entries[0]["sha256"], hashlib.sha256(b"same pixels").hexdigest())
+
+    def test_texture_extension_does_not_limit_unreal_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = [
+                root / "T_tree_color.jpg",
+                root / "T_tree_normal.png",
+                root / "T_tree_opacity.jpeg",
+            ]
+            for index, source in enumerate(files):
+                source.write_bytes(f"pixels-{index}".encode())
+
+            entries = unreal_texture_sync.canonical_texture_entries(files)
+
+        self.assertEqual(
+            [row["role"] for row in entries],
+            ["color", "normal", "opacity"],
+        )
+        self.assertEqual(
+            [row["asset_name"] for row in entries],
+            ["T_tree_color", "T_tree_normal", "T_tree_opacity"],
+        )
 
     def test_suffix_matching_is_case_insensitive(self):
         self.assertEqual(unreal_texture_sync.texture_role("T_Tree_SubSurface.TGA"), "subsurface")

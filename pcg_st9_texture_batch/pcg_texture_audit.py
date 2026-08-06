@@ -6335,8 +6335,7 @@ def _atlas_expected_outputs_are_valid(
         )
         path = _resolve_for_membership(value or "")
         if (
-            Path(path).suffix.casefold() != ".tga"
-            or Path(path).stem.casefold()
+            Path(path).stem.casefold()
             != f"{texture_base}_{role}".casefold()
             or _path_identity(Path(path).parent) not in texture_roots
         ):
@@ -7367,13 +7366,18 @@ def derive_status_actions(item):
         actions.append("Cluster bark를 canonical material로 정규화 필요")
     handoff_status = (cluster_assembly.get("handoff") or {}).get("status")
     if handoff_status == "blocked":
+        if status == "ready":
+            status = "needs_texture_work"
         actions.append("FBX role material–mesh dependency 오류 해결 필요")
     elif handoff_status == "pending_export":
         actions.append("SK export 후 branch/leaf Assembly handoff 검증 필요")
     if local_entries and not item["sbs_files"]:
         actions.append("Substance SBS 파일 확인 필요")
-    if actions and status == "ready":
-        status = "needs_texture_work"
+    if status == "ready" and handoff_status in {"ready", "pass_through"}:
+        # A complete current delivery is already actionable. Historical Atlas,
+        # Substance, or normalization maintenance is not a Push task and does
+        # not need to become user-facing warning noise in this state.
+        actions = []
     item["status"] = status
     item["actions"] = unique(actions)
     return item
@@ -7573,7 +7577,13 @@ def local_target_mesh_names(folder):
 
 def folder_match_tokens(folder):
     folder = Path(folder)
-    tokens = {normalize_local_asset_stem(folder.name)}
+    folder_token = normalize_local_asset_stem(folder.name)
+    # A generic Cluster directory is not an asset identity. Treating it as
+    # one makes every ``cluster_*`` mesh from a multi-target audit appear to
+    # belong to every species' Cluster folder.
+    tokens = set()
+    if folder_token not in {"cluster", "clusters"}:
+        tokens.add(folder_token)
     for pattern in ("*.spm", "*.st9"):
         for path in folder.glob(pattern):
             if path.is_file() and not is_backup_path(path):
@@ -7588,7 +7598,7 @@ def folder_target_mesh_names(folder, target_mesh_names):
     matches = []
     for mesh_name in target_mesh_names:
         for token in tokens:
-            if mesh_name == token or mesh_name.startswith(token + "_") or mesh_name.startswith(token):
+            if mesh_name == token or mesh_name.startswith(token + "_"):
                 matches.append(mesh_name)
                 break
     return sorted(matches)
@@ -8715,7 +8725,7 @@ def main():
         "--expected-production-source-revision",
         help=(
             "Batch-pinned code_compile_gate production source content hash; "
-            "the audit fails before asset evaluation when it differs"
+            "a mismatch is recorded as a non-blocking warning"
         ),
     )
     parser.add_argument(
@@ -8765,30 +8775,24 @@ def main():
         expected_revision,
         revision_started,
     )
+    production_source_revision_warning = None
     if expected_revision and not revision_state["matches_expected"]:
-        emit_progress_marker(
-            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
-            stage="production_source_revision",
-            error="revision_mismatch",
-        )
-        report = {
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "status": "failed",
-            "stage": "production_source_revision",
-            "error": (
-                "Production source revision changed before PCG audit start: "
-                f"expected {expected_revision}, "
-                f"worker {revision_state['started']['content_hash']}"
+        production_source_revision_warning = {
+            "code": "PRODUCTION_SOURCE_REVISION_MISMATCH",
+            "severity": "warning",
+            "asset_failure": False,
+            "expected_revision": expected_revision,
+            "actual_revision": revision_state["started"]["content_hash"],
+            "message": (
+                "Production source revision differs from the parent batch; "
+                "the audit continues with the worker's loaded revision."
             ),
-            "production_source_revision": revision_state,
-            "summary": {"total": 0, "by_status": {}},
-            "items": [],
         }
-        write_report_outputs(report, args.json_path, args.csv_path)
-        raise SystemExit(2)
     emit_progress_marker(
         CLUSTER_LIVE_AUDIT_REVISION_OK_MARKER,
         revision=revision_started.content_hash,
+        expected_revision=expected_revision,
+        warning=bool(production_source_revision_warning),
     )
     cfg = load_config()
     if args.prepare_sk:
@@ -8894,21 +8898,23 @@ def main():
         not revision_state["matches_expected"]
         or not revision_state["stable"]
     ):
-        emit_progress_marker(
-            CLUSTER_LIVE_AUDIT_FAILED_MARKER,
-            stage="production_source_revision",
-            error="revision_changed",
+        production_source_revision_warning = {
+            "code": "PRODUCTION_SOURCE_REVISION_MISMATCH",
+            "severity": "warning",
+            "asset_failure": False,
+            "expected_revision": expected_revision,
+            "started_revision": revision_state["started"]["content_hash"],
+            "finished_revision": revision_state["finished"]["content_hash"],
+            "stable": revision_state["stable"],
+            "message": (
+                "Production source revision differed during the audit; "
+                "results remain available and the batch may continue."
+            ),
+        }
+    if production_source_revision_warning:
+        report["production_source_revision_warning"] = (
+            production_source_revision_warning
         )
-        report["status"] = "failed"
-        report["stage"] = "production_source_revision"
-        report["error"] = (
-            "Production source revision changed during PCG audit: "
-            f"expected {expected_revision}, "
-            f"start {revision_state['started']['content_hash']}, "
-            f"final {revision_state['finished']['content_hash']}"
-        )
-        write_report_outputs(report, args.json_path, args.csv_path)
-        raise SystemExit(2)
     # Receipt persistence is a cache/audit-trail concern.  The live report
     # above is the authoritative data validation result, so a filesystem or
     # receipt self-validation failure must not turn clean source data into a

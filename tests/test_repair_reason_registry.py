@@ -367,7 +367,7 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
         )
         tokens = set(payload["tokens"])
 
-        self.assertEqual(len(tokens), 20)
+        self.assertEqual(len(tokens), 22)
         self.assertEqual(tokens - set(REASON_REGISTRY), set())
         self.assertEqual(
             sorted(
@@ -440,14 +440,17 @@ class ReasonScanTests(unittest.TestCase):
             {"first_local_reason", "second_local_reason"},
         )
 
-    def test_role_handoff_emits_the_canonical_generator_connection_reason(self):
+    def test_role_handoff_emits_nonblocking_connection_metadata_reason(self):
         module = (
             REPO_DIR
             / "sk_batch"
             / "cluster_assembly_handoff_contract.py"
         )
         codes = scan_module(module)
-        self.assertIn("generator_connection_contract_incomplete", codes)
+        self.assertIn(
+            "generator_connection_metadata_incomplete_nonblocking",
+            codes,
+        )
         self.assertNotIn("generator_connection_incomplete", codes)
 
     def test_scan_finds_codes_through_every_supported_shape(self):
