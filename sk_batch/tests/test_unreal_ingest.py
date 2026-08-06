@@ -1728,6 +1728,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
         fail_skeleton_publish=False,
         soft_false_previous_mesh_move=False,
         fail_first_previous_mesh_move=False,
+        stale_previous_mesh_object_path=False,
     ):
         runner = load_runner()
         final_mesh_path = "/Game/Meshes/Trees/SK_Test"
@@ -1846,7 +1847,13 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 ):
                     return False
                 assets.pop(source)
-                asset.path = target
+                keep_stale_object_path = bool(
+                    stale_previous_mesh_object_path
+                    and source == final_mesh_path
+                    and "_Legacy_" in target
+                )
+                if not keep_stale_object_path:
+                    asset.path = target
                 assets[target] = asset
                 assets[source] = {
                     "class": "ObjectRedirector",
@@ -2024,6 +2031,70 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertTrue(
             previous_mesh["rename_api_disagreed_with_live_move"]
         )
+
+    def test_registry_move_proof_overrides_stale_loaded_object_path(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            old_mesh,
+            _old_skeleton,
+        ) = self._transactional_publish_fixture(
+            mesh_referencers=["/Game/Maps/Test"],
+            stale_previous_mesh_object_path=True,
+        )
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        self.assertIsNot(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
+        previous_mesh = next(
+            row
+            for row in result["staged_import"]["relocated_previous_assets"]
+            if row["role"] == "previous canonical mesh"
+        )
+        observation = previous_mesh["live_move_observations"][0]
+        self.assertEqual(
+            observation["object_path"],
+            "/Game/Meshes/Trees/SK_Test",
+        )
+        self.assertTrue(observation["source_redirector"])
+        self.assertTrue(observation["target_is_asset"])
+        self.assertTrue(previous_mesh["moved"])
+
+    def test_registry_state_rolls_back_move_with_stale_object_path(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            old_mesh,
+            old_skeleton,
+        ) = self._transactional_publish_fixture(
+            fail_skeleton_publish=True,
+            stale_previous_mesh_object_path=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "incoming Skeleton publish move failed",
+        ):
+            runner._import_manifest_asset_with_fresh_skeleton(
+                object(),
+                manifest_asset,
+                {},
+            )
+
+        self.assertIs(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
+        self.assertIs(
+            assets["/Game/Meshes/Trees/SK_Test_Skeleton"],
+            old_skeleton,
+        )
+        self.assertFalse(any("_Legacy_" in path for path in assets))
 
     def test_exact_move_retries_once_after_live_path_did_not_change(self):
         (
