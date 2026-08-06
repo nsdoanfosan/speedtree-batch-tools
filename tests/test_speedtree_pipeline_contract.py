@@ -32,6 +32,7 @@ from speedtree_pipeline_contract import (
     prove_legacy_texture_normalize_semantic_migration,
     read_spm_text,
     read_tree_instance_profile,
+    refresh_preflight_report_after_exact_export,
     shared_contract_api,
     source_set_fingerprint,
     speedtree_generator_guid,
@@ -462,6 +463,173 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
             first_stmat.write_text("<SpeedTreeMaterials />", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "STMAT source is stale"):
                 validate_preflight_envelope(envelope, first)
+
+    def test_exact_export_refresh_accepts_same_target_stmat_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_exact_export.spm")
+            stmat = write_stmat(spm, ["M_bark_Mat", "M_leaf_Mat"])
+            readiness = resolve_texture_bindings(stmat)
+            report = {
+                "status": "ok",
+                "texture_readiness_contract": readiness,
+                "speedtree_pipeline_contract": build_preflight_envelope(
+                    spm,
+                    outcome="ok",
+                    texture_readiness=readiness,
+                ),
+            }
+            recorded_hash = report["speedtree_pipeline_contract"]["source"][
+                "stmat"
+            ][0]["sha256"]
+
+            stmat.write_text(
+                stmat.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "STMAT source is stale"):
+                validate_preflight_envelope(
+                    report["speedtree_pipeline_contract"], spm
+                )
+
+            refreshed = refresh_preflight_report_after_exact_export(
+                report,
+                spm,
+                stmat,
+            )
+
+            live = refreshed["speedtree_pipeline_contract"]
+            self.assertNotEqual(
+                live["source"]["stmat"][0]["sha256"], recorded_hash
+            )
+            self.assertEqual(
+                refreshed["exact_target_export_contract_refresh"][
+                    "texture_binding_disposition"
+                ],
+                "preserved_same_live_material_sources",
+            )
+            self.assertFalse(
+                refreshed["exact_target_export_contract_refresh"][
+                    "asset_failure"
+                ]
+            )
+            validate_preflight_envelope(live, spm)
+
+    def test_exact_export_refresh_rebinds_live_material_reorder(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_reordered_export.spm")
+            stmat = write_stmat(spm, ["M_bark_Mat", "M_leaf_Mat"])
+            readiness = resolve_texture_bindings(stmat)
+            report = {
+                "status": "ok",
+                "texture_readiness_contract": readiness,
+                "speedtree_pipeline_contract": build_preflight_envelope(
+                    spm,
+                    outcome="ok",
+                    texture_readiness=readiness,
+                ),
+            }
+
+            write_stmat(spm, ["M_leaf_Mat", "M_bark_Mat"])
+            refreshed = refresh_preflight_report_after_exact_export(
+                report,
+                spm,
+                stmat,
+            )
+
+            self.assertEqual(
+                refreshed["exact_target_export_contract_refresh"][
+                    "texture_binding_disposition"
+                ],
+                "refreshed_from_live_stmat",
+            )
+            self.assertEqual(
+                [
+                    intent["material_name"]
+                    for intent in refreshed["speedtree_pipeline_contract"][
+                        "material_intents"
+                    ]
+                ],
+                ["M_leaf_Mat", "M_bark_Mat"],
+            )
+            self.assertTrue(
+                all(
+                    intent["texture_source_mode"] == "managed_texture_set"
+                    for intent in refreshed["speedtree_pipeline_contract"][
+                        "material_intents"
+                    ]
+                )
+            )
+
+    def test_exact_export_refresh_rebinds_changed_live_texture_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_changed_maps.spm")
+            stmat = write_stmat(
+                spm,
+                ["M_leaf_Mat"],
+                texture_base="T_leaf_old",
+            )
+            readiness = resolve_texture_bindings(stmat)
+            report = {
+                "status": "ok",
+                "texture_readiness_contract": readiness,
+                "speedtree_pipeline_contract": build_preflight_envelope(
+                    spm,
+                    outcome="ok",
+                    texture_readiness=readiness,
+                ),
+            }
+
+            write_stmat(
+                spm,
+                ["M_leaf_Mat"],
+                texture_base="T_leaf_live",
+            )
+            refreshed = refresh_preflight_report_after_exact_export(
+                report,
+                spm,
+                stmat,
+            )
+
+            self.assertEqual(
+                refreshed["exact_target_export_contract_refresh"][
+                    "texture_binding_disposition"
+                ],
+                "refreshed_from_live_stmat",
+            )
+            intent = refreshed["speedtree_pipeline_contract"][
+                "material_intents"
+            ][0]
+            self.assertEqual(
+                intent["texture_binding"]["texture_base"],
+                "T_leaf_live",
+            )
+
+    def test_exact_export_refresh_still_rejects_spm_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_changed_source.spm")
+            stmat = write_stmat(spm, ["M_leaf_Mat"])
+            readiness = resolve_texture_bindings(stmat)
+            report = {
+                "status": "ok",
+                "texture_readiness_contract": readiness,
+                "speedtree_pipeline_contract": build_preflight_envelope(
+                    spm,
+                    outcome="ok",
+                    texture_readiness=readiness,
+                ),
+            }
+
+            write_spm(spm, "dead")
+            with self.assertRaisesRegex(ValueError, "SPM source changed"):
+                refresh_preflight_report_after_exact_export(
+                    report,
+                    spm,
+                    stmat,
+                )
 
     def test_source_fingerprint_is_canonical_content_identity_sha256(self):
         source = {

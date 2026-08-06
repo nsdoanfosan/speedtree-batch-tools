@@ -1167,6 +1167,148 @@ def validate_preflight_envelope(envelope, spm_path, require_ok=True):
     return copy.deepcopy(envelope)
 
 
+def refresh_preflight_report_after_exact_export(
+    report,
+    spm_path,
+    stmat_path=None,
+):
+    """Rebind an already-validated report to its exact producer output.
+
+    SpeedTree's FBX export promotes a newly generated STMAT at the canonical
+    target path.  That tool-owned replacement is expected after the caller has
+    validated the report and then exported the *same* SPM.  Revalidating the
+    pre-export byte hash at that point would make a successful exact-target
+    export invalidate itself.
+
+    The SPM identity remains immutable here.  Texture bindings are reused only
+    when the live STMAT has the same duplicate-safe material order, names, IDs,
+    and declared map sources as the validated report.  Otherwise bindings are
+    resolved again from the live STMAT; a resolver exception degrades only the
+    optional texture metadata to runtime-unassigned rather than failing the
+    asset.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("SpeedTree preflight report is not an object")
+    if report.get("status") != "ok":
+        raise ValueError(
+            "SpeedTree material preflight status is not ok: "
+            f"{report.get('status')!r}"
+        )
+    previous = report.get("speedtree_pipeline_contract")
+    if not isinstance(previous, dict):
+        raise ValueError("SpeedTree pipeline contract is not an object")
+
+    spm = _canonical_path(spm_path)
+    recorded_spm = (previous.get("source") or {}).get("spm") or {}
+    current_spm = source_identity(spm)
+    if not _same_source_identity(recorded_spm, current_spm):
+        raise ValueError(
+            "SpeedTree preflight SPM source changed during exact-target export"
+        )
+
+    stmat = _canonical_path(stmat_path or speedtree_stmat_path(spm))
+    unbound = build_preflight_envelope(
+        spm,
+        stmat,
+        outcome=previous.get("outcome") or "ok",
+        texture_readiness=None,
+        issues=previous.get("issues") or [],
+    )
+
+    def material_keys(envelope):
+        return [
+            (
+                int(item.get("stmat_material_index", -1)),
+                str(item.get("stmat_material_id") or ""),
+                str(item.get("material_name") or "").casefold(),
+            )
+            for item in (envelope.get("material_intents") or [])
+        ]
+
+    previous_readiness = report.get("texture_readiness_contract") or {}
+    live_resolution_error = ""
+    try:
+        from speedtree_texture_contract import resolve_texture_bindings
+
+        live_readiness = resolve_texture_bindings(stmat)
+    except Exception as exc:  # texture metadata is runtime-tolerant by contract
+        live_resolution_error = f"{type(exc).__name__}: {exc}"
+        live_readiness = {
+            "status": "unassigned",
+            "stmat": canonical_path(stmat),
+            "bindings": [],
+            "missing": [],
+            "texture_admission_mode": "runtime_tolerant",
+            "affects_pipeline_outcome": False,
+            "diagnostic": live_resolution_error,
+        }
+
+    def binding_source_keys(readiness):
+        return [
+            (
+                int(item.get("material_index", -1)),
+                str(item.get("material") or "").casefold(),
+                str(item.get("texture_base") or "").casefold(),
+                json.dumps(
+                    item.get("stmat_roles") or {},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ),
+                tuple(
+                    sorted(
+                        (
+                            str(role).casefold(),
+                            canonical_path_key(path),
+                        )
+                        for role, path in (item.get("files") or {}).items()
+                    )
+                ),
+            )
+            for item in (readiness.get("bindings") or [])
+        ]
+
+    preserve_bindings = (
+        material_keys(previous) == material_keys(unbound)
+        and binding_source_keys(previous_readiness)
+        == binding_source_keys(live_readiness)
+    )
+    texture_readiness = previous_readiness if preserve_bindings else live_readiness
+    refreshed = build_preflight_envelope(
+        spm,
+        stmat,
+        outcome=previous.get("outcome") or "ok",
+        texture_readiness=texture_readiness,
+        issues=previous.get("issues") or [],
+    )
+    validate_preflight_envelope(refreshed, spm, require_ok=True)
+
+    payload = copy.deepcopy(report)
+    payload["speedtree_pipeline_contract"] = refreshed
+    if not preserve_bindings:
+        payload["texture_readiness_contract"] = copy.deepcopy(live_readiness)
+    payload["exact_target_export_contract_refresh"] = {
+        "status": "refreshed",
+        "refresh_cause": "exact_target_export_regenerated_stmat",
+        "previous_stmat": copy.deepcopy(
+            (previous.get("source") or {}).get("stmat") or []
+        ),
+        "live_stmat": copy.deepcopy(
+            (refreshed.get("source") or {}).get("stmat") or []
+        ),
+        "texture_binding_disposition": (
+            "preserved_same_live_material_sources"
+            if preserve_bindings
+            else "runtime_unassigned_live_resolution_error"
+            if live_resolution_error
+            else "refreshed_from_live_stmat"
+        ),
+        "texture_resolution_diagnostic": live_resolution_error,
+        "asset_failure": False,
+    }
+    return payload
+
+
 def validate_preflight_report(report_path, spm_path, require_ok=True):
     path = _canonical_path(report_path)
     try:
@@ -1221,6 +1363,7 @@ __all__ = [
     "spm_file_structural_semantic_fingerprint",
     "spm_authoring_graph_fingerprint",
     "spm_structural_semantic_fingerprint",
+    "refresh_preflight_report_after_exact_export",
     "validate_preflight_envelope",
     "validate_preflight_report",
 ]
