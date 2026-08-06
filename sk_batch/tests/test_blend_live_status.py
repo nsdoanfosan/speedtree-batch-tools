@@ -6,10 +6,12 @@ import queue
 import tempfile
 import threading
 import unittest
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from atlas_target_registry import TargetRegistryError
@@ -3146,6 +3148,184 @@ class BlendLiveStatusTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
+    def test_cluster_live_audit_memo_survives_queue_boundaries(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.pending_batch_jobs = deque()
+        app.active_batch_job = None
+        app.batch_job_sequence = 0
+        app.batch_job_failures = []
+        app.shared_queue_runtime = None
+        app.log = mock.Mock()
+        app._reset_cluster_receipt_refresh_memo = mock.Mock()
+        app._set_batch_queue_controls = mock.Mock()
+        app._start_next_batch_job = mock.Mock()
+
+        app._enqueue_batch_job({
+            "label": "first queue",
+            "cfg": {},
+            "force_rerun": False,
+            "push_transport": "rpc",
+            "targets": [],
+            "inventory": {},
+        })
+
+        app.active_batch_job = {"id": 1, "label": "first queue"}
+        app.pending_batch_jobs.clear()
+        app.worker = None
+        app.progress_var = mock.Mock()
+        app._finish_batch_job({"id": 1, "status": "completed"})
+
+        app._reset_cluster_receipt_refresh_memo.assert_not_called()
+
+    def test_explicit_scan_resets_cluster_live_audit_memo(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app._scan_generation = 0
+        app.root = mock.Mock()
+        app.root_var = FakeVar("C:/fixture-root")
+        app.state = {}
+        app.state_lock = threading.RLock()
+        app._collect_cfg = mock.Mock(return_value={})
+        app._set_scan_controls = mock.Mock()
+        app._reset_cluster_receipt_refresh_memo = mock.Mock()
+        app.ui_queue = queue.Queue()
+
+        with mock.patch.object(gui, "save_config"), mock.patch.object(
+            gui.threading,
+            "Thread",
+        ) as thread:
+            app.scan()
+
+        app._reset_cluster_receipt_refresh_memo.assert_called_once()
+        thread.return_value.start.assert_called_once()
+
+    def test_cluster_live_audit_memo_binds_production_revision(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.force_rerun = False
+        revision = {"value": "production-revision-a"}
+        app._assert_active_production_source_manifest = mock.Mock(
+            side_effect=lambda: SimpleNamespace(
+                content_hash=revision["value"],
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            (spm.parent / "Cluster").mkdir(parents=True)
+            spm.write_bytes(b"tree")
+            runs = {"count": 0}
+
+            def run_uncached(*_args, **_kwargs):
+                runs["count"] += 1
+                return {
+                    "payload": {},
+                    "audit_report": str(
+                        Path(temporary) / f"audit-{runs['count']}.json"
+                    ),
+                    "audit": runs["count"],
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=run_uncached,
+            )
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="same-input-fingerprint",
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ()),
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=(),
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                side_effect=lambda _spm, raw: raw,
+            )
+
+            first = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010101"
+            )
+            second = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010102"
+            )
+            revision["value"] = "production-revision-b"
+            third = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010103"
+            )
+
+        self.assertEqual(first["audit"], 1)
+        self.assertEqual(second["audit"], 1)
+        self.assertEqual(third["audit"], 2)
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+        scope = app._cluster_receipt_refresh_scope(spm)
+        self.assertEqual(
+            app._cluster_receipt_refresh_memo[scope][
+                "production_source_revision"
+            ],
+            "production-revision-b",
+        )
+
+    def test_cluster_live_audit_force_rerun_bypasses_session_memo(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            (spm.parent / "Cluster").mkdir(parents=True)
+            spm.write_bytes(b"tree")
+            runs = {"count": 0}
+
+            def run_uncached(*_args, **_kwargs):
+                runs["count"] += 1
+                return {
+                    "payload": {},
+                    "audit_report": str(
+                        Path(temporary) / f"audit-{runs['count']}.json"
+                    ),
+                    "audit": runs["count"],
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=run_uncached,
+            )
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="same-input-fingerprint",
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ()),
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=(),
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                side_effect=lambda _spm, raw: raw,
+            )
+
+            first = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020101"
+            )
+            app.force_rerun = True
+            forced = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020102"
+            )
+            app.force_rerun = False
+            cached = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020103"
+            )
+
+        self.assertEqual(first["audit"], 1)
+        self.assertEqual(forced["audit"], 2)
+        self.assertEqual(cached["audit"], 1)
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+
     def test_cluster_live_artifact_cache_fingerprint_uses_bounded_reads(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -4164,6 +4344,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._refresh_stale_cluster_receipt_uncached = run_uncached
             with mock.patch.object(
                 gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={"selected_receipt": str(report)},
+            ), mock.patch.object(
+                gui,
                 "Future",
                 ObservableFuture,
             ), ThreadPoolExecutor(max_workers=2) as pool:
@@ -4658,6 +4842,10 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             app._refresh_stale_cluster_receipt_uncached = run_uncached
             with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={"selected_receipt": str(report)},
+            ), mock.patch.object(
                 gui,
                 "Future",
                 ObservableFuture,
