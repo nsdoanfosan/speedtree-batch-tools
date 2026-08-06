@@ -427,16 +427,15 @@ def normalize_manifest_handoff_sidecars(
                 "Send2UE material sidecar descriptor is not authoritative and "
                 "no source-bound strict wrapper is available"
             )
-        if (
-            not descriptor_authoritative
-            and fallback_descriptor is not None
-            and fallback_name.casefold() != authored_name.casefold()
-        ):
-            raise RuntimeError(
-                "Send2UE authoritative SpeedTree handoff descriptor belongs "
-                "to a different canonical unit: "
-                f"{fallback_name!r} != {authored_name!r} ({source_path})"
-            )
+        # The strict wrapper is owned by the selected SPM/STMAT source, while
+        # one Blender export can contain several authored Export Empty units.
+        # Their names therefore do not have to equal the wrapper's root mesh
+        # name (for example ``SK_cluster_blackgum_01_01`` is a live unit of
+        # ``SK_cluster_blackgum_01``).  Source ownership is already enforced by
+        # ``_source_bound_fallback_descriptor``; use that binding to reissue a
+        # descriptor for the exact live sidecar identity.  Treating a mere
+        # name difference as competing ownership incorrectly turns normal
+        # multi-unit exports into terminal failures.
         destination_folder = asset_path.rsplit("/", 1)[0]
         target_asset_path = destination_folder + "/" + authored_name
         target_key = target_asset_path.casefold()
