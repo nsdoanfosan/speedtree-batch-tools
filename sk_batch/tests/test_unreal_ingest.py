@@ -1726,12 +1726,14 @@ class UnrealIngestSaveTests(unittest.TestCase):
         skeleton_referencers=None,
         fail_mesh_publish=False,
         fail_skeleton_publish=False,
+        soft_false_previous_mesh_move=False,
+        fail_first_previous_mesh_move=False,
     ):
         runner = load_runner()
         final_mesh_path = "/Game/Meshes/Trees/SK_Test"
         final_skeleton_path = final_mesh_path + "_Skeleton"
         assets = {}
-        calls = {"renamed": [], "deleted": []}
+        calls = {"renamed": [], "rename_attempts": [], "deleted": []}
 
         class FakeAsset:
             def __init__(self, path, referencers=None):
@@ -1813,6 +1815,14 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
             @staticmethod
             def rename_asset(source, target):
+                calls["rename_attempts"].append((source, target))
+                if (
+                    fail_first_previous_mesh_move
+                    and source == final_mesh_path
+                    and "_Legacy_" in target
+                    and calls["rename_attempts"].count((source, target)) == 1
+                ):
+                    return False
                 if (
                     (
                         fail_mesh_publish
@@ -1843,6 +1853,12 @@ class UnrealIngestSaveTests(unittest.TestCase):
                     "target": target,
                 }
                 calls["renamed"].append((source, target))
+                if (
+                    soft_false_previous_mesh_move
+                    and source == final_mesh_path
+                    and "_Legacy_" in target
+                ):
+                    return False
                 return True
 
             @staticmethod
@@ -1976,6 +1992,76 @@ class UnrealIngestSaveTests(unittest.TestCase):
             len([path for path in assets if "_Legacy_" in path]),
             2,
         )
+
+    def test_live_move_overrides_false_rename_api_result(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            _calls,
+            old_mesh,
+            _old_skeleton,
+        ) = self._transactional_publish_fixture(
+            mesh_referencers=["/Game/Maps/Test"],
+            soft_false_previous_mesh_move=True,
+        )
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        self.assertIsNot(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
+        relocated = result["staged_import"]["relocated_previous_assets"]
+        previous_mesh = next(
+            row
+            for row in relocated
+            if row["role"] == "previous canonical mesh"
+        )
+        self.assertEqual(previous_mesh["rename_api_returns"], [False])
+        self.assertTrue(previous_mesh["moved"])
+        self.assertTrue(
+            previous_mesh["rename_api_disagreed_with_live_move"]
+        )
+
+    def test_exact_move_retries_once_after_live_path_did_not_change(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            calls,
+            old_mesh,
+            _old_skeleton,
+        ) = self._transactional_publish_fixture(
+            fail_first_previous_mesh_move=True,
+        )
+        repairs = []
+        runner._finish_pending_asset_compilation_for_publish = lambda: (
+            repairs.append("finished") or ["finished"]
+        )
+
+        result = runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        self.assertIsNot(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
+        relocated = result["staged_import"]["relocated_previous_assets"]
+        previous_mesh = next(
+            row
+            for row in relocated
+            if row["role"] == "previous canonical mesh"
+        )
+        self.assertEqual(previous_mesh["rename_api_returns"], [False, True])
+        self.assertEqual(previous_mesh["exact_retry_repair"], ["finished"])
+        self.assertEqual(repairs, ["finished"])
+        previous_move = (
+            "/Game/Meshes/Trees/SK_Test",
+            previous_mesh["target"],
+        )
+        self.assertEqual(calls["rename_attempts"].count(previous_move), 2)
 
     def test_transactional_mesh_publish_failure_restores_canonical_pair(self):
         (
