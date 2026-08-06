@@ -3393,6 +3393,10 @@ class App:
         if prepared is None:
             self._scan_generation = getattr(self, "_scan_generation", 0) + 1
             generation = self._scan_generation
+            # An explicit scan starts a new asset verification session.
+            # Queue boundaries do not: the memo itself re-fingerprints all
+            # inputs and live artifacts before any reuse.
+            self._reset_cluster_receipt_refresh_memo()
             root = self.root_var.get()
             self.cfg = self._collect_cfg()
             self.cfg["root"] = root
@@ -4366,9 +4370,6 @@ class App:
             and not self.pending_batch_jobs
         ):
             self.batch_job_failures = []
-            # One queue drain owns one validated live-audit memo generation.
-            # Every lookup still re-fingerprints the production inputs.
-            self._reset_cluster_receipt_refresh_memo()
         self.batch_job_sequence += 1
         job = dict(job)
         job["id"] = self.batch_job_sequence
@@ -5108,7 +5109,6 @@ class App:
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
-        self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
         if status == "stopped":
@@ -9405,6 +9405,38 @@ class App:
             if persist:
                 save_state(self.state)
 
+    def _begin_phase_state_save_batch(self):
+        """Defer routine state snapshots until the active phase completes."""
+        with self.state_lock:
+            self._phase_state_save_batch_depth = (
+                int(getattr(self, "_phase_state_save_batch_depth", 0)) + 1
+            )
+
+    def _save_state_after_phase_update(self):
+        """Persist now unless an active phase can safely coalesce this update.
+
+        Callers hold ``state_lock`` while updating ``self.state``.  Terminal
+        failures (and in-flight cancellations) continue to call ``save_state``
+        directly; deferred cancellation rows are captured by the forced phase
+        flush.
+        """
+        if getattr(self, "_phase_state_save_batch_depth", 0) > 0:
+            self._phase_state_save_batch_dirty = True
+            return
+        save_state(self.state)
+
+    def _end_phase_state_save_batch(self, *, force=False):
+        """Flush a coalesced phase state snapshot, including exceptional exits."""
+        with self.state_lock:
+            depth = int(getattr(self, "_phase_state_save_batch_depth", 0))
+            if depth > 1:
+                self._phase_state_save_batch_depth = depth - 1
+                return
+            if force or getattr(self, "_phase_state_save_batch_dirty", False):
+                save_state(self.state)
+            self._phase_state_save_batch_depth = 0
+            self._phase_state_save_batch_dirty = False
+
     @staticmethod
     def _failure_status_text(reason, kind):
         if kind in {"cancelled", "stopped"}:
@@ -9420,6 +9452,20 @@ class App:
         return f"실패: {reason}"
 
     def _run_batch(self, phase, targets, emit_done=True):
+        # SPM and Blender state writes are UI/progress snapshots.  They can be
+        # committed once at the phase boundary. Item failures stay immediate;
+        # deferred cancellation rows are committed by the final flush.
+        if phase not in {"spm", "blender"}:
+            return self._run_batch_impl(phase, targets, emit_done=emit_done)
+        self._begin_phase_state_save_batch()
+        try:
+            return self._run_batch_impl(phase, targets, emit_done=emit_done)
+        finally:
+            # Force one final snapshot even when a revision fence or another
+            # exceptional path exits before the normal phase tail.
+            self._end_phase_state_save_batch(force=True)
+
+    def _run_batch_impl(self, phase, targets, emit_done=True):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self._phase_abort_reason = None
         self._phase_failed_items = set()
@@ -10032,7 +10078,7 @@ class App:
         with self.state_lock:
             self._phase_failed_items = set(failed_items)
             if phase != "check":
-                save_state(self.state)
+                self._save_state_after_phase_update()
         if emit_done:
             progress = (
                 f"{title} 중단 — {self._phase_abort_reason}"
@@ -11200,7 +11246,7 @@ class App:
                     entry["blend_status_kind"] = "ok"
                     entry.pop("blend_status_error", None)
                     entry.pop("blend_status_result", None)
-                save_state(self.state)
+                self._save_state_after_phase_update()
         return text
 
     def _job_check(self, iid, spm):
@@ -11816,6 +11862,74 @@ class App:
         self.log(f"Cluster Normalizer/Atlas 갱신 완료: {Path(spm).name}")
         return result
 
+    def _migrate_cached_positive_spm_receipt(
+        self,
+        spm,
+        snapshot,
+        cache,
+        summary,
+    ):
+        """Write a durable positive receipt once without reparsing an SPM.
+
+        A GUI calibration cache is already bound to the exact full-file
+        fingerprint in ``snapshot``. Fresh reports retain the semantic bone
+        fingerprint produced for those same final bytes, so later cache hits
+        can migrate the small durable receipt without opening a large SPM
+        again. Legacy cache rows fall back to one semantic read and then
+        retain that result for future hits in this session.
+        """
+
+        status = str((cache or {}).get("status") or "")
+        if status not in {"calibrated", "already-ok"}:
+            return
+        semantic_fingerprint = str(
+            (cache or {}).get("bone_semantic_fingerprint") or ""
+        ).strip()
+        try:
+            if not semantic_fingerprint:
+                semantic_fingerprint = current_bone_semantic_fingerprint(spm)
+                cache["bone_semantic_fingerprint"] = semantic_fingerprint
+            receipt_key = (
+                _normalized_path(spm),
+                str(snapshot["fingerprint"]),
+                str(self.spm_calibration_signature),
+                str(SPM_BONE_CONTRACT_VERSION),
+                semantic_fingerprint,
+            )
+            with self.state_lock:
+                written = self.__dict__.setdefault(
+                    "_positive_calibration_receipt_memo",
+                    set(),
+                )
+                if receipt_key in written:
+                    return
+            receipt = write_positive_calibration_receipt(
+                spm,
+                getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
+                or (TOOL_DIR / "cache" / "spm_calibration"),
+                bone_semantic_fingerprint_value=semantic_fingerprint,
+                settings_signature=self.spm_calibration_signature,
+                bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+                report={
+                    "status": status,
+                    "cached_display_summary": summary,
+                    "calibration": {
+                        "mode": "migrated_positive_gui_cache",
+                    },
+                },
+            )
+            if receipt is not None:
+                with self.state_lock:
+                    self.__dict__.setdefault(
+                        "_positive_calibration_receipt_memo",
+                        set(),
+                    ).add(receipt_key)
+        except Exception as exc:
+            self.log(
+                "  [캐시 경고] SPM bone receipt migration failed: "
+                f"{Path(spm).name}: {exc}"
+            )
+
     def _job_spm(self, iid, spm):
         spm = Path(spm)
         entry = self.state.setdefault(iid, {})
@@ -11830,7 +11944,7 @@ class App:
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
-                save_state(self.state)
+                self._save_state_after_phase_update()
             reason = "source read-only" if read_only else "Cluster 전용 정책"
             self.log(f"SPM 본 보정 건너뜀 ({reason}): {spm.name}")
             return
@@ -11840,7 +11954,7 @@ class App:
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
-                save_state(self.state)
+                self._save_state_after_phase_update()
             self.log(f"본 세팅 건너뜀 (수동 본 유지): {spm.name}")
             return
 
@@ -11864,35 +11978,18 @@ class App:
             cached_text = f"{summary} ✓ (변경 없음)"
             if cache.get("status") == "not-sk-ready":
                 raise RuntimeError(f"SK 미제작: {cache.get('error', '본 설정 필요')} (캐시)")
+            self._migrate_cached_positive_spm_receipt(
+                spm,
+                snapshot,
+                cache,
+                summary,
+            )
             self.ui_queue.put(("cell", (iid, "spm_status", cached_text)))
             with self.state_lock:
                 cache["settings_signature"] = self.spm_calibration_signature
                 entry["spm_status"] = cached_text
                 entry["spm_summary"] = summary
-                save_state(self.state)
-            try:
-                write_positive_calibration_receipt(
-                    spm,
-                    getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
-                    or (TOOL_DIR / "cache" / "spm_calibration"),
-                    bone_semantic_fingerprint_value=(
-                        current_bone_semantic_fingerprint(spm)
-                    ),
-                    settings_signature=self.spm_calibration_signature,
-                    bone_contract_version=SPM_BONE_CONTRACT_VERSION,
-                    report={
-                        "status": cache.get("status"),
-                        "cached_display_summary": summary,
-                        "calibration": {
-                            "mode": "migrated_positive_gui_cache",
-                        },
-                    },
-                )
-            except Exception as exc:
-                self.log(
-                    "  [캐시 경고] SPM bone receipt migration failed: "
-                    f"{spm.name}: {exc}"
-                )
+                self._save_state_after_phase_update()
             self.log(f"본 세팅 건너뜀 (SPM/옵션 변경 없음): {spm.name}")
             return
 
@@ -11996,7 +12093,7 @@ class App:
         )
         with self.state_lock:
             if cacheable and final_snapshot:
-                entry["calibration_cache"] = {
+                calibration_cache = {
                     "version": CALIBRATION_CACHE_VERSION,
                     "spm_fingerprint": final_snapshot["fingerprint"],
                     "settings_signature": self.spm_calibration_signature,
@@ -12006,11 +12103,19 @@ class App:
                     "probe_cache_hit": bool((rep.get("calibration") or {}).get("probe_cache_hit")),
                     "completed_at": datetime.now().isoformat(timespec="seconds"),
                 }
+                semantic_fingerprint = str(
+                    rep.get("bone_semantic_fingerprint") or ""
+                ).strip()
+                if semantic_fingerprint:
+                    calibration_cache["bone_semantic_fingerprint"] = (
+                        semantic_fingerprint
+                    )
+                entry["calibration_cache"] = calibration_cache
             entry["spm_last_duration_seconds"] = round(duration, 3)
             entry["spm_status"] = f"{summary}{warn}"
             entry["spm_summary"] = summary
             entry["blend_status"] = blend_status
-            save_state(self.state)
+            self._save_state_after_phase_update()
         self.ui_queue.put(("cell", (iid, "blend_status", entry["blend_status"])))
         if status == "not-sk-ready":
             raise RuntimeError(f"SK 미제작: {rep.get('error', '보이는 Branch의 본 설정이 모두 꺼져 있음')}")
@@ -12023,11 +12128,12 @@ class App:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
     def _reset_cluster_receipt_refresh_memo(self):
-        """Start one process-local Cluster audit memo generation.
+        """Discard the process-local Cluster live-audit memo.
 
-        One local queue drain owns one generation.  A hit is never trusted by
-        age alone: every caller re-fingerprints the production inputs and live
-        artifacts before reuse, and the memo is discarded when the queue drains.
+        The memo lives for the GUI verification session and is reset only for
+        an explicit scan (or when the app exits).  A hit is never trusted by
+        age alone: every caller re-fingerprints production inputs and live
+        artifacts before reuse.
         """
         self._cluster_receipt_refresh_memo_lock = threading.Lock()
         self._cluster_receipt_refresh_memo = {}
@@ -12388,7 +12494,7 @@ class App:
         spm,
         stamp,
     ):
-        """Reuse one hash-current live audit inside the active queue drain.
+        """Reuse one hash-current live audit within this GUI session.
 
         Successful raw audits only are memoized. Concurrent callers for the
         same owner/input share one Future; an execution exception reaches all
@@ -12396,7 +12502,9 @@ class App:
         retry.
         """
         spm = Path(spm).resolve()
-        self._assert_active_production_source_manifest()
+        production_manifest = self._assert_active_production_source_manifest()
+        production_source_revision = str(production_manifest.content_hash)
+        force_rerun = bool(getattr(self, "force_rerun", False))
         if not (spm.parent / "Cluster").is_dir():
             return self._refresh_stale_cluster_receipt_uncached(
                 spm,
@@ -12409,7 +12517,11 @@ class App:
         cached_raw_audit = None
         while True:
             with self._cluster_receipt_refresh_memo_lock:
-                cached = self._cluster_receipt_refresh_memo.get(scope)
+                cached = (
+                    None
+                    if force_rerun
+                    else self._cluster_receipt_refresh_memo.get(scope)
+                )
                 cached_live_artifact_paths = (
                     (cached or {}).get("live_artifact_paths") or ()
                 )
@@ -12445,10 +12557,16 @@ class App:
                 # immutable cache entry while hashes were calculated. Validate
                 # that entry outside the lock instead of accepting or
                 # overwriting it based on the older snapshot.
-                if self._cluster_receipt_refresh_memo.get(scope) is not cached:
+                if (
+                    not force_rerun
+                    and self._cluster_receipt_refresh_memo.get(scope)
+                    is not cached
+                ):
                     continue
                 if (
                     cached is not None
+                    and cached.get("production_source_revision")
+                    == production_source_revision
                     and cached.get("input_fingerprint")
                     == current_cache_fingerprint
                     and cached.get("discovery_fingerprint")
@@ -12460,8 +12578,19 @@ class App:
                     flight_key = None
                     flight = None
                     owns_flight = False
+                elif force_rerun:
+                    # A force run must execute an independent live audit.
+                    # Keep the existing retry/stability wrapper, but neither
+                    # consume nor publish a session memo or shared flight.
+                    flight_key = None
+                    flight = Future()
+                    owns_flight = True
                 else:
-                    flight_key = (scope, pre_discovery_fingerprint)
+                    flight_key = (
+                        scope,
+                        production_source_revision,
+                        pre_discovery_fingerprint,
+                    )
                     flight = self._cluster_receipt_refresh_flights.get(
                         flight_key
                     )
@@ -12581,15 +12710,31 @@ class App:
                         and final_artifacts_match
                     )
                     if stable:
-                        self._assert_active_production_source_manifest()
-                        cache_entry = {
-                            "input_fingerprint": post_cache_fingerprint,
-                            "discovery_fingerprint": (
-                                final_discovery_fingerprint
-                            ),
-                            "live_artifact_paths": live_artifact_paths,
-                            "raw_audit": copy.deepcopy(raw_audit),
-                        }
+                        final_manifest = (
+                            self._assert_active_production_source_manifest()
+                        )
+                        final_revision = str(final_manifest.content_hash)
+                        if (
+                            not force_rerun
+                            and final_revision == production_source_revision
+                        ):
+                            cache_entry = {
+                                "production_source_revision": (
+                                    production_source_revision
+                                ),
+                                "input_fingerprint": post_cache_fingerprint,
+                                "discovery_fingerprint": (
+                                    final_discovery_fingerprint
+                                ),
+                                "live_artifact_paths": live_artifact_paths,
+                                "raw_audit": copy.deepcopy(raw_audit),
+                            }
+                        elif final_revision != production_source_revision:
+                            self.log(
+                                "Cluster Assembly live audit memo not "
+                                "published after production source revision "
+                                f"changed: {spm.name}"
+                            )
                         break
                     artifact_errors = final_artifact_errors
                     observed_discovery_records = final_discovery_records
@@ -12632,7 +12777,11 @@ class App:
         publish_error = completion_error
         with self._cluster_receipt_refresh_memo_lock:
             try:
-                if publish_error is None and cache_entry is not None:
+                if (
+                    publish_error is None
+                    and not force_rerun
+                    and cache_entry is not None
+                ):
                     self._cluster_receipt_refresh_memo[scope] = cache_entry
                 if publish_error is None:
                     flight.set_result(copy.deepcopy(raw_audit))
@@ -12653,7 +12802,8 @@ class App:
                         pass
             finally:
                 if (
-                    self._cluster_receipt_refresh_flights.get(flight_key)
+                    flight_key is not None
+                    and self._cluster_receipt_refresh_flights.get(flight_key)
                     is flight
                 ):
                     self._cluster_receipt_refresh_flights.pop(
@@ -14922,7 +15072,7 @@ class App:
                 entry["push_status"] = push_status
                 entry["push_status_kind"] = "ready"
                 entry.pop("push_status_error", None)
-                save_state(self.state)
+                self._save_state_after_phase_update()
         if cluster_blend_backup is not None:
             try:
                 cluster_blend_backup.unlink(missing_ok=True)

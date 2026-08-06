@@ -299,6 +299,66 @@ class ManualBonesTests(unittest.TestCase):
 
             self.assertIn("변경 없음", app.state[iid]["spm_status"])
 
+    def test_cached_spm_receipt_reuses_saved_semantic_fingerprint_once(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            spm = Path(tmp) / "Tree_test" / "Cluster" / "SK_cached_test.spm"
+            spm.parent.mkdir(parents=True)
+            spm.write_bytes(b"stable-spm")
+            snapshot = file_content_snapshot(spm)
+            iid = str(spm)
+            signature = "settings-signature"
+            app = gui.App.__new__(gui.App)
+            app.items = {
+                iid: {
+                    "spm": spm,
+                    "manual_bones_locked": False,
+                    "spm_snapshot": snapshot,
+                }
+            }
+            app.state = {
+                iid: {
+                    "calibration_cache": {
+                        "version": CALIBRATION_CACHE_VERSION,
+                        "spm_fingerprint": snapshot["fingerprint"],
+                        "settings_signature": signature,
+                        "status": "calibrated",
+                        "summary": "cached",
+                        "bone_semantic_fingerprint": "saved-semantic",
+                    }
+                }
+            }
+            app.state_lock = threading.RLock()
+            app.ui_queue = queue.Queue()
+            app.log = lambda _message: None
+            app.force_rerun = False
+            app.spm_calibration_signature = signature
+            app.cfg = {"spm_calibration_receipt_dir": Path(tmp) / "receipts"}
+
+            with mock.patch.object(gui, "save_state"), mock.patch.object(
+                gui,
+                "current_cluster_root_postcondition",
+                return_value={"ok": True},
+            ), mock.patch.object(
+                gui,
+                "current_bone_semantic_fingerprint",
+                side_effect=AssertionError("cached semantic must be reused"),
+            ), mock.patch.object(
+                gui,
+                "write_positive_calibration_receipt",
+                return_value=Path(tmp) / "receipt.json",
+            ) as write_receipt:
+                app._job_spm(iid, spm)
+                app._job_spm(iid, spm)
+
+            write_receipt.assert_called_once()
+            self.assertEqual(
+                write_receipt.call_args.kwargs[
+                    "bone_semantic_fingerprint_value"
+                ],
+                "saved-semantic",
+            )
+
     def test_successful_job_records_cache_then_next_run_skips(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,6 +401,9 @@ class ManualBonesTests(unittest.TestCase):
                                 "final_spm_fingerprint": (
                                     file_content_snapshot(spm)["fingerprint"]
                                 ),
+                                "bone_semantic_fingerprint": (
+                                    "semantic-after-calibration"
+                                ),
                                 "cluster_root_logical_postcondition": {
                                     "ok": True,
                                 },
@@ -373,6 +436,10 @@ class ManualBonesTests(unittest.TestCase):
             cache = app.state[iid]["calibration_cache"]
             self.assertEqual(cache["status"], "calibrated")
             self.assertEqual(cache["settings_signature"], "settings-signature")
+            self.assertEqual(
+                cache["bone_semantic_fingerprint"],
+                "semantic-after-calibration",
+            )
 
     def test_bone_mode_dropdown_changes_only_the_target_row(self):
         gui = load_gui_module()

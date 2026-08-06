@@ -34,7 +34,11 @@ PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS = {
     # Files are intentionally tiny, so these budgets guard algorithmic/I/O
     # amplification rather than pretending to predict OneDrive wall time.
     "cold_total": 10.0,
-    "warm_total": 6.0,
+    # Windows hosted runners repeatedly measured 6.2-6.6s while the same
+    # revision stayed below the budget locally. Keep this below the 8s
+    # usable-ready ceiling, but leave enough scheduler slack that the
+    # cardinality/invocation guards remain the signal for amplification.
+    "warm_total": 7.0,
     "cold_usable_ready": 15.0,
     "warm_usable_ready": 8.0,
     "cached_board_paint": 0.25,
